@@ -1,0 +1,1106 @@
+
+# Replay with ckdev-mutate (cortexkit-mutate 0.9.8) from the immutable CK_MUTATE_REV in ci.yml.
+# Rows were appended by `ck-mutate prove` (0.7.0, the runner's earlier name) against the source and named tests,
+# then replayed together. Keep this catalogue for silent, costly failures:
+# ledger durability, exactly-once ingestion, trust boundaries and wire contracts.
+# Ordinary logic belongs in ordinary tests.
+
+[[control]]
+id = "unknown-file-identity-is-not-equal"
+guards = "Unavailable file identities cannot authorize cached content or append-only resume"
+file = "crates/astrocyte-readers/src/file_identity.rs"
+old = "current.is_some() && current == previous"
+new = "current == previous // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-readers/src/file_identity.rs"
+runner = "cargo"
+package = "astrocyte-readers"
+target = "--lib"
+expect_red = ["file_identity::tests::unknown_file_identities_are_never_the_same"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "sqlite-unc-stays-out-of-uri-authority"
+guards = "Forward-slash UNC servers remain in the SQLite filename, not its URI authority"
+file = "crates/astrocyte-readers/src/sessions/opencode_schema.rs"
+old = "Ok(crate::sqlite_uri::sqlite_readonly_uri(raw))"
+new = 'Ok(format!("file:{raw}?mode=ro")) // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-readers/src/sessions/opencode_schema.rs"
+runner = "cargo"
+package = "astrocyte-readers"
+target = "--lib"
+expect_red = ["sessions::opencode_schema::tests::forward_slash_unc_uri_keeps_the_server_in_the_filename"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+#
+# No row for the generation predicate in the reprice head UPDATE
+# (pricing.rs, `WHERE event_id=?3 AND pricing_generation=?4`): replacing it
+# with `?4 IS NOT NULL` survives every test. The UPDATE compares against the
+# generation read a moment earlier in the same write transaction, so it can
+# only differ if that read-back check (row reprice-generation-readback) fails
+# first. The predicate is a second fence behind the read-back, not a separate
+# guard.
+
+[[control]]
+id = "sqlite-memory-statistics-disabled"
+guards = "The bundled SQLite build avoids the per-allocation global memory-statistics mutex"
+file = ".cargo/config.toml"
+old = 'LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"'
+new = 'LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=1" # NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::sqlite_build_disables_per_allocation_memory_statistics"]
+expect_message = "SQLite must not take a global memory-statistics mutex on every allocation"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "jsonl-unchanged-resume-single-hash"
+guards = "A quiet JSONL resume hashes the verified prefix only once, including a partial tail"
+file = "crates/astrocyte-readers/src/sessions/jsonl_resume.rs"
+old = "let unchanged_window = previous_window.filter(|_| consumed == start);"
+new = "let unchanged_window = previous_window.filter(|_| false); // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-readers/src/sessions/jsonl_resume.rs"
+runner = "cargo"
+package = "astrocyte-readers"
+target = "--lib"
+expect_red = ["sessions::jsonl_resume::tests::unchanged_resumes_hash_the_verified_prefix_only_once"]
+expect_message = "Window, tail"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "reprice-generation-readback"
+guards = "A stale resolve cannot commit after another writer advances the pricing generation"
+file = "crates/astrocyte-core/src/pricing.rs"
+old = "if u64::try_from(current_generation).ok() != Some(plan.pricing_generation) {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/pricing.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["pricing::tests::contention_between_resolve_and_commit_aborts_as_pricing_superseded"]
+expect_message = "PricingSuperseded"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "reprice-resolution-plan-binding"
+guards = "A resolution for a different event cannot write charges or advance the plan's generation"
+file = "crates/astrocyte-core/src/pricing.rs"
+old = "|| resolved.event_id != plan.event_id"
+new = "|| false // NON-VACUITY BREAK: accept another event's resolution"
+test_file = "crates/astrocyte-core/src/pricing.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["pricing::tests::a_resolution_for_another_plan_writes_no_charges_or_generation"]
+expect_message = "a foreign resolution must not write money or advance the plan"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ledger-auth-selection-immutable"
+guards = "Stored auth_selection cannot be rewritten, including a NULL filled in later"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''
+CREATE TRIGGER usage_event_update_guard
+BEFORE UPDATE ON usage_event
+WHEN NOT (
+    NEW.event_key IS OLD.event_key
+    AND NEW.event_id IS OLD.event_id
+    AND NEW.producer IS OLD.producer
+    AND NEW.producer_lineage IS OLD.producer_lineage
+    AND NEW.producer_ref IS OLD.producer_ref
+    AND NEW.prior_event_ref IS OLD.prior_event_ref
+    AND NEW.harness IS OLD.harness
+    AND NEW.project_root IS OLD.project_root
+    AND NEW.session IS OLD.session
+    AND NEW.run_ref IS OLD.run_ref
+    AND NEW.work_class IS OLD.work_class
+    AND NEW.occurred_at_ms IS OLD.occurred_at_ms
+    AND NEW.emitted_at_ms IS OLD.emitted_at_ms
+    AND NEW.recorded_at_ms IS OLD.recorded_at_ms
+    AND NEW.terminal_status IS OLD.terminal_status
+    AND NEW.attempt_ordinal IS OLD.attempt_ordinal
+    AND NEW.vendor_request_id IS OLD.vendor_request_id
+    AND NEW.provider IS OLD.provider
+    AND NEW.model IS OLD.model
+    AND NEW.account_ref IS OLD.account_ref
+    AND NEW.auth_selection IS OLD.auth_selection
+    AND NEW.charge_basis_mapping_version IS OLD.charge_basis_mapping_version
+    AND NEW.charge_basis_overrides IS OLD.charge_basis_overrides
+    AND (
+        NEW.charge_basis IS OLD.charge_basis
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.pricing_generation = OLD.pricing_generation
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.currency IS OLD.currency
+        OR (OLD.currency IS NULL AND NEW.currency IS NOT NULL)
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'usage_event_update_guard');
+END;
+'''
+new = '''
+CREATE TRIGGER usage_event_update_guard
+BEFORE UPDATE ON usage_event
+WHEN NOT (
+    NEW.event_key IS OLD.event_key
+    AND NEW.event_id IS OLD.event_id
+    AND NEW.producer IS OLD.producer
+    AND NEW.producer_lineage IS OLD.producer_lineage
+    AND NEW.producer_ref IS OLD.producer_ref
+    AND NEW.prior_event_ref IS OLD.prior_event_ref
+    AND NEW.harness IS OLD.harness
+    AND NEW.project_root IS OLD.project_root
+    AND NEW.session IS OLD.session
+    AND NEW.run_ref IS OLD.run_ref
+    AND NEW.work_class IS OLD.work_class
+    AND NEW.occurred_at_ms IS OLD.occurred_at_ms
+    AND NEW.emitted_at_ms IS OLD.emitted_at_ms
+    AND NEW.recorded_at_ms IS OLD.recorded_at_ms
+    AND NEW.terminal_status IS OLD.terminal_status
+    AND NEW.attempt_ordinal IS OLD.attempt_ordinal
+    AND NEW.vendor_request_id IS OLD.vendor_request_id
+    AND NEW.provider IS OLD.provider
+    AND NEW.model IS OLD.model
+    AND NEW.account_ref IS OLD.account_ref
+    -- NON-VACUITY BREAK: auth_selection is mutable
+    AND NEW.charge_basis_mapping_version IS OLD.charge_basis_mapping_version
+    AND NEW.charge_basis_overrides IS OLD.charge_basis_overrides
+    AND (
+        NEW.charge_basis IS OLD.charge_basis
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.pricing_generation = OLD.pricing_generation
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.currency IS OLD.currency
+        OR (OLD.currency IS NULL AND NEW.currency IS NOT NULL)
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'usage_event_update_guard');
+END;
+'''
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_integer_constraints_preserve_chain_shape_currency_and_immutability"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ledger-event-no-delete"
+guards = "Deleting a usage_event is refused without losing the ledger row"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''
+CREATE TRIGGER usage_event_no_delete
+BEFORE DELETE ON usage_event
+BEGIN
+    SELECT RAISE(ABORT, 'usage_event_no_delete');
+END;
+
+CREATE TRIGGER usage_event_pricing_generation_starts_zero
+BEFORE INSERT ON usage_event
+WHEN NEW.pricing_generation <> 0
+BEGIN
+    SELECT RAISE(ABORT, 'usage_event_pricing_generation_starts_zero');
+END;
+
+CREATE TRIGGER usage_event_update_guard
+BEFORE UPDATE ON usage_event
+WHEN NOT (
+    NEW.event_key IS OLD.event_key
+'''
+new = '''
+CREATE TRIGGER usage_event_no_delete
+BEFORE DELETE ON usage_event
+BEGIN
+    SELECT 1; -- NON-VACUITY BREAK
+END;
+
+CREATE TRIGGER usage_event_pricing_generation_starts_zero
+BEFORE INSERT ON usage_event
+WHEN NEW.pricing_generation <> 0
+BEGIN
+    SELECT RAISE(ABORT, 'usage_event_pricing_generation_starts_zero');
+END;
+
+CREATE TRIGGER usage_event_update_guard
+BEFORE UPDATE ON usage_event
+WHEN NOT (
+    NEW.event_key IS OLD.event_key
+'''
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_integer_constraints_preserve_chain_shape_currency_and_immutability"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ledger-measurement-no-update"
+guards = "Immutable measurements refuse UPDATE without changing stored readings"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''
+CREATE TRIGGER measurement_no_delete
+BEFORE DELETE ON measurement
+BEGIN
+    SELECT RAISE(ABORT, 'measurement_no_delete');
+END;
+
+CREATE TRIGGER measurement_no_update
+BEFORE UPDATE ON measurement
+BEGIN
+    SELECT RAISE(ABORT, 'measurement_no_update');
+END;
+'''
+new = '''
+CREATE TRIGGER measurement_no_delete
+BEFORE DELETE ON measurement
+BEGIN
+    SELECT RAISE(ABORT, 'measurement_no_delete');
+END;
+
+CREATE TRIGGER measurement_no_update
+BEFORE UPDATE ON measurement
+BEGIN
+    SELECT 1; -- NON-VACUITY BREAK
+END;
+'''
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_integer_constraints_preserve_chain_shape_currency_and_immutability"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ledger-measurement-no-delete"
+guards = "Immutable measurements refuse DELETE without changing stored readings"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''
+CREATE TRIGGER measurement_no_delete
+BEFORE DELETE ON measurement
+BEGIN
+    SELECT RAISE(ABORT, 'measurement_no_delete');
+END;
+
+CREATE TRIGGER measurement_no_update
+BEFORE UPDATE ON measurement
+BEGIN
+    SELECT RAISE(ABORT, 'measurement_no_update');
+END;
+'''
+new = '''
+CREATE TRIGGER measurement_no_delete
+BEFORE DELETE ON measurement
+BEGIN
+    SELECT 1; -- NON-VACUITY BREAK
+END;
+
+CREATE TRIGGER measurement_no_update
+BEFORE UPDATE ON measurement
+BEGIN
+    SELECT RAISE(ABORT, 'measurement_no_update');
+END;
+'''
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_integer_constraints_preserve_chain_shape_currency_and_immutability"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ledger-charge-no-update"
+guards = "The current schema refuses UPDATE of append-only priced charges"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''
+CREATE TRIGGER priced_charge_matches_event_generation_and_basis
+BEFORE INSERT ON priced_charge
+WHEN NOT EXISTS (
+    SELECT 1 FROM usage_event event
+    WHERE event.event_key = NEW.event_key
+      AND event.pricing_generation = NEW.pricing_generation
+      AND event.charge_basis = NEW.charge_basis
+)
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_matches_event_generation_and_basis');
+END;
+
+CREATE TRIGGER priced_charge_no_delete
+BEFORE DELETE ON priced_charge
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_no_delete');
+END;
+
+CREATE TRIGGER priced_charge_no_update
+BEFORE UPDATE ON priced_charge
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_no_update');
+END;
+'''
+new = '''
+CREATE TRIGGER priced_charge_matches_event_generation_and_basis
+BEFORE INSERT ON priced_charge
+WHEN NOT EXISTS (
+    SELECT 1 FROM usage_event event
+    WHERE event.event_key = NEW.event_key
+      AND event.pricing_generation = NEW.pricing_generation
+      AND event.charge_basis = NEW.charge_basis
+)
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_matches_event_generation_and_basis');
+END;
+
+CREATE TRIGGER priced_charge_no_delete
+BEFORE DELETE ON priced_charge
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_no_delete');
+END;
+
+CREATE TRIGGER priced_charge_no_update
+BEFORE UPDATE ON priced_charge
+BEGIN
+    SELECT 1; -- NON-VACUITY BREAK
+END;
+'''
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_integer_constraints_preserve_chain_shape_currency_and_immutability"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ledger-charge-no-delete"
+guards = "The current schema refuses DELETE of append-only priced charges"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''
+CREATE TRIGGER priced_charge_matches_event_generation_and_basis
+BEFORE INSERT ON priced_charge
+WHEN NOT EXISTS (
+    SELECT 1 FROM usage_event event
+    WHERE event.event_key = NEW.event_key
+      AND event.pricing_generation = NEW.pricing_generation
+      AND event.charge_basis = NEW.charge_basis
+)
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_matches_event_generation_and_basis');
+END;
+
+CREATE TRIGGER priced_charge_no_delete
+BEFORE DELETE ON priced_charge
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_no_delete');
+END;
+
+CREATE TRIGGER priced_charge_no_update
+BEFORE UPDATE ON priced_charge
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_no_update');
+END;
+'''
+new = '''
+CREATE TRIGGER priced_charge_matches_event_generation_and_basis
+BEFORE INSERT ON priced_charge
+WHEN NOT EXISTS (
+    SELECT 1 FROM usage_event event
+    WHERE event.event_key = NEW.event_key
+      AND event.pricing_generation = NEW.pricing_generation
+      AND event.charge_basis = NEW.charge_basis
+)
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_matches_event_generation_and_basis');
+END;
+
+CREATE TRIGGER priced_charge_no_delete
+BEFORE DELETE ON priced_charge
+BEGIN
+    SELECT 1; -- NON-VACUITY BREAK
+END;
+
+CREATE TRIGGER priced_charge_no_update
+BEFORE UPDATE ON priced_charge
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_no_update');
+END;
+'''
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_integer_constraints_preserve_chain_shape_currency_and_immutability"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ledger-adjustment-no-update"
+guards = "The current schema refuses UPDATE of append-only money adjustments"
+file = "crates/astrocyte-core/src/store.rs"
+old = """
+CREATE TRIGGER adjustment_no_update
+BEFORE UPDATE ON adjustment
+BEGIN
+    SELECT RAISE(ABORT, 'adjustment_no_update');
+END;"""
+new = """
+CREATE TRIGGER adjustment_no_update
+BEFORE UPDATE ON adjustment
+BEGIN
+    SELECT 1; -- NON-VACUITY BREAK
+END;"""
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v22_adjustment_update_and_delete_are_refused_without_effect"]
+expect_message = "called `Result::unwrap_err()` on an `Ok` value"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "redelivery-conflict-quarantine"
+guards = "Same-identity different-payload delivery is rejected and never replaces immutable measurements"
+file = "crates/astrocyte-core/src/ingest.rs"
+old = "if stored_payload.restated_by(request) {"
+new = "if stored_payload.restated_by(request) || true { // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/ingest.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["ingest::tests::same_identity_different_payload_is_quarantined_without_overwrite"]
+expect_message = "QuarantinedRedelivery"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "reader-redelivery-no-log"
+guards = "A file reader replay never writes a pushed-producer redelivery_log occurrence"
+file = "crates/astrocyte-core/src/ingest.rs"
+old = "if delivery == DeliveryPath::Pushed {"
+new = "if delivery == DeliveryPath::Pushed || delivery == DeliveryPath::Read { // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/ingest.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["ingest::tests::read_exact_redelivery_writes_no_redelivery_log_row"]
+expect_message = "assertion `left == right` failed"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "pricing-pending-enqueue-atomic"
+guards = "Event and pricing_pending row are recorded or rolled back in the same transaction"
+file = "crates/astrocyte-core/src/ingest.rs"
+old = "crate::pricing::enqueue_if_unpriced_in_tx(tx, &local_event_id)?;"
+new = "// NON-VACUITY BREAK: omit the transactional enqueue"
+test_file = "crates/astrocyte-core/src/ingest.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["ingest::tests::recording_enqueues_in_the_recording_transaction_and_a_failed_recording_leaves_no_queue_row"]
+expect_message = "the queue row must be written by the recording transaction"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "pricing-pending-last-head"
+guards = "A partially headed event remains queued until its last headless measurement gets a head"
+file = "crates/astrocyte-core/src/pricing.rs"
+old = 'WHERE event_key=(SELECT event_key FROM usage_event WHERE event_id=?1) AND NOT {EVENT_HAS_HEADLESS_MEASUREMENT}"'
+new = 'WHERE event_key=(SELECT event_key FROM usage_event WHERE event_id=?1) AND (1 OR NOT {EVENT_HAS_HEADLESS_MEASUREMENT})" // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/pricing.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["pricing::tests::pricing_the_last_headless_measurement_dequeues_and_a_partially_headed_event_stays"]
+expect_message = "an event with a measurement still headless must stay queued"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "statement-import-atomic"
+guards = "An import failure after settlement rolls back the transition and every statement import row"
+file = "crates/astrocyte-core/src/statement_import.rs"
+old = """
+    )?;
+    Ok(StatementImportOutcome {"""
+new = """
+    ).ok(); // NON-VACUITY BREAK: ignore the import write failure
+    Ok(StatementImportOutcome {"""
+test_file = "crates/astrocyte-core/src/statement_import.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["statement_import::tests::import_failure_after_transition_write_rolls_back_transition_and_all_import_rows"]
+expect_message = "Err(StatementError::Store(_))"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "reconciliation-snapshotted-difference"
+guards = "Reconciliation uses the ledger amount captured before the settling adjustment, not the current ledger amount"
+file = "crates/astrocyte-core/src/reconcile.rs"
+old = "attempt.vendor_amount_nanos,attempt.ledger_amount_nanos,event.currency"
+new = """
+attempt.vendor_amount_nanos,
+                 (SELECT COALESCE(sum(charge_nanos),0) FROM priced_charge
+                  WHERE event_key=attempt.event_key AND charge_key NOT IN
+                      (SELECT supersedes FROM priced_charge WHERE supersedes IS NOT NULL))
+                 + (SELECT COALESCE(sum(amount_nanos),0) FROM adjustment WHERE event_key=attempt.event_key),
+                 event.currency -- NON-VACUITY BREAK"""
+test_file = "crates/astrocyte-core/src/reconcile.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["reconcile::tests::latest_attempt_tie_break_and_outcome_counts_partition_statement_population", "reconcile::tests::settling_adjustment_preserves_original_snapshot_difference_in_reconciliation", "statement_import::tests::multiple_lines_for_previously_settled_event_count_ledger_once", "statement_import::tests::reimport_preserves_pre_adjustment_snapshot_and_split_line_attribution", "statement_import::tests::same_content_reimport_preserves_once_per_event_ledger_attribution"]
+expect_message = "assertion `left == right` failed"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "event-lineage-absence"
+guards = "Absent and empty-string producer lineage mint distinct event identities"
+file = "crates/astrocyte-core/src/fact.rs"
+old = """
+None => {
+            canonical_string_object_hash([("producer", producer), ("producer_ref", producer_ref)])
+        }"""
+new = """
+None => { // NON-VACUITY BREAK
+            canonical_string_object_hash([
+                ("producer", producer),
+                ("producer_lineage", ""),
+                ("producer_ref", producer_ref),
+            ])
+        }"""
+test_file = "crates/astrocyte-core/src/fact.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["fact::tests::lineage_absent_key_never_equals_lineage_present_key"]
+expect_message = "assertion `left != right` failed"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "startup-store-ahead-call"
+guards = "Startup refuses a store ahead of the binary before constructing state or serving"
+file = "crates/astrocyte-module/src/main.rs"
+old = "refuse_store_ahead_of_binary(&outcome)?;"
+new = "let _ = &outcome; // NON-VACUITY BREAK: bypass startup refusal"
+test_file = "crates/astrocyte-module/src/main.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--bin ck-astrocyte"
+expect_red = ["ck_astrocyte::tests::store_ahead_of_binary_refuses_startup_by_name"]
+expect_message = "a store ahead of the binary must not open"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "opencode-real-path-exactly-once"
+guards = "Re-draining an unchanged producer database through OpenCodeSource::drain records no new event"
+file = "crates/astrocyte-module/src/opencode_source.rs"
+old = """
+            let result = astrocyte_core::ingest::record_event_in_tx(
+                tx,
+                request,
+                recorded_at_ms,
+                astrocyte_core::ingest::DeliveryPath::Read,
+            )"""
+new = """
+            // NON-VACUITY BREAK: read time incorrectly becomes event identity
+            let mut request = request.clone();
+            request.producer_lineage = Some(recorded_at_ms.to_string());
+            let result = astrocyte_core::ingest::record_event_in_tx(
+                tx,
+                &request,
+                recorded_at_ms,
+                astrocyte_core::ingest::DeliveryPath::Read,
+            )"""
+test_file = "crates/astrocyte-module/src/opencode_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["astrocyte_module::refresher::opencode_source::tests::durable_cursor_advances_and_second_drain_reads_strictly_fewer_rows"]
+expect_message = '/left: 0\n right: 1/'
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "wire-absent-token-omission"
+guards = "Absent wire token fields omit measurements while an explicitly reported zero remains a reading"
+file = "crates/astrocyte-module/src/wire_map.rs"
+old = ".filter_map(|(role, field, quantity)| quantity.map(|units| (role, field, units)))"
+new = ".map(|(role, field, quantity)| (role, field, quantity.unwrap_or(0))) // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/wire_map.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["astrocyte_module::wire_map::tests::an_absent_count_omits_its_measurement_while_a_reported_zero_keeps_one"]
+expect_message = "cache_write must be absent entirely, and a reported zero must survive"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "flow-route-write-boundary"
+guards = "A flow-stamped route may read but cannot dispatch mutating ledger operations"
+file = "crates/astrocyte-module/src/main.rs"
+old = "if is_mutating_operation(&request.method) {"
+new = "if false && is_mutating_operation(&request.method) { // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/main.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--bin ck-astrocyte"
+expect_red = ["ck_astrocyte::tests::a_flow_stamped_route_may_read_but_every_write_is_refused"]
+expect_message = "a flow's write was served"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "control-decode-keep-serving"
+guards = "An undecodable control request returns invalid_request and does not stop the serve loop"
+file = "crates/astrocyte-module/src/main.rs"
+old = "return send(writer, refusal).await;"
+new = """
+send(writer, refusal).await?; // NON-VACUITY BREAK
+            return Err(ModuleError::Json(error));"""
+test_file = "crates/astrocyte-module/src/main.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--bin ck-astrocyte"
+expect_red = ["ck_astrocyte::tests::undecodable_control_request_is_refused_and_the_module_keeps_serving"]
+expect_message = "the module stopped serving after the bad request"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "coverage-backfill-provider"
+guards = "Coverage backfill must join plan and event on provider as well as the other identity dimension"
+file = "crates/astrocyte-core/src/subscription.rs"
+old = "ON plan.provider=event.provider"
+new = "ON 1=1 -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/refresher.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["astrocyte_module::refresher::tests::a_plan_under_a_different_provider_does_not_cover_this_account_s_event"]
+expect_message = "a plan with another vendor covers nothing bought from this one"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "coverage-backfill-account-ref"
+guards = "Coverage backfill must join plan and event on account_ref as well as the other identity dimension"
+file = "crates/astrocyte-core/src/subscription.rs"
+old = "AND plan.account_ref=event.account_ref"
+new = "-- NON-VACUITY BREAK: omit account equality"
+test_file = "crates/astrocyte-module/src/refresher.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["astrocyte_module::refresher::tests::a_plan_for_a_different_account_does_not_cover_this_providers_event"]
+expect_message = "a plan held by another account covers nothing this one spent"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "fusiform-dead-route-eviction"
+guards = "unknown_channel and stale_route_epoch evict the fusiform cached route and retry on a new epoch"
+file = "crates/astrocyte-module/src/fusiform_client.rs"
+old = """if error_codes::is_established_route_dead(
+                            response.header.flags,
+                            &error.code,
+                        ) {"""
+new = """if false && error_codes::is_established_route_dead(
+                            response.header.flags,
+                            &error.code,
+                        ) { // NON-VACUITY BREAK"""
+test_file = "crates/astrocyte-module/src/fusiform_client.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["astrocyte_module::fusiform_client::tests::fusiform_unknown_channel_evicts_the_cached_route", "astrocyte_module::fusiform_client::tests::fusiform_stale_route_epoch_evicts_the_cached_route"]
+expect_message = "/route|reopen|epoch/"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "qta-dead-route-eviction"
+guards = "unknown_channel and stale_route_epoch evict the qta cached route and retry on a new epoch"
+file = "crates/astrocyte-module/src/qta_client.rs"
+old = "if error_codes::is_established_route_dead(response.header.flags, code) {"
+new = "if false && error_codes::is_established_route_dead(response.header.flags, code) { // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/qta_client.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["astrocyte_module::qta_client::tests::qta_unknown_channel_evicts_the_cached_route", "astrocyte_module::qta_client::tests::qta_stale_route_epoch_evicts_the_cached_route"]
+expect_message = "/route|reopen|epoch/"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "launch-nonce-shared-reader"
+guards = "Shipped source reads a launch nonce only through subc_os::launch_nonce, never directly from the environment"
+file = "crates/astrocyte-module/src/main.rs"
+old = "let launch_nonce = subc_os::launch_nonce()"
+new = """
+let _ = std::env::var("SUBC_LAUNCH_NONCE"); // NON-VACUITY BREAK
+    let launch_nonce = subc_os::launch_nonce()"""
+test_file = "crates/astrocyte-module/src/main.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--bin ck-astrocyte"
+expect_red = ["ck_astrocyte::launch_nonce_tests::shipped_source_never_reads_launch_nonce_environment_directly"]
+expect_message = "direct launch-nonce environment access"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "shutdown-sigterm-reraise"
+platforms = ["linux", "macos"]
+guards = "SIGTERM finishes shutdown and remains death by SIGTERM so the supervisor respawns the module"
+file = "crates/astrocyte-module/src/main.rs"
+old = "Ok(LoopEnd::Sigterm) => die_by_sigterm(),"
+new = "Ok(LoopEnd::Sigterm) => std::process::ExitCode::SUCCESS, // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/main.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--bin ck-astrocyte"
+expect_red = ["tests::sigterm_while_the_daemon_connection_is_open_stops_cleanly_then_dies_by_sigterm"]
+expect_message = "after its clean stop the module must die by SIGTERM"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ledger-event-payload-immutable"
+guards = "Immutable usage event payload fields cannot be rewritten after recording"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''
+CREATE TRIGGER usage_event_update_guard
+BEFORE UPDATE ON usage_event
+WHEN NOT (
+    NEW.event_key IS OLD.event_key
+    AND NEW.event_id IS OLD.event_id
+    AND NEW.producer IS OLD.producer
+    AND NEW.producer_lineage IS OLD.producer_lineage
+    AND NEW.producer_ref IS OLD.producer_ref
+    AND NEW.prior_event_ref IS OLD.prior_event_ref
+    AND NEW.harness IS OLD.harness
+    AND NEW.project_root IS OLD.project_root
+    AND NEW.session IS OLD.session
+    AND NEW.run_ref IS OLD.run_ref
+    AND NEW.work_class IS OLD.work_class
+    AND NEW.occurred_at_ms IS OLD.occurred_at_ms
+    AND NEW.emitted_at_ms IS OLD.emitted_at_ms
+    AND NEW.recorded_at_ms IS OLD.recorded_at_ms
+    AND NEW.terminal_status IS OLD.terminal_status
+    AND NEW.attempt_ordinal IS OLD.attempt_ordinal
+    AND NEW.vendor_request_id IS OLD.vendor_request_id
+    AND NEW.provider IS OLD.provider
+    AND NEW.model IS OLD.model
+    AND NEW.account_ref IS OLD.account_ref
+    AND NEW.auth_selection IS OLD.auth_selection
+    AND NEW.charge_basis_mapping_version IS OLD.charge_basis_mapping_version
+    AND NEW.charge_basis_overrides IS OLD.charge_basis_overrides
+    AND (
+        NEW.charge_basis IS OLD.charge_basis
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.pricing_generation = OLD.pricing_generation
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.currency IS OLD.currency
+        OR (OLD.currency IS NULL AND NEW.currency IS NOT NULL)
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'usage_event_update_guard');
+END;
+'''
+new = '''
+CREATE TRIGGER usage_event_update_guard
+BEFORE UPDATE ON usage_event
+WHEN NOT (
+    NEW.event_key IS OLD.event_key
+    AND NEW.event_id IS OLD.event_id
+    AND NEW.producer IS OLD.producer
+    AND NEW.producer_lineage IS OLD.producer_lineage
+    AND NEW.producer_ref IS OLD.producer_ref
+    AND NEW.prior_event_ref IS OLD.prior_event_ref
+    AND NEW.harness IS OLD.harness
+    AND NEW.project_root IS OLD.project_root
+    AND NEW.session IS OLD.session
+    AND NEW.run_ref IS OLD.run_ref
+    AND NEW.work_class IS OLD.work_class
+    AND NEW.occurred_at_ms IS OLD.occurred_at_ms
+    AND NEW.emitted_at_ms IS OLD.emitted_at_ms
+    AND NEW.recorded_at_ms IS OLD.recorded_at_ms
+    -- NON-VACUITY BREAK: terminal_status is mutable
+    AND NEW.attempt_ordinal IS OLD.attempt_ordinal
+    AND NEW.vendor_request_id IS OLD.vendor_request_id
+    AND NEW.provider IS OLD.provider
+    AND NEW.model IS OLD.model
+    AND NEW.account_ref IS OLD.account_ref
+    AND NEW.auth_selection IS OLD.auth_selection
+    AND NEW.charge_basis_mapping_version IS OLD.charge_basis_mapping_version
+    AND NEW.charge_basis_overrides IS OLD.charge_basis_overrides
+    AND (
+        NEW.charge_basis IS OLD.charge_basis
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.pricing_generation = OLD.pricing_generation
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.currency IS OLD.currency
+        OR (OLD.currency IS NULL AND NEW.currency IS NOT NULL)
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'usage_event_update_guard');
+END;
+'''
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_integer_constraints_preserve_chain_shape_currency_and_immutability"]
+only = true
+timeout_s = 600
+
+[[control]]
+id = "claude-workers-absolute-roots"
+guards = "Relative declared Claude worker roots cannot authorize transcript reads"
+file = "crates/astrocyte-module/src/claude_workers_source.rs"
+old = "if !root.path.is_absolute() {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/claude_workers_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::claude_workers_source::tests::relative_root_is_refused_without_blocking_other_roots"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-workers-canonical-containment"
+guards = "Symlink-resolved declared roots stay inside the harness worker folder"
+file = "crates/astrocyte-module/src/claude_workers_source.rs"
+old = "if canonical == folder || !canonical.starts_with(&folder) {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/claude_workers_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::claude_workers_source::tests::outside_root_is_refused_without_blocking_other_roots", "refresher::claude_workers_source::tests::escaping_symlink_is_refused_without_blocking_other_roots"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-workers-ack-after-commit"
+guards = "A failed worker ingest transaction never publishes deletion acknowledgement"
+file = "crates/astrocyte-module/src/claude_workers_source.rs"
+old = "commit?;"
+new = "let _ = commit; // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/claude_workers_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::claude_workers_source::tests::ack_is_never_written_before_event_transaction_commits"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-workers-work-class"
+guards = "Claude worker usage keeps the declared work class without changing producer identity"
+file = "crates/astrocyte-module/src/claude_code_source.rs"
+old = "request.work_class = work_class.map(str::to_owned);"
+new = "request.work_class = None; // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/claude_workers_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+    "refresher::claude_workers_source::tests::worker_events_stamp_declared_class_without_changing_identity",
+    "refresher::claude_workers_source::tests::escaping_symlink_is_refused_without_blocking_other_roots",
+    "refresher::claude_workers_source::tests::outside_root_is_refused_without_blocking_other_roots",
+    "refresher::claude_workers_source::tests::relative_root_is_refused_without_blocking_other_roots",
+]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-workers-ack-isolation"
+guards = "A quarantined worker cannot prevent committed workers' acknowledgements or removed-entry pruning"
+file = "crates/astrocyte-module/src/claude_workers_source.rs"
+old = "if registry_valid {"
+new = "if degraded.is_none() { // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/claude_workers_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::claude_workers_source::tests::quarantined_worker_does_not_block_other_worker_ack_or_pruning"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "charge-predecessor-same-measurement"
+guards = "Predecessors must already exist on the same measurement, including with deferred FKs"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''
+CREATE TRIGGER priced_charge_supersedes_same_measurement
+BEFORE INSERT ON priced_charge
+WHEN NEW.supersedes IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM priced_charge p WHERE p.charge_key=NEW.supersedes
+      AND p.event_key IS NEW.event_key AND p.role IS NEW.role AND p.unit IS NEW.unit
+)
+BEGIN SELECT RAISE(ABORT, 'priced_charge_supersedes_same_measurement'); END;
+'''
+new = '''
+CREATE TRIGGER priced_charge_supersedes_same_measurement
+BEFORE INSERT ON priced_charge
+WHEN 0 AND NOT EXISTS ( -- NON-VACUITY BREAK
+    SELECT 1 FROM priced_charge p WHERE p.charge_key=NEW.supersedes
+      AND p.event_key IS NEW.event_key AND p.role IS NEW.role AND p.unit IS NEW.unit
+)
+BEGIN SELECT RAISE(ABORT, 'priced_charge_supersedes_same_measurement'); END;
+'''
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_predecessor_must_exist_on_the_same_measurement_even_with_deferred_fks"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "measurement-integer-event-fk"
+guards = "An integer measurement event key cannot refer to an absent event"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''
+    CONSTRAINT measurement_event_fk
+        FOREIGN KEY (event_key) REFERENCES "__compact_usage_event"(event_key) ON DELETE RESTRICT,
+'''
+new = '''
+    -- NON-VACUITY BREAK: event foreign key removed
+'''
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_measurement_event_key_foreign_key_rejects_orphans"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "migration-rebuilt-charge-fk-check"
+guards = "The FK-off rebuild cannot commit charges whose measurement is absent"
+file = "crates/astrocyte-core/src/store.rs"
+old = "SELECT 'post_foreign_key_check_priced_charge', count(*) FROM pragma_foreign_key_check('priced_charge');"
+new = "SELECT 'post_foreign_key_check_priced_charge', count(*) FROM pragma_foreign_key_check('priced_charge') WHERE 0; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_runner_checks_rebuilt_fks_and_rolls_back_to_22_with_enforcement_restored"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "migration-restores-foreign-key-enforcement"
+guards = "Startup restores FK enforcement after a rebuild succeeds, fails, or unwinds"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''set_foreign_keys(conn, true)?;
+            conn.pragma_update(None, "cache_size", -2000)'''
+new = '''set_foreign_keys(conn, false)?; // NON-VACUITY BREAK
+            conn.pragma_update(None, "cache_size", -2000)'''
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_runner_applies_once_and_returns_the_final_store_ahead_outcome", "store::tests::schema_v23_runner_checks_rebuilt_fks_and_rolls_back_to_22_with_enforcement_restored", "store::tests::schema_v23_runner_restores_foreign_keys_during_unwinding"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "transition-event-key-is-explicit"
+guards = "A NULL transition event key cannot auto-allocate another event's identity"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''            OR (to_state = 'unbillable' AND resolved_by = 'operator')
+        )
+) WITHOUT ROWID;'''
+new = '''            OR (to_state = 'unbillable' AND resolved_by = 'operator')
+        )
+); -- NON-VACUITY BREAK'''
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v23_child_event_keys_cannot_be_implicitly_allocated"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800

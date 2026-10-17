@@ -1,0 +1,6 @@
+{"type":"title","v":1,"title":"Synthetic fixture constructed from live Pi record shapes"}
+{"type":"session","id":"fixture-session","timestamp":"2026-09-20T00:00:00.000Z","cwd":"/tmp/astrocyte-reader-fixture"}
+{"type":"message","id":"reasoning-30","timestamp":"2026-09-20T00:00:01.000Z","message":{"role":"assistant","model":"claude-sonnet-4","provider":"anthropic","usage":{"input":10,"output":100,"cacheRead":20,"cacheWrite":5,"reasoning":30,"totalTokens":135}}}
+{"type":"message","id":"cache-write-absent","timestamp":"2026-09-20T00:00:02.000Z","message":{"role":"assistant","model":"gpt-5","provider":"openai","usage":{"input":2,"output":12,"cacheRead":3,"totalTokens":17}}}
+{"type":"message","id":"cache-write-zero","timestamp":"2026-09-20T00:00:03.000Z","message":{"role":"assistant","model":"gpt-5","provider":"openai","usage":{"input":2,"output":12,"cacheRead":3,"cacheWrite":0,"reasoning":0,"totalTokens":17}}}
+{"type":"message","id":"reasoning-7","timestamp":"2026-09-20T00:00:04.000Z","message":{"role":"assistant","model":"claude-sonnet-4","provider":"anthropic","usage":{"input":5,"output":20,"cacheRead":0,"cacheWrite":0,"reasoning":7,"totalTokens":25}}}

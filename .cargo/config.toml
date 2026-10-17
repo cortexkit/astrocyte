@@ -1,0 +1,3 @@
+[env]
+# Memory statistics take a global mutex on every SQLite allocation; no memory-statistics API is used here.
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"

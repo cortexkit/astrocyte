@@ -1,0 +1,24 @@
+# Astrocyte-owned readers for coding-harness session stores.
+[package]
+name = "astrocyte-readers"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/cortexkit/astrocyte"
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+simd-json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

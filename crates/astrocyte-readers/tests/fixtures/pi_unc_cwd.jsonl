@@ -1,0 +1,2 @@
+{"type":"session","id":"unc-session","timestamp":"2026-09-20T00:00:00.000Z","cwd":"\\\\build-server\\share\\Team Repo\\"}
+{"type":"message","id":"unc-1","timestamp":"2026-09-20T00:00:01.000Z","message":{"role":"assistant","model":"claude-sonnet-4","provider":"anthropic","responseId":"unc-response-1","usage":{"input":10,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":30}}}

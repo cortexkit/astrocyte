@@ -1,0 +1,72 @@
+# astrocyte-module — shared metering integrations, the ck-astrocyte daemon,
+# and development drivers. Ledger domain logic lives in astrocyte-core;
+# this crate owns configuration, producer mappings, peer clients and serving.
+[package]
+autobins = false
+name = "astrocyte-module"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/cortexkit/astrocyte"
+
+[lints]
+workspace = true
+
+[lib]
+name = "astrocyte_module"
+path = "src/lib.rs"
+
+[features]
+# Binary tests need shared fixtures and hooks without shipping them in releases.
+test-support = ["dep:tempfile"]
+
+[[bin]]
+name = "corpus_drive"
+path = "src/bin/corpus_drive.rs"
+
+[[bin]]
+name = "spend_drive"
+path = "src/bin/spend_drive.rs"
+
+[[bin]]
+name = "ck-astrocyte"
+path = "src/main.rs"
+
+[build-dependencies]
+sha2 = { workspace = true }
+
+[dependencies]
+astrocyte-core = { path = "../astrocyte-core" }
+astrocyte-readers = { workspace = true }
+chrono = { workspace = true }
+cortexkit-log = { workspace = true }
+cortexkit-paths = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# `signal`: SIGTERM ends the serve loop through the same stop-and-join path
+# as daemon EOF (see `stop_signal` in src/main.rs).
+tokio = { workspace = true, features = ["signal"] }
+rusqlite = { workspace = true }
+cortexkit-store = { workspace = true }
+cortexkit-store-types = { workspace = true }
+cortexkit-provider-usage = { workspace = true }
+subc-protocol = { workspace = true }
+subc-transport = { workspace = true }
+subc-os = { workspace = true }
+subc-jsonc = { workspace = true }
+fusiform-protocol = { workspace = true }
+tempfile = { version = "3", optional = true }
+
+# `emulate_default_handler`: after a SIGTERM stop has finished, the process
+# dies by SIGTERM so the supervisor reads a crash and respawns it (see
+# `die_by_sigterm` in src/main.rs). This crate forbids unsafe code, and
+# restoring a signal's default disposition otherwise needs libc calls.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+signal-hook = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+astrocyte-module = { path = ".", features = ["test-support"] }
+tempfile = "3"

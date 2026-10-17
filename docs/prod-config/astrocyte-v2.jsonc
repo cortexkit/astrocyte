@@ -1,0 +1,94 @@
+// ck-astrocyte v2 — production config example.
+// The paths and account references below are placeholders; replace them before use.
+//
+// The desired format is closed: every member below is required, a null is a
+// legal "not configured", and an unknown or missing member is a parse failure.
+// Config and binary move together in both directions.
+{
+  // Steady-state metering cadence. The capacity staleness horizon derives from
+  // this value (four times the cadence), so changing it moves that horizon too.
+  "poll_interval_secs": 30,
+
+  // Broca needs no member: its usage is read from its own store,
+  // <data home>/cortexkit/broca/run-index.db, like the harness readers'.
+
+  // Insula serves capacity windows over the same connection. Advisory only:
+  // a failing poll records a dated attempt and never blocks the spend drain.
+  "qta_connection_file": "/path/to/insula/subc-connection.json",
+
+  // Fusiform is the price catalog. Absent (null) means every event is stored
+  // unpriced with reason catalog_unconfigured -- distinct from fusiform's own
+  // no_catalog_coverage, so a report can tell "nobody looked" from "looked and
+  // found nothing".
+  "fusiform_connection_file": "/path/to/fusiform/subc-connection.json",
+
+  // The derived subscription multiplier: what each subscription's quota is
+  // worth at API list prices, recorded once a day per quota provider over the
+  // trailing 7 days and served by spend.multiplier.report. Display only; it
+  // never touches the spend ledger. Every rule here is an operator statement,
+  // declared rather than inferred, and is recorded on every observation.
+  "subscription_multiplier": {
+    // Plan-plane provider ids priced through an API provider's list rates,
+    // same model id: Pi's openai-codex models are the openai catalog's models.
+    "api_twins": { "openai-codex": "openai" },
+
+    // Providers that bill reasoning tokens at their output rate. Neither
+    // OpenAI nor Anthropic models publish rate.reasoning, so without this
+    // reasoning goes unpriced. Both vendors document reasoning (Anthropic's
+    // extended thinking) as billed output tokens.
+    "reasoning_billed_as_output": ["openai", "anthropic"],
+
+    // Monthly price per fusiform plan key, used instead of fusiform's. None:
+    // fusiform prices openai/pro_20x and anthropic/max_20x. (It refuses bare
+    // openai/pro, which is why the accounts below name the tier.)
+    "plan_price_overrides": {},
+
+    "quota_providers": {
+      "codex": {
+        // Codex publishes one 7-day pool.
+        "window": { "pool_key": "primary", "window_minutes": 10080 },
+        // Example scope for OpenCode and BROCA traffic that uses the codex pool.
+        "scope": [
+          { "producer": "pi", "provider": "openai-codex", "charge_basis": null },
+          { "producer": "opencode", "provider": "openai", "charge_basis": null },
+          { "producer": "broca", "provider": "openai", "charge_basis": "subscription_included" }
+        ],
+        // These sample references both use the same example plan.
+        "accounts": {
+          "sample-codex-account-1": { "plan": "openai/pro_20x", "price_override": null },
+          "sample-codex-account-2": { "plan": "openai/pro_20x", "price_override": null }
+        }
+      },
+      "claude": {
+        // secondary is the overall 7-day pool every Claude model draws on,
+        // Fable included; Fable also draws on its own extra:5:Fable pool.
+        "window": { "pool_key": "secondary", "window_minutes": 10080 },
+        // Example scope for OpenCode, Claude Code, and BROCA traffic using the pool.
+        "scope": [
+          { "producer": "opencode", "provider": "anthropic", "charge_basis": null },
+          { "producer": "claude-code", "provider": "anthropic", "charge_basis": null },
+          { "producer": "broca", "provider": "anthropic", "charge_basis": "subscription_included" }
+        ],
+        // These sample account references are illustrative, not real account IDs.
+        "accounts": {
+          "sample-claude-account-1": { "plan": "anthropic/max_20x", "price_override": null },
+          "sample-claude-account-2": { "plan": "anthropic/max_20x", "price_override": null },
+          "sample-claude-account-3": { "plan": "anthropic/max_20x", "price_override": null },
+          "sample-claude-account-4": { "plan": "anthropic/max_20x", "price_override": null },
+          "sample-claude-account-5": { "plan": "anthropic/max_20x", "price_override": null },
+          "sample-claude-account-6": { "plan": "anthropic/max_20x", "price_override": null },
+          "sample-claude-account-7": { "plan": "anthropic/max_20x", "price_override": null }
+        }
+      }
+    }
+  },
+
+  // Which producers the refresher drains. `enabled: false` turns every one
+  // off; `exclude` skips producers by source key: claude-code, claude-code-workers,
+  // codex, opencode, pi, gemini, goose, omp, kimi, broca. A skipped producer is not read and
+  // its runtime row is removed; events it recorded stay. An unknown or
+  // repeated key is refused, as is `enabled: false` with a non-empty exclude.
+  // A quota provider whose scope names a skipped producer records no
+  // multiplier day (scoped_producer_not_ingested) until it is ingested again.
+  "harness_ingest": { "enabled": true, "exclude": [] }
+}

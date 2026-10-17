@@ -1,0 +1,23 @@
+# astrocyte-core — pure metering/pricing/envelope/verdict domain logic.
+# No subc dependency: everything here is unit-testable without a daemon.
+[package]
+name = "astrocyte-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/cortexkit/astrocyte"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rusqlite = { workspace = true }
+cortexkit-store = { workspace = true }
+fusiform-protocol = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }

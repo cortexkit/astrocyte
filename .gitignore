@@ -1,0 +1,9 @@
+.DS_Store
+target/
+# Internal notes and tool state under .cortexkit/ stay out of git. Only these
+# folders and WORKER.md, the build and test guide, are tracked.
+/.cortexkit/*
+!/.cortexkit/release-notes/
+!/.cortexkit/skills/
+!/.cortexkit/rules/
+!/.cortexkit/WORKER.md
