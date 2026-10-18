@@ -26,6 +26,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CK_MUTATE_REV: 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e
+  NATS_SERVER_VERSION: "2.15.0"
+  NATS_SERVER_SHA256_LINUX_AMD64: 5d2c51caca950333aba84911df7d377f826f3a59ec36061c6539105084f65c92
+  NATS_SERVER_SHA256_WINDOWS_AMD64: 2d0861dc2ca3567d17f7d19611d7b346cc2ccbd7086a0a77cc957a2c71663200
 
 jobs:
   # Runners are GitHub-hosted. Blacksmith runners stopped picking up the
@@ -37,6 +40,8 @@ jobs:
     # A wedged test must surface as a fast red run, not burn the runner for
     # the 6-hour Actions default. Healthy runs finish well under 15 minutes.
     timeout-minutes: 20
+    env:
+      ASTROCYTE_REQUIRE_NATS_SERVER: "1"
     steps:
       - name: Checkout astrocyte
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -67,6 +72,22 @@ jobs:
       # when it doesn't. Unpiped, so its exit status is the step's.
       - name: Nothing internal is tracked under .cortexkit
         run: scripts/check-cortexkit-layout.sh
+
+      - name: Install pinned NATS server
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/nats-server.tar.gz"
+          directory="$RUNNER_TEMP/astrocyte-nats"
+          curl --fail --location --retry 3 \
+            "https://github.com/nats-io/nats-server/releases/download/v${NATS_SERVER_VERSION}/nats-server-v${NATS_SERVER_VERSION}-linux-amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$NATS_SERVER_SHA256_LINUX_AMD64" "$archive" | sha256sum --check -
+          mkdir -p "$directory"
+          tar -xzf "$archive" --strip-components=1 -C "$directory" \
+            "nats-server-v${NATS_SERVER_VERSION}-linux-amd64/nats-server"
+          echo "$directory" >> "$GITHUB_PATH"
+          "$directory/nats-server" --version
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -121,9 +142,29 @@ jobs:
     name: Test (windows)
     runs-on: windows-2025
     timeout-minutes: 30
+    env:
+      ASTROCYTE_REQUIRE_NATS_SERVER: "1"
     steps:
       - name: Checkout astrocyte
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install pinned NATS server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'nats-server.zip'
+          $directory = Join-Path $env:RUNNER_TEMP 'astrocyte-nats'
+          $version = $env:NATS_SERVER_VERSION
+          $url = "https://github.com/nats-io/nats-server/releases/download/v${version}/nats-server-v${version}-windows-amd64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          if ($actual -ne $env:NATS_SERVER_SHA256_WINDOWS_AMD64) {
+            throw 'NATS server archive checksum mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $directory
+          $bin = Join-Path $directory "nats-server-v${version}-windows-amd64"
+          $bin >> $env:GITHUB_PATH
+          & (Join-Path $bin 'nats-server.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'NATS server version check failed' }
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
@@ -154,6 +195,8 @@ jobs:
     needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      ASTROCYTE_REQUIRE_NATS_SERVER: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -164,6 +207,22 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+      # Account-isolation controls include a real-durable catch, so replays need NATS too.
+      - name: Install pinned NATS server
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/nats-server.tar.gz"
+          directory="$RUNNER_TEMP/astrocyte-nats"
+          curl --fail --location --retry 3 \
+            "https://github.com/nats-io/nats-server/releases/download/v${NATS_SERVER_VERSION}/nats-server-v${NATS_SERVER_VERSION}-linux-amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$NATS_SERVER_SHA256_LINUX_AMD64" "$archive" | sha256sum --check -
+          mkdir -p "$directory"
+          tar -xzf "$archive" --strip-components=1 -C "$directory" \
+            "nats-server-v${NATS_SERVER_VERSION}-linux-amd64/nats-server"
+          echo "$directory" >> "$GITHUB_PATH"
+          "$directory/nats-server" --version
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable

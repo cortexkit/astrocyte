@@ -477,6 +477,10 @@ impl NatsServer {
         {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                assert!(
+                    std::env::var_os("ASTROCYTE_REQUIRE_NATS_SERVER").is_none(),
+                    "ASTROCYTE_REQUIRE_NATS_SERVER is set, but nats-server is absent from PATH"
+                );
                 eprintln!("SKIP real quota bus fixture: nats-server absent");
                 return None;
             }
@@ -511,6 +515,54 @@ impl Drop for NatsServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn quota_nats_requirement_probe() {
+    if std::env::var_os("ASTROCYTE_NATS_REQUIREMENT_PROBE").is_some() {
+        assert!(NatsServer::start().is_none());
+    }
+}
+
+fn missing_nats_probe(required: bool) -> std::process::Output {
+    let directory = tempfile::tempdir().unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "quota_events::tests::quota_nats_requirement_probe",
+            "--nocapture",
+        ])
+        .current_dir(directory.path())
+        .env("PATH", directory.path())
+        .env("ASTROCYTE_NATS_REQUIREMENT_PROBE", "1")
+        .env_remove("ASTROCYTE_REQUIRE_NATS_SERVER");
+    if required {
+        command.env("ASTROCYTE_REQUIRE_NATS_SERVER", "1");
+    }
+    crate::test_support::output_within(&mut command, "the missing-NATS requirement probe")
+}
+
+#[test]
+fn quota_missing_required_nats_server_fails_instead_of_skipping() {
+    let output = missing_nats_probe(true);
+    assert!(
+        !output.status.success(),
+        "required NATS fixture silently skipped"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("ASTROCYTE_REQUIRE_NATS_SERVER is set, but nats-server is absent from PATH"));
+}
+
+#[test]
+fn quota_missing_optional_nats_server_still_skips_locally() {
+    let output = missing_nats_probe(false);
+    assert!(
+        output.status.success(),
+        "optional NATS fixture did not skip: {output:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("SKIP real quota bus fixture: nats-server absent"));
 }
 
 #[test]
