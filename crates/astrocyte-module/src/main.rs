@@ -1880,6 +1880,7 @@ mod tests {
             poll_interval_secs: 45,
             qta_connection_file: file(qta),
             fusiform_connection_file: file(fusiform),
+            reasoning_billed_as_output: Vec::new(),
             subscription_multiplier: config::intentional_empty().config.subscription_multiplier,
             harness_ingest: config::HarnessIngest::all_on(),
         }
@@ -2066,7 +2067,7 @@ mod tests {
             std::env::temp_dir().join(format!("astrocyte-check-{}.jsonc", std::process::id()));
         std::fs::write(
             &path,
-            br#"{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"subscription_multiplier":{"api_twins":{},"reasoning_billed_as_output":[],"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
+            br#"{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
         )
         .unwrap();
         let mut output = Vec::new();
@@ -2083,7 +2084,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            br#"{"poll_interval_secs":60,"catalog_file":null,"qta_connection_file":null,"fusiform_connection_file":null,"subscription_multiplier":{"api_twins":{},"reasoning_billed_as_output":[],"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
+            br#"{"poll_interval_secs":60,"catalog_file":null,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
         )
         .unwrap();
         assert!(check_config(&path, &mut Vec::new()).is_err());
@@ -2100,7 +2101,7 @@ mod tests {
         ));
         let document = |ingest: &str| {
             format!(
-                r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"subscription_multiplier":{{"api_twins":{{}},"reasoning_billed_as_output":[],"plan_price_overrides":{{}},"quota_providers":{{}}}}{ingest}}}"#
+                r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{{"api_twins":{{}},"plan_price_overrides":{{}},"quota_providers":{{}}}}{ingest}}}"#
             )
         };
         for (ingest, needle) in [

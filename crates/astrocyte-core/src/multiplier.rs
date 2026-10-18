@@ -102,10 +102,6 @@ pub struct MultiplierConfig {
     /// its tokens, with the model id unchanged (`openai-codex` → `openai`).
     #[serde(deserialize_with = "unique_map")]
     pub api_twins: BTreeMap<String, String>,
-    /// API provider ids that bill reasoning tokens at their output rate. Only
-    /// these price reasoning through `rate.output`; every other provider needs
-    /// its own `rate.reasoning`. A valuation rule, never a ledger rule.
-    pub reasoning_billed_as_output: Vec<String>,
     /// Monthly price per plan key (`openai/pro_20x`), overriding fusiform.
     #[serde(deserialize_with = "unique_map")]
     pub plan_price_overrides: BTreeMap<String, PriceOverride>,
@@ -210,15 +206,6 @@ impl MultiplierConfig {
                 return Err(format!(
                     "subscription_multiplier.api_twins entry '{plan_plane}' must map a non-empty \
                      provider to a different non-empty provider"
-                ));
-            }
-        }
-        let mut seen = BTreeSet::new();
-        for provider in &self.reasoning_billed_as_output {
-            if provider.is_empty() || !seen.insert(provider) {
-                return Err(format!(
-                    "subscription_multiplier.reasoning_billed_as_output entry '{provider}' must be \
-                     non-empty and listed once"
                 ));
             }
         }
@@ -854,10 +841,10 @@ struct ValuationRules<'a> {
 }
 
 impl<'a> ValuationRules<'a> {
-    fn from_config(config: &'a MultiplierConfig) -> Self {
+    fn from_config(config: &'a MultiplierConfig, reasoning_billed_as_output: &'a [String]) -> Self {
         Self {
             api_twins: &config.api_twins,
-            reasoning_billed_as_output: &config.reasoning_billed_as_output,
+            reasoning_billed_as_output,
         }
     }
 
@@ -1534,12 +1521,13 @@ pub fn compute_observation(
     rates: &ResolvedRates,
     plan_prices: &BTreeMap<String, PlanPriceUsed>,
     snapshot_at_ms: i64,
+    reasoning_billed_as_output: &[String],
 ) -> Result<Observation, MultiplierError> {
     let mut lines: BTreeMap<(String, String, Option<String>), ModelLine> = BTreeMap::new();
     let mut unpriced: BTreeMap<(String, String, String), (i64, u64)> = BTreeMap::new();
     let mut tokens = RoleTokens::default();
     let lookup = ModelLookup::new(rates);
-    let rules = ValuationRules::from_config(config);
+    let rules = ValuationRules::from_config(config, reasoning_billed_as_output);
     if let Some((from, to)) = plan.token_interval_ms {
         for_scoped_events(conn, &plan.provider.scope, from, to, |event| {
             let event = event.tokens;
@@ -1692,7 +1680,7 @@ pub fn compute_observation(
         plan_prices: plan_prices.values().cloned().collect(),
         catalog_resolved_at_ms: rates.resolved_at_ms,
         api_twins: config.api_twins.clone(),
-        reasoning_billed_as_output: config.reasoning_billed_as_output.clone(),
+        reasoning_billed_as_output: reasoning_billed_as_output.to_vec(),
         error_deflating: ERROR_DEFLATING.into(),
         error_inflating: ERROR_INFLATING.into(),
         multiplier: ratio(subscription_nanos),
@@ -2591,7 +2579,6 @@ mod tests {
     fn config(scope: Vec<ScopeRule>) -> MultiplierConfig {
         MultiplierConfig {
             api_twins: BTreeMap::from([("openai-codex".to_string(), "openai".to_string())]),
-            reasoning_billed_as_output: vec!["openai".into()],
             plan_price_overrides: BTreeMap::new(),
             quota_providers: BTreeMap::from([(
                 "codex".to_string(),
@@ -2737,6 +2724,17 @@ mod tests {
     ) -> Observation {
         let plan = plan_observation(conn, config, "codex", start, end).unwrap();
         compute_observation(conn, config, &plan, rates, &priced_plan(), end).unwrap()
+    }
+
+    fn compute_observation(
+        conn: &Connection,
+        config: &MultiplierConfig,
+        plan: &ObservationPlan,
+        rates: &ResolvedRates,
+        prices: &BTreeMap<String, PlanPriceUsed>,
+        at_ms: i64,
+    ) -> Result<Observation, MultiplierError> {
+        super::compute_observation(conn, config, plan, rates, prices, at_ms, &["openai".into()])
     }
 
     fn delta(conn: &Connection, start: i64, end: i64) -> AccountDelta {
@@ -3493,7 +3491,7 @@ mod tests {
     #[test]
     fn reasoning_prices_at_output_only_for_declared_providers() {
         let conn = conn();
-        let mut config = config(vec![rule("pi", "openai-codex", None)]);
+        let config = config(vec![rule("pi", "openai-codex", None)]);
         reading(&conn, "acct", 0, 0.0, None);
         reading(&conn, "acct", 100, 10.0, None);
         event(
@@ -3509,8 +3507,10 @@ mod tests {
         // Pi's openai-codex prices through its openai twin.
         let rates = rates_for(&[("openai", "m")], TEN_PER_M, None);
         assert_eq!(observe(&conn, &config, 0, 200, &rates).api_nanos, 5_000_000);
-        config.reasoning_billed_as_output.clear();
-        let observation = observe(&conn, &config, 0, 200, &rates);
+        let plan = plan_observation(&conn, &config, "codex", 0, 200).unwrap();
+        let observation =
+            super::compute_observation(&conn, &config, &plan, &rates, &priced_plan(), 200, &[])
+                .unwrap();
         assert_eq!(observation.api_nanos, 0);
         assert_eq!(observation.unpriced_tokens[0].reason, "no_rate");
         assert_eq!(observation.unpriced_tokens[0].tokens, 500);
@@ -3823,7 +3823,7 @@ mod tests {
         let mut unpriced = BTreeMap::new();
         let mut totals = RoleTokens::default();
         value_event(
-            &ValuationRules::from_config(&config),
+            &ValuationRules::from_config(&config, &["openai".into()]),
             ModelLookup::new(rates).get("openai", "m"),
             &event,
             &mut lines,
@@ -3870,7 +3870,8 @@ mod tests {
         let mut unpriced = BTreeMap::new();
         let mut totals = RoleTokens::default();
         let lookup = ModelLookup::new(&rates);
-        let rules = ValuationRules::from_config(&config);
+        let reasoning = ["openai".into()];
+        let rules = ValuationRules::from_config(&config, &reasoning);
         let start = std::time::Instant::now();
         let allocations = crate::canon::allocation_probe::count(|| {
             for _ in 0..100_000 {
@@ -4284,7 +4285,7 @@ mod tests {
     #[test]
     fn pace_prices_stored_rates_per_hour_producer_and_work_class() {
         let mut conn = conn();
-        let (mut config, _) = pace_fixture(&mut conn);
+        let (config, _) = pace_fixture(&mut conn);
         event(
             &conn,
             "long",
@@ -4299,8 +4300,7 @@ mod tests {
                 ("reasoning", "usage", 10),
             ],
         );
-        // This row must price by the recorded rules, not changed live rules.
-        config.reasoning_billed_as_output.clear();
+        // Pace receives only the live scope, not the live pricing declarations.
         conn.execute("INSERT INTO usage_event (event_id, producer, producer_lineage, producer_ref,
             occurred_at_ms, recorded_at_ms, provider, model, charge_basis, work_class)
             VALUES ('worker', 'broca', 'lineage', 'worker', ?1, ?1, 'openai', 'small', 'subscription_included', 'mason')", [2 * HOUR_MS + 10]).unwrap();
@@ -5111,7 +5111,6 @@ mod tests {
             Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let config: MultiplierConfig = serde_json::from_value(json!({
             "api_twins": {"openai-codex": "openai"},
-            "reasoning_billed_as_output": ["openai"],
             "plan_price_overrides": {},
             "quota_providers": {"codex": {
                 "window": {"pool_key": "primary", "window_minutes": 10080},

@@ -319,7 +319,11 @@ fn op_event_reprice(state: &SharedState, params: Value) -> OpResult {
         .map_err(map_subscription_error)?;
     let catalog = state.catalog_client();
     let resolved = match catalog.as_ref() {
-        Some(catalog) => astrocyte_core::subscription::resolve_reprice(&plan, catalog),
+        Some(catalog) => astrocyte_core::subscription::resolve_reprice(
+            &plan,
+            catalog,
+            &state.desired_config().reasoning_billed_as_output,
+        ),
         None => astrocyte_core::subscription::resolve_reprice_without_catalog(&plan),
     }
     .map_err(map_subscription_error)?;
@@ -355,7 +359,11 @@ fn op_basis_correct(state: &SharedState, params: Value) -> OpResult {
         .map_err(map_subscription_error)?;
     let catalog = state.catalog_client();
     let resolved = match catalog.as_ref() {
-        Some(catalog) => astrocyte_core::subscription::resolve_reprice(&plan, catalog),
+        Some(catalog) => astrocyte_core::subscription::resolve_reprice(
+            &plan,
+            catalog,
+            &state.desired_config().reasoning_billed_as_output,
+        ),
         None => astrocyte_core::subscription::resolve_reprice_without_catalog(&plan),
     }
     .map_err(map_subscription_error)?;
@@ -1678,7 +1686,7 @@ mod tests {
         let state = crate::state::leased_test_state(&directory);
         let mut desired = crate::config::intentional_empty().config;
         let config: multiplier::MultiplierConfig = serde_json::from_value(json!({
-            "api_twins": {}, "reasoning_billed_as_output": [], "plan_price_overrides": {},
+            "api_twins": {}, "plan_price_overrides": {},
             "quota_providers": {"claude": {"window": {"pool_key": "primary", "window_minutes": 300},
                 "scope": [{"producer": "opencode", "provider": "anthropic", "charge_basis": null}], "accounts": {}}}
         })).unwrap();
@@ -1697,7 +1705,7 @@ mod tests {
                 models: std::collections::BTreeMap::from([(("anthropic".into(), "model".into()),
                     serde_json::from_value(json!({"state": "rates", "base": {"input": {"state": "priced", "units_per_million": 10000000000_i64}}, "tiers": {}})).unwrap())]),
             };
-            let mut observation = multiplier::compute_observation(tx, &config, &plan, &rates, &Default::default(), 86400000).map_err(|error| error.message())?;
+            let mut observation = multiplier::compute_observation(tx, &config, &plan, &rates, &Default::default(), 86400000, &[]).map_err(|error| error.message())?;
             observation.api_nanos = 10_000_000;
             observation.delta_percent = 2.0;
             multiplier::insert_observation_in_tx(tx, &observation).map_err(|error| error.message())?;

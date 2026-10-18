@@ -145,19 +145,18 @@ the look-back, logged once per day and reason. Unreadable catalog rates
 (`rate_fact_unrecognized`) fail the day; absent models (`no_catalog_coverage`) count
 as unpriced tokens on a written row. Older days are not tried automatically.
 
-Ledger pricing and the multiplier read rate keys through one grammar,
-`parse_rate_key` in `astrocyte-core/src/catalog_client.rs`: `rate.<role>` is the
-unconditional rate and `rate.<role>.<selector>.<value>` a conditional one. Only a key
-that fits neither shape, a role outside the five priced roles, or an `above_context`
-threshold that is not a whole number is unreadable. `above_context.<threshold>` applies
-when the request's prompt exceeds the threshold. `mode.<name>` applies when the
-request's own record states that mode (for example `fast`); a request recorded as
-`standard` or `default`, or with no recorded mode, prices at the unconditional rate,
-and a request recorded in a mode the model has no rate for is unpriced. A selector
-family no producer records never applies. No event stores a mode yet, so every stored
-event prices at the unconditional rate; the multiplier counts those tokens as
-`mode_unrecorded_tokens` on each model line whose model serves a mode rate, and the
-row's reads-low text names that count beside `base_rate_tier_untested_tokens`.
+Ledger pricing and the multiplier share `parse_rate_key` in
+`astrocyte-core/src/catalog_client.rs`: unconditional `rate.<role>` or conditional
+`rate.<role>.<selector>.<value>`, with five roles and whole-number context thresholds.
+`above_context.<threshold>` tests the prompt size. `mode.<name>` requires a stated
+non-standard mode; absent, `standard` and `default` use base rates. A missing mode
+rate is unpriced; unrecorded selectors never apply. No event stores a mode yet.
+The multiplier counts `mode_unrecorded_tokens` for models serving mode rates,
+beside `base_rate_tier_untested_tokens` in the row's reads-low text.
+Both use the top-level `reasoning_billed_as_output` provider list: listed reasoning
+always uses output's rate key, including mode. Unlisted reasoning needs its own rate.
+Ledger coverage and whole-event `rate_tiered` refusals still precede rate selection;
+priced charges record the selected `fact_key` in `catalog_entry`.
 
 Any row records its day; corrected days get no second automatic row. A partial unique
 index refuses a second original per provider and day. While a configured catalog
@@ -177,16 +176,16 @@ is checked before calls or writes.
 
 ## Desired configuration
 
-The config is a closed JSONC object with five required members:
+The config is a closed JSONC object with six required members:
 `poll_interval_secs`, `qta_connection_file`, `fusiform_connection_file`,
-`subscription_multiplier`, `harness_ingest`. Null means "not configured". An unknown or
-missing member fails decoding, including inside `subscription_multiplier` and
-`harness_ingest`. `harness_ingest.exclude` names source keys from Producers (and
+`subscription_multiplier`, `harness_ingest`, `reasoning_billed_as_output`.
+Unknown or missing members fail decoding at every level. `harness_ingest.exclude` names source keys from Producers (and
 `broca`); unknown or repeated keys are refused, as is `enabled: false` with a non-empty
-`exclude`. A generation committed before migration 15 has no stored multiplier and
-hydrates as "not recorded", so the daily stage skips it until the next start publishes
-one. A generation committed before migration 17 has no stored `harness_ingest` and
-hydrates as all on, which is how it ingested. `hydrate_startup` reads the file once,
+`exclude`. Before migration 15, stored generations have no multiplier declaration;
+the daily stage skips them until a reload. Before migration 17, they have no
+`harness_ingest` and restore as all on. The reasoning list is stored in the
+generation JSON; older generations lift the nested multiplier list or use an empty
+list. New desired documents reject the nested form. `hydrate_startup` reads the file once,
 so every change takes effect at the next start. `ck-astrocyte --check-config <path>`
 validates a file without opening the store or the network. If no generation was ever
 committed, an invalid file at startup stops the module; otherwise it keeps the

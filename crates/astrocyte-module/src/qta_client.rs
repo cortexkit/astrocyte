@@ -653,6 +653,7 @@ mod tests {
                 poll_interval_secs: 3,
                 qta_connection_file: Some(peer.connection_file_path.to_string_lossy().into_owned()),
                 fusiform_connection_file: None,
+                reasoning_billed_as_output: Vec::new(),
                 subscription_multiplier: crate::config::intentional_empty()
                     .config
                     .subscription_multiplier,

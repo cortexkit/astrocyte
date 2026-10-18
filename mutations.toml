@@ -6,6 +6,21 @@
 # Ordinary logic belongs in ordinary tests.
 
 [[control]]
+id = "ledger-declared-reasoning-output-rate"
+guards = "Only declared providers price reasoning at output rates, including stated modes and provenance"
+file = "crates/astrocyte-core/src/pricing.rs"
+old = 'if measurement.role == "reasoning" && reasoning_as_output {'
+new = 'if measurement.role == "reasoning" && reasoning_as_output && false { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/pricing.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["pricing::tests::declared_reasoning_uses_output_rates_and_records_the_resolved_key"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
 id = "unknown-file-identity-is-not-equal"
 guards = "Unavailable file identities cannot authorize cached content or append-only resume"
 file = "crates/astrocyte-readers/src/file_identity.rs"

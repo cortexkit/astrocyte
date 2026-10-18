@@ -22,6 +22,11 @@
   // found nothing".
   "fusiform_connection_file": "/path/to/fusiform/subc-connection.json",
 
+  // Vendors that bill reasoning (including extended thinking) as output.
+  // Shared by ledger pricing and multiplier valuation, even if a reasoning
+  // rate exists. Unlisted vendors require their own reasoning rate.
+  "reasoning_billed_as_output": ["openai", "anthropic"],
+
   // The derived subscription multiplier: what each subscription's quota is
   // worth at API list prices, recorded once a day per quota provider over the
   // trailing 7 days and served by spend.multiplier.report. Display only; it
@@ -31,12 +36,6 @@
     // Plan-plane provider ids priced through an API provider's list rates,
     // same model id: Pi's openai-codex models are the openai catalog's models.
     "api_twins": { "openai-codex": "openai" },
-
-    // Providers that bill reasoning tokens at their output rate. Neither
-    // OpenAI nor Anthropic models publish rate.reasoning, so without this
-    // reasoning goes unpriced. Both vendors document reasoning (Anthropic's
-    // extended thinking) as billed output tokens.
-    "reasoning_billed_as_output": ["openai", "anthropic"],
 
     // Monthly price per fusiform plan key, used instead of fusiform's. None:
     // fusiform prices openai/pro_20x and anthropic/max_20x. (It refuses bare

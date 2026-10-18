@@ -13,6 +13,8 @@ pub struct AstrocyteConfig {
     pub poll_interval_secs: u64,
     pub qta_connection_file: Option<String>,
     pub fusiform_connection_file: Option<String>,
+    /// Providers whose reasoning tokens use output rates in ledger pricing and valuation.
+    pub reasoning_billed_as_output: Vec<String>,
     pub subscription_multiplier: MultiplierSetting,
     pub harness_ingest: HarnessIngest,
 }
@@ -169,6 +171,7 @@ struct DecodedConfig {
     poll_interval_secs: u64,
     qta_connection_file: Option<String>,
     fusiform_connection_file: Option<String>,
+    reasoning_billed_as_output: Vec<String>,
     subscription_multiplier: MultiplierConfig,
     harness_ingest: HarnessIngest,
 }
@@ -179,6 +182,7 @@ impl From<DecodedConfig> for AstrocyteConfig {
             poll_interval_secs: decoded.poll_interval_secs,
             qta_connection_file: decoded.qta_connection_file,
             fusiform_connection_file: decoded.fusiform_connection_file,
+            reasoning_billed_as_output: decoded.reasoning_billed_as_output,
             subscription_multiplier: MultiplierSetting::Recorded(decoded.subscription_multiplier),
             harness_ingest: decoded.harness_ingest,
         }
@@ -209,10 +213,42 @@ pub(crate) fn decode_multiplier_column(
     let Some(text) = column else {
         return Ok(MultiplierSetting::NotRecorded);
     };
-    let config: MultiplierConfig = serde_json::from_str(text)
+    // Older generations stored the pricing declaration inside this member.
+    // Hydration lifts it separately; desired documents still reject that shape.
+    let mut value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| ConfigError::Decode(format!("subscription_multiplier: {error}")))?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("reasoning_billed_as_output");
+    }
+    let config: MultiplierConfig = serde_json::from_value(value)
         .map_err(|error| ConfigError::Decode(format!("subscription_multiplier: {error}")))?;
     config.validate().map_err(ConfigError::Validation)?;
     Ok(MultiplierSetting::Recorded(config))
+}
+
+/// Read `reasoning_billed_as_output` from the generation JSON. If absent, use
+/// the old `subscription_multiplier.reasoning_billed_as_output` column member;
+/// generations without either declaration use an empty provider list.
+pub(crate) fn decode_reasoning_generation(
+    canonical_bytes: &[u8],
+    multiplier_column: Option<&str>,
+) -> Result<Vec<String>, ConfigError> {
+    let generation: serde_json::Value = serde_json::from_slice(canonical_bytes)
+        .map_err(|error| ConfigError::Decode(format!("desired generation: {error}")))?;
+    let nested: serde_json::Value = multiplier_column
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| ConfigError::Decode(format!("subscription_multiplier: {error}")))?
+        .unwrap_or(serde_json::Value::Null);
+    let value = generation
+        .get("reasoning_billed_as_output")
+        .or_else(|| nested.get("reasoning_billed_as_output"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let providers: Vec<String> = serde_json::from_value(value)
+        .map_err(|error| ConfigError::Decode(format!("reasoning_billed_as_output: {error}")))?;
+    validate_reasoning_providers(&providers)?;
+    Ok(providers)
 }
 
 /// The `desired_config.harness_ingest` column value: the member's canonical
@@ -260,12 +296,13 @@ pub fn decode(contents: &str) -> Result<DesiredContent, ConfigError> {
 }
 
 fn validate_closed_shape(value: &serde_json::Value) -> Result<(), ConfigError> {
-    const MEMBERS: [&str; 5] = [
+    const MEMBERS: [&str; 6] = [
         "poll_interval_secs",
         "qta_connection_file",
         "fusiform_connection_file",
         "subscription_multiplier",
         "harness_ingest",
+        "reasoning_billed_as_output",
     ];
     let object = value
         .as_object()
@@ -306,9 +343,9 @@ pub fn intentional_empty() -> DesiredContent {
         poll_interval_secs: 60,
         qta_connection_file: None,
         fusiform_connection_file: None,
+        reasoning_billed_as_output: Vec::new(),
         subscription_multiplier: MultiplierSetting::Recorded(MultiplierConfig {
             api_twins: Default::default(),
-            reasoning_billed_as_output: Vec::new(),
             plan_price_overrides: Default::default(),
             quota_providers: Default::default(),
         }),
@@ -325,12 +362,25 @@ fn validate_config(config: &AstrocyteConfig) -> Result<(), ConfigError> {
         config.fusiform_connection_file.as_deref(),
     )?;
     config.harness_ingest.validate()?;
+    validate_reasoning_providers(&config.reasoning_billed_as_output)?;
     match &config.subscription_multiplier {
         MultiplierSetting::Recorded(multiplier) => {
             multiplier.validate().map_err(ConfigError::Validation)
         }
         MultiplierSetting::NotRecorded => Ok(()),
     }
+}
+
+fn validate_reasoning_providers(providers: &[String]) -> Result<(), ConfigError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for provider in providers {
+        if provider.is_empty() || !seen.insert(provider) {
+            return Err(ConfigError::Validation(format!(
+                "reasoning_billed_as_output entry '{provider}' must be non-empty and listed once"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_poll_interval(value: u64) -> Result<(), ConfigError> {
@@ -363,7 +413,8 @@ mod tests {
 
     /// The multiplier member with nothing declared, as every other test
     /// document carries it so the document stays closed.
-    const NO_MULTIPLIER: &str = r#"{"api_twins":{},"reasoning_billed_as_output":[],"plan_price_overrides":{},"quota_providers":{}}"#;
+    const NO_MULTIPLIER: &str =
+        r#"{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}}"#;
 
     /// The `harness_ingest` member with every producer on. Every test document
     /// carries it, because the document is closed and the member is required.
@@ -375,6 +426,7 @@ mod tests {
         "poll_interval_secs": 60,
         "qta_connection_file": null,
         "fusiform_connection_file": null,
+        "reasoning_billed_as_output": [],
         "subscription_multiplier": {NO_MULTIPLIER},
         "harness_ingest": {INGEST_ON}
     }}"#
@@ -385,13 +437,12 @@ mod tests {
     /// `subscription_multiplier` member.
     fn with_multiplier(multiplier: &str) -> String {
         format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"subscription_multiplier":{multiplier},"harness_ingest":{INGEST_ON}}}"#
+            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{multiplier},"harness_ingest":{INGEST_ON}}}"#
         )
     }
 
     const CODEX: &str = r#"{
         "api_twins": {"openai-codex": "openai"},
-        "reasoning_billed_as_output": ["openai"],
         "plan_price_overrides": {},
         "quota_providers": {"codex": {
             "window": {"pool_key": "primary", "window_minutes": 10080},
@@ -408,6 +459,7 @@ mod tests {
                 "poll_interval_secs": 60,
                 "qta_connection_file": null,
                 "fusiform_connection_file": null,
+                "reasoning_billed_as_output": [],
                 "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON},
             }}"#
@@ -424,6 +476,7 @@ mod tests {
                 "catalog_file": null,
                 "qta_connection_file": null,
                 "fusiform_connection_file": null,
+                "reasoning_billed_as_output": [],
                 "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON}
             }}"#
@@ -443,6 +496,7 @@ mod tests {
                 "qta_connection_file": null,
                 "thalamus_connection_file": null,
                 "fusiform_connection_file": null,
+                "reasoning_billed_as_output": [],
                 "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON}
             }}"#
@@ -467,6 +521,7 @@ mod tests {
                 "qta_connection_file": null,
                 "broca_connection_file": null,
                 "fusiform_connection_file": null,
+                "reasoning_billed_as_output": [],
                 "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON}
             }}"#
@@ -483,11 +538,11 @@ mod tests {
     #[test]
     fn unknown_and_duplicate_members_are_rejected_before_canonicalization() {
         assert!(decode(&format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON},"future":null}}"#
+            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON},"future":null}}"#
         ))
         .is_err());
         let error = decode(&format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"qta_connection_file":"other","fusiform_connection_file":null,"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
+            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"qta_connection_file":"other","fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
         ))
         .unwrap_err();
         assert!(error.to_string().contains("duplicate field"));
@@ -497,11 +552,11 @@ mod tests {
     fn required_members_and_value_bounds_are_enforced() {
         assert!(decode(r#"{"poll_interval_secs":60,"qta_connection_file":null}"#).is_err());
         assert!(decode(&format!(
-            r#"{{"poll_interval_secs":0,"qta_connection_file":null,"fusiform_connection_file":null,"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
+            r#"{{"poll_interval_secs":0,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
         ))
         .is_err());
         assert!(decode(&format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":"","fusiform_connection_file":null,"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
+            r#"{{"poll_interval_secs":60,"qta_connection_file":"","fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
         ))
         .is_err());
     }
@@ -512,7 +567,7 @@ mod tests {
         assert_eq!(desired.config, intentional_empty().config);
         assert_eq!(
             String::from_utf8(desired.canonical_bytes).unwrap(),
-            r#"{"fusiform_connection_file":null,"harness_ingest":{"enabled":true,"exclude":[]},"poll_interval_secs":60,"qta_connection_file":null,"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{},"reasoning_billed_as_output":[]}}"#
+            r#"{"fusiform_connection_file":null,"harness_ingest":{"enabled":true,"exclude":[]},"poll_interval_secs":60,"qta_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}}}"#
         );
     }
 
@@ -609,11 +664,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reasoning_billing_is_a_required_top_level_declaration() {
+        let document = empty().replace(
+            "\"reasoning_billed_as_output\": []",
+            "\"reasoning_billed_as_output\": [\"openai\", \"anthropic\"]",
+        );
+        let desired = decode(&document).unwrap();
+        assert_eq!(
+            desired.config.reasoning_billed_as_output,
+            ["openai", "anthropic"]
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_billed_as_output");
+        assert!(decode(&value.to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("missing member 'reasoning_billed_as_output'"));
+        value["reasoning_billed_as_output"] = serde_json::json!([]);
+        value["subscription_multiplier"]["reasoning_billed_as_output"] = serde_json::json!([]);
+        assert!(decode(&value.to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field `reasoning_billed_as_output`"));
+    }
+
+    #[test]
+    fn reasoning_billing_refuses_empty_and_duplicate_providers() {
+        for providers in [
+            serde_json::json!([""]),
+            serde_json::json!(["openai", "openai"]),
+        ] {
+            let document = empty().replace(
+                "\"reasoning_billed_as_output\": []",
+                &format!("\"reasoning_billed_as_output\": {providers}"),
+            );
+            assert!(decode(&document)
+                .unwrap_err()
+                .to_string()
+                .contains("must be non-empty and listed once"));
+        }
+    }
+
     /// A document with the supplied JSON inserted verbatim as its
     /// `harness_ingest` member.
     fn with_ingest(ingest: &str) -> String {
         format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{ingest}}}"#
+            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{ingest}}}"#
         )
     }
 
@@ -673,7 +773,7 @@ mod tests {
     #[test]
     fn a_document_without_the_ingest_member_is_refused_by_name() {
         let error = decode(&format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"subscription_multiplier":{NO_MULTIPLIER}}}"#
+            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER}}}"#
         ))
         .unwrap_err();
         assert_eq!(

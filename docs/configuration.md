@@ -51,7 +51,7 @@ you are about to run.
 ## Members
 
 The root is a closed JSONC object (comments and trailing commas allowed).
-All five members are required. An unknown, missing or repeated member is
+All six members are required. An unknown, missing or repeated member is
 refused, at every level. `null` means "not configured"; a present string must
 not be empty.
 
@@ -92,16 +92,28 @@ twice, and `enabled: false` with a non-empty `exclude`. Tests:
 `ingestion_off_with_a_non_empty_exclude_is_refused_as_contradictory`,
 `excluded_workers_are_not_read_and_runtime_is_removed`.
 
+### `reasoning_billed_as_output`
+
+Array of non-empty provider ids, each listed once. A listed provider's reasoning
+tokens always use its output rate, even when a reasoning rate exists. This
+billing fact applies to the spend ledger and the subscription multiplier,
+including mode selection; ledger tier refusals and subscription coverage still
+win. Unlisted providers require their own reasoning rate: there is no default.
+The production example declares `openai` and `anthropic`. When restoring a saved
+configuration from the store, the module accepts the old
+`subscription_multiplier.reasoning_billed_as_output` location, or uses an empty
+list if none was saved. New configuration files must put
+`reasoning_billed_as_output` at the root, not inside `subscription_multiplier`.
+
 ### `subscription_multiplier`
 
 The declarations behind the daily subscription multiplier: what each
 subscription's quota is worth at API list prices. It never changes the spend
-ledger. All four members are required; use `{}` and `[]` to declare nothing.
+ledger. All three members are required; use `{}` to declare nothing.
 
 | Member | Shape | Meaning |
 |---|---|---|
 | `api_twins` | map of provider to provider | A plan-side provider priced at another provider's list rates, same model id (for example `openai-codex` to `openai`). The two must differ. |
-| `reasoning_billed_as_output` | array of providers | Providers whose reasoning tokens are priced at their output rate. Each listed once. |
 | `plan_price_overrides` | map of plan key to price | A monthly price used instead of fusiform's for that plan key. |
 | `quota_providers` | map of quota provider to declaration | One entry per quota provider, keyed by the provider name the quota module reports. |
 

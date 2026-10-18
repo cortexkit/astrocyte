@@ -890,15 +890,16 @@ pub fn now_ms() -> i64 {
 
 fn hydrate_config(conn: &Connection) -> Result<(AstrocyteConfig, u64), String> {
     #[allow(clippy::type_complexity)]
-    let (generation, mut config, multiplier_column, ingest_column): (
+    let (generation, mut config, multiplier_column, ingest_column, canonical_bytes): (
         i64,
         AstrocyteConfig,
         Option<String>,
         Option<String>,
+        Vec<u8>,
     ) = conn
         .query_row(
             "SELECT generation,poll_interval_secs,qta_connection_file,
-                    fusiform_connection_file,subscription_multiplier,harness_ingest
+                    fusiform_connection_file,subscription_multiplier,harness_ingest,canonical_bytes
              FROM desired_config WHERE id=1",
             [],
             |row| {
@@ -908,11 +909,13 @@ fn hydrate_config(conn: &Connection) -> Result<(AstrocyteConfig, u64), String> {
                         poll_interval_secs: row.get(1)?,
                         qta_connection_file: row.get(2)?,
                         fusiform_connection_file: row.get(3)?,
+                        reasoning_billed_as_output: Vec::new(),
                         subscription_multiplier: config::MultiplierSetting::NotRecorded,
                         harness_ingest: config::HarnessIngest::all_on(),
                     },
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
@@ -920,6 +923,9 @@ fn hydrate_config(conn: &Connection) -> Result<(AstrocyteConfig, u64), String> {
     if generation == 0 {
         return Ok((config::intentional_empty().config, 0));
     }
+    config.reasoning_billed_as_output =
+        config::decode_reasoning_generation(&canonical_bytes, multiplier_column.as_deref())
+            .map_err(|error| error.to_string())?;
     // NULL here is a generation committed before the store had the column.
     // It boots as "not recorded", never as an empty declaration, and the
     // next reload from the desired file publishes a generation that has it.

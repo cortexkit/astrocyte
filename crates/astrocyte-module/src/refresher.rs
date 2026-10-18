@@ -2258,7 +2258,11 @@ fn resolve_event<'a>(
     // Plan reading committed above; catalog resolution therefore never
     // runs while a SQLite transaction or store mutex is held.
     let resolved = match catalog {
-        Some(catalog) => astrocyte_core::subscription::resolve_reprice(&plan, catalog),
+        Some(catalog) => astrocyte_core::subscription::resolve_reprice(
+            &plan,
+            catalog,
+            &state.desired_config().reasoning_billed_as_output,
+        ),
         None => astrocyte_core::subscription::resolve_reprice_without_catalog(&plan),
     }
     .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
@@ -3448,6 +3452,7 @@ fn compute_multiplier_day(
                 &rates,
                 &plan_prices,
                 snapshot_at_ms,
+                &state.desired_config().reasoning_billed_as_output,
             )
             .map_err(|error| (error.code().to_string(), error.message()))
         })
@@ -3812,7 +3817,8 @@ mod tests {
                 "source": "late-fake",
                 "resolved_at_ms": request.at_ms,
                 "catalog_version": 1,
-                "models": {"anthropic/claude": {"rate.input": rate}},
+                "models": {"anthropic/claude": {"rate.input": rate,
+                    "rate.output": {"state":"priced","units":6000,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}}}},
                 "withheld": [], "uncertain": [], "overridden": []
             }))
             .unwrap())
@@ -3841,6 +3847,68 @@ mod tests {
                 Ok(((), true))
             })
             .unwrap();
+    }
+
+    #[test]
+    fn reasoning_billing_reaches_pricing_pass_reprice_and_basis_correction() {
+        use serde_json::json;
+        for path in ["pass", "reprice", "basis"] {
+            for declared in [false, true] {
+                let state = test_state();
+                let mut desired = config::intentional_empty().config;
+                if declared {
+                    desired.reasoning_billed_as_output.push("anthropic".into());
+                }
+                state.publish_desired(desired, 1);
+                let catalog = CatalogClient::connect(Arc::new(LateCatalog::warming(0))).unwrap();
+                state.install_catalog(Some(catalog)).unwrap();
+                let event_id = crate::ops::dispatch(&state, crate::ops::OP_EVENT_INGEST, json!({
+                    "producer":"producer", "producer_lineage":"lineage", "producer_ref":"thinking",
+                    "provider":"anthropic", "model":"claude", "occurred_at_ms":1_800_000_000_000_i64,
+                    "charge_basis": if path == "basis" { "unknown" } else { "metered_api" },
+                    "measurements":[{"role":"reasoning","unit":"token","kind":"billed","source":"usage.reasoning","quantity_units":1000,"quantity_exponent":0}]
+                })).unwrap()["event_id"].as_str().unwrap().to_owned();
+                match path {
+                    "pass" => {
+                        assert_eq!(
+                            price_unpriced_events(
+                                &state,
+                                1_800_000_000_001,
+                                &AtomicBool::new(false)
+                            )
+                            .unwrap(),
+                            1
+                        );
+                    }
+                    "reprice" => {
+                        crate::ops::dispatch(
+                            &state,
+                            crate::ops::OP_EVENT_REPRICE,
+                            json!({"event_id":event_id}),
+                        )
+                        .unwrap();
+                    }
+                    _ => {
+                        crate::ops::dispatch(&state, crate::ops::OP_BASIS_CORRECT, json!({"event_id":event_id,"corrected_basis":"metered_api","reason":"API-key evidence"})).unwrap();
+                    }
+                }
+                let stored: (String, Option<i64>, Option<String>, String) = state.with_conn(|conn| {
+                    conn.query_row("SELECT outcome,charge_nanos,unpriced_reason,json_extract(catalog_entry,'$.fact_key') FROM priced_charge", [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).map_err(|error| error.to_string())
+                }).unwrap();
+                let expected = if declared {
+                    ("priced".into(), Some(6), None, "rate.output".into())
+                } else {
+                    (
+                        "unpriced".into(),
+                        None,
+                        Some("no_rate".into()),
+                        "rate.reasoning".into(),
+                    )
+                };
+                assert_eq!(stored, expected, "{path}, declared={declared}");
+            }
+        }
     }
 
     fn priced_charge_rows(state: &SharedState) -> i64 {
@@ -5990,7 +6058,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            br#"{"poll_interval_secs":45,"qta_connection_file":null,"fusiform_connection_file":null,"subscription_multiplier":{"api_twins":{},"reasoning_billed_as_output":[],"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
+            br#"{"poll_interval_secs":45,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
         )
         .unwrap();
         reload_config(&state, Ok(path.clone())).unwrap();
@@ -6523,6 +6591,7 @@ mod loop_tests {
             poll_interval_secs: 11,
             qta_connection_file: None,
             fusiform_connection_file: None,
+            reasoning_billed_as_output: Vec::new(),
             subscription_multiplier: config::intentional_empty().config.subscription_multiplier,
             harness_ingest: config::HarnessIngest::all_on(),
         };
@@ -6650,6 +6719,7 @@ mod loop_tests {
             poll_interval_secs: 60,
             qta_connection_file: Some(connection.clone()),
             fusiform_connection_file: Some(connection),
+            reasoning_billed_as_output: Vec::new(),
             subscription_multiplier: config::intentional_empty().config.subscription_multiplier,
             harness_ingest: config::HarnessIngest::all_on(),
         })
@@ -6887,6 +6957,7 @@ mod multiplier_stage_tests {
             );
             let rate = json!({"state":"priced","units":self.input_rate_units.load(Ordering::SeqCst),"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}});
             let mut facts = BTreeMap::from([("rate.input".to_string(), rate.clone())]);
+            facts.insert("rate.output".into(), json!({"state":"priced","units":20_000_000_000_i64,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}}));
             if self.unrecognized_key.load(Ordering::SeqCst) {
                 facts.insert("rate.input.above_context.272k".to_string(), rate);
             }
@@ -6947,9 +7018,9 @@ mod multiplier_stage_tests {
         "poll_interval_secs": 60,
         "qta_connection_file": null,
         "fusiform_connection_file": null,
+        "reasoning_billed_as_output": ["openai"],
         "subscription_multiplier": {
             "api_twins": {},
-            "reasoning_billed_as_output": ["openai"],
             "plan_price_overrides": {},
             "quota_providers": {"codex": {
                 "window": {"pool_key": "primary", "window_minutes": 10080},
@@ -7141,6 +7212,45 @@ mod multiplier_stage_tests {
                 Ok(rows)
             })
             .unwrap()
+    }
+
+    #[test]
+    fn multiplier_uses_and_records_top_level_reasoning_billing() {
+        for declared in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = Arc::new(state::leased_test_state(&directory));
+            let document = if declared {
+                DESIRED.to_owned()
+            } else {
+                DESIRED.replace(
+                    "\"reasoning_billed_as_output\": [\"openai\"]",
+                    "\"reasoning_billed_as_output\": []",
+                )
+            };
+            publish_document(&state, &directory, &document);
+            seed_usage(&state);
+            state.ordered_write(|tx| {
+                tx.execute("INSERT INTO measurement (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
+                    VALUES ((SELECT event_key FROM usage_event WHERE event_id='e1'),'reasoning','token','billed','usage.reasoning',500,0)", [])
+                    .map_err(|error| error.to_string())?;
+                Ok(((), true))
+            }).unwrap();
+            let fusiform = FakeFusiform::new(false);
+            install_catalog(&state, &fusiform);
+            MultiplierStage::new(Some(fusiform)).tick(&state, false, NOW);
+            assert_eq!(
+                current_day_observations(&state),
+                [(
+                    "codex".into(),
+                    DAY.into(),
+                    if declared { 20_000_000 } else { 10_000_000 }
+                )]
+            );
+            let recorded: String = state.with_conn(|conn| conn.query_row(
+                "SELECT reasoning_billed_as_output FROM multiplier_observation WHERE observation_day=?1", [DAY], |row| row.get(0))
+                .map_err(|error| error.to_string())).unwrap();
+            assert_eq!(recorded, if declared { "[\"openai\"]" } else { "[]" });
+        }
     }
 
     fn observation_days(state: &SharedState) -> Vec<String> {
@@ -7447,6 +7557,61 @@ mod multiplier_stage_tests {
         assert_eq!(fusiform.plan_calls.load(Ordering::SeqCst), 7);
     }
 
+    #[test]
+    fn stored_generations_lift_reasoning_billing_and_new_generations_keep_it() {
+        for nested in [None, Some(serde_json::json!(["openai", "anthropic"]))] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut old: serde_json::Value = serde_json::from_str(DESIRED).unwrap();
+            old.as_object_mut()
+                .unwrap()
+                .remove("reasoning_billed_as_output");
+            if let Some(providers) = &nested {
+                old["subscription_multiplier"]["reasoning_billed_as_output"] = providers.clone();
+            }
+            {
+                let state = state::leased_test_state(&directory);
+                state.ordered_write(|tx| {
+                    tx.execute("UPDATE desired_config SET generation=3,canonical_bytes=?1,subscription_multiplier=?2 WHERE id=1",
+                        rusqlite::params![old.to_string().as_bytes(), old["subscription_multiplier"].to_string()])
+                        .map_err(|error| error.to_string())?;
+                    tx.execute("UPDATE source_runtime SET desired_generation=3", []).map_err(|error| error.to_string())?;
+                    Ok(((), true))
+                }).unwrap();
+            }
+            let state = Arc::new(state::leased_test_state(&directory));
+            let expected = if nested.is_some() {
+                vec!["openai", "anthropic"]
+            } else {
+                vec![]
+            };
+            assert_eq!(state.desired_config().reasoning_billed_as_output, expected);
+            assert!(matches!(
+                state.desired_config().subscription_multiplier,
+                config::MultiplierSetting::Recorded(_)
+            ));
+            publish_desired(&state, &directory);
+            drop(state);
+            let state = state::leased_test_state(&directory);
+            assert_eq!(
+                state.desired_config().reasoning_billed_as_output,
+                ["openai"]
+            );
+            state
+                .with_conn(|conn| {
+                    let stored: String = conn
+                        .query_row(
+                            "SELECT subscription_multiplier FROM desired_config",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    assert!(!stored.contains("reasoning_billed_as_output"));
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
     /// A day whose inputs cannot be read writes nothing and is retried on
     /// every later tick: the first tick after 00:00Z fails, a later one
     /// succeeds, and exactly one observation exists for the day.
@@ -7545,9 +7710,16 @@ mod multiplier_stage_tests {
             let plans =
                 multiplier::resolve_plans(Some(client.as_ref()), &config, &plan.provider, now)
                     .unwrap();
-            let observation =
-                multiplier::compute_observation(&conn, &config, &plan, &rates, &plans, now)
-                    .unwrap();
+            let observation = multiplier::compute_observation(
+                &conn,
+                &config,
+                &plan,
+                &rates,
+                &plans,
+                now,
+                &["openai".into()],
+            )
+            .unwrap();
             let tx = conn.transaction().unwrap();
             multiplier::insert_observation_in_tx(&tx, &observation).unwrap();
             tx.commit().unwrap();
@@ -7979,7 +8151,7 @@ mod harness_ingest_tests {
         std::fs::write(
             &path,
             format!(
-                r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"subscription_multiplier":{{"api_twins":{{}},"reasoning_billed_as_output":[],"plan_price_overrides":{{}},"quota_providers":{{}}}},"harness_ingest":{ingest}}}"#
+                r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{{"api_twins":{{}},"plan_price_overrides":{{}},"quota_providers":{{}}}},"harness_ingest":{ingest}}}"#
             ),
         )
         .unwrap();

@@ -665,19 +665,21 @@ fn read_plan_in_tx(
 pub fn resolve_reprice(
     plan: &SubscriptionRepricePlan,
     catalog: &CatalogClient,
+    reasoning_billed_as_output: &[String],
 ) -> Result<ResolvedSubscriptionReprice, SubscriptionError> {
-    resolve_reprice_with_catalog(plan, Some(catalog))
+    resolve_reprice_with_catalog(plan, Some(catalog), reasoning_billed_as_output)
 }
 
 pub fn resolve_reprice_without_catalog(
     plan: &SubscriptionRepricePlan,
 ) -> Result<ResolvedSubscriptionReprice, SubscriptionError> {
-    resolve_reprice_with_catalog(plan, None)
+    resolve_reprice_with_catalog(plan, None, &[])
 }
 
 fn resolve_reprice_with_catalog(
     plan: &SubscriptionRepricePlan,
     catalog: Option<&CatalogClient>,
+    reasoning_billed_as_output: &[String],
 ) -> Result<ResolvedSubscriptionReprice, SubscriptionError> {
     // Coverage wins before the catalog is consulted: a subscription in force at
     // the event's instant already answers what the charge was (zero, and the
@@ -692,7 +694,7 @@ fn resolve_reprice_with_catalog(
         (
             CoverageExpectation::NotApplicable | CoverageExpectation::Missing { .. },
             Some(catalog),
-        ) => pricing::resolve_reprice(&plan.pricing, catalog)?,
+        ) => pricing::resolve_reprice(&plan.pricing, catalog, reasoning_billed_as_output)?,
         (CoverageExpectation::NotApplicable | CoverageExpectation::Missing { .. }, None) => {
             pricing::resolve_reprice_without_catalog(&plan.pricing)?
         }
@@ -808,7 +810,7 @@ mod tests {
         origin: pricing::PricingOrigin,
     ) -> Result<RepriceOutcome, SubscriptionError> {
         let plan = read_reprice(conn, event_id)?;
-        let resolved = resolve_reprice(&plan, catalog)?;
+        let resolved = resolve_reprice(&plan, catalog, &[])?;
         let tx = conn.transaction()?;
         let outcome = commit_reprice_in_tx(&tx, &plan, &resolved, recorded_at_ms, origin)?;
         tx.commit()?;
@@ -1720,6 +1722,42 @@ mod tests {
     }
 
     #[test]
+    fn declared_reasoning_is_covered_without_catalog_io() {
+        let mut conn = conn();
+        set_subscription(
+            &mut conn,
+            &request("active", "JPY", 0, SubscriptionPeriod::Month, 100),
+            None,
+        )
+        .unwrap();
+        record_subscription_event(&conn, "covered-thinking", Some(150));
+        conn.execute("INSERT INTO measurement (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
+            VALUES ((SELECT event_key FROM usage_event WHERE event_id='covered-thinking'),'reasoning','token','billed','usage.reasoning',1000,0)", []).unwrap();
+        let (catalog, connection) = catalog();
+        let plan = read_reprice(&conn, "covered-thinking").unwrap();
+        let resolved = resolve_reprice(&plan, &catalog, &["provider-a".into()]).unwrap();
+        let tx = conn.transaction().unwrap();
+        commit_reprice_in_tx(
+            &tx,
+            &plan,
+            &resolved,
+            1_000,
+            pricing::PricingOrigin::PricingPass,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(connection.calls.load(Ordering::SeqCst), 0);
+        let rows: Vec<(String, String, i64, i64, Option<String>)> = conn.prepare(
+            "SELECT role,outcome,charge_nanos,basis_covered,catalog_entry FROM priced_charge ORDER BY role"
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+            .unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            rows,
+            ["input", "reasoning"].map(|role| (role.into(), "covered".into(), 0, 1, None))
+        );
+    }
+
+    #[test]
     fn plan_starting_after_event_is_unpriced_no_subscription_in_force() {
         let mut conn = conn();
         set_subscription(
@@ -1855,7 +1893,7 @@ mod tests {
         record_subscription_event(&conn, "contended", Some(150));
         let (catalog, _) = catalog();
         let plan = read_reprice(&conn, "contended").unwrap();
-        let resolved = resolve_reprice(&plan, &catalog).unwrap();
+        let resolved = resolve_reprice(&plan, &catalog, &[]).unwrap();
         set_subscription(
             &mut conn,
             &request("late-declaration", "USD", 2, SubscriptionPeriod::Month, 100),
