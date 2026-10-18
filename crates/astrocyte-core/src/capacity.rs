@@ -117,6 +117,13 @@ pub struct CapacityFreshness {
     pub detail: Option<String>,
 }
 
+impl CapacityFreshness {
+    /// The existing capacity freshness horizon, shared with event-mode backstop scheduling.
+    pub fn horizon_ms(&self) -> i64 {
+        self.effective_cadence_ms.saturating_mul(4)
+    }
+}
+
 /// Persists one validated response inside a transaction owned by the caller,
 /// deleting missing labeled accounts only for providers declared complete by
 /// that same response.
@@ -124,6 +131,43 @@ pub fn apply_snapshot_in_tx(
     tx: &Transaction<'_>,
     snapshot: &CapacitySnapshot,
     now_ms: i64,
+) -> rusqlite::Result<()> {
+    apply_readings_in_tx(tx, snapshot, now_ms, true)
+}
+
+/// Apply an event for exactly one quota account, without inventory retirement authority.
+/// An absent account label addresses only provider-current readings, never labeled accounts.
+pub fn apply_account_in_tx(
+    tx: &Transaction<'_>,
+    snapshot: &CapacitySnapshot,
+    provider: &str,
+    account: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    if snapshot.complete_providers.is_some()
+        || snapshot.observations.iter().any(|reading| {
+            reading.provider != provider || Some(reading.account_ref.as_str()) != account
+        })
+        || snapshot.windows.iter().any(|reading| {
+            reading.provider != provider || Some(reading.account_ref.as_str()) != account
+        })
+        || snapshot
+            .provider_readings
+            .iter()
+            .any(|reading| reading.provider != provider || account.is_some())
+    {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "quota event is not confined to its account".into(),
+        ));
+    }
+    apply_readings_in_tx(tx, snapshot, now_ms, false)
+}
+
+fn apply_readings_in_tx(
+    tx: &Transaction<'_>,
+    snapshot: &CapacitySnapshot,
+    now_ms: i64,
+    retire_accounts: bool,
 ) -> rusqlite::Result<()> {
     let degraded_entries = i64::try_from(snapshot.degraded_entries).map_err(|_| {
         rusqlite::Error::InvalidParameterName("degraded entry count exceeds SQLite range".into())
@@ -260,7 +304,11 @@ pub fn apply_snapshot_in_tx(
         }
     }
 
-    if let Some(complete_providers) = &snapshot.complete_providers {
+    if let Some(complete_providers) = snapshot
+        .complete_providers
+        .as_ref()
+        .filter(|_| retire_accounts)
+    {
         for provider in complete_providers {
             // One JSON set avoids a delete per missing account and one bind slot per survivor.
             let survivors = snapshot

@@ -285,12 +285,33 @@ priced is reported with its unpriced population, not as a smaller number.
 | Peer | Route | Calls | On failure |
 |---|---|---|---|
 | fusiform (price catalog) | `tool_provider`, module `fusiform` | `catalog.status`, `catalog.get`, `plan.prices` as `{"name", "arguments"}` tool calls | A failed pricing call writes no head; the event stays queued and a later pass retries it. Recompute refuses. Route death and `module_reloading` are retried once within the call's deadline. |
-| insula (the quota module, QTA) | `management_surface`, module `insula` | `usage.get` with empty params | The poll records the attempt and keeps the last windows. Capacity is advisory and never blocks spend. |
+| insula (the quota module, QTA) | `management_surface`, module `insula` | `usage.get` with empty params; `events_get` with `event_key` and `event_name: "quota_sampled"` | Invalid or missing event bodies owe a snapshot. A failed snapshot records the attempt and keeps the last windows. Capacity is advisory and never blocks spend. |
+| ckbus | Attested `management_surface`, module `ckbus` | `ckbus.credential`, `ckbus.credential_renew`, `ckbus.nonce_sign` | Retain per-tick insula polling and retry with exponential backoff (250 ms to 30 s). Never fail the module or change broker topology. |
 
-Each peer is reached through the connection file named in the
-[configuration](configuration.md). With no fusiform connection, events are
+Fusiform and insula use the connection files named in the
+[configuration](configuration.md). The ckbus route uses the module's daemon
+connection file and the daemon-validated `consumer_identity` shared with HELLO,
+not the un-attested peer clients. With no fusiform connection, events are
 stored unpriced with reason `catalog_unconfigured`; with no QTA connection,
 capacity is `disabled`.
+
+Insula notices use `ck.{bus_account}.event.insula.quota_sampled.v1`, with no body.
+Astrocyte binds its pre-existing pull durable from `cortexkit-bus-naming`'s consumer
+table, fetches in batches of 32 (one-second expiry), and hashes the exact compact
+`result.body` bytes against both reply and notice digests. It checks the body's
+provider, optional account, epoch and sequence against the notice. In-sequence
+readings update only that account (or unlabeled provider-current readings); they
+have no complete-provider retirement authority. First notices, new epochs, gaps,
+missing bodies or failed validation record a snapshot obligation before ack.
+Duplicates do not write again. Progress acks protect pending writes; final acks
+follow commit or recorded recovery. A restart begins with a snapshot owed.
+
+Healthy attachment, a current credential and a recent successful pull suppress
+per-tick snapshots. The backstop is the earlier of ten minutes and the existing
+capacity freshness horizon minus one cadence: normally 90 seconds. Event commits
+refresh capacity sooner; empty pulls never do. Any bus failure restores per-tick
+polling. Transitions are logged; health reply shapes, freshness rules, the
+multiplier and `budget.verdict` are unchanged.
 
 broca, the coding harnesses and thalamus-harness are not called. astrocyte
 reads their stores and files directly; see [harness readers](harness-readers.md)

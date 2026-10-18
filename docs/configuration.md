@@ -57,7 +57,7 @@ not be empty.
 
 ### `poll_interval_secs`
 
-Integer, at least 1. How often the refresher runs: drains, the capacity poll,
+Integer, at least 1. How often the refresher runs: drains, capacity recovery,
 pricing and the daily multiplier stage. A source with no successful drain
 within four intervals makes health degraded, and capacity freshness uses four
 times the capacity cadence.
@@ -65,8 +65,14 @@ times the capacity cadence.
 ### `qta_connection_file`
 
 String or `null`. The subc connection file used to reach insula, the quota
-module, for `usage.get`. `null` disables capacity polling. Capacity is
-advisory and never blocks spend recording.
+module, for `usage.get` snapshots and `events_get` quota bodies. `null` disables
+capacity ingestion. When configured, a separate reader binds the bus durable
+without creating it. Bus failures retain one snapshot per tick; a healthy reader
+backs up event delivery with snapshots at the earlier of ten minutes or the
+freshness horizon minus one cadence. At the default 30-second cadence, the horizon
+stays 120 seconds and quiet readings are refreshed after 90 seconds. Events update
+accounts between ticks and reset freshness; empty pulls do not. Owed recovery
+snapshots run on the next tick. Capacity is advisory and never blocks spend recording.
 
 ### `fusiform_connection_file`
 

@@ -64,6 +64,7 @@ struct Inner {
     /// Last observed store presence per source, kept after an absent store deletes
     /// its runtime row so the change is logged only once.
     source_discovery: Mutex<HashMap<String, bool>>,
+    quota_bus: crate::quota_events::Control,
     /// Test-only hold on the refresher loop's pricing pass, scoped to this
     /// state so a held test never silences the pass of a test running beside
     /// it. See `hold_pricing_pass_for_test` in refresher.rs.
@@ -270,6 +271,7 @@ impl SharedState {
                 capacity_runtime: None,
             }),
             source_discovery: Mutex::new(HashMap::new()),
+            quota_bus: crate::quota_events::Control::default(),
             #[cfg(any(test, feature = "test-support"))]
             pricing_pass_hold: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
@@ -530,6 +532,33 @@ impl SharedState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .config
             .clone()
+    }
+
+    /// Share the one launch-nonce handoff with the attested ckbus client, not other peers.
+    pub fn install_quota_bus_access(
+        &self,
+        path: std::path::PathBuf,
+        module_id: String,
+        nonce: String,
+    ) {
+        self.0.quota_bus.install_access(path, module_id, nonce);
+    }
+
+    pub(crate) fn quota_bus(&self) -> &crate::quota_events::Control {
+        &self.0.quota_bus
+    }
+
+    pub(crate) fn capacity_poll_ticket(
+        &self,
+        now_ms: i64,
+    ) -> Option<crate::quota_events::PollTicket> {
+        let projection = self.0.projection.read().ok();
+        self.quota_bus().poll_ticket(
+            now_ms,
+            projection
+                .as_ref()
+                .and_then(|p| p.capacity_runtime.as_ref()),
+        )
     }
 
     pub fn catalog_client(&self) -> Option<CatalogClient> {
@@ -856,7 +885,7 @@ impl PublicProjection {
                 .capacity_runtime
                 .as_ref()
                 .map(|freshness| {
-                    let horizon_ms = freshness.effective_cadence_ms.saturating_mul(4);
+                    let horizon_ms = freshness.horizon_ms();
                     json!({
                         "runtimeVariant": freshness.runtime_variant,
                         "changedAtMs": freshness.changed_at_ms,

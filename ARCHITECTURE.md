@@ -121,8 +121,16 @@ without degrading health.
    declared Claude workers and BROCA, skipping each producer `harness_ingest` turns
    off. A skipped producer is not read and its `source_runtime` row is removed, as for
    an absent harness store.
-3. Poll QTA `usage.get` when `qta_connection_file` is set. A failed poll records the
-   attempt and keeps the last windows. Capacity is advisory and never blocks spend.
+3. Consume insula quota events when `qta_connection_file` is set. A stoppable bus
+   thread binds the naming table's existing durable without provisioning topology.
+   It fetches `events_get` bodies and verifies exact-byte digests; account commits
+   or recorded snapshot obligations precede acks, and duplicates do not write again.
+   First notices, new epochs, gaps and invalid/missing bodies owe `usage.get` on the
+   next tick. Healthy readers backstop at the earlier of ten minutes or one cadence
+   before the unchanged freshness horizon (normally 90 seconds, versus 30-second
+   polling). Account commits reset freshness; empty pulls do not. Without a current
+   credential, attachment or recent successful pull, every tick polls as before.
+   Failed polls retain windows; capacity remains advisory.
 4. Price queued events through `run_pricing_walk`. With no catalog configured,
    events are stored unpriced with reason `catalog_unconfigured`.
 5. Spend a bounded budget reconciling `pricing_pending` against the full ledger, to
@@ -132,47 +140,37 @@ An unrequested refresher end or handler panic stops the module non-zero. Failed
 handlers attempt a small correlated `internal` error reply. EOF, GOODBYE and SIGTERM
 keep their clean-stop paths.
 
-After each tick, the multiplier stage (`astrocyte-core/src/multiplier.rs`) attempts
-missing rows for each configured quota provider's seven most recent completed UTC
-days, oldest first. Each row covers the seven days ending at its 00:00Z boundary.
-It waits until every `source_runtime` row has a successful read at or after that
-boundary; absent or skipped sources do not block. At two hours after the boundary it
-records anyway, naming stale sources in `error_deflating` (reads-low text).
-It reads quota Δused% from `window_sample` and scoped models on the reader connection,
-calls fusiform `plan.prices` and `catalog.get` outside transactions, then reads and
-prices tokens and appends in its own write. Failures write nothing and retry within
-the look-back, logged once per day and reason. Unreadable catalog rates
-(`rate_fact_unrecognized`) fail the day; absent models (`no_catalog_coverage`) count
-as unpriced tokens on a written row. Older days are not tried automatically.
+The ckbus route shares HELLO's single nonce handoff. Daemon validation of
+`consumer_identity` stamps its principal; nonces stay out of diagnostics.
+The refresher drains account writes between ticks (250 ms idle wait) and joins
+the bus reader on its stop flag. Mode changes are logged, not added to health schemas.
+
+After each tick, `astrocyte-core/src/multiplier.rs` attempts missing observations
+for the seven most recent completed UTC days, oldest first; each covers seven days
+ending at 00:00Z. It waits for source reads past the boundary, or two hours, then
+discloses stale sources in `error_deflating`. Absent/skipped sources do not block.
+It reads `window_sample` and scoped models, calls fusiform `plan.prices` and
+`catalog.get` outside transactions, and appends in its own write. Failures retry
+without rows, logged once per day/reason. `rate_fact_unrecognized` fails the day;
+`no_catalog_coverage` counts unpriced tokens. Older days need operator recompute.
 
 Ledger pricing and the multiplier share `parse_rate_key` in
-`astrocyte-core/src/catalog_client.rs`: unconditional `rate.<role>` or conditional
-`rate.<role>.<selector>.<value>`, with five roles and whole-number context thresholds.
-`above_context.<threshold>` tests the prompt size. `mode.<name>` requires a stated
-non-standard mode; absent, `standard` and `default` use base rates. A missing mode
-rate is unpriced; unrecorded selectors never apply. No event stores a mode yet.
-The multiplier counts `mode_unrecorded_tokens` for models serving mode rates,
-beside `base_rate_tier_untested_tokens` in the row's reads-low text.
-Both use the top-level `reasoning_billed_as_output` provider list: listed reasoning
-always uses output's rate key, including mode. Unlisted reasoning needs its own rate.
-Ledger coverage and whole-event `rate_tiered` refusals still precede rate selection;
+`astrocyte-core/src/catalog_client.rs`: `rate.<role>` or
+`rate.<role>.<selector>.<value>`. `above_context.<threshold>` tests prompt size;
+`mode.<name>` requires a stated non-standard mode. Missing mode rates are unpriced,
+not fallback rates. No event stores a mode yet; multiplier rows disclose
+`mode_unrecorded_tokens` beside `base_rate_tier_untested_tokens`.
+Both paths honor `reasoning_billed_as_output`; unlisted reasoning needs its own
+rate. Ledger coverage and whole-event `rate_tiered` refusals precede selection;
 priced charges record the selected `fact_key` in `catalog_entry`.
 
-Any row records its day; corrected days get no second automatic row. A partial unique
-index refuses a second original per provider and day. While a configured catalog
-is still discovering its history boundary, the day waits for it. A quota provider
-whose scope names a producer the configuration does not ingest (excluded or ingestion
-off) fails the day with `scoped_producer_not_ingested`: its quota still counts that
-traffic, but its tokens would not.
-
-`spend.multiplier.recompute` computes the same seven-day interval with current config
-and catalog. Price calls precede writes. It supersedes the
-day's head, or creates an original with null `supersedes`. Only missing
-originals wait for source reads. A head is a row no
-other row supersedes; `spend.multiplier.report` serves heads by day, not snapshot time.
-Unknown providers and failed computations write nothing.
-`scoped_producer_not_ingested` names excluded producers; every requested scope
-is checked before calls or writes.
+A unique index prevents a second original per provider/day. Observations wait until
+the catalog's history boundary is known. `scoped_producer_not_ingested` refuses scopes
+including excluded producers before calls or writes: their quota counts traffic
+whose tokens ingestion omits. `spend.multiplier.recompute` uses current config and
+catalog, superseding the head or creating an original; only missing originals wait
+for sources. `spend.multiplier.report` serves unsuperseded heads by day. Unknown
+providers and failed computations write nothing.
 
 ## Desired configuration
 

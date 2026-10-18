@@ -1445,6 +1445,13 @@ fn spawn_refresher(
                     plan_prices,
                     poll_interval_secs,
                 ) = startup?;
+                let bus_reader = state.desired_config().qta_connection_file.and_then(|path| {
+                    crate::quota_events::Reader::start(
+                        Arc::clone(&state),
+                        path.into(),
+                        Arc::clone(&stop),
+                    )
+                });
                 run_loop_full(
                     Arc::clone(&state),
                     producers,
@@ -1459,8 +1466,11 @@ fn spawn_refresher(
                     pending_catalog,
                     MultiplierStage::new(plan_prices),
                     poll_interval_secs,
-                    stop,
+                    Arc::clone(&stop),
                 );
+                if let Some(reader) = bus_reader {
+                    reader.join();
+                }
                 Ok(())
             }));
             // The client owns a current-thread runtime. Removing the state's last
@@ -1613,6 +1623,7 @@ fn run_loop_full(
         #[cfg(test)]
         state.note_interval_wait_for_test();
         while !stop.load(Ordering::Relaxed) && started.elapsed() < interval {
+            crate::quota_events::drain(&state, &stop);
             std::thread::sleep(
                 Duration::from_millis(250).min(interval.saturating_sub(started.elapsed())),
             );
@@ -1834,6 +1845,7 @@ fn run_iteration_all(
     pricing: &mut PricingWalk,
     stop: &AtomicBool,
 ) {
+    crate::quota_events::drain(state, stop);
     // Read once per tick from the committed desired configuration, so the
     // producers skipped here always match the generation in force.
     let ingest = state.desired_config().harness_ingest;
@@ -1925,9 +1937,14 @@ fn run_iteration_all(
         }
     }
     if !stop.load(Ordering::Relaxed) {
-        if let Some(capacity) = capacity {
+        if let Some((capacity, ticket)) = capacity.and_then(|capacity| {
+            state
+                .capacity_poll_ticket(current_time_ms())
+                .map(|ticket| (capacity, ticket))
+        }) {
             let result = capacity.poll();
             let now_ms = current_time_ms();
+            let succeeded = result.is_ok();
             let persisted = match result {
                 Ok(snapshot) => state.ordered_write(|tx| {
                     apply_snapshot_in_tx(tx, &snapshot, now_ms)
@@ -1940,6 +1957,9 @@ fn run_iteration_all(
                     Ok(((), true))
                 }),
             };
+            state
+                .quota_bus()
+                .finish_poll(ticket, succeeded && persisted.is_ok());
             if let Err(error) = persisted {
                 log_capacity_failed(&error);
             }

@@ -6,6 +6,40 @@
 # Ordinary logic belongs in ordinary tests.
 
 [[control]]
+id = "quota-events-gap-epoch-snapshot"
+guards = "Only the next sequence in the same insula epoch may admit an account event"
+file = "crates/astrocyte-module/src/quota_events.rs"
+old = 'epoch == &notice.epoch && seq.checked_add(1) == Some(notice.seq)'
+new = 'true // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/quota_events_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["quota_events::tests::quota_gap_epoch_missing_body_or_digest_mismatch_owes_snapshot_before_completion"]
+only = true
+timeout_s = 120
+build_timeout_s = 600
+
+[[control]]
+id = "quota-events-single-account-write"
+guards = "An insula event cannot retire or touch another quota account"
+file = "crates/astrocyte-core/src/capacity.rs"
+old = 'apply_readings_in_tx(tx, snapshot, now_ms, false)'
+new = '{ let mut snapshot = snapshot.clone(); snapshot.complete_providers = Some([provider.to_owned()].into()); apply_readings_in_tx(tx, &snapshot, now_ms, true) } // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/quota_events_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "quota_events::tests::quota_in_sequence_fetches_exact_digest_persists_only_its_account_before_completion",
+  "quota_events::tests::quota_real_durable_acknowledges_after_commit_and_never_creates_topology",
+  "quota_events::tests::quota_unlabeled_event_updates_provider_readings_without_touching_labeled_accounts",
+]
+only = true
+timeout_s = 120
+build_timeout_s = 600
+
+[[control]]
 id = "ledger-declared-reasoning-output-rate"
 guards = "Only declared providers price reasoning at output rates, including stated modes and provenance"
 file = "crates/astrocyte-core/src/pricing.rs"

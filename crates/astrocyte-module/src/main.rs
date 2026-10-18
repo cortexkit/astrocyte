@@ -531,7 +531,7 @@ where
     Stop: std::future::Future<Output = ()>,
 {
     tokio::pin!(stop_signal);
-    send_hello(&writer, config, &state.desired_config()).await?;
+    send_hello(&writer, config, &state.desired_config(), Some(&state)).await?;
     tokio::select! {
         ack = expect_hello_ack(read_half) => {
             ack?;
@@ -592,10 +592,18 @@ async fn send_hello(
     writer: &mpsc::Sender<Frame>,
     config: &ModuleConfig,
     desired: &config::AstrocyteConfig,
+    state: Option<&SharedState>,
 ) -> Result<(), ModuleError> {
     let launch_nonce = subc_os::launch_nonce()
         .map_err(|error| ModuleError::Message(format!("launch nonce: {error}")))?
         .map(|nonce| (nonce.value().to_string(), nonce_source(nonce.source())));
+    if let (Some(state), Some((nonce, _))) = (state, launch_nonce.as_ref()) {
+        state.install_quota_bus_access(
+            config.connection_file_path.clone(),
+            config.module_id.clone(),
+            nonce.clone(),
+        );
+    }
     let body = serde_json::to_vec(&hello_body(&config.module_id, desired, launch_nonce))
         .map_err(ModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
@@ -1073,14 +1081,15 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
         .build()
 }
 
-/// The modules astrocyte calls under `desired`, and no others. A module whose
-/// connection file is unset is never contacted, so it is not a consumer.
+/// The modules astrocyte calls under `desired`, and no others. Quota ingestion
+/// also uses ckbus through an attested route on the daemon connection file.
 /// BROCA never is: its usage is read from its store, not over subc.
 /// No configured peer means no consumer role at all.
 fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
     let of: Vec<String> = [
         ("fusiform", desired.fusiform_connection_file.is_some()),
         ("insula", desired.qta_connection_file.is_some()),
+        ("ckbus", desired.qta_connection_file.is_some()),
     ]
     .into_iter()
     .filter(|(_, configured)| *configured)
@@ -1104,8 +1113,7 @@ fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
 ///
 /// Names are stable identifiers that analysts key on; do not rename them.
 fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignalDeclaration> {
-    // Every periodic call below runs once per refresher tick, and the tick
-    // interval is `poll_interval_secs` from the desired configuration.
+    // The tick interval bounds fallback polling and discovery retries.
     let tick_cadence = || SignalCadence::Derived {
         source: "desired_config.poll_interval_secs".to_string(),
     };
@@ -1120,7 +1128,29 @@ fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignal
             anchored_to: SignalAnchor::FixedInterval,
             cadence: Some(tick_cadence()),
             domain: Some("insula".to_string()),
-            note: Some("One usage.get per refresher tick to record provider capacity.".to_string()),
+            note: Some("usage.get on owed snapshots; healthy-bus backstop is ten minutes or one cadence before the freshness horizon, whichever is sooner. Without the bus, poll every refresher tick.".to_string()),
+        });
+        declarations.push(SelfSignalDeclaration {
+            name: "astrocyte-insula-quota-body".to_string(),
+            kind: SelfSignalKind::Poller,
+            effect: SelfSignalEffect::Observe,
+            anchored_to: SignalAnchor::Event {
+                event: "insula.quota_sampled".to_string(),
+            },
+            cadence: None,
+            domain: Some("insula".to_string()),
+            note: Some(
+                "events_get fetches the immutable body of an in-sequence quota notice.".to_string(),
+            ),
+        });
+        declarations.push(SelfSignalDeclaration {
+            name: "astrocyte-ckbus-credentials".to_string(),
+            kind: SelfSignalKind::Poller,
+            effect: SelfSignalEffect::Mutate,
+            anchored_to: SignalAnchor::Event { event: "quota_bus_session".to_string() },
+            cadence: None,
+            domain: Some("ckbus".to_string()),
+            note: Some("ckbus.credential, ckbus.credential_renew and ckbus.nonce_sign authenticate the quota reader; failures retry with bounded backoff.".to_string()),
         });
     }
     if desired.fusiform_connection_file.is_some() {
@@ -1917,12 +1947,14 @@ mod tests {
             self_signal_names(&manifest),
             [
                 "astrocyte-insula-usage-poll",
+                "astrocyte-insula-quota-body",
+                "astrocyte-ckbus-credentials",
                 "astrocyte-fusiform-catalog-lookup",
                 "astrocyte-fusiform-history-status",
                 "astrocyte-fusiform-history-probe",
             ]
         );
-        assert_eq!(consumed_modules(&manifest), ["fusiform", "insula"]);
+        assert_eq!(consumed_modules(&manifest), ["fusiform", "insula", "ckbus"]);
         let wire = serde_json::to_value(&manifest).unwrap();
         let signals = wire["self_signals"].as_array().unwrap();
         let lookup = signals
@@ -2020,6 +2052,8 @@ mod tests {
                 self_signal_names(&manifest),
                 [
                     "astrocyte-insula-usage-poll",
+                    "astrocyte-insula-quota-body",
+                    "astrocyte-ckbus-credentials",
                     "astrocyte-fusiform-catalog-lookup",
                     "astrocyte-fusiform-history-status",
                     "astrocyte-fusiform-history-probe",
@@ -2028,26 +2062,30 @@ mod tests {
             );
             assert_eq!(
                 consumed_modules(&manifest),
-                ["fusiform", "insula"],
+                ["fusiform", "insula", "ckbus"],
                 "{ingest:?}"
             );
         }
     }
 
-    /// Only insula configured: its poll is declared, on the wire, with the
-    /// cadence pointing at the configured tick interval, and nothing else is.
+    /// Quota ingestion declares its fallback poll, event-body fetch and attested
+    /// credential lifecycle; no catalog calls are introduced.
     #[test]
-    fn manifest_declares_only_the_insula_poll_when_only_qta_is_configured() {
+    fn manifest_declares_quota_poll_events_and_credentials_when_only_qta_is_configured() {
         let manifest = manifest("astrocyte", &desired(true, false));
         assert_eq!(
             self_signal_names(&manifest),
-            ["astrocyte-insula-usage-poll"]
+            [
+                "astrocyte-insula-usage-poll",
+                "astrocyte-insula-quota-body",
+                "astrocyte-ckbus-credentials"
+            ]
         );
-        assert_eq!(consumed_modules(&manifest), ["insula"]);
+        assert_eq!(consumed_modules(&manifest), ["insula", "ckbus"]);
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire["consumes"],
-            json!([{"role": "service_client", "of": ["insula"]}])
+            json!([{"role": "service_client", "of": ["insula", "ckbus"]}])
         );
         let poll = &wire["self_signals"][0];
         assert_eq!(poll["name"], "astrocyte-insula-usage-poll");
@@ -3292,7 +3330,7 @@ mod launch_nonce_tests {
             module_id: DEFAULT_MODULE_ID.to_string(),
         };
         let (tx, mut rx) = mpsc::channel(1);
-        let result = send_hello(&tx, &config, &config::intentional_empty().config).await;
+        let result = send_hello(&tx, &config, &config::intentional_empty().config, None).await;
         drop(tx);
         let hello = rx
             .recv()
@@ -3409,7 +3447,7 @@ mod logging_tests {
                         module_id: std::env::var(SUBC_MODULE_ID_ENV).unwrap(),
                     };
                     let (tx, mut rx) = mpsc::channel(1);
-                    send_hello(&tx, &config, &config::intentional_empty().config)
+                    send_hello(&tx, &config, &config::intentional_empty().config, None)
                         .await
                         .unwrap();
                     // `tx` is still alive, so a HELLO that was never sent

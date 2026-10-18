@@ -54,7 +54,7 @@ pub struct QtaClient {
     /// connection names itself in daemon logs ("capacity-poll").
     session: String,
     runtime: tokio::runtime::Runtime,
-    live: std::sync::Mutex<Option<Live>>,
+    live: tokio::sync::Mutex<Option<Live>>,
 }
 
 impl QtaClient {
@@ -81,7 +81,7 @@ impl QtaClient {
             request_timeout,
             session,
             runtime,
-            live: std::sync::Mutex::new(None),
+            live: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -170,85 +170,94 @@ impl QtaClient {
     }
 
     fn fetch_inner(&self) -> Result<CapacitySnapshot, PullError> {
-        let mut guard = self
-            .live
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.runtime.block_on(async {
-            // A retry and all setup/I/O spend the original call's budget;
-            // neither Pings nor unrelated replies grant another timeout.
-            let deadline = tokio::time::Instant::now() + self.request_timeout;
-            let result = tokio::time::timeout_at(deadline, async {
-                // Up to two attempts, as for fusiform: a dead route
-                // surfaces as a daemon ERROR FRAME on a healthy connection. A
-                // module restart removes its channel, not its connection. Every
-                // transport error evicts the cached connection. A socket killed
-                // without FIN/RST reports no
-                // transport error, only a timeout. Leaving that socket cached
-                // would make every later call reuse the dead connection while
-                // health reads green. Retry only while the deadline permits it.
-                let mut last_err: Option<PullError> = None;
-                for _attempt in 0..2 {
-                    if guard.is_none() {
-                        match self.open().await {
-                            Ok(live) => *guard = Some(live),
-                            Err(e) => {
-                                return Err(PullError::Unavailable(format!("qta connect: {e}")))
-                            }
-                        }
-                    }
-                    let live = guard.as_mut().expect("just ensured");
-                    let body = match serde_json::to_vec(
-                        &json!({ "method": OP_USAGE_GET, "params": {} }),
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            return Err(PullError::Unavailable(format!("params encode: {e}")))
-                        }
-                    };
-                    let (channel, epoch) = (live.route_channel, live.route_epoch);
-                    let response = match self.roundtrip_on(live, channel, epoch, body).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            *guard = None;
-                            last_err = Some(PullError::Unavailable(format!("qta exchange: {e}")));
-                            continue;
-                        }
-                    };
-                    match self.classify(response, &mut guard) {
-                        Ok(snapshot) => return Ok(snapshot),
-                        Err(ClassifiedError::Retry(e)) => {
-                            last_err = Some(e); // route death evicts; reloading keeps the route
-                            continue;
-                        }
-                        Err(ClassifiedError::Final(e)) => return Err(e),
+        let body = self
+            .runtime
+            .block_on(self.request(OP_USAGE_GET, json!({})))?;
+        decode_usage_response(&body).map_err(PullError::Unavailable)
+    }
+
+    pub(crate) async fn event_body(&self, event_key: &str) -> Result<Vec<u8>, PullError> {
+        self.request(
+            "events_get",
+            json!({"event_key": event_key, "event_name": "quota_sampled"}),
+        )
+        .await
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Vec<u8>, PullError> {
+        let mut cached = self.live.lock().await;
+        // A cancelled bus session must drop any partly consumed frame, not cache its socket.
+        let mut guard = cached.take();
+        // A retry and all setup/I/O spend the original call's budget;
+        // neither Pings nor unrelated replies grant another timeout.
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        let result = tokio::time::timeout_at(deadline, async {
+            // Up to two attempts, as for fusiform: a dead route
+            // surfaces as a daemon ERROR FRAME on a healthy connection. A
+            // module restart removes its channel, not its connection. Every
+            // transport error evicts the cached connection. A socket killed
+            // without FIN/RST reports no
+            // transport error, only a timeout. Leaving that socket cached
+            // would make every later call reuse the dead connection while
+            // health reads green. Retry only while the deadline permits it.
+            let mut last_err: Option<PullError> = None;
+            for _attempt in 0..2 {
+                if guard.is_none() {
+                    match self.open().await {
+                        Ok(live) => guard = Some(live),
+                        Err(e) => return Err(PullError::Unavailable(format!("qta connect: {e}"))),
                     }
                 }
-                Err(last_err.unwrap_or_else(|| PullError::Unavailable("exhausted attempts".into())))
-            })
-            .await;
-            match result {
-                Ok(result) => result,
-                Err(_) => {
-                    *guard = None;
-                    Err(PullError::Unavailable(
-                        "qta exchange: response timeout".into(),
-                    ))
+                let live = guard.as_mut().expect("just ensured");
+                let body = match serde_json::to_vec(&json!({ "method": method, "params": params }))
+                {
+                    Ok(b) => b,
+                    Err(e) => return Err(PullError::Unavailable(format!("params encode: {e}"))),
+                };
+                let (channel, epoch) = (live.route_channel, live.route_epoch);
+                let response = match self.roundtrip_on(live, channel, epoch, body).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        guard = None;
+                        last_err = Some(PullError::Unavailable(format!("qta exchange: {e}")));
+                        continue;
+                    }
+                };
+                match self.classify(response, &mut guard) {
+                    Ok(reply) => return Ok(reply),
+                    Err(ClassifiedError::Retry(e)) => {
+                        last_err = Some(e); // route death evicts; reloading keeps the route
+                        continue;
+                    }
+                    Err(ClassifiedError::Final(e)) => return Err(e),
                 }
             }
+            Err(last_err.unwrap_or_else(|| PullError::Unavailable("exhausted attempts".into())))
         })
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                guard = None;
+                Err(PullError::Unavailable(
+                    "qta exchange: response timeout".into(),
+                ))
+            }
+        };
+        *cached = guard;
+        result
     }
 
     fn classify(
         &self,
         response: Frame,
-        guard: &mut std::sync::MutexGuard<'_, Option<Live>>,
-    ) -> Result<CapacitySnapshot, ClassifiedError> {
+        guard: &mut Option<Live>,
+    ) -> Result<Vec<u8>, ClassifiedError> {
         if response.header.ty == FrameType::Error {
             let err: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
             let code = err.get("code").and_then(Value::as_str).unwrap_or("");
             if error_codes::is_established_route_dead(response.header.flags, code) {
-                **guard = None;
+                *guard = None;
                 return Err(ClassifiedError::Retry(PullError::Unavailable(format!(
                     "route dead ({code})"
                 ))));
@@ -262,8 +271,7 @@ impl QtaClient {
                 "usage.get error: {err}"
             ))));
         }
-        decode_usage_response(&response.body)
-            .map_err(|error| ClassifiedError::Final(PullError::Unavailable(error)))
+        Ok(response.body)
     }
 }
 
@@ -779,7 +787,7 @@ mod tests {
         for _ in 0..2 {
             let before = peer.connection_count();
             {
-                let mut live = client.live.lock().unwrap();
+                let mut live = client.live.blocking_lock();
                 assert!(live.is_none(), "a timeout must evict the cached socket");
                 *live = Some(client.runtime.block_on(client.open()).unwrap());
             }
@@ -793,9 +801,32 @@ mod tests {
                 peer.assert_fetch_reconnected(before),
                 "the timed-out exchange must reach usage.get, not just route.open"
             );
-            assert!(client.live.lock().unwrap().is_none());
+            assert!(client.live.blocking_lock().is_none());
         }
 
+        peer.finish();
+    }
+
+    #[test]
+    fn qta_cancelled_event_fetch_does_not_cache_a_partly_consumed_socket() {
+        let peer = SilentPeer::start(Duration::ZERO);
+        let client = QtaClient::new(&peer.connection_file_path).unwrap();
+        *client.live.blocking_lock() = Some(client.runtime.block_on(client.open()).unwrap());
+        client.runtime.block_on(async {
+            let key = "a".repeat(64);
+            let mut request = Box::pin(client.event_body(&key));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    tokio::select! {
+                        result = &mut request => panic!("silent peer completed the event fetch: {result:?}"),
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                            if peer.connections.lock().unwrap().iter().any(|received| *received) { break; }
+                        }
+                    }
+                }
+            }).await.expect("event request did not reach the peer before cancellation");
+        });
+        assert!(client.live.blocking_lock().is_none());
         peer.finish();
     }
 
@@ -911,7 +942,7 @@ mod tests {
             peer.requests.lock().unwrap().len() >= 2,
             "the operation must reach the peer"
         );
-        assert!(client.live.lock().unwrap().is_none());
+        assert!(client.live.blocking_lock().is_none());
     }
 
     #[test]
