@@ -3347,6 +3347,145 @@ DROP TABLE astrocyte_v23_check;
 PRAGMA cache_size=-2000;
 "#,
     },
+    Migration {
+        version: 24,
+        statements: r#"-- Disposable derived data. Per-call facts and immutable charge history remain authoritative.
+CREATE TABLE summary_value (
+    value_id INTEGER PRIMARY KEY CHECK (value_id >= 0),
+    value TEXT UNIQUE,
+    CHECK ((value_id = 0) = (value IS NULL))
+);
+INSERT INTO summary_value VALUES (0,NULL);
+
+CREATE TABLE summary_hour (
+    kind INTEGER NOT NULL CHECK (kind IN (0,1)),
+    hour_number INTEGER NOT NULL,
+    revision INTEGER NOT NULL CHECK (typeof(revision)='integer' AND revision>0),
+    built_revision INTEGER,
+    format_version INTEGER,
+    events_total INTEGER NOT NULL DEFAULT 0 CHECK (events_total>=0),
+    first_ms INTEGER,
+    last_ms INTEGER,
+    PRIMARY KEY(kind,hour_number),
+    CHECK (kind=0 OR hour_number=0)
+) WITHOUT ROWID;
+CREATE TABLE summary_dirty_hour (
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    PRIMARY KEY(kind,hour_number),
+    FOREIGN KEY(kind,hour_number) REFERENCES summary_hour(kind,hour_number)
+) WITHOUT ROWID;
+CREATE TABLE summary_cell (
+    cell_id INTEGER PRIMARY KEY,
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    producer INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(producer>0),
+    provider INTEGER NOT NULL REFERENCES summary_value(value_id),
+    model INTEGER NOT NULL REFERENCES summary_value(value_id),
+    account INTEGER NOT NULL REFERENCES summary_value(value_id),
+    auth_selection INTEGER NOT NULL REFERENCES summary_value(value_id),
+    charge_basis INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(charge_basis>0),
+    work_class INTEGER NOT NULL REFERENCES summary_value(value_id),
+    project INTEGER NOT NULL REFERENCES summary_value(value_id),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id),
+    payload TEXT NOT NULL CHECK(json_valid(payload)),
+    UNIQUE(kind,hour_number,producer,provider,model,account,auth_selection,charge_basis,work_class,project,currency),
+    FOREIGN KEY(kind,hour_number) REFERENCES summary_hour(kind,hour_number)
+);
+CREATE TABLE summary_quantity (
+    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
+    unit INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(unit>0),
+    role INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(role>0),
+    exponent INTEGER NOT NULL CHECK(exponent BETWEEN -9 AND 1),
+    units TEXT NOT NULL,
+    observations INTEGER NOT NULL CHECK(observations>=0),
+    covered_units TEXT NOT NULL,
+    covered_observations INTEGER NOT NULL CHECK(covered_observations>=0),
+    PRIMARY KEY(cell_id,unit,role,exponent)
+) WITHOUT ROWID;
+CREATE TABLE summary_money (
+    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
+    kind INTEGER NOT NULL CHECK(kind IN (0,1)),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(currency>0),
+    nanos TEXT NOT NULL,
+    contributions INTEGER NOT NULL CHECK(contributions>0),
+    PRIMARY KEY(cell_id,kind,currency)
+) WITHOUT ROWID;
+CREATE TABLE summary_cost_frequency (
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    producer INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(producer>0),
+    work_class INTEGER NOT NULL REFERENCES summary_value(value_id),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(currency>0),
+    nanos INTEGER NOT NULL,
+    samples INTEGER NOT NULL CHECK(samples>0),
+    PRIMARY KEY(kind,hour_number,producer,work_class,currency,nanos),
+    FOREIGN KEY(kind,hour_number) REFERENCES summary_hour(kind,hour_number)
+) WITHOUT ROWID;
+CREATE TABLE summary_audit_state (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    after_kind INTEGER,
+    after_hour INTEGER,
+    next_due_ms INTEGER NOT NULL DEFAULT 0,
+    examined INTEGER NOT NULL DEFAULT 0,
+    mismatches INTEGER NOT NULL DEFAULT 0,
+    hours INTEGER NOT NULL DEFAULT 0,
+    chunks INTEGER NOT NULL DEFAULT 0,
+    spent_ms INTEGER NOT NULL DEFAULT 0,
+    max_chunk_ms INTEGER NOT NULL DEFAULT 0,
+    started_at_ms INTEGER,
+    CHECK((after_kind IS NULL)=(after_hour IS NULL)),
+    CHECK(after_kind IS NULL OR after_kind IN (0,1)),
+    CHECK(after_kind IS NULL OR after_kind=0 OR after_hour=0)
+);
+INSERT INTO summary_audit_state(id) VALUES(1);
+CREATE INDEX usage_event_summary_time ON usage_event(occurred_at_ms,event_key);
+
+-- SQLite division truncates; subtracting for a negative remainder gives UTC floor hours.
+INSERT INTO summary_hour(kind,hour_number,revision,events_total,first_ms,last_ms)
+SELECT occurred_at_ms IS NULL,
+       COALESCE(occurred_at_ms/3600000-(occurred_at_ms%3600000<0),0),1,
+       COUNT(*),MIN(occurred_at_ms),MAX(occurred_at_ms)
+FROM usage_event GROUP BY 1,2;
+INSERT INTO summary_dirty_hour SELECT kind,hour_number FROM summary_hour;
+
+-- Measurements are inserted with their event. Charge writers update the header first
+-- in the same transaction; priced_charge_matches_event_generation_and_basis enforces
+-- header/charge agreement, not transaction identity. Child inserts need no dirty write.
+CREATE TRIGGER summary_event_insert AFTER INSERT ON usage_event BEGIN
+    INSERT INTO summary_hour(kind,hour_number,revision)
+    VALUES(NEW.occurred_at_ms IS NULL,COALESCE(NEW.occurred_at_ms/3600000-(NEW.occurred_at_ms%3600000<0),0),1)
+    ON CONFLICT(kind,hour_number) DO UPDATE SET revision=revision+1;
+    INSERT OR IGNORE INTO summary_dirty_hour
+    VALUES(NEW.occurred_at_ms IS NULL,COALESCE(NEW.occurred_at_ms/3600000-(NEW.occurred_at_ms%3600000<0),0));
+END;
+CREATE TRIGGER summary_event_update AFTER UPDATE OF pricing_generation,currency,charge_basis ON usage_event BEGIN
+    INSERT INTO summary_hour(kind,hour_number,revision)
+    VALUES(NEW.occurred_at_ms IS NULL,COALESCE(NEW.occurred_at_ms/3600000-(NEW.occurred_at_ms%3600000<0),0),1)
+    ON CONFLICT(kind,hour_number) DO UPDATE SET revision=revision+1;
+    INSERT OR IGNORE INTO summary_dirty_hour
+    VALUES(NEW.occurred_at_ms IS NULL,COALESCE(NEW.occurred_at_ms/3600000-(NEW.occurred_at_ms%3600000<0),0));
+END;
+CREATE TRIGGER summary_adjustment_insert AFTER INSERT ON adjustment BEGIN
+    INSERT INTO summary_hour(kind,hour_number,revision)
+    SELECT occurred_at_ms IS NULL,COALESCE(occurred_at_ms/3600000-(occurred_at_ms%3600000<0),0),1
+    FROM usage_event WHERE event_key=NEW.event_key
+    ON CONFLICT(kind,hour_number) DO UPDATE SET revision=revision+1;
+    INSERT OR IGNORE INTO summary_dirty_hour
+    SELECT occurred_at_ms IS NULL,COALESCE(occurred_at_ms/3600000-(occurred_at_ms%3600000<0),0)
+    FROM usage_event WHERE event_key=NEW.event_key;
+END;
+CREATE TRIGGER summary_transition_insert AFTER INSERT ON chargeability_transition BEGIN
+    INSERT INTO summary_hour(kind,hour_number,revision)
+    SELECT occurred_at_ms IS NULL,COALESCE(occurred_at_ms/3600000-(occurred_at_ms%3600000<0),0),1
+    FROM usage_event WHERE event_key=NEW.event_key
+    ON CONFLICT(kind,hour_number) DO UPDATE SET revision=revision+1;
+    INSERT OR IGNORE INTO summary_dirty_hour
+    SELECT occurred_at_ms IS NULL,COALESCE(occurred_at_ms/3600000-(occurred_at_ms%3600000<0),0)
+    FROM usage_event WHERE event_key=NEW.event_key;
+END;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -3407,9 +3546,10 @@ mod tests {
     fn schema_v23_runner_applies_once_and_returns_the_final_store_ahead_outcome() {
         let (_directory, store) = migration_store();
         let first = migrate_store(&store).unwrap();
+        // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (23, 23, 23)
+            (24, 24, 24)
         );
         assert_eq!(
             store
@@ -3422,7 +3562,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 23, 23)
+            (0, 24, 24)
         );
         assert!(!second.store_ahead());
         store
@@ -3432,7 +3572,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',24,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',25,1)",
                     [],
                 )?;
                 Ok(())
@@ -3441,7 +3581,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 24, 23)
+            (0, 25, 24)
         );
         assert!(ahead.store_ahead());
     }
@@ -3487,6 +3627,177 @@ mod tests {
         let mut conn = open_memory();
         migrate23(&mut conn).unwrap();
         conn
+    }
+
+    fn hourly_store() -> Connection {
+        let conn = integer_store();
+        conn.execute_batch(
+            MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == 24)
+                .unwrap()
+                .statements,
+        )
+        .unwrap();
+        conn
+    }
+
+    fn hourly_request() -> crate::ingest::EventRecordRequest {
+        serde_json::from_value(serde_json::json!({
+            "producer":"hourly-test", "producer_ref":"call", "charge_basis":"unknown",
+            "occurred_at_ms":3_600_001,
+            "measurements":(["input","output","reasoning","cache_read","cache_write"].map(|role|
+                serde_json::json!({"role":role,"unit":"token","kind":"billed","source":"test",
+                    "quantity_units":12,"quantity_exponent":0})))
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn hourly_schema_seeds_every_hour_without_changing_per_call_facts() {
+        let conn = integer_store();
+        for (index, occurred) in [
+            Some(-1_i64),
+            None,
+            Some(0),
+            Some(3_599_999),
+            Some(3_600_000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.execute("INSERT INTO usage_event(event_id,producer,producer_ref,occurred_at_ms,recorded_at_ms,charge_basis)
+                VALUES(?1,'hourly-test',?1,?2,1,'unknown')",params![format!("e{index}"),occurred]).unwrap();
+        }
+        conn.execute_batch(
+            MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == 24)
+                .unwrap()
+                .statements,
+        )
+        .unwrap();
+        let dirty = conn
+            .prepare("SELECT kind,hour_number FROM summary_dirty_hour ORDER BY kind,hour_number")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(dirty, [(0, -1), (0, 0), (0, 1), (1, 0)]);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM usage_event", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        conn.execute("INSERT INTO summary_value(value) VALUES('')", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM summary_value", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(conn
+            .execute("INSERT INTO summary_value(value) VALUES(NULL)", [])
+            .is_err());
+    }
+
+    #[test]
+    fn hourly_recording_marks_once_and_rolls_back_with_its_measurements() {
+        use crate::ingest::{record_event_in_tx, DeliveryPath};
+        let mut conn = hourly_store();
+        let tx = conn.transaction().unwrap();
+        record_event_in_tx(&tx, &hourly_request(), 1, DeliveryPath::Read).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT revision FROM summary_hour", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM measurement", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM summary_dirty_hour", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        tx.rollback().unwrap();
+        for table in [
+            "usage_event",
+            "measurement",
+            "summary_hour",
+            "summary_dirty_hour",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{table}"
+            );
+        }
+        conn.execute_batch("CREATE TRIGGER refuse_dirty BEFORE INSERT ON summary_dirty_hour BEGIN SELECT RAISE(ABORT,'refuse dirty'); END;").unwrap();
+        let tx = conn.transaction().unwrap();
+        assert!(record_event_in_tx(&tx, &hourly_request(), 1, DeliveryPath::Read).is_err());
+        tx.rollback().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM usage_event", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn hourly_pricing_bumps_header_before_guarded_heads_and_marks_once() {
+        use crate::{ingest, pricing};
+        let mut conn = hourly_store();
+        let request = hourly_request();
+        let event = ingest::record_event(&mut conn, &request, 1).unwrap();
+        let tx = conn.transaction().unwrap();
+        let plan = pricing::read_reprice_in_tx(&tx, &event.event_id).unwrap();
+        tx.commit().unwrap();
+        let resolved = pricing::resolve_reprice_without_catalog(&plan).unwrap();
+        let tx = conn.transaction().unwrap();
+        pricing::commit_reprice_in_tx(
+            &tx,
+            &plan,
+            &resolved,
+            2,
+            pricing::PricingOrigin::PricingPass,
+        )
+        .unwrap();
+        assert_eq!(
+            tx.query_row("SELECT revision FROM summary_hour", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            tx.query_row(
+                "SELECT count(*) FROM priced_charge WHERE pricing_generation=1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            5
+        );
+        assert_eq!(
+            tx.query_row("SELECT pricing_generation FROM usage_event", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            1
+        );
+        tx.commit().unwrap();
     }
 
     fn logical_rows(
