@@ -1605,6 +1605,7 @@ fn run_loop_full(
     let interval = Duration::from_secs(poll_secs.max(1));
     let mut reconciler = QueueReconciler::new(QUEUE_RECONCILE_CHUNK, QUEUE_RECONCILE_TICK_BUDGET);
     let mut pricing = PricingWalk::new(PricingBudget::PER_TICK);
+    let mut summaries = astrocyte_core::report::SummaryMaintenance::default();
     while !stop.load(Ordering::Relaxed) {
         run_tick(
             &state,
@@ -1616,6 +1617,7 @@ fn run_loop_full(
             &mut reconciler,
             &stop,
         );
+        summary_tick(&state, &mut summaries, &stop);
         if !stop.load(Ordering::Relaxed) {
             multiplier.tick(&state, pending_catalog.is_some(), current_time_ms());
         }
@@ -1627,6 +1629,84 @@ fn run_loop_full(
             std::thread::sleep(
                 Duration::from_millis(250).min(interval.saturating_sub(started.elapsed())),
             );
+        }
+    }
+}
+
+/// Fresh summary work follows ingestion and pricing, with short snapshot chunks
+/// and a separate revision-checked writer transaction for publication.
+fn summary_tick(
+    state: &SharedState,
+    summaries: &mut astrocyte_core::report::SummaryMaintenance,
+    stop: &AtomicBool,
+) {
+    let budget = Duration::from_millis(1_500);
+    let started = std::time::Instant::now();
+    let mut slowest = Duration::ZERO;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let chunk = std::time::Instant::now();
+        let now = current_time_ms();
+        let ready = state.with_read_op(|conn| {
+            interrupt_on_stop(conn, stop, || Ok(summaries.read_chunk(conn, now)))
+                .map_err(|error| ("internal".into(), error.to_string()))?
+                .map_err(|error| ("internal".into(), format!("summary read: {error:?}")))
+        });
+        let ready = match ready {
+            Ok(ready) => ready,
+            Err((_, error)) => {
+                if !stop.load(Ordering::Relaxed) {
+                    tracing::warn!(target: "summary", %error, "summary chunk failed; retry after one hour");
+                    summaries.defer_after_error(now);
+                }
+                return;
+            }
+        };
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if ready {
+            let result = state.ordered_write(|tx| {
+                let outcome = interrupt_on_stop(tx, stop, || Ok(summaries.publish(tx, now)))
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| format!("summary publish: {error:?}"))?;
+                // Derived rows do not change the cached config/capacity projection.
+                Ok((outcome, false))
+            });
+            match result {
+                Ok(outcome) => {
+                    if outcome.deferred {
+                        tracing::warn!(target: "summary", hour=?outcome.hour,
+                            "hour exceeds bounded summary publication; retaining live aggregation");
+                    }
+                    if outcome.mismatch {
+                        tracing::warn!(target: "summary", hour=?outcome.hour,
+                            examined=outcome.examined, "clean hourly summary differs from base facts; requeued");
+                    }
+                    if outcome.audit_completed {
+                        tracing::info!(target: "summary", examined=outcome.examined,
+                            hours=outcome.hours, mismatches=outcome.mismatches,
+                            chunks=outcome.chunks, reduce_compare_ms=outcome.spent_ms,
+                            max_step_ms=outcome.max_chunk_ms, elapsed_ms=outcome.audit_elapsed_ms,
+                            "hourly summary full-ledger audit completed");
+                    }
+                }
+                Err(error) => {
+                    if !stop.load(Ordering::Relaxed) {
+                        tracing::warn!(target: "summary", %error, "summary publication failed; retry after one hour");
+                        summaries.defer_after_error(now);
+                    }
+                    return;
+                }
+            }
+        } else if !summaries.has_pending() {
+            return;
+        }
+        slowest = slowest.max(chunk.elapsed());
+        if started.elapsed().saturating_add(slowest) > budget {
+            return;
         }
     }
 }
@@ -6405,6 +6485,110 @@ mod loop_tests {
     }
 
     struct PricingSource;
+
+    #[test]
+    fn hourly_summary_tick_publishes_real_drain_facts_without_changing_the_served_report() {
+        let state = test_state();
+        run_iteration_with_capacity(
+            &state,
+            &[Producer {
+                source_key: "broca".into(),
+                client: Arc::new(PricingSource),
+            }],
+            None,
+            &AtomicBool::new(false),
+        );
+        let before =
+            crate::ops::dispatch(&state, "spend.workclass.report", serde_json::json!({})).unwrap();
+        assert_eq!(before["rows"][0]["events_total"], 1);
+        let mut summaries = astrocyte_core::report::SummaryMaintenance::default();
+        let stop = AtomicBool::new(true);
+        summary_tick(&state, &mut summaries, &stop);
+        assert_eq!(
+            state
+                .with_conn(|conn| conn
+                    .query_row("SELECT count(*) FROM summary_cell", [], |row| row
+                        .get::<_, i64>(0))
+                    .map_err(|error| error.to_string()))
+                .unwrap(),
+            0
+        );
+        stop.store(false, Ordering::Relaxed);
+        summary_tick(&state, &mut summaries, &stop);
+        assert_eq!(
+            crate::ops::dispatch(&state, "spend.workclass.report", serde_json::json!({})).unwrap(),
+            before
+        );
+        let (facts,cells,dirty):(i64,i64,i64)=state.with_conn(|conn|conn.query_row("SELECT (SELECT count(*) FROM usage_event),(SELECT count(*) FROM summary_cell),(SELECT count(*) FROM summary_dirty_hour)",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|error|error.to_string())).unwrap();
+        assert_eq!(facts, 1);
+        assert!(cells > 0);
+        assert_eq!(dirty, 0);
+    }
+
+    #[test]
+    fn hourly_report_snapshot_keeps_old_summary_money_across_a_write_and_publication() {
+        use astrocyte_core::{ingest, verdict};
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::state::leased_test_state(&directory);
+        let result=crate::ops::dispatch(&state,"spend.event.ingest",serde_json::json!({"producer":"fixture","producer_ref":"snapshot-one","provider":"provider","model":"model","charge_basis":"metered_api","occurred_at_ms":1000,
+            "measurements":[{"role":"input","unit":"token","kind":"billed","source":"fixture","quantity_units":12,"quantity_exponent":0}]})).unwrap();
+        let event_id = result["event_id"].as_str().unwrap().to_string();
+        // Hand-valued setup isolates snapshot behavior from catalog/network availability.
+        state.ordered_write(|tx| {
+            tx.execute("UPDATE usage_event SET pricing_generation=1,currency='USD' WHERE event_id=?1",[&event_id]).map_err(|error|error.to_string())?;
+            tx.execute("INSERT INTO priced_charge(event_key,role,unit,pricing_generation,outcome,charge_basis,basis_covered,currency,charge_nanos,rate_units,rate_exponent,floor_state,catalog_source,resolved_at_ms,catalog_entry,origin,recorded_at_ms)
+                VALUES((SELECT event_key FROM usage_event WHERE event_id=?1),'input','token',1,'priced','metered_api',0,'USD',100,1,9,'none','fixture',1,'{}','pricing_pass',1)",[&event_id]).map_err(|error|error.to_string())?;
+            Ok(((),true))
+        }).unwrap();
+        let mut summaries = astrocyte_core::report::SummaryMaintenance::default();
+        let stop = AtomicBool::new(false);
+        summary_tick(&state, &mut summaries, &stop);
+        let reader = rusqlite::Connection::open_with_flags(
+            directory.path().join("ledger.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader.busy_timeout(Duration::from_secs(5)).unwrap();
+        reader.pragma_update(None, "foreign_keys", true).unwrap();
+        let snapshot = reader.unchecked_transaction().unwrap();
+        let request = verdict::VerdictRequest {
+            project_root: None,
+            provider: None,
+            model: None,
+            est_cost_nanos: None,
+        };
+        let before = verdict::evaluate(&snapshot, &request).unwrap();
+        assert_eq!(before.consumed_nanos["USD"], 100);
+        state
+            .ordered_write(|tx| {
+                ingest::record_adjustment_in_tx(
+                    tx,
+                    &ingest::AdjustmentRecordRequest {
+                        event_id: event_id.clone(),
+                        currency: "USD".into(),
+                        amount_nanos: -25,
+                        reason: ingest::AdjustmentReason::Refund,
+                        occurred_at_ms: 2,
+                        note: None,
+                    },
+                    &ingest::AdjustmentWriteContext::correction_ingest("snapshot-refund".into()),
+                    3,
+                )
+                .map_err(|error| format!("{error:?}"))?;
+                Ok(((), true))
+            })
+            .unwrap();
+        summary_tick(&state, &mut summaries, &stop);
+        assert_eq!(
+            serde_json::to_vec(&verdict::evaluate(&snapshot, &request).unwrap()).unwrap(),
+            serde_json::to_vec(&before).unwrap()
+        );
+        snapshot.commit().unwrap();
+        let after = crate::ops::dispatch(&state, "budget.verdict", serde_json::json!({})).unwrap();
+        assert_eq!(after["consumed_nanos"]["USD"], 75);
+        let (facts,adjustments,dirty):(i64,i64,i64)=state.with_conn(|conn|conn.query_row("SELECT (SELECT count(*) FROM usage_event),(SELECT count(*) FROM adjustment),(SELECT count(*) FROM summary_dirty_hour)",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|error|error.to_string())).unwrap();
+        assert_eq!((facts, adjustments, dirty), (1, 1, 0));
+    }
 
     impl SourceClient for PricingSource {
         fn pull(&self, _since: Option<SourceCursor>, _limit: u32) -> Result<ExportPage, PullError> {
