@@ -1,18 +1,21 @@
 # Architecture
 
-Code is authoritative; `STRUCTURE.md` maps it.
+The source is authoritative; `STRUCTURE.md` maps it.
 
 ## System shape
 
-Astrocyte (`ck-astrocyte`) records machine AI usage off the request hot path,
-prices signed nanodollars against fusiform and serves reports/reconciliation over
-subc. `budget.verdict` returns `allow`; cap enforcement is not built.
+Astrocyte (`ck-astrocyte`) records machine-scoped AI usage off the request hot path,
+prices events in signed nanodollars against fusiform, and serves ledger, report and
+reconciliation over subc. `budget.verdict` always returns `allow`, because cap
+enforcement is not built.
 
-Three crates:
+The workspace has three crates:
 
-- `astrocyte-core`: identity, ingest, pricing, subscriptions, statements, reports,
-  reconciliation and SQLite; no subc dependency.
-- `astrocyte-module`: binary, serving/configuration, refresher, subc clients and mappings.
+- `astrocyte-core`: producer-neutral identity, ingest, pricing, subscriptions,
+  statements, reconciliation, reports and the SQLite schema. It has no subc
+  dependency.
+- `astrocyte-module`: the `ck-astrocyte` binary. It holds the serving surface, desired
+  configuration, the refresher loop, the subc clients and the producer mappings.
 - `astrocyte-readers`: parsers for coding-harness session stores (Claude Code,
   Codex, OpenCode, Pi, Gemini CLI, Goose, Oh My Pi, Kimi CLI) and provider identity
   normalization.
@@ -20,91 +23,54 @@ Three crates:
 ## Durable state
 
 `crates/astrocyte-core/src/store.rs` defines `MIGRATIONS` (versions 1 to 24).
-`initialize_connection` checks foreign keys, probes JSON/triggers/partial indexes
-and sets a 5000 ms busy timeout. Read-only connections copy the timeout, skipping
-the table-creating probe.
+`initialize_connection` enables and verifies foreign keys, probes SQLite JSON, triggers and
+partial indexes, and sets a 5000 ms busy timeout. The read-only report connection
+skips the table-creating probe and copies that timeout.
 
-After version 24 these tables exist:
+The [data model](docs/data-model.md#tables) describes every table in version 24 and its write rules.
 
-| Table | Holds |
-|---|---|
-| `usage_event` | producer identity, immutable facts and pricing projection |
-| `measurement` | immutable quantities by event, role and unit |
-| `chargeability_transition` | append-only chargeability settlement |
-| `quarantine_evidence` | contradictory referring quantities |
-| `rejected_delivery` | conflicting redelivery evidence |
-| `set_aside_record` | unreadable source/locator evidence and observation times |
-| `redelivery_log` | identical pushed redeliveries |
-| `adjustment` | signed write-off, restatement, repricing, refund or goodwill |
-| `priced_charge` | immutable per-measurement charge chains and origins |
-| `pricing_pending` | events with headless measurements |
-| `pricing_selection_state` | plan/backfill generations |
-| `account_subscription` | effective-dated subscription plans per provider account |
-| `statement` | vendor statement identities |
-| `statement_line` | immutable statement line content |
-| `match_attempt` | append-only line matches and captured amounts |
-| `statement_import` | CSV import provenance and content idempotency |
-| `desired_config` | the committed desired-configuration generation |
-| `source_runtime` | producer cursor, lineage, success and pending state |
-| `capacity_runtime` | disabled, unavailable or active capacity axis |
-| `capacity_window` | latest QTA quota windows per account |
-| `capacity_observation` | latest capacity observation per identity |
-| `capacity_provider_reading` | latest provider-level capacity readings |
-| `window_sample` | append-only capacity window history and breakdown |
-| `multiplier_observation` | immutable provider/day observations and superseding recomputes |
-| `summary_value` | lossless string/null dictionary |
-| `summary_hour` | persistent revisions, publication state and time extrema |
-| `summary_dirty_hour` | hours requiring fresh reduction |
-| `summary_cell` | dimension-keyed counts, exact money and reason maps |
-| `summary_quantity` | role/unit/exponent quantities and covered populations |
-| `summary_money` | actual-currency contributions and presence counts |
-| `summary_cost_frequency` | exact per-event head-value frequencies |
-| `summary_audit_state` | independent audit cursor and progress |
-
-Schema 23 introduced local integer `event_key`/`charge_key`, never served IDs.
-Event digests remain dedup identities; charge digests are retired. The predecessor
-FK and `priced_charge_supersedes_same_measurement` require an existing
-same-measurement predecessor even with deferred FKs. VACUUM and a full backup
-baseline follow rebuild commit offline. `spend.charge.explain` serves role, unit,
-generation and predecessor generation.
+Schema 23 uses local integer `event_key` and `charge_key` references, never served
+IDs. Event digests remain the dedup/served identity; charge digests are retired.
+The scalar predecessor FK and `priced_charge_supersedes_same_measurement` trigger
+require an existing same-measurement predecessor, even with deferred FKs. Operators
+run VACUUM after commit and start a full backup baseline. `spend.charge.explain`
+identifies charges by role, unit and generation; `supersedes` serves the predecessor
+generation.
 
 Triggers `usage_event_no_delete`, `measurement_no_update` and `priced_charge_no_update`
 abort UPDATE and DELETE. Corrections append rows; see the [data model](docs/data-model.md).
 
 ## Hourly summaries
 
-Migration 24 seeds history dirty without removing per-call facts. UTC-hour cells
-key producer, provider, model, account, auth selection, basis, work class, project
-and nullable currency through `summary_value`; undated is separate. Checked i128
-sums persist as decimal text with presence counts. Exact head-value frequencies
-for complete, dated, currency-known events preserve percentiles without adjustments.
-Budget uncertainty keeps its separate no-head/any-unpriced predicate.
-
-Event/header, adjustment and transition triggers mark hours in their transaction.
-Measurements share event insertion; charge writers must bump the header first.
-`priced_charge_matches_event_generation_and_basis` checks agreement, not transaction
-identity; no child dirty write is needed.
-
-`SummaryMaintenance` reduces fresh 5000-event read chunks, replacing an hour only
-if its revision still matches in the ordered writer transaction; no total deltas.
-Dirty, missing and timezone/plan seam hours read source facts in the report
-snapshot; broad scopes retain the original path. Oversized publications stay live.
-A persisted independent full-ledger audit requeues missed marks and logs progress,
-restarting an hour after completion. Stop interrupts work; failures back off an hour.
-Multiplier/recompute and per-event explanation keep their original paths.
+Per-call rows remain authoritative, and hourly summaries are derived data that can
+be rebuilt. Triggers mark the affected UTC hour or undated partition dirty in the
+same transaction that records an event or changes its pricing, adjustments or
+chargeability. The refresher rebuilds dirty hours from the base tables and
+publishes a replacement only if the hour's revision still matches. Reports read
+clean whole hours from summaries and read dirty, missing or timezone and
+subscription seam hours from base rows in the same snapshot. Work-class
+percentiles come from exact value frequencies rather than approximate buckets.
+The audit compares summaries against base rows, requeues discrepancies and starts
+its next pass an hour after the previous pass completes. Charge writers must
+update the event header before inserting heads; the existing generation-and-basis
+guard checks agreement, not transaction identity. The [data model](docs/data-model.md#hourly-summaries)
+explains the grain, arithmetic, invalidation rules and maintenance budgets.
 
 ## Write ordering
 
-`SharedState` has one store, a writer fence and two connections. `ordered_write`
-and `ordered_op_write` commit under the fence, refreshing the projection for
-primary changes. Network/file inputs precede writes; statement imports require
-regular files up to 64 MiB. A failed projection refresh leaves committed data and
-stale health; a write panic rolls back and stops non-zero for supervisor restart.
+`SharedState` holds one store, a writer fence and two connections. `ordered_write`
+(refresher) and `ordered_op_write` (served operations) run one transaction under the
+fence, then refresh the projection. Network and file I/O precede transactions;
+statement import accepts regular files up to 64 MiB. A failed projection refresh
+leaves the commit intact; health stays stale until a refresh succeeds. A write panic
+rolls back and stops the module non-zero so the supervisor restarts it.
 
-Served reads use `with_read_op` on the mutex-guarded read-only WAL connection:
-one snapshot without the ingest writer fence. Summary chunks and multiplier
-recompute use this reader; pricing/reprice/basis planning uses `with_conn` on the
-writer. The reader cannot write and needs no lease.
+Served reads, including `budget.verdict`, use `with_read_op` on a mutex-guarded
+read-only connection opened after migration. In WAL mode a report neither waits for
+nor blocks ingest, and each read sees one ledger snapshot. Refresher reads and reads before
+`spend.event.reprice` and `spend.basis.correct` use the writer via `with_conn`;
+`spend.multiplier.recompute` reads on the reader before writing. The reader cannot
+write, so it needs no lease.
 
 ## Producers
 
@@ -159,9 +125,6 @@ without degrading health.
 5. Spend a bounded budget reconciling `pricing_pending` against the full ledger, to
    catch any write path that failed to enqueue.
 
-6. Rebuild/audit hourly summaries in a shared 1.5-second soft budget, after normal
-   ingestion, pricing and queue reconciliation.
-
 An unrequested refresher end or handler panic stops the module non-zero. Failed
 handlers attempt a small correlated `internal` error reply. EOF, GOODBYE and SIGTERM
 keep their clean-stop paths.
@@ -171,14 +134,14 @@ The ckbus route shares HELLO's single nonce handoff. Daemon validation of
 The refresher drains account writes between ticks (250 ms idle wait) and joins
 the bus reader on its stop flag. Mode changes are logged, not added to health schemas.
 
-After each tick, `astrocyte-core/src/multiplier.rs` attempts missing completed UTC
-days among the last seven, oldest first; each covers seven days ending at 00:00Z.
-It waits for source progress or two hours, disclosing stale sources in
-`error_deflating`; absent/skipped sources do not block. It reads `window_sample`
-and scoped models, calls fusiform outside transactions, then appends in its own
-write. Failures retry without rows, logged once per day/reason.
-`rate_fact_unrecognized` fails the day; `no_catalog_coverage` counts unpriced tokens.
-Older days need operator recompute.
+After each tick, `astrocyte-core/src/multiplier.rs` attempts missing observations
+for the seven most recent completed UTC days, oldest first; each covers seven days
+ending at 00:00Z. It waits for source reads past the boundary, or two hours, then
+discloses stale sources in `error_deflating`. Absent/skipped sources do not block.
+It reads `window_sample` and scoped models, calls fusiform `plan.prices` and
+`catalog.get` outside transactions, and appends in its own write. Failures retry
+without rows, logged once per day/reason. `rate_fact_unrecognized` fails the day;
+`no_catalog_coverage` counts unpriced tokens. Older days need operator recompute.
 
 Ledger pricing and the multiplier share `parse_rate_key` in
 `astrocyte-core/src/catalog_client.rs`: `rate.<role>` or

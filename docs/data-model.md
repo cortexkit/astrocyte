@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 23. A schema change appends a migration; an applied
+currently version 24. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -10,30 +10,38 @@ ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
 | Table | Holds | Writes |
 |---|---|---|
-| `usage_event` | One usage event per natural key | insert; three projection columns, see below |
-| `measurement` | The event's quantities, one row per `(role, unit)` | insert only |
-| `chargeability_transition` | Whether an event is chargeable, settled once | insert only |
-| `quarantine_evidence` | A referring event's quantities that contradict its target | insert |
-| `rejected_delivery` | A redelivery whose payload differs from the stored event | insert |
-| `redelivery_log` | An identical redelivery pushed by a peer | insert |
-| `adjustment` | Signed money adjustments | insert |
-| `priced_charge` | The priced-charge chain per measurement | insert only |
-| `pricing_pending` | Events with a measurement that has no current head | queue |
-| `pricing_selection_state` | Plan generation and the generation the coverage backfill drained | one row |
-| `account_subscription` | Effective-dated subscription plans per provider account | insert; close once |
-| `statement` | Vendor statement identities | insert only |
-| `statement_line` | Statement line content | insert; match projection |
-| `match_attempt` | Line-to-event matches with the amounts captured | insert only |
-| `statement_import` | Import provenance and content digest | insert only |
-| `desired_config` | The committed desired configuration | one row |
-| `source_runtime` | Per-source cursor, lineage, last success and pending counts | upsert |
-| `set_aside_record` | Unreadable producer records by source and locator | upsert |
-| `capacity_runtime` | Capacity axis state | upsert |
-| `capacity_window` | Latest quota windows per account | upsert |
-| `capacity_observation` | Latest capacity observation per identity | upsert |
-| `capacity_provider_reading` | Latest provider-level capacity readings | upsert |
-| `window_sample` | Quota window history | insert |
-| `multiplier_observation` | Daily subscription multiplier rows | insert only |
+| `usage_event` | Each row records one usage event per producer reference and lineage, together with its pricing projection. | insert; three projection columns, see below |
+| `measurement` | Each row records one immutable event quantity for a role and unit. | insert only |
+| `chargeability_transition` | Each row records the one terminal settlement of an event's chargeability. | insert only |
+| `quarantine_evidence` | Each row preserves a referring event's quantities that contradict its target. | insert |
+| `rejected_delivery` | Each row preserves a redelivery whose payload differs from the stored event. | insert |
+| `redelivery_log` | Each row records an identical redelivery pushed by a peer. | insert |
+| `adjustment` | Each row records a signed write-off, restatement, repricing, refund or goodwill adjustment. | insert |
+| `priced_charge` | Each row records a charge-chain entry for a measurement and the origin of the pricing act. | insert only |
+| `pricing_pending` | Each row identifies an event with a measurement that has no current charge head. | queue |
+| `pricing_selection_state` | The row records the plan generation and the generation that coverage backfill has drained. | one row |
+| `account_subscription` | Each row declares an effective-dated subscription plan for a provider account. | insert; close once |
+| `statement` | Each row records a vendor statement identity. | insert only |
+| `statement_line` | Each row preserves immutable statement line content and its current match projection. | insert; match projection |
+| `match_attempt` | Each row records a statement-line match attempt and the amounts captured for that attempt. | insert only |
+| `statement_import` | Each row records CSV import provenance and its content digest for idempotency. | insert only |
+| `desired_config` | The row records the committed desired-configuration generation. | one row |
+| `source_runtime` | Each row records a producer's cursor, lineage, last successful drain and pending disclosure. | upsert |
+| `set_aside_record` | Each row records an unreadable producer record by source and locator, including its reason and observation times. | upsert |
+| `capacity_runtime` | The row records whether the capacity axis is disabled, configured but unavailable, or active. | upsert |
+| `capacity_window` | Each row records a provider account's latest QTA quota window. | upsert |
+| `capacity_observation` | Each row records the latest capacity observation for an identity. | upsert |
+| `capacity_provider_reading` | Each row records the latest capacity reading for a provider without account attribution. | upsert |
+| `window_sample` | Each row preserves a capacity-window observation and its breakdown in the append-only history. | insert |
+| `multiplier_observation` | Each row records a daily subscription multiplier observation or an operator recompute that supersedes an earlier observation. | insert only |
+| `summary_value` | Each row assigns an exact stored string an integer identifier, with identifier zero reserved for null. | Builders insert new values. |
+| `summary_hour` | Each row records an hour's persistent revision, published revision, format, event count and time extrema. | Triggers advance revisions, and publication records a completed build. |
+| `summary_dirty_hour` | Each row identifies an hour that needs a fresh reduction from base rows. | Triggers insert dirty keys, and successful publication removes them. |
+| `summary_cell` | Each row holds dimension-keyed event and measurement counters, exact money sums and reason maps for one hour. | Rebuilds replace these rows. |
+| `summary_quantity` | Each row holds exact quantities for a cell, role, unit and exponent, including the covered population and presence counts. | Rebuilds replace these rows. |
+| `summary_money` | Each row holds current-head or adjustment contributions in their actual currency, together with a presence count. | Rebuilds replace these rows. |
+| `summary_cost_frequency` | Each row counts an exact current-head value in the dated, complete, currency-known work-class sample. | Rebuilds replace these rows. |
+| `summary_audit_state` | The row records the independent audit's cursor, next start time and progress statistics. | The audit updates this row. |
 
 ## Immutability
 
@@ -194,3 +202,130 @@ terminal state, and the schema ties each state to who may set it:
 | `unbillable` | `operator` |
 
 The primary key on `event_id` makes the transition happen at most once.
+
+
+## Hourly summaries
+
+Migration 24 adds derived summary tables beside the ledger; it does not delete
+usage events, measurements, charge history or adjustments. It creates empty
+summary storage and marks every existing UTC hour, including the undated
+partition, dirty so that the refresher can build history in the background.
+Reports remain exact while that work is incomplete because they can still read
+the original rows.
+
+### Grain and exact values
+
+A summary cell is keyed by its UTC hour, producer, provider, model, account,
+auth selection, charge basis, work class, project and event currency. Hours use
+floor division, including for timestamps before the Unix epoch. Undated events
+have a separate partition rather than being assigned to the epoch or to their
+recording time. The string dictionary preserves stored values without trimming,
+case folding or aliasing; null has identifier zero, while an empty string has
+its own positive identifier.
+
+The cell payload records event and measurement populations, reason maps and
+money sums. Quantities are kept separately by role, unit and observed decimal
+exponent, with missing quantities distinguished from stated zero. These are raw
+measurement quantities, not a claim that summing overlapping token roles gives
+one disjoint billed-token count. Money and quantity sums use checked i128
+arithmetic and are stored as decimal text, so SQLite never coerces them through
+floating point. Presence counts preserve a genuine zero contribution and its
+currency instead of treating it as absent. Contributions in different currencies
+are never added together.
+
+The event-priced count is determined before aggregation: an event needs at least
+one measurement, a current head for every measurement, and no blocking declined
+quantity. An examined, declined measurement whose stated quantity is zero does
+not block that report verdict. A declined measurement with an absent or nonzero
+quantity still blocks, as does any measurement that has no current head.
+Budget uncertainty is a separate count because its existing rule is no heads or
+any unpriced head, even when the declined quantity is zero. For populations too
+large to prove that SQLite's signed limb sums cannot overflow, the verdict keeps
+its original SQL path and error behavior.
+
+Work-class percentiles use exact value frequencies, not fixed bins or averages
+of hourly percentiles. Only dated, complete events with a known currency enter
+the sample, and their value is the sum of their current priced heads before
+adjustments. The reader merges frequencies and selects the same nearest rank
+as the base-row report. Signed adjustments change spend and budget consumption,
+but they do not change that head-only cost distribution.
+
+### Transactional invalidation
+
+Event insertion, pricing-header updates, adjustment insertion and chargeability
+transitions mark the affected event's original hour dirty and advance its
+persistent revision in the same SQLite transaction. An adjustment is attributed
+to the usage event's occurrence hour, not to the adjustment's own timestamp.
+Basis corrections, explicit repricing and subscription coverage backfill use
+the same header-update path, so changes to heads, currency, reasons or the
+metered subtotal invalidate the old cells together. A chargeability transition
+is conservatively marked even though a transition alone does not remove money
+from the existing consumption reports.
+
+There is no dirty write for each measurement or charge row. Measurements are
+inserted with their new event, and every production caller of
+`pricing::insert_charge` first updates the event header in
+`pricing::commit_reprice_in_tx`. The existing
+`priced_charge_matches_event_generation_and_basis` guard rejects a head that
+does not agree with the header's generation and basis, but it does not prove
+that the header changed in the same transaction. Every future charge-writing
+path must preserve that header-first transaction sequence. A refused write or a
+rolled-back savepoint rolls back its dirty mark as well as its facts.
+
+### Rebuilding and reading
+
+`SummaryMaintenance` reads at most 5,000 events per source chunk in a short read
+snapshot. It keeps a fresh staged reduction across chunks only while the hour's
+revision remains unchanged. Publication takes the ordered writer transaction,
+checks the revision again, replaces all derived rows for that hour and removes
+the dirty key atomically. The persistent revision survives dirty-key removal,
+so a later write cannot be mistaken for the revision that a builder read
+earlier. No stored money, count or quantity total is maintained by applying
+deltas to the previous summary.
+
+The refresher runs this work after normal ingestion, pricing and pricing-queue
+reconciliation. Refresh and audit share a 1.5-second soft maintenance allowance:
+at least one chunk can run, and the observed slowest chunk guides whether
+another will fit. This is not a hard elapsed-time guarantee for a slow SQLite
+statement. Stop checks and SQLite interruption bound shutdown work, while
+persistent failures back off for an hour. A build that exceeds the 50,000-row
+publication ceiling stays dirty and continues to use live aggregation rather
+than publishing a partial answer.
+
+A report reads the manifest, dirty keys, summary rows and required base rows in
+one caller-owned SQLite snapshot. It uses summaries only for complete, clean
+whole hours whose published revision and format match. Dirty hours, missing
+summaries and hours that cross a local-calendar or subscription-plan boundary
+use the original event timestamps and base-row logic. This includes fractional
+timezone offsets, daylight-saving changes and arbitrary plan effective times.
+The two sources are disjoint, so no event is counted twice. When dirty coverage
+is broad, or a derived value cannot be used safely, the reader retains the
+original full base-row path.
+
+Subscription plans and costs, ingest freshness, set-aside evidence and current
+capacity are still read live rather than being frozen into the cube. Rate
+staleness combines the exact minimum current-head resolution time with the
+request's clock. Multiplier pace, multiplier reports and recomputes, and
+per-event charge explanation keep their existing paths; raw hourly token sums
+cannot replace their per-event valuation rules or history reads.
+
+### Independent audit
+
+The audit compares fresh reductions from base rows with published summaries,
+independently of the dirty queue. It walks both base and manifest hours, so it
+can discover an unmarked new hour that has no summary manifest. It also compares
+counts, money, quantities, exact frequencies and metadata, treating malformed
+derived data as a rebuild request rather than as zero money. A mismatch in a
+clean hour is marked dirty before a warning is logged, allowing later reports
+to use base rows while the refresher repairs it.
+
+The audit persists its cursor and progress statistics, and its next pass starts
+an hour after the previous pass completes. A full pass can take many ticks, so
+this is an hourly interval between passes, not a promise to finish the whole
+ledger every hour. Transactional invalidation keeps normal reports exact at
+every snapshot; the audit is a backstop for a missed mark and cannot make an
+earlier stale reply retroactively exact.
+
+The implementation is in `crates/astrocyte-core/src/report/hourly.rs`, and the
+refresher schedules it from `crates/astrocyte-module/src/refresher.rs`. The
+original reducers remain available for fallback and byte-equivalence tests.

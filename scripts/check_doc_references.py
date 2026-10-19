@@ -13,16 +13,17 @@ Two lists are checked for set equality rather than mere existence, because
 naming a table that a later migration dropped, or leaving out a served
 operation, would pass an existence check:
 
-- the Markdown table whose first header cell is "Table" must list exactly the
+- the "Tables" inventory in docs/data-model.md must list exactly the
   tables that exist after applying every migration in store.rs to an empty
-  in-memory SQLite database;
+  in-memory SQLite database; a "Table" list in any checked file must agree too;
 - the Markdown table whose first header cell is "Operation" must list exactly
   PUBLIC_OPERATION_NAMES from ops.rs.
 
 The highest migration version must also appear as "version N".
 
 Usage: scripts/check_doc_references.py [FILE.md ...]
-Defaults to ARCHITECTURE.md and STRUCTURE.md. Exits 1 on any miss.
+Defaults to ARCHITECTURE.md and STRUCTURE.md, and always checks the data-model
+table inventory. Exits 1 on any miss.
 """
 
 import pathlib
@@ -130,6 +131,7 @@ def resolve(token, files, dirs, source):
 # files; raising the number is the wrong fix.
 MAX_OVERVIEW_BYTES = 20_000
 OVERVIEW_FILES = ("ARCHITECTURE.md", "STRUCTURE.md")
+TABLE_INVENTORY_FILE = "docs/data-model.md"
 
 
 def controls(files, dirs, source, tables, operations):
@@ -171,6 +173,13 @@ def main(argv):
         return 1
     misses, checked = [], 0
 
+    inventory = markdown_column((ROOT / TABLE_INVENTORY_FILE).read_text(), "Table")
+    if inventory != tables:
+        misses.append(
+            f"{TABLE_INVENTORY_FILE}: table list differs from the migrated schema; "
+            f"missing {sorted(tables - inventory)}, extra {sorted(inventory - tables)}"
+        )
+
     for name in names:
         text = (ROOT / name).read_text()
         for token in sorted(set(re.findall(r"`([^`\n]+)`", text))):
@@ -205,7 +214,8 @@ def main(argv):
         print(miss)
     print(
         f"checked {checked} tokens, {len(tables)} tables, {len(operations)} operations "
-        f"in {len(names)} files: {len(misses)} misses (controls caught)"
+        f"in {len(names)} files and the {TABLE_INVENTORY_FILE} inventory: "
+        f"{len(misses)} misses (controls caught)"
     )
     return 1 if misses or checked == 0 else 0
 
