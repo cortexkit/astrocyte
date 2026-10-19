@@ -63,6 +63,16 @@ pub fn evaluate(
     conn: &Connection,
     request: &VerdictRequest,
 ) -> Result<VerdictResponse, VerdictError> {
+    if let Some(verdict) = crate::report::summary_verdict(conn, request) {
+        return Ok(verdict);
+    }
+    evaluate_base(conn, request)
+}
+
+pub(crate) fn evaluate_base(
+    conn: &Connection,
+    request: &VerdictRequest,
+) -> Result<VerdictResponse, VerdictError> {
     // Monetary rows are unioned, not joined to each other: multiple heads and
     // adjustments on one event must not multiply either contribution.
     // Split signed amounts into base-2^32 limbs before summing so an intermediate

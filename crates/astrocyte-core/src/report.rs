@@ -12,6 +12,16 @@ use std::hash::{BuildHasherDefault, Hasher};
 use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 use rusqlite::{params, Connection, OptionalExtension};
+
+mod hourly;
+pub use hourly::{SummaryMaintenance, SummaryOutcome};
+
+pub(crate) fn summary_verdict(
+    conn: &Connection,
+    request: &crate::verdict::VerdictRequest,
+) -> Option<crate::verdict::VerdictResponse> {
+    hourly::verdict(conn, request).ok().flatten()
+}
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -480,6 +490,7 @@ impl Interner {
 /// measurements and current charge heads already folded in.
 #[derive(Debug)]
 struct LedgerEvent {
+    key: i64,
     occurred_at_ms: Option<i64>,
     /// Interned in `Ledger::values`.
     currency: Option<u32>,
@@ -502,6 +513,9 @@ struct LedgerEvent {
     /// Sum of `charge_nanos` over current heads whose outcome is `priced`.
     priced_nanos: i128,
     adjustment_nanos: i128,
+    priced_measurements: u64,
+    covered_measurements: u64,
+    oldest_resolved_at_ms: Option<i64>,
 }
 
 impl LedgerEvent {
@@ -728,17 +742,29 @@ fn parse_charge_basis(value: &str, column: usize) -> rusqlite::Result<ChargeBasi
 /// `dimensions` names the grouping columns the caller will read; the others
 /// stay `None` so the pass does not intern strings nobody uses.
 fn load_ledger(conn: &Connection, dimensions: &[Grouping]) -> Result<Ledger, ReportError> {
+    load_scoped_ledger(conn, dimensions, None)
+}
+
+fn load_scoped_ledger(
+    conn: &Connection,
+    dimensions: &[Grouping],
+    filter: Option<&str>,
+) -> Result<Ledger, ReportError> {
     let mut values = Interner::default();
     let mut reasons = Interner::default();
     let mut index: FastMap<i64, u32> = FastMap::default();
     let mut events = Vec::new();
 
-    let mut statement = conn.prepare(
+    let event_filter = filter.map_or_else(String::new, |filter| format!(" WHERE {filter}"));
+    let child_filter = filter.map_or_else(String::new, |filter| {
+        format!(" WHERE event_key IN (SELECT event_key FROM usage_event WHERE {filter})")
+    });
+    let mut statement = conn.prepare(&format!(
         "SELECT event_key,occurred_at_ms,currency,charge_basis,attempt_ordinal,
-                pricing_generation,provider,model,account_ref,auth_selection,
-                work_class,project_root,producer
-         FROM usage_event",
-    )?;
+                 pricing_generation,provider,model,account_ref,auth_selection,
+                 work_class,project_root,producer
+         FROM usage_event{event_filter}"
+    ))?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let charge_basis = parse_charge_basis(required_text_column(row, 3)?, 3)?;
@@ -767,6 +793,7 @@ fn load_ledger(conn: &Connection, dimensions: &[Grouping]) -> Result<Ledger, Rep
         let position = u32::try_from(events.len()).map_err(|_| ReportError::Arithmetic)?;
         index.insert(row.get(0)?, position);
         events.push(LedgerEvent {
+            key: row.get(0)?,
             occurred_at_ms: row.get(1)?,
             currency: text_column(row, 2)?
                 .map(|value| values.intern(value))
@@ -780,6 +807,9 @@ fn load_ledger(conn: &Connection, dimensions: &[Grouping]) -> Result<Ledger, Rep
             declined: Vec::new(),
             priced_nanos: 0,
             adjustment_nanos: 0,
+            priced_measurements: 0,
+            covered_measurements: 0,
+            oldest_resolved_at_ms: None,
         });
     }
     drop(rows);
@@ -793,8 +823,9 @@ fn load_ledger(conn: &Connection, dimensions: &[Grouping]) -> Result<Ledger, Rep
     let mut measurements_total = 0_u64;
     {
         let mut lookup = EventLookup::new(&index);
-        let mut statement =
-            conn.prepare("SELECT event_key,role,unit,quantity_units FROM measurement")?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT event_key,role,unit,quantity_units FROM measurement{child_filter}"
+        ))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let position = lookup.find(row.get(0)?)?;
@@ -825,8 +856,12 @@ fn load_ledger(conn: &Connection, dimensions: &[Grouping]) -> Result<Ledger, Rep
     // so it can approach the full history size. This trades that memory for
     // sequential reads instead of an index probe per charge.
     let superseded: FastSet<i64> = {
-        let mut statement =
-            conn.prepare("SELECT supersedes FROM priced_charge WHERE supersedes IS NOT NULL")?;
+        let superseded_filter = child_filter
+            .strip_prefix(" WHERE ")
+            .map_or_else(String::new, |filter| format!(" AND {filter}"));
+        let mut statement = conn.prepare(&format!(
+            "SELECT supersedes FROM priced_charge WHERE supersedes IS NOT NULL{superseded_filter}"
+        ))?;
         let mut rows = statement.query([])?;
         let mut superseded = FastSet::default();
         while let Some(row) = rows.next()? {
@@ -838,11 +873,11 @@ fn load_ledger(conn: &Connection, dimensions: &[Grouping]) -> Result<Ledger, Rep
     let mut oldest_resolved_at_ms: Option<i64> = None;
     {
         let mut lookup = EventLookup::new(&index);
-        let mut statement = conn.prepare(
+        let mut statement = conn.prepare(&format!(
             "SELECT event_key,role,unit,outcome,charge_nanos,unpriced_reason,resolved_at_ms,
                     charge_key
-             FROM priced_charge",
-        )?;
+             FROM priced_charge{child_filter}"
+        ))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             if superseded.contains(&row.get::<_, i64>(7)?) {
@@ -874,12 +909,18 @@ fn load_ledger(conn: &Connection, dimensions: &[Grouping]) -> Result<Ledger, Rep
                         .checked_add(i128::from(charge_nanos))
                         .ok_or(ReportError::Arithmetic)?;
                     add_count(&mut priced_measurements, 1)?;
+                    add_count(&mut event.priced_measurements, 1)?;
+                    event.oldest_resolved_at_ms = Some(
+                        event
+                            .oldest_resolved_at_ms
+                            .map_or(resolved_at_ms, |old| old.min(resolved_at_ms)),
+                    );
                     oldest_resolved_at_ms = Some(
                         oldest_resolved_at_ms
                             .map_or(resolved_at_ms, |oldest| oldest.min(resolved_at_ms)),
                     );
                 }
-                "covered" => {}
+                "covered" => add_count(&mut event.covered_measurements, 1)?,
                 _ => {
                     let reason = reasons.intern(declined_reason(unpriced_reason))?;
                     match event
@@ -918,7 +959,9 @@ fn load_ledger(conn: &Connection, dimensions: &[Grouping]) -> Result<Ledger, Rep
 
     {
         let mut lookup = EventLookup::new(&index);
-        let mut statement = conn.prepare("SELECT event_key,amount_nanos FROM adjustment")?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT event_key,amount_nanos FROM adjustment{child_filter}"
+        ))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let position = lookup.find(row.get(0)?)?;
@@ -1016,13 +1059,36 @@ pub fn spend_report(
     request: &ReportRequest,
     now_ms: i64,
 ) -> Result<SpendReport, ReportError> {
+    if let Ok(Some(report)) = hourly::spend(conn, request, now_ms) {
+        return Ok(report);
+    }
+    spend_report_base(conn, request, now_ms, None)
+}
+
+fn spend_report_base(
+    conn: &Connection,
+    request: &ReportRequest,
+    now_ms: i64,
+    filter: Option<&str>,
+) -> Result<SpendReport, ReportError> {
     let grain = Grain::parse(&request.grain)
         .ok_or_else(|| ReportError::Refused(ReportRefusal::UnknownGrain(request.grain.clone())))?;
     let timezone: Tz = request.timezone.parse().map_err(|_| {
         ReportError::Refused(ReportRefusal::UnknownTimezone(request.timezone.clone()))
     })?;
     let grouping = parse_grouping(&request.grouping)?;
-    let ledger = load_ledger(conn, &grouping)?;
+    let ledger = load_scoped_ledger(conn, &grouping, filter)?;
+    spend_report_from_ledger(conn, &ledger, &grouping, grain, timezone, now_ms)
+}
+
+fn spend_report_from_ledger(
+    conn: &Connection,
+    ledger: &Ledger,
+    grouping: &[Grouping],
+    grain: Grain,
+    timezone: Tz,
+    now_ms: i64,
+) -> Result<SpendReport, ReportError> {
     let mut buckets: FastMap<CompactBucketKey, SpendAccumulator> = FastMap::default();
     let mut undated = 0_u64;
     // Bucket bounds depend only on the event's local date, and neighbouring
@@ -1411,9 +1477,20 @@ impl DecimalSum {
 /// Read subscription usage in one caller-owned transaction/snapshot.
 pub fn subscription_report(
     conn: &Connection,
-    _request: &SubscriptionReportRequest,
+    request: &SubscriptionReportRequest,
 ) -> Result<SubscriptionReport, ReportError> {
-    let events = load_subscription_events(conn)?;
+    if let Ok(Some(report)) = hourly::subscription(conn, request) {
+        return Ok(report);
+    }
+    subscription_report_base(conn, request, None)
+}
+
+fn subscription_report_base(
+    conn: &Connection,
+    _request: &SubscriptionReportRequest,
+    filter: Option<&str>,
+) -> Result<SubscriptionReport, ReportError> {
+    let events = load_subscription_events(conn, filter)?;
     let subscriptions = load_subscriptions(conn)?;
     let plans = SubscriptionIndex::new(&subscriptions);
     let mut rows: BTreeMap<SubscriptionBucketKey, SubscriptionAccumulator> = BTreeMap::new();
@@ -1575,10 +1652,14 @@ impl SubscriptionEvent {
 /// Reads only the subscription-included events, with their measurements and
 /// current charge heads, in one statement. The report never looks at any
 /// other event, so the charge-basis filter runs in SQL.
-fn load_subscription_events(conn: &Connection) -> Result<Vec<SubscriptionEvent>, ReportError> {
+fn load_subscription_events(
+    conn: &Connection,
+    filter: Option<&str>,
+) -> Result<Vec<SubscriptionEvent>, ReportError> {
     // Ordered by the event's rowid, which is the order the outer table scan
     // already produces, so every event's measurement rows arrive together.
-    let mut statement = conn.prepare(
+    let filter = filter.map_or_else(String::new, |filter| format!(" AND ({filter})"));
+    let mut statement = conn.prepare(&format!(
         "SELECT e.rowid,e.occurred_at_ms,e.provider,e.account_ref,
                 m.role,m.unit,m.quantity_units,m.quantity_exponent,head.outcome
          FROM usage_event e
@@ -1588,9 +1669,9 @@ fn load_subscription_events(conn: &Connection) -> Result<Vec<SubscriptionEvent>,
           AND NOT EXISTS (
               SELECT 1 FROM priced_charge child WHERE child.supersedes=head.charge_key
           )
-         WHERE e.charge_basis='subscription_included'
-         ORDER BY e.rowid",
-    )?;
+         WHERE e.charge_basis='subscription_included'{filter}
+         ORDER BY e.rowid"
+    ))?;
     let mut rows = statement.query([])?;
     let mut events: Vec<SubscriptionEvent> = Vec::new();
     let mut last_rowid = None;
@@ -1785,6 +1866,16 @@ struct WorkClassAccumulator {
 /// Read work-class distributions in one caller-owned transaction/snapshot.
 pub fn work_class_report(
     conn: &Connection,
+    request: &WorkClassReportRequest,
+) -> Result<WorkClassReport, ReportError> {
+    if let Ok(Some(report)) = hourly::workclass(conn) {
+        return Ok(report);
+    }
+    work_class_report_base(conn, request)
+}
+
+fn work_class_report_base(
+    conn: &Connection,
     _request: &WorkClassReportRequest,
 ) -> Result<WorkClassReport, ReportError> {
     let ledger = load_ledger(conn, &[Grouping::Producer, Grouping::WorkClass])?;
@@ -1965,6 +2056,17 @@ pub struct LedgerCoverage {
 
 /// Read ledger and operational coverage in one caller-owned transaction/snapshot.
 pub fn ledger_coverage(
+    conn: &Connection,
+    request: &LedgerCoverageRequest,
+    now_ms: i64,
+) -> Result<LedgerCoverage, ReportError> {
+    if let Ok(Some(report)) = hourly::coverage(conn, now_ms) {
+        return Ok(report);
+    }
+    ledger_coverage_base(conn, request, now_ms)
+}
+
+fn ledger_coverage_base(
     conn: &Connection,
     _request: &LedgerCoverageRequest,
     now_ms: i64,
