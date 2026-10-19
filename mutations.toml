@@ -6,6 +6,103 @@
 # Ordinary logic belongs in ordinary tests.
 
 [[control]]
+id = "hourly-summary-header-before-heads"
+guards = "Charge insertion refuses a reprice that did not advance its event header generation"
+file = "crates/astrocyte-core/src/pricing.rs"
+old = 'SET currency=COALESCE(currency,?1),pricing_generation=?2,charge_basis=?5'
+new = 'SET currency=COALESCE(currency,?1),pricing_generation=pricing_generation,charge_basis=?5 -- NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = [
+  "pricing::tests::a_provider_absent_from_the_coverage_gap_list_reaches_the_catalog",
+  "pricing::tests::aliased_model_rate_is_unpriced_as_inherited",
+  "pricing::tests::already_priced_refuses_without_appending_or_changing_generation",
+  "pricing::tests::arithmetic_overflow_records_unpriced_instead_of_wrapping_or_refusing_act",
+  "pricing::tests::basis_correction_metered_prices_and_preserves_catalog_reason",
+  "pricing::tests::basis_correction_rolls_back_projection_when_append_fails",
+  "pricing::tests::basis_correction_stale_resolution_refuses_without_writes",
+  "pricing::tests::basis_correction_subscription_is_covered_without_catalog",
+  "pricing::tests::basis_correction_supersedes_every_head_preserving_every_prior_column",
+  "pricing::tests::basis_correction_undated_remains_undated",
+  "pricing::tests::basis_correction_unknown_is_unpriced_without_catalog",
+  "pricing::tests::borrowed_stated_zero_is_unpriced_as_inherited",
+  "pricing::tests::cached_prompt_over_the_threshold_is_refused_though_input_alone_is_under",
+  "pricing::tests::cached_prompt_under_the_threshold_prices_at_base",
+  "pricing::tests::charge_rows_preserve_write_path_origin",
+  "pricing::tests::contention_between_resolve_and_commit_aborts_as_pricing_superseded",
+  "pricing::tests::covered_head_sets_currency_in_the_generation_checked_transaction",
+  "pricing::tests::crossing_tier_refusal_stores_no_catalog_entry_and_keeps_source_and_instant",
+  "pricing::tests::declared_reasoning_above_context_is_refused_like_output",
+  "pricing::tests::declared_reasoning_uses_output_rates_and_records_the_resolved_key",
+  "pricing::tests::deepseek_before_time_banded_pricing_reaches_flat_catalog_rate",
+  "pricing::tests::deepseek_time_banded_rate_is_unpriced_without_guessing_a_selector",
+  "pricing::tests::disjoint_broca_output_is_priced_as_stored",
+  "pricing::tests::first_priced_head_sets_currency_and_terminal_status_never_filters_usage",
+  "pricing::tests::floor_minimum_round_trips_with_its_units",
+  "pricing::tests::inclusive_broca_output_below_its_reasoning_is_unpriced",
+  "pricing::tests::inclusive_broca_output_is_priced_without_its_reasoning",
+  "pricing::tests::inclusive_source_xai_output_is_priced_as_stored",
+  "pricing::tests::inherited_rate_is_unpriced_not_charged",
+  "pricing::tests::mixed_reprice_preserves_priced_head_and_supersedes_only_unpriced_head",
+  "pricing::tests::own_stated_zero_still_requires_policy",
+  "pricing::tests::pre_history_event_records_catalog_pre_history_without_network_io",
+  "pricing::tests::priced_charge_records_floor_unknown_when_the_rate_carries_the_serde_default",
+  "pricing::tests::priced_charge_records_non_default_catalog_source",
+  "pricing::tests::pricing_the_last_headless_measurement_dequeues_and_a_partially_headed_event_stays",
+  "pricing::tests::published_rate_without_origin_still_prices",
+  "pricing::tests::representation_rounding_is_per_row_and_event_sum_is_not_rerounded",
+  "pricing::tests::stated_zero_remains_distinct_as_policy_unpriced",
+  "pricing::tests::stored_event_beside_conditional_rates_prices_at_base",
+  "pricing::tests::subscription_without_plan_is_unpriced_without_catalog_io",
+  "pricing::tests::threshold_crossing_request_is_unpriced_instead_of_guessing_scheme",
+  "pricing::tests::tier_rate_without_same_role_base_above_threshold_refuses_every_measurement",
+  "pricing::tests::tier_rate_without_same_role_base_below_threshold_leaves_that_role_unpriced",
+  "pricing::tests::undated_deepseek_event_is_unpriced_before_coverage_gap_check",
+  "pricing::tests::undated_event_is_unpriced_without_catalog_io",
+  "pricing::tests::unknown_cache_read_quantity_makes_the_prompt_unknown_and_refuses",
+  "pricing::tests::unknown_charge_basis_is_unpriced_without_catalog_io",
+  "pricing::tests::unlisted_reasoning_without_its_own_rate_stays_no_rate",
+  "pricing::tests::unreadable_tier_refusal_stores_no_catalog_entry_and_keeps_source_and_instant",
+  "pricing::tests::withheld_and_uncertain_rates_are_named_unpriced_outcomes",
+  "report::hourly::tests::coverage_backfill_and_basis_correction_replace_the_whole_clean_partition",
+  "report::hourly::tests::examined_declined_zero_is_report_priced_but_budget_uncertain",
+  "report::hourly::tests::half_hour_timezone_and_plan_seams_match_the_base_reader",
+  "report::hourly::tests::random_fixtures_are_byte_identical_when_clean_dirty_repriced_or_half_filled",
+  "store::tests::hourly_pricing_bumps_header_before_guarded_heads_and_marks_once",
+  "subscription::tests::absent_subscription_records_named_unpriced_without_catalog_io",
+  "subscription::tests::an_event_before_the_close_instant_still_resolves_to_covered",
+  "subscription::tests::an_event_covered_before_the_close_stays_covered_afterwards",
+  "subscription::tests::closing_a_plan_bounds_it_and_later_events_stop_resolving_to_covered",
+  "subscription::tests::declared_reasoning_is_covered_without_catalog_io",
+  "subscription::tests::plan_starting_after_event_is_unpriced_no_subscription_in_force",
+  "subscription::tests::subscription_in_force_covers_at_event_instant_without_catalog_io",
+  "subscription::tests::undated_subscription_event_is_unpriced_without_plan_or_catalog_resolution",
+]
+only = true
+timeout_s = 120
+build_timeout_s = 600
+
+[[control]]
+id = "hourly-summary-event-invalidation"
+guards = "Recording an event marks its hour dirty atomically, once for all its measurements"
+file = "crates/astrocyte-core/src/store.rs"
+old = 'CREATE TRIGGER summary_event_insert AFTER INSERT ON usage_event BEGIN'
+new = 'CREATE TRIGGER summary_event_insert AFTER INSERT ON usage_event WHEN 0 BEGIN -- NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = [
+  "store::tests::hourly_pricing_bumps_header_before_guarded_heads_and_marks_once",
+  "store::tests::hourly_recording_marks_once_and_rolls_back_with_its_measurements",
+]
+only = true
+timeout_s = 120
+build_timeout_s = 600
+
+[[control]]
 id = "quota-events-gap-epoch-snapshot"
 guards = "Only the next sequence in the same insula epoch may admit an account event"
 file = "crates/astrocyte-module/src/quota_events.rs"
@@ -1153,3 +1250,152 @@ expect_red = ["store::tests::schema_v23_child_event_keys_cannot_be_implicitly_al
 only = true
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "hourly-summary-adjustment-invalidation"
+guards = "A signed correction dirties its event hour before a report can serve stale money"
+file = "crates/astrocyte-core/src/store.rs"
+old = 'CREATE TRIGGER summary_adjustment_insert AFTER INSERT ON adjustment BEGIN'
+new = 'CREATE TRIGGER summary_adjustment_insert AFTER INSERT ON adjustment WHEN 0 BEGIN -- NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/report/hourly.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = [
+  "report::hourly::tests::dirty_hours_use_base_money_while_workclass_keeps_head_only_samples",
+  "report::hourly::tests::random_fixtures_are_byte_identical_when_clean_dirty_repriced_or_half_filled",
+]
+only = true
+timeout_s = 120
+build_timeout_s = 600
+
+[[control]]
+id = "hourly-summary-dirty-read-fallback"
+guards = "Reports combine clean summaries with source facts for dirty revisions"
+file = "crates/astrocyte-core/src/report/hourly.rs"
+old = 'built == Some(revision) && version == Some(FORMAT) && !dirty'
+new = '{ let _ = (revision,built,version,dirty); true } // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/report/hourly.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = [
+  "report::hourly::tests::audit_finds_an_unmarked_adjustment_and_restores_report_parity",
+  "report::hourly::tests::audit_walk_resumes_and_discovers_a_base_hour_missing_from_all_summary_tables",
+  "report::hourly::tests::coverage_backfill_and_basis_correction_replace_the_whole_clean_partition",
+  "report::hourly::tests::dirty_hours_use_base_money_while_workclass_keeps_head_only_samples",
+  "report::hourly::tests::random_fixtures_are_byte_identical_when_clean_dirty_repriced_or_half_filled",
+  "report::hourly::tests::write_after_reduction_cannot_publish_a_stale_revision",
+  "report::tests::a_covered_measurement_counts_in_the_population_and_never_as_declined",
+  "report::tests::a_declined_measurement_with_no_stated_quantity_makes_its_event_unpriced",
+  "report::tests::a_declined_non_zero_quantity_measurement_still_makes_its_event_unpriced",
+  "report::tests::a_declined_zero_quantity_measurement_does_not_make_its_event_unpriced",
+  "report::tests::a_label_with_a_zero_width_space_round_trips_byte_identical",
+  "report::tests::a_verdict_that_flips_on_a_declined_zero_moves_no_money",
+  "report::tests::account_attribution_joins_usage_events_to_capacity_windows_on_the_slug_axis",
+  "report::tests::an_event_complete_only_through_declined_zeros_carries_no_currency",
+  "report::tests::an_event_priced_around_a_declined_zero_still_reports_that_measurement",
+  "report::tests::an_event_with_two_distinct_blocking_reasons_reports_both",
+  "report::tests::an_unexamined_measurement_makes_its_event_unpriced_even_at_zero_quantity",
+  "report::tests::an_unexamined_measurement_reports_not_yet_priced_rather_than_unpriced",
+  "report::tests::auth_selection_grouping_splits_events_by_credential",
+  "report::tests::corrupt_priced_head_is_refused_without_rendering_zero_money",
+  "report::tests::covered_only_bucket_reports_a_nonempty_real_zero",
+  "report::tests::covered_quantities_group_by_unit_and_role_not_unit_alone",
+  "report::tests::headline_metered_nanos_equals_the_sum_of_its_rows",
+  "report::tests::mixed_covered_and_metered_bucket_reports_only_the_metered_part",
+  "report::tests::nearest_rank_uses_observed_values_and_publishes_sample_n",
+  "report::tests::only_the_charge_nothing_supersedes_counts_toward_verdict_and_total",
+  "report::tests::partial_event_reports_partial_total_with_unpriced_population_and_headline_reconciliation",
+  "report::tests::producer_label_coverage_counts_add_up_and_reports_labels_is_observed",
+  "report::tests::project_and_work_class_grouping_are_verbatim_and_machine_limited",
+  "report::tests::regression_midnight_gap_report_starts_at_first_existing_local_instant",
+  "report::tests::regression_monthly_subscription_keeps_original_anniversary_across_a_year",
+  "report::tests::regression_skipped_local_date_ends_at_next_existing_day",
+  "report::tests::regression_subscription_wire_rows_keep_provider_identity",
+  "report::tests::regression_workclass_partitions_currencies_like_spend_report",
+  "report::tests::regression_yearly_subscription_returns_to_leap_day_anniversary",
+  "report::tests::subscription_events_are_counted_once_across_measurements_and_plan_intervals",
+  "report::tests::subscription_report_counts_dated_events_with_no_account_separately",
+  "report::tests::subscription_report_counts_zero_unattributed_events_when_all_carry_an_account",
+  "report::tests::subscription_rows_use_non_calendar_plan_boundaries",
+  "report::tests::the_same_label_from_two_producers_is_two_rows",
+  "report::tests::timezone_argument_changes_bucket_boundaries_for_the_same_request",
+  "report::tests::undated_events_are_report_level_and_appear_in_no_bucket",
+  "report::tests::unknown_basis_adjustment_is_not_metered_value",
+  "report::tests::unpriced_metered_event_contributes_to_neither_value",
+  "report::tests::zero_measurement_events_are_counted_and_excluded_from_cost_sample",
+  "verdict::tests::adjustments_change_recorded_consumption_without_join_fanout",
+  "verdict::tests::consumption_uses_only_current_heads_and_counts_unpriced_events_once",
+  "verdict::tests::covered_zero_and_adjustment_only_spend_keep_their_currencies",
+  "verdict::tests::estimate_is_not_recorded_consumption",
+  "verdict::tests::filters_select_the_same_events_for_heads_and_adjustments",
+  "verdict::tests::signed_consumption_is_checked_after_refunds_cancel_large_heads",
+  "verdict::tests::two_currencies_are_reported_separately",
+]
+only = true
+timeout_s = 120
+build_timeout_s = 600
+
+[[control]]
+id = "hourly-summary-publication-revision"
+guards = "A source write after reduction cannot publish stale totals or clear its dirty key"
+file = "crates/astrocyte-core/src/report/hourly.rs"
+old = 'if !build.ready || build.revision != revision(tx, build.hour)? {'
+new = 'if !build.ready { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/report/hourly.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["report::hourly::tests::write_after_reduction_cannot_publish_a_stale_revision"]
+only = true
+timeout_s = 120
+build_timeout_s = 600
+
+[[control]]
+id = "hourly-summary-calendar-seam"
+guards = "A clean UTC hour split by a local calendar or plan boundary still reads source events"
+file = "crates/astrocyte-core/src/report/hourly.rs"
+old = 'if seam(hour, &key)? {'
+new = 'if seam(hour, &key)? && false { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/report/hourly.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["report::hourly::tests::half_hour_timezone_and_plan_seams_match_the_base_reader"]
+only = true
+timeout_s = 120
+build_timeout_s = 600
+
+[[control]]
+id = "hourly-summary-independent-audit"
+guards = "The audit compares clean cached money with fresh facts and requeues missed invalidations"
+file = "crates/astrocyte-core/src/report/hourly.rs"
+old = 'if !dirty && (build.revision == 0 || !cache_matches) {'
+new = 'if false && !dirty && (build.revision == 0 || !cache_matches) { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/report/hourly.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = [
+  "report::hourly::tests::audit_finds_an_unmarked_adjustment_and_restores_report_parity",
+  "report::hourly::tests::audit_walk_resumes_and_discovers_a_base_hour_missing_from_all_summary_tables",
+]
+only = true
+timeout_s = 120
+build_timeout_s = 600
+
+[[control]]
+id = "hourly-summary-budget-limb-fallback"
+guards = "Oversized cached money populations retain the original SQLite signed-sum semantics"
+file = "crates/astrocyte-core/src/report/hourly.rs"
+old = 'if !compatible_limb_population(contributions) {'
+new = 'if false && !compatible_limb_population(contributions) { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/report/hourly.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["report::hourly::tests::oversized_cached_budget_population_returns_to_the_original_source_sum"]
+only = true
+timeout_s = 120
+build_timeout_s = 600
