@@ -325,11 +325,12 @@ clean hour is marked dirty before a warning is logged, allowing later reports
 to use base rows while the refresher repairs it.
 
 The audit persists its cursor and progress statistics, and its next pass starts
-an hour after the previous pass completes. A full pass can take many ticks, so
-this is an hourly interval between passes, not a promise to finish the whole
-ledger every hour. Transactional invalidation keeps normal reports exact at
-every snapshot; the audit is a backstop for a missed mark and cannot make an
-earlier stale reply retroactively exact.
+a day after the previous pass completes. A pass re-reads the whole ledger, so
+it runs daily rather than hourly to keep its disk reads small. A full pass can
+take many ticks, so this is a daily interval between passes, not a promise to
+finish the whole ledger every day. Transactional invalidation keeps normal
+reports exact at every snapshot; the audit is a backstop for a missed mark and
+cannot make an earlier stale reply retroactively exact.
 
 The implementation is in `crates/astrocyte-core/src/report/hourly.rs`, and the
 refresher schedules it from `crates/astrocyte-module/src/refresher.rs`. The

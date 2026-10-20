@@ -51,7 +51,7 @@ clean whole hours from summaries and read dirty, missing or timezone and
 subscription seam hours from base rows in the same snapshot. Work-class
 percentiles come from exact value frequencies rather than approximate buckets.
 The audit compares summaries against base rows, requeues discrepancies and starts
-its next pass an hour after the previous pass completes. Charge writers must
+its next pass a day after the previous pass completes. Charge writers must
 update the event header before inserting heads; the existing generation-and-basis
 guard checks agreement, not transaction identity. The [data model](docs/data-model.md#hourly-summaries)
 explains the grain, arithmetic, invalidation rules and maintenance budgets.

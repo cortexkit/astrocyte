@@ -2792,9 +2792,12 @@ fn finish_pricing_pass(pass: PricingPass, failures: Vec<String>) -> Result<Prici
 ///
 /// What it guards against is a write path that records an event without
 /// enqueuing it; such an event would otherwise never be priced and nothing
-/// would say so. An unqueued event is found within one interval plus one
-/// pass, which is short for a spend ledger read in days.
-const QUEUE_RECONCILE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// would say so. Recording enqueues in the same transaction, and no pass has
+/// ever found an unqueued event, so the check runs daily: a pass reads the
+/// whole ledger, and run hourly it was a large share of astrocyte's disk
+/// reads. An unqueued event is found within one interval plus one pass, which
+/// is short for a spend ledger read in days.
+const QUEUE_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Events per reconciliation chunk. Each chunk is one short write transaction
 /// over a range of event ids, so the whole-ledger check never holds the store

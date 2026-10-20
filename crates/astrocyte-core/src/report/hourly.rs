@@ -10,6 +10,15 @@ const FORMAT: i64 = 1;
 const CHUNK: usize = 5_000;
 const MAX_PUBLICATION_ROWS: usize = 50_000;
 const HOUR_MS: i64 = 3_600_000;
+
+/// How long after one full-ledger audit pass completes the next one starts.
+///
+/// A pass re-reads every event, measurement and charge in the store, about
+/// 4 GB on this machine's ledger, and it is only a backstop: the triggers mark
+/// hours dirty in the same transaction as every write, and no pass has ever
+/// found a mismatch. Run hourly, the audit was most of astrocyte's disk reads.
+/// Daily keeps a missed mark bounded to about a day.
+const AUDIT_INTERVAL_MS: i64 = 24 * HOUR_MS;
 const DIMENSIONS: [Grouping; 8] = [
     Grouping::Provider,
     Grouping::Model,
@@ -586,7 +595,7 @@ impl SummaryMaintenance {
     pub fn defer_after_error(&mut self, now_ms: i64) {
         self.pending = None;
         self.finish_audit = false;
-        self.retry_after_ms = now_ms.saturating_add(3_600_000);
+        self.retry_after_ms = now_ms.saturating_add(HOUR_MS);
     }
     /// The caller holds a read snapshot for this chunk, never across ticks.
     pub fn read_chunk(&mut self, conn: &Connection, now_ms: i64) -> Result<bool, ReportError> {
@@ -679,7 +688,7 @@ impl SummaryMaintenance {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get::<_,Option<i64>>(6)?)),
             )?;
-            tx.execute("UPDATE summary_audit_state SET after_kind=NULL,after_hour=NULL,next_due_ms=?1,examined=0,mismatches=0,hours=0,chunks=0,spent_ms=0,max_chunk_ms=0,started_at_ms=NULL WHERE id=1",[now_ms.saturating_add(3_600_000)])?;
+            tx.execute("UPDATE summary_audit_state SET after_kind=NULL,after_hour=NULL,next_due_ms=?1,examined=0,mismatches=0,hours=0,chunks=0,spent_ms=0,max_chunk_ms=0,started_at_ms=NULL WHERE id=1",[now_ms.saturating_add(AUDIT_INTERVAL_MS)])?;
             return Ok(SummaryOutcome {
                 audited: true,
                 audit_completed: true,
