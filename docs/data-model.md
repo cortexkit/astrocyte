@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 24. A schema change appends a migration; an applied
+currently version 25. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -85,15 +85,20 @@ reference spaces that restart (a rebuilt producer store); a producer whose
 references are already stable sends none. `producer_ref` is stored verbatim.
 `auth_selection` is not part of the identity.
 
-Two unique constraints enforce the key: the table constraint, and
-`usage_event_natural_key_lineage_absent` for keys without a lineage, because
-SQLite treats nulls as distinct.
+Uniqueness is enforced through `event_id`: ingest's only writer stores the
+hash of the key and never an id supplied by its caller, so `UNIQUE(event_id)`
+refuses a second event with the same key. The table's
+`UNIQUE(producer, producer_lineage, producer_ref)` also holds for keys with a
+lineage; it does not for keys without one, because SQLite treats nulls as
+distinct. Schema 25 dropped the partial index that used to duplicate that
+check.
 
 A second delivery of an existing key is compared with the stored payload. An
 identical payload is an exact redelivery and changes nothing (a pushed one
 adds a `redelivery_log` row; a file re-read adds none). A different payload is
 written to `rejected_delivery` and the stored event stays. Tests:
 `identity_hash_bytes_match_persisted_format`,
+`schema_v25_keeps_lineage_absent_keys_unique_through_the_derived_event_id`,
 `lineage_absent_and_empty_string_lineage_are_distinct_stored_events`,
 `same_identity_different_payload_is_quarantined_without_overwrite`,
 `read_exact_redelivery_writes_no_redelivery_log_row`.

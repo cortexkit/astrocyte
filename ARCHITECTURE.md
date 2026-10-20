@@ -22,12 +22,12 @@ The workspace has three crates:
 
 ## Durable state
 
-`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS` (versions 1 to 24).
+`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS` (versions 1 to 25).
 `initialize_connection` enables and verifies foreign keys, probes SQLite JSON, triggers and
 partial indexes, and sets a 5000 ms busy timeout. The read-only report connection
 skips the table-creating probe and copies that timeout.
 
-The [data model](docs/data-model.md#tables) describes every table in version 24 and its write rules.
+The [data model](docs/data-model.md#tables) describes every table in version 25 and its write rules.
 
 Schema 23 uses local integer `event_key` and `charge_key` references, never served
 IDs. Event digests remain the dedup/served identity; charge digests are retired.

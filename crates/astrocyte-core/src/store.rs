@@ -3486,6 +3486,15 @@ CREATE TRIGGER summary_transition_insert AFTER INSERT ON chargeability_transitio
 END;
 "#,
     },
+    Migration {
+        version: 25,
+        statements: r#"-- UNIQUE(event_id) already enforces natural-key uniqueness for lineage-absent
+-- events: ingest's only writer stores the hash of (producer, lineage, ref) and
+-- never an id from its caller. This index duplicated that check and was its
+-- largest avoidable cost, a random-key insert on every recorded event.
+DROP INDEX usage_event_natural_key_lineage_absent;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -3549,7 +3558,7 @@ mod tests {
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (24, 24, 24)
+            (25, 25, 25)
         );
         assert_eq!(
             store
@@ -3562,7 +3571,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 24, 24)
+            (0, 25, 25)
         );
         assert!(!second.store_ahead());
         store
@@ -3572,7 +3581,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',25,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',26,1)",
                     [],
                 )?;
                 Ok(())
@@ -3581,9 +3590,40 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 25, 24)
+            (0, 26, 25)
         );
         assert!(ahead.store_ahead());
+    }
+
+    #[test]
+    fn schema_v25_keeps_lineage_absent_keys_unique_through_the_derived_event_id() {
+        let (_directory, store) = migration_store();
+        migrate_store(&store).unwrap();
+        store
+            .with_conn(|conn| {
+                let dropped: i64 = conn.query_row(
+                    "SELECT count(*) FROM sqlite_schema
+                     WHERE name='usage_event_natural_key_lineage_absent'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(dropped, 0);
+                // Ingest stores only the hash of the natural key, so a second
+                // lineage-absent event with the same key carries the same id and
+                // UNIQUE(event_id) refuses it, now that the partial index is gone.
+                let id = event_id("producer", None, "ref-a").unwrap();
+                let insert = "INSERT INTO usage_event
+                     (event_id,producer,producer_lineage,producer_ref,recorded_at_ms,
+                      charge_basis,pricing_generation)
+                     VALUES (?1,'producer',NULL,'ref-a',1000,'metered_api',0)";
+                conn.execute(insert, [&id])?;
+                assert!(conn.execute(insert, [&id]).is_err());
+                let count: i64 =
+                    conn.query_row("SELECT count(*) FROM usage_event", [], |row| row.get(0))?;
+                assert_eq!(count, 1);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

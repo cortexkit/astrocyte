@@ -485,14 +485,6 @@ pub fn record_event_in_tx(
     delivery: DeliveryPath,
 ) -> Result<EventRecordOutcome, IngestError> {
     validate_event_request(request, recorded_at_ms)?;
-    // Identity is {producer, producer_lineage, producer_ref} and must not
-    // change: the same charge re-exported with the same pin must dedupe.
-    // auth_selection is deliberately excluded from the canonical hash.
-    let local_event_id = event_id(
-        &request.producer,
-        request.producer_lineage.as_deref(),
-        &request.producer_ref,
-    )?;
 
     if let Some((stored_event_id, stored_payload)) = load_event_payload(tx, request)? {
         if stored_payload.restated_by(request) {
@@ -541,7 +533,7 @@ pub fn record_event_in_tx(
         });
     }
 
-    insert_event(tx, &local_event_id, request, recorded_at_ms)?;
+    let local_event_id = insert_event(tx, request, recorded_at_ms)?;
 
     let mut effects = PairEffects::default();
     let mut waiting_for_target = false;
@@ -958,12 +950,26 @@ fn load_measurements(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Inserts the event under the id derived from its natural key, and returns that id.
+///
+/// This is the only production writer of `usage_event`, and it never accepts an id
+/// from its caller. Uniqueness of the natural key rests on that: `UNIQUE(event_id)`
+/// enforces it only because every stored id is the hash of the key. For an absent
+/// lineage no other index does, since SQLite treats NULLs in the table's
+/// `UNIQUE(producer, producer_lineage, producer_ref)` as distinct.
 fn insert_event(
     tx: &Transaction<'_>,
-    event_id: &str,
     request: &EventRecordRequest,
     recorded_at_ms: i64,
-) -> Result<(), IngestError> {
+) -> Result<String, IngestError> {
+    // Identity is {producer, producer_lineage, producer_ref} and must not
+    // change: the same charge re-exported with the same pin must dedupe.
+    // auth_selection is deliberately excluded from the canonical hash.
+    let event_id = event_id(
+        &request.producer,
+        request.producer_lineage.as_deref(),
+        &request.producer_ref,
+    )?;
     tx.execute(
         "INSERT INTO usage_event (
              event_id,producer,producer_lineage,producer_ref,prior_event_ref,
@@ -1001,7 +1007,7 @@ fn insert_event(
             request.charge_basis_overrides,
         ],
     )?;
-    Ok(())
+    Ok(event_id)
 }
 
 fn insert_measurements(

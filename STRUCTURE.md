@@ -11,7 +11,7 @@ Crates live in `crates/`, public docs in `docs/`, and gates in `scripts/`.
 
 Domain logic and storage.
 
-- `store.rs`: `MIGRATIONS` (1 to 24), `initialize_connection` and `migrate_store`.
+- `store.rs`: `MIGRATIONS` (1 to 25), `initialize_connection` and `migrate_store`.
   Migration 23 rebuilds integer keys without charge digests, checking FKs before
   commit; startup restores enforcement. VACUUM is a separate offline step.
 - `fact.rs`: event and measurement identity, minted locally.
