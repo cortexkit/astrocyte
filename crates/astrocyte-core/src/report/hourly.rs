@@ -2089,6 +2089,14 @@ mod tests {
         assert_eq!(result.examined, 2);
         assert_eq!(result.hours, 2);
         assert_eq!(result.mismatches, 1);
+        // The next whole-ledger pass waits a day: hourly passes re-read the
+        // whole store and dominated the module's disk reads.
+        assert_eq!(
+            conn.query_row("SELECT next_due_ms FROM summary_audit_state", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            10_000 + 24 * HOUR_MS
+        );
         conn.execute_batch(&trigger).unwrap();
         compare(&conn);
     }
