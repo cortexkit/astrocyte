@@ -950,7 +950,8 @@ fn load_measurements(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Inserts the event under the id derived from its natural key, and returns that id.
+/// Inserts the event under the id derived from its natural key (`producer`,
+/// `producer_lineage` and `producer_ref`), and returns that id.
 ///
 /// This is the only production writer of `usage_event`, and it never accepts an id
 /// from its caller. Uniqueness of the natural key rests on that: `UNIQUE(event_id)`
