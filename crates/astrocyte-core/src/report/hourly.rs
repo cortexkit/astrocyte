@@ -13,11 +13,11 @@ const HOUR_MS: i64 = 3_600_000;
 
 /// How long after one full-ledger audit pass completes the next one starts.
 ///
-/// A pass re-reads every event, measurement and charge in the store, about
-/// 4 GB on this machine's ledger, and it is only a backstop: the triggers mark
-/// hours dirty in the same transaction as every write, and no pass has ever
-/// found a mismatch. Run hourly, the audit was most of astrocyte's disk reads.
-/// Daily keeps a missed mark bounded to about a day.
+/// A pass re-reads every event, measurement and charge in the store, so it
+/// costs disk reads in proportion to the whole ledger. It is only a backstop:
+/// the triggers mark hours dirty in the same transaction as every write, so a
+/// mismatch means a write path that bypassed them. Daily keeps such a miss
+/// bounded to about a day without re-reading the store every hour.
 const AUDIT_INTERVAL_MS: i64 = 24 * HOUR_MS;
 const DIMENSIONS: [Grouping; 8] = [
     Grouping::Provider,
@@ -2089,8 +2089,8 @@ mod tests {
         assert_eq!(result.examined, 2);
         assert_eq!(result.hours, 2);
         assert_eq!(result.mismatches, 1);
-        // The next whole-ledger pass waits a day: hourly passes re-read the
-        // whole store and dominated the module's disk reads.
+        // The next whole-ledger pass waits a day, because a pass re-reads the
+        // whole store.
         assert_eq!(
             conn.query_row("SELECT next_due_ms FROM summary_audit_state", [], |row| row
                 .get::<_, i64>(0))

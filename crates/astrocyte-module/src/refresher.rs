@@ -2792,10 +2792,9 @@ fn finish_pricing_pass(pass: PricingPass, failures: Vec<String>) -> Result<Prici
 ///
 /// What it guards against is a write path that records an event without
 /// enqueuing it; such an event would otherwise never be priced and nothing
-/// would say so. Recording enqueues in the same transaction, and no pass has
-/// ever found an unqueued event, so the check runs daily: a pass reads the
-/// whole ledger, and run hourly it was a large share of astrocyte's disk
-/// reads. An unqueued event is found within one interval plus one pass, which
+/// would say so. Recording enqueues in the same transaction, so a miss means
+/// a write path that bypassed it. A pass reads the whole ledger, so the check
+/// runs daily: an unqueued event is found within one day plus one pass, which
 /// is short for a spend ledger read in days.
 const QUEUE_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
