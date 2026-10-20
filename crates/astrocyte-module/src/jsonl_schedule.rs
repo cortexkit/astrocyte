@@ -1,5 +1,7 @@
 //! Process-local read deadlines, published with the drain's committed resume points.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -22,15 +24,16 @@ pub(crate) fn full_due(path: &Path, verified: Option<i64>, now: i64, interval: i
 }
 
 pub(super) fn phase(path: &Path, interval: i64) -> i64 {
-    let hash = path
-        .as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
-        });
-    i64::try_from(hash % u64::try_from(interval).expect("positive verification interval"))
-        .expect("phase fits the interval")
+    // Match the resume cache's Path equality: redundant separators and '.'
+    // components, plus '/' versus '\\' on Windows, must not move a deadline.
+    // A new DefaultHasher has fixed keys; phases need not survive a toolchain
+    // change because restarting the process fully verifies every file again.
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    i64::try_from(
+        hasher.finish() % u64::try_from(interval).expect("positive verification interval"),
+    )
+    .expect("phase fits the interval")
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +134,20 @@ mod tests {
     const DAY: i64 = 86_400_000;
     const HOUR: i64 = 3_600_000;
     const FIVE_MINUTES: i64 = 300_000;
+
+    #[test]
+    fn equivalent_paths_keep_the_same_daily_phase() {
+        let path = Path::new("sessions/pi/session.jsonl");
+        let alternate = Path::new("sessions//pi/./session.jsonl");
+        assert_eq!(path, alternate);
+        assert_eq!(phase(path, DAY), phase(alternate, DAY));
+        #[cfg(windows)]
+        {
+            let native = Path::new(r"sessions\pi\session.jsonl");
+            assert_eq!(path, native);
+            assert_eq!(phase(path, DAY), phase(native, DAY));
+        }
+    }
 
     struct Tick {
         hashed: u64,
@@ -378,7 +395,15 @@ mod tests {
         for (reader, path, contents) in fixtures(temp.path(), true) {
             let state = test_state();
             let stop = AtomicBool::new(false);
-            let start = phase(&path, DAY);
+            // Directory walking and callers can spell the same path differently.
+            // Keep the exact deadline even when the clock uses an equivalent path.
+            let alternate = path
+                .parent()
+                .unwrap()
+                .join(".")
+                .join(path.file_name().unwrap());
+            assert_eq!(path, alternate);
+            let start = phase(&alternate, DAY);
             reader.drain(&state, start, &stop).unwrap();
             let stat = FileStat::read(&path).unwrap();
             std::fs::write(&path, contents.replace(":11", ":19")).unwrap();
