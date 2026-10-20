@@ -17,6 +17,8 @@ mod codex_source;
 mod gemini_source;
 #[path = "goose_source.rs"]
 mod goose_source;
+#[path = "jsonl_schedule.rs"]
+pub(crate) mod jsonl_schedule;
 #[path = "kimi_source.rs"]
 mod kimi_source;
 #[path = "omp_source.rs"]
@@ -286,9 +288,10 @@ pub(crate) mod harness_drain {
     pub(crate) const PAGE_LIMIT: u32 = 10_000;
 
     /// How often a file's whole consumed prefix is re-hashed instead of only
-    /// the trailing window, on the drain's clock. Same cadence as the Pi,
-    /// Claude Code and Codex readers.
-    pub(crate) const FULL_PREFIX_VERIFY_INTERVAL_MS: i64 = 60 * 60 * 1000;
+    /// the trailing window, on the drain's clock. Gemini JSON documents retain
+    /// their separate hourly policy.
+    pub(crate) const FULL_PREFIX_VERIFY_INTERVAL_MS: i64 = super::jsonl_schedule::DAILY_VERIFY_MS;
+    pub(crate) use super::jsonl_schedule::{FileStat, WindowSchedule};
 
     /// Resume points and full-verification times for one source's files.
     ///
@@ -299,6 +302,7 @@ pub(crate) mod harness_drain {
     pub(crate) struct ResumeCache<P> {
         pub resume: HashMap<PathBuf, P>,
         pub prefix_verified_ms: HashMap<PathBuf, i64>,
+        pub windows: HashMap<PathBuf, WindowSchedule>,
     }
 
     impl<P> Default for ResumeCache<P> {
@@ -306,21 +310,26 @@ pub(crate) mod harness_drain {
             Self {
                 resume: HashMap::new(),
                 prefix_verified_ms: HashMap::new(),
+                windows: HashMap::new(),
             }
         }
     }
 
-    /// The prefix check for a file with (or without) a resume point: `Full`
-    /// once the last full verification is an interval old or unknown.
+    /// A resumed file gets a full check at its next daily phase, when its
+    /// verification time is unknown, or when the drain clock moves backwards.
     pub(crate) fn prefix_check(
+        path: &Path,
         has_resume_point: bool,
         verified_ms: Option<i64>,
         recorded_at_ms: i64,
     ) -> PrefixCheck {
         if has_resume_point
-            && verified_ms.is_none_or(|verified| {
-                recorded_at_ms.saturating_sub(verified) >= FULL_PREFIX_VERIFY_INTERVAL_MS
-            })
+            && super::jsonl_schedule::full_due(
+                path,
+                verified_ms,
+                recorded_at_ms,
+                FULL_PREFIX_VERIFY_INTERVAL_MS,
+            )
         {
             PrefixCheck::Full
         } else {
@@ -642,6 +651,10 @@ pub(crate) mod harness_drain {
     ) -> Result<RecordTally, SourceDrainError> {
         let mut stopped = false;
         let committed = state.ordered_write(|tx| {
+            if requests.is_empty() && stop_requested() {
+                stopped = true;
+                return Err(format!("{key} ingest stopped"));
+            }
             let dispositions = record_events_in_tx(
                 tx,
                 key,
@@ -740,6 +753,7 @@ pub(crate) mod harness_drain {
         parse: impl Fn(&Path, Option<P>, PrefixCheck) -> JsonlRead<P, C, Call>,
         map: impl Fn(Call) -> Result<EventRecordRequest, String>,
         add_counts: impl Fn(&mut C, &C) -> u64,
+        offset: impl Fn(&P) -> u64,
     ) -> Result<JsonlDrainOutcome<C>, SourceDrainError> {
         let root_label = format!("{label} sessions");
         let Some(root) = present_root(state, key, root, &root_label)? else {
@@ -750,13 +764,14 @@ pub(crate) mod harness_drain {
         };
         let files = files_below(root, keep)
             .map_err(|error| format!("read {root_label} root {}: {error}", root.display()))?;
-        let (mut previous_points, previous_verified) = {
+        let (mut previous_points, previous_verified, previous_windows) = {
             let mut previous = cache
                 .lock()
                 .map_err(|_| format!("{label} cache lock poisoned"))?;
             (
                 std::mem::take(&mut previous.resume),
                 previous.prefix_verified_ms.clone(),
+                previous.windows.clone(),
             )
         };
         let mut outcome = JsonlDrainOutcome::default();
@@ -766,12 +781,36 @@ pub(crate) mod harness_drain {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            // Stat metadata never authorizes skipping a file. Quiet files still
-            // verify their trailing window; full-prefix checks retain their cadence.
+            let stat = FileStat::read(&path)
+                .map_err(|error| format!("stat {label} session {}: {error}", path.display()))?;
             let point = previous_points.remove(&path);
             let verified = previous_verified.get(&path).copied();
-            let check = prefix_check(point.is_some(), verified, recorded_at_ms);
+            let check = prefix_check(&path, point.is_some(), verified, recorded_at_ms);
+            let window = previous_windows.get(&path);
+            if let Some(window) = window.filter(|window| {
+                point.is_some() && window.defer(&stat, recorded_at_ms, check == PrefixCheck::Full)
+            }) {
+                next.resume
+                    .insert(path.clone(), point.expect("checked resume point"));
+                if let Some(verified) = verified {
+                    next.prefix_verified_ms.insert(path.clone(), verified);
+                }
+                next.windows.insert(path, window.clone());
+                continue;
+            }
+            let previous_offset = point.as_ref().map(&offset);
             let parsed = parse(&path, point, check);
+            let next_offset = parsed.resume.as_ref().map(&offset);
+            next.windows.insert(
+                path.clone(),
+                WindowSchedule::after_read(
+                    window,
+                    stat.clone(),
+                    recorded_at_ms,
+                    parsed.resumed && next_offset == previous_offset,
+                    next_offset == Some(stat.len),
+                ),
+            );
             if let Some(verified) = verified_after(check, parsed.resumed, verified, recorded_at_ms)
             {
                 next.prefix_verified_ms.insert(path.clone(), verified);

@@ -134,6 +134,7 @@ impl OmpSource {
                 total.add(counts);
                 counts.skipped_lines
             },
+            astrocyte_readers::sessions::omp::OmpResumePoint::offset,
         )
     }
 }

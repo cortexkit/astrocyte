@@ -125,6 +125,7 @@ impl KimiSource {
                 total.add(counts);
                 counts.skipped_lines
             },
+            astrocyte_readers::sessions::kimi::KimiResumePoint::offset,
         )
     }
 }

@@ -311,6 +311,13 @@ fn parse_line(
 #[derive(Debug)]
 pub struct OmpResumePoint(JsonlResumePoint<OmpParseState>);
 
+impl OmpResumePoint {
+    /// Complete bytes consumed, excluding an unterminated tail.
+    pub fn offset(&self) -> u64 {
+        self.0.offset()
+    }
+}
+
 /// Result of one [`parse_omp_file_resumable`] call.
 #[derive(Debug, Default)]
 pub struct OmpResumableParse {

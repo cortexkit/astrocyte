@@ -379,6 +379,13 @@ fn parse_jsonl_line(
 #[derive(Debug)]
 pub struct GeminiResumePoint(JsonlResumePoint<GeminiParseState>);
 
+impl GeminiResumePoint {
+    /// Complete bytes consumed, excluding an unterminated tail.
+    pub fn offset(&self) -> u64 {
+        self.0.offset()
+    }
+}
+
 /// Result of one [`parse_gemini_jsonl_resumable`] call.
 #[derive(Debug, Default)]
 pub struct GeminiResumableParse {

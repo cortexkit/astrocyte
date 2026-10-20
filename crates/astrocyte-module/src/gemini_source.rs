@@ -30,8 +30,8 @@ use astrocyte_readers::sessions::gemini::{
 
 use crate::refresher::harness_drain::{
     derived_measurement, files_below, health_reason, prefix_check, present_root, record_requests,
-    verbatim_measurement, verified_after, HarnessSource, ResumeCache, SourceRoot as GeminiRoot,
-    FULL_PREFIX_VERIFY_INTERVAL_MS,
+    verbatim_measurement, verified_after, FileStat, HarnessSource, ResumeCache,
+    SourceRoot as GeminiRoot, WindowSchedule,
 };
 use crate::refresher::SourceDrainError;
 use crate::state::SharedState;
@@ -170,8 +170,11 @@ impl GeminiSource {
                 .lock()
                 .map_err(|_| "Gemini CLI cache lock poisoned".to_string())?,
         );
-        let (mut previous_points, previous_verified) =
-            (previous.jsonl.resume, previous.jsonl.prefix_verified_ms);
+        let (mut previous_points, previous_verified, previous_windows) = (
+            previous.jsonl.resume,
+            previous.jsonl.prefix_verified_ms,
+            previous.jsonl.windows,
+        );
         let previous_documents = previous.documents;
 
         let mut outcome = GeminiDrainOutcome {
@@ -190,8 +193,45 @@ impl GeminiSource {
             {
                 let previous = previous_points.remove(&path);
                 let verified = previous_verified.get(&path).copied();
-                let check = prefix_check(previous.is_some(), verified, recorded_at_ms);
+                let stat = FileStat::read(&path)
+                    .map_err(|error| format!("stat Gemini JSONL {}: {error}", path.display()))?;
+                let check = prefix_check(&path, previous.is_some(), verified, recorded_at_ms);
+                let window = previous_windows.get(&path);
+                if let Some(window) = window.filter(|window| {
+                    previous.is_some()
+                        && window.defer(
+                            &stat,
+                            recorded_at_ms,
+                            check == astrocyte_readers::sessions::jsonl_resume::PrefixCheck::Full,
+                        )
+                }) {
+                    next.jsonl
+                        .resume
+                        .insert(path.clone(), previous.expect("checked resume point"));
+                    if let Some(verified) = verified {
+                        next.jsonl.prefix_verified_ms.insert(path.clone(), verified);
+                    }
+                    next.jsonl.windows.insert(path, window.clone());
+                    continue;
+                }
+                let previous_offset = previous
+                    .as_ref()
+                    .map(astrocyte_readers::sessions::gemini::GeminiResumePoint::offset);
                 let parse = parse_gemini_jsonl_resumable(&path, previous, check);
+                let offset = parse
+                    .resume
+                    .as_ref()
+                    .map(astrocyte_readers::sessions::gemini::GeminiResumePoint::offset);
+                next.jsonl.windows.insert(
+                    path.clone(),
+                    WindowSchedule::after_read(
+                        window,
+                        stat.clone(),
+                        recorded_at_ms,
+                        parse.resumed && offset == previous_offset,
+                        offset == Some(stat.len),
+                    ),
+                );
                 if let Some(verified) =
                     verified_after(check, parse.resumed, verified, recorded_at_ms)
                 {
@@ -254,6 +294,8 @@ impl GeminiSource {
 }
 
 type DocumentCalls = (Vec<GeminiCall>, GeminiParseCounts);
+
+const FULL_PREFIX_VERIFY_INTERVAL_MS: i64 = 60 * 60 * 1000;
 
 /// Read one JSON document if it may have changed. Returns the mark to keep
 /// and, when the document was parsed, its calls and counts; `None` when the

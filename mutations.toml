@@ -6,6 +6,110 @@
 # Ordinary logic belongs in ordinary tests.
 
 [[control]]
+id = "jsonl-daily-literal-deadline"
+guards = "A due daily full-prefix check overrides a quiet window and catches old-byte rewrites"
+file = "crates/astrocyte-module/src/jsonl_schedule.rs"
+old = 'now < verified || now.saturating_sub(verified) >= wait'
+new = 'now < verified || now.saturating_sub(verified) > wait // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/jsonl_schedule.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "refresher::jsonl_schedule::tests::daily_checks_are_not_postponed_by_appends_on_every_tick",
+  "refresher::jsonl_schedule::tests::daily_literal_deadline_overrides_quiet_deferral_and_quarantines_old_bytes",
+  "refresher::jsonl_schedule::tests::stopped_or_rolled_back_drain_does_not_spend_a_daily_check",
+  "refresher::pi_source::tests::pi_daily_deadlines_stay_staggered_as_inventory_grows",
+  "refresher::pi_source::tests::pi_file_growing_every_tick_still_gets_its_periodic_full_verification",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "jsonl-quiet-five-minute-bound"
+guards = "Unchanged metadata never postpones quiet-file content checks beyond five minutes"
+file = "crates/astrocyte-module/src/jsonl_schedule.rs"
+old = 'now.saturating_sub(self.checked_ms) < QUIET_CHECK_MS'
+new = 'now.saturating_sub(self.checked_ms) < QUIET_CHECK_MS * 2 // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/jsonl_schedule.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::jsonl_schedule::tests::quiet_five_minute_bound_catches_hidden_rewrite_and_append"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "jsonl-quiet-metadata-wakeup"
+guards = "Changed size, mtime or identity wakes a quiet file before its content deadline"
+file = "crates/astrocyte-module/src/jsonl_schedule.rs"
+old = '&& self.stat.same(stat)'
+new = '&& { let _ = stat; true } // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/jsonl_schedule.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::jsonl_schedule::tests::quiet_metadata_change_wakes_before_the_window_deadline"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "jsonl-quiet-content-deferral"
+guards = "An unexpired quiet drain reads no content but commits source health"
+file = "crates/astrocyte-module/src/jsonl_schedule.rs"
+old = 'self.ready'
+new = 'false && self.ready // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/jsonl_schedule.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "refresher::jsonl_schedule::tests::quiet_five_minute_bound_catches_hidden_rewrite_and_append",
+  "refresher::jsonl_schedule::tests::quiet_unexpired_tick_reads_no_content_but_commits_health",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "jsonl-daily-path-stagger"
+guards = "Daily deadlines remain spread across the day as the inventory grows"
+file = "crates/astrocyte-module/src/jsonl_schedule.rs"
+old = 'let phase = phase(path, interval);'
+new = 'let phase = { let _ = path; 0 }; // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/pi_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "refresher::jsonl_schedule::tests::daily_checks_are_not_postponed_by_appends_on_every_tick",
+  "refresher::jsonl_schedule::tests::daily_literal_deadline_overrides_quiet_deferral_and_quarantines_old_bytes",
+  "refresher::pi_source::tests::pi_daily_deadlines_stay_staggered_as_inventory_grows",
+  "refresher::pi_source::tests::pi_file_growing_every_tick_still_gets_its_periodic_full_verification",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "jsonl-stopped-empty-drain-keeps-check-due"
+guards = "A stop after scheduled verification rolls back even an event-free drain"
+file = "crates/astrocyte-module/src/refresher.rs"
+old = 'if requests.is_empty() && stop_requested() {'
+new = 'if false && requests.is_empty() && stop_requested() { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/jsonl_schedule.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::jsonl_schedule::tests::stopped_or_rolled_back_drain_does_not_spend_a_daily_check"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
 id = "hourly-summary-header-before-heads"
 guards = "Charge insertion refuses a reprice that did not advance its event header generation"
 file = "crates/astrocyte-core/src/pricing.rs"

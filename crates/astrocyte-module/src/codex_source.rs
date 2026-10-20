@@ -64,6 +64,7 @@ struct CodexCache {
     resume: HashMap<PathBuf, CodexResumePoint>,
     /// When each file's consumed prefix was last verified end to end.
     prefix_verified_ms: HashMap<PathBuf, i64>,
+    windows: HashMap<PathBuf, crate::refresher::harness_drain::WindowSchedule>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,27 +203,32 @@ impl CodexSource {
             outcome.files_by_directory.insert(directory, found.len());
             files.extend(found);
         }
-        let (mut previous_points, previous_verified) = {
+        let (mut previous_points, previous_verified, previous_windows) = {
             let cache = self
                 .cache
                 .lock()
                 .map_err(|_| "Codex cache lock poisoned".to_string())?;
-            (cache.resume.clone(), cache.prefix_verified_ms.clone())
+            (
+                cache.resume.clone(),
+                cache.prefix_verified_ms.clone(),
+                cache.windows.clone(),
+            )
         };
 
         let mut resume_points = HashMap::with_capacity(files.len());
         let mut verified_ms = HashMap::with_capacity(files.len());
+        let mut windows = HashMap::with_capacity(files.len());
         let mut requests = Vec::new();
         let mut set_aside = Vec::new();
         for path in files {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            // Every file is read every drain: size, mtime and inode are never
-            // enough to skip one. A quiet file costs one trailing window hash
-            // and a zero-byte read.
+            let stat = crate::refresher::harness_drain::FileStat::read(&path)
+                .map_err(|error| format!("stat Codex session {}: {error}", path.display()))?;
             let previous = previous_points.remove(&path);
             let check = if crate::refresher::harness_drain::prefix_check(
+                &path,
                 previous.is_some(),
                 previous_verified.get(&path).copied(),
                 recorded_at_ms,
@@ -232,10 +238,33 @@ impl CodexSource {
             } else {
                 CodexPrefixCheck::Window
             };
+            let window = previous_windows.get(&path);
+            if let (Some(point), Some(window)) = (previous.as_ref(), window) {
+                if window.defer(&stat, recorded_at_ms, check == CodexPrefixCheck::Full) {
+                    resume_points.insert(path.clone(), point.clone());
+                    if let Some(&verified) = previous_verified.get(&path) {
+                        verified_ms.insert(path.clone(), verified);
+                    }
+                    windows.insert(path, window.clone());
+                    continue;
+                }
+            }
+            let previous_offset = previous.as_ref().map(CodexResumePoint::offset);
             let parse = parse_codex_file_resumable(&path, previous, check);
             if let Some(reason) = parse.io_error {
                 return Err(format!("read Codex session file {}: {reason}", path.display()).into());
             }
+            let offset = parse.resume.as_ref().map(CodexResumePoint::offset);
+            windows.insert(
+                path.clone(),
+                crate::refresher::harness_drain::WindowSchedule::after_read(
+                    window,
+                    stat.clone(),
+                    recorded_at_ms,
+                    parse.resumed && offset == previous_offset,
+                    offset == Some(stat.len),
+                ),
+            );
             set_aside.extend(parse.set_aside.into_iter().map(|(line, reason)| {
                 crate::refresher::SetAsideRecord {
                     locator: format!("{path:?}:line:{line}"),
@@ -292,6 +321,7 @@ impl CodexSource {
             .map_err(|_| "Codex cache lock poisoned".to_string())?;
         cache.resume = resume_points;
         cache.prefix_verified_ms = verified_ms;
+        cache.windows = windows;
         Ok(outcome)
     }
 }

@@ -270,6 +270,13 @@ fn parse_line(
 #[derive(Debug)]
 pub struct KimiResumePoint(JsonlResumePoint<KimiParseState>);
 
+impl KimiResumePoint {
+    /// Complete bytes consumed, excluding an unterminated tail.
+    pub fn offset(&self) -> u64 {
+        self.0.offset()
+    }
+}
+
 /// Result of one [`parse_kimi_wire_resumable`] call.
 #[derive(Debug, Default)]
 pub struct KimiResumableParse {

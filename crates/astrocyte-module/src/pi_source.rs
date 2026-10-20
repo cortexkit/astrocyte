@@ -22,6 +22,7 @@ use chrono::DateTime;
 use rusqlite::params;
 use serde::Deserialize;
 
+use crate::refresher::jsonl_schedule::{full_due, FileStat, WindowSchedule};
 use crate::refresher::SourceDrainError;
 use crate::state::SharedState;
 
@@ -140,7 +141,7 @@ struct CachedIdentity {
 /// file (~10 MB/s of continuous SHA-256 — the dominant share of the daemon's
 /// 6-8% of one core, measured in production 2026-09-23), growing with the
 /// file forever.
-const PI_FULL_PREFIX_VERIFY_INTERVAL_MS: i64 = 60 * 60 * 1000;
+const PI_FULL_PREFIX_VERIFY_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Default)]
 struct PiCache {
@@ -151,6 +152,7 @@ struct PiCache {
     /// When each file's consumed prefix was last verified end to end, on the
     /// drain's `recorded_at_ms` clock. Committed together with `resume`.
     prefix_verified_ms: HashMap<PathBuf, i64>,
+    windows: HashMap<PathBuf, WindowSchedule>,
     /// For each file, how far its session-header search has read and whether
     /// it found the header (see `HeaderScan`). Committed together with
     /// `resume`, and trusted only for a file whose resume verified.
@@ -285,7 +287,7 @@ impl PiSource {
 
         let files = jsonl_files(root)
             .map_err(|error| format!("read Pi session root {}: {error}", root.display()))?;
-        let (cached_resume, cached_verified, cached_header_scans) = {
+        let (cached_resume, cached_verified, cached_header_scans, cached_windows) = {
             let cache = self
                 .cache
                 .lock()
@@ -294,6 +296,7 @@ impl PiSource {
                 cache.resume.clone(),
                 cache.prefix_verified_ms.clone(),
                 cache.header_scans.clone(),
+                cache.windows.clone(),
             )
         };
         // A windowed drain skips records outside the requested time range.
@@ -306,6 +309,7 @@ impl PiSource {
         let mut resume_points = HashMap::with_capacity(files.len());
         let mut verified_ms = HashMap::with_capacity(files.len());
         let mut header_scans = HashMap::with_capacity(files.len());
+        let mut windows = HashMap::with_capacity(files.len());
         let mut observations = Vec::new();
         let mut set_aside = Vec::new();
         for path in files {
@@ -316,34 +320,52 @@ impl PiSource {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            // Every file is read every drain. Size and mtime are never enough
-            // to skip one: Linux file timestamps are coarse, so a same-size
-            // rewrite within one timestamp tick keeps both. A file that did
-            // not change costs one trailing-window hash and a zero-byte read.
-            //
-            // A file resumes from its last complete line when the bytes
-            // before it are unchanged (checked by digest, not by size or
-            // mtime), and is read in full otherwise; content-derived identity
-            // makes the full read safe. Ordinary ticks re-hash only the
-            // trailing window of the consumed prefix; the whole prefix is
-            // re-hashed once the verification cadence is due.
-            //
-            // The reader answers an unopenable file with an empty parse, so the
-            // file is opened here first to fail the drain visibly instead.
-            fs::File::open(&path)
+            // Stat every file, including deferred ones. Metadata can wake a
+            // quiet file but cannot extend either content-check deadline.
+            let stat = FileStat::read(&path)
                 .map_err(|error| format!("open Pi session file {}: {error}", path.display()))?;
             let previous = resumable.then(|| cached_resume.get(&path)).flatten();
             let check = match previous {
                 Some(_)
-                    if cached_verified.get(&path).is_none_or(|&verified| {
-                        recorded_at_ms.saturating_sub(verified) >= PI_FULL_PREFIX_VERIFY_INTERVAL_MS
-                    }) =>
+                    if full_due(
+                        &path,
+                        cached_verified.get(&path).copied(),
+                        recorded_at_ms,
+                        PI_FULL_PREFIX_VERIFY_INTERVAL_MS,
+                    ) =>
                 {
                     PiPrefixCheck::Full
                 }
                 _ => PiPrefixCheck::Window,
             };
+            let window = resumable.then(|| cached_windows.get(&path)).flatten();
+            if let (Some(point), Some(window)) = (previous, window) {
+                if window.defer(&stat, recorded_at_ms, check == PiPrefixCheck::Full) {
+                    resume_points.insert(path.clone(), point.clone());
+                    if let Some(&verified) = cached_verified.get(&path) {
+                        verified_ms.insert(path.clone(), verified);
+                    }
+                    if let Some(&scan) = cached_header_scans.get(&path) {
+                        header_scans.insert(path.clone(), scan);
+                    }
+                    windows.insert(path, window.clone());
+                    continue;
+                }
+            }
             let parse = parse_pi_file_resumable(&path, previous, check);
+            if resumable {
+                let offset = parse.resume.as_ref().map(PiResumePoint::offset);
+                windows.insert(
+                    path.clone(),
+                    WindowSchedule::after_read(
+                        window,
+                        stat.clone(),
+                        recorded_at_ms,
+                        parse.resumed && offset == previous.map(PiResumePoint::offset),
+                        offset == Some(stat.len),
+                    ),
+                );
+            }
             set_aside.extend(parse.set_aside.into_iter().map(|(offset, reason)| {
                 crate::refresher::SetAsideRecord {
                     locator: format!("{path:?}:byte:{offset}"),
@@ -466,6 +488,7 @@ impl PiSource {
             cache.resume = resume_points;
             cache.prefix_verified_ms = verified_ms;
             cache.header_scans = header_scans;
+            cache.windows = windows;
         }
         cache.identities.extend(additions);
         Ok(outcome)
@@ -1497,17 +1520,22 @@ mod tests {
         let path = write_fixture(temp.path(), "encoded", &contents);
         let state = test_state();
         let source = PiSource::at(temp.path());
-        // t=0: the process-start full read, which sets the verification clock.
+        // Start at the file's daily phase so its next deadline is a literal day.
+        let start = crate::refresher::jsonl_schedule::phase(&path, 86_400_000);
         assert_eq!(
-            source.drain(&state, 0, &NEVER_STOP).unwrap().parsed.records,
+            source
+                .drain(&state, start, &NEVER_STOP)
+                .unwrap()
+                .parsed
+                .records,
             1
         );
 
-        // Tick every 30 s of the drain clock, appending one record per tick.
+        // Append on every hourly tick of the fake clock for a full day.
         // On tick 5 the same append also carries a same-length rewrite of
         // entry-1, far outside the trailing window.
-        let tick_ms = 30_000_i64;
-        let ticks_per_interval = PI_FULL_PREFIX_VERIFY_INTERVAL_MS / tick_ms;
+        let tick_ms = 3_600_000_i64;
+        let ticks_per_interval = 24;
         let mut current = contents;
         for tick in 1..=ticks_per_interval {
             if tick == 5 {
@@ -1522,8 +1550,10 @@ mod tests {
                 message_line(&format!("entry-t{tick}"), &format!("response-t{tick}"), 21)
             ));
             fs::write(&path, &current).unwrap();
-            let outcome = source.drain(&state, tick * tick_ms, &NEVER_STOP).unwrap();
-            if tick * tick_ms < PI_FULL_PREFIX_VERIFY_INTERVAL_MS {
+            let outcome = source
+                .drain(&state, start + tick * tick_ms, &NEVER_STOP)
+                .unwrap();
+            if tick * tick_ms < 86_400_000 {
                 assert_eq!(
                     outcome.files_resumed, 1,
                     "tick {tick}: no full verification is due yet"
@@ -1542,6 +1572,41 @@ mod tests {
                 );
                 assert_eq!(outcome.quarantined_redeliveries, 1, "entry-1 changed");
             }
+        }
+    }
+
+    #[test]
+    fn pi_daily_deadlines_stay_staggered_as_inventory_grows() {
+        use crate::refresher::jsonl_schedule::phase;
+        let temp = TempDir::new().unwrap();
+        let contents = padded(
+            format!(
+                "{PAD_TEST_HEADER}\n{}\n",
+                message_line("entry", "response", 11)
+            ),
+            131_072,
+        );
+        let mut deadlines = Vec::new();
+        for index in 0..32 {
+            let path = write_fixture(temp.path(), &format!("project-{index}"), &contents);
+            let phase = phase(&path, 86_400_000);
+            deadlines.push((if phase == 0 { 86_400_000 } else { phase }, path));
+        }
+        deadlines.sort();
+        assert!(deadlines.windows(2).all(|pair| pair[0].0 != pair[1].0));
+        let source = PiSource::at(temp.path());
+        let state = test_state();
+        source.drain(&state, 0, &NEVER_STOP).unwrap();
+        for (index, (deadline, path)) in deadlines.iter().take(8).enumerate() {
+            write_fixture(temp.path(), &format!("added-{index}"), &contents);
+            source.drain(&state, deadline - 1, &NEVER_STOP).unwrap();
+            assert_eq!(source.cache.lock().unwrap().prefix_verified_ms[path], 0);
+            let due = source.drain(&state, *deadline, &NEVER_STOP).unwrap();
+            assert!(due.hashed_bytes >= u64::try_from(contents.len()).unwrap());
+            assert_eq!(
+                source.cache.lock().unwrap().prefix_verified_ms[path],
+                *deadline
+            );
         }
     }
 

@@ -71,6 +71,7 @@ pub(crate) struct ClaudeCodeCache {
     resume: HashMap<PathBuf, ClaudeResumePoint>,
     /// When each file's consumed prefix was last verified end to end.
     prefix_verified_ms: HashMap<PathBuf, i64>,
+    windows: HashMap<PathBuf, crate::refresher::harness_drain::WindowSchedule>,
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +256,7 @@ pub(crate) fn read_projects(
     let mut outcome = ClaudeCodeDrainOutcome::default();
     let mut resume_points = HashMap::with_capacity(files.len());
     let mut verified_ms = HashMap::with_capacity(files.len());
+    let mut windows = HashMap::with_capacity(files.len());
     let mut requests = Vec::new();
     let mut set_aside = Vec::new();
     for (path, depth) in files {
@@ -262,13 +264,12 @@ pub(crate) fn read_projects(
             return Err(SourceDrainError::Stopped);
         }
         *outcome.files_by_depth.entry(depth).or_default() += 1;
-        // Every file is read every drain: size, mtime and inode are never
-        // enough to skip one (coarse timestamps and reused inodes have
-        // hidden real appends before). A quiet file costs one trailing
-        // window hash and a zero-byte read.
-        let previous = previous_points.remove(&path);
+        let stat = crate::refresher::harness_drain::FileStat::read(&path)
+            .map_err(|error| format!("stat Claude Code session {}: {error}", path.display()))?;
+        let point = previous_points.remove(&path);
         let check = if crate::refresher::harness_drain::prefix_check(
-            previous.is_some(),
+            &path,
+            point.is_some(),
             previous_verified.get(&path).copied(),
             recorded_at_ms,
         ) == astrocyte_readers::sessions::jsonl_resume::PrefixCheck::Full
@@ -277,13 +278,36 @@ pub(crate) fn read_projects(
         } else {
             ClaudePrefixCheck::Window
         };
+        let window = previous.windows.get(&path);
+        if let (Some(point), Some(window)) = (point.as_ref(), window) {
+            if window.defer(&stat, recorded_at_ms, check == ClaudePrefixCheck::Full) {
+                resume_points.insert(path.clone(), point.clone());
+                if let Some(&verified) = previous_verified.get(&path) {
+                    verified_ms.insert(path.clone(), verified);
+                }
+                windows.insert(path, window.clone());
+                continue;
+            }
+        }
+        let previous_offset = point.as_ref().map(ClaudeResumePoint::offset);
         let parse =
-            parse_claude_file_resumable(&path, previous, check, recorded_at_ms, quiet_window_ms);
+            parse_claude_file_resumable(&path, point, check, recorded_at_ms, quiet_window_ms);
         if let Some(reason) = parse.io_error {
             return Err(
                 format!("read Claude Code session file {}: {reason}", path.display()).into(),
             );
         }
+        let offset = parse.resume.as_ref().map(ClaudeResumePoint::offset);
+        windows.insert(
+            path.clone(),
+            crate::refresher::harness_drain::WindowSchedule::after_read(
+                window,
+                stat.clone(),
+                recorded_at_ms,
+                parse.resumed && offset == previous_offset,
+                offset == Some(stat.len) && parse.pending_calls == 0,
+            ),
+        );
         set_aside.extend(parse.set_aside.into_iter().map(|(line, reason)| {
             crate::refresher::SetAsideRecord {
                 locator: format!("{path:?}:line:{line}"),
@@ -330,6 +354,7 @@ pub(crate) fn read_projects(
         cache: ClaudeCodeCache {
             resume: resume_points,
             prefix_verified_ms: verified_ms,
+            windows,
         },
     })
 }

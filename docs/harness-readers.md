@@ -18,11 +18,35 @@ Readers open SQLite stores read-only through a `mode=ro` URI
 files with plain reads. JSONL readers resume from a byte offset that always
 ends on a newline; an unterminated tail is left for the next read. Before
 trusting the offset they re-hash the consumed prefix with SHA-256: the last
-64 KiB on ordinary ticks, the whole prefix on a periodic cadence
+64 KiB on ordinary content checks, the whole prefix on a periodic cadence
 (`jsonl_resume.rs`; Pi keeps its own copy). A shrunk file, a changed inode or
 a changed prefix makes the file be read again from the start. Events already
 recorded then come back as exact redeliveries, because each event's identity
 and content come from the file alone.
+
+Pi, Claude Code (including declared workers), Codex, Oh My Pi, Kimi and Gemini
+JSONL verify the whole consumed prefix at least every 24 hours. Each path has
+a deterministic daily phase, so adding files does not move existing deadlines.
+The first deadline is within 24 hours of a verified read, not a day plus an
+offset. Appends never renew that deadline. Due files are checked whole, even
+when one oversized file exceeds a soft byte budget. Cold starts and restarts
+still read every file in full.
+
+Every drain still discovers and stats every file. After one observed hour
+without change, a complete file with no pending Claude calls may defer its
+window check until five minutes after its last content check. An hour avoids
+backing off ordinary pauses in active sessions. Changed size, modification
+time or file identity wakes the file immediately; unknown metadata cannot
+authorize deferral. Unchanged metadata never extends the five-minute bound.
+Once a file change is detected, every-tick checking resumes, and a due
+full-prefix check overrides deferral. Thus window rewrites and hidden appends
+are detected on the next tick for active files, or within five minutes for
+quiet files. Rewrites before the window are detected within 24 hours. Add
+drain latency to these bounds. Changed payloads with existing event identities
+reach quarantine rather than replacing ledger facts. Even an entirely deferred
+drain commits and advances `source_runtime.last_success_ms`; stopped or rolled
+back drains do not consume scheduled checks. Gemini JSON documents retain
+their separate hourly verification policy. OpenCode and Goose are unchanged.
 
 Records a reader cannot use are counted, not guessed at. The BROCA, Claude
 Code, Codex, OpenCode and Pi sources also store them as `set_aside_record`
