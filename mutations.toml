@@ -45,8 +45,8 @@ build_timeout_s = 600
 id = "jsonl-quiet-metadata-wakeup"
 guards = "Changed size, mtime or identity wakes a quiet file before its content deadline"
 file = "crates/astrocyte-module/src/jsonl_schedule.rs"
-old = '&& self.stat.same(stat)'
-new = '&& { let _ = stat; true } // NON-VACUITY BREAK'
+old = '            && self.stat.same(stat)'
+new = '            && { let _ = stat; true } // NON-VACUITY BREAK'
 test_file = "crates/astrocyte-module/src/jsonl_schedule.rs"
 runner = "cargo"
 package = "astrocyte-module"
@@ -60,8 +60,8 @@ build_timeout_s = 600
 id = "jsonl-quiet-content-deferral"
 guards = "An unexpired quiet drain reads no content but commits source health"
 file = "crates/astrocyte-module/src/jsonl_schedule.rs"
-old = 'self.ready'
-new = 'false && self.ready // NON-VACUITY BREAK'
+old = '&& now.saturating_sub(self.changed_ms) >= QUIET_AFTER_MS'
+new = '&& false && now.saturating_sub(self.changed_ms) >= QUIET_AFTER_MS // NON-VACUITY BREAK'
 test_file = "crates/astrocyte-module/src/jsonl_schedule.rs"
 runner = "cargo"
 package = "astrocyte-module"
