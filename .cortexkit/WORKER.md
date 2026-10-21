@@ -50,6 +50,11 @@ touches, and every row on master. When you add a row, replay it exactly as CI do
 (`ckdev-mutate run --only <row id>`). List every test the mutant reddens, or the row reports
 `WRONG_TEST`.
 
+Before delivering any change, run `ckdev-mutate check` over the whole catalogue (about
+80 s). Rows match their target code by exact text, and an edit can repeat that text in a
+file another row targets. Replaying only your own rows misses that, and CI then refuses the
+catalogue before running any test.
+
 ## Store and migrations
 
 - Schema changes append a new `Migration` in `crates/astrocyte-core/src/store.rs`. Never
