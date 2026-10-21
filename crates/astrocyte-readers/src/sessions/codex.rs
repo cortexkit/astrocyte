@@ -20,12 +20,13 @@
 // buckets, OpenClaw ownership, turn-start and duration bookkeeping, the
 // deferred-model queue, and the "stale regression" heuristic (a regressing
 // total is counted and not ingested instead). Divergences inside retained
-// code are marked inline.
+// code are marked inline. Archive bounds, request settlement and activity
+// diagnostics are adapted from tokscale v4.20.0 (c1973901fc2f7ba0d134252bfd923c714cc123db).
 
 //! Codex CLI session reader.
 //!
-//! Reads `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (and the same shape
-//! under `~/.codex/archived_sessions/`). Every record is
+//! Reads `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` and `.jsonl.zst`
+//! (and the same shapes under `~/.codex/archived_sessions/`). Every record is
 //! `{"timestamp","ordinal","type","payload"}`.
 //!
 //! Codex writes an `event_msg` `token_count` record after every completed
@@ -51,8 +52,20 @@ use super::jsonl_resume::{JsonlResumePoint, PrefixCheck, PREFIX_WINDOW_BYTES};
 use super::normalize_workspace_key;
 use super::utils::{parse_json_line, parse_rfc3339_millis};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+
+#[path = "codex_archive.rs"]
+mod archive;
+
+/// Whether the rollout is a compressed archive rather than appendable JSONL.
+pub fn is_codex_archive(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "zst")
+        && path
+            .with_extension("")
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+}
 
 /// Bytes of the already-consumed prefix that a [`CodexPrefixCheck::Window`]
 /// resume re-hashes.
@@ -99,6 +112,9 @@ struct CodexPayload {
     model: Option<String>,
     turn_id: Option<String>,
     info: Option<CodexInfo>,
+    thread_id: Option<String>,
+    response_id: Option<String>,
+    usage: Option<CodexTokenUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +264,9 @@ impl CodexCallUsage {
 /// One model response, from one advancing `token_count` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexCall {
+    /// True for calls emitted from `token_usage_record`; these use request
+    /// identities rather than native `token_count` response positions.
+    pub supplementary: bool,
     /// One-based line of the token-count record, retained across resumes.
     pub source_line: u64,
     pub set_aside_reason: Option<String>,
@@ -317,6 +336,7 @@ pub struct CodexParseCounts {
     pub output_conflicts: u64,
     /// Calls whose `input` or `output` is [`CodexDerived::Underivable`].
     pub underivable_roles: u64,
+    pub supplementary_requests: u64,
 }
 
 impl CodexParseCounts {
@@ -341,6 +361,7 @@ impl CodexParseCounts {
         input_conflicts,
         output_conflicts,
         underivable_roles,
+        supplementary_requests,
     );
 }
 
@@ -373,7 +394,7 @@ fn unreadable_line_is_skipped(trimmed: &str, buffer: &mut Vec<u8>) -> bool {
         return true;
     };
     match probe.entry_type.as_deref() {
-        Some("session_meta") | Some("turn_context") => true,
+        Some("session_meta") | Some("turn_context") | Some("token_usage_record") => true,
         Some("event_msg") => match parse_json_line::<EventPayloadProbe>(trimmed, buffer) {
             Some(EventPayloadProbe {
                 payload: Some(PayloadTypeProbe { payload_type }),
@@ -410,6 +431,61 @@ struct CodexParseState {
     current_cwd: Option<String>,
     previous_total: Option<CodexTokenUsage>,
     responses_in_turn: HashMap<String, u32>,
+    pending: Option<PendingRequest>,
+    confirmations: VecDeque<(Option<String>, CodexTokenUsage)>,
+    settled: VecDeque<(Option<String>, CodexTokenUsage)>,
+    activity: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRequest {
+    call: CodexCall,
+    usage: CodexTokenUsage,
+    compacted: bool,
+}
+
+fn same_response(left: &CodexTokenUsage, right: &CodexTokenUsage) -> bool {
+    matches!((left.input_tokens, left.output_tokens, right.input_tokens, right.output_tokens),
+        (Some(li), Some(lo), Some(ri), Some(ro)) if li == ri && lo == ro)
+}
+
+fn take_confirmation(
+    records: &mut VecDeque<(Option<String>, CodexTokenUsage)>,
+    turn: &Option<String>,
+    usage: &CodexTokenUsage,
+) -> bool {
+    let found = records.iter().position(|(record_turn, record_usage)| {
+        record_turn == turn && same_response(record_usage, usage)
+    });
+    found.is_some_and(|index| records.remove(index).is_some())
+}
+
+fn remember_response(
+    records: &mut VecDeque<(Option<String>, CodexTokenUsage)>,
+    turn: Option<String>,
+    usage: CodexTokenUsage,
+) {
+    // Late confirmations are local to recent requests, not a transcript-sized cache.
+    if records.len() == 256 {
+        records.pop_front();
+    }
+    records.push_back((turn, usage));
+}
+
+fn settle_pending(
+    state: &mut CodexParseState,
+    counts: &mut CodexParseCounts,
+    calls: &mut Vec<CodexCall>,
+) {
+    if let Some(pending) = state.pending.take() {
+        remember_response(
+            &mut state.settled,
+            pending.call.turn_id.clone(),
+            pending.usage,
+        );
+        counts.supplementary_requests += 1;
+        calls.push(pending.call);
+    }
 }
 
 /// Millisecond timestamp of a UUID v7 (its first 48 bits), or `None` for any
@@ -481,9 +557,147 @@ fn parse_line(
         return;
     };
     let Some(payload) = entry.payload else {
+        if entry.entry_type == "compacted" {
+            if let Some(pending) = state.pending.as_mut() {
+                pending.compacted = true;
+            }
+        }
         return;
     };
+    if matches!(entry.entry_type.as_str(), "response_item" | "compacted")
+        || (entry.entry_type == "event_msg"
+            && payload.payload_type.as_deref() == Some("task_started"))
+    {
+        state.activity = true;
+    }
+    if entry.entry_type == "compacted" {
+        if let Some(pending) = state.pending.as_mut() {
+            pending.compacted = true;
+        }
+        return;
+    }
+    if ((entry.entry_type == "turn_context"
+        || (entry.entry_type == "event_msg"
+            && payload.payload_type.as_deref() == Some("task_started")))
+        && payload.turn_id.is_some()
+        && payload.turn_id != state.current_turn)
+        || (entry.entry_type == "event_msg"
+            && matches!(
+                payload.payload_type.as_deref(),
+                Some("task_complete" | "turn_aborted")
+            )
+            && (payload.turn_id.is_none()
+                || state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.call.turn_id == payload.turn_id)))
+    {
+        settle_pending(state, counts, calls);
+    }
+    let mut suppress_token_count = false;
+    if entry.entry_type == "event_msg" && payload.payload_type.as_deref() == Some("token_count") {
+        let accepted_last = payload.info.as_ref().and_then(|info| {
+            let total = info.total_token_usage.as_ref()?;
+            let last = info.last_token_usage.as_ref()?;
+            if state
+                .previous_total
+                .as_ref()
+                .is_some_and(|previous| previous == total || total.regresses_from(previous))
+            {
+                None
+            } else {
+                Some(last)
+            }
+        });
+        if let Some(last) = accepted_last {
+            if state.pending.as_ref().is_some_and(|pending| {
+                pending.call.turn_id == state.current_turn && same_response(&pending.usage, last)
+            }) {
+                state.pending = None;
+            } else if take_confirmation(&mut state.settled, &state.current_turn, last) {
+                suppress_token_count = true;
+            } else {
+                remember_response(
+                    &mut state.confirmations,
+                    state.current_turn.clone(),
+                    last.clone(),
+                );
+            }
+        }
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.compacted)
+        {
+            settle_pending(state, counts, calls);
+        }
+    }
     match (entry.entry_type.as_str(), payload.payload_type.as_deref()) {
+        ("token_usage_record", _) => {
+            let Some(thread) = state.thread.as_ref() else {
+                counts.records_unidentifiable += 1;
+                return;
+            };
+            if payload
+                .thread_id
+                .as_ref()
+                .is_some_and(|id| id != &thread.thread_id)
+            {
+                return;
+            }
+            let turn = payload
+                .turn_id
+                .clone()
+                .or_else(|| state.current_turn.clone());
+            if thread.is_fork
+                && matches!((turn.as_deref().and_then(uuid_v7_millis), thread.created_ms), (Some(turn), Some(thread)) if turn < thread)
+            {
+                return;
+            }
+            let Some(usage) = payload.usage else {
+                return;
+            };
+            if usage.fields().iter().all(Option::is_none) {
+                return;
+            }
+            if take_confirmation(&mut state.confirmations, &turn, &usage) {
+                return;
+            }
+            let request_id = payload
+                .response_id
+                .filter(|id| !id.is_empty())
+                .map(|id| format!("response:{id}"))
+                .or_else(|| entry.ordinal.map(|ordinal| format!("ordinal:{ordinal}")));
+            let Some(request_id) = request_id else {
+                counts.records_unidentifiable += 1;
+                return;
+            };
+            let call = CodexCall {
+                supplementary: true,
+                source_line: state.lines,
+                set_aside_reason: (thread.is_fork && turn.is_none())
+                    .then(|| "fork replay cannot be identified without a turn id".into()),
+                session_id: thread.session_id.clone(),
+                thread_id: thread.thread_id.clone(),
+                producer_ref: format!("{}:request:{request_id}", thread.thread_id),
+                turn_id: turn,
+                model: state.current_model.clone(),
+                provider: thread.provider.clone(),
+                project_root: state
+                    .current_cwd
+                    .as_deref()
+                    .or(thread.cwd.as_deref())
+                    .and_then(normalize_workspace_key),
+                occurred_at_ms: parse_rfc3339_millis(entry.timestamp.as_deref()),
+                usage: CodexCallUsage::from_usage(&usage),
+            };
+            settle_pending(state, counts, calls);
+            state.pending = Some(PendingRequest {
+                call,
+                usage,
+                compacted: false,
+            });
+        }
         ("session_meta", _) => {
             // The first `session_meta` names the file's thread. Measured: one
             // per file, at ordinal 0. Upstream notes newer fork logs may embed
@@ -551,6 +765,9 @@ fn parse_line(
                 *position += 1;
                 *position
             });
+            if suppress_token_count {
+                return;
+            }
             let Some(thread) = &state.thread else {
                 counts.records_unidentifiable += 1;
                 return;
@@ -593,6 +810,7 @@ fn parse_line(
                 .filter(|role| *role == CodexDerived::Underivable)
                 .count() as u64;
             calls.push(CodexCall {
+                supplementary: false,
                 source_line: state.lines,
                 set_aside_reason: (thread.is_fork && state.current_turn.is_none())
                     .then(|| "fork replay cannot be identified without a turn id".to_string()),
@@ -642,6 +860,8 @@ pub struct CodexResumableParse {
     /// Bytes fed to SHA-256 by this call. A steady-state resume is
     /// O(window + appended), never O(file): the deterministic cost counter.
     pub hashed_bytes: u64,
+    /// Decoded archive bytes, including records not used for accounting.
+    pub decompressed_bytes: u64,
     pub counts: CodexParseCounts,
 }
 
@@ -654,29 +874,26 @@ pub struct CodexResumableParse {
 /// every call, which the ledger absorbs as exact redeliveries because each
 /// call's identity and content come from the file alone.
 ///
-/// Only newline-terminated lines are consumed; an unterminated tail is left
-/// for the next call. That is the whole completeness rule: Codex writes a
-/// `token_count` once per completed response (measured: in 343 of 343
-/// advancing records after a thread's first, the per-response block equals
-/// exactly the growth of the running total, so no record ever revises an
-/// earlier response), so a response's numbers are final when its line is.
-/// A turn still in flight has only its finished responses on disk, and an
-/// interrupted turn (`turn_aborted`, or a file that simply stops) leaves no
-/// partial response behind to wait for.
+/// Only newline-terminated plain-file lines are consumed; an unterminated
+/// tail waits for the next read. Request usage stays pending until confirmed
+/// by token counts or settled by compaction, a terminal event or a later request
+/// or turn. An unresolved live EOF is not a settlement signal. Archives require
+/// complete decoding before any calls are returned.
 ///
-/// Call identity is `<turn_id>:<n>`, the n-th response of the turn in file
-/// order, not the record's `ordinal` or byte offset. Turn ids are UUIDs
-/// minted per turn, and a response keeps its position in its turn wherever
-/// the turn is copied: a subagent fork replays its parent's responses under
-/// the parent's turn id at the same positions but different ordinals and
-/// timestamps (measured: two forks replaying one and two parent responses).
-/// The replay is skipped here, and if a replay ever escapes that check it
-/// carries the parent's identity instead of becoming a second call.
+/// Native call identity is `<turn_id>:<n>`, the n-th response of the turn in
+/// file order, not the record's `ordinal` or byte offset. UUID-v7 turn ids can
+/// identify a fork's parent replay. Older synthetic turn ids remain scoped by
+/// the session lineage in the ledger; sharing a positional reference alone does
+/// not establish that two calls are copies. Supplementary request keys use a
+/// separate namespace and never consume native response positions.
 pub fn parse_codex_file_resumable(
     path: &Path,
     previous: Option<CodexResumePoint>,
     check: CodexPrefixCheck,
 ) -> CodexResumableParse {
+    if is_codex_archive(path) {
+        return archive::parse_archive(path);
+    }
     let mut counts = CodexParseCounts::default();
     let mut set_aside = Vec::new();
     let mut calls = Vec::new();
@@ -715,6 +932,7 @@ pub fn parse_codex_file_resumable(
             .cursor
             .map(|cursor| CodexResumePoint(cursor.with_state(read.state))),
         hashed_bytes: read.hashed_bytes,
+        decompressed_bytes: 0,
         counts,
     }
 }

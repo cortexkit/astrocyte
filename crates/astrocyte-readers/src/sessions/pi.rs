@@ -743,6 +743,58 @@ pub struct PiUsageRecord {
     /// `None` when the entry has none or it does not parse. Never derived
     /// from the file.
     pub occurred_at_ms: Option<i64>,
+    /// Operation records use the entry's model and provider without inheriting
+    /// those values from the conversation.
+    pub operation: Option<PiOperationAttribution>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PiOperationAttribution {
+    pub model: Option<String>,
+    pub provider: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PiOperationEntry {
+    id: Option<String>,
+    timestamp: Option<String>,
+    kind: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    usage: Option<MapOnly<IngestPiUsage>>,
+}
+
+fn pi_operation(
+    entry: PiOperationEntry,
+    state: &PiParseState,
+    namespace: &str,
+) -> Option<PiUsageRecord> {
+    let id = entry.id.filter(|id| !id.trim().is_empty())?;
+    let usage = PiUsage::from(entry.usage?);
+    let normalized = usage.to_breakdown();
+    let occurred_at_ms = super::utils::parse_rfc3339_millis(entry.timestamp.as_deref());
+    let mut message = UnifiedMessage::new_with_agent(
+        "pi",
+        entry.model.as_deref().unwrap_or("unknown"),
+        entry.provider.as_deref().unwrap_or("pi"),
+        state.session_id.clone()?,
+        occurred_at_ms.unwrap_or(0),
+        normalized.tokens,
+        0.0,
+        state.agent.clone(),
+    );
+    message.output_reasoning_conflicted = normalized.output_reasoning_conflicted;
+    message.dedup_key = Some(format!("{namespace}:operation:{id}"));
+    message.set_workspace(state.workspace_key.clone(), state.workspace_label.clone());
+    Some(PiUsageRecord {
+        source_offset: 0,
+        message,
+        occurred_at_ms,
+        operation: Some(PiOperationAttribution {
+            model: entry.model,
+            provider: entry.provider,
+        }),
+    })
 }
 
 // ASTROCYTE DIVERGENCE: upstream keeps the per-line body inline in
@@ -864,6 +916,27 @@ fn parse_pi_line(
         }
         return ControlFlow::Continue(());
     };
+
+    // Only native Pi operations are covered here. Other clients sharing this
+    // format continue to account for assistant messages only. Decode operation
+    // fields separately so assistant records still need only one JSON pass.
+    if context.client == "pi" && matches!(entry.entry_type.as_str(), "compaction" | "usage") {
+        match parse_json_line::<MapOnly<PiOperationEntry>>(trimmed, buffer) {
+            Some(MapOnly(operation)) => {
+                if entry.entry_type == "compaction"
+                    || operation.kind.as_deref() == Some("cache_warm")
+                {
+                    if let Some(record) =
+                        pi_operation(operation, state, context.dedup_namespace.unwrap_or("pi"))
+                    {
+                        messages.push(record);
+                    }
+                }
+            }
+            None => *skipped_lines += 1,
+        }
+        return ControlFlow::Continue(());
+    }
 
     #[cfg(test)]
     {
@@ -1017,6 +1090,7 @@ fn parse_pi_line(
         source_offset: 0,
         message: unified,
         occurred_at_ms: recorded_timestamp,
+        operation: None,
     });
     ControlFlow::Continue(())
 }

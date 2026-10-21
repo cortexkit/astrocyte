@@ -90,6 +90,12 @@ pub(crate) struct WindowSchedule {
 }
 
 impl WindowSchedule {
+    /// Skip archive decompression between daily full-file verifications when
+    /// its size, modification time and file identity have not changed.
+    pub(crate) fn defer_archive(&self, stat: &FileStat, now: i64, full_due: bool) -> bool {
+        self.ready && !full_due && self.stat.same(stat) && now >= self.checked_ms
+    }
+
     pub(crate) fn defer(&self, stat: &FileStat, now: i64, full_due: bool) -> bool {
         // One observed quiet hour avoids backing off pauses in active sessions.
         // Stat can only wake a file early; it never renews the content deadline.

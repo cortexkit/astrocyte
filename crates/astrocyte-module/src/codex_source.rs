@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::{EventRecordRequest, MeasurementInput};
 use astrocyte_readers::sessions::codex::{
-    parse_codex_file_resumable, CodexCall, CodexDerived, CodexParseCounts, CodexPrefixCheck,
-    CodexResumePoint,
+    is_codex_archive, parse_codex_file_resumable, CodexCall, CodexDerived, CodexParseCounts,
+    CodexPrefixCheck, CodexResumePoint,
 };
 
 use crate::refresher::SourceDrainError;
@@ -52,6 +52,7 @@ pub(crate) struct CodexDrainOutcome {
     /// Bytes fed to SHA-256 while reading rollouts: the deterministic
     /// steady-state cost counter, O(window + appended) per file.
     pub hashed_bytes: u64,
+    pub decompressed_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -227,9 +228,11 @@ impl CodexSource {
             let stat = crate::refresher::harness_drain::FileStat::read(&path)
                 .map_err(|error| format!("stat Codex session {}: {error}", path.display()))?;
             let previous = previous_points.remove(&path);
+            let archive = is_codex_archive(&path);
+            let window = previous_windows.get(&path);
             let check = if crate::refresher::harness_drain::prefix_check(
                 &path,
-                previous.is_some(),
+                previous.is_some() || (archive && window.is_some()),
                 previous_verified.get(&path).copied(),
                 recorded_at_ms,
             ) == astrocyte_readers::sessions::jsonl_resume::PrefixCheck::Full
@@ -238,7 +241,17 @@ impl CodexSource {
             } else {
                 CodexPrefixCheck::Window
             };
-            let window = previous_windows.get(&path);
+            if archive
+                && window.is_some_and(|window| {
+                    window.defer_archive(&stat, recorded_at_ms, check == CodexPrefixCheck::Full)
+                })
+            {
+                if let Some(&verified) = previous_verified.get(&path) {
+                    verified_ms.insert(path.clone(), verified);
+                }
+                windows.insert(path, window.expect("archive window exists").clone());
+                continue;
+            }
             if let (Some(point), Some(window)) = (previous.as_ref(), window) {
                 if window.defer(&stat, recorded_at_ms, check == CodexPrefixCheck::Full) {
                     resume_points.insert(path.clone(), point.clone());
@@ -262,7 +275,7 @@ impl CodexSource {
                     stat.clone(),
                     recorded_at_ms,
                     parse.resumed && offset == previous_offset,
-                    offset == Some(stat.len),
+                    archive || offset == Some(stat.len),
                 ),
             );
             set_aside.extend(parse.set_aside.into_iter().map(|(line, reason)| {
@@ -281,6 +294,7 @@ impl CodexSource {
                 outcome.files_resumed += 1;
             }
             outcome.hashed_bytes += parse.hashed_bytes;
+            outcome.decompressed_bytes += parse.decompressed_bytes;
             outcome.counts.add(&parse.counts);
             if parse.counts.skipped_lines > 0 {
                 outcome
@@ -348,7 +362,11 @@ impl crate::refresher::harness_drain::HarnessSource for CodexSource {
 
 /// Sorted JSONL files, without following symlinks.
 fn jsonl_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
-    crate::refresher::harness_drain::jsonl_files(root)
+    crate::refresher::harness_drain::files_below(root, &|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "jsonl")
+            || is_codex_archive(path)
+    })
 }
 
 fn derived_measurement(
@@ -413,6 +431,11 @@ fn map_call(call: CodexCall) -> Result<EventRecordRequest, String> {
         )?);
     }
 
+    if call.supplementary {
+        for measurement in &mut measurements {
+            measurement.source = measurement.source.replace("last_token_usage", "usage");
+        }
+    }
     Ok(EventRecordRequest {
         producer: CODEX_SOURCE_KEY.to_string(),
         // The conversation id. Measured stable across a resume (Codex appends
@@ -503,6 +526,315 @@ mod tests {
     use tempfile::TempDir;
 
     static NEVER_STOP: AtomicBool = AtomicBool::new(false);
+
+    fn raw_zstd(text: &str) -> Vec<u8> {
+        // A standards-compliant frame of raw blocks keeps fixtures independent
+        // of a platform C compressor or an installed zstd executable.
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0, 0];
+        let chunks: Vec<_> = text.as_bytes().chunks(1024).collect();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let header =
+                (u32::try_from(chunk.len()).unwrap() << 3) | u32::from(index + 1 == chunks.len());
+            frame.extend_from_slice(&header.to_le_bytes()[..3]);
+            frame.extend_from_slice(chunk);
+        }
+        frame
+    }
+
+    fn write_archive(root: &Path, name: &str, text: &str) -> PathBuf {
+        let path = root.join("sessions").join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, raw_zstd(text)).unwrap();
+        path
+    }
+
+    #[test]
+    fn archive_discovery_preserves_plain_twin_identity_and_measurements() {
+        let temp = TempDir::new().unwrap();
+        write_file(temp.path(), "sessions/a.jsonl", &parent_rollout());
+        let state = test_state();
+        let source = CodexSource::at(temp.path());
+        assert_eq!(drain(&source, &state, 100).rows_recorded, 2);
+        let expected = quantities(&state, &format!("{TURN}:1"));
+        write_archive(temp.path(), "a.jsonl.zst", &parent_rollout());
+        let outcome = drain(&source, &state, 101);
+        assert_eq!(outcome.files_by_directory["sessions"], 2);
+        assert_eq!(
+            outcome.decompressed_bytes,
+            u64::try_from(parent_rollout().len()).unwrap()
+        );
+        assert_eq!(outcome.exact_redeliveries, 2);
+        assert_eq!(outcome.rows_recorded, 0);
+        assert_eq!(outcome.quarantined_redeliveries, 0);
+        assert_eq!(event_refs(&state).len(), 2);
+        assert_eq!(quantities(&state, &format!("{TURN}:1")), expected);
+    }
+
+    #[test]
+    fn archive_steady_tick_skips_decode_but_changes_and_daily_deadline_wake_it() {
+        let temp = TempDir::new().unwrap();
+        let path = write_archive(temp.path(), "a.jsonl.zst", &parent_rollout());
+        let state = test_state();
+        let source = CodexSource::at(temp.path());
+        assert!(drain(&source, &state, 100).decompressed_bytes > 0);
+        for now in [101, 301_000, 3_601_000] {
+            let outcome = drain(&source, &state, now);
+            assert_eq!(outcome.decompressed_bytes, 0, "tick {now}");
+            assert_eq!(outcome.files_read, 0);
+            assert_eq!(
+                count(
+                    &state,
+                    "SELECT last_success_ms FROM source_runtime WHERE source_key='codex'"
+                ),
+                now
+            );
+        }
+        append(&path, "broken");
+        assert!(source.drain(&state, 3_601_001, &NEVER_STOP).is_err());
+        fs::write(&path, raw_zstd(&parent_rollout())).unwrap();
+        assert!(drain(&source, &state, 3_601_002).decompressed_bytes > 0);
+        let replacement = write_archive(temp.path(), "replacement.tmp", &parent_rollout());
+        fs::remove_file(&path).unwrap();
+        fs::rename(replacement, &path).unwrap();
+        assert!(drain(&source, &state, 3_601_003).decompressed_bytes > 0);
+        assert_eq!(drain(&source, &state, 3_601_004).decompressed_bytes, 0);
+        assert!(drain(&source, &state, 3_601_003 + 86_400_000).decompressed_bytes > 0);
+        assert_eq!(event_refs(&state).len(), 2);
+    }
+
+    #[test]
+    fn archive_corruption_never_commits_partial_usage_or_success() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("sessions")).unwrap();
+        let source = CodexSource::at(temp.path());
+        let state = test_state();
+        drain(&source, &state, 100);
+        let good = raw_zstd(&parent_rollout());
+        let mut checksum = good.clone();
+        checksum[4] |= 4;
+        checksum.extend_from_slice(&[0; 4]);
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(b"garbage");
+        for bytes in [
+            &good[..good.len() - 1],
+            checksum.as_slice(),
+            trailing.as_slice(),
+        ] {
+            let path = temp.path().join("sessions/a.jsonl.zst");
+            fs::write(path, bytes).unwrap();
+            assert!(source.drain(&state, 200, &NEVER_STOP).is_err());
+            assert!(event_refs(&state).is_empty());
+            assert_eq!(
+                count(
+                    &state,
+                    "SELECT last_success_ms FROM source_runtime WHERE source_key='codex'"
+                ),
+                100
+            );
+            assert!(source.cache.lock().unwrap().windows.is_empty());
+        }
+        write_archive(temp.path(), "a.jsonl.zst", &parent_rollout());
+        assert_eq!(drain(&source, &state, 300).rows_recorded, 2);
+    }
+
+    #[test]
+    fn archive_conflicting_full_identities_reach_quarantine() {
+        let temp = TempDir::new().unwrap();
+        write_archive(temp.path(), "a.jsonl.zst", &parent_rollout());
+        let state = test_state();
+        let source = CodexSource::at(temp.path());
+        drain(&source, &state, 100);
+        let before = quantities(&state, &format!("{TURN}:1"));
+        write_archive(
+            temp.path(),
+            "b.jsonl.zst",
+            &parent_rollout().replace("\"cached_input_tokens\":60", "\"cached_input_tokens\":59"),
+        );
+        let outcome = drain(&source, &state, 200);
+        assert_eq!(outcome.quarantined_redeliveries, 1);
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM rejected_delivery"), 1);
+        assert_eq!(outcome.rows_recorded, 0);
+        assert_eq!(quantities(&state, &format!("{TURN}:1")), before);
+        assert_eq!(event_refs(&state).len(), 2);
+    }
+
+    #[test]
+    fn active_archive_without_usage_commits_visible_coverage_not_zero_usage() {
+        let temp = TempDir::new().unwrap();
+        write_archive(
+            temp.path(),
+            "active.jsonl.zst",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\"}}\n",
+        );
+        let state = test_state();
+        let outcome = drain(&CodexSource::at(temp.path()), &state, 100);
+        assert_eq!(outcome.rows_recorded, 0);
+        assert!(event_refs(&state).is_empty());
+        crate::refresher::harness_drain::assert_set_aside(&state, "codex", 1);
+        assert_eq!(
+            count(
+                &state,
+                "SELECT last_success_ms FROM source_runtime WHERE source_key='codex'"
+            ),
+            100
+        );
+    }
+
+    fn request_usage(id: &str, counters: [u64; 5]) -> String {
+        format!("{{\"type\":\"token_usage_record\",\"ordinal\":9,\"payload\":{{\"thread_id\":\"{THREAD}\",\"turn_id\":\"{TURN}\",\"response_id\":\"{id}\",\"usage\":{}}}}}\n", block(counters))
+    }
+
+    #[test]
+    fn compaction_settlement_uses_supplementary_keys_without_shifting_native_positions() {
+        let temp = TempDir::new().unwrap();
+        let first = [100, 60, 0, 30, 12];
+        let path = write_file(
+            temp.path(),
+            "sessions/a.jsonl",
+            &(session_meta(THREAD, None)
+                + &turn(1, TURN)
+                + &token_count(3, first, first)
+                + &request_usage("compact", [400, 300, 0, 20, 5])),
+        );
+        let source = CodexSource::at(temp.path());
+        let state = test_state();
+        drain(&source, &state, 100);
+        assert_eq!(event_refs(&state), BTreeSet::from([format!("{TURN}:1")]));
+        append(&path, "{\"type\":\"compacted\",\"payload\":{}}\n");
+        append(
+            &path,
+            &token_count(10, [150, 70, 0, 35, 12], [50, 10, 0, 5, 0]),
+        );
+        drain(&source, &state, 200);
+        let supplemental = format!("{THREAD}:request:response:compact");
+        assert_eq!(
+            event_refs(&state),
+            BTreeSet::from([
+                format!("{TURN}:1"),
+                format!("{TURN}:2"),
+                supplemental.clone()
+            ])
+        );
+        assert_eq!(quantities(&state, &supplemental)["input"], Some(100));
+        assert_eq!(quantities(&state, &supplemental)["output"], Some(15));
+        assert_eq!(quantities(&state, &format!("{TURN}:2"))["input"], Some(40));
+        let full = drain(&CodexSource::at(temp.path()), &state, 300);
+        assert_eq!(full.exact_redeliveries, 3);
+        assert_eq!(full.quarantined_redeliveries, 0);
+    }
+
+    #[test]
+    fn confirmed_requests_are_not_added_to_native_usage_in_either_order() {
+        for request_first in [true, false] {
+            let temp = TempDir::new().unwrap();
+            let usage = [100, 60, 0, 30, 12];
+            let request = request_usage("confirmed", usage);
+            let native = token_count(3, usage, usage);
+            let pair = if request_first {
+                request + &native
+            } else {
+                native + &request
+            };
+            write_file(
+                temp.path(),
+                "sessions/a.jsonl",
+                &(session_meta(THREAD, None)
+                    + &turn(1, TURN)
+                    + &pair
+                    + "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n"),
+            );
+            let state = test_state();
+            drain(&CodexSource::at(temp.path()), &state, 100);
+            assert_eq!(event_refs(&state), BTreeSet::from([format!("{TURN}:1")]));
+            assert_eq!(
+                quantities(&state, &format!("{TURN}:1"))["cache_read"],
+                Some(60)
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_eof_waits_for_confirmation_and_replays_identically() {
+        let temp = TempDir::new().unwrap();
+        let contents = session_meta(THREAD, None)
+            + &turn(1, TURN)
+            + &request_usage("compact", [400, 300, 0, 20, 5])
+            + "{\"type\":\"compacted\",\"payload\":{}}\n";
+        let path = write_file(temp.path(), "sessions/a.jsonl", &contents);
+        let state = test_state();
+        let source = CodexSource::at(temp.path());
+        assert_eq!(drain(&source, &state, 100).rows_recorded, 0);
+        write_archive(temp.path(), "a.jsonl.zst", &contents);
+        let outcome = drain(&source, &state, 200);
+        assert_eq!(outcome.rows_recorded, 0);
+        assert_eq!(outcome.exact_redeliveries, 0);
+        assert_eq!(outcome.quarantined_redeliveries, 0);
+        let native = token_count(10, [400, 300, 0, 20, 5], [400, 300, 0, 20, 5]);
+        append(&path, &native);
+        assert_eq!(drain(&source, &state, 300).rows_recorded, 1);
+        write_archive(temp.path(), "a.jsonl.zst", &(contents + &native));
+        let replay = drain(&CodexSource::at(temp.path()), &state, 400);
+        assert_eq!(replay.exact_redeliveries, 2);
+        assert_eq!(replay.quarantined_redeliveries, 0);
+        assert_eq!(event_refs(&state), BTreeSet::from([format!("{TURN}:1")]));
+    }
+
+    #[test]
+    fn pending_request_waits_across_empty_drains_and_terminal_settlement_is_not_double_counted() {
+        let temp = TempDir::new().unwrap();
+        let usage = [100, 60, 0, 30, 12];
+        let path = write_file(
+            temp.path(),
+            "sessions/a.jsonl",
+            &(session_meta(THREAD, None) + &turn(1, TURN) + &request_usage("terminal", usage)),
+        );
+        let source = CodexSource::at(temp.path());
+        let state = test_state();
+        for now in [100, 200] {
+            assert_eq!(drain(&source, &state, now).rows_recorded, 0);
+            assert!(event_refs(&state).is_empty());
+            assert_eq!(
+                count(
+                    &state,
+                    "SELECT last_success_ms FROM source_runtime WHERE source_key='codex'"
+                ),
+                now
+            );
+        }
+        append(&path, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"turn_id\":\"other\"}}\n");
+        assert_eq!(drain(&source, &state, 250).rows_recorded, 0);
+        append(
+            &path,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\"}}\n",
+        );
+        assert_eq!(drain(&source, &state, 300).rows_recorded, 1);
+        append(&path, &token_count(10, usage, usage));
+        assert_eq!(drain(&source, &state, 400).rows_recorded, 0);
+        append(
+            &path,
+            &token_count(11, [150, 70, 0, 35, 12], [50, 10, 0, 5, 0]),
+        );
+        assert_eq!(drain(&source, &state, 500).rows_recorded, 1);
+        assert_eq!(event_refs(&state).len(), 2);
+        assert!(event_refs(&state).contains(&format!("{THREAD}:request:response:terminal")));
+    }
+
+    #[test]
+    fn terminal_matches_request_turn_without_a_turn_context() {
+        let temp = TempDir::new().unwrap();
+        let contents = session_meta(THREAD, None) + &request_usage("terminal", [100, 60, 0, 30, 12])
+            + &format!("{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{TURN}\"}}}}\n");
+        write_file(temp.path(), "sessions/a.jsonl", &contents);
+        let state = test_state();
+        assert_eq!(
+            drain(&CodexSource::at(temp.path()), &state, 100).rows_recorded,
+            1
+        );
+        assert_eq!(
+            quantities(&state, &format!("{THREAD}:request:response:terminal"))["input"],
+            Some(40)
+        );
+    }
 
     #[test]
     fn set_aside_codex_overflow_keeps_good_calls_and_resume() {

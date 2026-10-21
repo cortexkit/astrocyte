@@ -48,6 +48,12 @@ drain commits and advances `source_runtime.last_success_ms`; stopped or rolled
 back drains do not consume scheduled checks. Gemini JSON documents retain
 their separate hourly verification policy. OpenCode and Goose are unchanged.
 
+Codex `.jsonl.zst` archives are immutable snapshots, not appendable streams.
+After a verified read, unchanged size, modification time and file identity skip
+all decompression until the same staggered daily full-check deadline. A change
+or replacement wakes the archive immediately. Unknown metadata never authorizes
+deferral. Cold starts read every archive again.
+
 Records a reader cannot use are counted, not guessed at. The BROCA, Claude
 Code, Codex, OpenCode and Pi sources also store them as `set_aside_record`
 rows (source key, locator, reason), committed together with the good events
@@ -62,7 +68,7 @@ The source key is the `producer` stored on every event and the key used by
 |---|---|---|
 | `claude-code` | Claude Code | `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/**/*.jsonl` |
 | `claude-code-workers` | Claude Code workers declared by thalamus-harness | `<root>/projects/**/*.jsonl` for each declared root |
-| `codex` | Codex CLI | `<CODEX_HOME or ~/.codex>/sessions/` and `archived_sessions/`, `*.jsonl` |
+| `codex` | Codex CLI | `<CODEX_HOME or ~/.codex>/sessions/` and `archived_sessions/`, `*.jsonl` and `*.jsonl.zst` |
 | `opencode` | OpenCode | `OPENCODE_DB`, else `<XDG data home>/opencode/opencode.db`, table `message` |
 | `pi` | Pi | `PI_CODING_AGENT_SESSION_DIR`, else `<PI_CODING_AGENT_DIR or ~/.pi/agent>/sessions/**/*.jsonl` |
 | `gemini` | Gemini CLI | `<GEMINI_CLI_HOME or ~>/.gemini/tmp/`, `session-*.json(l)` and files under `chats/` |
@@ -100,8 +106,10 @@ Each source resolves its store path by these rules, implemented in
 |---|---|---|---|
 | `claude-code`, `claude-code-workers` | One API request: the records sharing a `requestId`, folded at the per-field maximum | `requestId` | none |
 | `codex` | One advancing `token_count` record (`last_token_usage`) | `<turn id>:<n>` for the n-th response of the turn, else `<thread id>:ordinal:<n>` | `session_meta.session_id` |
+| `codex` | One otherwise unconfirmed `token_usage_record` | `<thread id>:request:response:<response id>`, else `<thread id>:request:ordinal:<n>` | `session_meta.session_id` |
 | `opencode` | One assistant `message` row whose tokens are final (`time.completed` or `finish` set) | `message.id` | none |
 | `pi` | One assistant message with usage | `<namespace>:response:<responseId>`, else a composite of entry id, timestamp, provider, model and counts | none |
+| `pi` | One compaction with usage, or `usage` entry of kind `cache_warm` | `pi:operation:<entry id>` | none |
 | `gemini` | One message with `tokens` | message id | `sessionId` |
 | `goose` | One session's accumulated usage, not one call | `sessions.id` | `sessions.id` |
 | `omp` | One assistant message with usage | entry `id` | session header `id` |
@@ -122,6 +130,27 @@ Rules that affect what is recorded:
   `a_call_already_recorded_by_thalamus_is_skipped`.
 - A Codex subagent fork replays its parent's turns; replayed turns are
   skipped, and a moved rollout re-reads as exact redeliveries.
+- A Codex archive uses the same parser and event identities as its plain twin;
+  no archive suffix enters the identity. Records with the same producer, session
+  lineage and producer reference but different content reach quarantine instead
+  of replacing the first observation. Decoding is bounded to 1 GiB in total, 16 MiB per record and a
+  64 MiB decoder window. An oversized record is discarded with set-aside evidence,
+  and later records are still read. Corruption, truncation, checksum mismatch,
+  trailing junk or an exceeded decoded-size limit fail the whole drain without
+  committing partial usage or advancing success. Activity without supported usage
+  produces a visible set-aside record; its token quantities remain unknown.
+- Codex request records are matched to native token counts by reported input and
+  output, regardless of which record appears first. A terminal event, new turn or
+  subsequent request settles an unconfirmed request under its supplementary key.
+  A compaction record marks the pending request; a later token count confirms it
+  or settles it separately. EOF alone leaves it pending across drains, so appends
+  and full replays agree. Late confirmations of settled requests are not counted
+  again. These supplementary events never allocate native token-count positions.
+- Pi operations use only their own model and provider, including absence. They
+  never inherit the preceding assistant's model. Their reasoning remains nested
+  in output, and their reported cost does not establish a charge basis. Existing
+  assistant timestamps and fallback identities are unchanged; request-start
+  timestamps are not adopted.
 - A Goose session is recorded once its `updated_at` is 24 hours old
   (`GOOSE_QUIET_WINDOW_MS`). A session that grows after that is re-emitted
   and quarantined as a redelivery with a different payload; it is never
@@ -184,5 +213,6 @@ each fact. Test: `pi_event_is_unpriced_because_charge_basis_is_unknown`.
 field where it has one (Codex `model_provider`, OpenCode `providerID`, Goose
 `provider_name`, Oh My Pi and Pi `provider`). Claude Code and Gemini CLI
 record none, so it is inferred from the model name by
-`inferred_provider_from_model`; Pi does the same when its record has no
-provider. Kimi CLI records neither, so `provider` and `model` stay absent.
+`inferred_provider_from_model`; Pi assistant messages do the same when the record
+has no provider. This includes Codestral and Devstral in the Mistral family.
+Pi operations and Kimi CLI keep missing model and provider fields absent.

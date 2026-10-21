@@ -108,6 +108,8 @@ fn inferred_provider_from_model_inner(
     }
     if contains_family(&lower, "mistral", delimit_family_names)
         || contains_family(&lower, "mixtral", delimit_family_names)
+        || contains_family(&lower, "codestral", delimit_family_names)
+        || contains_family(&lower, "devstral", delimit_family_names)
     {
         return Some("mistral");
     }
@@ -238,6 +240,22 @@ mod tests {
             "metamorphic-v1",
         ] {
             assert_eq!(inferred_provider_from_model(model), None, "{model}");
+        }
+    }
+
+    #[test]
+    fn codestral_and_devstral_infer_mistral() {
+        for model in [
+            "codestral-latest",
+            "devstral-small",
+            "Codestral-2508",
+            "Devstral-2",
+        ] {
+            assert_eq!(
+                inferred_provider_from_model(model),
+                Some("mistral"),
+                "{model}"
+            );
         }
     }
 

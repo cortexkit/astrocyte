@@ -9,6 +9,12 @@ own licenses.
 Source: https://github.com/junhoyeo/tokscale, release v4.17.0 (tag commit
 `dcf8d3656bbcecf05d112c6f35f9be328e4f66b7`), crate `crates/tokscale-core`.
 
+Selected reader behavior is also adapted from release v4.20.0 (tag commit
+`c1973901fc2f7ba0d134252bfd923c714cc123db`): bounded Codex archive reads,
+request-usage settlement and missing-usage diagnostics, Pi billed operations,
+and Codestral/Devstral provider inference. Astrocyte retains its own immutable
+event identities, optional measurements and ingestion scheduling.
+
 These files in `crates/astrocyte-readers/src/` are copied from the
 same-named files under tokscale's `crates/tokscale-core/src/`. Each says so in
 its header, and each marks where astrocyte departs from upstream with an

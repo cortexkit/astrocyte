@@ -661,6 +661,7 @@ fn map_message(record: PiUsageRecord) -> Result<EventRecordRequest, String> {
     let PiUsageRecord {
         message,
         occurred_at_ms,
+        operation,
         ..
     } = record;
     if message.output_reasoning_conflicted {
@@ -712,8 +713,11 @@ fn map_message(record: PiUsageRecord) -> Result<EventRecordRequest, String> {
         terminal_status: None,
         attempt_ordinal: None,
         vendor_request_id: None,
-        provider: Some(message.provider_id),
-        model: Some(message.model_id),
+        provider: operation.as_ref().map_or_else(
+            || Some(message.provider_id),
+            |operation| operation.provider.clone(),
+        ),
+        model: operation.map_or_else(|| Some(message.model_id), |operation| operation.model),
         account_ref: None,
         auth_selection: None,
         charge_basis_mapping_version: None,
@@ -956,6 +960,53 @@ mod tests {
     use tempfile::TempDir;
 
     static NEVER_STOP: AtomicBool = AtomicBool::new(false);
+
+    #[test]
+    fn billed_operations_keep_entry_keys_and_model_less_attribution() {
+        let temp = TempDir::new().unwrap();
+        let contents = fixture("session", "/repo", Some("assistant"))
+            + "{\"type\":\"compaction\",\"id\":\"compact\",\"timestamp\":\"2026-09-01T00:01:00Z\",\"usage\":{\"input\":185327,\"output\":2316,\"reasoning\":730}}\n"
+            + "{\"type\":\"usage\",\"kind\":\"cache_warm\",\"id\":\"warm\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input\":2,\"output\":1,\"cacheRead\":512333,\"reasoning\":0}}\n"
+            + "{\"type\":\"compaction\",\"id\":\"not-billed\"}\n";
+        write_fixture(temp.path(), "project", &contents);
+        let source = PiSource::at(temp.path());
+        let state = test_state();
+        let outcome = source.drain(&state, 100, &NEVER_STOP).unwrap();
+        assert_eq!(outcome.rows_recorded, 3);
+        state.with_conn(|conn| {
+            let (model, provider): (Option<String>, Option<String>) = conn.query_row(
+                "SELECT model,provider FROM usage_event WHERE producer_ref='pi:operation:compact'", [], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|error| error.to_string())?;
+            assert_eq!(model, None);
+            assert_eq!(provider, None);
+            let warm: (String, String) = conn.query_row(
+                "SELECT model,provider FROM usage_event WHERE producer_ref='pi:operation:warm'", [], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|error| error.to_string())?;
+            assert_eq!(warm, ("claude-opus-5-5".into(), "anthropic".into()));
+            let mut stmt = conn.prepare("SELECT role,quantity_units FROM measurement JOIN usage_event USING(event_key) WHERE producer_ref='pi:operation:compact' ORDER BY role").map_err(|e| e.to_string())?;
+            let quantities = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))).map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
+            assert_eq!(quantities, vec![("input".into(), 185327), ("output".into(), 1586), ("reasoning".into(), 730)]);
+            Ok(())
+        }).unwrap();
+        let reread = PiSource::at(temp.path())
+            .drain(&state, 200, &NEVER_STOP)
+            .unwrap();
+        assert_eq!(reread.exact_redeliveries, 3);
+        assert_eq!(reread.quarantined_redeliveries, 0);
+    }
+
+    #[test]
+    fn operation_reasoning_conflicts_are_set_aside_without_losing_assistants() {
+        let temp = TempDir::new().unwrap();
+        write_fixture(temp.path(), "project", &(fixture("session", "/repo", Some("assistant"))
+            + "{\"type\":\"compaction\",\"id\":\"bad\",\"usage\":{\"input\":2,\"output\":1,\"reasoning\":2}}\n"));
+        let state = test_state();
+        let outcome = PiSource::at(temp.path())
+            .drain(&state, 100, &NEVER_STOP)
+            .unwrap();
+        assert_eq!(outcome.rows_recorded, 1);
+        crate::refresher::harness_drain::assert_set_aside(&state, "pi", 1);
+    }
 
     #[test]
     #[ignore = "mechanism timing for request comparison"]
