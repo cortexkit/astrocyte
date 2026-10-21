@@ -576,8 +576,12 @@ mod tests {
         let path = write_archive(temp.path(), "a.jsonl.zst", &parent_rollout());
         let state = test_state();
         let source = CodexSource::at(temp.path());
-        assert!(drain(&source, &state, 100).decompressed_bytes > 0);
-        for now in [101, 301_000, 3_601_000] {
+        // The daily verification phase comes from the temporary path, so a fixed
+        // clock would put a full check inside this window on some runs. Start just
+        // after this path's daily deadline, so the next one is nearly a day away.
+        let start = crate::refresher::jsonl_schedule::phase(&path, 86_400_000) + 1;
+        assert!(drain(&source, &state, start).decompressed_bytes > 0);
+        for now in [start + 1, start + 301_000, start + 3_601_000] {
             let outcome = drain(&source, &state, now);
             assert_eq!(outcome.decompressed_bytes, 0, "tick {now}");
             assert_eq!(outcome.files_read, 0);
@@ -590,15 +594,22 @@ mod tests {
             );
         }
         append(&path, "broken");
-        assert!(source.drain(&state, 3_601_001, &NEVER_STOP).is_err());
+        assert!(source
+            .drain(&state, start + 3_601_001, &NEVER_STOP)
+            .is_err());
         fs::write(&path, raw_zstd(&parent_rollout())).unwrap();
-        assert!(drain(&source, &state, 3_601_002).decompressed_bytes > 0);
+        assert!(drain(&source, &state, start + 3_601_002).decompressed_bytes > 0);
         let replacement = write_archive(temp.path(), "replacement.tmp", &parent_rollout());
         fs::remove_file(&path).unwrap();
         fs::rename(replacement, &path).unwrap();
-        assert!(drain(&source, &state, 3_601_003).decompressed_bytes > 0);
-        assert_eq!(drain(&source, &state, 3_601_004).decompressed_bytes, 0);
-        assert!(drain(&source, &state, 3_601_003 + 86_400_000).decompressed_bytes > 0);
+        assert!(drain(&source, &state, start + 3_601_003).decompressed_bytes > 0);
+        assert_eq!(
+            drain(&source, &state, start + 3_601_004).decompressed_bytes,
+            0
+        );
+        assert!(
+            drain(&source, &state, start + 3_601_003 + 86_400_000).decompressed_bytes > 0
+        );
         assert_eq!(event_refs(&state).len(), 2);
     }
 
