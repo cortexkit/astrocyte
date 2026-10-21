@@ -607,9 +607,7 @@ mod tests {
             drain(&source, &state, start + 3_601_004).decompressed_bytes,
             0
         );
-        assert!(
-            drain(&source, &state, start + 3_601_003 + 86_400_000).decompressed_bytes > 0
-        );
+        assert!(drain(&source, &state, start + 3_601_003 + 86_400_000).decompressed_bytes > 0);
         assert_eq!(event_refs(&state).len(), 2);
     }
 
