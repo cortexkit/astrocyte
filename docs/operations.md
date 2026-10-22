@@ -80,6 +80,17 @@ VACUUM is not part of the migration. Check row counts, current heads, head money
 Take a new full backup baseline: rebuilds and VACUUM relocate pages. Keep the old
 file and matching binary for rollback; old binaries cannot read schema 23.
 
+### SQLite temporary files
+
+The store's writer keeps SQLite statement journals in memory, so ledger writes go
+only to the store directory. Two kinds of SQLite work still use SQLite's
+temporary directory: the report reader, when a large sort or grouping spills,
+and the OpenCode reader, which queries OpenCode's own database. On Linux and
+macOS, SQLite picks that directory from `SQLITE_TMPDIR`, then `TMPDIR`, then
+`/var/tmp`; on Windows, from the system temporary path. It does not follow the
+store's location. On Linux and macOS, set `SQLITE_TMPDIR` in the module's
+environment to keep that work on another drive.
+
 ## 2. Subscriptions
 
 A subscription plan makes events with charge basis `subscription_included`

@@ -7,6 +7,11 @@ how the module works; `STRUCTURE.md` says where code goes.
 
 Run these before you commit. CI runs the same checks on Linux and Windows.
 
+Run every `cargo` and `ckdev-mutate` command on the Linux build server (`runon: "linux,4c"`),
+never on the Mac. Each freshly built test binary that runs on the Mac costs a macOS
+security scan, and `ckdev-mutate check` builds every test target to list test names. Only
+the Python and shell checks below run locally.
+
 ```sh
 scripts/fmt-check.sh
 cargo clippy --workspace --all-targets -- -D warnings
@@ -50,10 +55,10 @@ touches, and every row on master. When you add a row, replay it exactly as CI do
 (`ckdev-mutate run --only <row id>`). List every test the mutant reddens, or the row reports
 `WRONG_TEST`.
 
-Before delivering any change, run `ckdev-mutate check` over the whole catalogue (about
-80 s). Rows match their target code by exact text, and an edit can repeat that text in a
-file another row targets. Replaying only your own rows misses that, and CI then refuses the
-catalogue before running any test.
+Before delivering any change, run `ckdev-mutate check` over the whole catalogue on the build
+server (about 80 s). Rows match their target code by exact text, and an edit can repeat that
+text in a file another row targets. Replaying only your own rows misses that, and CI then
+refuses the catalogue before running any test.
 
 ## Store and migrations
 

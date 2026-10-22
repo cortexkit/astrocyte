@@ -34,8 +34,19 @@ impl From<rusqlite::Error> for StoreInitError {
 /// one fsync per commit, and the answer to that cost is fewer commits: bulk
 /// writers such as the refresher's pricing pass commit their work in groups
 /// rather than one row or one event per transaction.
+///
+/// `temp_store` is MEMORY. A statement that can fail partway inside a larger
+/// transaction (an insert whose triggers write other tables, or a savepoint
+/// per priced event) keeps a statement journal, and SQLite otherwise writes
+/// that journal to a file in its temporary directory (`SQLITE_TMPDIR`,
+/// `TMPDIR` or `/var/tmp`), not beside the store. Measured on a production
+/// copy, one catch-up tick wrote 659 MB through those files against 168 MB to
+/// the store and WAL, and MEMORY raised peak memory by 4.4 MiB. A statement
+/// journal holds only the pages one statement or savepoint changes, so its
+/// size follows a single event's writes, not the transaction's.
 pub fn initialize_connection(conn: &Connection) -> Result<(), StoreInitError> {
     conn.busy_timeout(Duration::from_millis(STORE_BUSY_TIMEOUT_MS))?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     let foreign_keys: i64 = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
     if foreign_keys != 1 {
@@ -6737,6 +6748,18 @@ mod tests {
             enabled, 1,
             "SQLite must not take a global memory-statistics mutex on every allocation"
         );
+    }
+
+    #[test]
+    fn connection_initialization_keeps_statement_journals_in_memory() {
+        // SQLite unlinks a temporary journal as soon as it opens it, so a test
+        // cannot observe the file; the setting it reads back is the guard.
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        let temp_store: i64 = conn
+            .pragma_query_value(None, "temp_store", |row| row.get(0))
+            .unwrap();
+        assert_eq!(temp_store, 2, "temp_store must be MEMORY");
     }
 
     #[test]
