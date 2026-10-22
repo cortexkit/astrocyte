@@ -190,9 +190,11 @@ jobs:
 
   # No branch/event-dependent job or step if: the train gate must never skip.
   # Select replay scope in the command, while every event runs the same gate.
+  # Runs beside the test jobs, not after them: each shard does its own build,
+  # so waiting on Test only added the Linux test time (about 3 minutes) to
+  # every train. A failing test still fails the run.
   mutations:
     name: Mutations (${{ matrix.shard }}/4)
-    needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
