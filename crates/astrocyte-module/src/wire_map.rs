@@ -183,9 +183,33 @@ fn output_measurement(wire: &WireSpendSegmentFact) -> Result<Option<MeasurementI
     }))
 }
 
+/// Every reported count as a measurement, in the order given.
+fn reported_token_measurements<'a>(
+    counts: impl IntoIterator<Item = (&'a str, &'a str, Option<u64>)>,
+) -> Result<Vec<MeasurementInput>, String> {
+    counts
+        .into_iter()
+        // An absent field OMITS the measurement rather than recording one with a
+        // null quantity. The measurement set is the set of things measured, so a
+        // concept the provider does not have is not a reading of unknown size — it
+        // is not a reading. A variable count is already legal and already occurs
+        // (recorded anthropic events that split cache writes into 5m and 1h
+        // tiers carry six), and this
+        // is what lets an openai event be fully priced: three or four measurements
+        // that all price, instead of five where one can never price and drags the
+        // event's verdict to unpriced by the weakest-part rule.
+        //
+        // A null quantity stays meaningful for producers that report a measurement
+        // whose size they do not know; the pricing path already refuses it as
+        // `missing_quantity` per measurement rather than pricing it as zero.
+        .filter_map(|(role, field, quantity)| quantity.map(|units| (role, field, units)))
+        .map(|(role, field, quantity)| token_measurement(role, field, quantity))
+        .collect()
+}
+
 pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String> {
     let output = output_measurement(&wire)?;
-    let mut measurements = [
+    let mut measurements = reported_token_measurements([
         ("input", "input_tokens", wire.usage.input_tokens),
         (
             "cache_read",
@@ -198,24 +222,7 @@ pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String
             wire.usage.cache_write_tokens,
         ),
         ("reasoning", "reasoning_tokens", wire.usage.reasoning_tokens),
-    ]
-    .into_iter()
-    // An absent field OMITS the measurement rather than recording one with a
-    // null quantity. The measurement set is the set of things measured, so a
-    // concept the provider does not have is not a reading of unknown size — it
-    // is not a reading. A variable count is already legal and already occurs
-    // (recorded anthropic events that split cache writes into 5m and 1h
-    // tiers carry six), and this
-    // is what lets an openai event be fully priced: three or four measurements
-    // that all price, instead of five where one can never price and drags the
-    // event's verdict to unpriced by the weakest-part rule.
-    //
-    // A null quantity stays meaningful for producers that report a measurement
-    // whose size they do not know; the pricing path already refuses it as
-    // `missing_quantity` per measurement rather than pricing it as zero.
-    .filter_map(|(role, field, quantity)| quantity.map(|units| (role, field, units)))
-    .map(|(role, field, quantity)| token_measurement(role, field, quantity))
-    .collect::<Result<Vec<_>, String>>()?;
+    ])?;
     // Output goes back in its original position, before reasoning, so the
     // measurement order is unchanged from the verbatim mapping.
     let reasoning_at = measurements.len() - usize::from(wire.usage.reasoning_tokens.is_some());
@@ -352,14 +359,10 @@ pub fn map_system_one_fact(wire: WireSystemOneFact) -> Result<EventRecordRequest
             ))
         }
     };
-    let measurements = [
+    let measurements = reported_token_measurements([
         ("input", "input_tokens", wire.usage.input_tokens),
         ("output", "output_tokens", wire.usage.output_tokens),
-    ]
-    .into_iter()
-    .filter_map(|(role, field, quantity)| quantity.map(|units| (role, field, units)))
-    .map(|(role, field, quantity)| token_measurement(role, field, quantity))
-    .collect::<Result<Vec<_>, String>>()?;
+    ])?;
     Ok(EventRecordRequest {
         producer: BROCA_PRODUCER.into(),
         producer_lineage: None,
