@@ -3782,7 +3782,7 @@ mod tests {
         ] {
             refuse_without_effect(&conn, "usage_event", sql, "usage_event_update_guard");
         }
-        // The projections the guard lets move still move.
+        // The guard still allows a pricing_generation step.
         conn.execute_batch(
             "UPDATE usage_event SET pricing_generation=pricing_generation+1 WHERE event_key=10",
         )
@@ -3846,7 +3846,7 @@ mod tests {
     }
 
     /// The hourly store migrated to the latest schema, for tests that record
-    /// through ingest, which reads and writes every current column.
+    /// through ingest, whose event queries include `flow_ref`.
     fn latest_hourly_store() -> Connection {
         let conn = hourly_store();
         for migration in MIGRATIONS.iter().filter(|migration| migration.version > 24) {

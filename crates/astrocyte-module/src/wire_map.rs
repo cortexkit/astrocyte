@@ -316,8 +316,8 @@ pub struct WireSystemOneFact {
     pub auth_selection: Option<String>,
     pub charge_basis: ChargeBasis,
     pub occurred_at_ms: u64,
-    /// Carried verbatim with the same three stored states as on a session
-    /// fact: absent or null -> NULL, a string -> that exact string.
+    /// Carried verbatim as on a session fact: absent or null is stored as
+    /// NULL, and a string is stored unchanged.
     #[serde(default)]
     pub work_class: Option<String>,
     pub usage: WireSystemOneUsage,
