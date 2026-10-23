@@ -368,18 +368,22 @@ const READS_CACHE_SQL: &str = "SELECT EXISTS (SELECT 1 FROM usage_event e
        AND m.role='cache_read' AND m.quantity_exponent=0 AND m.quantity_units>0)";
 const UNDATED_SQL: &str = "SELECT COUNT(*) FROM usage_event
      WHERE session=?1 AND producer=?2 AND occurred_at_ms IS NULL";
-/// `?1` since, `?2` one producer or NULL, `?3` limit.
+/// `?1` since, `?2` one producer or NULL, `?3` limit. The unary `+` keeps
+/// SQLite from walking a producer's whole history through the producer
+/// index: the time range on `usage_event_summary_time` is the narrow one.
 const ACTIVE_SESSIONS_SQL: &str = concat!(
     "SELECT producer,session,MAX(occurred_at_ms) FROM usage_event",
-    " WHERE occurred_at_ms>=?1 AND session IS NOT NULL AND producer IN ",
+    " WHERE occurred_at_ms>=?1 AND +session IS NOT NULL AND +producer IN ",
     harnesses_sql!(),
-    " AND (?2 IS NULL OR producer=?2)",
+    " AND (?2 IS NULL OR +producer=?2)",
     " GROUP BY producer,session ORDER BY 3 DESC, producer, session LIMIT ?3"
 );
+/// The `+` keeps the scan on the `event_key` range, as for
+/// [`ACTIVE_SESSIONS_SQL`].
 const RECORDED_AFTER_SQL: &str = concat!(
     "SELECT e.producer,e.session,",
     step_columns!(),
-    " WHERE e.event_key>?1 AND e.session IS NOT NULL AND e.producer IN ",
+    " WHERE e.event_key>?1 AND +e.session IS NOT NULL AND +e.producer IN ",
     harnesses_sql!(),
     " ORDER BY e.event_key"
 );
@@ -1438,8 +1442,14 @@ mod tests {
 
     fn plan(conn: &Connection, sql: &str) -> String {
         let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let values = [
+            rusqlite::types::Value::Text("long".into()),
+            rusqlite::types::Value::Text("claude-code".into()),
+            rusqlite::types::Value::Integer(200),
+        ];
+        let count = statement.parameter_count();
         statement
-            .query_map(params!["long", "claude-code", 200], |row| {
+            .query_map(rusqlite::params_from_iter(&values[..count]), |row| {
                 row.get::<_, String>(3)
             })
             .unwrap()
@@ -1454,6 +1464,19 @@ mod tests {
     fn a_session_window_reads_its_own_index_range() {
         let window_sql = WINDOW_SQL;
         let conn = long_session_store();
+        // The session list walks the recent time range and the memory's
+        // catch-up the new keys, never a producer's whole history.
+        let active_plan = plan(&conn, ACTIVE_SESSIONS_SQL);
+        assert!(
+            active_plan.contains("USING INDEX usage_event_summary_time"),
+            "{active_plan}"
+        );
+        let recorded_plan = plan(&conn, RECORDED_AFTER_SQL);
+        assert!(
+            recorded_plan.contains("USING INTEGER PRIMARY KEY (rowid>?)"),
+            "{recorded_plan}"
+        );
+        assert!(!recorded_plan.contains("TEMP B-TREE"), "{recorded_plan}");
         let window_plan = plan(&conn, window_sql);
         assert!(
             window_plan.contains("USING INDEX usage_event_session_time"),
