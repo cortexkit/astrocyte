@@ -332,7 +332,14 @@ pub struct WireSystemOneFact {
 
 /// A batch fact's token counts. Each is absent when the provider did not
 /// report it, never zero, and an absent count produces no measurement.
+///
+/// Unknown keys are refused, unlike the fact's top level. BROCA's batch
+/// models report input and output only; a count added later under another
+/// name would otherwise decode as if it were never sent, and its tokens would
+/// vanish from the ledger without a trace. Refusing sets the row aside as
+/// evidence instead, where the coverage report shows it.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WireSystemOneUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -1144,5 +1151,15 @@ mod tests {
         let with = map_fact(serde_json::from_value(decided).unwrap()).unwrap();
         assert_eq!(with, without);
         assert_eq!(with.auth_selection.as_deref(), Some("apikey:openai:astro"));
+    }
+
+    /// A batch fact's usage carrying a count this decoder does not know is
+    /// refused, so the row is set aside rather than stored without it.
+    #[test]
+    fn system_one_usage_with_an_unknown_count_is_refused() {
+        let mut fixture = system_one_fixture();
+        fixture["usage"] = serde_json::json!({"input_tokens": 10, "cached_input_tokens": 4});
+        let error = serde_json::from_value::<WireSystemOneFact>(fixture).unwrap_err();
+        assert!(error.to_string().contains("cached_input_tokens"), "{error}");
     }
 }
