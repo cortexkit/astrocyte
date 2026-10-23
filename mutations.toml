@@ -1602,3 +1602,165 @@ expect_red = ["store::tests::schema_v26_adds_a_null_flow_ref_keeps_every_row_and
 only = true
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "cache-verdict-stable-band-edge"
+guards = "A cache retention of exactly 0.95 is stable, as on the Magic Context dashboard"
+file = "crates/astrocyte-core/src/cache_diagnostics.rs"
+old = 'let verdict = if retention >= STABLE_MIN_RETENTION {'
+new = 'let verdict = if retention > STABLE_MIN_RETENTION { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/cache_diagnostics.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = [
+  "cache_diagnostics::tests::implicit_cache_verdicts_use_the_steps_own_prompt",
+  "cache_diagnostics::tests::prefix_cache_verdicts_cover_every_band_and_edge",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "cache-verdict-warning-band-edge"
+guards = "A cache retention of exactly 0.80 is a warning, not a bust"
+file = "crates/astrocyte-core/src/cache_diagnostics.rs"
+old = '} else if retention >= WARNING_MIN_RETENTION {'
+new = '} else if retention > WARNING_MIN_RETENTION { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/cache_diagnostics.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = [
+  "cache_diagnostics::tests::implicit_cache_verdicts_use_the_steps_own_prompt",
+  "cache_diagnostics::tests::prefix_cache_verdicts_cover_every_band_and_edge",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "cache-store-window-lead-from-whole-session"
+guards = "A stored window's first step is derived from the session's earlier steps, so verdicts never depend on page size"
+file = "crates/astrocyte-core/src/cache_diagnostics.rs"
+old = 'Some(first) => lead_before(conn, producer, session, first)?,'
+new = 'Some(_) => Lead::default(), // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-core/src/cache_diagnostics.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["cache_diagnostics::tests::store_steps_are_the_same_whatever_the_window"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "cache-memory-window-lead-folds-earlier-kept-steps"
+guards = "A window answered from memory carries the kept steps before it, so memory and store answers stay byte-identical"
+file = "crates/astrocyte-module/src/recent_steps.rs"
+old = '            lead.advance(&record.step_counts());'
+new = '            let _ = record; // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/recent_steps.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "recent_steps::tests::memory_keeps_the_newest_thousand_steps_and_answers_like_the_store",
+  "refresher::pi_source::tests::drained_pi_steps_are_served_alike_from_memory_and_store",
+]
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
+id = "cache-memory-eviction-keeps-the-dropped-steps-lead"
+guards = "A step memory drops past the 1,000-step bound still shapes the verdicts of the steps it keeps"
+file = "crates/astrocyte-module/src/recent_steps.rs"
+old = 'window.lead.advance(&dropped.step_counts());'
+new = 'let _ = dropped; // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/recent_steps.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["recent_steps::tests::memory_keeps_the_newest_thousand_steps_and_answers_like_the_store"]
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
+id = "cache-memory-late-step-detail-announced"
+guards = "An older event that gains its step_detail on an exact re-read is refreshed in the recent-steps memory"
+file = "crates/astrocyte-core/src/ingest.rs"
+old = 'if record_step_detail(tx, &stored_event_id, &request.step_detail)? {'
+new = 'if record_step_detail(tx, &stored_event_id, &request.step_detail)? && false { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/recent_steps.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["recent_steps::tests::a_late_finish_reaches_memory"]
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
+id = "step-detail-no-update"
+guards = "step_detail rows are immutable: an UPDATE is refused"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'step_detail_no_update');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/ingest.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["ingest::tests::step_detail_refuses_update_and_delete"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "step-detail-insert-once"
+guards = "INSERT OR REPLACE cannot replace a step_detail row behind the delete trigger's back"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'step_detail_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/ingest.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["ingest::tests::step_detail_refuses_update_and_delete"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "reader-diagnostic-string-decodes-leniently"
+guards = "A malformed OpenCode finish or Pi stopReason never makes a record that decoded before fail to decode"
+file = "crates/astrocyte-readers/src/sessions/lenient.rs"
+old = '    deserializer.deserialize_any(Lenient::<String>(PhantomData))'
+new = '    <Option<String> as serde::Deserialize>::deserialize(deserializer) // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/opencode_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "refresher::opencode_source::tests::opencode_finish_is_stored_beside_a_byte_identical_ledger",
+  "refresher::pi_source::tests::pi_stop_reason_is_stored_beside_a_byte_identical_ledger",
+]
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
+id = "reader-diagnostic-unsigned-decodes-leniently"
+guards = "A malformed Codex model_context_window never makes a token_count record that decoded before fail to decode"
+file = "crates/astrocyte-readers/src/sessions/lenient.rs"
+old = '    deserializer.deserialize_any(Lenient::<u64>(PhantomData))'
+new = '    <Option<u64> as serde::Deserialize>::deserialize(deserializer) // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/codex_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::codex_source::tests::codex_context_window_is_stored_beside_a_byte_identical_ledger"]
+only = true
+timeout_s = 600
+build_timeout_s = 900
