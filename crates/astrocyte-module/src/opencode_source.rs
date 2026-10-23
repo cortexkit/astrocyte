@@ -762,6 +762,7 @@ fn map_message(message: OpenCodeMessage) -> Result<EventRecordRequest, String> {
         project_root: message.project_root,
         session: Some(message.session_id),
         run_ref: None,
+        flow_ref: None,
         // Preserve producer spelling byte-for-byte, including U+200B prefixes:
         // visually identical labels with different bytes are distinct work classes.
         work_class: message.agent,

@@ -8,6 +8,9 @@
 //! the same transaction as each insert. This reader tails that table from the
 //! durable cursor and decodes each row with the decoder the `usage.export`
 //! pull used, so an event keeps the identity and payload the pull gave it.
+//! A row whose segment carries `"kind": "system_one"` is a fact from one of
+//! BROCA's batch models and has its own decoder; a row with any other `kind`
+//! is set aside (see [`decode_store_row`]).
 //!
 //! When `BROCA_STATE_ROOT` is unset, BROCA writes to the same path, resolving
 //! the data home in the same order as this reader
@@ -30,7 +33,9 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 use serde_json::Value;
 
 use super::{interrupt_on_stop, ExportPage, PullError, SourceClient, SourceCursor};
-use crate::wire_map::{map_fact, WireSpendSegmentFact};
+use crate::wire_map::{
+    map_fact, map_system_one_fact, WireSpendSegmentFact, WireSystemOneFact, SYSTEM_ONE_KIND,
+};
 
 pub(crate) const BROCA_SOURCE_KEY: &str = "broca";
 
@@ -297,10 +302,13 @@ fn read_snapshot(
     })
 }
 
-/// Decode one row the way `usage.export` served it. `segment_json` carries no
-/// `export_seq`; the pull's wire type has it at the top level, so the row's
-/// column is put there before decoding. The rest of the row is decoded as
-/// stored: `usage.export` re-encoded the same fields without adding any.
+/// Decode one row by the `kind` its segment carries.
+///
+/// A segment with no `kind` is a session fact and is decoded exactly as the
+/// `usage.export` pull served it. A `system_one` segment is a batch fact. Any
+/// other `kind`, including a `kind` that is not a string, is refused with the
+/// kind named, so the row is set aside as evidence: decoding it as a session
+/// fact could record a charge under a shape BROCA did not mean.
 fn decode_store_row(
     export_seq: i64,
     fact_id: &str,
@@ -308,24 +316,67 @@ fn decode_store_row(
 ) -> Result<EventRecordRequest, String> {
     let export_seq = u64::try_from(export_seq)
         .map_err(|_| format!("export_seq {export_seq} of fact {fact_id} is negative"))?;
-    let mut segment: Value = serde_json::from_str(segment_json)
+    let segment: Value = serde_json::from_str(segment_json)
         .map_err(|error| format!("segment_json of fact {fact_id} is not JSON: {error}"))?;
+    if !segment.is_object() {
+        return Err(format!("segment_json of fact {fact_id} is not an object"));
+    }
+    let kind = segment.get("kind").cloned();
+    match kind {
+        None => decode_session_segment(export_seq, fact_id, segment),
+        Some(Value::String(kind)) if kind == SYSTEM_ONE_KIND => {
+            decode_system_one_segment(export_seq, fact_id, segment)
+        }
+        Some(kind) => Err(format!("segment of fact {fact_id} has unknown kind {kind}")),
+    }
+}
+
+/// Decode a session fact the way `usage.export` served it. `segment_json`
+/// carries no `export_seq`; the pull's wire type has it at the top level, so
+/// the row's column is put there before decoding. The rest of the row is
+/// decoded as stored: `usage.export` re-encoded the same fields without
+/// adding any.
+fn decode_session_segment(
+    export_seq: u64,
+    fact_id: &str,
+    mut segment: Value,
+) -> Result<EventRecordRequest, String> {
     segment
         .as_object_mut()
         .ok_or_else(|| format!("segment_json of fact {fact_id} is not an object"))?
         .insert("export_seq".to_string(), Value::from(export_seq));
     let wire: WireSpendSegmentFact = serde_json::from_value(segment)
         .map_err(|error| format!("decode segment of fact {fact_id}: {error}"))?;
-    // The column and the segment name the fact the same way whenever BROCA
-    // wrote the row; a disagreement means the row is damaged, and ingesting
-    // it under either id could record a charge under the wrong identity.
-    if wire.fact_id != fact_id {
+    refuse_fact_id_mismatch(export_seq, fact_id, &wire.fact_id)?;
+    map_fact(wire)
+}
+
+fn decode_system_one_segment(
+    export_seq: u64,
+    fact_id: &str,
+    segment: Value,
+) -> Result<EventRecordRequest, String> {
+    let wire: WireSystemOneFact = serde_json::from_value(segment)
+        .map_err(|error| format!("decode {SYSTEM_ONE_KIND} segment of fact {fact_id}: {error}"))?;
+    refuse_fact_id_mismatch(export_seq, fact_id, &wire.fact_id)?;
+    map_system_one_fact(wire)
+}
+
+/// The column and the segment name the fact the same way whenever BROCA
+/// wrote the row; a disagreement means the row is damaged, and ingesting it
+/// under either id could record a charge under the wrong identity.
+fn refuse_fact_id_mismatch(
+    export_seq: u64,
+    column_fact_id: &str,
+    segment_fact_id: &str,
+) -> Result<(), String> {
+    if segment_fact_id != column_fact_id {
         return Err(format!(
-            "export_facts row {export_seq} names fact {fact_id} but its segment names {}",
-            wire.fact_id
+            "export_facts row {export_seq} names fact {column_fact_id} but its segment names \
+             {segment_fact_id}"
         ));
     }
-    map_fact(wire)
+    Ok(())
 }
 
 fn page_from_snapshot(snapshot: Snapshot, path: &Path) -> Result<ExportPage, PullError> {
@@ -419,12 +470,17 @@ mod tests {
     /// Insert one fact at `export_seq` and move the high water with it in the
     /// same transaction, as BROCA does.
     fn add_fact(path: &Path, export_seq: i64, fact_id: &str) {
+        add_segment(path, export_seq, fact_id, &stored_segment(fact_id));
+    }
+
+    /// Insert one row with the given segment JSON, as [`add_fact`] does.
+    fn add_segment(path: &Path, export_seq: i64, fact_id: &str, segment_json: &str) {
         let mut connection = Connection::open(path).unwrap();
         let tx = connection.transaction().unwrap();
         tx.execute(
             "INSERT INTO export_facts (export_seq,fact_id,run_id,segment_json)
              VALUES (?1,?2,'run-1',?3)",
-            rusqlite::params![export_seq, fact_id, stored_segment(fact_id)],
+            rusqlite::params![export_seq, fact_id, segment_json],
         )
         .unwrap();
         tx.execute(
@@ -469,6 +525,9 @@ mod tests {
         }
     }
 
+    /// A session-only store stores exactly the bytes it stored before batch
+    /// facts existed: the hash was pinned before the `flow_ref` column was
+    /// added, and flow_ref is NULL on every row.
     #[test]
     fn set_aside_good_broca_rows_are_byte_identical() {
         let temp = TempDir::new().unwrap();
@@ -483,6 +542,8 @@ mod tests {
             "broca",
             "f699ba842c11f2f7a694b4aa9acdd7e8fc439bcca4cf7fd65ff9ebbe0eeacda4",
         );
+        assert_eq!(count(&state, "usage_event"), 2);
+        assert_eq!(count(&state, "usage_event WHERE flow_ref IS NOT NULL"), 0);
     }
 
     /// `(lineage, consumed_ordinal, last_success_ms, pending_unknown)` of the
@@ -767,6 +828,397 @@ mod tests {
     fn a_row_whose_fact_id_disagrees_with_its_segment_is_refused() {
         let error = decode_store_row(1, "column-id", &stored_segment("segment-id")).unwrap_err();
         assert!(error.contains("column-id"), "{error}");
+        let error = decode_store_row(1, "column-id", &system_one_segment("segment-id", |_| {}))
+            .unwrap_err();
+        assert!(error.contains("column-id"), "{error}");
+    }
+
+    /// A BROCA batch fact as stored: the agreed fixture under `fact_id`,
+    /// changed by `edit`.
+    fn system_one_segment(
+        fact_id: &str,
+        edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+    ) -> String {
+        let mut segment = crate::wire_map::system_one_fixture();
+        let object = segment.as_object_mut().unwrap();
+        object.insert("fact_id".into(), Value::from(fact_id));
+        edit(object);
+        segment.to_string()
+    }
+
+    /// A batch fact made in a flow: `flow_id` instead of `run_id`, both
+    /// counts reported, a work class and no account.
+    fn flow_segment(fact_id: &str, flow_id: &str) -> String {
+        system_one_segment(fact_id, |object| {
+            object.remove("run_id");
+            object.remove("account_ref");
+            object.insert("flow_id".into(), Value::from(flow_id));
+            object.insert("work_class".into(), Value::from("extract"));
+            object.insert(
+                "usage".into(),
+                serde_json::json!({"input_tokens": 40, "output_tokens": 7}),
+            );
+        })
+    }
+
+    /// The stored attribution of every BROCA event, by producer_ref. The
+    /// lineage is asserted separately: a tuple holds at most twelve fields.
+    type StoredEvent = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<i64>,
+        Option<String>,
+    );
+
+    fn stored_events(state: &SharedState) -> Vec<StoredEvent> {
+        state
+            .with_conn(|conn| {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT producer_ref,harness,project_root,session,
+                                run_ref,flow_ref,provider,model,account_ref,charge_basis,
+                                occurred_at_ms,work_class
+                         FROM usage_event WHERE producer='broca' ORDER BY producer_ref",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
+                            row.get(11)?,
+                        ))
+                    })
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap()
+    }
+
+    /// `(producer_ref, role, source, quantity)` of every stored measurement.
+    fn stored_measurements(state: &SharedState) -> Vec<(String, String, String, Option<i64>)> {
+        state
+            .with_conn(|conn| {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT e.producer_ref,m.role,m.source,m.quantity_units
+                         FROM measurement m JOIN usage_event e USING(event_key)
+                         ORDER BY e.producer_ref,m.role",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap()
+    }
+
+    /// `(locator, reason)` of every BROCA set-aside row, in locator order.
+    fn set_aside_rows(state: &SharedState) -> Vec<(String, String)> {
+        state
+            .with_conn(|conn| {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT locator,reason FROM set_aside_record
+                         WHERE source_key='broca' ORDER BY locator",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap()
+    }
+
+    /// Session facts and batch facts share `export_facts`. Both are recorded
+    /// by one drain: a batch fact under its `fact_id`, with its run or flow
+    /// and no session, harness or project, and a measurement for each count
+    /// it reported and none for a count it did not.
+    #[test]
+    fn session_and_system_one_facts_in_one_store_are_both_recorded() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("run-index.db");
+        create_store(&path, "instance-a", 1);
+        add_fact(&path, 1, "session-a");
+        add_segment(
+            &path,
+            2,
+            "batch-run",
+            &system_one_segment("batch-run", |_| {}),
+        );
+        add_segment(
+            &path,
+            3,
+            "batch-flow",
+            &flow_segment("batch-flow", "flow-1"),
+        );
+        add_fact(&path, 5, "session-b");
+        let state = test_state();
+
+        let outcome =
+            drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
+
+        assert_eq!(outcome.events_recorded, 4);
+        assert_eq!(
+            runtime(&state),
+            Some((Some("instance-a:1".into()), Some(5), Some(100), 0))
+        );
+        assert!(set_aside_rows(&state).is_empty());
+        let some = |value: &str| Some(value.to_string());
+        let session = |fact: &str| -> StoredEvent {
+            (
+                fact.into(),
+                some("test"),
+                some("/project"),
+                some("session-1"),
+                some("run-1"),
+                None,
+                some("anthropic"),
+                some("claude"),
+                None,
+                "metered_api".into(),
+                Some(1000),
+                None,
+            )
+        };
+        assert_eq!(
+            stored_events(&state),
+            vec![
+                (
+                    "batch-flow".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    some("flow-1"),
+                    some("typesafe"),
+                    some("typesafe/jev-1.13.0"),
+                    None,
+                    "metered_api".into(),
+                    Some(1_792_772_000_000),
+                    some("extract"),
+                ),
+                (
+                    "batch-run".into(),
+                    None,
+                    None,
+                    None,
+                    some("run-1"),
+                    None,
+                    some("typesafe"),
+                    some("typesafe/jev-1.13.0"),
+                    some("primary"),
+                    "metered_api".into(),
+                    Some(1_792_772_000_000),
+                    None,
+                ),
+                session("session-a"),
+                session("session-b"),
+            ]
+        );
+        assert_eq!(
+            count(&state, "usage_event WHERE producer_lineage IS NOT NULL"),
+            0
+        );
+        let auth: Vec<Option<String>> = state
+            .with_conn(|conn| {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT auth_selection FROM usage_event
+                         WHERE producer_ref LIKE 'batch-%' ORDER BY producer_ref",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([], |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(auth, vec![some("apikey:typesafe"), some("apikey:typesafe")]);
+        let batch_measurements: Vec<_> = stored_measurements(&state)
+            .into_iter()
+            .filter(|(fact, ..)| fact.starts_with("batch-"))
+            .collect();
+        let row = |fact: &str, role: &str, source: &str, quantity: i64| {
+            (
+                fact.to_string(),
+                role.to_string(),
+                source.to_string(),
+                Some(quantity),
+            )
+        };
+        assert_eq!(
+            batch_measurements,
+            vec![
+                row("batch-flow", "input", "usage.input_tokens", 40),
+                row("batch-flow", "output", "usage.output_tokens", 7),
+                row("batch-run", "input", "usage.input_tokens", 100),
+            ]
+        );
+    }
+
+    /// A row this reader cannot record is set aside with a reason naming the
+    /// kind or member, the good rows around it are recorded, and the cursor
+    /// passes it. An unknown kind is never decoded as a session fact, even
+    /// when the rest of its segment would decode as one.
+    #[test]
+    fn set_aside_unknown_kind_and_malformed_system_one_rows_keep_good_rows_and_progress() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("run-index.db");
+        create_store(&path, "instance-a", 1);
+        add_fact(&path, 1, "good-session");
+        let mut unknown: Value = serde_json::from_str(&stored_segment("unknown-kind")).unwrap();
+        unknown["kind"] = Value::from("system_two");
+        add_segment(&path, 2, "unknown-kind", &unknown.to_string());
+        add_segment(
+            &path,
+            3,
+            "no-provider",
+            &system_one_segment("no-provider", |object| {
+                object.remove("provider");
+            }),
+        );
+        add_segment(
+            &path,
+            4,
+            "run-and-flow",
+            &system_one_segment("run-and-flow", |object| {
+                object.insert("flow_id".into(), Value::from("flow-1"));
+            }),
+        );
+        add_segment(
+            &path,
+            5,
+            "no-run-or-flow",
+            &system_one_segment("no-run-or-flow", |object| {
+                object.remove("run_id");
+            }),
+        );
+        add_segment(
+            &path,
+            6,
+            "good-batch",
+            &system_one_segment("good-batch", |_| {}),
+        );
+        let state = test_state();
+        let broca = source(&path);
+        for now in [100, 200] {
+            drain_once(&state, &broca, BROCA_SOURCE_KEY, PAGE_LIMIT, now).unwrap();
+            assert_eq!(
+                stored_events(&state)
+                    .into_iter()
+                    .map(|event| event.0)
+                    .collect::<Vec<_>>(),
+                vec!["good-batch".to_string(), "good-session".to_string()]
+            );
+            assert_eq!(runtime(&state).unwrap().1, Some(6));
+            let set_aside = set_aside_rows(&state);
+            assert_eq!(set_aside.len(), 4, "{set_aside:?}");
+            for ((locator, reason), (seq, expected)) in set_aside.iter().zip([
+                (2, "unknown kind \"system_two\""),
+                (3, "missing field `provider`"),
+                (4, "both run_id and flow_id"),
+                (5, "neither run_id nor flow_id"),
+            ]) {
+                assert!(locator.ends_with(&format!("export_seq:{seq}")), "{locator}");
+                assert!(reason.contains(expected), "{seq}: {reason}");
+            }
+            crate::refresher::harness_drain::assert_set_aside(&state, "broca", 4);
+        }
+        assert_eq!(count(&state, "measurement"), 5 + 1);
+    }
+
+    /// Batch facts re-read from a rebuilt store are exact redeliveries, and a
+    /// re-read batch fact whose flow changed is a contradiction: quarantined,
+    /// with the stored event left as first written.
+    #[test]
+    fn a_reread_system_one_fact_is_an_exact_redelivery_and_a_changed_flow_quarantines() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("run-index.db");
+        let write_store = |instance: &str, flow_id: &str| {
+            if path.exists() {
+                std::fs::remove_file(&path).unwrap();
+            }
+            create_store(&path, instance, 1);
+            add_fact(&path, 1, "session-a");
+            add_segment(
+                &path,
+                2,
+                "batch-run",
+                &system_one_segment("batch-run", |_| {}),
+            );
+            add_segment(&path, 3, "batch-flow", &flow_segment("batch-flow", flow_id));
+        };
+        write_store("instance-a", "flow-1");
+        let state = test_state();
+        drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
+        let events = stored_events(&state);
+        let measurements = stored_measurements(&state);
+        assert_eq!(events.len(), 3);
+
+        write_store("instance-b", "flow-1");
+        let outcome =
+            drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 200).unwrap();
+        assert_eq!(outcome.quarantined_redeliveries, 0);
+        assert_eq!(stored_events(&state), events);
+        assert_eq!(stored_measurements(&state), measurements);
+        assert_eq!(count(&state, "rejected_delivery"), 0);
+        assert_eq!(count(&state, "redelivery_log"), 0);
+
+        write_store("instance-c", "flow-2");
+        let outcome =
+            drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 300).unwrap();
+        assert_eq!(outcome.quarantined_redeliveries, 1);
+        assert_eq!(stored_events(&state), events, "the stored flow is kept");
+        assert_eq!(stored_measurements(&state), measurements);
+        let rejected: Vec<(String, String)> = state
+            .with_conn(|conn| {
+                let mut statement = conn
+                    .prepare("SELECT producer_ref,incoming_payload FROM rejected_delivery")
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(rejected.len(), 1, "{rejected:?}");
+        assert_eq!(rejected[0].0, "batch-flow");
+        assert!(
+            rejected[0].1.contains(r#""flow_ref":"flow-2""#),
+            "{}",
+            rejected[0].1
+        );
+        assert_eq!(
+            runtime(&state),
+            Some((Some("instance-c:1".into()), Some(3), Some(300), 0))
+        );
     }
 
     /// Reconciles this reader against a ledger the `usage.export` pull filled.

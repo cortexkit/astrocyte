@@ -239,13 +239,23 @@ pub(crate) mod harness_drain {
                     let columns: Vec<usize> = (0..stmt.column_count())
                         .filter(|col| stmt.column_name(*col).unwrap() != "event_key")
                         .collect();
+                    // `flow_ref` was added to usage_event after these hashes
+                    // were pinned, and only BROCA batch facts set it. A NULL
+                    // there is left out, so a pinned hash still proves every
+                    // earlier column is stored exactly as before; a set
+                    // flow_ref is hashed like any other value.
+                    let flow_ref = (0..stmt.column_count())
+                        .find(|col| stmt.column_name(*col).unwrap() == "flow_ref");
                     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
                     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
                         for col in &columns {
-                            bytes.extend(
-                                format!("{:?}|", row.get_ref(*col).map_err(|e| e.to_string())?)
-                                    .as_bytes(),
-                            );
+                            let value = row.get_ref(*col).map_err(|e| e.to_string())?;
+                            if Some(*col) == flow_ref
+                                && matches!(value, rusqlite::types::ValueRef::Null)
+                            {
+                                continue;
+                            }
+                            bytes.extend(format!("{value:?}|").as_bytes());
                         }
                         bytes.push(b'\n');
                     }

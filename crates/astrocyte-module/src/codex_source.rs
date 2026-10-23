@@ -449,6 +449,7 @@ fn map_call(call: CodexCall) -> Result<EventRecordRequest, String> {
         project_root: call.project_root,
         session: Some(call.session_id),
         run_ref: None,
+        flow_ref: None,
         work_class: None,
         occurred_at_ms: call.occurred_at_ms,
         emitted_at_ms: None,

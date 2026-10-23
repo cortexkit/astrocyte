@@ -106,6 +106,13 @@ pub struct EventRecordRequest {
     pub session: Option<String>,
     #[serde(default)]
     pub run_ref: Option<String>,
+    /// The BROCA flow a call was made in, for a BROCA batch fact that names a
+    /// flow instead of a run. Only the BROCA store reader sets it; it is
+    /// skipped by serde like the charge-basis provenance below, so a pushed
+    /// `spend.event.ingest` payload naming it is refused as an unknown field
+    /// and the pushed surface is unchanged.
+    #[serde(skip)]
+    pub flow_ref: Option<String>,
     #[serde(default)]
     pub work_class: Option<String>,
     #[serde(default)]
@@ -300,6 +307,7 @@ struct EventPayload {
     project_root: Option<String>,
     session: Option<String>,
     run_ref: Option<String>,
+    flow_ref: Option<String>,
     work_class: Option<String>,
     occurred_at_ms: Option<i64>,
     emitted_at_ms: Option<i64>,
@@ -343,6 +351,7 @@ impl EventPayload {
             || self.project_root != incoming.project_root
             || self.session != incoming.session
             || self.run_ref != incoming.run_ref
+            || self.flow_ref != incoming.flow_ref
             || self.work_class != incoming.work_class
             || self.occurred_at_ms != incoming.occurred_at_ms
             || self.emitted_at_ms != incoming.emitted_at_ms
@@ -838,7 +847,7 @@ fn validate_event_request(
 fn canonical_incoming_payload(request: &EventRecordRequest) -> Result<String, CanonError> {
     let mut measurements = request.measurements.iter().collect::<Vec<_>>();
     measurements.sort_by(|left, right| (&left.role, &left.unit).cmp(&(&right.role, &right.unit)));
-    jcs_serialize(&json!({
+    let mut payload = json!({
         "producer": request.producer,
         "producer_lineage": request.producer_lineage,
         "producer_ref": request.producer_ref,
@@ -861,7 +870,14 @@ fn canonical_incoming_payload(request: &EventRecordRequest) -> Result<String, Ca
         "charge_basis_mapping_version": request.charge_basis_mapping_version,
         "charge_basis_overrides": request.charge_basis_overrides,
         "measurements": measurements,
-    }))
+    });
+    // `flow_ref` is written only when present, so the evidence recorded for an
+    // event without a flow (every event before the column existed, and every
+    // event from any producer other than BROCA) keeps exactly the bytes it had.
+    if let (Some(flow_ref), Some(object)) = (&request.flow_ref, payload.as_object_mut()) {
+        object.insert("flow_ref".into(), json!(flow_ref));
+    }
+    jcs_serialize(&payload)
 }
 
 fn load_event_payload(
@@ -875,7 +891,7 @@ fn load_event_payload(
             "SELECT prior_event_ref,harness,project_root,session,run_ref,work_class,
                 occurred_at_ms,emitted_at_ms,terminal_status,attempt_ordinal,
                 vendor_request_id,provider,model,account_ref,auth_selection,charge_basis,
-                charge_basis_mapping_version,charge_basis_overrides,event_id
+                charge_basis_mapping_version,charge_basis_overrides,event_id,flow_ref
          FROM usage_event
          WHERE producer=?1 AND producer_lineage IS ?2 AND producer_ref=?3",
         )?
@@ -896,6 +912,7 @@ fn load_event_payload(
                         project_root: row.get(2)?,
                         session: row.get(3)?,
                         run_ref: row.get(4)?,
+                        flow_ref: row.get(19)?,
                         work_class: row.get(5)?,
                         occurred_at_ms: row.get(6)?,
                         emitted_at_ms: row.get(7)?,
@@ -977,10 +994,10 @@ fn insert_event(
              harness,project_root,session,run_ref,work_class,
              occurred_at_ms,emitted_at_ms,recorded_at_ms,terminal_status,attempt_ordinal,
              vendor_request_id,provider,model,account_ref,auth_selection,charge_basis,pricing_generation,
-             charge_basis_mapping_version,charge_basis_overrides
+             charge_basis_mapping_version,charge_basis_overrides,flow_ref
           ) VALUES (
               ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,
-              ?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,0,?22,?23
+              ?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,0,?22,?23,?24
           )",
         params![
             event_id,
@@ -1006,6 +1023,7 @@ fn insert_event(
             request.charge_basis.as_str(),
             request.charge_basis_mapping_version,
             request.charge_basis_overrides,
+            request.flow_ref,
         ],
     )?;
     Ok(event_id)
@@ -1229,6 +1247,7 @@ mod tests {
             project_root: Some("/project".into()),
             session: Some("session-a".into()),
             run_ref: Some("run-a".into()),
+            flow_ref: None,
             work_class: Some("generation".into()),
             occurred_at_ms: Some(1_000),
             emitted_at_ms: Some(1_010),

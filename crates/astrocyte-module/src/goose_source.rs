@@ -304,6 +304,7 @@ fn map_session(session: GooseSession) -> Result<EventRecordRequest, String> {
         project_root: session.project_root,
         session: Some(session.session_id),
         run_ref: None,
+        flow_ref: None,
         work_class: None,
         // The session's start, as upstream dates it.
         occurred_at_ms: session.created_at_ms,

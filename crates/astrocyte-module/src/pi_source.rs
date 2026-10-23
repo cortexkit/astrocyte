@@ -705,6 +705,7 @@ fn map_message(record: PiUsageRecord) -> Result<EventRecordRequest, String> {
         project_root: message.workspace_key,
         session: Some(message.session_id),
         run_ref: None,
+        flow_ref: None,
         work_class: None,
         // `None` when the record carries no timestamp: the ledger keeps it
         // undated rather than dated by a guess.
@@ -820,6 +821,7 @@ fn same_call(left: &EventRecordRequest, right: &EventRecordRequest) -> bool {
         prior_event_ref,
         harness,
         run_ref,
+        flow_ref,
         work_class,
         occurred_at_ms,
         emitted_at_ms,
@@ -841,6 +843,7 @@ fn same_call(left: &EventRecordRequest, right: &EventRecordRequest) -> bool {
         && prior_event_ref == &right.prior_event_ref
         && harness == &right.harness
         && run_ref == &right.run_ref
+        && flow_ref == &right.flow_ref
         && work_class == &right.work_class
         && occurred_at_ms == &right.occurred_at_ms
         && emitted_at_ms == &right.emitted_at_ms

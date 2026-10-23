@@ -214,19 +214,7 @@ pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String
     // whose size they do not know; the pricing path already refuses it as
     // `missing_quantity` per measurement rather than pricing it as zero.
     .filter_map(|(role, field, quantity)| quantity.map(|units| (role, field, units)))
-    .map(|(role, field, quantity)| {
-        Ok(MeasurementInput {
-            role: role.into(),
-            unit: "token".into(),
-            kind: "billed".into(),
-            source: format!("usage.{field}"),
-            quantity_units: Some(
-                i64::try_from(quantity)
-                    .map_err(|_| format!("{field} exceeds stored integer range"))?,
-            ),
-            quantity_exponent: Some(0),
-        })
-    })
+    .map(|(role, field, quantity)| token_measurement(role, field, quantity))
     .collect::<Result<Vec<_>, String>>()?;
     // Output goes back in its original position, before reasoning, so the
     // measurement order is unchanged from the verbatim mapping.
@@ -235,7 +223,7 @@ pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String
         measurements.insert(reasoning_at, output);
     }
     Ok(EventRecordRequest {
-        producer: "broca".into(),
+        producer: BROCA_PRODUCER.into(),
         // BROCA's content-hash references survive restarts. Adding an instance
         // lineage would turn a re-export of the same charge into a new event.
         producer_lineage: None,
@@ -245,14 +233,9 @@ pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String
         project_root: Some(wire.session.project_root),
         session: Some(wire.session.session),
         run_ref: Some(wire.run_id),
+        flow_ref: None,
         work_class: wire.work_class,
-        occurred_at_ms: wire
-            .occurred_at_ms
-            .map(|ms| {
-                i64::try_from(ms)
-                    .map_err(|_| "occurred_at_ms exceeds stored integer range".to_string())
-            })
-            .transpose()?,
+        occurred_at_ms: wire.occurred_at_ms.map(stored_occurred_at).transpose()?,
         emitted_at_ms: None,
         terminal_status: wire.terminal_reason,
         attempt_ordinal: None,
@@ -268,6 +251,142 @@ pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String
     })
 }
 
+/// The producer name every BROCA fact is recorded under, whatever its kind.
+const BROCA_PRODUCER: &str = "broca";
+
+/// One reported token count as a billed measurement, sourced from the wire
+/// field it came from. Shared by both kinds of BROCA fact so the same field
+/// is stored the same way whichever kind carried it.
+fn token_measurement(role: &str, field: &str, quantity: u64) -> Result<MeasurementInput, String> {
+    Ok(MeasurementInput {
+        role: role.into(),
+        unit: "token".into(),
+        kind: "billed".into(),
+        source: format!("usage.{field}"),
+        quantity_units: Some(
+            i64::try_from(quantity).map_err(|_| format!("{field} exceeds stored integer range"))?,
+        ),
+        quantity_exponent: Some(0),
+    })
+}
+
+fn stored_occurred_at(ms: u64) -> Result<i64, String> {
+    i64::try_from(ms).map_err(|_| "occurred_at_ms exceeds stored integer range".to_string())
+}
+
+/// The `kind` a BROCA batch fact carries in its segment. A session fact
+/// carries no `kind` at all.
+pub(crate) const SYSTEM_ONE_KIND: &str = "system_one";
+
+/// A usage fact from one of BROCA's batch decision or extraction models.
+/// These answer a batch of items with no session of their own, so the fact
+/// names its batch and item instead, and the run OR the flow the call was
+/// made in. Shared members carry the same names and nesting as on a session
+/// fact. The segment carries no cost or rate members.
+///
+/// Members not named here are ignored, as on a session fact, so a member
+/// BROCA adds later does not set the whole fact aside.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireSystemOneFact {
+    pub fact_id: String,
+    /// The batch and the item's position in it. Required so a segment
+    /// decodes only in the agreed shape; neither is stored, because the
+    /// event's identity is `fact_id` alone.
+    #[expect(
+        dead_code,
+        reason = "required for decoding; the event's identity is fact_id"
+    )]
+    pub batch_id: String,
+    #[expect(
+        dead_code,
+        reason = "required for decoding; the event's identity is fact_id"
+    )]
+    pub item_index: u64,
+    /// Exactly one of these two is present; [`map_system_one_fact`] refuses
+    /// a fact with both or neither.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub flow_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub account_ref: Option<String>,
+    #[serde(default)]
+    pub auth_selection: Option<String>,
+    pub charge_basis: ChargeBasis,
+    pub occurred_at_ms: u64,
+    /// Carried verbatim with the same three stored states as on a session
+    /// fact: absent or null -> NULL, a string -> that exact string.
+    #[serde(default)]
+    pub work_class: Option<String>,
+    pub usage: WireSystemOneUsage,
+}
+
+/// A batch fact's token counts. Each is absent when the provider did not
+/// report it, never zero, and an absent count produces no measurement.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WireSystemOneUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+/// Maps a BROCA batch fact to an event. Identity is the same as for a session
+/// fact (producer `broca`, no lineage, `fact_id` as the reference), so a
+/// re-read of the fact is an exact redelivery. The fact has no session,
+/// harness or project, and those stay NULL rather than being invented.
+pub fn map_system_one_fact(wire: WireSystemOneFact) -> Result<EventRecordRequest, String> {
+    let (run_ref, flow_ref) = match (wire.run_id, wire.flow_id) {
+        (Some(run_id), None) => (Some(run_id), None),
+        (None, Some(flow_id)) => (None, Some(flow_id)),
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "system_one fact {} carries both run_id and flow_id",
+                wire.fact_id
+            ))
+        }
+        (None, None) => {
+            return Err(format!(
+                "system_one fact {} carries neither run_id nor flow_id",
+                wire.fact_id
+            ))
+        }
+    };
+    let measurements = [
+        ("input", "input_tokens", wire.usage.input_tokens),
+        ("output", "output_tokens", wire.usage.output_tokens),
+    ]
+    .into_iter()
+    .filter_map(|(role, field, quantity)| quantity.map(|units| (role, field, units)))
+    .map(|(role, field, quantity)| token_measurement(role, field, quantity))
+    .collect::<Result<Vec<_>, String>>()?;
+    Ok(EventRecordRequest {
+        producer: BROCA_PRODUCER.into(),
+        producer_lineage: None,
+        producer_ref: wire.fact_id,
+        prior_event_ref: None,
+        harness: None,
+        project_root: None,
+        session: None,
+        run_ref,
+        flow_ref,
+        work_class: wire.work_class,
+        occurred_at_ms: Some(stored_occurred_at(wire.occurred_at_ms)?),
+        emitted_at_ms: None,
+        terminal_status: None,
+        attempt_ordinal: None,
+        vendor_request_id: None,
+        provider: Some(wire.provider),
+        model: Some(wire.model),
+        account_ref: wire.account_ref,
+        auth_selection: wire.auth_selection,
+        charge_basis: wire.charge_basis,
+        charge_basis_mapping_version: None,
+        charge_basis_overrides: None,
+        measurements,
+    })
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn wire_fixture() -> serde_json::Value {
     serde_json::json!({
@@ -277,6 +396,18 @@ pub(crate) fn wire_fixture() -> serde_json::Value {
         "auth_selection":"apikey:openai:astro",
         "usage":{"input_tokens":100,"cached_input_tokens":50,"cache_write_tokens":0,"output_tokens":20,"reasoning_tokens":5},
         "occurred_at_ms": 1000
+    })
+}
+
+/// A BROCA batch fact in the agreed shape, made in a run, with input only.
+#[cfg(test)]
+pub(crate) fn system_one_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "system_one", "fact_id": "system-one-hash", "batch_id": "batch-1",
+        "item_index": 0, "run_id": "run-1", "provider": "typesafe",
+        "model": "typesafe/jev-1.13.0", "account_ref": "primary",
+        "auth_selection": "apikey:typesafe", "charge_basis": "metered_api",
+        "occurred_at_ms": 1_792_772_000_000_u64, "usage": {"input_tokens": 100}
     })
 }
 
@@ -538,6 +669,138 @@ mod tests {
             }))
             .unwrap())
         }
+    }
+
+    /// The same pricing path a BROCA session fact takes, against a catalog
+    /// that knows only the batch model: the provider's own rate for input,
+    /// and a provider-stated zero for output.
+    struct SystemOneCatalog;
+
+    impl astrocyte_core::catalog_client::CatalogConnection for SystemOneCatalog {
+        fn catalog_status(
+            &self,
+            request: fusiform_protocol::StatusRequest,
+        ) -> Result<
+            fusiform_protocol::StatusResponse,
+            astrocyte_core::catalog_client::CatalogCallError,
+        > {
+            OneRateCatalog.catalog_status(request)
+        }
+
+        fn catalog_get(
+            &self,
+            request: fusiform_protocol::CatalogGetRequest,
+        ) -> Result<
+            fusiform_protocol::CatalogGetResponse,
+            astrocyte_core::catalog_client::CatalogCallError,
+        > {
+            if request.at_ms == Some(0) {
+                return OneRateCatalog.catalog_get(request);
+            }
+            let key = format!(
+                "{}/{}",
+                request.provider_id.as_deref().unwrap_or_default(),
+                request.model_id.as_deref().unwrap_or_default()
+            );
+            // $3 per million input tokens (3e9 nanodollars per million), so
+            // the fixture's 100 input tokens cost 300,000 nanodollars.
+            let models = if key == "typesafe/typesafe/jev-1.13.0" {
+                serde_json::json!({ key: {
+                    "rate.input": {"state":"priced","units":3_000_000_000_u64,"exponent":9,
+                        "currency":"USD","unit_provenance":{"kind":"stated"}},
+                    "rate.output": {"state":"stated_zero"}
+                }})
+            } else {
+                serde_json::json!({})
+            };
+            Ok(serde_json::from_value(serde_json::json!({
+                "source": "test-catalog",
+                "resolved_at_ms": request.at_ms,
+                "catalog_version": 1,
+                "models": models,
+                "withheld": [], "uncertain": [], "overridden": []
+            }))
+            .unwrap())
+        }
+    }
+
+    /// A batch fact's input prices through the normal pricing pass. Its
+    /// reported output, against a provider's own stated zero, stays unpriced
+    /// as `stated_zero_requires_policy`: the existing rule for a stated zero,
+    /// pinned here for batch facts rather than changed.
+    #[test]
+    fn a_system_one_fact_prices_input_and_leaves_a_stated_zero_output_unpriced() {
+        use astrocyte_core::pricing;
+        let mut wire = system_one_fixture();
+        wire["usage"]["output_tokens"] = 20.into();
+        let request = map_system_one_fact(serde_json::from_value(wire).unwrap()).unwrap();
+        let state = test_state();
+        assert_eq!(
+            record(&state, &request),
+            astrocyte_core::ingest::RecordDisposition::Recorded
+        );
+        let event_id = astrocyte_core::fact::event_id(
+            &request.producer,
+            request.producer_lineage.as_deref(),
+            &request.producer_ref,
+        )
+        .unwrap();
+        let catalog = astrocyte_core::catalog_client::CatalogClient::connect(std::sync::Arc::new(
+            SystemOneCatalog,
+        ))
+        .unwrap();
+        state
+            .ordered_write(|tx| {
+                let plan = pricing::read_reprice_in_tx(tx, &event_id).unwrap();
+                let resolved = pricing::resolve_reprice(&plan, &catalog, &[]).unwrap();
+                pricing::commit_reprice_in_tx(
+                    tx,
+                    &plan,
+                    &resolved,
+                    3000,
+                    pricing::PricingOrigin::PricingPass,
+                )
+                .unwrap();
+                Ok(((), true))
+            })
+            .unwrap();
+        type Charge = (String, String, Option<String>, Option<String>, Option<i64>);
+        let charges: Vec<Charge> = state
+            .with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT role,outcome,unpriced_reason,currency,charge_nanos
+                         FROM priced_charge ORDER BY role",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                    })
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(
+            charges,
+            vec![
+                (
+                    "input".into(),
+                    "priced".into(),
+                    None,
+                    Some("USD".into()),
+                    Some(300_000)
+                ),
+                (
+                    "output".into(),
+                    "unpriced".into(),
+                    Some("stated_zero_requires_policy".into()),
+                    None,
+                    None
+                ),
+            ]
+        );
     }
 
     /// Reasoning above output contradicts BROCA's subset rule. The event still

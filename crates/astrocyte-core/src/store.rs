@@ -3506,6 +3506,65 @@ END;
 DROP INDEX usage_event_natural_key_lineage_absent;
 "#,
     },
+    Migration {
+        version: 26,
+        statements: r#"-- BROCA's batch decision and extraction models answer batches that belong to
+-- no session. A call made inside a run names the run (run_ref); a call made
+-- inside a flow names the flow instead, stored here. Nullable with no default:
+-- every event recorded before this column existed, and every event from any
+-- other producer, has no flow, and ALTER TABLE ADD COLUMN rewrites no row.
+ALTER TABLE usage_event ADD COLUMN flow_ref TEXT;
+
+-- The update guard lists every column that must stay unchanged, so a new
+-- column is mutable until it is listed. The guard is recreated from the
+-- version 23 definition with flow_ref added beside run_ref; every other
+-- condition is carried unchanged.
+DROP TRIGGER usage_event_update_guard;
+CREATE TRIGGER usage_event_update_guard
+BEFORE UPDATE ON usage_event
+WHEN NOT (
+    NEW.event_key IS OLD.event_key
+    AND NEW.event_id IS OLD.event_id
+    AND NEW.producer IS OLD.producer
+    AND NEW.producer_lineage IS OLD.producer_lineage
+    AND NEW.producer_ref IS OLD.producer_ref
+    AND NEW.prior_event_ref IS OLD.prior_event_ref
+    AND NEW.harness IS OLD.harness
+    AND NEW.project_root IS OLD.project_root
+    AND NEW.session IS OLD.session
+    AND NEW.run_ref IS OLD.run_ref
+    AND NEW.flow_ref IS OLD.flow_ref
+    AND NEW.work_class IS OLD.work_class
+    AND NEW.occurred_at_ms IS OLD.occurred_at_ms
+    AND NEW.emitted_at_ms IS OLD.emitted_at_ms
+    AND NEW.recorded_at_ms IS OLD.recorded_at_ms
+    AND NEW.terminal_status IS OLD.terminal_status
+    AND NEW.attempt_ordinal IS OLD.attempt_ordinal
+    AND NEW.vendor_request_id IS OLD.vendor_request_id
+    AND NEW.provider IS OLD.provider
+    AND NEW.model IS OLD.model
+    AND NEW.account_ref IS OLD.account_ref
+    AND NEW.auth_selection IS OLD.auth_selection
+    AND NEW.charge_basis_mapping_version IS OLD.charge_basis_mapping_version
+    AND NEW.charge_basis_overrides IS OLD.charge_basis_overrides
+    AND (
+        NEW.charge_basis IS OLD.charge_basis
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.pricing_generation = OLD.pricing_generation
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.currency IS OLD.currency
+        OR (OLD.currency IS NULL AND NEW.currency IS NOT NULL)
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'usage_event_update_guard');
+END;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -3569,7 +3628,7 @@ mod tests {
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (25, 25, 25)
+            (26, 26, 26)
         );
         assert_eq!(
             store
@@ -3582,7 +3641,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 25, 25)
+            (0, 26, 26)
         );
         assert!(!second.store_ahead());
         store
@@ -3592,7 +3651,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',26,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',27,1)",
                     [],
                 )?;
                 Ok(())
@@ -3601,7 +3660,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 26, 25)
+            (0, 27, 26)
         );
         assert!(ahead.store_ahead());
     }
@@ -3635,6 +3694,99 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn schema_v26_adds_a_null_flow_ref_keeps_every_row_and_guards_it() {
+        let conn = hourly_store();
+        conn.execute_batch(
+            MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == 25)
+                .unwrap()
+                .statements,
+        )
+        .unwrap();
+        seed_integer_chains(&conn);
+        // Enough events that the migration's cost is visible if it ever
+        // started rewriting rows; the time is printed, never asserted.
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<20000)
+             INSERT INTO usage_event (event_id,producer,producer_ref,run_ref,charge_basis,
+                                      recorded_at_ms,occurred_at_ms)
+             SELECT 'bulk-'||i,'fixture','bulk-'||i,'run-'||i,'metered_api',1,i FROM n;",
+        )
+        .unwrap();
+        let before = all_rows(&conn);
+        let started = std::time::Instant::now();
+        conn.execute_batch(
+            MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == 26)
+                .unwrap()
+                .statements,
+        )
+        .unwrap();
+        println!(
+            "schema v26 on {} events took {:?}",
+            table_rows(&conn, "usage_event").len(),
+            started.elapsed()
+        );
+        // Every table keeps its rows; usage_event rows gain one trailing
+        // NULL, the new flow_ref.
+        let after = all_rows(&conn);
+        let expected: Vec<_> = before
+            .into_iter()
+            .map(|(table, rows)| {
+                let rows = if table == "usage_event" {
+                    rows.into_iter()
+                        .map(|mut row| {
+                            row.push(rusqlite::types::Value::Null);
+                            row
+                        })
+                        .collect()
+                } else {
+                    rows
+                };
+                (table, rows)
+            })
+            .collect();
+        assert_eq!(after, expected);
+        let last_column: String = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('usage_event') ORDER BY cid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_column, "flow_ref");
+        for sql in [
+            "UPDATE usage_event SET flow_ref='flow-1' WHERE event_key=10",
+            "UPDATE usage_event SET run_ref='changed' WHERE event_key=10",
+            "UPDATE usage_event SET auth_selection='changed' WHERE event_key=10",
+            "UPDATE usage_event SET terminal_status='changed' WHERE event_key=10",
+        ] {
+            refuse_without_effect(&conn, "usage_event", sql, "usage_event_update_guard");
+        }
+        // A set flow_ref is as fixed as a NULL one.
+        conn.execute(
+            "INSERT INTO usage_event (event_id,producer,producer_ref,flow_ref,charge_basis,
+                                      recorded_at_ms)
+             VALUES ('flowed','fixture','flowed','flow-1','metered_api',1)",
+            [],
+        )
+        .unwrap();
+        for sql in [
+            "UPDATE usage_event SET flow_ref='flow-2' WHERE event_id='flowed'",
+            "UPDATE usage_event SET flow_ref=NULL WHERE event_id='flowed'",
+        ] {
+            refuse_without_effect(&conn, "usage_event", sql, "usage_event_update_guard");
+        }
+        // The projections the guard lets move still move.
+        conn.execute_batch(
+            "UPDATE usage_event SET pricing_generation=pricing_generation+1 WHERE event_key=10",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3690,6 +3842,16 @@ mod tests {
                 .statements,
         )
         .unwrap();
+        conn
+    }
+
+    /// The hourly store migrated to the latest schema, for tests that record
+    /// through ingest, which reads and writes every current column.
+    fn latest_hourly_store() -> Connection {
+        let conn = hourly_store();
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version > 24) {
+            conn.execute_batch(migration.statements).unwrap();
+        }
         conn
     }
 
@@ -3758,7 +3920,7 @@ mod tests {
     #[test]
     fn hourly_recording_marks_once_and_rolls_back_with_its_measurements() {
         use crate::ingest::{record_event_in_tx, DeliveryPath};
-        let mut conn = hourly_store();
+        let mut conn = latest_hourly_store();
         let tx = conn.transaction().unwrap();
         record_event_in_tx(&tx, &hourly_request(), 1, DeliveryPath::Read).unwrap();
         assert_eq!(
@@ -3809,7 +3971,7 @@ mod tests {
     #[test]
     fn hourly_pricing_bumps_header_before_guarded_heads_and_marks_once() {
         use crate::{ingest, pricing};
-        let mut conn = hourly_store();
+        let mut conn = latest_hourly_store();
         let request = hourly_request();
         let event = ingest::record_event(&mut conn, &request, 1).unwrap();
         let tx = conn.transaction().unwrap();
@@ -4537,6 +4699,10 @@ mod tests {
             .unwrap();
         conn.execute("UPDATE usage_event SET attempt_ordinal=4294967296", [])
             .unwrap();
+        // Ingest reads `flow_ref` (added in v26), which this pre-v19 store
+        // lacks; add it so the read reaches the overflowing ordinal.
+        conn.execute_batch("ALTER TABLE usage_event ADD COLUMN flow_ref TEXT")
+            .unwrap();
         let before = table_rows(&conn, "usage_event");
         let request = crate::ingest::EventRecordRequest {
             producer: event.producer,
@@ -4547,6 +4713,7 @@ mod tests {
             project_root: event.project_root,
             session: event.session,
             run_ref: event.run_ref,
+            flow_ref: None,
             work_class: event.work_class,
             occurred_at_ms: event.occurred_at_ms,
             emitted_at_ms: event.emitted_at_ms,
