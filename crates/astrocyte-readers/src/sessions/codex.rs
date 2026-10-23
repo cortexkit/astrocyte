@@ -121,6 +121,11 @@ struct CodexPayload {
 struct CodexInfo {
     last_token_usage: Option<CodexTokenUsage>,
     total_token_usage: Option<CodexTokenUsage>,
+    /// The model's context window, kept for cache diagnostics. Decoded
+    /// leniently so a malformed value cannot make a record that decoded
+    /// before fail now.
+    #[serde(default, deserialize_with = "super::lenient::unsigned")]
+    model_context_window: Option<u64>,
 }
 
 /// One usage block as Codex reported it.
@@ -290,6 +295,9 @@ pub struct CodexCall {
     /// a file mtime.
     pub occurred_at_ms: Option<i64>,
     pub usage: CodexCallUsage,
+    /// `info.model_context_window` of the `token_count` record, for cache
+    /// diagnostics only. `None` for a `token_usage_record` call.
+    pub context_limit: Option<u64>,
 }
 
 /// Counts for one parse call. Every count covers only the lines this call
@@ -690,6 +698,7 @@ fn parse_line(
                     .and_then(normalize_workspace_key),
                 occurred_at_ms: parse_rfc3339_millis(entry.timestamp.as_deref()),
                 usage: CodexCallUsage::from_usage(&usage),
+                context_limit: None,
             };
             settle_pending(state, counts, calls);
             state.pending = Some(PendingRequest {
@@ -739,6 +748,7 @@ fn parse_line(
                 counts.token_counts_without_info += 1;
                 return;
             };
+            let context_limit = info.model_context_window;
             let (Some(total), Some(last)) = (info.total_token_usage, info.last_token_usage) else {
                 counts.records_without_usage_pair += 1;
                 return;
@@ -827,6 +837,7 @@ fn parse_line(
                     .and_then(normalize_workspace_key),
                 occurred_at_ms: parse_rfc3339_millis(entry.timestamp.as_deref()),
                 usage,
+                context_limit,
             });
         }
         _ => {}

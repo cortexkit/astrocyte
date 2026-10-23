@@ -30,6 +30,9 @@ pub struct OpenCodeMessage {
     pub provider_id: String,
     pub model_id: String,
     pub agent: Option<String>,
+    /// `data.finish` verbatim, when it is a string. Kept for cache
+    /// diagnostics only; it is not part of the ledger event.
+    pub finish: Option<String>,
     pub tokens: TokenBreakdown,
 }
 

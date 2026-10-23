@@ -235,6 +235,15 @@ pub struct PiMessage {
     pub provider: Option<String>,
     #[serde(rename = "responseId")]
     pub response_id: Option<String>,
+    /// `stopReason` (`stop`, `toolUse`, `aborted`, ...), kept for cache
+    /// diagnostics. Decoded leniently: a non-string value is dropped rather
+    /// than making a message that decoded before fail now.
+    #[serde(
+        default,
+        rename = "stopReason",
+        deserialize_with = "super::lenient::string"
+    )]
+    pub stop_reason: Option<String>,
 }
 
 /// The camelCase usage block of a Pi record: `utils::CamelUsage`'s
@@ -295,6 +304,12 @@ struct IngestPiMessage {
     provider: Option<String>,
     #[serde(rename = "responseId")]
     response_id: Option<String>,
+    #[serde(
+        default,
+        rename = "stopReason",
+        deserialize_with = "super::lenient::string"
+    )]
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -363,6 +378,7 @@ impl From<MapOnly<IngestPiEntry>> for PiSessionEntry {
                 model: message.model,
                 provider: message.provider,
                 response_id: message.response_id,
+                stop_reason: message.stop_reason,
             }),
             name: entry.name,
             target_id: entry.target_id,
@@ -746,6 +762,9 @@ pub struct PiUsageRecord {
     /// Operation records use the entry's model and provider without inheriting
     /// those values from the conversation.
     pub operation: Option<PiOperationAttribution>,
+    /// The message's `stopReason`, for cache diagnostics only. Not part of
+    /// the ledger event.
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -794,6 +813,7 @@ fn pi_operation(
             model: entry.model,
             provider: entry.provider,
         }),
+        stop_reason: None,
     })
 }
 
@@ -1091,6 +1111,7 @@ fn parse_pi_line(
         message: unified,
         occurred_at_ms: recorded_timestamp,
         operation: None,
+        stop_reason: message.stop_reason.clone(),
     });
     ControlFlow::Continue(())
 }

@@ -209,6 +209,7 @@ fn map_call(call: KimiCall) -> Result<EventRecordRequest, String> {
         // No wire record says how Kimi CLI authenticated.
         charge_basis: ChargeBasis::Unknown,
         measurements,
+        step_detail: Default::default(),
     })
 }
 

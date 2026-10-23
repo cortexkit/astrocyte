@@ -216,6 +216,7 @@ fn map_call(call: OmpCall) -> Result<EventRecordRequest, String> {
         // (`openai-codex`) names an API route, not who paid.
         charge_basis: ChargeBasis::Unknown,
         measurements,
+        step_detail: Default::default(),
     })
 }
 

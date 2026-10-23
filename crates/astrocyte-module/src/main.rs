@@ -1843,6 +1843,8 @@ mod tests {
                 "spend.report",
                 "spend.subscription.report",
                 "spend.workclass.report",
+                "usage.cache.sessions",
+                "usage.cache.steps",
             ])
         );
     }

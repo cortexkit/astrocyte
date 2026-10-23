@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 26. A schema change appends a migration; an applied
+currently version 27. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -12,6 +12,7 @@ ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 |---|---|---|
 | `usage_event` | Each row records one usage event per producer reference and lineage, together with its pricing projection. | insert; three projection columns, see below |
 | `measurement` | Each row records one immutable event quantity for a role and unit. | insert only |
+| `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
 | `chargeability_transition` | Each row records the one terminal settlement of an event's chargeability. | insert only |
 | `quarantine_evidence` | Each row preserves a referring event's quantities that contradict its target. | insert |
 | `rejected_delivery` | Each row preserves a redelivery whose payload differs from the stored event. | insert |
@@ -56,6 +57,8 @@ in the table above means both of these exist:
 - `statement_import_no_update`, `statement_import_no_delete`
 - `multiplier_observation_no_update`, `multiplier_observation_no_delete`
 - `account_subscription_no_delete`
+- `step_detail_no_update`, `step_detail_no_delete`, and `step_detail_insert_once`,
+  which also stops `INSERT OR REPLACE` from replacing a row
 
 `usage_event_update_guard` lets exactly three columns of an event move, all
 projections the ledger maintains: `pricing_generation` advances by one per
@@ -84,6 +87,19 @@ event, including every event recorded before schema 26, has a null
 `usage_event_update_guard` with `flow_ref` listed beside `run_ref`. A
 redelivery whose `flow_ref` differs from the stored one is a contradiction and
 goes to `rejected_delivery`, like any other payload field.
+
+`step_detail` (schema 27) holds what a harness reader keeps beside an event
+for cache diagnostics: OpenCode's `finish`, Pi's `stopReason` and Codex's
+`model_context_window`. It is a side table because redelivery compares every
+`usage_event` field: a reader that began storing a new event field would make
+every event it recorded earlier look contradicted. A row is written in the
+transaction that records its event, only when a field is present. An exact
+re-read may add the row an older event lacks; it never changes a row, and
+the table is never part of the redelivery comparison. Claude Code and Oh My Pi
+keep their stop reason in `usage_event.terminal_status`. Schema 27 also adds
+the index `usage_event_session_time` on `(session, occurred_at_ms)` for the
+cache-diagnostics reads. Tests: `step_detail_refuses_update_and_delete`,
+`a_redelivery_adds_missing_step_detail_but_never_changes_it`.
 
 ## Event identity
 

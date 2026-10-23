@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use astrocyte_core::fact::ChargeBasis;
-use astrocyte_core::ingest::{EventRecordRequest, RecordDisposition};
+use astrocyte_core::ingest::{EventRecordRequest, RecordDisposition, StepDetail};
 use astrocyte_readers::file_identity::{file_identity, same_identity};
 use astrocyte_readers::sessions::opencode::{
     read_opencode_page, read_opencode_tail, OpenCodeCursor, OpenCodeMessage, OpenCodeReadError,
@@ -779,6 +779,12 @@ fn map_message(message: OpenCodeMessage) -> Result<EventRecordRequest, String> {
         charge_basis_overrides: None,
         charge_basis: ChargeBasis::Unknown,
         measurements,
+        // `data.finish` is kept beside the event for cache diagnostics; it is
+        // not part of the event, so decoding it changes no ledger row.
+        step_detail: StepDetail {
+            finish: message.finish,
+            context_limit: None,
+        },
     })
 }
 
@@ -866,6 +872,54 @@ mod tests {
             "opencode",
             "11ece20b59027050753832cf2355e9d7d5e955cd40e3984d49408cdfe84fc6e8",
         );
+    }
+
+    /// `data.finish` is kept in `step_detail`, and reading it changes no
+    /// ledger row. The pinned fixture above carries `finish`; the same two
+    /// messages without it (still final through `time.completed`) store
+    /// exactly the same ledger bytes and no `step_detail` row.
+    #[test]
+    fn opencode_finish_is_stored_beside_a_byte_identical_ledger() {
+        const PINNED: &str = "11ece20b59027050753832cf2355e9d7d5e955cd40e3984d49408cdfe84fc6e8";
+        let drain = |finish: Option<serde_json::Value>| {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("opencode.db");
+            let conn = create_database(&path);
+            for (id, created) in [("before", 10), ("after", 30)] {
+                let mut data: serde_json::Value =
+                    serde_json::from_str(&payload("build", "/producer/root", 13, 17, created))
+                        .unwrap();
+                match &finish {
+                    Some(finish) => data["finish"] = finish.clone(),
+                    None => {
+                        data.as_object_mut().unwrap().remove("finish");
+                    }
+                }
+                conn.execute(
+                    "INSERT INTO message (id,session_id,time_created,time_updated,data)
+                     VALUES (?1,'session',?2,?2,?3)",
+                    params![id, created, data.to_string()],
+                )
+                .unwrap();
+            }
+            let state = test_state();
+            OpenCodeSource::at(&path)
+                .drain(&state, 100, &NEVER_STOP)
+                .unwrap();
+            crate::refresher::harness_drain::assert_good_snapshot(&state, "opencode", PINNED);
+            crate::refresher::harness_drain::step_details(&state)
+        };
+        let stop = Some("stop".to_string());
+        assert_eq!(
+            drain(Some(serde_json::json!("stop"))),
+            [
+                ("after".to_string(), stop.clone(), None),
+                ("before".to_string(), stop, None)
+            ]
+        );
+        assert!(drain(None).is_empty());
+        // A finish that is not a string is not kept, and the message is read.
+        assert!(drain(Some(serde_json::json!({"reason": "stop"}))).is_empty());
     }
 
     #[test]

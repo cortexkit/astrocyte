@@ -3565,6 +3565,45 @@ BEGIN
 END;
 "#,
     },
+    Migration {
+        version: 27,
+        statements: r#"-- Per-step detail a harness reader keeps beside an event for cache
+-- diagnostics: the finish reason OpenCode and Pi report, and the context window
+-- Codex reports. It lives outside usage_event on purpose. The ledger compares
+-- every re-read against the stored event and quarantines a difference, so a
+-- reader that started storing a new event field would make every event it
+-- recorded earlier look contradicted. A row here is written with its event
+-- (or, for an older event, when a reader re-reads it exactly), only when a
+-- field is present, and is never compared with anything.
+CREATE TABLE step_detail (
+    event_key     INTEGER PRIMARY KEY REFERENCES usage_event(event_key),
+    finish        TEXT,
+    context_limit INTEGER,
+    CHECK (finish IS NOT NULL OR context_limit IS NOT NULL)
+);
+CREATE TRIGGER step_detail_no_update BEFORE UPDATE ON step_detail
+BEGIN
+    SELECT RAISE(ABORT, 'step_detail_no_update');
+END;
+CREATE TRIGGER step_detail_no_delete BEFORE DELETE ON step_detail
+BEGIN
+    SELECT RAISE(ABORT, 'step_detail_no_delete');
+END;
+-- INSERT OR REPLACE deletes the row it replaces without firing delete
+-- triggers (recursive triggers are off), so a second row for an event is
+-- refused before it can replace the first.
+CREATE TRIGGER step_detail_insert_once BEFORE INSERT ON step_detail
+WHEN EXISTS (SELECT 1 FROM step_detail WHERE event_key=NEW.event_key)
+BEGIN
+    SELECT RAISE(ABORT, 'step_detail_insert_once');
+END;
+
+-- Cache diagnostics read one session's steps newest first. The rowid that
+-- ends every index entry is the event_key tie-break, so this index serves
+-- ORDER BY occurred_at_ms, event_key within a session without a sort.
+CREATE INDEX usage_event_session_time ON usage_event(session, occurred_at_ms);
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -3628,7 +3667,7 @@ mod tests {
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (26, 26, 26)
+            (27, 27, 27)
         );
         assert_eq!(
             store
@@ -3641,7 +3680,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 26, 26)
+            (0, 27, 27)
         );
         assert!(!second.store_ahead());
         store
@@ -3651,7 +3690,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',27,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',28,1)",
                     [],
                 )?;
                 Ok(())
@@ -3660,7 +3699,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 27, 26)
+            (0, 28, 27)
         );
         assert!(ahead.store_ahead());
     }
@@ -4728,6 +4767,7 @@ mod tests {
             charge_basis_mapping_version: None,
             charge_basis_overrides: None,
             measurements: vec![],
+            step_detail: Default::default(),
         };
         let error = crate::ingest::record_event(&mut conn, &request, 100).unwrap_err();
         assert!(

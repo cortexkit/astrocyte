@@ -12,6 +12,7 @@ pub mod gemini;
 pub mod goose;
 pub mod jsonl_resume;
 pub mod kimi;
+mod lenient;
 pub mod omp;
 pub mod opencode;
 pub(crate) mod opencode_schema;

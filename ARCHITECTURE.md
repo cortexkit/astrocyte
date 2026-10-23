@@ -22,12 +22,12 @@ The workspace has three crates:
 
 ## Durable state
 
-`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS` (versions 1 to 26).
+`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS` (versions 1 to 27).
 `initialize_connection` enables and verifies foreign keys, probes SQLite JSON, triggers and
 partial indexes, and sets a 5000 ms busy timeout. The read-only report connection
 skips the table-creating probe and copies that timeout.
 
-The [data model](docs/data-model.md#tables) describes every table in version 26 and its write rules.
+The [data model](docs/data-model.md#tables) describes every table in version 27 and its write rules.
 
 Schema 23 uses local integer `event_key` and `charge_key` references, never served
 IDs. Event digests remain the dedup/served identity; charge digests are retired.
@@ -203,6 +203,12 @@ surface; dispatch and the manifest both use it.
 | `spend.multiplier.report` | read, multiplier heads by day |
 | `spend.multiplier.pace` | read, hourly usage by producer and work class at the latest head's rates |
 | `spend.multiplier.recompute` | write, operator recompute of a multiplier day |
+| `usage.cache.sessions` | read, harness sessions with their cache hit ratio and busts |
+| `usage.cache.steps` | read, one session's model steps with derived cache verdicts |
+
+`usage.cache.steps` answers from an in-memory copy of the newest 1,000 steps
+of up to 200 sessions active in the last day. It is loaded at startup and
+advanced after each commit, and the store answers when it cannot.
 
 Astrocyte calls QTA `usage.get` and fusiform `catalog.status`, `catalog.get` and
 `plan.prices`. The contract is the [module surface](docs/module-surface.md).

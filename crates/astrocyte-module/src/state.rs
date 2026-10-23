@@ -65,6 +65,13 @@ struct Inner {
     /// its runtime row so the change is logged only once.
     source_discovery: Mutex<HashMap<String, bool>>,
     quota_bus: crate::quota_events::Control,
+    /// Recent harness steps kept for `usage.cache.steps`. Lock order: this
+    /// mutex before either store connection, never the other way round.
+    recent_steps: Mutex<crate::recent_steps::RecentSteps>,
+    /// Test-only clock for the recent-steps memory, whose 24-hour window is
+    /// otherwise measured from the wall clock. See `set_recent_steps_now_for_test`.
+    #[cfg(test)]
+    recent_steps_now: Mutex<Option<i64>>,
     /// Test-only hold on the refresher loop's pricing pass, scoped to this
     /// state so a held test never silences the pass of a test running beside
     /// it. See `hold_pricing_pass_for_test` in refresher.rs.
@@ -272,6 +279,9 @@ impl SharedState {
             }),
             source_discovery: Mutex::new(HashMap::new()),
             quota_bus: crate::quota_events::Control::default(),
+            recent_steps: Mutex::new(crate::recent_steps::RecentSteps::default()),
+            #[cfg(test)]
+            recent_steps_now: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             pricing_pass_hold: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
@@ -760,7 +770,96 @@ impl SharedState {
             .projection_degraded
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.advance_recent_steps();
         Ok(())
+    }
+
+    /// Fold the steps committed since the last call into the recent-steps
+    /// memory. Part of the post-commit projection refresh, so it runs under
+    /// the writer fence on the writer's connection and reads only the events
+    /// recorded since the previous refresh. A failure is logged and leaves
+    /// memory off; `usage.cache.steps` then reads the store.
+    fn advance_recent_steps(&self) {
+        let now_ms = self.recent_steps_now_ms();
+        let mut memory = self
+            .0
+            .recent_steps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let advanced = self.with_conn(|conn| {
+            memory
+                .advance(conn, now_ms)
+                .map_err(|error| describe_sqlite_error(&error))
+        });
+        if let Err(error) = advanced {
+            tracing::warn!(target: "astrocyte", %error,
+                "recent cache steps not advanced; usage.cache.steps reads the store");
+        }
+    }
+
+    /// Fill the recent-steps memory from the store: the sessions active in
+    /// the last 24 hours, their newest steps each. Bounded by the memory's
+    /// own limits, and run on the reader connection in one snapshot. Called
+    /// once at startup, off the async executor. A failure is logged; the
+    /// store then serves every request.
+    pub(crate) fn rebuild_recent_steps(&self) {
+        let now_ms = self.recent_steps_now_ms();
+        let started = std::time::Instant::now();
+        let mut memory = self
+            .0
+            .recent_steps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let rebuilt = self.with_read_conn_split(|conn| memory.rebuild(conn, now_ms));
+        match rebuilt {
+            Ok(()) => tracing::info!(target: "astrocyte",
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "recent cache steps loaded"),
+            Err(failure) => {
+                *memory = crate::recent_steps::RecentSteps::default();
+                let error = match failure {
+                    StoreFailure::Operation(error) => describe_sqlite_error(&error),
+                    StoreFailure::Store(error) => error,
+                };
+                tracing::warn!(target: "astrocyte", %error,
+                    "recent cache steps not loaded; usage.cache.steps reads the store");
+            }
+        }
+    }
+
+    /// `usage.cache.steps` from memory, or `None` when the store must answer.
+    pub(crate) fn recent_steps_answer(
+        &self,
+        query: &astrocyte_core::cache_diagnostics::StepsQuery,
+    ) -> Option<astrocyte_core::cache_diagnostics::StepsReply> {
+        self.0
+            .recent_steps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .answer(query)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_recent_steps_for_test<T>(
+        &self,
+        read: impl FnOnce(&crate::recent_steps::RecentSteps) -> T,
+    ) -> T {
+        read(&self.0.recent_steps.lock().unwrap())
+    }
+
+    /// Measure the recent-steps window from `now_ms` instead of the wall
+    /// clock, so a test can use fixed step times.
+    #[cfg(test)]
+    pub(crate) fn set_recent_steps_now_for_test(&self, now_ms: i64) {
+        *self.0.recent_steps_now.lock().unwrap() = Some(now_ms);
+    }
+
+    fn recent_steps_now_ms(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(now_ms) = *self.0.recent_steps_now.lock().unwrap() {
+            return now_ms;
+        }
+        now_ms()
     }
 }
 

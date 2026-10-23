@@ -52,6 +52,8 @@ Test: `every_operation_name_reaches_its_own_handler`.
 | `spend.reconcile` | read | `statement_id` |
 | `spend.multiplier.report` | read | `from_ms`, `to_ms` |
 | `spend.multiplier.pace` | read | `quota_provider`, `from_ms`, `to_ms` |
+| `usage.cache.sessions` | read | `since_ms?`, `harness?`, `limit?` |
+| `usage.cache.steps` | read | `harness`, `session`, `limit?`, `after_cursor?` |
 | `spend.event.ingest` | write | see §3.1 |
 | `spend.correction.ingest` | write | see §3.2 |
 | `spend.chargeability.settle` | write | `event_id`, `to_state`, `reason` |
@@ -279,6 +281,88 @@ Reads never write. A refusal on a read is one of the codes below.
 
 Absent values are `null` or omitted, never zero. A total that cannot be
 priced is reported with its unpriced population, not as a smaller number.
+
+### 4.1 Cache diagnostics
+
+These two operations serve the model steps the harness readers recorded, per
+session, with cache verdicts. A harness is a producer whose events are one
+model step each: `claude-code`, `codex`, `gemini`, `kimi`, `omp`, `opencode` or
+`pi`. A request that fails to decode is refused `malformed`, as everywhere
+else. A request that decodes is refused with one of these codes:
+
+| Code | Condition |
+|---|---|
+| `invalid_request` | `limit` is 0, `session` is empty, or `since_ms` is negative. |
+| `unknown_harness` | `harness` is not one of the harnesses above. |
+| `range_too_large` | `limit` is above its maximum, or `since_ms` is more than 7 days before now. |
+
+`usage.cache.steps` returns up to `limit` steps of one session (default 200,
+maximum 1,000): the newest ones, oldest first. With `after_cursor`, only the
+steps of that window whose cursor is greater are returned. The reply has
+`harness`, `session`, `steps`, `earlier_steps` (whether the session has older
+steps than the window) and `undated_steps` (steps without a time, which are
+not placed on the timeline). Each step has these fields:
+
+- `cursor`, the step's ledger key. Keys grow in commit order, so a late step
+  can have a greater cursor than a step that happened after it.
+- `step_ref`, the harness's own id for the step, and `occurred_at_ms`.
+- `input`, `cache_read`, `cache_write`, `output` and `reasoning`, each omitted
+  when the reader did not store it. `cache_write` sums every cache lifetime
+  Claude Code reports.
+- `provider`, `model`, `finish` and `context_limit`. `finish` comes from
+  OpenCode's `finish`, Pi's `stopReason`, or the stored stop reason of Claude
+  Code and Oh My Pi. `context_limit` comes from Codex.
+- `prompt`, which is input plus cache read plus cache write.
+- `retention`, `verdict` and `prompt_dropped`.
+
+The verdict is one of `cold_start`, `stable`, `warning`, `bust`, `full_bust`
+and `unknown`. It is computed over the whole session in time order, so a
+step's verdict does not depend on the page size. The rules are the Magic
+Context dashboard's:
+
+- A step without a stored cache read is `unknown`. It is also never the
+  baseline the next step is compared with.
+- In a session where no step ever read a positive number of cached tokens,
+  every step is `unknown`. Codex is the exception.
+- The session's first step is `cold_start`.
+- Otherwise, the step is compared with the last earlier step that reported its
+  cache. When there is none, or that step read zero, the verdict is `stable`
+  with no `retention`. Otherwise, `expected` is that step's cache read plus its
+  growth, which is its cache write when positive and otherwise its uncached
+  input. `retention` is this step's cache read divided by `expected`.
+- Codex reports no cache writes, so its `retention` is the cache read divided
+  by the cache read plus the uncached input. When that sum is zero, the
+  verdict is `unknown`.
+- A cache read of zero is `full_bust`. Otherwise, a `retention` of at least
+  0.95 is `stable`, at least 0.80 is `warning`, and anything lower is `bust`.
+- `prompt_dropped` is true when `prompt` is at least 15,000 tokens smaller than
+  that earlier step's prompt.
+
+The serving side keeps the newest 1,000 steps of up to 200 sessions active in
+the last 24 hours in memory. It loads them at startup and adds each commit's
+new steps after the commit. A request it can answer exactly is answered from
+memory, and any other request is answered from the store. Both build the reply
+the same way. Tests: `drained_pi_steps_are_served_alike_from_memory_and_store`,
+`store_steps_are_the_same_whatever_the_window`,
+`prefix_cache_verdicts_cover_every_band_and_edge`.
+
+`usage.cache.sessions` returns `since_ms` (default: 24 hours ago) and
+`sessions`, the harness sessions with a step at or after `since_ms`, most
+recently active first. There are at most `limit` sessions (default 50, maximum
+200), optionally for one `harness`. Each session has these fields:
+
+- `harness` and `session`.
+- `project_root`, from the newest step in the window that has one.
+- `steps`, the number of steps in the window.
+- `hit_ratio`, which is the cache reads divided by the sum of input, cache
+  read and cache write. Only steps that report their cache count, and the
+  field is omitted when there are none.
+- `busts`, the number of steps whose verdict is `bust` or `full_bust`.
+- `last_activity_ms`.
+- `context_limit`, the newest positive context limit in the window.
+
+It is always read from the store. Test:
+`sessions_report_hit_ratio_busts_limit_and_activity`.
 
 ## 5. Calls astrocyte makes
 

@@ -30,6 +30,7 @@ Domain logic and storage.
 - `report/hourly.rs`: This module builds and audits hourly summaries and combines
   clean summaries with live base rows for reports.
 - `verdict.rs`: the machine-scoped `budget.verdict` read.
+- `cache_diagnostics.rs`: harness steps per session and their derived cache verdicts.
 - `capacity.rs`: QTA capacity windows, observations, runtime and freshness.
 - `money.rs`: signed nanodollar arithmetic with one rounding site.
 - `canon.rs`: internal exact-integer canonical JSON and SHA-256 hashing.
@@ -43,6 +44,7 @@ Shared library; three binaries.
 - `main.rs`: startup, `--version`, `--check-config`, subc serving and the manifest.
 - `ops.rs`: `PUBLIC_OPERATION_NAMES` and `dispatch` for the served operations.
 - `state.rs`: `SharedState`, the writer fence, the public projection and health.
+- `recent_steps.rs`: the in-memory recent steps behind `usage.cache.steps`.
 - `config.rs`: closed desired-configuration decoding and canonical identity.
 - `refresher.rs`: the background loop (drains, capacity poll, pricing pass, pricing
   queue reconciliation, the daily multiplier stage and its operator recompute).

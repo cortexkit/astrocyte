@@ -28,10 +28,12 @@ pub const OP_BASIS_CORRECT: &str = "spend.basis.correct";
 pub const OP_MULTIPLIER_REPORT: &str = "spend.multiplier.report";
 pub const OP_MULTIPLIER_PACE: &str = "spend.multiplier.pace";
 pub const OP_MULTIPLIER_RECOMPUTE: &str = "spend.multiplier.recompute";
+pub const OP_CACHE_SESSIONS: &str = "usage.cache.sessions";
+pub const OP_CACHE_STEPS: &str = "usage.cache.steps";
 
 /// The closed public surface consumed by dispatch, the manifest, and the schema
 /// artifact. Exact name-set parity prevents a same-sized but incorrect surface.
-pub const PUBLIC_OPERATION_NAMES: [&str; 18] = [
+pub const PUBLIC_OPERATION_NAMES: [&str; 20] = [
     OP_VERDICT,
     OP_REPORT,
     OP_EVENT_INGEST,
@@ -50,6 +52,8 @@ pub const PUBLIC_OPERATION_NAMES: [&str; 18] = [
     OP_MULTIPLIER_REPORT,
     OP_MULTIPLIER_PACE,
     OP_MULTIPLIER_RECOMPUTE,
+    OP_CACHE_SESSIONS,
+    OP_CACHE_STEPS,
 ];
 
 /// Versioned, committed operation-schema artifact embedded in the serving
@@ -92,6 +96,7 @@ fn operation_params_schema(name: &str) -> Value {
     let optional_i64 =
         json!({"type": ["integer", "null"], "minimum": i64::MIN, "maximum": i64::MAX});
     let u32_value = json!({"type": "integer", "minimum": 0, "maximum": u32::MAX});
+    let optional_u32 = json!({"type": ["integer", "null"], "minimum": 0, "maximum": u32::MAX});
     let charge_basis = json!({"enum": ["metered_api", "subscription_included", "unknown"]});
     match name {
         OP_CORRECTION_INGEST => correction_ingest_schema(),
@@ -247,6 +252,23 @@ fn operation_params_schema(name: &str) -> Value {
                 "quota_provider": optional_string,
             }),
         ),
+        OP_CACHE_SESSIONS => closed_object(
+            &[],
+            json!({
+                "since_ms": optional_i64,
+                "harness": optional_string,
+                "limit": optional_u32,
+            }),
+        ),
+        OP_CACHE_STEPS => closed_object(
+            &["harness", "session"],
+            json!({
+                "harness": string,
+                "session": string,
+                "limit": optional_u32,
+                "after_cursor": optional_i64,
+            }),
+        ),
         other => unreachable!("operation {other} is served without a params schema"),
     }
 }
@@ -301,6 +323,8 @@ pub fn dispatch(state: &SharedState, method: &str, params: Value) -> OpResult {
         OP_MULTIPLIER_REPORT => op_multiplier_report(state, params),
         OP_MULTIPLIER_PACE => op_multiplier_pace(state, params),
         OP_MULTIPLIER_RECOMPUTE => op_multiplier_recompute(state, params),
+        OP_CACHE_SESSIONS => op_cache_sessions(state, params),
+        OP_CACHE_STEPS => op_cache_steps(state, params),
         other => Err(("unknown_method".into(), format!("unknown method '{other}'"))),
     }
 }
@@ -678,6 +702,54 @@ fn op_multiplier_recompute(state: &SharedState, params: Value) -> OpResult {
     )
 }
 
+/// Harness sessions with recent steps, with their cache health. Read from
+/// the store on the reader connection.
+fn op_cache_sessions(state: &SharedState, params: Value) -> OpResult {
+    let request: astrocyte_core::cache_diagnostics::CacheSessionsRequest =
+        serde_json::from_value(params).map_err(|error| {
+            (
+                "malformed".into(),
+                format!("cache sessions params: {error}"),
+            )
+        })?;
+    read_value(state, |conn| {
+        astrocyte_core::cache_diagnostics::cache_sessions(conn, request, now_ms())
+            .map(|reply| json!(reply))
+            .map_err(map_cache_error)
+    })
+}
+
+/// One session's newest steps with their derived cache verdicts. Answered
+/// from the recent-steps memory when it holds the whole window, otherwise
+/// from the store on the reader connection; both build the reply the same way.
+fn op_cache_steps(state: &SharedState, params: Value) -> OpResult {
+    let request: astrocyte_core::cache_diagnostics::CacheStepsRequest =
+        serde_json::from_value(params)
+            .map_err(|error| ("malformed".into(), format!("cache steps params: {error}")))?;
+    let query = request
+        .validate()
+        .map_err(|refusal| (refusal.code().into(), refusal.message()))?;
+    if let Some(reply) = state.recent_steps_answer(&query) {
+        return Ok(json!(reply));
+    }
+    read_value(state, |conn| {
+        astrocyte_core::cache_diagnostics::steps_from_store(conn, &query)
+            .map(|reply| json!(reply))
+            .map_err(|error| ("internal".into(), format!("cache steps: {error}")))
+    })
+}
+
+fn map_cache_error(error: astrocyte_core::cache_diagnostics::CacheError) -> (String, String) {
+    match error {
+        astrocyte_core::cache_diagnostics::CacheError::Refused(refusal) => {
+            (refusal.code().into(), refusal.message())
+        }
+        astrocyte_core::cache_diagnostics::CacheError::Store(error) => {
+            ("internal".into(), format!("cache sessions: {error}"))
+        }
+    }
+}
+
 /// Run a served read-only operation on the store's reader connection, in one
 /// read transaction (see `SharedState::with_read_op`), so the report neither
 /// waits for nor holds up the writer. Only for operations that never write.
@@ -1009,6 +1081,8 @@ mod tests {
             "spend.subscription.report",
             "spend.subscription.set",
             "spend.workclass.report",
+            "usage.cache.sessions",
+            "usage.cache.steps",
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -1034,7 +1108,7 @@ mod tests {
     #[test]
     fn every_operation_name_reaches_its_own_handler() {
         // Each operation is paired with the marker its own handler writes.
-        const ROUTES: [(&str, &str); 18] = HANDLER_MARKERS;
+        const ROUTES: [(&str, &str); 20] = HANDLER_MARKERS;
 
         // The markers only discriminate while none of them is a prefix of
         // another: three of these begin with the word "subscription", and if
@@ -1083,7 +1157,7 @@ mod tests {
     /// request-decoding error. A refusal with code `malformed` and a message
     /// starting with that literal came from the decoder; any other answer
     /// means the decoder accepted the params.
-    const HANDLER_MARKERS: [(&str, &str); 18] = [
+    const HANDLER_MARKERS: [(&str, &str); 20] = [
         (OP_VERDICT, "verdict params: "),
         (OP_REPORT, "report params: "),
         (OP_EVENT_INGEST, "event params: "),
@@ -1102,6 +1176,8 @@ mod tests {
         (OP_MULTIPLIER_REPORT, "multiplier report params: "),
         (OP_MULTIPLIER_PACE, "multiplier pace params: "),
         (OP_MULTIPLIER_RECOMPUTE, "multiplier recompute params: "),
+        (OP_CACHE_SESSIONS, "cache sessions params: "),
+        (OP_CACHE_STEPS, "cache steps params: "),
     ];
 
     /// Valid params for one operation, plus one params value both the decoder
@@ -1276,6 +1352,24 @@ mod tests {
                     json!({"observation_day": "2024-10-05", "quota_provider": null}),
                 ],
                 json!({"observation_day": 20_241_005}),
+            ),
+            sample(
+                OP_CACHE_SESSIONS,
+                vec![
+                    json!({}),
+                    json!({"since_ms": null, "harness": "codex", "limit": 5}),
+                    json!({"since_ms": null, "harness": null, "limit": null}),
+                ],
+                json!({"limit": -1}),
+            ),
+            sample(
+                OP_CACHE_STEPS,
+                vec![
+                    json!({"harness": "opencode", "session": "s"}),
+                    json!({"harness": "pi", "session": "s", "limit": 3, "after_cursor": 7}),
+                    json!({"harness": "pi", "session": "s", "limit": null, "after_cursor": null}),
+                ],
+                json!({"harness": "pi", "session": 1}),
             ),
         ]
     }

@@ -323,6 +323,7 @@ fn map_session(session: GooseSession) -> Result<EventRecordRequest, String> {
         // paid. See the tier note above before changing this.
         charge_basis: ChargeBasis::Unknown,
         measurements,
+        step_detail: Default::default(),
     })
 }
 

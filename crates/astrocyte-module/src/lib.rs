@@ -13,6 +13,7 @@ pub mod peer_exchange;
 mod qta_client;
 mod quota_bus_client;
 mod quota_events;
+mod recent_steps;
 mod refresher;
 pub mod state;
 mod wire_map;

@@ -162,6 +162,14 @@ Rules that affect what is recorded:
   `worker_events_stamp_declared_class_without_changing_identity`.
 - A timestamp that is absent or does not parse leaves the event undated. A
   file's modification time is never used instead.
+- Three readers keep a diagnostic field beside the event, in `step_detail`:
+  OpenCode's `finish`, Pi's `stopReason` and Codex's
+  `info.model_context_window`. Each is decoded so that a value of the wrong
+  type is dropped and the record still reads exactly as before, and none is
+  part of the event, so reading them changed no stored event. Tests:
+  `opencode_finish_is_stored_beside_a_byte_identical_ledger`,
+  `pi_stop_reason_is_stored_beside_a_byte_identical_ledger`,
+  `codex_context_window_is_stored_beside_a_byte_identical_ledger`.
 - BROCA writes two kinds of fact into `export_facts`. A segment with no `kind`
   member is a session fact, recorded with its session, harness, project and
   run. A segment with `"kind": "system_one"` comes from one of BROCA's batch

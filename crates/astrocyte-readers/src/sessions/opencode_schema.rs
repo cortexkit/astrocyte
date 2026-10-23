@@ -237,6 +237,12 @@ struct StoredMessage {
     agent: Option<String>,
     #[serde(default, deserialize_with = "deserialize_path")]
     path: Option<StoredPath>,
+    /// The step's finish reason (`stop`, `tool-calls`, ...). The page query
+    /// already reads `finish` as a marker that the tokens are final; this
+    /// keeps its value for cache diagnostics. Decoded leniently so a
+    /// non-string value cannot make a message that decoded before fail now.
+    #[serde(default, deserialize_with = "super::lenient::string")]
+    finish: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -808,6 +814,7 @@ fn map_stored(
         // U+200B prefixes. Normalizing visually identical labels at ingest
         // destroys evidence that OpenCode declared distinct work classes.
         agent: stored.agent,
+        finish: stored.finish,
         // OpenCode reports output and reasoning as separate buckets. Subtracting
         // reasoning would corrupt turns where reasoning exceeds output.
         tokens,

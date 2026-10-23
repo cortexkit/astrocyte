@@ -431,6 +431,7 @@ fn map_call(call: GeminiCall) -> Result<EventRecordRequest, String> {
         // No recording says how Gemini CLI authenticated.
         charge_basis: ChargeBasis::Unknown,
         measurements,
+        step_detail: Default::default(),
     })
 }
 

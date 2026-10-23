@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use astrocyte_core::fact::ChargeBasis;
-use astrocyte_core::ingest::EventRecordRequest;
+use astrocyte_core::ingest::{EventRecordRequest, StepDetail};
 #[cfg(test)]
 use astrocyte_readers::sessions::pi::{parse_pi_file, PI_PREFIX_WINDOW_BYTES};
 use astrocyte_readers::sessions::pi::{
@@ -662,6 +662,7 @@ fn map_message(record: PiUsageRecord) -> Result<EventRecordRequest, String> {
         message,
         occurred_at_ms,
         operation,
+        stop_reason,
         ..
     } = record;
     if message.output_reasoning_conflicted {
@@ -725,6 +726,12 @@ fn map_message(record: PiUsageRecord) -> Result<EventRecordRequest, String> {
         charge_basis_overrides: None,
         charge_basis: ChargeBasis::Unknown,
         measurements,
+        // `stopReason` is kept beside the event for cache diagnostics; it is
+        // not part of the event, so decoding it changes no ledger row.
+        step_detail: StepDetail {
+            finish: stop_reason,
+            context_limit: None,
+        },
     })
 }
 
@@ -836,6 +843,9 @@ fn same_call(left: &EventRecordRequest, right: &EventRecordRequest) -> bool {
         charge_basis_overrides,
         charge_basis,
         measurements,
+        // Diagnostic detail is not a fact coordinate: two copies of one call
+        // are the same call whatever their finish reason says.
+        step_detail: _,
     } = left;
     producer == &right.producer
         && producer_lineage == &right.producer_lineage
@@ -1108,6 +1118,208 @@ mod tests {
             "pi",
             "52f73639e3ab975cad24d00d1db73f6e6addf95ae74faa6ce45c131bba151c9f",
         );
+    }
+
+    /// `stopReason` is kept in `step_detail`, and reading it changes no
+    /// ledger row: the fixture with it stores exactly the bytes pinned by
+    /// `set_aside_good_pi_rows_are_byte_identical` for the same fixture
+    /// without it, which has no `step_detail` row.
+    #[test]
+    fn pi_stop_reason_is_stored_beside_a_byte_identical_ledger() {
+        let with_stop = fixture("session", "/repo", Some("before"))
+            .replace(r#""usage":{"#, r#""stopReason":"toolUse","usage":{"#);
+        assert!(with_stop.contains("stopReason"));
+        let temp = TempDir::new().unwrap();
+        write_fixture(temp.path(), "project", &with_stop);
+        let state = test_state();
+        PiSource::at(temp.path())
+            .drain(&state, 100, &NEVER_STOP)
+            .unwrap();
+        crate::refresher::harness_drain::assert_good_snapshot(
+            &state,
+            "pi",
+            "52f73639e3ab975cad24d00d1db73f6e6addf95ae74faa6ce45c131bba151c9f",
+        );
+        assert_eq!(
+            crate::refresher::harness_drain::step_details(&state),
+            [(
+                "pi:response:before".to_string(),
+                Some("toolUse".to_string()),
+                None
+            )]
+        );
+
+        let temp = TempDir::new().unwrap();
+        write_fixture(
+            temp.path(),
+            "project",
+            &fixture("session", "/repo", Some("before")),
+        );
+        let state = test_state();
+        PiSource::at(temp.path())
+            .drain(&state, 100, &NEVER_STOP)
+            .unwrap();
+        assert!(crate::refresher::harness_drain::step_details(&state).is_empty());
+
+        // A malformed stop reason is dropped, and the message is still read.
+        let malformed = with_stop.replace(r#""toolUse""#, r#"{"not":"a string"}"#);
+        let temp = TempDir::new().unwrap();
+        write_fixture(temp.path(), "project", &malformed);
+        let state = test_state();
+        PiSource::at(temp.path())
+            .drain(&state, 100, &NEVER_STOP)
+            .unwrap();
+        crate::refresher::harness_drain::assert_good_snapshot(
+            &state,
+            "pi",
+            "52f73639e3ab975cad24d00d1db73f6e6addf95ae74faa6ce45c131bba151c9f",
+        );
+        assert!(crate::refresher::harness_drain::step_details(&state).is_empty());
+    }
+
+    /// 2026-09-01T00:00:00Z.
+    const CACHE_DAY_MS: i64 = 1_788_220_800_000;
+
+    fn cache_line(id: &str, second: u32, input: u64, read: u64, write: u64, stop: &str) -> String {
+        let total = input + 7 + read + write;
+        format!(
+            r#"{{"type":"message","id":"{id}","timestamp":"2026-09-01T00:00:{second:02}.000Z","message":{{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4","responseId":"resp-{id}","stopReason":"{stop}","usage":{{"input":{input},"output":7,"cacheRead":{read},"cacheWrite":{write},"totalTokens":{total}}}}}}}"#
+        ) + "\n"
+    }
+
+    fn cache_steps(state: &SharedState, params: serde_json::Value) -> serde_json::Value {
+        crate::ops::dispatch(state, crate::ops::OP_CACHE_STEPS, params).unwrap()
+    }
+
+    fn cache_steps_from_store(
+        state: &SharedState,
+        query: &astrocyte_core::cache_diagnostics::StepsQuery,
+    ) -> serde_json::Value {
+        state
+            .with_read_op(|conn| {
+                astrocyte_core::cache_diagnostics::steps_from_store(conn, query)
+                    .map(|reply| serde_json::json!(reply))
+                    .map_err(|error| ("internal".into(), error.to_string()))
+            })
+            .unwrap()
+    }
+
+    fn steps_query(
+        limit: usize,
+        after_cursor: Option<i64>,
+    ) -> astrocyte_core::cache_diagnostics::StepsQuery {
+        astrocyte_core::cache_diagnostics::StepsQuery {
+            producer: "pi".into(),
+            session: "cache-session".into(),
+            limit,
+            after_cursor,
+        }
+    }
+
+    /// A refresher drain of a Pi session, then `usage.cache.steps`: the steps
+    /// come back with the dashboard's verdicts and the finish reasons, and
+    /// the answer from the recent-steps memory is byte-identical to the
+    /// answer from the store, before and after more steps arrive.
+    #[test]
+    fn drained_pi_steps_are_served_alike_from_memory_and_store() {
+        let temp = TempDir::new().unwrap();
+        let header = r#"{"type":"session","id":"cache-session","timestamp":"2026-09-01T00:00:00.000Z","cwd":"/repo"}"#.to_string() + "\n";
+        let path = write_fixture(
+            temp.path(),
+            "project",
+            &[
+                header,
+                cache_line("a", 1, 100, 0, 10_000, "toolUse"),
+                cache_line("b", 2, 100, 30_000, 500, "toolUse"),
+                cache_line("c", 3, 100, 30_500, 0, "stop"),
+            ]
+            .concat(),
+        );
+        let state = test_state();
+        state.set_recent_steps_now_for_test(CACHE_DAY_MS + 3_600_000);
+        let source = PiSource::at(temp.path());
+        source.drain(&state, 100, &NEVER_STOP).unwrap();
+
+        let params = serde_json::json!({"harness": "pi", "session": "cache-session"});
+        assert!(state.recent_steps_answer(&steps_query(200, None)).is_none());
+        let from_store = cache_steps(&state, params.clone());
+        let summary = |reply: &serde_json::Value| {
+            reply["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|step| {
+                    (
+                        step["verdict"].as_str().unwrap().to_string(),
+                        step["finish"].as_str().unwrap().to_string(),
+                        step["prompt_dropped"].as_bool().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = |verdict: &str, finish: &str, dropped: bool| {
+            (verdict.to_string(), finish.to_string(), dropped)
+        };
+        assert_eq!(
+            summary(&from_store),
+            [
+                expected("cold_start", "toolUse", false),
+                // The first step read nothing: no baseline.
+                expected("stable", "toolUse", false),
+                // 30,500 of 30,000 + 500 written.
+                expected("stable", "stop", false),
+            ]
+        );
+        assert_eq!(from_store["steps"][2]["retention"], 1.0);
+
+        state.rebuild_recent_steps();
+        state.with_recent_steps_for_test(|memory| {
+            assert!(memory.is_ready());
+            assert_eq!(memory.kept("pi", "cache-session"), Some(3));
+        });
+        assert!(state.recent_steps_answer(&steps_query(200, None)).is_some());
+        assert_eq!(cache_steps(&state, params.clone()), from_store);
+
+        // A new step reaches memory through the drain's own commit.
+        append(&path, &cache_line("d", 4, 100, 2_000, 0, "stop"));
+        source.drain(&state, 200, &NEVER_STOP).unwrap();
+        state.with_recent_steps_for_test(|memory| {
+            assert_eq!(memory.kept("pi", "cache-session"), Some(4));
+        });
+        let from_memory = cache_steps(&state, params.clone());
+        assert_eq!(
+            from_memory,
+            cache_steps_from_store(&state, &steps_query(200, None))
+        );
+        // 2,000 of an expected 30,500 + 100, and the prompt fell by 28,500.
+        assert_eq!(summary(&from_memory)[3], expected("bust", "stop", true));
+
+        // A smaller window and a cursor: still the same from both.
+        let cursor = from_memory["steps"][2]["cursor"].as_i64().unwrap();
+        let windowed = cache_steps(
+            &state,
+            serde_json::json!({"harness": "pi", "session": "cache-session", "limit": 3, "after_cursor": cursor}),
+        );
+        assert!(state
+            .recent_steps_answer(&steps_query(3, Some(cursor)))
+            .is_some());
+        assert_eq!(
+            windowed,
+            cache_steps_from_store(&state, &steps_query(3, Some(cursor)))
+        );
+        assert_eq!(windowed["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(windowed["steps"][0], from_memory["steps"][3]);
+        assert_eq!(windowed["earlier_steps"], true);
+
+        // The request is closed.
+        let (code, message) = crate::ops::dispatch(
+            &state,
+            crate::ops::OP_CACHE_STEPS,
+            serde_json::json!({"harness": "pi", "session": "cache-session", "page": 2}),
+        )
+        .unwrap_err();
+        assert_eq!(code, "malformed");
+        assert!(message.starts_with("cache steps params: "), "{message}");
     }
 
     fn fixture(session: &str, cwd: &str, response_id: Option<&str>) -> String {

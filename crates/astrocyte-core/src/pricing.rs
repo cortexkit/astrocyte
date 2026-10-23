@@ -2397,6 +2397,7 @@ mod tests {
                 charge_basis_overrides: None,
                 charge_basis: basis,
                 measurements,
+                step_detail: Default::default(),
             },
             900,
         )
@@ -4181,6 +4182,7 @@ mod tests {
                         ..measurement("reasoning", Some(reasoning))
                     },
                 ],
+                step_detail: Default::default(),
             },
             900,
         )

@@ -160,6 +160,28 @@ pub struct EventRecordRequest {
     pub charge_basis_overrides: Option<String>,
     #[serde(default)]
     pub measurements: Vec<MeasurementInput>,
+    /// Diagnostic detail a harness reader keeps beside the event, stored in
+    /// `step_detail` rather than in `usage_event`. It is not part of the
+    /// event's payload: redelivery never compares it, so a reader that starts
+    /// decoding a new field cannot make an earlier event look contradicted.
+    /// Skipped by serde, so a pushed `spend.event.ingest` naming it is refused
+    /// as an unknown field.
+    #[serde(skip)]
+    pub step_detail: StepDetail,
+}
+
+/// The finish reason and context window a harness reader saw for one model
+/// step. Both are optional; a step with neither gets no `step_detail` row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepDetail {
+    pub finish: Option<String>,
+    pub context_limit: Option<i64>,
+}
+
+impl StepDetail {
+    fn is_empty(&self) -> bool {
+        self.finish.is_none() && self.context_limit.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -497,6 +519,11 @@ pub fn record_event_in_tx(
 
     if let Some((stored_event_id, stored_payload)) = load_event_payload(tx, request)? {
         if stored_payload.restated_by(request) {
+            // An exact re-read may give an event recorded before its reader
+            // kept this detail the row it lacks. It never changes a row.
+            if record_step_detail(tx, &stored_event_id, &request.step_detail)? {
+                note_late_step_detail(tx, &stored_event_id)?;
+            }
             if delivery == DeliveryPath::Pushed {
                 tx.execute(
                     "INSERT INTO redelivery_log (
@@ -596,6 +623,7 @@ pub fn record_event_in_tx(
     // one transaction, this ordering lets a failed event write prove that the
     // transition evidence rolls back with the settling act.
     insert_measurements(tx, &local_event_id, &request.measurements)?;
+    record_step_detail(tx, &local_event_id, &request.step_detail)?;
     // Queued in this transaction so the queue cannot disagree with the ledger
     // after a crash: the event and its queue row commit or vanish together.
     // An event with no measurements has nothing to price and is not queued.
@@ -1053,6 +1081,44 @@ fn insert_measurements(
     Ok(())
 }
 
+/// Write the event's `step_detail` row when the reader saw at least one
+/// field and the event has none yet. Returns whether a row was written. An
+/// existing row is left exactly as it is: the table is insert-once, and the
+/// first reading of a step is the one kept.
+fn record_step_detail(
+    tx: &Transaction<'_>,
+    event_id: &str,
+    detail: &StepDetail,
+) -> Result<bool, IngestError> {
+    if detail.is_empty() {
+        return Ok(false);
+    }
+    let written = tx.execute(
+        "INSERT INTO step_detail (event_key,finish,context_limit)
+         SELECT event_key,?2,?3 FROM usage_event e WHERE event_id=?1
+           AND NOT EXISTS (SELECT 1 FROM step_detail d WHERE d.event_key=e.event_key)",
+        params![event_id, detail.finish, detail.context_limit],
+    )?;
+    Ok(written == 1)
+}
+
+/// Remember, for this connection only, that an event recorded earlier gained
+/// its `step_detail` row in this transaction. New events are found by their
+/// increasing `event_key`; an older event gaining a row is not, so the
+/// serving side's recent-steps cache reads this list after the commit (see
+/// `cache_diagnostics::take_late_step_details`). A TEMP table is private to
+/// the connection, is never written to the store file, and rolls back with
+/// the transaction, so a rolled-back re-read leaves nothing behind.
+fn note_late_step_detail(tx: &Transaction<'_>, event_id: &str) -> Result<(), IngestError> {
+    tx.execute_batch(crate::cache_diagnostics::CREATE_LATE_STEP_DETAIL)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO temp.step_detail_late (event_key)
+         SELECT event_key FROM usage_event WHERE event_id=?1",
+        [event_id],
+    )?;
+    Ok(())
+}
+
 fn find_target_event(
     tx: &Transaction<'_>,
     producer: &str,
@@ -1262,6 +1328,7 @@ mod tests {
             charge_basis_mapping_version: None,
             charge_basis_overrides: None,
             measurements,
+            step_detail: Default::default(),
         }
     }
 
@@ -1795,6 +1862,160 @@ mod tests {
         let outcome = record_event_in_tx(&tx, request, recorded_at_ms, delivery).unwrap();
         tx.commit().unwrap();
         outcome
+    }
+
+    fn with_detail(
+        mut request: EventRecordRequest,
+        finish: Option<&str>,
+        limit: Option<i64>,
+    ) -> EventRecordRequest {
+        request.step_detail = StepDetail {
+            finish: finish.map(str::to_string),
+            context_limit: limit,
+        };
+        request
+    }
+
+    fn stored_detail(conn: &Connection, event_id: &str) -> Option<(Option<String>, Option<i64>)> {
+        conn.query_row(
+            "SELECT d.finish,d.context_limit FROM step_detail d
+             JOIN usage_event e USING(event_key) WHERE e.event_id=?1",
+            [event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    /// The detail lands with its event, only when a field is present, and
+    /// changes nothing the ledger stores for the event.
+    #[test]
+    fn step_detail_is_written_with_its_event_only_when_present() {
+        let mut conn = conn();
+        let plain = request("plain", None, vec![measurement("input", Some(3))]);
+        let detailed = with_detail(
+            request("detailed", None, vec![measurement("input", Some(3))]),
+            Some("stop"),
+            Some(258_400),
+        );
+        let plain_id = record_via(&mut conn, &plain, 2_000, DeliveryPath::Read).event_id;
+        let detailed_id = record_via(&mut conn, &detailed, 2_000, DeliveryPath::Read).event_id;
+        assert_eq!(stored_detail(&conn, &plain_id), None);
+        assert_eq!(
+            stored_detail(&conn, &detailed_id),
+            Some((Some("stop".into()), Some(258_400)))
+        );
+        assert_eq!(count(&conn, "step_detail"), 1);
+        // The payload compared on redelivery is the same with or without it.
+        let payload = |id: &str| {
+            conn.query_row(
+                "SELECT producer_ref IS NOT NULL,terminal_status,provider,model,occurred_at_ms
+                 FROM usage_event WHERE event_id=?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(payload(&plain_id), payload(&detailed_id));
+    }
+
+    /// An exact re-read gives an event recorded without detail the row it
+    /// lacks, and never changes a row it has. A contradicting re-read is
+    /// quarantined and writes no detail at all.
+    #[test]
+    fn a_redelivery_adds_missing_step_detail_but_never_changes_it() {
+        let mut conn = conn();
+        let first = request("step", None, vec![measurement("input", Some(3))]);
+        let id = record_via(&mut conn, &first, 2_000, DeliveryPath::Read).event_id;
+        assert_eq!(stored_detail(&conn, &id), None);
+
+        let reread = with_detail(first.clone(), Some("tool-calls"), None);
+        let outcome = record_via(&mut conn, &reread, 3_000, DeliveryPath::Read);
+        assert_eq!(outcome.disposition, RecordDisposition::ExactRedelivery);
+        assert_eq!(
+            stored_detail(&conn, &id),
+            Some((Some("tool-calls".into()), None))
+        );
+        assert_eq!(
+            crate::cache_diagnostics::take_late_step_details(&conn).unwrap(),
+            vec![conn
+                .query_row(
+                    "SELECT event_key FROM usage_event WHERE event_id=?1",
+                    [&id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap()],
+            "the late row is announced to the recent-steps memory"
+        );
+
+        let different = with_detail(first.clone(), Some("stop"), Some(9));
+        let outcome = record_via(&mut conn, &different, 4_000, DeliveryPath::Read);
+        assert_eq!(outcome.disposition, RecordDisposition::ExactRedelivery);
+        assert_eq!(
+            stored_detail(&conn, &id),
+            Some((Some("tool-calls".into()), None))
+        );
+        assert!(crate::cache_diagnostics::take_late_step_details(&conn)
+            .unwrap()
+            .is_empty());
+
+        let mut contradicting = with_detail(
+            request("other", None, vec![measurement("input", Some(3))]),
+            None,
+            None,
+        );
+        let other_id = record_via(&mut conn, &contradicting, 5_000, DeliveryPath::Read).event_id;
+        contradicting.measurements = vec![measurement("input", Some(4))];
+        contradicting.step_detail.finish = Some("stop".into());
+        let outcome = record_via(&mut conn, &contradicting, 6_000, DeliveryPath::Read);
+        assert_eq!(
+            outcome.disposition,
+            RecordDisposition::QuarantinedRedelivery
+        );
+        assert_eq!(stored_detail(&conn, &other_id), None);
+        assert_eq!(count(&conn, "step_detail"), 1);
+    }
+
+    /// `step_detail` is insert-once like the ledger tables.
+    #[test]
+    fn step_detail_refuses_update_and_delete() {
+        let mut conn = conn();
+        let detailed = with_detail(request("step", None, vec![]), Some("stop"), Some(5));
+        let id = record_via(&mut conn, &detailed, 2_000, DeliveryPath::Read).event_id;
+        let update = conn
+            .execute("UPDATE step_detail SET finish='length'", [])
+            .unwrap_err();
+        assert!(
+            update.to_string().contains("step_detail_no_update"),
+            "{update}"
+        );
+        let delete = conn.execute("DELETE FROM step_detail", []).unwrap_err();
+        assert!(
+            delete.to_string().contains("step_detail_no_delete"),
+            "{delete}"
+        );
+        let replace = conn
+            .execute(
+                "INSERT OR REPLACE INTO step_detail (event_key,finish) SELECT event_key,'x' FROM usage_event",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            replace.to_string().contains("step_detail_insert_once"),
+            "{replace}"
+        );
+        assert_eq!(
+            stored_detail(&conn, &id),
+            Some((Some("stop".into()), Some(5)))
+        );
     }
 
     /// A reader re-reading a file it already ingested is our action, not the

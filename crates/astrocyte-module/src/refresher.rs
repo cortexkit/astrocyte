@@ -266,6 +266,30 @@ pub(crate) mod harness_drain {
         let hash = format!("{:x}", Sha256::digest(&bytes));
         assert_eq!(hash, expected, "{source}: stored ledger bytes changed");
     }
+
+    /// Every `step_detail` row as `(producer_ref, finish, context_limit)`,
+    /// ordered by `producer_ref`.
+    #[cfg(test)]
+    pub(crate) fn step_details(
+        state: &crate::state::SharedState,
+    ) -> Vec<(String, Option<String>, Option<i64>)> {
+        state
+            .with_conn(|conn| {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT e.producer_ref,d.finish,d.context_limit FROM step_detail d
+                         JOIN usage_event e USING(event_key) ORDER BY e.producer_ref",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string());
+                rows
+            })
+            .unwrap()
+    }
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1053,7 +1077,11 @@ fn validate_page(page: &ExportPage) -> Result<(), PullError> {
 }
 
 pub fn hydrate_startup(state: &Arc<SharedState>) -> Result<(), String> {
-    reload_config(state, state::user_config_path())
+    reload_config(state, state::user_config_path())?;
+    // Runs on a blocking thread before serving starts; a failure only leaves
+    // `usage.cache.steps` reading the store.
+    state.rebuild_recent_steps();
+    Ok(())
 }
 
 /// Exercise retention/refusal for invalid startup bytes, not successful publication.

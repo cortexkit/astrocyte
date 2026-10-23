@@ -255,6 +255,7 @@ pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String
         charge_basis_mapping_version: wire.charge_basis_mapping_version,
         charge_basis_overrides: wire.charge_basis_overrides,
         measurements,
+        step_detail: Default::default(),
     })
 }
 
@@ -402,6 +403,7 @@ pub fn map_system_one_fact(wire: WireSystemOneFact) -> Result<EventRecordRequest
         charge_basis_mapping_version: wire.charge_basis_mapping_version,
         charge_basis_overrides: wire.charge_basis_overrides,
         measurements,
+        step_detail: Default::default(),
     })
 }
 

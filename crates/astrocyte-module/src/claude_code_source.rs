@@ -483,6 +483,7 @@ fn map_call(call: ClaudeCodeCall) -> Result<EventRecordRequest, String> {
         // Nothing in a transcript says who paid for the call.
         charge_basis: ChargeBasis::Unknown,
         measurements,
+        step_detail: Default::default(),
     })
 }
 
@@ -1119,6 +1120,7 @@ mod tests {
                         charge_basis_overrides: None,
                         charge_basis: ChargeBasis::Unknown,
                         measurements: Vec::new(),
+                        step_detail: Default::default(),
                     };
                     astrocyte_core::ingest::record_event_in_tx(
                         tx,

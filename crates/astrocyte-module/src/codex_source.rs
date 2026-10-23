@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use astrocyte_core::fact::ChargeBasis;
-use astrocyte_core::ingest::{EventRecordRequest, MeasurementInput};
+use astrocyte_core::ingest::{EventRecordRequest, MeasurementInput, StepDetail};
 use astrocyte_readers::sessions::codex::{
     is_codex_archive, parse_codex_file_resumable, CodexCall, CodexDerived, CodexParseCounts,
     CodexPrefixCheck, CodexResumePoint,
@@ -469,6 +469,15 @@ fn map_call(call: CodexCall) -> Result<EventRecordRequest, String> {
         // records and is not read as a statement of who paid.
         charge_basis: ChargeBasis::Unknown,
         measurements,
+        // The context window is kept beside the event for cache diagnostics;
+        // it is not part of the event, so decoding it changes no ledger row.
+        // A window too large for SQLite's integer is not kept.
+        step_detail: StepDetail {
+            finish: None,
+            context_limit: call
+                .context_limit
+                .and_then(|limit| i64::try_from(limit).ok()),
+        },
     })
 }
 
@@ -938,6 +947,40 @@ mod tests {
             "codex",
             "7944ff0d36e02effa93219baa184dd7d762c97a21b748efed8a2db10141d31cc",
         );
+    }
+
+    /// `info.model_context_window` is kept in `step_detail`, and reading it
+    /// changes no ledger row: the rollout with it stores exactly the bytes
+    /// pinned by `set_aside_good_codex_rows_are_byte_identical` for the same
+    /// rollout without it, which has no `step_detail` row.
+    #[test]
+    fn codex_context_window_is_stored_beside_a_byte_identical_ledger() {
+        const PINNED: &str = "7944ff0d36e02effa93219baa184dd7d762c97a21b748efed8a2db10141d31cc";
+        let drain = |rollout: String| {
+            let temp = TempDir::new().unwrap();
+            write_file(temp.path(), "sessions/a.jsonl", &rollout);
+            let state = test_state();
+            drain(&CodexSource::at(temp.path()), &state, 100);
+            crate::refresher::harness_drain::assert_good_snapshot(&state, "codex", PINNED);
+            crate::refresher::harness_drain::step_details(&state)
+                .into_iter()
+                .map(|(_, finish, limit)| (finish, limit))
+                .collect::<Vec<_>>()
+        };
+        let with_window = |window: &str| {
+            parent_rollout().replace(
+                r#""last_token_usage":"#,
+                &format!(r#""model_context_window":{window},"last_token_usage":"#),
+            )
+        };
+        assert_eq!(
+            drain(with_window("258400")),
+            [(None, Some(258_400)), (None, Some(258_400))]
+        );
+        assert!(drain(parent_rollout()).is_empty());
+        // A malformed window is not kept, and the usage is still read.
+        assert!(drain(with_window("-1")).is_empty());
+        assert!(drain(with_window(r#""wide""#)).is_empty());
     }
 
     #[cfg(unix)]
