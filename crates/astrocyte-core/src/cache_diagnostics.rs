@@ -26,7 +26,11 @@ pub const CACHE_HARNESSES: [&str; 7] = [
 ];
 
 /// [`CACHE_HARNESSES`] as an SQL list. A test keeps the two equal.
-const CACHE_HARNESSES_SQL: &str = "('claude-code','codex','gemini','kimi','omp','opencode','pi')";
+macro_rules! harnesses_sql {
+    () => {
+        "('claude-code','codex','gemini','kimi','omp','opencode','pi')"
+    };
+}
 
 /// A prompt that shrank by at least this many tokens since the previous
 /// cache-reporting step is a drop. Magic Context's reclaims are tens of
@@ -335,9 +339,66 @@ macro_rules! step_columns {
     };
 }
 
-/// A plain token count written by a cache-read measurement.
-const HAS_CACHE_READ: &str = "EXISTS (SELECT 1 FROM measurement m WHERE m.event_key=e.event_key \
-     AND m.role='cache_read' AND m.quantity_exponent=0)";
+/// The newest dated steps of one session: `?1` session, `?2` producer,
+/// `?3` limit.
+const WINDOW_SQL: &str = concat!(
+    "SELECT ",
+    step_columns!(),
+    " WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL",
+    " ORDER BY e.occurred_at_ms DESC, e.event_key DESC LIMIT ?3"
+);
+/// Whether the session has a dated step before `(?3 time, ?4 key)`.
+const EARLIER_SQL: &str = "SELECT EXISTS (SELECT 1 FROM usage_event e
+     WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL
+       AND (e.occurred_at_ms,e.event_key)<(?3,?4))";
+/// The last dated step before `(?3 time, ?4 key)` with a plain token count
+/// written by a cache-read measurement.
+const BASELINE_SQL: &str = concat!(
+    "SELECT ",
+    step_columns!(),
+    " WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL",
+    " AND (e.occurred_at_ms,e.event_key)<(?3,?4)",
+    " AND EXISTS (SELECT 1 FROM measurement m WHERE m.event_key=e.event_key",
+    " AND m.role='cache_read' AND m.quantity_exponent=0)",
+    " ORDER BY e.occurred_at_ms DESC, e.event_key DESC LIMIT 1"
+);
+const READS_CACHE_SQL: &str = "SELECT EXISTS (SELECT 1 FROM usage_event e
+     JOIN measurement m ON m.event_key=e.event_key
+     WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL
+       AND m.role='cache_read' AND m.quantity_exponent=0 AND m.quantity_units>0)";
+const UNDATED_SQL: &str = "SELECT COUNT(*) FROM usage_event
+     WHERE session=?1 AND producer=?2 AND occurred_at_ms IS NULL";
+/// `?1` since, `?2` one producer or NULL, `?3` limit.
+const ACTIVE_SESSIONS_SQL: &str = concat!(
+    "SELECT producer,session,MAX(occurred_at_ms) FROM usage_event",
+    " WHERE occurred_at_ms>=?1 AND session IS NOT NULL AND producer IN ",
+    harnesses_sql!(),
+    " AND (?2 IS NULL OR producer=?2)",
+    " GROUP BY producer,session ORDER BY 3 DESC, producer, session LIMIT ?3"
+);
+const RECORDED_AFTER_SQL: &str = concat!(
+    "SELECT e.producer,e.session,",
+    step_columns!(),
+    " WHERE e.event_key>?1 AND e.session IS NOT NULL AND e.producer IN ",
+    harnesses_sql!(),
+    " ORDER BY e.event_key"
+);
+const BY_KEY_SQL: &str = concat!(
+    "SELECT e.producer,e.session,",
+    step_columns!(),
+    " WHERE e.event_key=?1 AND e.session IS NOT NULL AND e.producer IN ",
+    harnesses_sql!()
+);
+/// The dated steps of one session at or after `?3`, oldest first.
+const SINCE_SQL: &str = concat!(
+    "SELECT ",
+    step_columns!(),
+    " WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms>=?3",
+    " ORDER BY e.occurred_at_ms, e.event_key"
+);
+const PROJECT_ROOT_SQL: &str = "SELECT project_root FROM usage_event
+     WHERE session=?1 AND producer=?2 AND occurred_at_ms>=?3 AND project_root IS NOT NULL
+     ORDER BY occurred_at_ms DESC, event_key DESC LIMIT 1";
 
 fn count(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<u64>> {
     row.get::<_, Option<i64>>(column)?
@@ -385,12 +446,7 @@ pub fn load_session(
     limit: usize,
 ) -> rusqlite::Result<SessionSteps> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let mut statement = conn.prepare_cached(concat!(
-        "SELECT ",
-        step_columns!(),
-        " WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL",
-        " ORDER BY e.occurred_at_ms DESC, e.event_key DESC LIMIT ?3"
-    ))?;
+    let mut statement = conn.prepare_cached(WINDOW_SQL)?;
     let mut rows = statement
         .query_map(params![session, producer, limit], step_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -414,26 +470,15 @@ fn lead_before(
     session: &str,
     step: &StepRow,
 ) -> rusqlite::Result<Lead> {
-    let earlier_steps = conn
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM usage_event e
-             WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL
-               AND (e.occurred_at_ms,e.event_key)<(?3,?4))",
-        )?
-        .query_row(
-            params![session, producer, step.occurred_at_ms, step.cursor],
-            |row| row.get::<_, bool>(0),
-        )?;
+    let earlier_steps = conn.prepare_cached(EARLIER_SQL)?.query_row(
+        params![session, producer, step.occurred_at_ms, step.cursor],
+        |row| row.get::<_, bool>(0),
+    )?;
     if !earlier_steps {
         return Ok(Lead::default());
     }
     let baseline = conn
-        .prepare_cached(&format!(
-            "SELECT {} WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL
-               AND (e.occurred_at_ms,e.event_key)<(?3,?4) AND {HAS_CACHE_READ}
-             ORDER BY e.occurred_at_ms DESC, e.event_key DESC LIMIT 1",
-            step_columns!()
-        ))?
+        .prepare_cached(BASELINE_SQL)?
         .query_row(
             params![session, producer, step.occurred_at_ms, step.cursor],
             step_row,
@@ -448,20 +493,13 @@ fn lead_before(
 /// Whether any dated step of the session read a positive number of cached
 /// tokens.
 fn session_reads_cache(conn: &Connection, producer: &str, session: &str) -> rusqlite::Result<bool> {
-    conn.prepare_cached(
-        "SELECT EXISTS (SELECT 1 FROM usage_event e JOIN measurement m ON m.event_key=e.event_key
-         WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL
-           AND m.role='cache_read' AND m.quantity_exponent=0 AND m.quantity_units>0)",
-    )?
-    .query_row(params![session, producer], |row| row.get(0))
+    conn.prepare_cached(READS_CACHE_SQL)?
+        .query_row(params![session, producer], |row| row.get(0))
 }
 
 fn undated_steps(conn: &Connection, producer: &str, session: &str) -> rusqlite::Result<u64> {
     let undated: i64 = conn
-        .prepare_cached(
-            "SELECT COUNT(*) FROM usage_event
-             WHERE session=?1 AND producer=?2 AND occurred_at_ms IS NULL",
-        )?
+        .prepare_cached(UNDATED_SQL)?
         .query_row(params![session, producer], |row| row.get(0))?;
     Ok(u64::try_from(undated).unwrap_or(0))
 }
@@ -476,13 +514,7 @@ pub fn active_sessions(
     limit: usize,
 ) -> rusqlite::Result<Vec<(String, String, i64)>> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let mut statement = conn.prepare_cached(&format!(
-        "SELECT producer,session,MAX(occurred_at_ms) FROM usage_event
-         WHERE occurred_at_ms>=?1 AND session IS NOT NULL
-           AND producer IN {CACHE_HARNESSES_SQL} AND (?2 IS NULL OR producer=?2)
-         GROUP BY producer,session
-         ORDER BY 3 DESC, producer, session LIMIT ?3"
-    ))?;
+    let mut statement = conn.prepare_cached(ACTIVE_SESSIONS_SQL)?;
     let sessions = statement
         .query_map(params![since_ms, producer, limit], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -496,11 +528,7 @@ pub fn steps_recorded_after(
     conn: &Connection,
     after_event_key: i64,
 ) -> rusqlite::Result<Vec<RecordedStep>> {
-    let mut statement = conn.prepare_cached(&format!(
-        "SELECT e.producer,e.session,{} WHERE e.event_key>?1 AND e.session IS NOT NULL
-           AND e.producer IN {CACHE_HARNESSES_SQL} ORDER BY e.event_key",
-        step_columns!()
-    ))?;
+    let mut statement = conn.prepare_cached(RECORDED_AFTER_SQL)?;
     let steps = statement
         .query_map([after_event_key], recorded_step)?
         .collect();
@@ -510,11 +538,7 @@ pub fn steps_recorded_after(
 /// The harness steps with these event keys, in key order. Keys of other
 /// producers' events are skipped.
 pub fn steps_by_key(conn: &Connection, event_keys: &[i64]) -> rusqlite::Result<Vec<RecordedStep>> {
-    let mut statement = conn.prepare_cached(&format!(
-        "SELECT e.producer,e.session,{} WHERE e.event_key=?1 AND e.session IS NOT NULL
-           AND e.producer IN {CACHE_HARNESSES_SQL}",
-        step_columns!()
-    ))?;
+    let mut statement = conn.prepare_cached(BY_KEY_SQL)?;
     let mut steps = Vec::new();
     for key in event_keys {
         if let Some(step) = statement.query_row([key], recorded_step).optional()? {
@@ -859,12 +883,7 @@ fn session_summary(
     last_activity_ms: i64,
 ) -> rusqlite::Result<CacheSession> {
     let rows = conn
-        .prepare_cached(concat!(
-            "SELECT ",
-            step_columns!(),
-            " WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms>=?3",
-            " ORDER BY e.occurred_at_ms, e.event_key"
-        ))?
+        .prepare_cached(SINCE_SQL)?
         .query_map(params![session, producer, since_ms], step_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let lead = match rows.first() {
@@ -894,11 +913,7 @@ fn session_summary(
     #[allow(clippy::cast_precision_loss)] // A ratio of token counts; rounding is harmless.
     let hit_ratio = (prompt > 0).then(|| read as f64 / prompt as f64);
     let project_root = conn
-        .prepare_cached(
-            "SELECT project_root FROM usage_event
-             WHERE session=?1 AND producer=?2 AND occurred_at_ms>=?3 AND project_root IS NOT NULL
-             ORDER BY occurred_at_ms DESC, event_key DESC LIMIT 1",
-        )?
+        .prepare_cached(PROJECT_ROOT_SQL)?
         .query_row(params![session, producer, since_ms], |row| row.get(0))
         .optional()?;
     Ok(CacheSession {
@@ -1169,7 +1184,7 @@ mod tests {
     #[test]
     fn the_sql_harness_list_is_the_harness_list() {
         let listed = format!("('{}')", CACHE_HARNESSES.join("','"));
-        assert_eq!(listed, CACHE_HARNESSES_SQL);
+        assert_eq!(listed, harnesses_sql!());
     }
 
     fn conn() -> Connection {
@@ -1437,12 +1452,7 @@ mod tests {
     /// no sort, and its cost does not grow with the rest of the store.
     #[test]
     fn a_session_window_reads_its_own_index_range() {
-        let window_sql = concat!(
-            "SELECT ",
-            step_columns!(),
-            " WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL",
-            " ORDER BY e.occurred_at_ms DESC, e.event_key DESC LIMIT ?3"
-        );
+        let window_sql = WINDOW_SQL;
         let conn = long_session_store();
         let window_plan = plan(&conn, window_sql);
         assert!(
@@ -1637,5 +1647,173 @@ mod tests {
         );
         assert_eq!(steps("pi", "s", None), Ok(200));
         assert_eq!(steps("pi", "s", Some(STEPS_MAX_LIMIT)), Ok(1_000));
+    }
+
+    /// Every statement the cache-diagnostics reads prepare.
+    const ALL_SQL: [&str; 10] = [
+        WINDOW_SQL,
+        EARLIER_SQL,
+        BASELINE_SQL,
+        READS_CACHE_SQL,
+        UNDATED_SQL,
+        SINCE_SQL,
+        PROJECT_ROOT_SQL,
+        ACTIVE_SESSIONS_SQL,
+        RECORDED_AFTER_SQL,
+        BY_KEY_SQL,
+    ];
+
+    /// VM steps SQLite ran in the cache-diagnostics statements while `work`
+    /// ran on `conn`. The reads prepare through the connection's statement
+    /// cache, so the cached statements' counters cover all of their runs.
+    fn vm_steps<T>(conn: &Connection, work: impl FnOnce() -> T) -> (T, u64) {
+        use rusqlite::StatementStatus::VmStep;
+        for sql in ALL_SQL {
+            conn.prepare_cached(sql).unwrap().reset_status(VmStep);
+        }
+        let result = work();
+        let steps = ALL_SQL
+            .iter()
+            .map(|sql| u64::try_from(conn.prepare_cached(sql).unwrap().get_status(VmStep)).unwrap())
+            .sum();
+        (result, steps)
+    }
+
+    /// Builds a store of 2,050,000 harness events with four measurements
+    /// each (10,000 sessions of 200 steps over about four weeks, plus one
+    /// 50,000-step session), applies migration 27 to it and prints the
+    /// migration time, the query plans and the VM steps of the
+    /// cache-diagnostics reads. Run on the build server:
+    /// `cargo test --workspace --lib -- --ignored --nocapture measure_cache_reads`.
+    #[test]
+    #[ignore = "builds a 2,050,000-event store; run by hand to measure"]
+    fn measure_cache_reads_on_a_two_million_event_store() {
+        use std::time::Instant;
+        let path = std::env::temp_dir().join(format!("cache-measure-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in &MIGRATIONS[..26] {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        // 2026-10-01T00:00:00Z; sessions start four minutes apart, steps
+        // are 30 seconds apart, the long session's 5 seconds apart.
+        let base: i64 = 1_790_812_800_000;
+        let started = Instant::now();
+        conn.execute_batch(&format!(
+            "BEGIN;
+             WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<1999999)
+             INSERT INTO usage_event (event_id,producer,producer_ref,session,occurred_at_ms,
+                                      recorded_at_ms,charge_basis,provider,model)
+             SELECT 'e'||i,
+                    CASE (i/200)%3 WHEN 0 THEN 'opencode' WHEN 1 THEN 'pi' ELSE 'claude-code' END,
+                    'r'||i,'s'||(i/200),{base}+(i/200)*240000+(i%200)*30000,1,'unknown',
+                    'anthropic','claude-sonnet-4'
+             FROM n;
+             WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<49999)
+             INSERT INTO usage_event (event_id,producer,producer_ref,session,occurred_at_ms,
+                                      recorded_at_ms,charge_basis,provider,model)
+             SELECT 'big'||i,'opencode','big'||i,'big',{base}+2400000000-250000000+i*5000,1,
+                    'unknown','anthropic','claude-sonnet-4'
+             FROM n;
+             INSERT INTO measurement SELECT event_key,'input','token','billed','x',event_key%900,0 FROM usage_event;
+             INSERT INTO measurement SELECT event_key,'cache_read','token','billed','x',20000+event_key%40000,0 FROM usage_event;
+             INSERT INTO measurement SELECT event_key,'cache_write','token','billed','x',event_key%500,0 FROM usage_event;
+             INSERT INTO measurement SELECT event_key,'output','token','billed','x',event_key%300,0 FROM usage_event;
+             COMMIT;"
+        ))
+        .unwrap();
+        println!(
+            "built 2,050,000 events and 8,200,000 measurements in {:?}",
+            started.elapsed()
+        );
+
+        let started = Instant::now();
+        conn.execute_batch(MIGRATIONS[26].statements).unwrap();
+        println!(
+            "migration 27 (step_detail, usage_event_session_time) took {:?}",
+            started.elapsed()
+        );
+
+        let explain = |label: &str, sql: &str| {
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let count = statement.parameter_count();
+            let values: Vec<rusqlite::types::Value> = (0..count)
+                .map(|index| match index {
+                    0 => rusqlite::types::Value::Text("big".into()),
+                    1 => rusqlite::types::Value::Text("opencode".into()),
+                    _ => rusqlite::types::Value::Integer(base),
+                })
+                .collect();
+            let plan = statement
+                .query_map(rusqlite::params_from_iter(values), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            println!("plan {label}:\n  {}", plan.join("\n  "));
+        };
+        for (label, sql) in [
+            ("steps window", WINDOW_SQL),
+            ("earlier steps", EARLIER_SQL),
+            ("lead baseline", BASELINE_SQL),
+            ("session reads cache", READS_CACHE_SQL),
+            ("undated count", UNDATED_SQL),
+            ("sessions window", SINCE_SQL),
+            ("project root", PROJECT_ROOT_SQL),
+            ("active sessions", ACTIVE_SESSIONS_SQL),
+            ("steps recorded after", RECORDED_AFTER_SQL),
+            ("step by key", BY_KEY_SQL),
+        ] {
+            explain(label, sql);
+        }
+
+        let now = base + 2_400_000_000;
+        for (label, producer, session, limit) in [
+            ("typical session, 200 steps", "pi", "s9997", 200),
+            ("long session, 200 steps", "opencode", "big", 200),
+            ("long session, 1000 steps", "opencode", "big", 1_000),
+        ] {
+            let started = Instant::now();
+            let (reply, steps) = vm_steps(&conn, || {
+                steps_from_store(&conn, &query(producer, session, limit, None)).unwrap()
+            });
+            println!(
+                "usage.cache.steps {label}: {} steps returned, {steps} VM steps, {:?}",
+                reply.steps.len(),
+                started.elapsed()
+            );
+        }
+        let started = Instant::now();
+        let (reply, steps) = vm_steps(&conn, || {
+            cache_sessions(
+                &conn,
+                CacheSessionsRequest {
+                    since_ms: None,
+                    harness: None,
+                    limit: None,
+                },
+                now,
+            )
+            .unwrap()
+        });
+        println!(
+            "usage.cache.sessions last 24h, limit 50: {} sessions, {steps} VM steps, {:?}",
+            reply.sessions.len(),
+            started.elapsed()
+        );
+        let started = Instant::now();
+        let (sessions, steps) = vm_steps(&conn, || {
+            active_sessions(&conn, now - RECENT_WINDOW_MS, None, 200).unwrap()
+        });
+        println!(
+            "memory rebuild session list: {} sessions, {steps} VM steps, {:?}",
+            sessions.len(),
+            started.elapsed()
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
     }
 }
