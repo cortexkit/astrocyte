@@ -8,9 +8,10 @@ how the module works; `STRUCTURE.md` says where code goes.
 Run these before you commit. CI runs the same checks on Linux and Windows.
 
 Run every `cargo` and `ckdev-mutate` command on the Linux build server (`runon: "linux,4c"`),
-never on the Mac. Each freshly built test binary that runs on the Mac costs a macOS
-security scan, and `ckdev-mutate check` builds every test target to list test names. Only
-the Python and shell checks below run locally.
+never on the shared development machine. Local builds and tests compete with every other
+agent on that machine (on macOS, each freshly built test binary also costs a security
+scan), and `ckdev-mutate check` builds every test target to list test names. Only the
+Python and shell checks below run locally.
 
 ```sh
 scripts/fmt-check.sh
