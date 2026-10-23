@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 25. A schema change appends a migration; an applied
+currently version 26. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -61,8 +61,8 @@ in the table above means both of these exist:
 projections the ledger maintains: `pricing_generation` advances by one per
 pricing act, `charge_basis` changes only together with that step (a basis
 correction), and `currency` moves from null to one value once. Every
-producer field, including `auth_selection` and BROCA's charge-basis
-provenance, is write-once. `statement_line_update_guard` keeps line content
+producer field, including `auth_selection`, `flow_ref` and BROCA's
+charge-basis provenance, is write-once. `statement_line_update_guard` keeps line content
 fixed while the match projection moves. `account_subscription_update_guard`
 allows one change: closing an open plan.
 
@@ -73,7 +73,17 @@ A correction to any of these tables is a new row, never an edit. Tests:
 `priced_charge_update_and_delete_are_refused_without_effect`,
 `statement_content_and_history_are_immutable_without_effect`,
 `storage_update_and_delete_guards_preserve_subscription_history`,
-`schema_v13_provenance_columns_start_null_and_are_immutable`.
+`schema_v13_provenance_columns_start_null_and_are_immutable`,
+`schema_v26_adds_a_null_flow_ref_keeps_every_row_and_guards_it`.
+
+`usage_event.flow_ref` (schema 26) names the BROCA flow a batch call was made
+in. A BROCA batch fact sets exactly one of `run_ref` and `flow_ref`: a call
+made inside a run stores the run and a null `flow_ref`. Every other
+event, including every event recorded before schema 26, has a null
+`flow_ref`. Schema 26 added the column without rewriting any row and recreated
+`usage_event_update_guard` with `flow_ref` listed beside `run_ref`. A
+redelivery whose `flow_ref` differs from the stored one is a contradiction and
+goes to `rejected_delivery`, like any other payload field.
 
 ## Event identity
 

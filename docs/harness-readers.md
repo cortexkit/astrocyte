@@ -162,6 +162,22 @@ Rules that affect what is recorded:
   `worker_events_stamp_declared_class_without_changing_identity`.
 - A timestamp that is absent or does not parse leaves the event undated. A
   file's modification time is never used instead.
+- BROCA writes two kinds of fact into `export_facts`. A segment with no `kind`
+  member is a session fact, recorded with its session, harness, project and
+  run. A segment with `"kind": "system_one"` comes from one of BROCA's batch
+  decision or extraction models. It has no session, so `session`, `harness`
+  and `project_root` stay null. It carries exactly one of `run_id`, stored as
+  `run_ref`, or `flow_id`, stored as `flow_ref`. Its `input_tokens` and
+  `output_tokens` become `input` and `output` measurements, each only when
+  reported. Both kinds use `fact_id` as `producer_ref`, so a re-read is an
+  exact redelivery.
+- A BROCA row is set aside, with the reason, when its segment has any other
+  `kind`, or is a `system_one` fact that is missing a required member or
+  carries both or neither of `run_id` and `flow_id`. Such a row is never
+  decoded as a session fact. The rows around it are recorded and the cursor
+  moves past it. Tests:
+  `session_and_system_one_facts_in_one_store_are_both_recorded`,
+  `set_aside_unknown_kind_and_malformed_system_one_rows_keep_good_rows_and_progress`.
 
 ## 4. Token roles
 

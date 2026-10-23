@@ -1548,3 +1548,57 @@ expect_red = ["refresher::pi_source::tests::billed_operations_keep_entry_keys_an
 only = true
 timeout_s = 300
 build_timeout_s = 600
+
+[[control]]
+id = "broca-unknown-kind-not-session"
+guards = "A BROCA fact with an unknown kind is set aside, never decoded as a session fact"
+file = "crates/astrocyte-module/src/broca_source.rs"
+old = 'Some(kind) => Err(format!("segment of fact {fact_id} has unknown kind {kind}")),'
+new = 'Some(_) => decode_session_segment(export_seq, fact_id, segment), // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/broca_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::broca_source::tests::set_aside_unknown_kind_and_malformed_system_one_rows_keep_good_rows_and_progress"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "broca-system-one-run-flow-exclusive"
+guards = "A BROCA batch fact carrying both run_id and flow_id is set aside, not recorded under both"
+file = "crates/astrocyte-module/src/wire_map.rs"
+old = '''
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "system_one fact {} carries both run_id and flow_id",
+                wire.fact_id
+            ))
+        }
+'''
+new = '''
+        (Some(run_id), Some(flow_id)) => (Some(run_id), Some(flow_id)), // NON-VACUITY BREAK
+'''
+test_file = "crates/astrocyte-module/src/broca_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::broca_source::tests::set_aside_unknown_kind_and_malformed_system_one_rows_keep_good_rows_and_progress"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-flow-ref-immutable"
+guards = "Stored flow_ref cannot be rewritten, including a NULL filled in later"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    AND NEW.flow_ref IS OLD.flow_ref\n"
+new = "    -- NON-VACUITY BREAK: flow_ref is mutable\n"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v26_adds_a_null_flow_ref_keeps_every_row_and_guards_it"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
