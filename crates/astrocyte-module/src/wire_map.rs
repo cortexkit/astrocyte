@@ -327,6 +327,14 @@ pub struct WireSystemOneFact {
     /// NULL, and a string is stored unchanged.
     #[serde(default)]
     pub work_class: Option<String>,
+    /// Charge-basis provenance, carried verbatim with the same three wire
+    /// states as on a session fact (see [`WireSpendSegmentFact`]). BROCA
+    /// stamps both on its batch facts too; dropping them would store a batch
+    /// call's charge basis with no record of which table decided it.
+    #[serde(default)]
+    pub charge_basis_mapping_version: Option<u32>,
+    #[serde(default)]
+    pub charge_basis_overrides: Option<String>,
     pub usage: WireSystemOneUsage,
 }
 
@@ -391,8 +399,8 @@ pub fn map_system_one_fact(wire: WireSystemOneFact) -> Result<EventRecordRequest
         account_ref: wire.account_ref,
         auth_selection: wire.auth_selection,
         charge_basis: wire.charge_basis,
-        charge_basis_mapping_version: None,
-        charge_basis_overrides: None,
+        charge_basis_mapping_version: wire.charge_basis_mapping_version,
+        charge_basis_overrides: wire.charge_basis_overrides,
         measurements,
     })
 }

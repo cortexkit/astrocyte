@@ -1082,6 +1082,106 @@ mod tests {
         );
     }
 
+    /// The two batch facts BROCA captured from its real producer path, as the
+    /// exact `segment_json` bytes it stores (broca
+    /// crates/broca-module-serve/tests/golden/, source 32a91294). They pin the
+    /// shape BROCA actually writes, not the shape this decoder was written
+    /// from: if BROCA renames or nests a member, this drain sets the row aside
+    /// and the test fails.
+    #[test]
+    fn broca_captured_system_one_facts_are_recorded_with_their_provenance() {
+        let vector = |name: &str| {
+            std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/vectors/broca-system-one")
+                    .join(name),
+            )
+            .unwrap()
+        };
+        let run_fact = "2e8d91c64676534cfd6e30783b2b95d7ab90905c8bd8bff6ebf80e91437f3f00";
+        let flow_fact = "fc713f0ed72c3b03d4e734619bc163705fe49eb4797815f0aa84e7a5e588c8c9";
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("run-index.db");
+        create_store(&path, "instance-a", 1);
+        add_segment(
+            &path,
+            1,
+            run_fact,
+            vector("system_one_run_fact.json").trim_end(),
+        );
+        add_segment(
+            &path,
+            2,
+            flow_fact,
+            vector("system_one_flow_fact.json").trim_end(),
+        );
+        let state = test_state();
+
+        let outcome =
+            drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
+
+        assert_eq!(outcome.events_recorded, 2);
+        assert!(set_aside_rows(&state).is_empty());
+        let some = |value: &str| Some(value.to_string());
+        let stored = |run: Option<String>, flow: Option<String>, fact: &str| -> StoredEvent {
+            (
+                fact.into(),
+                None,
+                None,
+                None,
+                run,
+                flow,
+                some("typesafe"),
+                some("typesafe/jev-1.13.0"),
+                some("primary"),
+                "metered_api".into(),
+                Some(1_792_772_000_000),
+                None,
+            )
+        };
+        assert_eq!(
+            stored_events(&state),
+            vec![
+                stored(Some("run".into()), None, run_fact),
+                stored(None, Some("flow-1".into()), flow_fact),
+            ]
+        );
+        let provenance: Vec<(Option<String>, Option<i64>, Option<String>)> = state
+            .with_conn(|conn| {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT auth_selection,charge_basis_mapping_version,charge_basis_overrides
+                         FROM usage_event WHERE producer='broca' ORDER BY producer_ref",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        let expected = (some("apikey:typesafe:primary"), Some(5), some("none"));
+        assert_eq!(provenance, vec![expected.clone(), expected]);
+        assert_eq!(
+            stored_measurements(&state),
+            vec![
+                (
+                    run_fact.into(),
+                    "input".into(),
+                    "usage.input_tokens".into(),
+                    Some(100)
+                ),
+                (
+                    flow_fact.into(),
+                    "input".into(),
+                    "usage.input_tokens".into(),
+                    Some(100)
+                ),
+            ]
+        );
+    }
+
     /// A row this reader cannot record is set aside with a reason naming the
     /// kind or member, the good rows around it are recorded, and the cursor
     /// passes it. An unknown kind is never decoded as a session fact, even

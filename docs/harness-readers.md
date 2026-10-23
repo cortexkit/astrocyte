@@ -169,8 +169,13 @@ Rules that affect what is recorded:
   and `project_root` stay null. It carries exactly one of `run_id`, stored as
   `run_ref`, or `flow_id`, stored as `flow_ref`. Its `input_tokens` and
   `output_tokens` become `input` and `output` measurements, each only when
-  reported. Both kinds use `fact_id` as `producer_ref`, so a re-read is an
-  exact redelivery.
+  reported, and any other key inside `usage` sets the row aside. Its
+  charge-basis provenance (`charge_basis_mapping_version`,
+  `charge_basis_overrides`) is stored as on a session fact. Both kinds use
+  `fact_id` as `producer_ref`, so a re-read is an exact redelivery. Two facts
+  captured from BROCA's real producer are pinned in
+  `crates/astrocyte-module/tests/vectors/broca-system-one/` (test:
+  `broca_captured_system_one_facts_are_recorded_with_their_provenance`).
 - A BROCA row is set aside, with the reason, when its segment has any other
   `kind`, or is a `system_one` fact that is missing a required member or
   carries both or neither of `run_id` and `flow_id`. Such a row is never
