@@ -11,7 +11,7 @@ Crates live in `crates/`, public docs in `docs/`, and gates in `scripts/`.
 
 Domain logic and storage.
 
-- `store.rs`: `MIGRATIONS` (1 to 29), `initialize_connection` and `migrate_store`.
+- `store.rs`: `MIGRATIONS` (1 to 30), `initialize_connection` and `migrate_store`.
   Migration 23 rebuilds integer keys without charge digests, checking FKs before
   commit; startup restores enforcement. VACUUM is a separate offline step.
 - `fact.rs`: event and measurement identity, minted locally.
@@ -61,8 +61,8 @@ Shared library; three binaries.
   harness producers sharing `refresher::harness_drain`, each with its own
   mapping and cursor.
 - `harness_paths.rs`: injectable harness paths.
-- `claude_workers_source.rs`: declared Claude roots, containment and atomic post-commit
-  read acknowledgements; shared Claude Code mapping.
+- `declared_roots.rs` (roots files, containment), `claude_workers_source.rs` (read
+  acknowledgements), `opencode_thalamus_source.rs` (read watermark): declared folders.
 - `build.rs`: stamps source and dependency provenance into the binary.
 - `test_support.rs`: waits and fixtures; gated by tests or the `test-support`
   dev-dependency feature.

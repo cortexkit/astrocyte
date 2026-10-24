@@ -46,7 +46,10 @@ impl CursorHome {
     /// The key set-aside evidence is filed under.
     pub(crate) fn source_key(&self) -> &'static str {
         match self {
-            Self::Runtime(key) | Self::Declared { source_key: key, .. } => key,
+            Self::Runtime(key)
+            | Self::Declared {
+                source_key: key, ..
+            } => key,
         }
     }
 
@@ -62,8 +65,7 @@ impl CursorHome {
     /// A declared store is erased by its owner soon after its session ends,
     /// so its connection is closed after every read on every OS.
     pub(crate) fn retains_connection(&self) -> bool {
-        astrocyte_readers::read_io::retain_harness_connections()
-            && matches!(self, Self::Runtime(_))
+        astrocyte_readers::read_io::retain_harness_connections() && matches!(self, Self::Runtime(_))
     }
 
     pub(crate) fn read_cursor(
@@ -1069,7 +1071,6 @@ fn commit_page_in_lane(
         Err(reason) => Err(SourceDrainError::Failed(reason)),
     }
 }
-
 
 fn map_message(message: OpenCodeMessage) -> Result<EventRecordRequest, String> {
     let measurements = [

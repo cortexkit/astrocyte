@@ -22,12 +22,12 @@ The workspace has three crates:
 
 ## Durable state
 
-`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS` (versions 1 to 29).
+`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS` (versions 1 to 30).
 `initialize_connection` enables and verifies foreign keys, probes SQLite JSON, triggers and
 partial indexes, and sets a 5000 ms busy timeout. The read-only report connection
 skips the table-creating probe and copies that timeout.
 
-The [data model](docs/data-model.md#tables) describes every table in version 29 and its write rules.
+The [data model](docs/data-model.md#tables) describes every table in version 30 and its write rules.
 
 Schema 23 uses local integer `event_key` and `charge_key` references, never served
 IDs. Event digests remain the dedup/served identity; charge digests are retired.
@@ -82,11 +82,11 @@ write, so it needs no lease.
 - **Harness files.** Each tick reads the local harness session stores through
   `astrocyte-readers`, one isolated drain per source key; see
   [harness readers](docs/harness-readers.md). Goose emits one total per session.
-- **Declared Claude workers.** `claude-code-workers` reads the harness module's
-  private worker roots declared under the shared data home, independently of the
-  main Claude Code root. Events keep producer `claude-code` and request identity,
-  with the declared `work_class`. A post-commit read acknowledgement lets the
-  harness delete finished workers; see the [binding contract](docs/claude-workers-contract.md).
+- **Declared folders.** thalamus-harness declares private folders in roots files:
+  `claude-code-workers` reads Claude workers, `opencode-thalamus` OpenCode
+  sessions, with the declared `work_class`. An acknowledgement or read watermark
+  lets it erase finished folders; see the [workers](docs/claude-workers-contract.md)
+  and [sessions](docs/thalamus-opencode-sessions-contract.md) contracts.
 - **Push.** Peers call `spend.event.ingest`, `spend.correction.ingest` and
   `spend.chargeability.settle`; see [retry rules](docs/money-ingest.md).
 

@@ -109,7 +109,10 @@ impl OpenCodeV2Source {
     /// Make the next full drain a full pass from the durable cursor, whatever
     /// the cadence says.
     pub(crate) fn require_full_pass(&self) {
-        self.cache.lock().unwrap_or_else(|p| p.into_inner()).last_full = None;
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last_full = None;
     }
 
     /// Whether, since the last `require_full_pass`, a full pass has reached

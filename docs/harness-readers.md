@@ -60,8 +60,8 @@ identity. On Windows, creation time is only a replacement hint. A replacement
 with equal size, modification time and creation time can be missed by a Windows
 fast cycle; the next full tick keeps the real open-handle identity check.
 Brand-new session files wait for discovery on the next full tick, at most
-`poll_interval_secs` (30 seconds in production). Codex archives
-and Gemini JSON documents stay on full ticks. Full-prefix verification, quiet-file
+`poll_interval_secs` (30 seconds in production). Codex archives,
+Gemini JSON documents and declared OpenCode sessions stay on full ticks. Full-prefix verification, quiet-file
 checks, worker deletion acknowledgements, pricing, quota polling, multiplier
 work, audits and retention keep their existing schedules.
 
@@ -88,6 +88,9 @@ the handle would prevent the producer from deleting or replacing its store.
 Windows idle cycles therefore reopen present stores and prepare statements per
 read; the zero-opens and zero-prepares guarantee applies only on Unix. Cached
 absence of the v2 marker still skips the v2 read on both operating systems.
+The readers of declared OpenCode sessions close their connection after every
+read on every operating system, because the harness module erases a finished
+session's folder soon after it ends.
 
 Full ticks discover OpenCode 2 by its `session_v2` marker. When the marker is
 absent, the fast lane uses that cached result and makes no v2 query or connection
@@ -112,6 +115,8 @@ and the resume position. `spend.ledger.coverage` reports them.
 The source key is normally the `producer` stored on every event and the key used by
 `harness_ingest.exclude`. OpenCode 2 keeps a separate `opencode-v2` runtime and health
 row, but shares the `opencode` producer and configuration key with OpenCode 1.
+Declared OpenCode sessions record producer `opencode` too, but have their own
+`opencode-thalamus` runtime row, set-aside source and configuration key.
 
 | Source key | Harness | Store |
 |---|---|---|
@@ -119,6 +124,7 @@ row, but shares the `opencode` producer and configuration key with OpenCode 1.
 | `claude-code-workers` | Claude Code workers declared by thalamus-harness | `<root>/projects/**/*.jsonl` for each declared root |
 | `codex` | Codex CLI | `<CODEX_HOME or ~/.codex>/sessions/` and `archived_sessions/`, `*.jsonl` and `*.jsonl.zst` |
 | `opencode` | OpenCode | `OPENCODE_DB`, else `<XDG data home>/opencode/opencode.db`, tables `message` and `session_message` |
+| `opencode-thalamus` | OpenCode sessions declared by thalamus-harness | `<path>/opencode.db` for each declared folder, both OpenCode layouts |
 | `pi` | Pi | `PI_CODING_AGENT_SESSION_DIR`, else `<PI_CODING_AGENT_DIR or ~/.pi/agent>/sessions/**/*.jsonl` |
 | `gemini` | Gemini CLI | `<GEMINI_CLI_HOME or ~>/.gemini/tmp/`, `session-*.json(l)` and files under `chats/` |
 | `goose` | Goose | `GOOSE_PATH_ROOT/data/`, else the platform data directory, `sessions/sessions.db`, table `sessions` |
@@ -145,6 +151,10 @@ Each source resolves its store path by these rules, implemented in
 - The Claude worker roots come from
   `<data home>/cortexkit/thalamus-harness/claude-workers/roots.json`. The
   binding rules are the [Claude workers contract](claude-workers-contract.md).
+- The OpenCode session folders come from
+  `<data home>/cortexkit/thalamus-harness/opencode-sessions/roots.json`. The
+  binding rules are the
+  [OpenCode sessions contract](thalamus-opencode-sessions-contract.md).
 - broca's store is read only at the default data-home path. A
   `BROCA_STATE_ROOT` elsewhere puts it where astrocyte does not look, and it
   reads as absent.
@@ -156,8 +166,8 @@ Each source resolves its store path by these rules, implemented in
 | `claude-code`, `claude-code-workers` | One API request: the records sharing a `requestId`, folded at the per-field maximum | `requestId` | none |
 | `codex` | One advancing `token_count` record (`last_token_usage`) | `<turn id>:<n>` for the n-th response of the turn, else `<thread id>:ordinal:<n>` | `session_meta.session_id` |
 | `codex` | One otherwise unconfirmed `token_usage_record` | `<thread id>:request:response:<response id>`, else `<thread id>:request:ordinal:<n>` | `session_meta.session_id` |
-| `opencode` | One assistant `message` row whose tokens are final (`time.completed` or `finish` set) | `message.id` | none |
-| `opencode` | One v2-only assistant `session_message` row with tokens, completed or quiet for one hour | `session_message.id` | none |
+| `opencode`, `opencode-thalamus` | One assistant `message` row whose tokens are final (`time.completed` or `finish` set) | `message.id` | none |
+| `opencode`, `opencode-thalamus` | One v2-only assistant `session_message` row with tokens, completed or quiet for one hour | `session_message.id` | none |
 | `pi` | One assistant message with usage | `<namespace>:response:<responseId>`, else a composite of entry id, timestamp, provider, model and counts | none |
 | `pi` | One compaction with usage, or `usage` entry of kind `cache_warm` | `pi:operation:<entry id>` | none |
 | `gemini` | One message with `tokens` | message id | `sessionId` |
@@ -244,6 +254,50 @@ Rules that affect what is recorded:
 - Declared Claude worker events keep producer `claude-code` and the same
   identity, and carry the declared `work_class`. Test:
   `worker_events_stamp_declared_class_without_changing_identity`.
+- Declared OpenCode sessions are read from each folder in thalamus-harness's
+  `roots.json`, which astrocyte re-reads on every full tick. A folder's path
+  must be absolute and, after symlinks are resolved, strictly inside the
+  `opencode-sessions/` folder that holds the roots file; any other entry is
+  logged and skipped while the other entries still read. The roots file and
+  the containment rule share their code with the Claude workers
+  (`declared_roots.rs`). A missing roots file means no sessions: there is no
+  runtime row and no folder cursor. An unknown `version` reads nothing and
+  degrades the source. An unreadable or malformed file, including one that
+  names a folder twice, keeps the last good entry list and degrades the source.
+- Each folder's `opencode.db` is read with the OpenCode 1 and OpenCode 2
+  readers described above, on the same cadence and under the same event
+  rules, so a call keeps producer `opencode` and OpenCode's message id. Only
+  `work_class` differs: it is the entry's `owner_principal`, verbatim, in
+  place of the agent name. Each folder and layout keeps its own durable cursor
+  in `declared_store_cursor`, while the whole source shares one
+  `source_runtime` row, `opencode-thalamus`. A store without OpenCode 1's
+  `message` table is read with the OpenCode 2 reader alone. In an `active`
+  folder an OpenCode 2 call with tokens but no completion waits for the quiet
+  hour. In a `done` folder no further write can come, so such a call is
+  recorded on the next read, and that read is a full pass from each durable
+  cursor, which also finds anything the tail reads could not see. OpenCode 1
+  rows hold real token counts only once `finish` is written, so their rule is
+  the same in both states. Tests:
+  `declared_calls_keep_the_user_store_identity_and_carry_the_owner`,
+  `an_unfinished_call_is_recorded_at_once_in_a_done_folder_and_waits_in_an_active_one`,
+  `a_folder_seen_done_gets_a_full_pass_before_it_releases_the_watermark`.
+- After every full pass over the declared folders, the source stores its read
+  watermark (`read_watermark`, see the [data model](data-model.md)): the
+  pass's start minus 60 seconds, in the transaction that records the pass.
+  A pass is complete, and moves the watermark, only when the roots file was
+  usable, every `done` folder has been read by a full pass to its high water,
+  and every declared folder that still has its `opencode.db` was read and
+  committed. A folder that cannot be resolved, opened or queried for any other
+  reason, such as a corrupt file, holds the watermark back and degrades the
+  source until it reads; the other folders are still read. A folder whose
+  `opencode.db` is gone, including one erased during the pass, is skipped
+  without degrading, and its cursor is deleted. A record that is set aside as
+  evidence counts as read. Excluding `opencode-thalamus` in `harness_ingest`
+  reads nothing, removes the runtime row and leaves the watermark as it was.
+  Tests: `an_unreadable_folder_holds_the_watermark_and_degrades_but_others_read`,
+  `erasing_a_folder_between_ticks_neither_blocks_nor_degrades`,
+  `a_set_aside_record_does_not_hold_the_watermark`,
+  `excluded_sessions_are_not_read_and_runtime_is_removed`.
 - A timestamp that is absent or does not parse leaves the event undated. A
   file's modification time is never used instead.
 - Three readers keep a diagnostic field beside the event, in `step_detail`:

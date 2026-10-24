@@ -84,7 +84,7 @@
 
   // Which producers the refresher drains. `enabled: false` turns every one
   // off; `exclude` skips producers by source key: claude-code, claude-code-workers,
-  // codex, opencode, pi, gemini, goose, omp, kimi, broca. A skipped producer is not read and
+  // codex, opencode, opencode-thalamus, pi, gemini, goose, omp, kimi, broca. A skipped producer is not read and
   // its runtime row is removed; events it recorded stay. An unknown or
   // repeated key is refused, as is `enabled: false` with a non-empty exclude.
   // A quota provider whose scope names a skipped producer records no

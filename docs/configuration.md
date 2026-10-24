@@ -90,7 +90,7 @@ catalog. With `null`, every event is stored unpriced with reason
 Which sources the refresher drains. `enabled: false` turns every source off.
 Otherwise each source key in `exclude` is skipped. Valid keys are the
 `INGEST_SOURCES` list: `claude-code`, `claude-code-workers`, `codex`,
-`opencode`, `pi`, `gemini`, `goose`, `omp`, `kimi`, `broca`. A skipped source
+`opencode`, `opencode-thalamus`, `pi`, `gemini`, `goose`, `omp`, `kimi`, `broca`. A skipped source
 is not read and its `source_runtime` row is removed, so it never reads as
 stale. Events it already recorded stay. Refused: an unknown key, a key listed
 twice, and `enabled: false` with a non-empty `exclude`. Tests:

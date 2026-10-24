@@ -140,9 +140,7 @@ impl OpenCodeThalamusSource {
                 }
                 RootsFile::UnknownVersion => {
                     harness_drain::ensure_runtime_row(state, SOURCE_KEY)?;
-                    return Err("unknown OpenCode session roots version"
-                        .to_string()
-                        .into());
+                    return Err("unknown OpenCode session roots version".to_string().into());
                 }
                 RootsFile::Unusable(reason) => {
                     problems.push(reason);
@@ -173,21 +171,23 @@ impl OpenCodeThalamusSource {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            let canonical =
-                match declared_roots::contain(Some(&folder), &entry.path, "OpenCode session folder")
-                {
-                    Ok(Contained::Inside(path)) => path,
-                    Ok(Contained::Refused(reason)) => {
-                        warn_once(&mut cache.warned, reason);
-                        continue;
-                    }
-                    Ok(Contained::Gone) => continue,
-                    Err(reason) => {
-                        complete = false;
-                        problems.push(reason);
-                        continue;
-                    }
-                };
+            let canonical = match declared_roots::contain(
+                Some(&folder),
+                &entry.path,
+                "OpenCode session folder",
+            ) {
+                Ok(Contained::Inside(path)) => path,
+                Ok(Contained::Refused(reason)) => {
+                    warn_once(&mut cache.warned, reason);
+                    continue;
+                }
+                Ok(Contained::Gone) => continue,
+                Err(reason) => {
+                    complete = false;
+                    problems.push(reason);
+                    continue;
+                }
+            };
             let mut reader = cache
                 .folders
                 .remove(&canonical)
@@ -343,7 +343,10 @@ fn warn_once(warned: &mut HashSet<String>, reason: String) {
 fn forget_source(state: &SharedState) -> Result<(), String> {
     state.ordered_write(|tx| {
         let changed = tx
-            .execute("DELETE FROM source_runtime WHERE source_key=?1", [SOURCE_KEY])
+            .execute(
+                "DELETE FROM source_runtime WHERE source_key=?1",
+                [SOURCE_KEY],
+            )
             .map_err(|e| format!("remove absent {SOURCE_KEY} source runtime: {e}"))?
             + tx.execute(
                 "DELETE FROM declared_store_cursor WHERE source_key=?1",
@@ -707,7 +710,9 @@ mod tests {
                         let columns = stmt.column_count();
                         let rows = stmt
                             .query_map([], |row| {
-                                (0..columns).map(|i| row.get(i)).collect::<rusqlite::Result<Row>>()
+                                (0..columns)
+                                    .map(|i| row.get(i))
+                                    .collect::<rusqlite::Result<Row>>()
                             })
                             .unwrap()
                             .collect::<rusqlite::Result<Vec<_>>>()
@@ -761,7 +766,11 @@ mod tests {
             assert_eq!(declared, own, "{layout:?}: identity must not change");
             assert_eq!(declared_measurements, own_measurements, "{layout:?}");
             assert_eq!(own_classes, vec![Some("build".to_string())], "{layout:?}");
-            assert_eq!(declared_classes, vec![Some(OWNER.to_string())], "{layout:?}");
+            assert_eq!(
+                declared_classes,
+                vec![Some(OWNER.to_string())],
+                "{layout:?}"
+            );
             assert_eq!(f.runtime(), Some((Some(T0), false)), "{layout:?}");
             assert_eq!(f.degraded(), None, "{layout:?}");
         }

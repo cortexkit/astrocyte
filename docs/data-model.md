@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 29. A schema change appends a migration; an applied
+currently version 30. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -33,6 +33,8 @@ ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 | `desired_config` | The row records the committed desired-configuration generation. | one row |
 | `source_runtime` | Each row records a producer's cursor, lineage, last successful drain and pending disclosure. | upsert |
 | `set_aside_record` | Each row records an unreadable producer record by source and locator, including its reason and observation times. | upsert |
+| `declared_store_cursor` | Each row records the durable read position of one store that another module declared, per source and on-disk layout. | upsert; deleted when the store is no longer declared |
+| `read_watermark` | Each row records a reader source's read watermark, the time before which everything in its declared stores is recorded. | upsert that only moves forward |
 | `capacity_runtime` | The row records whether the capacity axis is disabled, configured but unavailable, or active. | upsert |
 | `capacity_window` | Each row records a provider account's latest QTA quota window. | upsert |
 | `capacity_observation` | Each row records the latest capacity observation for an identity. | upsert |
@@ -142,6 +144,30 @@ append is caught up on the next commit, and `pruned_through`, the newest
 deleted feed cursor, below which a read is refused `cursor_expired`.
 Migration 29 starts the feed at the store's current cache cursor, so an
 upgraded store does not replay its history.
+
+`declared_store_cursor` and `read_watermark` (schema 30) serve harness stores
+that another module declares, which today are the private OpenCode data
+folders of the sessions thalamus-harness runs (see the
+[contract](thalamus-opencode-sessions-contract.md)). Such a source has one
+`source_runtime` row for all its stores, so each store keeps its own durable
+cursor in `declared_store_cursor`, keyed by source key, the store's canonical
+folder path and its layout (`opencode-1` or `opencode-2`). The `lineage`,
+`consumed_ordinal` and `high_water_ordinal` columns mean what they mean in
+`source_runtime`. A cursor row is written in the same transaction as the
+events its page recorded, and it is deleted once its folder is erased or is
+no longer declared, because a new session always gets a new folder.
+
+`read_watermark` holds one row per reader source. `watermark_ms` is the start
+of the source's most recent complete pass over every declared store, minus 60
+seconds. It is written only in the transaction that records that pass, after
+every store's own transaction has committed, and it never decreases: the
+writer keeps the larger of the stored and the new value, so neither a restart
+nor a clock that stepped back can lower it. `updated_at_ms` is when a complete
+pass last confirmed it. No row means no complete pass yet. Excluding the
+source in `harness_ingest`, or the roots file disappearing, leaves the row
+unchanged. Tests: `the_watermark_is_set_only_after_the_pass_commits`,
+`the_watermark_never_goes_backwards_across_a_restart`,
+`the_watermark_is_none_before_the_first_complete_pass`.
 
 ## Event identity
 

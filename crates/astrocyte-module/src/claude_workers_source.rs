@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::harness_paths::ClaudeWorkerPaths;
-use crate::refresher::declared_roots::{self, Contained, RootsFile};
 use crate::refresher::claude_code_source::{self, ClaudeCodeCache, ClaudeCodeDrainOutcome};
+use crate::refresher::declared_roots::{self, Contained, RootsFile};
 use crate::refresher::harness_drain::{self, HarnessSource};
 use crate::refresher::SourceDrainError;
 use crate::state::SharedState;
