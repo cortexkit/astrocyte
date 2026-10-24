@@ -20,7 +20,7 @@ use astrocyte_readers::sessions::claudecode::{
 };
 use rusqlite::params;
 
-use crate::refresher::SourceDrainError;
+use crate::refresher::{harness_drain::DrainMode, SourceDrainError};
 use crate::state::SharedState;
 
 pub(crate) const CLAUDE_CODE_SOURCE_KEY: &str = "claude-code";
@@ -152,10 +152,20 @@ impl ClaudeCodeSource {
         recorded_at_ms: i64,
         stop: &AtomicBool,
     ) -> Result<ClaudeCodeDrainOutcome, SourceDrainError> {
+        self.drain_in_lane(state, recorded_at_ms, stop, DrainMode::Full)
+    }
+
+    fn drain_in_lane(
+        &self,
+        state: &SharedState,
+        recorded_at_ms: i64,
+        stop: &AtomicBool,
+        mode: DrainMode,
+    ) -> Result<ClaudeCodeDrainOutcome, SourceDrainError> {
         let root = match &self.root {
             ClaudeCodeRoot::Path(root) => root,
             ClaudeCodeRoot::Unresolved(reason) => {
-                crate::refresher::harness_drain::ensure_runtime_row(state, CLAUDE_CODE_SOURCE_KEY)?;
+                mode.ensure_runtime(state, CLAUDE_CODE_SOURCE_KEY)?;
                 return Err(reason.clone().into());
             }
         };
@@ -168,7 +178,7 @@ impl ClaudeCodeSource {
                     root.display(),
                     true,
                 );
-                crate::refresher::harness_drain::ensure_runtime_row(state, CLAUDE_CODE_SOURCE_KEY)?;
+                mode.ensure_runtime(state, CLAUDE_CODE_SOURCE_KEY)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 crate::refresher::harness_drain::record_source_discovery(
@@ -177,14 +187,14 @@ impl ClaudeCodeSource {
                     root.display(),
                     false,
                 );
-                crate::refresher::harness_drain::remove_runtime_row(state, CLAUDE_CODE_SOURCE_KEY)?;
+                mode.remove_runtime(state, CLAUDE_CODE_SOURCE_KEY)?;
                 return Ok(ClaudeCodeDrainOutcome {
                     root_absent: true,
                     ..ClaudeCodeDrainOutcome::default()
                 });
             }
             Err(error) => {
-                crate::refresher::harness_drain::ensure_runtime_row(state, CLAUDE_CODE_SOURCE_KEY)?;
+                mode.ensure_runtime(state, CLAUDE_CODE_SOURCE_KEY)?;
                 return Err(format!(
                     "inspect Claude Code projects root {}: {error}",
                     root.display()
@@ -205,6 +215,7 @@ impl ClaudeCodeSource {
             self.quiet_window_ms,
             None,
             stop,
+            mode,
         )?;
         let ClaudeCodeRead {
             mut outcome,
@@ -212,7 +223,7 @@ impl ClaudeCodeSource {
             set_aside,
             cache: next_cache,
         } = read;
-        record_requests(
+        record_requests_in_lane(
             state,
             CLAUDE_CODE_SOURCE_KEY,
             &requests,
@@ -220,6 +231,7 @@ impl ClaudeCodeSource {
             recorded_at_ms,
             &mut outcome,
             &|| stop.load(Ordering::Relaxed),
+            mode,
         )?;
 
         let mut cache = self
@@ -247,6 +259,7 @@ pub(crate) fn read_projects(
     quiet_window_ms: i64,
     work_class: Option<&str>,
     stop: &AtomicBool,
+    mode: DrainMode,
 ) -> Result<ClaudeCodeRead, SourceDrainError> {
     let files = jsonl_files(root)
         .map_err(|error| format!("read Claude Code projects root {}: {error}", root.display()))?;
@@ -257,6 +270,11 @@ pub(crate) fn read_projects(
     let mut resume_points = HashMap::with_capacity(files.len());
     let mut verified_ms = HashMap::with_capacity(files.len());
     let mut windows = HashMap::with_capacity(files.len());
+    if !mode.is_full() {
+        resume_points.clone_from(&previous.resume);
+        verified_ms.clone_from(previous_verified);
+        windows.clone_from(&previous.windows);
+    }
     let mut requests = Vec::new();
     let mut set_aside = Vec::new();
     for (path, depth) in files {
@@ -266,8 +284,12 @@ pub(crate) fn read_projects(
         *outcome.files_by_depth.entry(depth).or_default() += 1;
         let stat = crate::refresher::harness_drain::FileStat::read(&path)
             .map_err(|error| format!("stat Claude Code session {}: {error}", path.display()))?;
+        if !mode.is_full() && !stat.fast_changed(previous.windows.get(&path), recorded_at_ms) {
+            continue;
+        }
+        resume_points.remove(&path);
         let point = previous_points.remove(&path);
-        let check = if crate::refresher::harness_drain::prefix_check(
+        let check = if mode.prefix_check(
             &path,
             point.is_some(),
             previous_verified.get(&path).copied(),
@@ -314,7 +336,7 @@ pub(crate) fn read_projects(
                 reason,
             }
         }));
-        if check == ClaudePrefixCheck::Full || !parse.resumed {
+        if mode.is_full() && (check == ClaudePrefixCheck::Full || !parse.resumed) {
             verified_ms.insert(path.clone(), recorded_at_ms);
         } else if let Some(&verified) = previous_verified.get(&path) {
             verified_ms.insert(path.clone(), verified);
@@ -360,6 +382,16 @@ pub(crate) fn read_projects(
 }
 
 impl crate::refresher::harness_drain::HarnessSource for ClaudeCodeSource {
+    fn drain_fast(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+    ) -> Result<(), SourceDrainError> {
+        self.drain_in_lane(state, at, stop, DrainMode::Fast)
+            .map(|_| ())
+    }
+
     fn source_key(&self) -> &'static str {
         CLAUDE_CODE_SOURCE_KEY
     }
@@ -493,7 +525,8 @@ fn map_call(call: ClaudeCodeCall) -> Result<EventRecordRequest, String> {
 /// Identity is per producer, so without the skip a call the gateway captured
 /// on the wire would become a second event here. The gateway's events are
 /// immutable and stay; the transcript's copy is the one not recorded.
-pub(crate) fn record_requests(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_requests_in_lane(
     state: &SharedState,
     source_key: &str,
     requests: &[EventRecordRequest],
@@ -501,9 +534,13 @@ pub(crate) fn record_requests(
     recorded_at_ms: i64,
     outcome: &mut ClaudeCodeDrainOutcome,
     stop_requested: &dyn Fn() -> bool,
+    mode: DrainMode,
 ) -> Result<(), SourceDrainError> {
+    if !mode.has_work(requests.len(), set_aside.len()) {
+        return Ok(());
+    }
     let mut stopped = false;
-    let committed = state.ordered_write(|tx| {
+    let committed = mode.write(state, |tx| {
         if requests.is_empty() && stop_requested() {
             stopped = true;
             return Err("Claude Code ingest stopped".into());
@@ -548,12 +585,14 @@ pub(crate) fn record_requests(
             }
             dispositions.push(result.disposition);
         }
-        crate::refresher::harness_drain::mark_current_in_tx(
-            tx,
-            source_key,
-            "Claude Code",
-            recorded_at_ms,
-        )?;
+        if mode.is_full() {
+            crate::refresher::harness_drain::mark_current_in_tx(
+                tx,
+                source_key,
+                "Claude Code",
+                recorded_at_ms,
+            )?;
+        }
         Ok((
             (dispositions, thalamus_skips, newly_seen, quarantined_refs),
             true,

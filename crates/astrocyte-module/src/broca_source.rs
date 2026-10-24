@@ -256,17 +256,16 @@ fn read_snapshot(
         .execute_batch("PRAGMA query_only=ON; BEGIN DEFERRED")
         .map_err(|error| sqlite_error(stop, &context, error))?;
     let read = interrupt_on_stop(&connection, stop, || {
-        let (source_instance_id, source_epoch, high_water) = connection.query_row(
+        let mut meta = connection.prepare(
             "SELECT source_instance_id,source_epoch,high_water FROM export_meta WHERE id=1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
         )?;
+        let (source_instance_id, source_epoch, high_water) = meta.query_row([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
         let lineage = encode_lineage(&source_instance_id, source_epoch);
         let start = since
             .filter(|cursor| cursor.lineage == lineage)
@@ -284,6 +283,14 @@ fn read_snapshot(
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        #[cfg(all(test, target_os = "linux"))]
+        super::fast_lane_measure::note_vm_steps(
+            u64::try_from(
+                meta.get_status(rusqlite::StatementStatus::VmStep)
+                    + statement.get_status(rusqlite::StatementStatus::VmStep),
+            )
+            .unwrap(),
+        );
         Ok((source_instance_id, source_epoch, high_water, rows))
     });
     let finish = connection.execute_batch(if read.is_ok() { "COMMIT" } else { "ROLLBACK" });

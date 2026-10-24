@@ -8,6 +8,39 @@
 # exercise the changed path and fail, proving that the original guard is tested.
 
 [[control]]
+id = "fast-lane-idle-no-commit"
+guards = "An unchanged fast tail, including exact seed redeliveries, never commits"
+file = "crates/astrocyte-module/src/state.rs"
+old = 'if skip_unchanged && tx.total_changes() == before {'
+new = 'if false && skip_unchanged && tx.total_changes() == before { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/fast_lane_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::fast_lane_tests::idle_fast_lane_commits_nothing_and_keeps_full_drain_health"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "fast-lane-no-full-pass"
+guards = "A due OpenCode full pass cannot run between full refresher ticks"
+file = "crates/astrocyte-module/src/opencode_source.rs"
+old = '''        if mode.is_full()
+            && cache.choose(&signature, recorded_at_ms, &self.cadence) == OpenCodePass::Full
+        {'''
+new = '''        if cache.choose(&signature, recorded_at_ms, &self.cadence) == OpenCodePass::Full // NON-VACUITY BREAK
+        {'''
+test_file = "crates/astrocyte-module/src/fast_lane_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::fast_lane_tests::fast_lane_never_runs_due_full_passes_or_full_only_sources"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
 id = "jsonl-daily-literal-deadline"
 guards = "A due daily full-prefix check overrides a quiet window and catches old-byte rewrites"
 file = "crates/astrocyte-module/src/jsonl_schedule.rs"
@@ -914,8 +947,21 @@ test_file = "crates/astrocyte-module/src/opencode_source.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
-expect_red = ["astrocyte_module::refresher::opencode_source::tests::durable_cursor_advances_and_second_drain_reads_strictly_fewer_rows"]
-expect_message = '/left: 0\n right: 1/'
+expect_red = [
+  "refresher::fast_lane_tests::fast_lane_never_runs_due_full_passes_or_full_only_sources",
+  "refresher::fast_lane_tests::idle_fast_lane_commits_nothing_and_keeps_full_drain_health",
+  "refresher::opencode_source::tests::a_new_message_is_ingested_by_the_tail_on_the_next_tick_without_a_full_pass",
+  "refresher::opencode_source::tests::boundary_reread_is_an_exact_redelivery_without_a_redelivery_log_row",
+  "refresher::opencode_source::tests::durable_cursor_advances_and_second_drain_reads_strictly_fewer_rows",
+  "refresher::opencode_source::tests::finished_and_completed_states_map_to_identical_requests",
+  "refresher::opencode_source::tests::opencode_finish_is_stored_beside_a_byte_identical_ledger",
+  "refresher::opencode_source::tests::set_aside_good_opencode_rows_are_byte_identical",
+  "refresher::opencode_source::tests::set_aside_opencode_bad_row_keeps_good_rows_and_cursor",
+  "refresher::opencode_source::tests::tied_timestamp_boundary_is_inclusive_so_no_message_is_skipped",
+]
+# These tests compare event counts, COMMIT counts and ledger bytes, so their
+# common error message is an equality assertion rather than specific values.
+expect_message = '/assertion `left == right` failed/'
 only = false
 timeout_s = 600
 build_timeout_s = 1800
@@ -1244,8 +1290,8 @@ build_timeout_s = 1800
 id = "claude-workers-ack-isolation"
 guards = "A quarantined worker cannot prevent committed workers' acknowledgements or removed-entry pruning"
 file = "crates/astrocyte-module/src/claude_workers_source.rs"
-old = "if registry_valid {"
-new = "if degraded.is_none() { // NON-VACUITY BREAK"
+old = "if registry_valid && mode.is_full() {"
+new = "if degraded.is_none() && mode.is_full() { // NON-VACUITY BREAK"
 test_file = "crates/astrocyte-module/src/claude_workers_source.rs"
 runner = "cargo"
 package = "astrocyte-module"
@@ -1797,6 +1843,8 @@ expect_red = [
   "refresher::broca_source::tests::broca_model_step_cache_ops_match_memory_store_and_shared_cursors",
   "refresher::broca_source::tests::broca_model_step_backlog_page_reports_time_and_vm_steps",
   "refresher::broca_source::tests::broca_model_step_cursors_survive_reopen_and_expiry_without_reuse",
+  "refresher::fast_lane_tests::fast_lane_event_bytes_match_full_drain",
+  "refresher::fast_lane_tests::fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval",
 ]
 only = true
 timeout_s = 300

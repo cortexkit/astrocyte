@@ -101,26 +101,29 @@ without degrading health.
 
 ## Refresher loop
 
-`start_refresher` runs `run_tick` on a dedicated OS thread, once per
-`poll_interval_secs`. One tick:
+`start_refresher` runs full ticks on one OS thread every `poll_interval_secs`.
+Between ticks, `FAST_LANE_INTERVAL` (two seconds) runs OpenCode's rowid tail,
+BROCA's fact tail and JSONL readers for recently changed files. An idle tail
+commits nothing; only full drains advance `last_success_ms`. Both lanes share
+ingestion and post-commit memory refresh under the writer fence. Tails never
+run full passes or maintenance, and stop requests interrupt their reads as
+they do full ticks. One full tick:
 
-1. Connect a pending fusiform catalog and find where its history begins: from
-   `history_begins_at_ms` in `catalog.status`, or, when an older fusiform omits it,
-   from a refused time-zero `catalog.get`. Until then, step 4 waits.
-2. Drain OpenCode, Pi, Claude Code, Codex, Gemini CLI, Goose, Oh My Pi, Kimi CLI,
-   declared Claude workers and BROCA, skipping each producer `harness_ingest` turns
-   off. A skipped producer is not read and its `source_runtime` row is removed, as for
-   an absent harness store.
+1. Connect a pending fusiform catalog and find its history boundary through
+   `catalog.status`, falling back to a refused time-zero `catalog.get` for older
+   peers. Until then, step 4 waits.
+2. Drain harness stores and BROCA, except sources disabled by `harness_ingest`.
+   Skipped sources are not read and lose their `source_runtime` row, as for absent
+   stores.
 3. Consume insula quota events when `qta_connection_file` is set. A stoppable bus
-   thread binds the naming table's existing durable without provisioning topology.
-   It fetches `events_get` bodies and verifies exact-byte digests; account commits
-   or recorded snapshot obligations precede acks, and duplicates do not write again.
-   First notices, new epochs, gaps and invalid/missing bodies owe `usage.get` on the
-   next tick. Healthy readers backstop at the earlier of ten minutes or one cadence
-   before the unchanged freshness horizon (normally 90 seconds, versus 30-second
-   polling). Account commits reset freshness; empty pulls do not. Without a current
-   credential, attachment or recent successful pull, every tick polls as before.
-   Failed polls retain windows; capacity remains advisory.
+   thread uses subscriptions named by `cortexkit-bus-naming`. It verifies digests
+   and acknowledges only after an account commit or a durable request to fetch
+   a snapshot next tick. Duplicates do not write. First notices, epochs, gaps and
+   invalid bodies require `usage.get` next tick.
+   Healthy readers poll at ten minutes or one cadence before freshness expires,
+   whichever is earlier. Only account commits reset freshness. Without a current
+   credential, attachment or recent successful pull, every tick polls. Failed
+   polls retain windows; capacity remains advisory.
 4. Price queued events through `run_pricing_walk`. With no catalog configured,
    events are stored unpriced with reason `catalog_unconfigured`.
 5. Spend a bounded budget reconciling `pricing_pending` against the full ledger, to

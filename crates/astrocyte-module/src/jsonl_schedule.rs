@@ -44,6 +44,15 @@ pub(crate) struct FileStat {
 }
 
 impl FileStat {
+    pub(crate) fn fast_changed(&self, previous: Option<&WindowSchedule>, now_ms: i64) -> bool {
+        let recent = self
+            .modified
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|age| i64::try_from(age.as_millis()).ok())
+            .is_some_and(|modified| now_ms.saturating_sub(modified) <= 5 * 60 * 1000);
+        recent && previous.is_none_or(|window| !window.stat.same(self))
+    }
+
     pub(crate) fn read(path: &Path) -> std::io::Result<Self> {
         let file = std::fs::File::open(path)?;
         let metadata = file.metadata()?;

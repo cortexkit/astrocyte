@@ -8,7 +8,7 @@ harness's store location, ledger mapping and resume rules are in its
 
 ## 1. How a drain works
 
-On every refresher tick each source is drained independently: a failure
+On every full refresher tick each source is drained independently: a failure
 degrades only that source's health. A source whose store is absent is not
 ingested and has no `source_runtime` row. A source named in
 `harness_ingest.exclude` is not read at all (see [configuration](configuration.md)).
@@ -42,11 +42,31 @@ Once a file change is detected, every-tick checking resumes, and a due
 full-prefix check overrides deferral. Thus window rewrites and hidden appends
 are detected on the next tick for active files, or within five minutes for
 quiet files. Rewrites before the window are detected within 24 hours. Add
-drain latency to these bounds. Changed payloads with existing event identities
+full-drain latency to these bounds. Changed payloads with existing event identities
 reach quarantine rather than replacing ledger facts. Even an entirely deferred
-drain commits and advances `source_runtime.last_success_ms`; stopped or rolled
+full drain commits and advances `source_runtime.last_success_ms`; stopped or rolled
 back drains do not consume scheduled checks. Gemini JSON documents retain
-their separate hourly verification policy. OpenCode and Goose are unchanged.
+their separate hourly verification policy. Goose stays on full ticks.
+
+Between full ticks, the refresher's single writer runs a fast lane every two
+seconds (`FAST_LANE_INTERVAL`). It reads OpenCode's rowid tail and BROCA's
+`export_facts` tail. Pi, Oh My Pi, Claude Code, declared Claude workers, Codex,
+Kimi and Gemini JSONL files are read only when their size, modification time or
+identity changed and their modification time is within the last five minutes.
+The readers still discover and stat files, including new files. Codex archives
+and Gemini JSON documents stay on full ticks. Full-prefix verification, quiet-file
+checks, worker deletion acknowledgements, pricing, quota polling, multiplier
+work, audits and retention keep their existing schedules.
+
+A fast read uses the same event mapping, identities and commit ordering as a full
+drain, so later full reads deduplicate it normally. BROCA advances its durable
+fact cursor with new facts; OpenCode retains its separate in-memory rowid cursor.
+After startup or a detected store replacement, OpenCode waits for a full pass to
+establish the store identity. An idle fast cycle commits nothing, including when
+OpenCode's initial tail seed returns only exact redeliveries. Fast reads never
+advance `last_success_ms` or clear degraded health. Committed events refresh the
+recent-steps memory through the normal post-commit path. Both lanes run on the
+same refresher thread and use the same stop signal.
 
 Codex `.jsonl.zst` archives are immutable snapshots, not appendable streams.
 After a verified read, unchanged size, modification time and file identity skip

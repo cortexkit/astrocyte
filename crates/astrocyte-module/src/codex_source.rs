@@ -21,7 +21,7 @@ use astrocyte_readers::sessions::codex::{
     CodexPrefixCheck, CodexResumePoint,
 };
 
-use crate::refresher::SourceDrainError;
+use crate::refresher::{harness_drain::DrainMode, SourceDrainError};
 use crate::state::SharedState;
 
 pub(crate) const CODEX_SOURCE_KEY: &str = "codex";
@@ -143,10 +143,20 @@ impl CodexSource {
         recorded_at_ms: i64,
         stop: &AtomicBool,
     ) -> Result<CodexDrainOutcome, SourceDrainError> {
+        self.drain_in_lane(state, recorded_at_ms, stop, DrainMode::Full)
+    }
+
+    fn drain_in_lane(
+        &self,
+        state: &SharedState,
+        recorded_at_ms: i64,
+        stop: &AtomicBool,
+        mode: DrainMode,
+    ) -> Result<CodexDrainOutcome, SourceDrainError> {
         let home = match &self.home {
             CodexHome::Path(home) => home,
             CodexHome::Unresolved(reason) => {
-                crate::refresher::harness_drain::ensure_runtime_row(state, CODEX_SOURCE_KEY)?;
+                mode.ensure_runtime(state, CODEX_SOURCE_KEY)?;
                 return Err(reason.clone().into());
             }
         };
@@ -158,7 +168,7 @@ impl CodexSource {
                 Ok(_) => present.push((directory, root)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    crate::refresher::harness_drain::ensure_runtime_row(state, CODEX_SOURCE_KEY)?;
+                    mode.ensure_runtime(state, CODEX_SOURCE_KEY)?;
                     return Err(
                         format!("inspect Codex session root {}: {error}", root.display()).into(),
                     );
@@ -177,7 +187,7 @@ impl CodexSource {
                 &paths,
                 false,
             );
-            crate::refresher::harness_drain::remove_runtime_row(state, CODEX_SOURCE_KEY)?;
+            mode.remove_runtime(state, CODEX_SOURCE_KEY)?;
             return Ok(CodexDrainOutcome {
                 root_absent: true,
                 ..CodexDrainOutcome::default()
@@ -194,7 +204,7 @@ impl CodexSource {
             &paths,
             true,
         );
-        crate::refresher::harness_drain::ensure_runtime_row(state, CODEX_SOURCE_KEY)?;
+        mode.ensure_runtime(state, CODEX_SOURCE_KEY)?;
 
         let mut outcome = CodexDrainOutcome::default();
         let mut files = Vec::new();
@@ -219,6 +229,11 @@ impl CodexSource {
         let mut resume_points = HashMap::with_capacity(files.len());
         let mut verified_ms = HashMap::with_capacity(files.len());
         let mut windows = HashMap::with_capacity(files.len());
+        if !mode.is_full() {
+            resume_points.clone_from(&previous_points);
+            verified_ms.clone_from(&previous_verified);
+            windows.clone_from(&previous_windows);
+        }
         let mut requests = Vec::new();
         let mut set_aside = Vec::new();
         for path in files {
@@ -227,10 +242,17 @@ impl CodexSource {
             }
             let stat = crate::refresher::harness_drain::FileStat::read(&path)
                 .map_err(|error| format!("stat Codex session {}: {error}", path.display()))?;
+            if !mode.is_full()
+                && (is_codex_archive(&path)
+                    || !stat.fast_changed(previous_windows.get(&path), recorded_at_ms))
+            {
+                continue;
+            }
+            resume_points.remove(&path);
             let previous = previous_points.remove(&path);
             let archive = is_codex_archive(&path);
             let window = previous_windows.get(&path);
-            let check = if crate::refresher::harness_drain::prefix_check(
+            let check = if mode.prefix_check(
                 &path,
                 previous.is_some() || (archive && window.is_some()),
                 previous_verified.get(&path).copied(),
@@ -284,7 +306,7 @@ impl CodexSource {
                     reason,
                 }
             }));
-            if check == CodexPrefixCheck::Full || !parse.resumed {
+            if mode.is_full() && (check == CodexPrefixCheck::Full || !parse.resumed) {
                 verified_ms.insert(path.clone(), recorded_at_ms);
             } else if let Some(&verified) = previous_verified.get(&path) {
                 verified_ms.insert(path.clone(), verified);
@@ -327,6 +349,7 @@ impl CodexSource {
             recorded_at_ms,
             &mut outcome,
             &|| stop.load(Ordering::Relaxed),
+            mode,
         )?;
 
         let mut cache = self
@@ -341,6 +364,16 @@ impl CodexSource {
 }
 
 impl crate::refresher::harness_drain::HarnessSource for CodexSource {
+    fn drain_fast(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+    ) -> Result<(), SourceDrainError> {
+        self.drain_in_lane(state, at, stop, DrainMode::Fast)
+            .map(|_| ())
+    }
+
     fn source_key(&self) -> &'static str {
         CODEX_SOURCE_KEY
     }
@@ -489,12 +522,16 @@ fn record_requests(
     recorded_at_ms: i64,
     outcome: &mut CodexDrainOutcome,
     stop_requested: &dyn Fn() -> bool,
+    mode: DrainMode,
 ) -> Result<(), SourceDrainError> {
+    if !mode.has_work(requests.len(), set_aside.len()) {
+        return Ok(());
+    }
     use crate::refresher::harness_drain::{
         mark_current_in_tx, record_events_in_tx, record_set_aside_in_tx, RecordTally,
     };
     let mut stopped = false;
-    let committed = state.ordered_write(|tx| {
+    let committed = mode.write(state, |tx| {
         if requests.is_empty() && stop_requested() {
             stopped = true;
             return Err("Codex ingest stopped".into());
@@ -508,7 +545,9 @@ fn record_requests(
             stop_requested,
             &mut stopped,
         )?;
-        mark_current_in_tx(tx, CODEX_SOURCE_KEY, "Codex", recorded_at_ms)?;
+        if mode.is_full() {
+            mark_current_in_tx(tx, CODEX_SOURCE_KEY, "Codex", recorded_at_ms)?;
+        }
         Ok(((dispositions, newly_seen), true))
     });
     let (dispositions, newly_seen) = match committed {

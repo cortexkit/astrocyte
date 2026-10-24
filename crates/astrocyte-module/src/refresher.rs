@@ -13,6 +13,12 @@ mod claude_code_source;
 mod claude_workers_source;
 #[path = "codex_source.rs"]
 mod codex_source;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "fast_lane_measure.rs"]
+mod fast_lane_measure;
+#[cfg(test)]
+#[path = "fast_lane_tests.rs"]
+mod fast_lane_tests;
 #[path = "gemini_source.rs"]
 mod gemini_source;
 #[path = "goose_source.rs"]
@@ -318,6 +324,85 @@ pub(crate) mod harness_drain {
             recorded_at_ms: i64,
             stop: &AtomicBool,
         ) -> Result<Option<String>, SourceDrainError>;
+
+        /// Read only cheap tails. Sources without an incremental path stay on full ticks.
+        fn drain_fast(
+            &self,
+            _state: &SharedState,
+            _recorded_at_ms: i64,
+            _stop: &AtomicBool,
+        ) -> Result<(), SourceDrainError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum DrainMode {
+        Full,
+        Fast,
+    }
+
+    impl DrainMode {
+        pub(crate) fn write<T>(
+            self,
+            state: &SharedState,
+            operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(T, bool), String>,
+        ) -> Result<T, String> {
+            if self.is_full() {
+                state.ordered_write(operation)
+            } else {
+                state.ordered_tail_write(operation)
+            }
+        }
+        pub(crate) fn is_full(self) -> bool {
+            self == Self::Full
+        }
+
+        pub(crate) fn has_work(self, events: usize, evidence: usize) -> bool {
+            self.is_full() || events != 0 || evidence != 0
+        }
+
+        pub(crate) fn prefix_check(
+            self,
+            path: &Path,
+            resumed: bool,
+            verified: Option<i64>,
+            now: i64,
+        ) -> PrefixCheck {
+            if self.is_full() {
+                prefix_check(path, resumed, verified, now)
+            } else {
+                PrefixCheck::Window
+            }
+        }
+
+        pub(crate) fn verified_after(
+            self,
+            check: PrefixCheck,
+            resumed: bool,
+            verified: Option<i64>,
+            now: i64,
+        ) -> Option<i64> {
+            if self.is_full() {
+                verified_after(check, resumed, verified, now)
+            } else {
+                verified
+            }
+        }
+
+        pub(crate) fn ensure_runtime(self, state: &SharedState, key: &str) -> Result<(), String> {
+            if self.is_full() {
+                ensure_runtime_row(state, key)?;
+            }
+            Ok(())
+        }
+
+        pub(crate) fn remove_runtime(self, state: &SharedState, key: &str) -> Result<(), String> {
+            if self.is_full() {
+                remove_runtime_row(state, key)?;
+            }
+            Ok(())
+        }
     }
 
     pub(crate) const PAGE_LIMIT: u32 = 10_000;
@@ -451,32 +536,33 @@ pub(crate) mod harness_drain {
 
     /// Return `Ok(None)` for a missing path, but an error when it cannot be
     /// inspected: a failed inspection must not hide an unreadable source.
-    pub(crate) fn present_root<'a>(
+    pub(crate) fn present_root_in_lane<'a>(
         state: &SharedState,
         key: &str,
         root: &'a SourceRoot,
         label: &str,
+        mode: DrainMode,
     ) -> Result<Option<&'a Path>, String> {
         let path = match root {
             SourceRoot::Path(path) => path,
             SourceRoot::Unresolved(reason) => {
-                ensure_runtime_row(state, key)?;
+                mode.ensure_runtime(state, key)?;
                 return Err(reason.clone());
             }
         };
         match fs::metadata(path) {
             Ok(_) => {
                 record_source_discovery(state, key, path.display(), true);
-                ensure_runtime_row(state, key)?;
+                mode.ensure_runtime(state, key)?;
                 Ok(Some(path))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 record_source_discovery(state, key, path.display(), false);
-                remove_runtime_row(state, key)?;
+                mode.remove_runtime(state, key)?;
                 Ok(None)
             }
             Err(error) => {
-                ensure_runtime_row(state, key)?;
+                mode.ensure_runtime(state, key)?;
                 Err(format!("inspect {label} root {}: {error}", path.display()))
             }
         }
@@ -684,8 +770,29 @@ pub(crate) mod harness_drain {
         recorded_at_ms: i64,
         stop_requested: &dyn Fn() -> bool,
     ) -> Result<RecordTally, SourceDrainError> {
+        record_requests_in_lane(
+            state,
+            key,
+            requests,
+            recorded_at_ms,
+            stop_requested,
+            DrainMode::Full,
+        )
+    }
+
+    pub(crate) fn record_requests_in_lane(
+        state: &SharedState,
+        key: &str,
+        requests: &[EventRecordRequest],
+        recorded_at_ms: i64,
+        stop_requested: &dyn Fn() -> bool,
+        mode: DrainMode,
+    ) -> Result<RecordTally, SourceDrainError> {
+        if !mode.has_work(requests.len(), 0) {
+            return Ok(RecordTally::default());
+        }
         let mut stopped = false;
-        let committed = state.ordered_write(|tx| {
+        let committed = mode.write(state, |tx| {
             if requests.is_empty() && stop_requested() {
                 stopped = true;
                 return Err(format!("{key} ingest stopped"));
@@ -698,7 +805,9 @@ pub(crate) mod harness_drain {
                 stop_requested,
                 &mut stopped,
             )?;
-            mark_current_in_tx(tx, key, key, recorded_at_ms)?;
+            if mode.is_full() {
+                mark_current_in_tx(tx, key, key, recorded_at_ms)?;
+            }
             Ok((dispositions, true))
         });
         let dispositions = match committed {
@@ -789,9 +898,10 @@ pub(crate) mod harness_drain {
         map: impl Fn(Call) -> Result<EventRecordRequest, String>,
         add_counts: impl Fn(&mut C, &C) -> u64,
         offset: impl Fn(&P) -> u64,
+        mode: DrainMode,
     ) -> Result<JsonlDrainOutcome<C>, SourceDrainError> {
         let root_label = format!("{label} sessions");
-        let Some(root) = present_root(state, key, root, &root_label)? else {
+        let Some(root) = present_root_in_lane(state, key, root, &root_label, mode)? else {
             return Ok(JsonlDrainOutcome {
                 root_absent: true,
                 ..JsonlDrainOutcome::default()
@@ -818,9 +928,21 @@ pub(crate) mod harness_drain {
             }
             let stat = FileStat::read(&path)
                 .map_err(|error| format!("stat {label} session {}: {error}", path.display()))?;
+            if !mode.is_full() && !stat.fast_changed(previous_windows.get(&path), recorded_at_ms) {
+                if let Some(point) = previous_points.remove(&path) {
+                    next.resume.insert(path.clone(), point);
+                }
+                if let Some(verified) = previous_verified.get(&path) {
+                    next.prefix_verified_ms.insert(path.clone(), *verified);
+                }
+                if let Some(window) = previous_windows.get(&path) {
+                    next.windows.insert(path, window.clone());
+                }
+                continue;
+            }
             let point = previous_points.remove(&path);
             let verified = previous_verified.get(&path).copied();
-            let check = prefix_check(&path, point.is_some(), verified, recorded_at_ms);
+            let check = mode.prefix_check(&path, point.is_some(), verified, recorded_at_ms);
             let window = previous_windows.get(&path);
             if let Some(window) = window.filter(|window| {
                 point.is_some() && window.defer(&stat, recorded_at_ms, check == PrefixCheck::Full)
@@ -846,7 +968,8 @@ pub(crate) mod harness_drain {
                     next_offset == Some(stat.len),
                 ),
             );
-            if let Some(verified) = verified_after(check, parsed.resumed, verified, recorded_at_ms)
+            if let Some(verified) =
+                mode.verified_after(check, parsed.resumed, verified, recorded_at_ms)
             {
                 next.prefix_verified_ms.insert(path.clone(), verified);
             }
@@ -865,9 +988,14 @@ pub(crate) mod harness_drain {
                 requests.push(map(call)?);
             }
         }
-        let tally = record_requests(state, key, &requests, recorded_at_ms, &|| {
-            stop.load(std::sync::atomic::Ordering::Relaxed)
-        })?;
+        let tally = record_requests_in_lane(
+            state,
+            key,
+            &requests,
+            recorded_at_ms,
+            &|| stop.load(std::sync::atomic::Ordering::Relaxed),
+            mode,
+        )?;
         outcome.rows_recorded = tally.recorded;
         outcome.exact_redeliveries = tally.exact_redeliveries;
         outcome.quarantined_redeliveries = tally.quarantined_redeliveries;
@@ -907,6 +1035,24 @@ pub fn drain_once(
     limit: u32,
     now_ms: i64,
 ) -> Result<DrainOutcome, PullError> {
+    drain_once_in_lane(
+        state,
+        source,
+        source_key,
+        limit,
+        now_ms,
+        harness_drain::DrainMode::Full,
+    )
+}
+
+fn drain_once_in_lane(
+    state: &SharedState,
+    source: &dyn SourceClient,
+    source_key: &str,
+    limit: u32,
+    now_ms: i64,
+    mode: harness_drain::DrainMode,
+) -> Result<DrainOutcome, PullError> {
     let current = durable_cursor(state, source_key).map_err(PullError::Store)?;
     // The read is the only I/O boundary, and is intentionally before the
     // transaction below.
@@ -917,7 +1063,8 @@ pub fn drain_once(
     let page = match source.pull(current.clone(), limit) {
         Err(PullError::SourceAbsent) => {
             harness_drain::record_source_discovery(state, source_key, &discovery_path, false);
-            harness_drain::remove_runtime_row(state, source_key).map_err(PullError::Store)?;
+            mode.remove_runtime(state, source_key)
+                .map_err(PullError::Store)?;
             return Ok(DrainOutcome::default());
         }
         result => {
@@ -928,6 +1075,12 @@ pub fn drain_once(
     };
     validate_page(&page)?;
     source.refuse_regression(current.as_ref(), &page)?;
+    if !mode.has_work(
+        page.events.len() + page.model_steps.len(),
+        page.set_aside.len(),
+    ) {
+        return Ok(DrainOutcome::default());
+    }
     let cursor = &page.cursor;
     let high_water = &page.high_water;
     // The schema stores one lineage for both ordinals. If the producer already
@@ -939,8 +1092,8 @@ pub fn drain_once(
         cursor.ordinal
     };
     let source_key = source_key.to_owned();
-    let (outcome, newly_seen) = state
-        .ordered_write(|tx| {
+    let (outcome, newly_seen) = mode
+        .write(state, |tx| {
             // The row is removed while the producer's store is absent or the
             // producer is excluded, so the first drain after either recreates
             // it in the same transaction as the cursor it records.
@@ -990,7 +1143,8 @@ pub fn drain_once(
                 .execute(
                     "UPDATE source_runtime
                  SET lineage=?2, consumed_ordinal=?3, high_water_ordinal=?4,
-                     last_success_ms=?5, pending_known=?6, pending_unknown=?7
+                      last_success_ms=CASE WHEN ?8 THEN ?5 ELSE last_success_ms END,
+                      pending_known=?6, pending_unknown=?7
                  WHERE source_key=?1",
                     params![
                         source_key,
@@ -1000,6 +1154,7 @@ pub fn drain_once(
                         now_ms,
                         page.pending_known,
                         i64::from(page.pending_unknown),
+                        mode.is_full(),
                     ],
                 )
                 .map_err(|error| format!("record source runtime: {error}"))?;
@@ -1718,12 +1873,116 @@ fn run_loop_full(
             multiplier.tick(&state, pending_catalog.is_some(), current_time_ms());
         }
         let started = std::time::Instant::now();
+        let mut next_fast = FAST_LANE_INTERVAL;
         #[cfg(test)]
         state.note_interval_wait_for_test();
         while !stop.load(Ordering::Relaxed) && started.elapsed() < interval {
             crate::quota_events::drain(&state, &stop);
+            fast_lane_if_due(
+                &state,
+                &producers,
+                &file_sources,
+                &stop,
+                started.elapsed(),
+                interval,
+                &mut next_fast,
+            );
             std::thread::sleep(
                 Duration::from_millis(250).min(interval.saturating_sub(started.elapsed())),
+            );
+        }
+    }
+}
+
+const FAST_LANE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The elapsed-time argument lets tests advance the same scheduler without wall-clock sleeps.
+fn fast_lane_if_due(
+    state: &SharedState,
+    producers: &[Producer],
+    sources: &FileSources,
+    stop: &AtomicBool,
+    elapsed: Duration,
+    full_interval: Duration,
+    next_fast: &mut Duration,
+) {
+    #[cfg(all(test, target_os = "linux"))]
+    if !fast_lane_measure::enabled() {
+        return;
+    }
+    if elapsed < *next_fast || elapsed >= full_interval || stop.load(Ordering::Relaxed) {
+        return;
+    }
+    run_fast_lane(state, producers, sources, current_time_ms(), stop);
+    // Do not replay missed cycles after a slow read.
+    *next_fast = elapsed.saturating_add(FAST_LANE_INTERVAL);
+}
+
+fn run_fast_lane(
+    state: &SharedState,
+    producers: &[Producer],
+    sources: &FileSources,
+    at: i64,
+    stop: &AtomicBool,
+) {
+    #[cfg(all(test, target_os = "linux"))]
+    let _measurement = fast_lane_measure::cycle(true);
+    let ingest = state.desired_config().harness_ingest;
+    let older: [Option<&dyn harness_drain::HarnessSource>; 4] = [
+        sources
+            .opencode
+            .as_deref()
+            .map(|source| source as &dyn harness_drain::HarnessSource),
+        sources
+            .pi
+            .as_deref()
+            .map(|source| source as &dyn harness_drain::HarnessSource),
+        sources
+            .claude_code
+            .as_deref()
+            .map(|source| source as &dyn harness_drain::HarnessSource),
+        sources
+            .codex
+            .as_deref()
+            .map(|source| source as &dyn harness_drain::HarnessSource),
+    ];
+    for source in older
+        .into_iter()
+        .flatten()
+        .chain(sources.harnesses.iter().map(AsRef::as_ref))
+    {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if !ingest.ingests(source.source_key()) {
+            continue;
+        }
+        if let Err(SourceDrainError::Failed(error)) = source.drain_fast(state, at, stop) {
+            // Full drains own health and retries; a failed tail must not make a source look fresh.
+            tracing::debug!(source = source.source_key(), %error, "fast tail read failed");
+        }
+    }
+    for producer in producers {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if producer.source_key != broca_source::BROCA_SOURCE_KEY
+            || !ingest.ingests(&producer.source_key)
+        {
+            continue;
+        }
+        if let Err(error) = drain_once_in_lane(
+            state,
+            producer.client.as_ref(),
+            &producer.source_key,
+            broca_source::PAGE_LIMIT,
+            at,
+            harness_drain::DrainMode::Fast,
+        ) {
+            tracing::debug!(
+                source = producer.source_key,
+                ?error,
+                "fast producer tail read failed"
             );
         }
     }
@@ -1819,6 +2078,8 @@ fn run_tick(
     reconciler: &mut QueueReconciler,
     stop: &AtomicBool,
 ) {
+    #[cfg(all(test, target_os = "linux"))]
+    let _measurement = fast_lane_measure::cycle(false);
     if let Some(pending) = pending_catalog.as_ref() {
         match pending.try_connect(state) {
             Ok(true) => *pending_catalog = None,

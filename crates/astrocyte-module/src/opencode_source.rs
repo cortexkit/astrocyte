@@ -1,5 +1,6 @@
 //! OpenCode's on-disk SQLite producer and ledger ingest mapping.
 
+use super::harness_drain::DrainMode;
 use std::collections::BTreeMap;
 #[cfg(any(test, feature = "test-support"))]
 use std::ffi::OsString;
@@ -368,10 +369,21 @@ impl OpenCodeSource {
         page_limit: usize,
         stop: &AtomicBool,
     ) -> Result<OpenCodeDrainOutcome, SourceDrainError> {
+        self.drain_in_lane(state, recorded_at_ms, page_limit, stop, DrainMode::Full)
+    }
+
+    pub(crate) fn drain_in_lane(
+        &self,
+        state: &SharedState,
+        recorded_at_ms: i64,
+        page_limit: usize,
+        stop: &AtomicBool,
+        mode: DrainMode,
+    ) -> Result<OpenCodeDrainOutcome, SourceDrainError> {
         let root = match &self.root {
             OpenCodeRoot::Path(root) => root,
             OpenCodeRoot::Unresolved(reason) => {
-                crate::refresher::harness_drain::ensure_runtime_row(state, OPENCODE_SOURCE_KEY)?;
+                mode.ensure_runtime(state, OPENCODE_SOURCE_KEY)?;
                 return Err(reason.clone().into());
             }
         };
@@ -384,7 +396,7 @@ impl OpenCodeSource {
                     root.display(),
                     true,
                 );
-                crate::refresher::harness_drain::ensure_runtime_row(state, OPENCODE_SOURCE_KEY)?;
+                mode.ensure_runtime(state, OPENCODE_SOURCE_KEY)?;
                 database
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -394,14 +406,14 @@ impl OpenCodeSource {
                     root.display(),
                     false,
                 );
-                crate::refresher::harness_drain::remove_runtime_row(state, OPENCODE_SOURCE_KEY)?;
+                mode.remove_runtime(state, OPENCODE_SOURCE_KEY)?;
                 return Ok(OpenCodeDrainOutcome {
                     root_absent: true,
                     ..OpenCodeDrainOutcome::default()
                 });
             }
             Err(error) => {
-                crate::refresher::harness_drain::ensure_runtime_row(state, OPENCODE_SOURCE_KEY)?;
+                mode.ensure_runtime(state, OPENCODE_SOURCE_KEY)?;
                 return Err(
                     format!("inspect OpenCode database {}: {error}", root.display()).into(),
                 );
@@ -419,7 +431,17 @@ impl OpenCodeSource {
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if cache.choose(&signature, recorded_at_ms, &self.cadence) == OpenCodePass::Full {
+        if !mode.is_full()
+            && (cache.front_row_id.is_none()
+                || cache
+                    .signature
+                    .is_some_and(|previous| signature.replaces(&previous)))
+        {
+            return Ok(OpenCodeDrainOutcome::default());
+        }
+        if mode.is_full()
+            && cache.choose(&signature, recorded_at_ms, &self.cadence) == OpenCodePass::Full
+        {
             return self.full_pass(
                 &mut cache,
                 signature,
@@ -439,11 +461,22 @@ impl OpenCodeSource {
             limit: page_limit,
         };
         let mut page = read_opencode_tail(root, &request, stop).map_err(read_error)?;
+        // A known-empty store can acquire its first row between full ticks. There
+        // is no old rowid identity to contradict when the tail starts at zero.
+        if !mode.is_full() && cache.front_row_id == Some(None) && page.start_rowid == 0 {
+            cache.front_row_id = Some(page.front_row_id.clone());
+        }
         if cache.tail_is_stale(&page) {
             // Nothing from the tail read is committed: its rowids may belong
             // to another store. The full pass in this same tick works out the
             // lineage again and reads from the durable cursor.
             cache.forget_tail();
+            if !mode.is_full() {
+                return Ok(OpenCodeDrainOutcome {
+                    cost: page.cost,
+                    ..OpenCodeDrainOutcome::default()
+                });
+            }
             let mut outcome = self.full_pass(
                 &mut cache,
                 signature,
@@ -464,10 +497,15 @@ impl OpenCodeSource {
             })
             .collect();
         let requests = map_messages(root, std::mem::take(&mut page.messages), &mut set_aside);
-        let committed =
-            commit_page_with_evidence(state, &requests, &set_aside, None, recorded_at_ms, &|| {
-                stop.load(Ordering::Relaxed)
-            })?;
+        let committed = commit_page_in_lane(
+            state,
+            &requests,
+            &set_aside,
+            None,
+            recorded_at_ms,
+            &|| stop.load(Ordering::Relaxed),
+            mode,
+        )?;
         cache.after_tail(signature, &page, &reread, recorded_at_ms, &self.cadence);
         let mut outcome = OpenCodeDrainOutcome {
             pass: Some(OpenCodePass::Tail),
@@ -547,6 +585,19 @@ impl OpenCodeSource {
 }
 
 impl crate::refresher::harness_drain::HarnessSource for OpenCodeSource {
+    fn drain_fast(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+    ) -> Result<(), SourceDrainError> {
+        let outcome = self.drain_in_lane(state, at, PAGE_LIMIT, stop, DrainMode::Fast)?;
+        #[cfg(all(test, target_os = "linux"))]
+        super::fast_lane_measure::note_vm_steps(outcome.cost.vm_steps);
+        let _ = outcome;
+        Ok(())
+    }
+
     fn source_key(&self) -> &'static str {
         OPENCODE_SOURCE_KEY
     }
@@ -558,6 +609,8 @@ impl crate::refresher::harness_drain::HarnessSource for OpenCodeSource {
         stop: &AtomicBool,
     ) -> Result<Option<String>, SourceDrainError> {
         let outcome = self.drain(state, recorded_at_ms, stop)?;
+        #[cfg(all(test, target_os = "linux"))]
+        super::fast_lane_measure::note_vm_steps(outcome.cost.vm_steps);
         Ok((outcome.quarantined_redeliveries > 0).then(|| {
             format!(
                 "{} OpenCode deliveries were quarantined",
@@ -640,8 +693,31 @@ fn commit_page_with_evidence(
     recorded_at_ms: i64,
     stop_requested: &dyn Fn() -> bool,
 ) -> Result<Vec<RecordDisposition>, SourceDrainError> {
+    commit_page_in_lane(
+        state,
+        requests,
+        set_aside,
+        cursor,
+        recorded_at_ms,
+        stop_requested,
+        DrainMode::Full,
+    )
+}
+
+fn commit_page_in_lane(
+    state: &SharedState,
+    requests: &[EventRecordRequest],
+    set_aside: &[crate::refresher::SetAsideRecord],
+    cursor: Option<&PageCursor<'_>>,
+    recorded_at_ms: i64,
+    stop_requested: &dyn Fn() -> bool,
+    mode: DrainMode,
+) -> Result<Vec<RecordDisposition>, SourceDrainError> {
+    if !mode.has_work(requests.len(), set_aside.len()) {
+        return Ok(Vec::new());
+    }
     let mut stopped = false;
-    let committed = state.ordered_write(|tx| {
+    let committed = mode.write(state, |tx| {
         if requests.is_empty() && stop_requested() {
             stopped = true;
             return Err("OpenCode ingest stopped".into());
@@ -668,29 +744,33 @@ fn commit_page_with_evidence(
             .map_err(|error| format!("record OpenCode event: {error:?}"))?;
             dispositions.push(result.disposition);
         }
-        let updated = match cursor {
-            Some(cursor) => {
-                let pending_unknown =
-                    i64::from(cursor.consumed_ordinal < cursor.high_water_ordinal);
-                tx.execute(
-                    "UPDATE source_runtime
+        let updated = if !mode.is_full() {
+            Ok(1)
+        } else {
+            match cursor {
+                Some(cursor) => {
+                    let pending_unknown =
+                        i64::from(cursor.consumed_ordinal < cursor.high_water_ordinal);
+                    tx.execute(
+                        "UPDATE source_runtime
                      SET lineage=?2,consumed_ordinal=?3,high_water_ordinal=?4,
                          last_success_ms=?5,pending_known=0,pending_unknown=?6
                      WHERE source_key=?1",
-                    params![
-                        OPENCODE_SOURCE_KEY,
-                        cursor.lineage,
-                        cursor.consumed_ordinal,
-                        cursor.high_water_ordinal,
-                        recorded_at_ms,
-                        pending_unknown,
-                    ],
-                )
+                        params![
+                            OPENCODE_SOURCE_KEY,
+                            cursor.lineage,
+                            cursor.consumed_ordinal,
+                            cursor.high_water_ordinal,
+                            recorded_at_ms,
+                            pending_unknown,
+                        ],
+                    )
+                }
+                None => tx.execute(
+                    "UPDATE source_runtime SET last_success_ms=?2 WHERE source_key=?1",
+                    params![OPENCODE_SOURCE_KEY, recorded_at_ms],
+                ),
             }
-            None => tx.execute(
-                "UPDATE source_runtime SET last_success_ms=?2 WHERE source_key=?1",
-                params![OPENCODE_SOURCE_KEY, recorded_at_ms],
-            ),
         }
         .map_err(|error| format!("record OpenCode source runtime: {error}"))?;
         if updated != 1 {

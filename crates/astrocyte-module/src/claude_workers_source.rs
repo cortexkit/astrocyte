@@ -79,6 +79,16 @@ impl ClaudeWorkersSource {
         at: i64,
         stop: &AtomicBool,
     ) -> Result<Option<String>, SourceDrainError> {
+        self.drain_in_lane(state, at, stop, harness_drain::DrainMode::Full)
+    }
+
+    fn drain_in_lane(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+        mode: harness_drain::DrainMode,
+    ) -> Result<Option<String>, SourceDrainError> {
         let paths = self
             .paths
             .as_ref()
@@ -111,16 +121,17 @@ impl ClaudeWorkersSource {
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                harness_drain::remove_runtime_row(state, SOURCE_KEY)?;
+                mode.remove_runtime(state, SOURCE_KEY)?;
                 cache.roots.clear();
                 cache.resumes.clear();
                 cache.blocked.clear();
-                if !cache
-                    .ack
-                    .as_ref()
-                    .expect("ack loaded")
-                    .read_through
-                    .is_empty()
+                if mode.is_full()
+                    && !cache
+                        .ack
+                        .as_ref()
+                        .expect("ack loaded")
+                        .read_through
+                        .is_empty()
                 {
                     update_ack(
                         paths,
@@ -136,7 +147,7 @@ impl ClaudeWorkersSource {
             Err(error) => degraded = Some(format!("read Claude worker roots: {error}")),
         }
         let registry_valid = degraded.is_none();
-        harness_drain::ensure_runtime_row(state, SOURCE_KEY)?;
+        mode.ensure_runtime(state, SOURCE_KEY)?;
         let folder = fs::canonicalize(paths.roots.parent().expect("roots parent"))
             .map_err(|e| format!("resolve Claude worker folder: {e}"))?;
         let roots = cache.roots.clone();
@@ -193,6 +204,7 @@ impl ClaudeWorkersSource {
                     astrocyte_readers::sessions::claudecode::CLAUDE_CODE_QUIET_WINDOW_MS,
                     Some(&root.work_class),
                     stop,
+                    mode,
                 )?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     // A worker may exit without ever creating a transcript.
@@ -232,7 +244,7 @@ impl ClaudeWorkersSource {
             set_aside.extend(read.set_aside);
             next_resumes.insert(canonical, read.cache);
         }
-        let commit = claude_code_source::record_requests(
+        let commit = claude_code_source::record_requests_in_lane(
             state,
             SOURCE_KEY,
             &requests,
@@ -240,6 +252,7 @@ impl ClaudeWorkersSource {
             at,
             &mut outcome,
             &|| stop.load(Ordering::Relaxed),
+            mode,
         );
         commit?;
         cache.resumes = next_resumes;
@@ -256,7 +269,7 @@ impl ClaudeWorkersSource {
         // A malformed or unreadable roots file cannot authorize deletion. Publish
         // acknowledgements only after a valid roots file was read and the ledger
         // transaction recording its calls and last-success time has committed.
-        if registry_valid {
+        if registry_valid && mode.is_full() {
             ready.retain(|id| !cache.blocked.contains(id));
             let declared: HashSet<_> = roots.iter().map(|r| r.worker_id.as_str()).collect();
             let mut entries: BTreeMap<String, i64> = cache
@@ -285,6 +298,16 @@ impl ClaudeWorkersSource {
 }
 
 impl HarnessSource for ClaudeWorkersSource {
+    fn drain_fast(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+    ) -> Result<(), SourceDrainError> {
+        self.drain_in_lane(state, at, stop, harness_drain::DrainMode::Fast)
+            .map(|_| ())
+    }
+
     fn source_key(&self) -> &'static str {
         SOURCE_KEY
     }

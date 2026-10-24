@@ -127,15 +127,34 @@ fn sqlite_read_failure<E>(error: rusqlite::Error) -> StoreFailure<E> {
 }
 
 /// Run one ordered write transaction on `conn`: BEGIN, the caller's
-/// operation, COMMIT. Any error rolls the transaction back when it drops.
+/// operation, COMMIT. Tail reads may roll back an unchanged transaction instead.
+/// Any error rolls the transaction back when it drops.
 fn run_ordered_transaction<T, E>(
     conn: &Connection,
     operation: impl FnOnce(&Transaction<'_>) -> Result<(T, bool), E>,
+    skip_unchanged: bool,
 ) -> Result<(T, bool), StoreFailure<E>> {
     let tx = conn.unchecked_transaction().map_err(sqlite_write_failure)?;
+    let before = tx.total_changes();
     let output = operation(&tx).map_err(StoreFailure::Operation)?;
+    if skip_unchanged && tx.total_changes() == before {
+        tx.rollback().map_err(sqlite_write_failure)?;
+        return Ok((output.0, false));
+    }
     tx.commit().map_err(sqlite_write_failure)?;
+    #[cfg(test)]
+    TRANSACTION_COMMITS.with(|count| count.set(count.get() + 1));
     Ok(output)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRANSACTION_COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn transaction_commits_for_test() -> usize {
+    TRANSACTION_COMMITS.with(std::cell::Cell::get)
 }
 
 /// Render a SQLite error with its text and, when SQLite supplied one, its
@@ -407,7 +426,19 @@ impl SharedState {
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> Result<(T, bool), String>,
     ) -> Result<T, String> {
-        self.ordered_write_split(operation)
+        self.ordered_write_split(operation, false)
+            .map_err(|failure| match failure {
+                StoreFailure::Operation(error) | StoreFailure::Store(error) => error,
+            })
+    }
+
+    /// Tail reads can re-emit already recorded events while seeding their in-memory cursor.
+    /// Roll back a transaction with no SQLite changes rather than committing an empty drain.
+    pub(crate) fn ordered_tail_write<T>(
+        &self,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<(T, bool), String>,
+    ) -> Result<T, String> {
+        self.ordered_write_split(operation, true)
             .map_err(|failure| match failure {
                 StoreFailure::Operation(error) | StoreFailure::Store(error) => error,
             })
@@ -439,7 +470,7 @@ impl SharedState {
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> Result<(T, bool), (String, String)>,
     ) -> Result<T, (String, String)> {
-        self.ordered_write_split(operation)
+        self.ordered_write_split(operation, false)
             .map_err(|failure| match failure {
                 StoreFailure::Operation(refusal) => refusal,
                 StoreFailure::Store(error) => ("internal".into(), error),
@@ -453,6 +484,7 @@ impl SharedState {
     fn ordered_write_split<T, E>(
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> Result<(T, bool), E>,
+        skip_unchanged: bool,
     ) -> Result<T, StoreFailure<E>> {
         let _crash_guard = WriteCrashGuard(self);
         let _writer = self.0.writer.lock().map_err(|_| {
@@ -467,7 +499,7 @@ impl SharedState {
                 let mut outcome = None;
                 store
                     .with_conn(|conn| {
-                        outcome = Some(run_ordered_transaction(conn, operation));
+                        outcome = Some(run_ordered_transaction(conn, operation, skip_unchanged));
                         Ok(())
                     })
                     .map_err(|error| StoreFailure::Store(format!("store write: {error}")))?;
@@ -482,7 +514,7 @@ impl SharedState {
                 let guard = connection
                     .lock()
                     .map_err(|_| StoreFailure::Store("store mutex poisoned".into()))?;
-                run_ordered_transaction(&guard, operation)?
+                run_ordered_transaction(&guard, operation, skip_unchanged)?
             }
         };
         if changed {

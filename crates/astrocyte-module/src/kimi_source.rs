@@ -4,6 +4,7 @@
 //! `<GROUP>/<SESSION_UUID>/wire.jsonl`). Each `StatusUpdate` is one
 //! response; the reader is `astrocyte_readers::sessions::kimi`.
 
+use super::harness_drain::DrainMode;
 #[cfg(test)]
 use crate::refresher::harness_drain::files_below;
 #[cfg(test)]
@@ -101,6 +102,16 @@ impl KimiSource {
         recorded_at_ms: i64,
         stop: &AtomicBool,
     ) -> Result<KimiDrainOutcome, SourceDrainError> {
+        self.drain_in_lane(state, recorded_at_ms, stop, DrainMode::Full)
+    }
+
+    fn drain_in_lane(
+        &self,
+        state: &SharedState,
+        recorded_at_ms: i64,
+        stop: &AtomicBool,
+        mode: DrainMode,
+    ) -> Result<KimiDrainOutcome, SourceDrainError> {
         drain_jsonl(
             state,
             KIMI_SOURCE_KEY,
@@ -126,11 +137,22 @@ impl KimiSource {
                 counts.skipped_lines
             },
             astrocyte_readers::sessions::kimi::KimiResumePoint::offset,
+            mode,
         )
     }
 }
 
 impl HarnessSource for KimiSource {
+    fn drain_fast(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+    ) -> Result<(), SourceDrainError> {
+        self.drain_in_lane(state, at, stop, DrainMode::Fast)
+            .map(|_| ())
+    }
+
     fn source_key(&self) -> &'static str {
         KIMI_SOURCE_KEY
     }

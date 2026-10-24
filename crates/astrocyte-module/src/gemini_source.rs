@@ -29,8 +29,8 @@ use astrocyte_readers::sessions::gemini::{
 };
 
 use crate::refresher::harness_drain::{
-    derived_measurement, files_below, health_reason, prefix_check, present_root, record_requests,
-    verbatim_measurement, verified_after, FileStat, HarnessSource, ResumeCache,
+    derived_measurement, files_below, health_reason, present_root_in_lane, record_requests_in_lane,
+    verbatim_measurement, DrainMode, FileStat, HarnessSource, ResumeCache,
     SourceRoot as GeminiRoot, WindowSchedule,
 };
 use crate::refresher::SourceDrainError;
@@ -156,7 +156,19 @@ impl GeminiSource {
         recorded_at_ms: i64,
         stop: &AtomicBool,
     ) -> Result<GeminiDrainOutcome, SourceDrainError> {
-        let Some(root) = present_root(state, GEMINI_SOURCE_KEY, &self.root, "Gemini CLI")? else {
+        self.drain_in_lane(state, recorded_at_ms, stop, DrainMode::Full)
+    }
+
+    fn drain_in_lane(
+        &self,
+        state: &SharedState,
+        recorded_at_ms: i64,
+        stop: &AtomicBool,
+        mode: DrainMode,
+    ) -> Result<GeminiDrainOutcome, SourceDrainError> {
+        let Some(root) =
+            present_root_in_lane(state, GEMINI_SOURCE_KEY, &self.root, "Gemini CLI", mode)?
+        else {
             return Ok(GeminiDrainOutcome {
                 root_absent: true,
                 ..GeminiDrainOutcome::default()
@@ -182,6 +194,11 @@ impl GeminiSource {
             ..GeminiDrainOutcome::default()
         };
         let mut next = GeminiCache::default();
+        if !mode.is_full() {
+            next.documents.clone_from(&previous_documents);
+            next.jsonl.prefix_verified_ms.clone_from(&previous_verified);
+            next.jsonl.windows.clone_from(&previous_windows);
+        }
         let mut calls = Vec::new();
         for path in files {
             if stop.load(Ordering::Relaxed) {
@@ -195,7 +212,16 @@ impl GeminiSource {
                 let verified = previous_verified.get(&path).copied();
                 let stat = FileStat::read(&path)
                     .map_err(|error| format!("stat Gemini JSONL {}: {error}", path.display()))?;
-                let check = prefix_check(&path, previous.is_some(), verified, recorded_at_ms);
+                if !mode.is_full()
+                    && !stat.fast_changed(previous_windows.get(&path), recorded_at_ms)
+                {
+                    if let Some(previous) = previous {
+                        next.jsonl.resume.insert(path, previous);
+                    }
+                    continue;
+                }
+                next.jsonl.resume.remove(&path);
+                let check = mode.prefix_check(&path, previous.is_some(), verified, recorded_at_ms);
                 let window = previous_windows.get(&path);
                 if let Some(window) = window.filter(|window| {
                     previous.is_some()
@@ -233,7 +259,7 @@ impl GeminiSource {
                     ),
                 );
                 if let Some(verified) =
-                    verified_after(check, parse.resumed, verified, recorded_at_ms)
+                    mode.verified_after(check, parse.resumed, verified, recorded_at_ms)
                 {
                     next.jsonl.prefix_verified_ms.insert(path.clone(), verified);
                 }
@@ -246,6 +272,9 @@ impl GeminiSource {
                 calls.extend(parse.calls);
                 parse.counts
             } else {
+                if !mode.is_full() {
+                    continue;
+                }
                 match read_document(
                     &path,
                     previous_documents.get(&path),
@@ -278,9 +307,14 @@ impl GeminiSource {
             .map(map_call)
             .collect::<Result<Vec<_>, _>>()?;
 
-        let tally = record_requests(state, GEMINI_SOURCE_KEY, &requests, recorded_at_ms, &|| {
-            stop.load(Ordering::Relaxed)
-        })?;
+        let tally = record_requests_in_lane(
+            state,
+            GEMINI_SOURCE_KEY,
+            &requests,
+            recorded_at_ms,
+            &|| stop.load(Ordering::Relaxed),
+            mode,
+        )?;
         outcome.rows_recorded = tally.recorded;
         outcome.exact_redeliveries = tally.exact_redeliveries;
         outcome.quarantined_redeliveries = tally.quarantined_redeliveries;
@@ -353,6 +387,16 @@ fn read_document(
 }
 
 impl HarnessSource for GeminiSource {
+    fn drain_fast(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+    ) -> Result<(), SourceDrainError> {
+        self.drain_in_lane(state, at, stop, DrainMode::Fast)
+            .map(|_| ())
+    }
+
     fn source_key(&self) -> &'static str {
         GEMINI_SOURCE_KEY
     }

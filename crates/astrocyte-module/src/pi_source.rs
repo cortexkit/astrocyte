@@ -1,5 +1,6 @@
 //! Pi's on-disk session producer and `UnifiedMessage` ingest mapping.
 
+use super::harness_drain::DrainMode;
 use std::collections::{BTreeMap, HashMap};
 #[cfg(any(test, feature = "test-support"))]
 use std::ffi::OsString;
@@ -238,7 +239,7 @@ impl PiSource {
         recorded_at_ms: i64,
         stop: &AtomicBool,
     ) -> Result<PiDrainOutcome, SourceDrainError> {
-        self.drain_inner(state, recorded_at_ms, None, stop)
+        self.drain_inner(state, recorded_at_ms, None, stop, DrainMode::Full)
     }
 
     fn drain_inner(
@@ -247,11 +248,12 @@ impl PiSource {
         recorded_at_ms: i64,
         occurred_window: Option<(i64, i64)>,
         stop: &AtomicBool,
+        mode: DrainMode,
     ) -> Result<PiDrainOutcome, SourceDrainError> {
         let root = match &self.root {
             PiRoot::Path(root) => root,
             PiRoot::Unresolved(reason) => {
-                crate::refresher::harness_drain::ensure_runtime_row(state, PI_SOURCE_KEY)?;
+                mode.ensure_runtime(state, PI_SOURCE_KEY)?;
                 return Err(reason.clone().into());
             }
         };
@@ -264,7 +266,7 @@ impl PiSource {
                     root.display(),
                     true,
                 );
-                crate::refresher::harness_drain::ensure_runtime_row(state, PI_SOURCE_KEY)?;
+                mode.ensure_runtime(state, PI_SOURCE_KEY)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 crate::refresher::harness_drain::record_source_discovery(
@@ -273,14 +275,14 @@ impl PiSource {
                     root.display(),
                     false,
                 );
-                crate::refresher::harness_drain::remove_runtime_row(state, PI_SOURCE_KEY)?;
+                mode.remove_runtime(state, PI_SOURCE_KEY)?;
                 return Ok(PiDrainOutcome {
                     root_absent: true,
                     ..PiDrainOutcome::default()
                 });
             }
             Err(error) => {
-                crate::refresher::harness_drain::ensure_runtime_row(state, PI_SOURCE_KEY)?;
+                mode.ensure_runtime(state, PI_SOURCE_KEY)?;
                 return Err(format!("inspect Pi session root {}: {error}", root.display()).into());
             }
         }
@@ -310,6 +312,12 @@ impl PiSource {
         let mut verified_ms = HashMap::with_capacity(files.len());
         let mut header_scans = HashMap::with_capacity(files.len());
         let mut windows = HashMap::with_capacity(files.len());
+        if !mode.is_full() {
+            resume_points.clone_from(&cached_resume);
+            verified_ms.clone_from(&cached_verified);
+            header_scans.clone_from(&cached_header_scans);
+            windows.clone_from(&cached_windows);
+        }
         let mut observations = Vec::new();
         let mut set_aside = Vec::new();
         for path in files {
@@ -324,15 +332,21 @@ impl PiSource {
             // quiet file but cannot extend either content-check deadline.
             let stat = FileStat::read(&path)
                 .map_err(|error| format!("open Pi session file {}: {error}", path.display()))?;
+            if !mode.is_full() && !stat.fast_changed(cached_windows.get(&path), recorded_at_ms) {
+                continue;
+            }
+            resume_points.remove(&path);
+            header_scans.remove(&path);
             let previous = resumable.then(|| cached_resume.get(&path)).flatten();
             let check = match previous {
                 Some(_)
-                    if full_due(
-                        &path,
-                        cached_verified.get(&path).copied(),
-                        recorded_at_ms,
-                        PI_FULL_PREFIX_VERIFY_INTERVAL_MS,
-                    ) =>
+                    if mode.is_full()
+                        && full_due(
+                            &path,
+                            cached_verified.get(&path).copied(),
+                            recorded_at_ms,
+                            PI_FULL_PREFIX_VERIFY_INTERVAL_MS,
+                        ) =>
                 {
                     PiPrefixCheck::Full
                 }
@@ -395,7 +409,7 @@ impl PiSource {
                 // due Full check re-verified the whole consumed prefix; both
                 // restart the cadence. A window-checked resume carries the
                 // previous verification time forward.
-                if check == PiPrefixCheck::Full || !parse.resumed {
+                if mode.is_full() && (check == PiPrefixCheck::Full || !parse.resumed) {
                     verified_ms.insert(path.clone(), recorded_at_ms);
                 } else if let Some(&verified) = cached_verified.get(&path) {
                     verified_ms.insert(path.clone(), verified);
@@ -470,15 +484,17 @@ impl PiSource {
             select_requests(observations, &cache.identities)
         };
         outcome.observations_deduplicated = observations_deduplicated;
-        record_requests(
-            state,
-            &requests,
-            &set_aside,
-            recorded_at_ms,
-            true,
-            &mut outcome,
-            &|| stop.load(Ordering::Relaxed),
-        )?;
+        if mode.has_work(requests.len(), set_aside.len()) {
+            record_requests(
+                state,
+                &requests,
+                &set_aside,
+                recorded_at_ms,
+                mode.is_full(),
+                &mut outcome,
+                &|| stop.load(Ordering::Relaxed),
+            )?;
+        }
 
         let mut cache = self
             .cache
@@ -507,11 +523,22 @@ impl PiSource {
             recorded_at_ms,
             Some((start_ms, end_ms)),
             &AtomicBool::new(false),
+            DrainMode::Full,
         )
     }
 }
 
 impl crate::refresher::harness_drain::HarnessSource for PiSource {
+    fn drain_fast(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+    ) -> Result<(), SourceDrainError> {
+        self.drain_inner(state, at, None, stop, DrainMode::Fast)
+            .map(|_| ())
+    }
+
     fn source_key(&self) -> &'static str {
         PI_SOURCE_KEY
     }
@@ -886,7 +913,12 @@ fn record_requests(
         mark_current_in_tx, record_events_in_tx, record_set_aside_in_tx, RecordTally,
     };
     let mut stopped = false;
-    let committed = state.ordered_write(|tx| {
+    let mode = if update_runtime {
+        DrainMode::Full
+    } else {
+        DrainMode::Fast
+    };
+    let committed = mode.write(state, |tx| {
         if requests.is_empty() && stop_requested() {
             stopped = true;
             return Err("Pi ingest stopped".into());

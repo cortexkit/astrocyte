@@ -7,6 +7,7 @@
 //! not taken from `PI_CODING_AGENT_DIR`: Pi reads that same variable, so
 //! honouring it here could point both sources at one tree.
 
+use super::harness_drain::DrainMode;
 #[cfg(test)]
 use crate::refresher::harness_drain::files_below;
 #[cfg(test)]
@@ -107,6 +108,16 @@ impl OmpSource {
         recorded_at_ms: i64,
         stop: &AtomicBool,
     ) -> Result<OmpDrainOutcome, SourceDrainError> {
+        self.drain_in_lane(state, recorded_at_ms, stop, DrainMode::Full)
+    }
+
+    fn drain_in_lane(
+        &self,
+        state: &SharedState,
+        recorded_at_ms: i64,
+        stop: &AtomicBool,
+        mode: DrainMode,
+    ) -> Result<OmpDrainOutcome, SourceDrainError> {
         drain_jsonl(
             state,
             OMP_SOURCE_KEY,
@@ -135,11 +146,22 @@ impl OmpSource {
                 counts.skipped_lines
             },
             astrocyte_readers::sessions::omp::OmpResumePoint::offset,
+            mode,
         )
     }
 }
 
 impl HarnessSource for OmpSource {
+    fn drain_fast(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+    ) -> Result<(), SourceDrainError> {
+        self.drain_in_lane(state, at, stop, DrainMode::Fast)
+            .map(|_| ())
+    }
+
     fn source_key(&self) -> &'static str {
         OMP_SOURCE_KEY
     }
