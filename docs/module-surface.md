@@ -376,6 +376,128 @@ recently active first. There are at most `limit` sessions (default 50, maximum
 It is always read from the store. Test:
 `sessions_report_hit_ratio_busts_limit_and_activity`.
 
+### 4.2 Live step feed (contract v1, not yet served)
+
+Apps follow cache diagnostics live through two operations: a subscription
+that only says new steps exist, and a paged read that returns them. Apps talk
+only to astrocyte. Astrocyte combines the steps it reads from harness files
+with the `step.finished.v1` events agent runners publish on the bus. A step a
+runner announces is in the feed within seconds; billing still comes only from
+the durable reads.
+
+**Who may call.** The daemon-attested principal at route bind decides:
+`Principal::Direct` (local apps on the same computer) and `reserved:callosum`
+with a phone-class device label (`fed-phone:<fingerprint>`). Every other
+principal is refused `not_permitted`, simulators (`fed-sim:`) and other
+computers (`fed-computer:`) included.
+
+**Cursors** are opaque strings. They are ordered by astrocyte's commits, are
+stable across restarts and are never reused. Apps pass them back and never
+parse or compare them.
+
+**Order rule for apps.** Subscribe first and hold the notices, read history
+with `usage.steps.read`, then read again from the read's `through`. After a
+reconnect, read once more a few seconds later: a step that has just finished
+can take a few seconds to be committed.
+
+#### `usage.steps.subscribe`
+
+Request: `{}`. Any member is refused `malformed`.
+
+Each notice is one StreamData frame:
+
+```json
+{"through": "c1824004"}
+```
+
+`through` is the newest committed cursor. Notices are coalesced: at most four
+a second, and a notice may cover many steps or none that the caller may see.
+
+| How it ends | Meaning |
+|---|---|
+| StreamEnd | Astrocyte is stopping or the route closed. Subscribe again. |
+| Error `lagged`, detail `{"through": "<last notified cursor>"}` | The subscriber fell behind its queue bound. Subscribe again and read from the last cursor it holds. |
+| Caller's Cancel | Ended by the caller; no further frame. |
+
+Opening refusals: `not_permitted`, `subscription_capacity` (more than 16 open
+subscriptions), `draining` (astrocyte is stopping), `malformed`.
+
+#### `usage.steps.read`
+
+Request: `{"after": "<cursor>", "limit": 200}`. Both members are optional.
+Without `after`, the read starts at the oldest row the feed still holds. The
+feed holds the rows committed in the last 24 hours. `limit` defaults to 200,
+with a maximum of 1,000.
+
+Reply:
+
+```json
+{
+  "rows": [
+    {
+      "cursor": "c1824003",
+      "harness": "opencode",
+      "source": "file",
+      "step_ref": "msg_0a1b2c3d4e5f",
+      "session": "ses_0a1b2c3d",
+      "occurred_at_ms": 1792880000000,
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "input": 1200,
+      "cache_read": 182000,
+      "cache_write": 900,
+      "output": 640,
+      "reasoning": 120,
+      "finish": "tool-calls",
+      "prompt": 184100,
+      "retention": 0.9912,
+      "verdict": "stable",
+      "prompt_dropped": false
+    }
+  ],
+  "next": null,
+  "through": "c1824004"
+}
+```
+
+- `rows` are oldest first. `next` is the cursor to pass as `after` for the
+  following page, or null when the reply reached `through`. `through` is the
+  newest committed cursor.
+- A row's identity is `harness` plus `step_ref`. When any field of a step
+  changes (a runner-announced step recorded from its log, a finish reason that
+  arrives late, or a verdict recomputed because an earlier step of its session
+  arrived late), the whole row is sent again at a new cursor. The last row for
+  an identity wins: apps replace, never append.
+- `source` is `file` for a step astrocyte read from a harness store or a
+  runner's durable log, and `runner` for a step known so far only from a
+  runner's bus event.
+- `harness` is the producer: `claude-code`, `codex`, `gemini`, `kimi`, `omp`,
+  `opencode`, `pi`, or the runner's module id (`broca`, `thalamus-harness`,
+  `thalamus`).
+- Required: `cursor`, `harness`, `source`, `step_ref`, `session`,
+  `occurred_at_ms`, `prompt`, `verdict`, `prompt_dropped`. Steps without a time
+  are not in the feed.
+- Optional, omitted when unknown and never zero for unknown: `run_id` (runner
+  steps), `provider`, `model`, `input`, `cache_read`, `cache_write`,
+  `cache_write_5m`, `cache_write_1h`, `output`, `reasoning`, `finish`,
+  `context_limit`, `request_body_len`, `retention`, `request_size`.
+- Counts are disjoint: `output` never includes `reasoning`, and
+  `cache_write` is the sum of every cache lifetime. `cache_write_5m` and
+  `cache_write_1h` are present only when the source split them.
+- `prompt`, `retention`, `verdict` (`cold_start`, `stable`, `warning`, `bust`,
+  `full_bust`, `unknown`), `prompt_dropped` and `request_size` (`smaller`,
+  `not_smaller`) follow the rules in section 4.1 exactly. They are computed
+  over the step's whole session in time order. The thresholds 0.95 and 0.80
+  and the 15,000-token prompt drop are part of this contract's version.
+- Rows never carry prompt text, tool names or error text.
+
+Refusals: `malformed` (undecodable, or an unknown member), `invalid_request`
+(`limit` is 0, or `after` is not a cursor astrocyte issued), `range_too_large`
+(`limit` above 1,000), `cursor_expired` (`after` is older than the feed holds;
+detail `{"through": "<newest cursor>"}`: reload per-session history with
+`usage.cache.sessions` and `usage.cache.steps`, then read from `through`), and
+`not_permitted`.
+
 ## 5. Calls astrocyte makes
 
 | Peer | Route | Calls | On failure |
