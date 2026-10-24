@@ -26,29 +26,22 @@ use cortexkit_store_types::module_store_path;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use state::{now_ms, PublicProjection, SharedState};
+use subc_client_rs::{
+    async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, HealthStatus,
+    ModuleHandler, ModuleStopHandle, RequestCtx, RouteBindRequest, RouteHandle, ServeOptions,
+    SubcModuleError,
+};
 use subc_protocol::{
     manifest::{
         build_provenance_from_source, BuildGitShaAbsenceReason, BuildGitShaSource, Concurrency,
-        ConsumerRole, GitTreeState, LaunchNonceSource, ManagementOperation,
-        ManagementOperationKind, ModuleManifest, ProviderRole, SelfSignalDeclaration,
-        SelfSignalEffect, SelfSignalKind, SignalAnchor, SignalCadence, TrustTier,
+        ConsumerRole, GitTreeState, ManagementOperation, ManagementOperationKind, ModuleManifest,
+        ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor,
+        SignalCadence, TrustTier,
     },
-    session::{
-        HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
-    },
-    ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
-    PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
-};
-use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
-use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
-    net::TcpStream,
-    sync::mpsc,
+    SUBC_MODULE_ID_ENV,
 };
 
 use config::DEFAULT_MODULE_ID;
-const HELLO_CORR: u64 = 1;
-const EGRESS_BUFFER: usize = 64;
 
 fn main() -> Result<std::process::ExitCode, Box<dyn Error>> {
     // `--version` answers before logging, the launch nonce or any config is
@@ -317,24 +310,17 @@ impl ModuleConfig {
 
 async fn run(config: ModuleConfig, state: Arc<SharedState>) -> Result<LoopEnd, ModuleError> {
     let startup_state = Arc::clone(&state);
-    let stream = connect_after_startup(
+    connect_after_startup(
         move || astrocyte_module::hydrate_startup(&startup_state),
-        || connect_to_subc(&config.connection_file_path),
-    )
-    .await?;
-    // Installed before HELLO is sent, so any SIGTERM that reaches a module
-    // the daemon has seen takes the clean stop below. A SIGTERM during
-    // hydration or connect still has the default disposition: nothing has
-    // started that needs stopping.
-    let sigterm = sigterm_received()?;
-    let (read_half, write_half) = tokio::io::split(stream);
-    serve_connection(
-        read_half,
-        write_half,
-        &config,
-        state,
-        astrocyte_module::start_refresher,
-        sigterm,
+        || async move {
+            // Installed before the refresher starts and before the daemon
+            // connection is opened, so any SIGTERM that reaches a module the
+            // daemon can see takes the clean stop in `serve_module`. A SIGTERM
+            // during hydration still has the default disposition: nothing has
+            // started that needs stopping.
+            let sigterm = sigterm_received()?;
+            serve_module(&config, state, astrocyte_module::start_refresher, sigterm).await
+        },
     )
     .await
 }
@@ -345,8 +331,8 @@ async fn run(config: ModuleConfig, state: Arc<SharedState>) -> Result<LoopEnd, M
 /// includes this module, and the supervisor's own teardown sends SIGTERM
 /// before SIGKILL. Without a handler the default disposition ends the
 /// process at once and skips the refresher stop and join that daemon EOF
-/// runs. With it, SIGTERM ends `module_loop` and shutdown continues on that
-/// same path.
+/// runs. With it, SIGTERM stops serving and shutdown continues on that same
+/// path.
 ///
 /// tokio keeps its handler installed for the life of the process, so once
 /// this future has fired (or been dropped) any further SIGTERM is recorded
@@ -374,21 +360,37 @@ fn sigterm_received() -> Result<impl std::future::Future<Output = ()>, ModuleErr
 
 type RefresherThread = std::thread::JoinHandle<Result<(), String>>;
 
+/// How long the serve helper may take over a stop, per stage. When astrocyte
+/// stops serving itself (SIGTERM, a crash, a dead refresher), requests
+/// already accepted get up to this long to send their replies; then GOODBYE
+/// and the final flush get up to this long again. The helper also waits up
+/// to two seconds for drain hooks to start. Its whole part of a stop is
+/// therefore at most 2 s + 2 x 5 s = 12 s. The refresher is told to stop
+/// when the stop begins and is joined beside the helper's drain; every
+/// refresher stage honours its stop flag, so that join takes seconds. Both
+/// together fit well inside the supervisor's 30 s stop budget (the daemon
+/// caps a module's budget at 25 s). The helper's default of 2 s is raised
+/// so that a served write already running, such as a statement import, can
+/// still answer its caller.
+const SERVE_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Serve until the daemon closes, a stop signal arrives, or an internal crash
 /// is observed, then stop and join the refresher through one shutdown path.
-/// The injected starter lets tests use the real serving owner with a slow or
-/// crashed refresher. Clean stops return their `LoopEnd`; crashes return errors.
-async fn serve_connection<R, W, Start, Stop>(
-    mut read_half: R,
-    write_half: W,
+///
+/// The connection itself (connect, authenticate, HELLO, frames, request
+/// dispatch, cancellation and the writer) belongs to the shared serve helper
+/// in subc-client-rs; this function owns everything around it: the
+/// refresher, the crash latch, the stop causes and their two log lines. The
+/// injected starter lets tests use the real serving owner with a slow or
+/// crashed refresher. Clean stops return their `LoopEnd`; crashes and
+/// connection failures return errors.
+async fn serve_module<Start, Stop>(
     config: &ModuleConfig,
     state: Arc<SharedState>,
     start_refresher: Start,
     stop_signal: Stop,
 ) -> Result<LoopEnd, ModuleError>
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin + Send + 'static,
     Stop: std::future::Future<Output = ()>,
     Start: FnOnce(
             Arc<SharedState>,
@@ -397,8 +399,7 @@ where
         + Send
         + 'static,
 {
-    let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
-    let writer = tokio::spawn(drain_writer(write_half, rx));
+    install_quota_bus_access(&state, config)?;
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let starting_state = Arc::clone(&state);
@@ -417,8 +418,34 @@ where
             .map_err(|_| ModuleError::Message("internal crash: refresher thread panicked".into()))?
             .map_err(ModuleError::Message)
     });
+
+    let connection_end = Arc::new(Mutex::new(None));
+    let handler = AstrocyteHandler {
+        state: Arc::clone(&state),
+        flows: FlowRoutes::default(),
+        connection_end: Arc::clone(&connection_end),
+    };
+    // HELLO is sent once per connection, so the manifest declares the desired
+    // configuration in force at this moment. Startup hydrates that
+    // configuration before the connection exists, so it is always the real
+    // one here. A later reload that adds or removes a peer is NOT
+    // re-announced: the daemon keeps the self-signals and consumers declared
+    // here until the module reconnects.
+    let stop_handle = ModuleStopHandle::new();
+    let serving = ServeOptions::default()
+        .with_writer_drain_timeout(SERVE_DRAIN_BUDGET)
+        .with_stop_handle(stop_handle.clone())
+        .serve_with(
+            &config.connection_file_path,
+            manifest(&config.module_id, &state.desired_config()),
+            handler,
+        );
+    tokio::pin!(serving);
+    tokio::pin!(stop_signal);
+
     let mut joined = None;
-    let loop_result = tokio::select! {
+    let mut served = false;
+    let ended = tokio::select! {
         biased;
         cause = state.crashed() => Err(ModuleError::Message(format!("internal crash: {cause}"))),
         result = &mut refresher_join => {
@@ -430,54 +457,105 @@ where
             joined = Some(result);
             Err(ModuleError::Message(format!("internal crash: {cause}")))
         }
-        result = module_loop(
-        &mut read_half,
-        tx.clone(),
-        config,
-        Arc::clone(&state),
-        stop_signal,
-        ) => result,
+        () = &mut stop_signal => Ok(LoopEnd::Sigterm),
+        result = &mut serving => {
+            served = true;
+            how_serving_ended(result, &connection_end)
+        }
     };
-    let cause = match &loop_result {
+    let cause = match &ended {
         Ok(end) => end.as_str(),
         Err(_) => "error",
     };
-    drop(tx);
     // These two lines bracket shutdown. When the daemon's drain reports that
     // some module still held work, they show whether astrocyte had already
     // stopped by that instant and how long its refresher took to stop.
     let stopping_at = std::time::Instant::now();
-    // `cause` says what ended the loop: eof, goodbye, sigterm, or error.
-    tracing::info!(target: "astrocyte", cause, clean = loop_result.is_ok(),
+    // `cause` says what ended serving: eof, goodbye, sigterm, or error.
+    tracing::info!(target: "astrocyte", cause, clean = ended.is_ok(),
         "stopping refresher");
     // Every refresher stage honours this flag, including a SQLite statement
     // already running, so the join below takes seconds, well inside the
     // supervisor's drain window, rather than however long the stage would
     // have run.
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let refresher_result = match joined {
-        Some(result) => result,
-        None => refresher_join.await,
-    }
-    .map_err(|error| ModuleError::Message(format!("refresher monitor: {error}")))
-    .and_then(|result| result);
+    // When astrocyte stops on its own account, the helper finishes the
+    // requests it accepted, sends GOODBYE and flushes, within
+    // SERVE_DRAIN_BUDGET per stage. The refresher is joined at the same time.
+    let stop_serving = async {
+        if served {
+            Ok(())
+        } else {
+            stop_handle.stop();
+            serving.await
+        }
+    };
+    let join_refresher = async {
+        match joined {
+            Some(result) => result,
+            None => refresher_join.await,
+        }
+    };
+    let (stopped_serving, refresher_result) = tokio::join!(stop_serving, join_refresher);
+    let refresher_result = refresher_result
+        .map_err(|error| ModuleError::Message(format!("refresher monitor: {error}")))
+        .and_then(|result| result);
+    // Logged once both the refresher and every request handler have ended,
+    // so no write can follow it.
     tracing::info!(target: "astrocyte",
         stop_ms = u64::try_from(stopping_at.elapsed().as_millis()).unwrap_or(u64::MAX),
         "refresher stopped, nothing further will be written");
 
-    let writer_result = writer
-        .await
-        .map_err(|error| ModuleError::Message(error.to_string()));
-    let loop_result = loop_result.and_then(|end| refresher_result.map(|()| end));
-    let loop_result = match state.crash_cause() {
+    let ended = ended.and_then(|end| refresher_result.map(|()| end));
+    let ended = ended.and_then(|end| {
+        stopped_serving
+            .map(|()| end)
+            .map_err(|error| serve_error(&error))
+    });
+    match state.crash_cause() {
         Some(cause) => Err(ModuleError::Message(format!("internal crash: {cause}"))),
-        None => loop_result,
-    };
-    match (loop_result, writer_result) {
-        (Err(loop_error), _) => Err(loop_error),
-        (Ok(end), Ok(Ok(()))) => Ok(end),
-        (Ok(_), Ok(Err(writer_error))) => Err(writer_error),
-        (Ok(_), Err(join_error)) => Err(join_error),
+        None => ended,
+    }
+}
+
+/// How the helper's serving future ended, as a stop cause. GOODBYE and EOF
+/// are the daemon's deliberate stops. A reset connection is an error, as it
+/// was before the helper: the supervisor restarts the module either way, and
+/// a clean exit would read as a deliberate stop. Windows reports a killed
+/// daemon as a reset where Unix reports EOF, so a killed daemon exits 1 on
+/// Windows and 0 on Unix, both as before.
+fn how_serving_ended(
+    result: Result<(), SubcModuleError>,
+    connection_end: &Mutex<Option<ConnectionEnd>>,
+) -> Result<LoopEnd, ModuleError> {
+    result.map_err(|error| serve_error(&error))?;
+    let end = *connection_end
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match end {
+        Some(ConnectionEnd::Goodbye) => Ok(LoopEnd::Goodbye),
+        Some(ConnectionEnd::Eof) => Ok(LoopEnd::Eof),
+        Some(ConnectionEnd::Reset) => Err(ModuleError::Message(
+            "the daemon connection was reset".into(),
+        )),
+        Some(other) => Err(ModuleError::Message(format!(
+            "serving ended without a stop request: {other}"
+        ))),
+        None => Err(ModuleError::Message(
+            "serving ended without reporting how".into(),
+        )),
+    }
+}
+
+/// A serving failure as a module error. A request handler that panicked has
+/// already been answered `internal` by the helper; serving then stops, and
+/// the process exits 1, because a panic may have left shared state broken.
+fn serve_error(error: &SubcModuleError) -> ModuleError {
+    match error {
+        SubcModuleError::HandlerPanic => ModuleError::Message(
+            "internal crash: route handler crashed: a request handler panicked".into(),
+        ),
+        other => ModuleError::Message(other.to_string()),
     }
 }
 
@@ -497,24 +575,25 @@ where
     connect().await
 }
 
-async fn connect_to_subc(connection_file_path: &Path) -> Result<TcpStream, ModuleError> {
-    let connection = connection_file::read(connection_file_path)
-        .map_err(|error| ModuleError::Message(format!("reading connection file: {error}")))?;
-    let endpoint = connection
-        .endpoints
-        .first()
-        .ok_or_else(|| ModuleError::Message("connection file has no endpoints".into()))?;
-    let address = format!("{}:{}", endpoint.host, endpoint.port);
-    let mut stream = TcpStream::connect(&address)
-        .await
-        .map_err(|error| ModuleError::Message(format!("connect {address}: {error}")))?;
-    authenticate_client(&mut stream, &connection, std::time::Duration::from_secs(2))
-        .await
-        .map_err(|error| ModuleError::Message(format!("authenticate: {error}")))?;
-    Ok(stream)
+/// Share the process's one launch-nonce read with the attested ckbus client.
+///
+/// `subc_os::launch_nonce` reads the nonce once per process and caches it;
+/// `main` takes it before anything else starts, and the serve helper's HELLO
+/// reads the same cached value. The value is never logged.
+fn install_quota_bus_access(state: &SharedState, config: &ModuleConfig) -> Result<(), ModuleError> {
+    let launch_nonce = subc_os::launch_nonce()
+        .map_err(|error| ModuleError::Message(format!("launch nonce: {error}")))?;
+    if let Some(nonce) = launch_nonce {
+        state.install_quota_bus_access(
+            config.connection_file_path.clone(),
+            config.module_id.clone(),
+            nonce.value().to_string(),
+        );
+    }
+    Ok(())
 }
 
-/// What ended `module_loop` cleanly; logged as the shutdown `cause`.
+/// What ended serving cleanly; logged as the shutdown `cause`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoopEnd {
     /// The daemon's connection reached EOF.
@@ -535,189 +614,93 @@ impl LoopEnd {
     }
 }
 
-/// Only the waits for the daemon's next frame race `stop_signal`; a frame
-/// already being handled finishes before the loop returns.
-async fn module_loop<R, Stop>(
-    read_half: &mut R,
-    writer: mpsc::Sender<Frame>,
-    config: &ModuleConfig,
+/// Astrocyte's side of the serve helper: request dispatch, route binds,
+/// health and how the connection ended.
+struct AstrocyteHandler {
     state: Arc<SharedState>,
-    stop_signal: Stop,
-) -> Result<LoopEnd, ModuleError>
-where
-    R: AsyncRead + Unpin,
-    Stop: std::future::Future<Output = ()>,
-{
-    tokio::pin!(stop_signal);
-    send_hello(&writer, config, &state.desired_config(), Some(&state)).await?;
-    tokio::select! {
-        ack = expect_hello_ack(read_half) => {
-            ack?;
+    flows: FlowRoutes,
+    connection_end: Arc<Mutex<Option<ConnectionEnd>>>,
+}
+
+#[async_trait]
+impl ModuleHandler for AstrocyteHandler {
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        let flow = self.flows.flow_of(ctx.route_handle());
+        handle_route_request(&self.state, &body, flow)
+    }
+
+    async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+        let flow_id = request
+            .scope
+            .as_ref()
+            .and_then(|stamp| stamp.attributes.flow_id.clone());
+        self.flows.record_bind(request.handle, flow_id);
+        BindDecision::accept()
+    }
+
+    async fn on_route_gone(&self, handle: &RouteHandle) {
+        self.flows.forget(*handle);
+    }
+
+    async fn health(&self) -> HealthReport {
+        health_report(&self.state.public_projection())
+    }
+
+    async fn on_connection_end(&self, end: ConnectionEnd) {
+        if end == ConnectionEnd::Reset {
+            tracing::error!(target: "astrocyte", "the daemon connection was reset");
         }
-        () = &mut stop_signal => return Ok(LoopEnd::Sigterm),
-    }
-    let public_projection = state.public_projection();
-    let flow_routes = FlowRoutes::default();
-    loop {
-        let frame = tokio::select! {
-            frame = read_frame(read_half) => {
-                frame.map_err(|error| ModuleError::Message(error.to_string()))?
-            }
-            () = &mut stop_signal => return Ok(LoopEnd::Sigterm),
-        };
-        let Some(frame) = frame else {
-            return Ok(LoopEnd::Eof);
-        };
-        if !handle_frame(frame, &writer, &state, &public_projection, &flow_routes).await? {
-            return Ok(LoopEnd::Goodbye);
-        }
+        *self
+            .connection_end
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(end);
+        self.flows.clear();
     }
 }
 
-async fn drain_writer<W>(write_half: W, mut rx: mpsc::Receiver<Frame>) -> Result<(), ModuleError>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut writer = BufWriter::new(write_half);
-    while let Some(frame) = rx.recv().await {
-        write_frame(&mut writer, &frame)
-            .await
-            .map_err(|error| ModuleError::Message(error.to_string()))?;
-        while let Ok(frame) = rx.try_recv() {
-            write_frame(&mut writer, &frame)
-                .await
-                .map_err(|error| ModuleError::Message(error.to_string()))?;
-        }
-        writer
-            .flush()
-            .await
-            .map_err(|error| ModuleError::Message(error.to_string()))?;
-    }
-    writer
-        .flush()
-        .await
-        .map_err(|error| ModuleError::Message(error.to_string()))?;
-    Ok(())
-}
-
-/// HELLO is sent once per connection, so the manifest declares the desired
-/// configuration in force at this moment. Startup hydrates that configuration
-/// before the subc connection exists, so it is always the real one here. A
-/// later reload that adds or removes a peer is NOT re-announced: the daemon
-/// keeps the self-signals and consumers declared here until the module
-/// reconnects.
-async fn send_hello(
-    writer: &mpsc::Sender<Frame>,
-    config: &ModuleConfig,
-    desired: &config::AstrocyteConfig,
-    state: Option<&SharedState>,
-) -> Result<(), ModuleError> {
-    let launch_nonce = subc_os::launch_nonce()
-        .map_err(|error| ModuleError::Message(format!("launch nonce: {error}")))?
-        .map(|nonce| (nonce.value().to_string(), nonce_source(nonce.source())));
-    if let (Some(state), Some((nonce, _))) = (state, launch_nonce.as_ref()) {
-        state.install_quota_bus_access(
-            config.connection_file_path.clone(),
-            config.module_id.clone(),
-            nonce.clone(),
-        );
-    }
-    let body = serde_json::to_vec(&hello_body(&config.module_id, desired, launch_nonce))
-        .map_err(ModuleError::Json)?;
-    let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
-        .map_err(|error| ModuleError::Message(error.to_string()))?;
-    send(writer, frame).await
-}
-
-/// The provenance name for where subc-os read the nonce from. A source added
-/// to subc-os after this was written keeps its own name on the wire, so the
-/// field never claims a source the nonce did not come from.
-fn nonce_source(source: subc_os::LaunchNonceSource) -> LaunchNonceSource {
-    match source {
-        subc_os::LaunchNonceSource::Fd => LaunchNonceSource::Fd,
-        subc_os::LaunchNonceSource::Env => LaunchNonceSource::Env,
-        other => LaunchNonceSource::ForwardCompatibleUnknown(other.as_str().to_string()),
-    }
-}
-
-/// The HELLO body, with the launch nonce and the place it was read from.
-///
-/// The daemon hands the nonce over either on an inherited descriptor or in
-/// `SUBC_LAUNCH_NONCE`, and the provenance block states which one this
-/// process read. With no nonce there is nothing to state, and the field stays
-/// absent rather than naming a source nothing was read from.
-fn hello_body(
-    module_id: &str,
-    desired: &config::AstrocyteConfig,
-    launch_nonce: Option<(String, LaunchNonceSource)>,
-) -> ModuleHelloBody {
-    let mut manifest = manifest(module_id, desired);
-    let launch_nonce = launch_nonce.map(|(value, source)| {
-        if let Some(provenance) = manifest.provenance.as_mut() {
-            provenance.launch_nonce_source = Some(source);
-        }
-        value
-    });
-    ModuleHelloBody {
-        manifest,
-        protocol_ver: PROTOCOL_VERSION,
-        control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
-        launch_nonce,
-    }
-}
-
-async fn expect_hello_ack<R>(reader: &mut R) -> Result<ModuleHelloAckBody, ModuleError>
-where
-    R: AsyncRead + Unpin,
-{
-    let frame = read_frame(reader)
-        .await
-        .map_err(|error| ModuleError::Message(error.to_string()))?
-        .ok_or_else(|| ModuleError::Message("connection closed before HELLO_ACK".into()))?;
-    match frame.header.ty {
-        FrameType::HelloAck => serde_json::from_slice(&frame.body).map_err(ModuleError::Json),
-        FrameType::Error => {
-            let body =
-                serde_json::from_slice::<ErrorBody>(&frame.body).map_err(ModuleError::Json)?;
-            Err(ModuleError::Message(format!(
-                "subc rejected HELLO: {} — {}",
-                body.code, body.message
-            )))
-        }
-        ty => Err(ModuleError::Message(format!(
-            "unexpected frame {ty:?} awaiting HELLO_ACK"
-        ))),
-    }
-}
-
-/// The flow each route was bound under, keyed by route channel and holding
-/// the bind's epoch, for this connection only. Astrocyte checks no caller
-/// identity on its writes, so a route a flow opened is refused every
-/// mutating operation (see `handle_route_request`); reads stay served.
+/// The flow each route was bound under, for this connection only. Astrocyte
+/// checks no caller identity on its writes, so a route a flow opened is
+/// refused every mutating operation (see `handle_route_request`); reads stay
+/// served. Keyed by the full route handle, so a channel reused under a new
+/// epoch never inherits an old flow.
 #[derive(Default)]
-struct FlowRoutes(Mutex<HashMap<u16, (u32, String)>>);
+struct FlowRoutes(Mutex<HashMap<RouteHandle, String>>);
 
 impl FlowRoutes {
-    /// Every bind replaces what the channel held before, so a channel reused
-    /// by a route opened without a flow is never refused by a stale entry.
-    fn record_bind(&self, channel: u16, epoch: u32, flow_id: Option<String>) {
+    /// Every bind replaces what the route held before, so a route opened
+    /// without a flow is never refused by a stale entry.
+    fn record_bind(&self, route: RouteHandle, flow_id: Option<String>) {
         let mut routes = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         match flow_id {
             Some(flow_id) => {
-                routes.insert(channel, (epoch, flow_id));
+                routes.insert(route, flow_id);
             }
             None => {
-                routes.remove(&channel);
+                routes.remove(&route);
             }
         }
     }
 
-    fn flow_of(&self, channel: u16, epoch: u32) -> Option<String> {
-        let routes = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        routes
-            .get(&channel)
-            .filter(|(bound_epoch, _)| *bound_epoch == epoch)
-            .map(|(_, flow_id)| flow_id.clone())
+    fn forget(&self, route: RouteHandle) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&route);
+    }
+
+    fn clear(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+    }
+
+    fn flow_of(&self, route: RouteHandle) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&route)
+            .cloned()
     }
 }
 
@@ -739,152 +722,7 @@ fn is_mutating_operation(name: &str) -> bool {
     )
 }
 
-async fn handle_frame(
-    frame: Frame,
-    writer: &mpsc::Sender<Frame>,
-    state: &Arc<SharedState>,
-    public_projection: &PublicProjection,
-    flow_routes: &FlowRoutes,
-) -> Result<bool, ModuleError> {
-    match frame.header.ty {
-        FrameType::Ping if frame.header.channel == 0 => {
-            let pong = Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Pong,
-                frame.header.flags,
-                0,
-                0,
-                frame.header.corr,
-                Vec::new(),
-            )
-            .map_err(|error| ModuleError::Message(error.to_string()))?;
-            send(writer, pong).await?;
-            Ok(true)
-        }
-        FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
-        FrameType::Goodbye => Ok(true),
-        FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, writer, public_projection, flow_routes).await?;
-            Ok(true)
-        }
-        FrameType::Request => {
-            let writer = writer.clone();
-            let state = Arc::clone(state);
-            let flow = flow_routes.flow_of(frame.header.channel, frame.header.epoch);
-            let (ver, channel, epoch, corr) = (
-                frame.header.ver,
-                frame.header.channel,
-                frame.header.epoch,
-                frame.header.corr,
-            );
-            tokio::spawn(async move {
-                let handler_writer = writer.clone();
-                let handler_state = Arc::clone(&state);
-                let result = tokio::spawn(async move {
-                    handle_route_request(frame, &handler_writer, &handler_state, flow).await
-                })
-                .await;
-                let (error, crashed) = match result {
-                    Ok(Ok(())) => return,
-                    Ok(Err(error)) => (error.to_string(), false),
-                    Err(error) => (format!("route handler crashed: {error}"), true),
-                };
-                // Keep the fallback independent of the failed reply's payload:
-                // an oversized refusal must not produce another oversized one.
-                if crashed {
-                    tracing::warn!(target: "astrocyte", channel, corr, %error, "route handler failed; attempting error reply before stopping");
-                } else {
-                    tracing::error!(target: "astrocyte", channel, corr, %error, "route handler failed");
-                }
-                if let Err(error) = send_route_error(
-                    &writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "internal",
-                    "request could not be completed",
-                )
-                .await
-                {
-                    tracing::error!(target: "astrocyte", channel, corr, %error, "fallback error reply failed");
-                }
-                if crashed {
-                    state.report_crash(error);
-                }
-            });
-            Ok(true)
-        }
-        _ => Ok(true),
-    }
-}
-
-async fn handle_control_request(
-    frame: Frame,
-    writer: &mpsc::Sender<Frame>,
-    public_projection: &PublicProjection,
-    flow_routes: &FlowRoutes,
-) -> Result<(), ModuleError> {
-    // A control request this build can't decode (a newer daemon's field or
-    // op, such as a scope attribute added after this build's subc-protocol)
-    // is refused on its own correlation id, and the module keeps serving.
-    // Returning the decode error instead would end the serve loop and stop
-    // the module, and every retry after the restart would stop it again.
-    let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
-        Ok(request) => request,
-        Err(error) => {
-            tracing::warn!(
-                target: "astrocyte",
-                error = %error,
-                "refused a control request this build cannot decode"
-            );
-            let body = serde_json::to_vec(&ErrorBody {
-                code: "invalid_request".to_string(),
-                message: format!("control request not understood by this build: {error}"),
-                detail: None,
-            })
-            .map_err(ModuleError::Json)?;
-            let refusal = Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Error,
-                control_flags(),
-                0,
-                0,
-                frame.header.corr,
-                body,
-            )
-            .map_err(|error| ModuleError::Message(error.to_string()))?;
-            return send(writer, refusal).await;
-        }
-    };
-    let response_body = match request {
-        ModuleControlRequest::RouteBind {
-            route_channel,
-            epoch,
-            scope,
-            ..
-        } => {
-            let flow_id = scope.and_then(|stamp| stamp.attributes.flow_id);
-            flow_routes.record_bind(route_channel, epoch, flow_id);
-            ModuleControlResponse::RouteBindAck {}
-        }
-        ModuleControlRequest::HealthCheck {} => health_report(public_projection),
-    };
-    let body = serde_json::to_vec(&response_body).map_err(ModuleError::Json)?;
-    let response = Frame::build_with_version(
-        frame.header.ver,
-        FrameType::Response,
-        control_flags(),
-        0,
-        0,
-        frame.header.corr,
-        body,
-    )
-    .map_err(|error| ModuleError::Message(error.to_string()))?;
-    send(writer, response).await
-}
-
-fn health_report(public_projection: &PublicProjection) -> ModuleControlResponse {
+fn health_report(public_projection: &PublicProjection) -> HealthReport {
     let now_ms = now_ms();
     let health = public_projection.health(now_ms);
     let status = match health.status {
@@ -896,7 +734,7 @@ fn health_report(public_projection: &PublicProjection) -> ModuleControlResponse 
         "capacityRuntime": health.capacity_runtime,
         "spendLastAttemptMs": health.spend_last_attempt_ms,
     });
-    ModuleControlResponse::HealthCheck {
+    HealthReport {
         status,
         detail: health.degraded_reason,
         metrics: Some(metrics),
@@ -910,29 +748,29 @@ struct RouteRequest {
     params: Value,
 }
 
-async fn handle_route_request(
-    frame: Frame,
-    writer: &mpsc::Sender<Frame>,
+fn refusal(code: &str, message: String) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: code.to_string(),
+        message,
+    }
+}
+
+/// One routed request, decoded, checked against the route's flow and
+/// dispatched. The helper sends what this returns on the request's own
+/// route and correlation id; a reply larger than the daemon delivers is
+/// replaced there by a small `frame_too_large` refusal.
+fn handle_route_request(
     state: &Arc<SharedState>,
+    body: &[u8],
     flow: Option<String>,
-) -> Result<(), ModuleError> {
-    let channel = frame.header.channel;
-    let epoch = frame.header.epoch;
-    let corr = frame.header.corr;
-    let ver = frame.header.ver;
-    let request: RouteRequest = match serde_json::from_slice(&frame.body) {
+) -> HandlerOutcome {
+    let request: RouteRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
+            return refusal(
                 "invalid_request",
-                &format!("request body not decodable: {error}"),
-            )
-            .await;
+                format!("request body not decodable: {error}"),
+            );
         }
     };
     // A flow acts for its owner without the owner present, and astrocyte
@@ -941,83 +779,29 @@ async fn handle_route_request(
     // it is refused before dispatch, so nothing is touched.
     if let Some(flow_id) = flow {
         if is_mutating_operation(&request.method) {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
+            return refusal(
                 "flow_scopes_unsupported",
-                &format!(
+                format!(
                     "{} changes the ledger and is not served to a flow (flow {flow_id})",
                     request.method
                 ),
-            )
-            .await;
+            );
         }
     }
     // Dispatch performs synchronous SQLite work and may bridge the fusiform
     // socket through its current-thread runtime. Leave the daemon executor
     // before entering that blocking boundary.
     match tokio::task::block_in_place(|| ops::dispatch(state, &request.method, request.params)) {
-        Ok(result) => {
-            let body =
-                serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?;
-            let response = Frame::build_with_version(
-                ver,
-                FrameType::Response,
-                Flags::new(false, Priority::Interactive, false),
-                channel,
-                epoch,
-                corr,
-                body,
-            )
-            .map_err(|error| ModuleError::Message(error.to_string()))?;
-            send(writer, response).await
-        }
-        Err((code, message)) => {
-            send_route_error(writer, ver, channel, epoch, corr, &code, &message).await
-        }
+        Ok(result) => match serde_json::to_vec(&json!({ "result": result })) {
+            Ok(body) => HandlerOutcome::Response(body),
+            Err(error) => {
+                tracing::error!(target: "astrocyte", method = request.method, %error,
+                    "route reply could not be encoded");
+                refusal("internal", "request could not be completed".to_string())
+            }
+        },
+        Err((code, message)) => refusal(&code, message),
     }
-}
-
-async fn send_route_error(
-    writer: &mpsc::Sender<Frame>,
-    ver: u8,
-    channel: u16,
-    epoch: u32,
-    corr: u64,
-    code: &str,
-    message: &str,
-) -> Result<(), ModuleError> {
-    let body = serde_json::to_vec(&ErrorBody {
-        code: code.to_string(),
-        message: message.to_string(),
-        detail: None,
-    })
-    .map_err(ModuleError::Json)?;
-    let frame = Frame::build_with_version(
-        ver,
-        FrameType::Error,
-        Flags::new(false, Priority::Interactive, false),
-        channel,
-        epoch,
-        corr,
-        body,
-    )
-    .map_err(|error| ModuleError::Message(error.to_string()))?;
-    send(writer, frame).await
-}
-
-async fn send(writer: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), ModuleError> {
-    writer
-        .send(frame)
-        .await
-        .map_err(|_| ModuleError::Message("egress channel closed".into()))
-}
-
-fn control_flags() -> Flags {
-    Flags::new(false, Priority::Passive, false)
 }
 
 /// The manifest is the public operation authority. Its operation entries and
@@ -1331,14 +1115,12 @@ fn parse_subc_arg(args: impl IntoIterator<Item = OsString>) -> Result<PathBuf, M
 #[derive(Debug)]
 enum ModuleError {
     Message(String),
-    Json(serde_json::Error),
 }
 
 impl fmt::Display for ModuleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Message(message) => write!(formatter, "{message}"),
-            Self::Json(error) => write!(formatter, "json: {error}"),
         }
     }
 }
@@ -1348,19 +1130,120 @@ impl Error for ModuleError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{self as refresher, test_state};
+    use crate::test_support::{self as refresher, test_state, HANG_GUARD};
+    use subc_protocol::{
+        session::{ModuleControlRequest, ModuleControlResponse},
+        ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
+    };
+    use subc_transport::{
+        auth::authenticate_server,
+        connection_file::{self, ConnectionInfo, Endpoint, KEY_LEN, SCHEMA_VERSION},
+        read_frame, write_frame,
+    };
+    use tokio::{io::AsyncWriteExt, net::TcpStream};
 
-    async fn ack_daemon(daemon: &mut tokio::io::DuplexStream) {
-        let hello = read_frame(daemon).await.unwrap().unwrap();
-        assert_eq!(hello.header.ty, FrameType::Hello);
-        let ack = Frame::build(
+    /// A stand-in daemon: a loopback listener and the connection file that
+    /// names it, so the module's real serving path (the serve helper's
+    /// connect, authentication and HELLO) runs unchanged in tests.
+    pub(super) struct FakeDaemon {
+        listener: tokio::net::TcpListener,
+        connection: ConnectionInfo,
+        pub(super) config: ModuleConfig,
+        _directory: tempfile::TempDir,
+    }
+
+    impl FakeDaemon {
+        pub(super) async fn start() -> Self {
+            Self::start_on("127.0.0.1").await
+        }
+
+        /// Listen on `host`, written to the connection file exactly as given,
+        /// so an IPv6 address stays unbracketed as the daemon writes it.
+        pub(super) async fn start_on(host: &str) -> Self {
+            let bind = if host.contains(':') {
+                format!("[{host}]:0")
+            } else {
+                format!("{host}:0")
+            };
+            let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+            let connection = ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: None,
+                endpoints: vec![Endpoint {
+                    host: host.into(),
+                    port: listener.local_addr().unwrap().port(),
+                }],
+                key: vec![7; KEY_LEN],
+                daemon_id: [9; 16],
+                pid: std::process::id(),
+                daemon_ver: "test".into(),
+            };
+            let directory = tempfile::TempDir::new().unwrap();
+            let path = directory.path().join("subc-connection.json");
+            connection_file::write_atomic(&path, &connection).unwrap();
+            Self {
+                listener,
+                connection,
+                config: ModuleConfig {
+                    connection_file_path: path,
+                    module_id: DEFAULT_MODULE_ID.to_string(),
+                },
+                _directory: directory,
+            }
+        }
+
+        /// Accept the module's connection, authenticate it and read its HELLO.
+        pub(super) async fn accept(&self) -> (TcpStream, ModuleHelloBody) {
+            let (mut stream, _) = tokio::time::timeout(HANG_GUARD, self.listener.accept())
+                .await
+                .expect("the module never connected")
+                .unwrap();
+            authenticate_server(
+                &mut stream,
+                &self.connection.key,
+                &self.connection.daemon_id,
+                &self.connection.daemon_ver,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let hello = next_frame(&mut stream).await;
+            assert_eq!(hello.header.ty, FrameType::Hello);
+            (stream, serde_json::from_slice(&hello.body).unwrap())
+        }
+
+        /// Accept, authenticate, read HELLO and answer HELLO_ACK.
+        pub(super) async fn accept_and_ack(&self) -> TcpStream {
+            let (mut stream, _) = self.accept().await;
+            send(&mut stream, hello_ack()).await;
+            stream
+        }
+    }
+
+    pub(super) async fn send(stream: &mut TcpStream, frame: Frame) {
+        write_frame(stream, &frame).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    /// The module's next frame. A module that closes the connection instead
+    /// fails the test.
+    pub(super) async fn next_frame(stream: &mut TcpStream) -> Frame {
+        tokio::time::timeout(HANG_GUARD, read_frame(stream))
+            .await
+            .expect("no frame from the module")
+            .unwrap()
+            .expect("the module closed the connection")
+    }
+
+    pub(super) fn hello_ack() -> Frame {
+        Frame::build(
             FrameType::HelloAck,
-            control_flags(),
+            Flags::new(false, Priority::Passive, false),
             0,
             0,
-            0,
+            1,
             serde_json::to_vec(&ModuleHelloAckBody {
-                negotiated_ver: 1,
+                negotiated_ver: subc_protocol::PROTOCOL_VERSION,
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
@@ -1368,16 +1251,151 @@ mod tests {
             })
             .unwrap(),
         )
-        .unwrap();
-        write_frame(daemon, &ack).await.unwrap();
-        daemon.flush().await.unwrap();
+        .unwrap()
     }
 
-    fn test_module_config() -> ModuleConfig {
-        ModuleConfig {
-            connection_file_path: PathBuf::from("/nonexistent/subc.json"),
-            module_id: DEFAULT_MODULE_ID.into(),
+    pub(super) fn control_request(corr: u64, body: Vec<u8>) -> Frame {
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .unwrap()
+    }
+
+    pub(super) fn route_frame(
+        ty: FrameType,
+        channel: u16,
+        epoch: u32,
+        corr: u64,
+        body: Vec<u8>,
+    ) -> Frame {
+        Frame::build(
+            ty,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            body,
+        )
+        .unwrap()
+    }
+
+    pub(super) fn bind_body(channel: u16, epoch: u32, flow_id: Option<&str>) -> Vec<u8> {
+        use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
+        use subc_protocol::{BindIdentity, Principal, RouteTarget};
+        let scope = flow_id.map(|flow_id| {
+            ScopeStamp::new(
+                Principal::Reserved {
+                    module_id: "prefrontal-core".to_string(),
+                },
+                "scope-1",
+                1,
+                ScopeKind::Worker,
+            )
+            .with_attributes(ScopeAttributes::new().with_flow_id(Some(flow_id.to_string())))
+            .with_owner_authorized(true)
+        });
+        serde_json::to_vec(&ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch,
+            target: RouteTarget::ManagementSurface {
+                module_id: DEFAULT_MODULE_ID.to_string(),
+            },
+            identity: BindIdentity::new("/tmp/p", "h", "s"),
+            principal: None,
+            consumer_capabilities: None,
+            role_versions: None,
+            admission_facts: None,
+            scope,
+            call_mode: None,
+        })
+        .unwrap()
+    }
+
+    /// Bind a route the way the daemon does, and wait for the module's ACK.
+    /// The serve helper drops requests on a route it has not bound.
+    pub(super) async fn bind(stream: &mut TcpStream, channel: u16, epoch: u32, corr: u64) {
+        send(
+            stream,
+            control_request(corr, bind_body(channel, epoch, None)),
+        )
+        .await;
+        loop {
+            let reply = next_frame(stream).await;
+            if reply.header.channel == 0 && reply.header.corr == corr {
+                assert_eq!(reply.header.ty, FrameType::Response, "route.bind refused");
+                return;
+            }
         }
+    }
+
+    /// A refresher stand-in that idles until the serving owner stops it.
+    /// Dropping the stand-in also stops it, so a test that fails before
+    /// serving ends does not leave the thread running.
+    pub(super) struct IdleRefresher(Arc<std::sync::atomic::AtomicBool>);
+
+    impl IdleRefresher {
+        pub(super) fn new() -> Self {
+            Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        }
+
+        pub(super) fn starter(
+            &self,
+        ) -> impl FnOnce(
+            Arc<SharedState>,
+            Arc<std::sync::atomic::AtomicBool>,
+        ) -> Result<RefresherThread, String>
+               + Send
+               + 'static {
+            let forced = Arc::clone(&self.0);
+            move |_, stop| {
+                Ok(std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                        && !forced.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        std::thread::park_timeout(std::time::Duration::from_millis(10));
+                    }
+                    Ok(())
+                }))
+            }
+        }
+    }
+
+    impl Drop for IdleRefresher {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Serve `state` against `daemon` on a spawned task with an idle
+    /// refresher and no stop signal.
+    fn serve_idle(
+        daemon: &FakeDaemon,
+        state: Arc<SharedState>,
+        refresher: &IdleRefresher,
+    ) -> tokio::task::JoinHandle<Result<LoopEnd, ModuleError>> {
+        let config = ModuleConfig {
+            connection_file_path: daemon.config.connection_file_path.clone(),
+            module_id: daemon.config.module_id.clone(),
+        };
+        let starter = refresher.starter();
+        tokio::spawn(async move {
+            serve_module(&config, state, starter, std::future::pending::<()>()).await
+        })
+    }
+
+    async fn served(
+        serving: tokio::task::JoinHandle<Result<LoopEnd, ModuleError>>,
+        what: &str,
+    ) -> Result<LoopEnd, ModuleError> {
+        tokio::time::timeout(HANG_GUARD, serving)
+            .await
+            .unwrap_or_else(|_| panic!("{what}"))
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1406,103 +1424,74 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn refresher_initialization_keeps_executor_available_before_hello() {
-        let (module, mut daemon) = tokio::io::duplex(64 * 1024);
+        let daemon = FakeDaemon::start().await;
         let (pulse, pulsed) = std::sync::mpsc::channel();
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let initialized = Arc::clone(&ready);
-        let peer = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            let _ = pulse.send(());
-            ack_daemon(&mut daemon).await;
-            assert!(
-                ready.load(std::sync::atomic::Ordering::SeqCst),
-                "HELLO preceded initialization"
-            );
+        let config = ModuleConfig {
+            connection_file_path: daemon.config.connection_file_path.clone(),
+            module_id: DEFAULT_MODULE_ID.into(),
+        };
+        let serving = tokio::spawn(async move {
+            serve_module(
+                &config,
+                Arc::new(test_state()),
+                move |_, stop| {
+                    pulsed
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .map_err(|_| "refresher initialization blocked the executor".to_string())?;
+                    initialized.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(std::thread::spawn(move || {
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            std::thread::park_timeout(std::time::Duration::from_millis(10));
+                        }
+                        Ok(())
+                    }))
+                },
+                std::future::pending::<()>(),
+            )
+            .await
         });
-        let (read, write) = tokio::io::split(module);
-        let result = serve_connection(
-            read,
-            write,
-            &test_module_config(),
-            Arc::new(test_state()),
-            move |_, stop| {
-                pulsed
-                    .recv_timeout(std::time::Duration::from_secs(1))
-                    .map_err(|_| "refresher initialization blocked the executor".to_string())?;
-                initialized.store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok(std::thread::spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        std::thread::park_timeout(std::time::Duration::from_millis(10));
-                    }
-                    Ok(())
-                }))
-            },
-            std::future::pending::<()>(),
-        )
-        .await;
-        peer.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let _ = pulse.send(());
+        let stream = daemon.accept_and_ack().await;
+        assert!(
+            ready.load(std::sync::atomic::Ordering::SeqCst),
+            "HELLO preceded initialization"
+        );
+        drop(stream);
+        let result = served(serving, "serving did not end at EOF").await;
         assert!(matches!(result.unwrap(), LoopEnd::Eof));
     }
 
-    #[tokio::test]
+    /// The daemon writes an IPv6 endpoint unbracketed (`::1`), and the serve
+    /// helper must still connect, authenticate and send HELLO to it.
+    #[tokio::test(flavor = "multi_thread")]
     async fn unbracketed_ipv6_endpoint_connects_and_authenticates() {
-        use subc_transport::auth::authenticate_server;
-        use subc_transport::connection_file::{ConnectionInfo, Endpoint, KEY_LEN, SCHEMA_VERSION};
-        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
-        let connection = ConnectionInfo {
-            schema: SCHEMA_VERSION,
-            wire_version: None,
-            endpoints: vec![Endpoint {
-                host: "::1".into(),
-                port: listener.local_addr().unwrap().port(),
-            }],
-            key: vec![7; KEY_LEN],
-            daemon_id: [9; 16],
-            pid: std::process::id(),
-            daemon_ver: "test".into(),
-        };
-        let directory = tempfile::TempDir::new().unwrap();
-        let path = directory.path().join("connection.json");
-        connection_file::write_atomic(&path, &connection).unwrap();
-        let peer = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            authenticate_server(
-                &mut stream,
-                &connection.key,
-                &connection.daemon_id,
-                &connection.daemon_ver,
-                std::time::Duration::from_secs(2),
-            )
-            .await
-            .unwrap();
-            stream.write_all(b"authenticated").await.unwrap();
-        });
-        let result = connect_to_subc(&path).await;
-        if result.is_err() {
-            peer.abort();
-        }
-        let mut stream = result.unwrap();
-        let mut bytes = [0; 13];
-        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut bytes)
-            .await
-            .unwrap();
-        assert_eq!(&bytes, b"authenticated");
-        peer.await.unwrap();
+        let daemon = FakeDaemon::start_on("::1").await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::new(test_state()), &refresher);
+        let (stream, hello) = daemon.accept().await;
+        assert_eq!(hello.manifest.module_id, DEFAULT_MODULE_ID);
+        drop(stream);
+        // The connection closed before HELLO_ACK, which is a startup failure.
+        assert!(served(serving, "serving did not end").await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn crashed_refresher_ends_serving_with_nonzero_exit() {
         for panic_thread in [true, false] {
-            let (module, mut daemon) = tokio::io::duplex(64 * 1024);
+            let daemon = FakeDaemon::start().await;
             let (crash, crashed) = std::sync::mpsc::channel::<()>();
+            let config = ModuleConfig {
+                connection_file_path: daemon.config.connection_file_path.clone(),
+                module_id: DEFAULT_MODULE_ID.into(),
+            };
             let serving = tokio::spawn(async move {
-                let (read, write) = tokio::io::split(module);
-                serve_connection(
-                    read,
-                    write,
-                    &test_module_config(),
+                serve_module(
+                    &config,
                     Arc::new(test_state()),
                     move |_, _| {
                         Ok(std::thread::spawn(move || {
@@ -1517,12 +1506,16 @@ mod tests {
                 )
                 .await
             });
-            ack_daemon(&mut daemon).await;
+            let mut stream = daemon.accept_and_ack().await;
             crash.send(()).unwrap();
-            let result = tokio::time::timeout(std::time::Duration::from_secs(3), serving)
-                .await
-                .expect("serving must end when its refresher crashes")
-                .unwrap();
+            // A stop on astrocyte's own account still says GOODBYE.
+            loop {
+                let frame = next_frame(&mut stream).await;
+                if frame.header.ty == FrameType::Goodbye {
+                    break;
+                }
+            }
+            let result = served(serving, "serving must end when its refresher crashes").await;
             assert!(result
                 .as_ref()
                 .unwrap_err()
@@ -1542,32 +1535,10 @@ mod tests {
                     .map_err(|error| error.to_string())
             })
             .unwrap();
-        let (module, mut daemon) = tokio::io::duplex(64 * 1024);
-        let serving_state = Arc::clone(&state);
-        let forced_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let refresher_forced_stop = Arc::clone(&forced_stop);
-        let serving = tokio::spawn(async move {
-            let (read, write) = tokio::io::split(module);
-            serve_connection(
-                read,
-                write,
-                &test_module_config(),
-                serving_state,
-                |_, stop| {
-                    Ok(std::thread::spawn(move || {
-                        while !stop.load(std::sync::atomic::Ordering::Relaxed)
-                            && !refresher_forced_stop.load(std::sync::atomic::Ordering::Relaxed)
-                        {
-                            std::thread::park_timeout(std::time::Duration::from_millis(10));
-                        }
-                        Ok(())
-                    }))
-                },
-                std::future::pending::<()>(),
-            )
-            .await
-        });
-        ack_daemon(&mut daemon).await;
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let _stream = daemon.accept_and_ack().await;
         let panicking = Arc::clone(&state);
         assert!(
             tokio::task::spawn_blocking(move || panicking.panic_write_for_test())
@@ -1579,45 +1550,35 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM crash_probe", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 0, "the panicked transaction must roll back");
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), serving).await;
-        forced_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let result = result
-            .expect("serving must end after a write panic")
-            .unwrap();
+        let result = served(serving, "serving must end after a write panic").await;
         assert!(result.as_ref().unwrap_err().to_string().contains("crash"));
         assert_eq!(finish_process(result), std::process::ExitCode::FAILURE);
     }
 
+    /// A reply larger than the daemon delivers is refused on the request's
+    /// own route and correlation id with `frame_too_large`, carrying the
+    /// reply's size and the limit, rather than being lost. The request names
+    /// a method of 5 MiB, which the `unknown_method` refusal echoes back.
     #[tokio::test(flavor = "multi_thread")]
-    async fn near_limit_route_failure_gets_correlated_internal_error_frame() {
-        let state = Arc::new(test_state());
-        let (tx, mut rx) = mpsc::channel(EGRESS_BUFFER);
-        let frame = Frame::build(
-            FrameType::Request,
-            control_flags(),
-            2,
-            3,
-            42,
-            serde_json::to_vec(&json!({"method": "x".repeat(64 * 1024 * 1024 - 32)})).unwrap(),
+    async fn oversized_route_reply_is_refused_frame_too_large_on_its_own_correlation() {
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::new(test_state()), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        bind(&mut stream, 2, 3, 2).await;
+        let method = "x".repeat(5 * 1024 * 1024);
+        send(
+            &mut stream,
+            route_frame(
+                FrameType::Request,
+                2,
+                3,
+                42,
+                serde_json::to_vec(&json!({ "method": method })).unwrap(),
+            ),
         )
-        .unwrap();
-        handle_frame(
-            frame,
-            &tx,
-            &state,
-            &state.public_projection(),
-            &FlowRoutes::default(),
-        )
-        .await
-        .unwrap();
-        // The 64 MiB method name is decoded, echoed into an error message and serialized
-        // before the oversize reply falls back to `internal`, which takes several seconds in
-        // a debug build on a loaded runner. This deadline only stops a hang; the assertions
-        // below are about what the reply contains, not how fast it arrives.
-        let response = tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv())
-            .await
-            .expect("failed route must send a reply")
-            .unwrap();
+        .await;
+        let response = next_frame(&mut stream).await;
         assert_eq!(
             (
                 response.header.ty,
@@ -1627,9 +1588,20 @@ mod tests {
             ),
             (FrameType::Error, 2, 3, 42)
         );
-        let body: ErrorBody = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(body.code, "internal");
         assert!(response.body.len() < 1024);
+        let body: ErrorBody = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body.code, "frame_too_large");
+        let detail = body.detail.expect("the refusal carries size and limit");
+        assert_eq!(
+            detail["limit"],
+            json!(subc_protocol::MAX_DELIVERED_FRAME_LEN)
+        );
+        assert!(detail["size"].as_u64().unwrap() > 5 * 1024 * 1024);
+        drop(stream);
+        assert!(matches!(
+            served(serving, "serving did not end at EOF").await,
+            Ok(LoopEnd::Eof)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1637,62 +1609,32 @@ mod tests {
         let directory = tempfile::TempDir::new().unwrap();
         let state = Arc::new(state::leased_test_state(&directory));
         state.panic_next_read_for_test();
-        let (module, mut daemon) = tokio::io::duplex(64 * 1024);
-        let forced_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let refresher_forced_stop = Arc::clone(&forced_stop);
-        let serving = tokio::spawn(async move {
-            let (read, write) = tokio::io::split(module);
-            serve_connection(
-                read,
-                write,
-                &test_module_config(),
-                state,
-                |_, stop| {
-                    Ok(std::thread::spawn(move || {
-                        while !stop.load(std::sync::atomic::Ordering::Relaxed)
-                            && !refresher_forced_stop.load(std::sync::atomic::Ordering::Relaxed)
-                        {
-                            std::thread::park_timeout(std::time::Duration::from_millis(10));
-                        }
-                        Ok(())
-                    }))
-                },
-                std::future::pending::<()>(),
-            )
-            .await
-        });
-        ack_daemon(&mut daemon).await;
-        let frame = Frame::build(
-            FrameType::Request,
-            control_flags(),
-            2,
-            3,
-            43,
-            serde_json::to_vec(&json!({"method": ops::OP_REPORT,
-                "params": {"grouping": [], "grain": "day", "timezone": "UTC"}}))
-            .unwrap(),
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, state, &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        bind(&mut stream, 2, 3, 2).await;
+        send(
+            &mut stream,
+            route_frame(
+                FrameType::Request,
+                2,
+                3,
+                43,
+                serde_json::to_vec(&json!({"method": ops::OP_REPORT,
+                    "params": {"grouping": [], "grain": "day", "timezone": "UTC"}}))
+                .unwrap(),
+            ),
         )
-        .unwrap();
-        write_frame(&mut daemon, &frame).await.unwrap();
-        daemon.flush().await.unwrap();
-        let response =
-            tokio::time::timeout(std::time::Duration::from_secs(3), read_frame(&mut daemon)).await;
-        if response.is_err() {
-            forced_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        let response = response
-            .expect("a panicked handler must reply")
-            .unwrap()
-            .unwrap();
+        .await;
+        let response = next_frame(&mut stream).await;
         assert_eq!(
             (response.header.ty, response.header.corr),
             (FrameType::Error, 43)
         );
         let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(error.code, "internal");
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), serving).await;
-        forced_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let result = result.expect("handler panic must end serving").unwrap();
+        let result = served(serving, "handler panic must end serving").await;
         assert!(result
             .as_ref()
             .unwrap_err()
@@ -1700,10 +1642,91 @@ mod tests {
             .contains("route handler crashed"));
         assert_eq!(finish_process(result), std::process::ExitCode::FAILURE);
     }
+
+    /// GOODBYE is the daemon's planned stop: serving ends cleanly with that
+    /// cause, and the process exits 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_goodbye_ends_serving_cleanly_and_exits_zero() {
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::new(test_state()), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        send(
+            &mut stream,
+            Frame::build(
+                FrameType::Goodbye,
+                Flags::new(false, Priority::Passive, false),
+                0,
+                0,
+                0,
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+        .await;
+        let result = served(serving, "serving did not end at GOODBYE").await;
+        assert!(matches!(result, Ok(LoopEnd::Goodbye)), "{result:?}");
+        assert_eq!(finish_process(result), std::process::ExitCode::SUCCESS);
+    }
+
+    /// A connection reset mid-stream is an error, not a deliberate stop: the
+    /// process exits 1 so the supervisor restarts it as a failure. Windows
+    /// reports a killed daemon this way, where Unix reports EOF.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_daemon_connection_ends_serving_with_nonzero_exit() {
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::new(test_state()), &refresher);
+        let stream = daemon.accept_and_ack().await;
+        // Linger zero makes the close send RST instead of FIN.
+        stream.set_zero_linger().unwrap();
+        drop(stream);
+        let result = served(serving, "serving did not end at the reset").await;
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("connection was reset"),
+            "{result:?}"
+        );
+        assert_eq!(finish_process(result), std::process::ExitCode::FAILURE);
+    }
+
+    /// SIGTERM stops serving through the helper's stop handle: it says
+    /// GOODBYE to the daemon and ends with the `sigterm` cause.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_signal_says_goodbye_and_ends_with_the_sigterm_cause() {
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let (signal, signalled) = tokio::sync::oneshot::channel::<()>();
+        let config = ModuleConfig {
+            connection_file_path: daemon.config.connection_file_path.clone(),
+            module_id: DEFAULT_MODULE_ID.into(),
+        };
+        let starter = refresher.starter();
+        let serving = tokio::spawn(async move {
+            serve_module(&config, Arc::new(test_state()), starter, async move {
+                let _ = signalled.await;
+            })
+            .await
+        });
+        let mut stream = daemon.accept_and_ack().await;
+        signal.send(()).unwrap();
+        loop {
+            let frame = next_frame(&mut stream).await;
+            if frame.header.ty == FrameType::Goodbye {
+                break;
+            }
+        }
+        let result = served(serving, "serving did not end after the stop signal").await;
+        assert!(matches!(result, Ok(LoopEnd::Sigterm)), "{result:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn reprice_management_frame_reaches_the_configured_live_catalog() {
         use crate::test_support::catalog::{event, CatalogPeer};
-        use crate::test_support::{wait_until, Background, HANG_GUARD};
+        use crate::test_support::{wait_until, Background};
         use std::sync::atomic::AtomicBool;
 
         let event_at = 1_000;
@@ -1747,35 +1770,17 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let request = Frame::build(
-            FrameType::Request,
-            Flags::new(false, Priority::Interactive, false),
-            7,
-            1,
-            42,
-            serde_json::to_vec(&json!({
-                "method": crate::ops::OP_EVENT_REPRICE,
-                "params": {"event_id": event_id}
-            }))
-            .unwrap(),
-        )
+        let request = serde_json::to_vec(&json!({
+            "method": crate::ops::OP_EVENT_REPRICE,
+            "params": {"event_id": event_id}
+        }))
         .unwrap();
-        let (writer, mut responses) = tokio::sync::mpsc::channel(1);
 
-        crate::handle_route_request(request, &writer, &state, None)
-            .await
-            .unwrap();
+        let outcome = crate::handle_route_request(&state, &request, None);
 
-        let response = tokio::time::timeout(HANG_GUARD, responses.recv())
-            .await
-            .expect("the reprice frame was never answered")
-            .expect("the response channel closed without an answer");
-        assert_eq!(
-            response.header.ty,
-            FrameType::Response,
-            "{}",
-            String::from_utf8_lossy(&response.body)
-        );
+        let HandlerOutcome::Response(_) = outcome else {
+            panic!("the reprice frame was refused: {outcome:?}");
+        };
         let stored: (i64, i64) = state
             .with_conn(|conn| {
                 conn.query_row(
@@ -1882,45 +1887,6 @@ mod tests {
         assert!(
             wire.get("bindings").is_none(),
             "bindings serialized: {wire}"
-        );
-    }
-
-    #[test]
-    fn hello_states_where_the_nonce_was_read_only_when_it_sends_one() {
-        let desired = config::intentional_empty().config;
-        for (source, wire) in [
-            (LaunchNonceSource::Fd, "fd"),
-            (LaunchNonceSource::Env, "env"),
-        ] {
-            let sent = hello_body("astrocyte", &desired, Some(("nonce-1".to_string(), source)));
-            assert_eq!(sent.launch_nonce.as_deref(), Some("nonce-1"));
-            let body = serde_json::to_value(&sent).unwrap();
-            assert_eq!(
-                body["manifest"]["provenance"]["launch_nonce_source"],
-                serde_json::json!(wire)
-            );
-        }
-
-        let unsent = hello_body("astrocyte", &desired, None);
-        assert_eq!(unsent.launch_nonce, None);
-        let wire = serde_json::to_value(&unsent).unwrap();
-        assert!(
-            wire["manifest"]["provenance"]
-                .get("launch_nonce_source")
-                .is_none(),
-            "a source was named for a nonce that was never read: {wire}"
-        );
-    }
-
-    #[test]
-    fn nonce_sources_keep_their_own_names() {
-        assert_eq!(
-            nonce_source(subc_os::LaunchNonceSource::Fd),
-            LaunchNonceSource::Fd
-        );
-        assert_eq!(
-            nonce_source(subc_os::LaunchNonceSource::Env),
-            LaunchNonceSource::Env
         );
     }
 
@@ -2248,31 +2214,18 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let request = Frame::build(
-            FrameType::Request,
-            Flags::new(false, Priority::Interactive, false),
-            7,
-            1,
-            42,
-            serde_json::to_vec(&json!({
-                "method": ops::OP_EVENT_REPRICE,
-                "params": {"event_id": event_id}
-            }))
-            .unwrap(),
-        )
+        let request = serde_json::to_vec(&json!({
+            "method": ops::OP_EVENT_REPRICE,
+            "params": {"event_id": event_id}
+        }))
         .unwrap();
-        let (writer, mut responses) = mpsc::channel(1);
 
-        handle_route_request(request, &writer, &state, None)
-            .await
-            .unwrap();
+        let outcome = handle_route_request(&state, &request, None);
 
-        let response = tokio::time::timeout(crate::test_support::HANG_GUARD, responses.recv())
-            .await
-            .expect("the reprice frame was never answered")
-            .expect("the response channel closed without an answer");
-        assert_eq!(response.header.ty, FrameType::Response);
-        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        let HandlerOutcome::Response(response) = outcome else {
+            panic!("the reprice frame was refused: {outcome:?}");
+        };
+        let body: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(body["result"]["measurements_repriced"], 1);
         let reason: String = state
             .with_conn(|conn| {
@@ -2289,176 +2242,92 @@ mod tests {
         assert_eq!(reason, "catalog_unconfigured");
     }
 
-    /// Every graceful stop in this module hangs off one line: `module_loop`
+    /// Every graceful stop in this module hangs off one event: serving
     /// RETURNING when the daemon's connection closes (EOF). That return is
-    /// what flips the refresher's stop flag and joins it. A loop that
+    /// what flips the refresher's stop flag and joins it. Serving that
     /// reconnected, or waited, instead of returning would leave the refresher
     /// running against a daemon that is gone and every teardown hook unrun --
-    /// silently, because nothing else observes the difference. Four modules
-    /// implement this shape independently and subc's own fence covers only the
-    /// SDK's serve(); astrocyte hand-rolls its loop, so this is the fence for
-    /// this seat. Bounded so the mutation (make the EOF arm wait instead of
-    /// return) fails by name in seconds rather than hanging the suite.
+    /// silently, because nothing else observes the difference. The serve
+    /// helper has its own fence for this; this one covers astrocyte's owner
+    /// around it. Bounded so a regression fails by name rather than hanging
+    /// the suite.
     #[tokio::test(flavor = "multi_thread")]
     async fn module_loop_returns_on_daemon_eof_rather_than_reconnecting_or_waiting() {
-        let state = Arc::new(test_state());
-        let config = ModuleConfig {
-            connection_file_path: PathBuf::from("/nonexistent/subc-connection.json"),
-            module_id: DEFAULT_MODULE_ID.to_string(),
-        };
-        // The module's read half and a handle we control as "the daemon".
-        let (mut module_read, mut daemon_write) = tokio::io::duplex(64 * 1024);
-        let (tx, mut rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
-        // Drain the module's egress so send_hello never blocks on a full channel.
-        let egress = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-
-        let ack = Frame::build(
-            FrameType::HelloAck,
-            Flags::new(false, Priority::Interactive, false),
-            0,
-            0,
-            0,
-            serde_json::to_vec(&ModuleHelloAckBody {
-                negotiated_ver: 1,
-                subc_ops: Vec::new(),
-                subc_capabilities: Vec::new(),
-                storage: None,
-                machine_id: None,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        write_frame(&mut daemon_write, &ack).await.unwrap();
-        daemon_write.flush().await.unwrap();
-
-        let looped = tokio::spawn(async move {
-            module_loop(
-                &mut module_read,
-                tx,
-                &config,
-                state,
-                std::future::pending::<()>(),
-            )
-            .await
-        });
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::new(test_state()), &refresher);
+        let stream = daemon.accept_and_ack().await;
         // The daemon goes away: drop our end. No GOODBYE, no route.closing --
         // the same thing a daemon cut looks like from the module's side.
-        drop(daemon_write);
+        drop(stream);
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), looped)
-            .await
-            .expect(
-                "module_loop did not return within 5s of the daemon's connection closing. \
-                 The refresher's stop flag and join hang off this return; if the loop now \
-                 reconnects or waits, teardown never runs on a daemon cut, silently.",
-            )
-            .unwrap();
+        let result = served(
+            serving,
+            "serving did not return after the daemon's connection closed. The \
+             refresher's stop flag and join hang off this return; if serving now \
+             reconnects or waits, teardown never runs on a daemon cut, silently.",
+        )
+        .await;
         assert!(
             matches!(result, Ok(LoopEnd::Eof)),
             "EOF is a clean return, not an error: {result:?}"
         );
-        egress.abort();
     }
 
     /// A control request this build can't decode must be refused on its own
     /// correlation id while the module keeps serving. The real case is a
     /// newer daemon's `route.bind` whose scope carries an attribute this
     /// build's subc-protocol doesn't know (`ScopeAttributes` refuses unknown
-    /// fields); an unknown control op takes the same decode path. Before the
-    /// fix the decode error ended `module_loop`, which stops the module.
+    /// fields); an unknown control op takes the same decode path. The serve
+    /// helper owns the refusal now; this test holds astrocyte to it.
     #[tokio::test(flavor = "multi_thread")]
     async fn undecodable_control_request_is_refused_and_the_module_keeps_serving() {
-        let state = Arc::new(test_state());
-        let config = ModuleConfig {
-            connection_file_path: PathBuf::from("/nonexistent/subc-connection.json"),
-            module_id: DEFAULT_MODULE_ID.to_string(),
-        };
-        let (mut module_read, mut daemon_write) = tokio::io::duplex(64 * 1024);
-        let (tx, mut rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
-        let control = |corr: u64, body: &str| {
-            Frame::build(
-                FrameType::Request,
-                Flags::new(false, Priority::Passive, false),
-                0,
-                0,
-                corr,
-                body.as_bytes().to_vec(),
-            )
-            .unwrap()
-        };
-        let ack = Frame::build(
-            FrameType::HelloAck,
-            Flags::new(false, Priority::Interactive, false),
-            0,
-            0,
-            0,
-            serde_json::to_vec(&ModuleHelloAckBody {
-                negotiated_ver: 1,
-                subc_ops: Vec::new(),
-                subc_capabilities: Vec::new(),
-                storage: None,
-                machine_id: None,
-            })
-            .unwrap(),
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::new(test_state()), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        send(
+            &mut stream,
+            control_request(7, br#"{"op":"route.future_op","flow_id":"x"}"#.to_vec()),
         )
-        .unwrap();
-        write_frame(&mut daemon_write, &ack).await.unwrap();
-        write_frame(
-            &mut daemon_write,
-            &control(7, r#"{"op":"route.future_op","flow_id":"x"}"#),
+        .await;
+        send(
+            &mut stream,
+            control_request(8, br#"{"op":"health.check"}"#.to_vec()),
         )
-        .await
-        .unwrap();
-        write_frame(&mut daemon_write, &control(8, r#"{"op":"health.check"}"#))
-            .await
-            .unwrap();
-        daemon_write.flush().await.unwrap();
+        .await;
 
-        let looped = tokio::spawn(async move {
-            module_loop(
-                &mut module_read,
-                tx,
-                &config,
-                state,
-                std::future::pending::<()>(),
-            )
-            .await
-        });
-
-        // Skip the module's HELLO; then the refusal, then the health answer.
-        let mut replies = Vec::new();
+        // The refusal and the health answer, by correlation id: health is
+        // answered on its own task.
+        let mut replies = HashMap::new();
         while replies.len() < 2 {
-            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            let frame = tokio::time::timeout(HANG_GUARD, read_frame(&mut stream))
                 .await
-                .expect("no reply within 5 s: the module stopped serving after the bad request")
-                .expect("egress closed: the module stopped serving after the bad request");
-            if frame.header.ty != FrameType::Hello {
-                replies.push(frame);
+                .expect("no reply: the module stopped serving after the bad request")
+                .unwrap()
+                .expect("connection closed: the module stopped serving after the bad request");
+            if frame.header.channel == 0 {
+                replies.insert(frame.header.corr, frame);
             }
         }
-        assert_eq!(replies[0].header.ty, FrameType::Error);
-        assert_eq!(replies[0].header.corr, 7);
-        let refusal: ErrorBody = serde_json::from_slice(&replies[0].body).unwrap();
+        assert_eq!(replies[&7].header.ty, FrameType::Error);
+        let refusal: ErrorBody = serde_json::from_slice(&replies[&7].body).unwrap();
         assert_eq!(refusal.code, "invalid_request");
-        assert_eq!(replies[1].header.ty, FrameType::Response);
-        assert_eq!(replies[1].header.corr, 8);
+        assert_eq!(replies[&8].header.ty, FrameType::Response);
         assert!(
             matches!(
-                serde_json::from_slice::<ModuleControlResponse>(&replies[1].body).unwrap(),
+                serde_json::from_slice::<ModuleControlResponse>(&replies[&8].body).unwrap(),
                 ModuleControlResponse::HealthCheck { .. }
             ),
             "the request after the refusal must still be answered"
         );
         assert!(
-            !looped.is_finished(),
-            "module_loop ended after a bad control request"
+            !serving.is_finished(),
+            "serving ended after a bad control request"
         );
 
-        drop(daemon_write);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), looped)
-            .await
-            .unwrap()
-            .unwrap();
+        drop(stream);
+        let result = served(serving, "serving did not end at EOF").await;
         assert!(matches!(result, Ok(LoopEnd::Eof)), "{result:?}");
     }
 
@@ -2468,57 +2337,13 @@ mod tests {
     /// without a flow goes through. Asserted by the rows the writes leave.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_flow_stamped_route_may_read_but_every_write_is_refused() {
-        use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
-        use subc_protocol::{BindIdentity, Principal, RouteTarget};
-
         let state = Arc::new(test_state());
-        let config = ModuleConfig {
-            connection_file_path: PathBuf::from("/nonexistent/subc-connection.json"),
-            module_id: DEFAULT_MODULE_ID.to_string(),
-        };
-        let (mut module_read, mut daemon_write) = tokio::io::duplex(256 * 1024);
-        let (tx, mut rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
-        let frame = |ty: FrameType, channel: u16, corr: u64, body: Vec<u8>| {
-            // Control channel 0 carries epoch 0; routes carry the bind's epoch.
-            let epoch = if channel == 0 { 0 } else { 1 };
-            Frame::build(
-                ty,
-                Flags::new(false, Priority::Interactive, false),
-                channel,
-                epoch,
-                corr,
-                body,
-            )
-            .unwrap()
-        };
-        let bind = |channel: u16, flow_id: Option<&str>| {
-            let scope = flow_id.map(|flow_id| {
-                ScopeStamp::new(
-                    Principal::Reserved {
-                        module_id: "prefrontal-core".to_string(),
-                    },
-                    "scope-1",
-                    1,
-                    ScopeKind::Worker,
-                )
-                .with_attributes(ScopeAttributes::new().with_flow_id(Some(flow_id.to_string())))
-                .with_owner_authorized(true)
-            });
-            serde_json::to_vec(&ModuleControlRequest::RouteBind {
-                route_channel: channel,
-                epoch: 1,
-                target: RouteTarget::ManagementSurface {
-                    module_id: DEFAULT_MODULE_ID.to_string(),
-                },
-                identity: BindIdentity::new("/tmp/p", "h", "s"),
-                principal: None,
-                consumer_capabilities: None,
-                role_versions: None,
-                admission_facts: None,
-                scope,
-                call_mode: None,
-            })
-            .unwrap()
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        let request = |channel: u16, corr: u64, body: Vec<u8>| {
+            route_frame(FrameType::Request, channel, 1, corr, body)
         };
         let set = |account: &str| {
             serde_json::to_vec(&json!({"method": ops::OP_SUBSCRIPTION_SET, "params": {
@@ -2529,61 +2354,22 @@ mod tests {
         };
         let read = serde_json::to_vec(&json!({"method": "budget.verdict", "params": {}})).unwrap();
 
-        let ack = Frame::build(
-            FrameType::HelloAck,
-            Flags::new(false, Priority::Interactive, false),
-            0,
-            0,
-            0,
-            serde_json::to_vec(&ModuleHelloAckBody {
-                negotiated_ver: 1,
-                subc_ops: Vec::new(),
-                subc_capabilities: Vec::new(),
-                storage: None,
-                machine_id: None,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        write_frame(&mut daemon_write, &ack).await.unwrap();
         // Channel 5 is a flow's route; channel 6 was opened without one.
-        // Binds go on control channel 0. `module_loop` handles control frames
-        // in arrival order, so both binds are recorded before either route's
-        // requests are dispatched.
-        write_frame(
-            &mut daemon_write,
-            &frame(FrameType::Request, 0, 1, bind(5, Some("flow-a"))),
+        // Binds go on control channel 0. The serve helper handles control
+        // frames in arrival order, so both binds are recorded before either
+        // route's requests are dispatched.
+        send(
+            &mut stream,
+            control_request(1, bind_body(5, 1, Some("flow-a"))),
         )
-        .await
-        .unwrap();
-        write_frame(
-            &mut daemon_write,
-            &frame(FrameType::Request, 0, 2, bind(6, None)),
-        )
-        .await
-        .unwrap();
-        write_frame(
-            &mut daemon_write,
-            &frame(FrameType::Request, 5, 10, set("flow-acct")),
-        )
-        .await
-        .unwrap();
-        write_frame(
-            &mut daemon_write,
-            &frame(FrameType::Request, 5, 11, read.clone()),
-        )
-        .await
-        .unwrap();
-        write_frame(
-            &mut daemon_write,
-            &frame(FrameType::Request, 6, 12, set("owner-acct")),
-        )
-        .await
-        .unwrap();
-        write_frame(
-            &mut daemon_write,
-            &frame(
-                FrameType::Request,
+        .await;
+        send(&mut stream, control_request(2, bind_body(6, 1, None))).await;
+        send(&mut stream, request(5, 10, set("flow-acct"))).await;
+        send(&mut stream, request(5, 11, read.clone())).await;
+        send(&mut stream, request(6, 12, set("owner-acct"))).await;
+        send(
+            &mut stream,
+            request(
                 5,
                 13,
                 serde_json::to_vec(&json!({
@@ -2592,31 +2378,16 @@ mod tests {
                 .unwrap(),
             ),
         )
-        .await
-        .unwrap();
-        daemon_write.flush().await.unwrap();
+        .await;
 
-        let loop_state = Arc::clone(&state);
-        let looped = tokio::spawn(async move {
-            module_loop(
-                &mut module_read,
-                tx,
-                &config,
-                loop_state,
-                std::future::pending::<()>(),
-            )
-            .await
-        });
-
-        // Route replies are answered on spawned tasks, so collect by corr.
+        // Route replies are answered on their own tasks, so collect by corr.
         let mut replies = HashMap::new();
         while replies.len() < 4 {
-            let reply = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
-                .await
-                .expect("no reply within 10 s")
-                .expect("egress closed");
+            let reply = next_frame(&mut stream).await;
             if reply.header.channel != 0 {
                 replies.insert(reply.header.corr, reply);
+            } else {
+                assert_eq!(reply.header.ty, FrameType::Response, "route.bind refused");
             }
         }
         let refused = &replies[&10];
@@ -2658,19 +2429,19 @@ mod tests {
             .unwrap();
         assert_eq!(accounts, vec!["owner-acct".to_string()]);
 
-        drop(daemon_write);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), looped).await;
+        drop(stream);
+        let _ = served(serving, "serving did not end at EOF").await;
     }
 
     /// The whole shutdown path under the condition that used to kill the
     /// module: the daemon closes the connection while the refresher is inside
-    /// an OpenCode page statement that would run for hours. `serve_connection`
-    /// must see EOF, stop and join the refresher, and return well inside the
-    /// supervisor's 30 s drain window. The test above proves the loop returns
-    /// on EOF with no refresher attached; it cannot show that the join after
-    /// it is bounded. The drain-level tests prove the drain returns and
-    /// commits nothing; they cannot show that the stop flag reaches the drain
-    /// through the module's own shutdown.
+    /// an OpenCode page statement that would run for hours. Serving must see
+    /// EOF, stop and join the refresher, and return well inside the
+    /// supervisor's 30 s drain window. The test above proves serving returns
+    /// on EOF with an idle refresher; it cannot show that the join after it
+    /// is bounded. The drain-level tests prove the drain returns and commits
+    /// nothing; they cannot show that the stop flag reaches the drain through
+    /// the module's own shutdown.
     #[test]
     fn daemon_eof_during_a_slow_opencode_read_joins_the_refresher_promptly() {
         use crate::test_support::opencode as opencode_fixture;
@@ -2679,7 +2450,6 @@ mod tests {
         let opencode_database = opencode_fixture::slow_page_database(temp.path());
         let probed_database = opencode_database.clone();
         let state = Arc::new(test_state());
-        let (module_side, mut daemon_side) = tokio::io::duplex(64 * 1024);
         // Dropping the sender is the daemon's close signal.
         let (close_daemon, daemon_closes) = std::sync::mpsc::channel::<()>();
         let (served, returned) = std::sync::mpsc::channel();
@@ -2692,51 +2462,31 @@ mod tests {
                 .build()
                 .unwrap();
             let result = runtime.block_on(async move {
-                // Sent by the daemon once it has decided to close; the
-                // refresher starter below waits for it.
-                let (daemon_closing, closing_seen) = std::sync::mpsc::channel::<()>();
-                let (read_half, write_half) = tokio::io::split(module_side);
+                let daemon = FakeDaemon::start().await;
+                let config = ModuleConfig {
+                    connection_file_path: daemon.config.connection_file_path.clone(),
+                    module_id: DEFAULT_MODULE_ID.to_string(),
+                };
                 let serving = tokio::spawn(async move {
-                    let config = ModuleConfig {
-                        connection_file_path: PathBuf::from("/nonexistent/subc-connection.json"),
-                        module_id: DEFAULT_MODULE_ID.to_string(),
-                    };
-                    serve_connection(
-                        read_half,
-                        write_half,
+                    serve_module(
                         &config,
                         serve_state,
                         move |state, stop| {
-                            let refresher = refresher::start_refresher_with_opencode(
-                                state,
-                                stop,
-                                opencode_database,
-                            );
-                            // `serve_connection` sends HELLO only after this
-                            // starter returns. Holding it until the daemon has
-                            // decided to close makes the daemon's close race
-                            // the module's HELLO every run, not only on a
-                            // loaded runner. A daemon that closed before
-                            // reading HELLO would make that write fail with a
-                            // broken pipe, which `serve_connection` reports as
-                            // an error rather than a clean EOF.
-                            let _ = closing_seen.recv();
-                            refresher
+                            refresher::start_refresher_with_opencode(state, stop, opencode_database)
                         },
                         std::future::pending::<()>(),
                     )
                     .await
                 });
-                // Closed on the test's signal, or when the test drops the
-                // sender by failing first: either way the daemon goes away, so
-                // the module stops its refresher rather than outliving the test.
+                // The module connects once its refresher has started. The
+                // daemon answers its HELLO, then holds the connection until
+                // the test's signal, or until the test drops the sender by
+                // failing first: either way the daemon goes away, so the
+                // module stops its refresher rather than outliving the test.
+                let stream = daemon.accept_and_ack().await;
                 let _ = tokio::task::spawn_blocking(move || daemon_closes.recv()).await;
-                drop(daemon_closing);
-                // A real daemon sends HELLO_ACK only in answer to the module's
-                // HELLO, so by the time it can close, HELLO has been written.
-                // Then it goes away with no GOODBYE, as in a daemon stop.
-                ack_daemon(&mut daemon_side).await;
-                drop(daemon_side);
+                // No GOODBYE, as in a daemon stop.
+                drop(stream);
                 serving.await.unwrap()
             });
             let _ = served.send(result);
@@ -2924,23 +2674,7 @@ mod tests {
                     .unwrap();
                     let hello = read_frame(&mut stream).await.unwrap().unwrap();
                     assert_eq!(hello.header.ty, FrameType::Hello);
-                    let ack = Frame::build(
-                        FrameType::HelloAck,
-                        Flags::new(false, Priority::Interactive, false),
-                        0,
-                        0,
-                        HELLO_CORR,
-                        serde_json::to_vec(&ModuleHelloAckBody {
-                            negotiated_ver: 1,
-                            subc_ops: Vec::new(),
-                            subc_capabilities: Vec::new(),
-                            storage: None,
-                            machine_id: None,
-                        })
-                        .unwrap(),
-                    )
-                    .unwrap();
-                    write_frame(&mut stream, &ack).await.unwrap();
+                    write_frame(&mut stream, &hello_ack()).await.unwrap();
                     stream.flush().await.unwrap();
                     handshaken.send(()).unwrap();
                     tokio::task::spawn_blocking(move || daemon_released.recv())
@@ -3148,7 +2882,6 @@ mod tests {
         let error = match open_state_at_store(&path) {
             Ok(_) => panic!("a store ahead of the binary must not open"),
             Err(ModuleError::Message(message)) => message,
-            Err(other) => panic!("unexpected refusal shape: {other:?}"),
         };
         assert!(
             error.contains(&format!("version {ahead_version}")),
@@ -3165,6 +2898,7 @@ mod tests {
 #[cfg(test)]
 mod launch_nonce_tests {
     use super::*;
+    use subc_protocol::{manifest::LaunchNonceSource, ModuleHelloBody};
 
     /// Scan every workspace crate's Rust source, including tests. The line-level rule
     /// rejects nonce-key literals on the same line as an env::var or var_os call,
@@ -3344,18 +3078,37 @@ mod launch_nonce_tests {
         );
     }
 
-    async fn hello_or_error() -> (Result<(), ModuleError>, Option<ModuleHelloBody>) {
+    /// Serve against a stand-in daemon through the real serving path and
+    /// return how serving ended and the HELLO the daemon received, if any.
+    /// The daemon answers HELLO_ACK and then closes the connection.
+    async fn hello_or_error() -> (Result<LoopEnd, ModuleError>, Option<ModuleHelloBody>) {
+        let daemon = tests::FakeDaemon::start().await;
+        let refresher = tests::IdleRefresher::new();
         let config = ModuleConfig {
-            connection_file_path: PathBuf::new(),
+            connection_file_path: daemon.config.connection_file_path.clone(),
             module_id: DEFAULT_MODULE_ID.to_string(),
         };
-        let (tx, mut rx) = mpsc::channel(1);
-        let result = send_hello(&tx, &config, &config::intentional_empty().config, None).await;
-        drop(tx);
-        let hello = rx
-            .recv()
+        let state = Arc::new(crate::test_support::test_state());
+        let starter = refresher.starter();
+        let serving = tokio::spawn(async move {
+            serve_module(&config, state, starter, std::future::pending::<()>()).await
+        });
+        let received = tokio::spawn(async move {
+            let (mut stream, hello) = daemon.accept().await;
+            tests::send(&mut stream, tests::hello_ack()).await;
+            hello
+        });
+        let result = tokio::time::timeout(crate::test_support::HANG_GUARD, serving)
             .await
-            .map(|frame| serde_json::from_slice(&frame.body).unwrap());
+            .expect("serving did not end")
+            .unwrap();
+        // A module that never connected leaves the daemon waiting.
+        let hello = if result.is_ok() || received.is_finished() {
+            Some(received.await.unwrap())
+        } else {
+            received.abort();
+            None
+        };
         (result, hello)
     }
 
@@ -3367,13 +3120,28 @@ mod launch_nonce_tests {
             || {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 let (result, hello) = runtime.block_on(hello_or_error());
-                result.unwrap();
+                assert!(matches!(result, Ok(LoopEnd::Eof)), "{result:?}");
                 let hello = hello.expect("a HELLO frame");
                 assert_eq!(hello.launch_nonce.as_deref(), Some("env-nonce"));
                 let provenance = hello.manifest.provenance.expect("provenance");
                 assert_eq!(provenance.launch_nonce_source, Some(LaunchNonceSource::Env));
             },
         );
+    }
+
+    /// With no nonce handed over, HELLO carries none and names no source:
+    /// the provenance never claims a place a nonce was read from.
+    #[test]
+    fn a_hello_without_a_nonce_names_no_source() {
+        in_child("a_hello_without_a_nonce_names_no_source", &[], || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (result, hello) = runtime.block_on(hello_or_error());
+            assert!(matches!(result, Ok(LoopEnd::Eof)), "{result:?}");
+            let hello = hello.expect("a HELLO frame");
+            assert_eq!(hello.launch_nonce, None);
+            let provenance = hello.manifest.provenance.expect("provenance");
+            assert_eq!(provenance.launch_nonce_source, None);
+        });
     }
 
     // Unix descriptor handoffs are authoritative: a malformed one cannot fall
@@ -3411,7 +3179,7 @@ mod launch_nonce_tests {
             || {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 let (result, hello) = runtime.block_on(hello_or_error());
-                result.unwrap();
+                assert!(matches!(result, Ok(LoopEnd::Eof)), "{result:?}");
                 let hello = hello.expect("a HELLO frame");
                 assert_eq!(hello.launch_nonce.as_deref(), Some("env-nonce"));
                 let provenance = hello.manifest.provenance.expect("provenance");
@@ -3460,25 +3228,14 @@ mod logging_tests {
             "wire_module_id_matches_filterable_logger_root",
             "off,astrocyte=debug",
             |handle| {
-                let runtime = tokio::runtime::Runtime::new().unwrap();
-                let wire_id = runtime.block_on(async {
-                    let config = ModuleConfig {
-                        connection_file_path: PathBuf::new(),
-                        module_id: std::env::var(SUBC_MODULE_ID_ENV).unwrap(),
-                    };
-                    let (tx, mut rx) = mpsc::channel(1);
-                    send_hello(&tx, &config, &config::intentional_empty().config, None)
-                        .await
-                        .unwrap();
-                    // `tx` is still alive, so a HELLO that was never sent
-                    // would wait forever without this bound.
-                    let frame = tokio::time::timeout(crate::test_support::HANG_GUARD, rx.recv())
-                        .await
-                        .expect("send_hello returned without sending a HELLO")
-                        .expect("the HELLO channel closed without a frame");
-                    let hello: ModuleHelloBody = serde_json::from_slice(&frame.body).unwrap();
-                    hello.manifest.module_id
-                });
+                // `serve_module` hands the serve helper this manifest, and the
+                // helper sends it in HELLO unchanged.
+                let config = ModuleConfig {
+                    connection_file_path: PathBuf::new(),
+                    module_id: std::env::var(SUBC_MODULE_ID_ENV).unwrap(),
+                };
+                let wire_id =
+                    manifest(&config.module_id, &config::intentional_empty().config).module_id;
                 log_terminal_error(&"root probe");
                 let contents = std::fs::read_to_string(handle.path()).unwrap();
                 let lines: Vec<_> = contents

@@ -130,9 +130,9 @@ they do full ticks. One full tick:
 5. Spend a bounded budget reconciling `pricing_pending` against the full ledger, to
    catch any write path that failed to enqueue.
 
-An unrequested refresher end or handler panic stops the module non-zero. Failed
-handlers attempt a small correlated `internal` error reply. EOF, GOODBYE and SIGTERM
-keep their clean-stop paths.
+The `subc-client-rs` serve helper owns the connection. A refresher end, reset or
+handler panic exits 1; a panic is answered `internal`. EOF and GOODBYE exit 0;
+SIGTERM stops cleanly, then re-raises.
 
 The ckbus route shares HELLO's single nonce handoff. Daemon validation of
 `consumer_identity` stamps its principal; nonces stay out of diagnostics.

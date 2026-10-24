@@ -1000,24 +1000,6 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
-id = "control-decode-keep-serving"
-guards = "An undecodable control request returns invalid_request and does not stop the serve loop"
-file = "crates/astrocyte-module/src/main.rs"
-old = "return send(writer, refusal).await;"
-new = """
-send(writer, refusal).await?; // NON-VACUITY BREAK
-            return Err(ModuleError::Json(error));"""
-test_file = "crates/astrocyte-module/src/main.rs"
-runner = "cargo"
-package = "astrocyte-module"
-target = "--bin ck-astrocyte"
-expect_red = ["ck_astrocyte::tests::undecodable_control_request_is_refused_and_the_module_keeps_serving"]
-expect_message = "the module stopped serving after the bad request"
-only = true
-timeout_s = 600
-build_timeout_s = 1800
-
-[[control]]
 id = "coverage-backfill-provider"
 guards = "Coverage backfill must join plan and event on provider as well as the other identity dimension"
 file = "crates/astrocyte-core/src/subscription.rs"
