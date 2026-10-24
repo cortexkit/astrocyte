@@ -102,12 +102,11 @@ without degrading health.
 ## Refresher loop
 
 `start_refresher` runs full ticks on one OS thread every `poll_interval_secs`.
-Between ticks, `FAST_LANE_INTERVAL` (two seconds) runs OpenCode's rowid tail,
-BROCA's fact tail and JSONL readers for hot files discovered on full ticks. An idle tail
-commits nothing; only full drains advance `last_success_ms`. Both lanes share
-ingestion and post-commit memory refresh under the writer fence. Tails never
-run full passes or maintenance, and stop requests interrupt their reads as
-they do full ticks. One full tick:
+Between ticks, `FAST_LANE_INTERVAL` (two seconds) tails OpenCode 1/2 and BROCA
+and checks JSONL hot paths discovered on full ticks. Idle cycles commit nothing.
+Only full drains advance `last_success_ms`. Both lanes share ingestion and
+post-commit memory refresh under the writer fence. Tails run no full passes or
+maintenance, and stop requests interrupt both lanes. One full tick:
 
 1. Connect a pending fusiform catalog and find its history boundary through
    `catalog.status`, falling back to a refused time-zero `catalog.get` for older

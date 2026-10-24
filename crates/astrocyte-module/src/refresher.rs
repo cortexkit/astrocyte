@@ -1998,7 +1998,11 @@ fn run_fast_lane(
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        if !ingest.ingests(source.source_key()) {
+        let ingest_key = match source.source_key() {
+            opencode_v2_source::SOURCE_KEY => opencode_source::OPENCODE_SOURCE_KEY,
+            key => key,
+        };
+        if !ingest.ingests(ingest_key) {
             continue;
         }
         if let Err(SourceDrainError::Failed(error)) = source.drain_fast(state, at, stop) {

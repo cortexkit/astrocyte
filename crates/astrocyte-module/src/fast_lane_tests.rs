@@ -28,7 +28,11 @@ impl Corpus {
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
             CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+            CREATE TABLE session_v2(id TEXT PRIMARY KEY);
+            CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,
+                type TEXT NOT NULL,seq INTEGER NOT NULL,time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,data TEXT NOT NULL);",
             )
             .unwrap();
         let broca_path = directory.path().join("broca.db");
@@ -49,8 +53,13 @@ impl Corpus {
         fs::write(&pi_path, "{\"type\":\"session\",\"id\":\"pi-session\",\"cwd\":\"/synthetic\",\"timestamp\":\"2026-09-21T00:00:00Z\"}\n").unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let files = FileSources {
-            opencode: Some(Arc::new(opencode_source::OpenCodeSource::at(opencode_path))),
+            opencode: Some(Arc::new(opencode_source::OpenCodeSource::at(
+                &opencode_path,
+            ))),
             pi: Some(Arc::new(pi_source::PiSource::at(pi_root))),
+            harnesses: vec![Arc::new(opencode_v2_source::OpenCodeV2Source::at(
+                &opencode_path,
+            ))],
             ..FileSources::default()
         };
         let producers = vec![Producer {
@@ -111,6 +120,24 @@ impl Corpus {
             "{line}"
         )
         .unwrap();
+    }
+
+    fn append_v2(&self, index: i64) {
+        let payload = json!({"type":"assistant", "agent":"build",
+            "model":{"providerID":"anthropic","id":"claude-sonnet-4"},
+            "time":{"created":NOW + index,"completed":NOW + index + 1},"finish":"stop",
+            "tokens":{"input":3,"output":13,"reasoning":17,"cache":{"read":5,"write":7}}});
+        self.opencode
+            .execute(
+                "INSERT INTO session_message VALUES(?1,'oc-v2-session','assistant',?2,?3,?3,?4)",
+                params![
+                    format!("v2-message-{index}"),
+                    index,
+                    NOW + index,
+                    payload.to_string()
+                ],
+            )
+            .unwrap();
     }
 
     pub(super) fn full(&self, state: &SharedState, at: i64) {
@@ -234,6 +261,124 @@ fn fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval() {
 }
 
 #[test]
+fn fresh_v2_only_completed_row_is_served_on_the_next_fast_interval() {
+    let corpus = Corpus::new();
+    let state = test_state();
+    state.set_recent_steps_now_for_test(NOW);
+    corpus.full(&state, NOW);
+    let health = runtime(&state);
+    let query = || {
+        crate::ops::dispatch(
+            &state,
+            crate::ops::OP_CACHE_STEPS,
+            json!({"harness":"opencode","session":"oc-v2-session"}),
+        )
+        .unwrap()
+    };
+    corpus.append_v2(1);
+    let mut next = FAST_LANE_INTERVAL;
+    fast_lane_if_due(
+        &state,
+        &corpus.producers,
+        &corpus.files,
+        &corpus.stop,
+        FAST_LANE_INTERVAL - Duration::from_nanos(1),
+        Duration::from_secs(30),
+        &mut next,
+    );
+    assert_eq!(query()["steps"], json!([]));
+    corpus.due(&state);
+    let reply = query();
+    assert_eq!(reply["steps"].as_array().unwrap().len(), 1, "{reply}");
+    assert_eq!(reply["steps"][0]["step_ref"], "v2-message-1");
+    assert_eq!(reply["steps"][0]["input"], 3);
+    assert_eq!(reply["steps"][0]["output"], 13);
+    assert_eq!(reply["steps"][0]["finish"], "stop");
+    assert_eq!(rows(&state, "usage_event").len(), 1);
+    assert_eq!(runtime(&state), health);
+    corpus.due(&state);
+    assert_eq!(query()["steps"], reply["steps"]);
+    assert_eq!(rows(&state, "usage_event").len(), 1);
+}
+
+#[test]
+fn absent_v2_marker_keeps_fast_cycles_query_free_until_a_full_tick() {
+    use astrocyte_readers::read_io;
+    let mut corpus = Corpus::new();
+    corpus.files.opencode = None;
+    corpus.files.pi = None;
+    corpus
+        .opencode
+        .execute("DROP TABLE session_v2", [])
+        .unwrap();
+    corpus.append_v2(1);
+    let state = test_state();
+    corpus.full(&state, NOW);
+    assert!(rows(&state, "usage_event").is_empty());
+    let health = runtime(&state);
+    for added_marker in [false, true] {
+        if added_marker {
+            corpus
+                .opencode
+                .execute("CREATE TABLE session_v2(id TEXT PRIMARY KEY)", [])
+                .unwrap();
+        }
+        read_io::reset_counts();
+        run_fast_lane(&state, &[], &corpus.files, NOW, &corpus.stop);
+        assert_eq!(read_io::counts(), read_io::Counts::default());
+        assert!(rows(&state, "usage_event").is_empty());
+        assert_eq!(runtime(&state), health);
+    }
+    corpus.full(&state, NOW + 30_000);
+    assert_eq!(rows(&state, "usage_event").len(), 1);
+}
+
+#[test]
+fn v2_fast_lane_never_runs_an_overdue_full_pass() {
+    let mut corpus = Corpus::new();
+    corpus.files.opencode = None;
+    corpus.files.pi = None;
+    let state = test_state();
+    let at = current_time_ms();
+    corpus.full(&state, at);
+    let health = runtime(&state);
+    corpus.append_v2(1);
+    run_fast_lane(
+        &state,
+        &[],
+        &corpus.files,
+        at + 24 * 60 * 60 * 1000,
+        &corpus.stop,
+    );
+    assert_eq!(rows(&state, "usage_event").len(), 1);
+    assert_eq!(runtime(&state), health);
+}
+
+#[test]
+fn opencode_exclusion_covers_both_fast_readers() {
+    use astrocyte_readers::read_io;
+    let corpus = Corpus::new();
+    let state = test_state();
+    corpus.full(&state, NOW);
+    let mut config = state.desired_config();
+    config.harness_ingest.exclude = vec!["opencode".into()];
+    state.publish_desired(config, 1);
+    let health = runtime(&state);
+    corpus.append_opencode(1);
+    corpus.append_v2(1);
+    read_io::reset_counts();
+    corpus.due(&state);
+    assert_eq!(read_io::counts().connection_opens, 0);
+    assert!(rows(&state, "usage_event").is_empty());
+    assert_eq!(runtime(&state), health);
+    let mut config = state.desired_config();
+    config.harness_ingest.exclude.clear();
+    state.publish_desired(config, 2);
+    corpus.due(&state);
+    assert_eq!(rows(&state, "usage_event").len(), 2);
+}
+
+#[test]
 fn idle_fast_lane_commits_nothing_and_keeps_full_drain_health() {
     let corpus = Corpus::new();
     corpus.append(1);
@@ -278,7 +423,7 @@ fn add_jsonl_inventory(corpus: &mut Corpus) -> usize {
         root.join("claude"),
     )));
     corpus.files.codex = Some(Arc::new(codex_source::CodexSource::at(root.join("codex"))));
-    corpus.files.harnesses = vec![
+    let jsonl: Vec<Arc<dyn harness_drain::HarnessSource>> = vec![
         Arc::new(gemini_source::GeminiSource::at(root.join("gemini"))),
         Arc::new(omp_source::OmpSource::at(root.join("omp"))),
         Arc::new(kimi_source::KimiSource::at(root.join("kimi"))),
@@ -286,6 +431,7 @@ fn add_jsonl_inventory(corpus: &mut Corpus) -> usize {
             root.into(),
         )),
     ];
+    corpus.files.harnesses.extend(jsonl);
     7
 }
 
@@ -295,6 +441,7 @@ fn idle_fast_cycle_opens_nothing_and_stats_only_hot_files() {
     let mut corpus = Corpus::new();
     let hot_files = add_jsonl_inventory(&mut corpus);
     corpus.append(1);
+    corpus.append_v2(1);
     let state = test_state();
     let at = current_time_ms();
     corpus.full(&state, at);
@@ -312,6 +459,7 @@ fn idle_fast_cycle_opens_nothing_and_stats_only_hot_files() {
         );
         let counts = read_io::counts();
         assert_eq!(counts.connection_opens, 0, "{counts:?}");
+        assert_eq!(counts.statement_prepares, 0, "{counts:?}");
         assert_eq!(counts.directory_reads, 0, "{counts:?}");
         assert_eq!(counts.file_opens, 0, "{counts:?}");
         assert_eq!(

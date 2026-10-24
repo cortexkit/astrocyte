@@ -49,7 +49,7 @@ back drains do not consume scheduled checks. Gemini JSON documents retain
 their separate hourly verification policy. Goose stays on full ticks.
 
 Between full ticks, the refresher's single writer runs a fast lane every two
-seconds (`FAST_LANE_INTERVAL`). It reads OpenCode's rowid tail and BROCA's
+seconds (`FAST_LANE_INTERVAL`). It reads OpenCode 1 and 2 rowid tails and BROCA's
 `export_facts` tail. Pi, Oh My Pi, Claude Code, declared Claude workers, Codex,
 Kimi and Gemini JSONL readers retain a hot set from full ticks: files modified
 within the last five minutes, plus newly discovered files. A file that keeps
@@ -67,7 +67,7 @@ work, audits and retention keep their existing schedules.
 
 A fast read uses the same event mapping, identities and commit ordering as a full
 drain, so later full reads deduplicate it normally. BROCA advances its durable
-fact cursor with new facts; OpenCode retains its separate in-memory rowid cursor.
+fact cursor with new facts; each OpenCode reader retains its own in-memory rowid cursor.
 After startup or a detected store replacement, OpenCode waits for a full pass to
 establish the store identity. An idle fast cycle commits nothing, including when
 OpenCode's initial tail seed returns only exact redeliveries. Fast reads never
@@ -75,11 +75,18 @@ advance `last_success_ms` or clear degraded health. Committed events refresh the
 recent-steps memory through the normal post-commit path. Both lanes run on the
 same refresher thread and use the same stop signal.
 
-OpenCode and BROCA retain read-only SQLite connections and cached statements
+Both OpenCode readers and BROCA retain read-only SQLite connections and cached statements
 between fast cycles. Full ticks check the database path for replacement and
 discard an obsolete connection; read failures also discard it. Every read ends
 its transaction before returning, so an idle connection never pins an old WAL
 snapshot or prevents the producer from checkpointing.
+
+Full ticks discover OpenCode 2 by its `session_v2` marker. When the marker is
+absent, the fast lane uses that cached result and makes no v2 query or connection
+attempt. A newly added marker waits for the next full tick. Once discovered,
+v2-only completed rows reach `usage.cache.steps` on the next fast interval without
+moving the durable cursor or changing full-drain health. Both generations obey
+the `opencode` ingestion configuration key.
 
 Codex `.jsonl.zst` archives are immutable snapshots, not appendable streams.
 After a verified read, unchanged size, modification time and file identity skip

@@ -9,8 +9,8 @@ use serde::Deserialize;
 
 use super::opencode::{OpenCodeCursor, OpenCodeMessage, OpenCodeReadError, OpenCodeScanCost};
 use super::opencode_schema::{
-    counted_query_row, sqlite_error, with_read_snapshot, OpenCodeOpenRow, OpenCodeSetAside,
-    OpenCodeTailRequest,
+    counted_query_row, in_read_snapshot, readonly_uri, sqlite_error, with_read_snapshot,
+    OpenCodeOpenRow, OpenCodeSetAside, OpenCodeTailRequest,
 };
 use crate::TokenBreakdown;
 
@@ -88,10 +88,12 @@ fn table_exists(
 fn begin_page(
     connection: &Connection,
     stop: &AtomicBool,
+    check_marker: bool,
 ) -> Result<Option<Page>, OpenCodeReadError> {
     let mut page = Page::default();
-    if !table_exists(connection, &mut page.cost, "session_v2")
-        .map_err(|e| sqlite_error(stop, "detect OpenCode 2", e))?
+    if check_marker
+        && !table_exists(connection, &mut page.cost, "session_v2")
+            .map_err(|e| sqlite_error(stop, "detect OpenCode 2", e))?
     {
         return Ok(None);
     }
@@ -127,7 +129,7 @@ pub fn read_page(
     stop: &AtomicBool,
 ) -> Result<Option<Page>, OpenCodeReadError> {
     with_read_snapshot(path, stop, |connection| {
-        let Some(mut page) = begin_page(connection, stop)? else {
+        let Some(mut page) = begin_page(connection, stop, true)? else {
             return Ok(None);
         };
         page.high_water = counted_query_row(
@@ -199,52 +201,101 @@ pub fn read_tail(
     stop: &AtomicBool,
 ) -> Result<Option<Page>, OpenCodeReadError> {
     with_read_snapshot(path, stop, |connection| {
-        let Some(mut page) = begin_page(connection, stop)? else {
-            return Ok(None);
-        };
-        page.start_rowid = request
-            .after_rowid
-            .unwrap_or_else(|| page.max_rowid.saturating_sub(request.seed_rows).max(0));
-        page.through_rowid = page.start_rowid.max(page.max_rowid);
-        let limit = i64::try_from(request.limit)
-            .map_err(|_| "OpenCode 2 tail limit out of range".to_string())?;
-        if limit == 0 {
-            return Err("OpenCode 2 tail limit is zero".to_string().into());
-        }
-        let legacy = table_exists(connection, &mut page.cost, "message")
-            .map_err(|e| sqlite_error(stop, "detect OpenCode 1 table", e))?;
-        // Range over all types so a run of user rows also advances the tail.
-        let mut statement = connection
-            .prepare(
-                "SELECT rowid,id,session_id,time_updated,data,type FROM session_message
+        read_tail_snapshot(connection, request, now_ms, stop, true)
+    })
+}
+
+/// Retain the read-only connection and statements, never the read transaction.
+pub struct TailReader {
+    connection: Connection,
+}
+
+impl TailReader {
+    pub fn open(path: &Path, stop: &AtomicBool) -> Result<Option<Self>, OpenCodeReadError> {
+        let connection =
+            super::sqlite_read::open_read_connection(readonly_uri(path)?, path, "OpenCode 2")?;
+        // After an error, the path may name a store without the v2 schema.
+        let present = in_read_snapshot(&connection, path, stop, |connection| {
+            table_exists(connection, &mut OpenCodeScanCost::default(), "session_v2")
+                .map_err(|error| sqlite_error(stop, "detect OpenCode 2", error))
+        })?;
+        Ok(present.then_some(Self { connection }))
+    }
+
+    /// Full ticks check the marker. Fast reads may skip that query only after
+    /// a full tick established that this store contains the v2 schema.
+    pub fn read(
+        &self,
+        path: &Path,
+        request: &OpenCodeTailRequest<'_>,
+        now_ms: i64,
+        stop: &AtomicBool,
+        check_marker: bool,
+    ) -> Result<Option<Page>, OpenCodeReadError> {
+        in_read_snapshot(&self.connection, path, stop, |connection| {
+            read_tail_snapshot(connection, request, now_ms, stop, check_marker)
+        })
+    }
+}
+
+fn read_tail_snapshot(
+    connection: &Connection,
+    request: &OpenCodeTailRequest<'_>,
+    now_ms: i64,
+    stop: &AtomicBool,
+    check_marker: bool,
+) -> Result<Option<Page>, OpenCodeReadError> {
+    let Some(mut page) = begin_page(connection, stop, check_marker)? else {
+        return Ok(None);
+    };
+    page.start_rowid = request
+        .after_rowid
+        .unwrap_or_else(|| page.max_rowid.saturating_sub(request.seed_rows).max(0));
+    page.through_rowid = page.start_rowid.max(page.max_rowid);
+    let limit = i64::try_from(request.limit)
+        .map_err(|_| "OpenCode 2 tail limit out of range".to_string())?;
+    if limit == 0 {
+        return Err("OpenCode 2 tail limit is zero".to_string().into());
+    }
+    let legacy = table_exists(connection, &mut page.cost, "message")
+        .map_err(|e| sqlite_error(stop, "detect OpenCode 1 table", e))?;
+    // Range over all types so a run of user rows also advances the tail.
+    let mut statement = crate::read_io::prepare_cached(
+        connection,
+        "SELECT rowid,id,session_id,time_updated,data,type FROM session_message
              WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT ?3",
-            )
-            .map_err(|e| sqlite_error(stop, "prepare OpenCode 2 tail", e))?;
-        let mut rows = statement
-            .query(params![page.start_rowid, page.max_rowid, limit])
-            .map_err(|e| sqlite_error(stop, "query OpenCode 2 tail", e))?;
-        let mut returned = 0;
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| sqlite_error(stop, "step OpenCode 2 tail", e))?
-        {
-            returned += 1;
-            if returned == request.limit {
-                page.through_rowid = row
-                    .get(0)
-                    .map_err(|e| sqlite_error(stop, "read OpenCode 2 rowid", e))?;
-            }
-            if row
-                .get::<_, String>(5)
-                .map_err(|e| sqlite_error(stop, "read OpenCode 2 type", e))?
-                == "assistant"
-            {
-                take_row(connection, row, legacy, now_ms, stop, &mut page)?;
-            }
+    )
+    .map_err(|e| sqlite_error(stop, "prepare OpenCode 2 tail", e))?;
+    let mut rows = statement
+        .query(params![page.start_rowid, page.max_rowid, limit])
+        .map_err(|e| sqlite_error(stop, "query OpenCode 2 tail", e))?;
+    let mut returned = 0;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| sqlite_error(stop, "step OpenCode 2 tail", e))?
+    {
+        returned += 1;
+        if returned == request.limit {
+            page.through_rowid = row
+                .get(0)
+                .map_err(|e| sqlite_error(stop, "read OpenCode 2 rowid", e))?;
         }
-        drop(rows);
-        page.cost.add_statement(&statement);
-        let mut lookup = connection.prepare(
+        if row
+            .get::<_, String>(5)
+            .map_err(|e| sqlite_error(stop, "read OpenCode 2 type", e))?
+            == "assistant"
+        {
+            take_row(connection, row, legacy, now_ms, stop, &mut page)?;
+        }
+    }
+    drop(rows);
+    page.cost.add_statement(&statement);
+    if request
+        .open_rowids
+        .iter()
+        .any(|&rowid| rowid <= page.start_rowid)
+    {
+        let mut lookup = crate::read_io::prepare_cached(connection,
             "SELECT rowid,id,session_id,time_updated,data FROM session_message WHERE rowid=?1 AND type='assistant'",
         ).map_err(|e| sqlite_error(stop, "prepare OpenCode 2 pending lookup", e))?;
         let start = page.start_rowid;
@@ -260,8 +311,8 @@ pub fn read_tail(
             }
         }
         page.cost.add_statement(&lookup);
-        Ok(Some(page))
-    })
+    }
+    Ok(Some(page))
 }
 
 fn take_row(

@@ -361,7 +361,7 @@ pub(super) fn with_read_snapshot<T>(
     in_read_snapshot(&connection, db_path, stop, read)
 }
 
-fn in_read_snapshot<T>(
+pub(super) fn in_read_snapshot<T>(
     connection: &Connection,
     db_path: &Path,
     stop: &AtomicBool,
@@ -880,7 +880,7 @@ fn map_stored(
     })
 }
 
-fn readonly_uri(path: &Path) -> Result<String, String> {
+pub(super) fn readonly_uri(path: &Path) -> Result<String, String> {
     let raw = path
         .to_str()
         .ok_or_else(|| format!("OpenCode database path is not UTF-8: {}", path.display()))?;
