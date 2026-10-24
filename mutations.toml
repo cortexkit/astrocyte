@@ -2090,3 +2090,52 @@ expect_red = [
 only = true
 timeout_s = 600
 build_timeout_s = 900
+
+[[control]]
+id = "cache-notice-after-commit"
+guards = "A cache step notice is published only after its transaction commits, never for steps that roll back"
+file = "crates/astrocyte-module/src/state.rs"
+old = "outcome = Some(run_ordered_transaction(conn, operation, skip_unchanged));"
+new = """
+outcome = Some(run_ordered_transaction(conn, |tx: &Transaction<'_>| { let output = operation(tx); self.publish_cache_notices(tx); output }, skip_unchanged)); // NON-VACUITY BREAK: publish before commit"""
+test_file = "crates/astrocyte-module/src/cache_notices.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["cache_notices::tests::a_notice_is_published_only_after_its_steps_commit"]
+expect_message = "a rolled-back transaction published a notice"
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
+id = "cache-subscribe-resync"
+guards = "A subscription resuming from a cursor older than the notice log starts with one resync notice"
+file = "crates/astrocyte-module/src/cache_notices.rs"
+old = "Some(cursor) if cursor < log.floor => Ok(Start::Resync(high_water)),"
+new = "Some(cursor) if false && cursor < log.floor => Ok(Start::Resync(high_water)), // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/cache_notices.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["cache_notices::tests::a_cursor_older_than_the_log_gets_one_resync_then_live_notices"]
+expect_message = "the subscription ended"
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
+id = "cache-subscribe-cancel"
+guards = "A subscriber's cancel ends its cache subscription"
+file = "crates/astrocyte-module/src/cache_notices.rs"
+old = "() = sink.ended() => {"
+new = "() = std::future::pending::<()>() => { // NON-VACUITY BREAK: ignore cancel"
+test_file = "crates/astrocyte-module/src/cache_notices.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["cache_notices::tests::a_cancelled_subscription_ends"]
+expect_message = "the subscription did not end"
+only = true
+timeout_s = 600
+build_timeout_s = 900

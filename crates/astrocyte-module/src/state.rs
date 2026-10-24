@@ -68,6 +68,8 @@ struct Inner {
     /// Recent harness steps kept for `usage.cache.steps`. Lock order: this
     /// mutex before either store connection, never the other way round.
     recent_steps: Mutex<crate::recent_steps::RecentSteps>,
+    /// Notices of committed cache steps for `usage.cache.subscribe`.
+    cache_notices: crate::cache_notices::NoticeLog,
     /// Test-only clock for the recent-steps memory, whose 24-hour window is
     /// otherwise measured from the wall clock. See `set_recent_steps_now_for_test`.
     #[cfg(test)]
@@ -299,6 +301,7 @@ impl SharedState {
             source_discovery: Mutex::new(HashMap::new()),
             quota_bus: crate::quota_events::Control::default(),
             recent_steps: Mutex::new(crate::recent_steps::RecentSteps::default()),
+            cache_notices: crate::cache_notices::NoticeLog::default(),
             #[cfg(test)]
             recent_steps_now: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
@@ -827,6 +830,27 @@ impl SharedState {
             tracing::warn!(target: "astrocyte", %error,
                 "recent cache steps not advanced; usage.cache.steps reads the store");
         }
+        drop(memory);
+        // After memory, so a subscriber told of a step finds it there.
+        let _ = self.with_conn(|conn| {
+            self.publish_cache_notices(conn);
+            Ok(())
+        });
+    }
+
+    /// Publish the cache steps committed since the last call to
+    /// `usage.cache.subscribe`. Must run only after a commit: a notice for a
+    /// step that then rolled back would name a cursor that never existed.
+    fn publish_cache_notices(&self, conn: &Connection) {
+        if let Err(error) = self.0.cache_notices.publish(conn) {
+            tracing::warn!(target: "astrocyte", error = %describe_sqlite_error(&error),
+                "cache step notices not published");
+        }
+    }
+
+    /// The notice log behind `usage.cache.subscribe`.
+    pub fn cache_notices(&self) -> &crate::cache_notices::NoticeLog {
+        &self.0.cache_notices
     }
 
     /// Fill the recent-steps memory from the store: the sessions active in

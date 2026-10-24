@@ -46,6 +46,7 @@ Shared library; three binaries.
 - `ops.rs`: `PUBLIC_OPERATION_NAMES` and `dispatch` for the served operations.
 - `state.rs`: `SharedState`, the writer fence, the public projection and health.
 - `recent_steps.rs`: the in-memory recent steps behind `usage.cache.steps`.
+- `cache_notices.rs`: the notice log behind `usage.cache.subscribe`.
 - `config.rs`: closed desired-configuration decoding and canonical identity.
 - `refresher.rs`: the background loop (drains, capacity poll, pricing pass, pricing
   queue reconciliation, the daily multiplier stage and its operator recompute).

@@ -62,6 +62,7 @@ Test: `every_operation_name_reaches_its_own_handler`.
 | `spend.multiplier.pace` | read | `quota_provider`, `from_ms`, `to_ms` |
 | `usage.cache.sessions` | read | `since_ms?`, `harness?`, `limit?` |
 | `usage.cache.steps` | read | `harness`, `session`, `limit?`, `after_cursor?` |
+| `usage.cache.subscribe` | read, watch | `after_cursor?` |
 | `spend.event.ingest` | write | see §3.1 |
 | `spend.correction.ingest` | write | see §3.2 |
 | `spend.chargeability.settle` | write | `event_id`, `to_state`, `reason` |
