@@ -38,6 +38,7 @@ target = "--lib"
 expect_red = [
   "refresher::fast_lane_tests::idle_fast_cycle_opens_nothing_and_stats_only_hot_files",
   "refresher::fast_lane_tests::new_opencode_row_reuses_prepared_statements",
+  "refresher::opencode_v2_source::tests::v2_full_tick_discards_rowids_when_file_identity_is_unknown",
 ]
 only = true
 timeout_s = 300
@@ -56,6 +57,7 @@ target = "--lib"
 expect_red = [
   "refresher::fast_lane_tests::idle_fast_cycle_opens_nothing_and_stats_only_hot_files",
   "refresher::fast_lane_tests::new_opencode_row_reuses_prepared_statements",
+  "refresher::fast_lane_tests::opencode_exclusion_covers_both_fast_readers",
 ]
 only = true
 timeout_s = 300

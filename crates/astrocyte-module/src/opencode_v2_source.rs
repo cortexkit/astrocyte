@@ -155,11 +155,14 @@ impl OpenCodeV2Source {
         } else {
             return self.absent(state, mode);
         };
-        let replaced = cache
-            .signature
-            .is_some_and(|previous| signature.replaces(previous));
+        let replaced = mode.is_full()
+            && cache
+                .signature
+                .is_some_and(|previous| signature.replaces(previous));
         if replaced {
             cache.reader = None;
+            cache.tail = None;
+            cache.open.clear();
         }
         let mut full = mode.is_full()
             && (replaced
@@ -1098,5 +1101,35 @@ mod tests {
         assert_eq!(source.drain(&state, 105, &STOP).unwrap().recorded, 1);
         assert_eq!(count(&state, "usage_event"), 2);
         assert_eq!(runtime(&state), ("new".into(), 20, 20));
+    }
+
+    #[test]
+    fn v2_full_tick_discards_rowids_when_file_identity_is_unknown() {
+        let (_temp, path, conn) = database();
+        insert(&conn, "first", 10, &payload(10, true));
+        let state = test_state();
+        let source = OpenCodeV2Source::at(path);
+        source.drain(&state, 100, &STOP).unwrap();
+        source.drain_fast(&state, 101, &STOP).unwrap();
+        {
+            let mut cache = source.cache.lock().unwrap();
+            assert!(cache.tail.is_some());
+            // Simulate a previously unavailable file identity. Fast cycles must
+            // keep the connection; only a full tick may re-inspect the path.
+            cache.signature.as_mut().unwrap().identity = None;
+        }
+        read_io::reset_counts();
+        source.drain_fast(&state, 102, &STOP).unwrap();
+        assert_eq!(read_io::counts(), read_io::Counts::default());
+        {
+            let mut cache = source.cache.lock().unwrap();
+            // An obsolete pending row must not survive the full identity check.
+            cache.open.insert(i64::MAX, 0);
+        }
+        assert!(source.drain(&state, 103, &STOP).unwrap().full);
+        let cache = source.cache.lock().unwrap();
+        assert_eq!(cache.tail, None);
+        assert!(cache.open.is_empty());
+        assert_eq!(count(&state, "usage_event"), 1);
     }
 }
