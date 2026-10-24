@@ -328,7 +328,6 @@ fn broca_model_step_cache_ops_match_memory_store_and_shared_cursors() {
     let (_temp, path) = model_step_store();
     let state = test_state();
     state.set_recent_steps_now_for_test(MODEL_STEP_NOW);
-    state.rebuild_recent_steps();
     let mut last = 0;
     for (step, read, len, verdict, size) in [
         (1, 41250, 48214, Verdict::ColdStart, None),
@@ -360,6 +359,19 @@ fn broca_model_step_cache_ops_match_memory_store_and_shared_cursors() {
         let stored = state
             .with_conn(|conn| cache::steps_from_store(conn, &query).map_err(|e| e.to_string()))
             .unwrap();
+        if step == 1 {
+            assert!(state.recent_steps_answer(&query).is_none());
+            assert_eq!(
+                crate::ops::dispatch(
+                    &state,
+                    crate::ops::OP_CACHE_STEPS,
+                    serde_json::json!({"harness":"broca", "session":"golden-session", "limit":1})
+                )
+                .unwrap(),
+                serde_json::json!(stored)
+            );
+            state.rebuild_recent_steps();
+        }
         let memory = state
             .recent_steps_answer(&query)
             .expect("BROCA session is in memory");
