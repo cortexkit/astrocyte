@@ -42,21 +42,28 @@ rename).
 }
 ```
 
-- `path`: the session's private OpenCode data folder. Astrocyte reads
-  `<path>/opencode.db`. Entries are keyed by `path`: a folder belongs to one
-  launch of one session, and a relaunched session gets a new folder and a new
-  entry. The path must be absolute and, after symlinks are resolved, inside
-  the `opencode-sessions/` folder that holds `roots.json`. Astrocyte refuses
-  any other path, logs it and skips that entry; the other entries still read.
+- `path`: the folder that directly holds the session's `opencode.db`, that
+  is the private OpenCode server's data folder, not the session's whole
+  private tree. Astrocyte reads `<path>/opencode.db`. Entries are keyed by
+  `path`, and a folder belongs to one session for that session's whole life:
+  when the session's server restarts after a module restart or an idle stop,
+  it reuses the same folder and the same entry. A new session always gets a
+  new folder. The path must be absolute and, after symlinks are resolved,
+  inside the `opencode-sessions/` folder that holds `roots.json`. Astrocyte
+  refuses any other path, logs it and skips that entry; the other entries
+  still read.
 - `session_ref`: the harness module's reference for the session. Astrocyte
   uses it only in log lines in v1.
-- `owner_principal`: the module that started the session, as the daemon
-  attests it (for example `prefrontal-core` or `magic-context`). Astrocyte
-  records it as the `work_class` of every call from that folder.
-- `state`: `active` while the session's OpenCode server may still write, and
-  `done` once that server has exited. `done_at_ms` (Unix milliseconds) is set
-  when the state becomes `done` and must not be earlier than the server's
-  exit; it is null while active.
+- `owner_principal`: the module that started the session, as the bare
+  module id the daemon attests (for example `prefrontal-core` or
+  `magic-context`, never `reserved:prefrontal-core`). Astrocyte records it
+  verbatim as the `work_class` of every call from that folder.
+- `state`: `active` while the session may still write, including while its
+  server is stopped for idleness. It becomes `done` only when the session
+  ends for good: it expired, was released or was deleted. `done_at_ms` (Unix
+  milliseconds) is set when the state becomes `done` and must not be earlier
+  than the exit of the session's last OpenCode server; it is null while
+  active.
 
 Unknown fields, at the top level or in an entry, are ignored, so either side
 can add fields without a coordinated release. A changed meaning bumps
@@ -99,6 +106,14 @@ Astrocyte provides `log-read-watermark/v1` from the llm-runner contract
 - T is stored and never goes backwards, including across restarts.
 - A record astrocyte cannot parse counts as read once it has been set aside
   as evidence, so one bad record cannot hold T back.
+- A declared folder that cannot be read (its `opencode.db` cannot be opened
+  or queried for any reason other than being gone) is not part of a complete
+  pass: it holds T back and reports the source degraded until it reads, so a
+  folder whose calls were never recorded is never released. A folder whose
+  `opencode.db` is gone is skipped without degrading the source.
+- A complete pass runs on every refresher tick (`poll_interval_secs`, 30
+  seconds in the shipped configuration). A `done` folder can therefore
+  normally be erased about two to three minutes after its `done_at_ms`.
 - `{watermark_ms: null}` means no complete pass yet: erase nothing.
 - Astrocyte answers only the daemon-attested `thalamus-harness` principal.
   Any other caller, and every caller while `opencode-thalamus` is excluded in
@@ -112,7 +127,6 @@ waiting. There is no deletion ceiling: the harness module reports its own
 health degraded once any due erase has waited 24 hours past due, so a long
 astrocyte outage is visible and never loses billing. Mark the entry `done`
 before erasing its folder, and remove the entry once the folder is gone.
-Astrocyte skips an erased folder without degrading the source.
 
 ## 6. Not guaranteed
 
