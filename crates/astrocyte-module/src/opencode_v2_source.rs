@@ -10,16 +10,16 @@ use std::sync::Mutex;
 use astrocyte_core::fact::{event_id, ChargeBasis};
 use astrocyte_core::ingest::{EventRecordRequest, RecordDisposition, StepDetail};
 use astrocyte_readers::sessions::opencode::{
-    OpenCodeCursor, OpenCodeMessage, OpenCodeReadError, OpenCodeScanCost, OpenCodeTailRequest,
+    OpenCodeMessage, OpenCodeReadError, OpenCodeScanCost, OpenCodeTailRequest,
 };
 use astrocyte_readers::sessions::opencode_v2::{self, Page, TailReader};
 use astrocyte_readers::{
     file_identity::{file_identity, same_identity},
     read_io,
 };
-use rusqlite::params;
 
 use super::harness_drain::{self, DrainMode, HarnessSource};
+use super::opencode_source::{stamp_work_class, CursorHome, PageCursor, ReadOptions};
 use super::{SetAsideRecord, SourceDrainError};
 use crate::state::SharedState;
 
@@ -66,6 +66,7 @@ pub(crate) struct Outcome {
 
 pub(crate) struct OpenCodeV2Source {
     root: Result<PathBuf, String>,
+    home: CursorHome,
     cache: Mutex<Cache>,
 }
 
@@ -80,6 +81,7 @@ pub(crate) fn registered() -> OpenCodeV2Source {
         crate::harness_paths::opencode(&cortexkit_paths::SystemEnv).map_err(|e| e.to_string());
     OpenCodeV2Source {
         root,
+        home: CursorHome::Runtime(SOURCE_KEY),
         cache: Mutex::new(Cache::default()),
     }
 }
@@ -89,8 +91,32 @@ impl OpenCodeV2Source {
     pub(crate) fn at(path: impl Into<PathBuf>) -> Self {
         Self {
             root: Ok(path.into()),
+            home: CursorHome::Runtime(SOURCE_KEY),
             cache: Mutex::new(Cache::default()),
         }
+    }
+
+    /// A reader of a store another module declared, at `database`, keeping
+    /// its cursor at `home`. It reads on the same cadence as the user's store.
+    pub(crate) fn declared(database: PathBuf, home: CursorHome) -> Self {
+        Self {
+            root: Ok(database),
+            home,
+            cache: Mutex::new(Cache::default()),
+        }
+    }
+
+    /// Make the next full drain a full pass from the durable cursor, whatever
+    /// the cadence says.
+    pub(crate) fn require_full_pass(&self) {
+        self.cache.lock().unwrap_or_else(|p| p.into_inner()).last_full = None;
+    }
+
+    /// Whether, since the last `require_full_pass`, a full pass has reached
+    /// the store's high water or a read found no OpenCode 2 layout at all.
+    pub(crate) fn full_pass_reached_high_water(&self) -> bool {
+        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        !cache.marker_present || cache.last_full.is_some()
     }
 
     pub(crate) fn drain(
@@ -102,6 +128,17 @@ impl OpenCodeV2Source {
         self.drain_in_lane(state, now, stop, DrainMode::Full)
     }
 
+    /// One full-tick drain of a declared store, read with `options`.
+    pub(crate) fn drain_declared(
+        &self,
+        state: &SharedState,
+        now: i64,
+        stop: &AtomicBool,
+        options: ReadOptions<'_>,
+    ) -> Result<Outcome, SourceDrainError> {
+        self.drain_with_options(state, now, stop, DrainMode::Full, options)
+    }
+
     fn drain_in_lane(
         &self,
         state: &SharedState,
@@ -109,8 +146,19 @@ impl OpenCodeV2Source {
         stop: &AtomicBool,
         mode: DrainMode,
     ) -> Result<Outcome, SourceDrainError> {
-        let result = self.drain_inner(state, now, stop, mode);
-        if result.is_err() || !read_io::retain_harness_connections() {
+        self.drain_with_options(state, now, stop, mode, ReadOptions::default())
+    }
+
+    fn drain_with_options(
+        &self,
+        state: &SharedState,
+        now: i64,
+        stop: &AtomicBool,
+        mode: DrainMode,
+        options: ReadOptions<'_>,
+    ) -> Result<Outcome, SourceDrainError> {
+        let result = self.drain_inner(state, now, stop, mode, options);
+        if result.is_err() || !self.home.retains_connection() {
             self.cache.lock().unwrap_or_else(|p| p.into_inner()).reader = None;
         }
         result
@@ -122,6 +170,7 @@ impl OpenCodeV2Source {
         now: i64,
         stop: &AtomicBool,
         mode: DrainMode,
+        options: ReadOptions<'_>,
     ) -> Result<Outcome, SourceDrainError> {
         if stop.load(Ordering::Relaxed) {
             return Err(SourceDrainError::Stopped);
@@ -172,8 +221,13 @@ impl OpenCodeV2Source {
                     .is_none_or(|last| now < last || now.saturating_sub(last) >= FULL_INTERVAL));
         let pending = cache.open.keys().copied().collect::<Vec<_>>();
         let mut extra_cost = OpenCodeScanCost::default();
+        // No write can follow a settled store's last one, so each call in it
+        // with tokens but no completion is as final as one whose quiet window
+        // has passed. Reading at the end of time makes the reader treat it so;
+        // the read cadence above still runs on the real clock.
+        let reader_now = if options.settled { i64::MAX } else { now };
         let page = if full {
-            self.full_page(state, path, now, stop)?
+            self.full_page(state, path, reader_now, stop)?
         } else {
             if cache.reader.is_none() {
                 let Some(reader) = TailReader::open(path, stop).map_err(read_error)? else {
@@ -194,12 +248,12 @@ impl OpenCodeV2Source {
                         open_rowids: &pending,
                         limit: PAGE_LIMIT,
                     },
-                    now,
+                    reader_now,
                     stop,
                     mode.is_full(),
                 )
                 .map_err(read_error)?;
-            if !read_io::retain_harness_connections() {
+            if !self.home.retains_connection() {
                 cache.reader = None;
             }
             // An empty store can acquire its first row between full ticks.
@@ -224,7 +278,7 @@ impl OpenCodeV2Source {
                         });
                     }
                     full = true;
-                    self.full_page(state, path, now, stop)?
+                    self.full_page(state, path, reader_now, stop)?
                 }
                 page => page,
             }
@@ -233,8 +287,19 @@ impl OpenCodeV2Source {
             *cache = Cache::default();
             return self.absent(state, mode);
         };
-        mode.ensure_runtime(state, SOURCE_KEY)?;
-        let outcome = commit(state, &page, full, now, stop, mode)?;
+        if let Some(key) = self.home.runtime_key() {
+            mode.ensure_runtime(state, key)?;
+        }
+        let outcome = commit(
+            state,
+            &self.home,
+            &page,
+            full,
+            now,
+            stop,
+            mode,
+            options.work_class,
+        )?;
         cache.marker_present = true;
         cache.signature = Some(signature);
         if full {
@@ -268,7 +333,9 @@ impl OpenCodeV2Source {
     }
 
     fn absent(&self, state: &SharedState, mode: DrainMode) -> Result<Outcome, SourceDrainError> {
-        mode.remove_runtime(state, SOURCE_KEY)?;
+        if let Some(key) = self.home.runtime_key() {
+            mode.remove_runtime(state, key)?;
+        }
         Ok(Outcome {
             absent: true,
             ..Outcome::default()
@@ -282,33 +349,10 @@ impl OpenCodeV2Source {
         now: i64,
         stop: &AtomicBool,
     ) -> Result<Option<Page>, SourceDrainError> {
-        let cursor = state.with_conn(|conn| {
-            conn.query_row(
-                "SELECT lineage,consumed_ordinal FROM source_runtime WHERE source_key=?1",
-                [SOURCE_KEY],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                    ))
-                },
-            )
-            .optional()
-            .map(|row| {
-                row.and_then(|(lineage, ordinal)| {
-                    Some(OpenCodeCursor {
-                        lineage: lineage?,
-                        ordinal: ordinal?,
-                    })
-                })
-            })
-            .map_err(|e| e.to_string())
-        })?;
+        let cursor = self.home.read_cursor(state)?;
         opencode_v2::read_page(path, cursor.as_ref(), PAGE_LIMIT, now, stop).map_err(read_error)
     }
 }
-
-use rusqlite::OptionalExtension;
 
 impl HarnessSource for OpenCodeV2Source {
     fn source_key(&self) -> &'static str {
@@ -348,13 +392,19 @@ fn read_error(error: OpenCodeReadError) -> SourceDrainError {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site; the arguments are the drain's own context"
+)]
 fn commit(
     state: &SharedState,
+    home: &CursorHome,
     page: &Page,
     full: bool,
     now: i64,
     stop: &AtomicBool,
     mode: DrainMode,
+    work_class: Option<&str>,
 ) -> Result<Outcome, SourceDrainError> {
     let mut stopped = false;
     let result = mode.write(state, |tx| {
@@ -392,6 +442,7 @@ fn commit(
             }
             match map_message(message.clone()) {
                 Ok(request) => {
+                    let request = stamp_work_class(request, work_class);
                     let result = astrocyte_core::ingest::record_event_in_tx(
                         tx,
                         &request,
@@ -413,34 +464,22 @@ fn commit(
             stopped = true;
             return Err("OpenCode 2 ingest stopped".into());
         }
-        let newly_seen = harness_drain::record_set_aside_in_tx(tx, SOURCE_KEY, &evidence, now)?;
-        if full {
-            tx.execute(
-                "UPDATE source_runtime SET lineage=?2,consumed_ordinal=?3,
-                high_water_ordinal=?4,last_success_ms=?5,pending_known=0,pending_unknown=?6
-                WHERE source_key=?1",
-                params![
-                    SOURCE_KEY,
-                    page.lineage,
-                    page.consumed,
-                    page.high_water,
-                    now,
-                    i64::from(page.consumed < page.high_water)
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-        } else if mode.is_full() {
-            tx.execute(
-                "UPDATE source_runtime SET last_success_ms=?2 WHERE source_key=?1",
-                params![SOURCE_KEY, now],
-            )
-            .map_err(|e| e.to_string())?;
+        let newly_seen =
+            harness_drain::record_set_aside_in_tx(tx, home.source_key(), &evidence, now)?;
+        if mode.is_full() {
+            let cursor = PageCursor {
+                lineage: &page.lineage,
+                consumed_ordinal: page.consumed,
+                high_water_ordinal: page.high_water,
+            };
+            home.record_read_in_tx(tx, full.then_some(&cursor), now)
+                .map_err(|e| e.to_string())?;
         }
         Ok(((outcome, newly_seen), true))
     });
     match result {
         Ok((outcome, newly_seen)) => {
-            harness_drain::warn_set_aside(SOURCE_KEY, &newly_seen);
+            harness_drain::warn_set_aside(home.source_key(), &newly_seen);
             Ok(outcome)
         }
         Err(_) if stopped => Err(SourceDrainError::Stopped),
@@ -501,7 +540,7 @@ mod tests {
     use super::*;
     use crate::state::test_state;
     use astrocyte_readers::sessions::opencode_v2::QUIET_WINDOW;
-    use rusqlite::Connection;
+    use rusqlite::{params, Connection};
     use serde_json::{json, Value};
     use tempfile::TempDir;
 

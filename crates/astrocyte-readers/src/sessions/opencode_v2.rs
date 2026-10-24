@@ -192,6 +192,16 @@ pub fn read_page(
     })
 }
 
+/// Whether the store at `path` has OpenCode 1's `message` table. An OpenCode 2
+/// store need not have one, and the OpenCode 1 reader fails on a store
+/// without it. Opened read-only like every other read here.
+pub fn has_v1_message_table(path: &Path, stop: &AtomicBool) -> Result<bool, OpenCodeReadError> {
+    with_read_snapshot(path, stop, |connection| {
+        table_exists(connection, &mut OpenCodeScanCost::default(), "message")
+            .map_err(|e| sqlite_error(stop, "detect OpenCode 1 table", e))
+    })
+}
+
 /// A rowid range plus point lookups for rows still in flight. No update-time
 /// query or full table scan runs on this path; idle cost is independent of history.
 pub fn read_tail(

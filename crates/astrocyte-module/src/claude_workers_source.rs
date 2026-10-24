@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::harness_paths::ClaudeWorkerPaths;
+use crate::refresher::declared_roots::{self, Contained, RootsFile};
 use crate::refresher::claude_code_source::{self, ClaudeCodeCache, ClaudeCodeDrainOutcome};
 use crate::refresher::harness_drain::{self, HarnessSource};
 use crate::refresher::SourceDrainError;
@@ -30,11 +31,6 @@ struct Root {
 enum WorkerState {
     Active,
     Done,
-}
-
-#[derive(Deserialize)]
-struct Registry {
-    roots: Vec<Root>,
 }
 
 #[derive(Default, PartialEq, Deserialize, Serialize)]
@@ -103,28 +99,16 @@ impl ClaudeWorkersSource {
         }
         let mut degraded = None;
         if mode.is_full() {
-            match fs::read(&paths.roots) {
-                Ok(bytes) => {
-                    let value: Result<serde_json::Value, _> = serde_json::from_slice(&bytes);
-                    match value {
-                        Ok(value)
-                            if value
-                                .get("version")
-                                .and_then(serde_json::Value::as_u64)
-                                .is_some_and(|v| v != 1) =>
-                        {
-                            return Err("unknown Claude worker roots version".to_string().into());
-                        }
-                        Ok(value) => match decode_registry(value) {
-                            Ok(roots) => cache.roots = roots,
-                            Err(reason) => degraded = Some(reason),
-                        },
-                        Err(error) => {
-                            degraded = Some(format!("decode Claude worker roots: {error}"))
-                        }
-                    }
+            match declared_roots::read::<Root>(&paths.roots, "Claude worker roots") {
+                RootsFile::Declared(roots) => match check_worker_ids(&roots) {
+                    Ok(()) => cache.roots = roots,
+                    Err(reason) => degraded = Some(reason),
+                },
+                RootsFile::UnknownVersion => {
+                    return Err("unknown Claude worker roots version".to_string().into());
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                RootsFile::Unusable(reason) => degraded = Some(reason),
+                RootsFile::Absent => {
                     mode.remove_runtime(state, SOURCE_KEY)?;
                     cache.roots.clear();
                     cache.validated_roots.clear();
@@ -149,7 +133,6 @@ impl ClaudeWorkersSource {
                     }
                     return Ok(None);
                 }
-                Err(error) => degraded = Some(format!("read Claude worker roots: {error}")),
             }
         }
         let registry_valid = degraded.is_none();
@@ -179,45 +162,21 @@ impl ClaudeWorkersSource {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            if !root.path.is_absolute() {
-                warn_once(
-                    &mut cache,
-                    format!("refuse relative worker root {}", root.path.display()),
-                );
-                continue;
-            }
-            let canonical = if mode.is_full() {
-                match fs::canonicalize(&root.path) {
-                    Ok(path) => path,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let canonical =
+                match declared_roots::contain(folder.as_deref(), &root.path, "worker root")? {
+                    Contained::Inside(path) => path,
+                    Contained::Refused(reason) => {
+                        warn_once(&mut cache, reason);
+                        continue;
+                    }
+                    Contained::Gone => {
                         warn_once(
                             &mut cache,
                             format!("skip deleted worker root {}", root.path.display()),
                         );
                         continue;
                     }
-                    Err(error) => {
-                        return Err(
-                            format!("resolve worker root {}: {error}", root.path.display()).into(),
-                        )
-                    }
-                }
-            } else {
-                root.path.clone()
-            };
-            if folder
-                .as_ref()
-                .is_some_and(|folder| canonical == *folder || !canonical.starts_with(folder))
-            {
-                warn_once(
-                    &mut cache,
-                    format!(
-                        "refuse worker root outside declared folder: {}",
-                        root.path.display()
-                    ),
-                );
-                continue;
-            }
+                };
             let mut validated = root.clone();
             validated.path = canonical.clone();
             validated_roots.push(validated);
@@ -357,14 +316,9 @@ impl HarnessSource for ClaudeWorkersSource {
     }
 }
 
-fn decode_registry(value: serde_json::Value) -> Result<Vec<Root>, String> {
-    if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
-        return Err("missing or invalid Claude worker roots version".into());
-    }
-    let registry: Registry =
-        serde_json::from_value(value).map_err(|e| format!("decode Claude worker roots: {e}"))?;
+fn check_worker_ids(roots: &[Root]) -> Result<(), String> {
     let mut ids = HashSet::new();
-    for root in &registry.roots {
+    for root in roots {
         let suffix = root.worker_id.strip_prefix("w-").unwrap_or("");
         if suffix.len() != 32
             || !suffix
@@ -375,7 +329,7 @@ fn decode_registry(value: serde_json::Value) -> Result<Vec<Root>, String> {
             return Err("invalid or duplicate Claude worker id".into());
         }
     }
-    Ok(registry.roots)
+    Ok(())
 }
 
 fn warn_once(cache: &mut Cache, reason: String) {

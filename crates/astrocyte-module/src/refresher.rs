@@ -13,6 +13,8 @@ mod claude_code_source;
 mod claude_workers_source;
 #[path = "codex_source.rs"]
 mod codex_source;
+#[path = "declared_roots.rs"]
+mod declared_roots;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "fast_lane_measure.rs"]
 mod fast_lane_measure;
@@ -31,6 +33,8 @@ mod kimi_source;
 mod omp_source;
 #[path = "opencode_source.rs"]
 pub(crate) mod opencode_source;
+#[path = "opencode_thalamus_source.rs"]
+pub(crate) mod opencode_thalamus_source;
 #[path = "opencode_v2_source.rs"]
 pub(crate) mod opencode_v2_source;
 #[path = "pi_source.rs"]
@@ -1610,7 +1614,19 @@ fn refresher_harness_sources() -> Vec<Arc<dyn harness_drain::HarnessSource>> {
         Arc::new(refresher_omp_source()),
         Arc::new(refresher_kimi_source()),
         Arc::new(refresher_claude_workers_source()),
+        Arc::new(refresher_opencode_thalamus_source()),
     ]
+}
+
+fn refresher_opencode_thalamus_source() -> opencode_thalamus_source::OpenCodeThalamusSource {
+    #[cfg(any(test, feature = "test-support"))]
+    let home = std::env::temp_dir().join(format!(
+        "astrocyte-test-data-without-opencode-sessions-{}",
+        std::process::id()
+    ));
+    #[cfg(not(any(test, feature = "test-support")))]
+    let home = PathBuf::from(cortexkit_store_types::resolve_data_home());
+    opencode_thalamus_source::OpenCodeThalamusSource::from_data_home(home)
 }
 
 fn refresher_claude_workers_source() -> claude_workers_source::ClaudeWorkersSource {

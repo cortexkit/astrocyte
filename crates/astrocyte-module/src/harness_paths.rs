@@ -21,6 +21,16 @@ pub(crate) fn claude_workers(data_home: PathBuf) -> Result<ClaudeWorkerPaths, St
     })
 }
 
+/// The roots file declaring the OpenCode sessions thalamus-harness runs in
+/// private OpenCode servers. The session folders sit beside it. Like the
+/// Claude worker roots, it is resolved under Astrocyte's own data home.
+pub(crate) fn opencode_sessions_roots(data_home: PathBuf) -> Result<PathBuf, String> {
+    if !data_home.is_absolute() {
+        return Err(format!("the data home resolved to the relative {data_home:?}; refusing to resolve OpenCode session roots"));
+    }
+    Ok(data_home.join("cortexkit/thalamus-harness/opencode-sessions/roots.json"))
+}
+
 // OpenCode keeps one database: `OPENCODE_DB` when set (a file path, not a
 // directory), else `<XDG data home>/opencode/opencode.db`. Its data home comes
 // from the xdg-basedir package, which uses XDG_DATA_HOME or

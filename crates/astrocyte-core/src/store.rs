@@ -3716,6 +3716,35 @@ INSERT INTO step_feed_state(id, cache_high_water, pruned_through) VALUES (
 );
 "#,
     },
+    Migration {
+        version: 30,
+        statements: r#"-- Another module can declare harness stores for astrocyte to read, such as
+-- the private OpenCode data folder of each session thalamus-harness runs. One
+-- source_runtime row covers all of a source's stores, so each store keeps its
+-- own durable read position here, one row per store and on-disk layout. The
+-- columns mean what the same columns of source_runtime mean. A row is removed
+-- once its store is no longer declared.
+CREATE TABLE declared_store_cursor (
+    source_key         TEXT NOT NULL,
+    store_path         TEXT NOT NULL,
+    layout             TEXT NOT NULL,
+    lineage            TEXT NOT NULL,
+    consumed_ordinal   INTEGER NOT NULL,
+    high_water_ordinal INTEGER NOT NULL,
+    PRIMARY KEY (source_key, store_path, layout)
+) WITHOUT ROWID;
+
+-- A read watermark per reader source: the time before which everything the
+-- source's declared stores held has been recorded, so the declaring module may
+-- erase a store it has finished with. The value only moves forward; no row
+-- means no complete read yet.
+CREATE TABLE read_watermark (
+    source_key    TEXT PRIMARY KEY,
+    watermark_ms  INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+) WITHOUT ROWID;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -3779,7 +3808,7 @@ mod tests {
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (29, 29, 29)
+            (30, 30, 30)
         );
         assert_eq!(
             store
@@ -3792,7 +3821,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 29, 29)
+            (0, 30, 30)
         );
         assert!(!second.store_ahead());
         store
@@ -3802,7 +3831,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',30,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',31,1)",
                     [],
                 )?;
                 Ok(())
@@ -3811,7 +3840,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 30, 29)
+            (0, 31, 30)
         );
         assert!(ahead.store_ahead());
     }

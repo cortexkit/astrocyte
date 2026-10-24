@@ -24,6 +24,154 @@ use crate::state::SharedState;
 pub(crate) const OPENCODE_SOURCE_KEY: &str = "opencode";
 const PAGE_LIMIT: usize = super::harness_drain::PAGE_LIMIT as usize;
 
+/// Where a reader of one OpenCode store keeps its durable cursor and records
+/// its set-aside evidence. Shared by the OpenCode 1 and OpenCode 2 readers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CursorHome {
+    /// The user's own store: the cursor lives in the source's own
+    /// `source_runtime` row, which the reader creates and removes with the store.
+    Runtime(&'static str),
+    /// A store another module declared: the cursor is one
+    /// `declared_store_cursor` row. The declaring source owns the single
+    /// `source_runtime` row for all its stores and records its own success once
+    /// its whole pass has committed, so a read never touches that row.
+    Declared {
+        source_key: &'static str,
+        store: String,
+        layout: &'static str,
+    },
+}
+
+impl CursorHome {
+    /// The key set-aside evidence is filed under.
+    pub(crate) fn source_key(&self) -> &'static str {
+        match self {
+            Self::Runtime(key) | Self::Declared { source_key: key, .. } => key,
+        }
+    }
+
+    /// The `source_runtime` row this reader creates and removes itself.
+    pub(crate) fn runtime_key(&self) -> Option<&'static str> {
+        match self {
+            Self::Runtime(key) => Some(key),
+            Self::Declared { .. } => None,
+        }
+    }
+
+    /// Whether the reader may keep its read-only connection between reads.
+    /// A declared store is erased by its owner soon after its session ends,
+    /// so its connection is closed after every read on every OS.
+    pub(crate) fn retains_connection(&self) -> bool {
+        astrocyte_readers::read_io::retain_harness_connections()
+            && matches!(self, Self::Runtime(_))
+    }
+
+    pub(crate) fn read_cursor(
+        &self,
+        state: &SharedState,
+    ) -> Result<Option<OpenCodeCursor>, String> {
+        use rusqlite::OptionalExtension;
+        let row = state.with_conn(|connection| {
+            match self {
+                Self::Runtime(key) => connection.query_row(
+                    "SELECT lineage,consumed_ordinal FROM source_runtime WHERE source_key=?1",
+                    [key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ),
+                Self::Declared {
+                    source_key,
+                    store,
+                    layout,
+                } => connection.query_row(
+                    "SELECT lineage,consumed_ordinal FROM declared_store_cursor
+                     WHERE source_key=?1 AND store_path=?2 AND layout=?3",
+                    params![source_key, store, layout],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ),
+            }
+            .optional()
+            .map_err(|error| format!("read OpenCode durable cursor: {error}"))
+        })?;
+        Ok(
+            row.and_then(|(lineage, ordinal): (Option<String>, Option<i64>)| {
+                Some(OpenCodeCursor {
+                    lineage: lineage?,
+                    ordinal: ordinal?,
+                })
+            }),
+        )
+    }
+
+    /// Record a committed read in `tx`: the new durable cursor after a full
+    /// page, or only the success time after a tail read. Returns the rows
+    /// changed, which is 1 unless the source's runtime row has disappeared.
+    pub(crate) fn record_read_in_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        cursor: Option<&PageCursor<'_>>,
+        recorded_at_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        match (self, cursor) {
+            (Self::Runtime(key), Some(cursor)) => tx.execute(
+                "UPDATE source_runtime
+                 SET lineage=?2,consumed_ordinal=?3,high_water_ordinal=?4,
+                     last_success_ms=?5,pending_known=0,pending_unknown=?6
+                 WHERE source_key=?1",
+                params![
+                    key,
+                    cursor.lineage,
+                    cursor.consumed_ordinal,
+                    cursor.high_water_ordinal,
+                    recorded_at_ms,
+                    i64::from(cursor.consumed_ordinal < cursor.high_water_ordinal),
+                ],
+            ),
+            (Self::Runtime(key), None) => tx.execute(
+                "UPDATE source_runtime SET last_success_ms=?2 WHERE source_key=?1",
+                params![key, recorded_at_ms],
+            ),
+            (
+                Self::Declared {
+                    source_key,
+                    store,
+                    layout,
+                },
+                Some(cursor),
+            ) => tx.execute(
+                "INSERT INTO declared_store_cursor
+                 (source_key,store_path,layout,lineage,consumed_ordinal,high_water_ordinal)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(source_key,store_path,layout) DO UPDATE SET
+                     lineage=excluded.lineage,consumed_ordinal=excluded.consumed_ordinal,
+                     high_water_ordinal=excluded.high_water_ordinal",
+                params![
+                    source_key,
+                    store,
+                    layout,
+                    cursor.lineage,
+                    cursor.consumed_ordinal,
+                    cursor.high_water_ordinal,
+                ],
+            ),
+            (Self::Declared { .. }, None) => Ok(1),
+        }
+    }
+}
+
+/// How one drain reads a store. The user's own store reads with the default:
+/// the producer's agent name as work class, and the normal wait for calls that
+/// have tokens but no completion.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReadOptions<'a> {
+    /// Stamped as `work_class` on every call read, instead of the agent name.
+    pub work_class: Option<&'a str>,
+    /// No further write can come to the store, so an OpenCode 2 call with
+    /// tokens but no completion is final now rather than after the quiet
+    /// window. OpenCode 1 rows carry their tokens only once `finish` or
+    /// `time.completed` is written, so its reader has nothing to wait for.
+    pub settled: bool,
+}
+
 /// When each kind of read runs. See `OpenCodeSource` for the design these
 /// numbers tune.
 #[derive(Debug, Clone, Copy)]
@@ -281,6 +429,7 @@ impl OpenCodeCache {
 /// 51 user rows.
 pub(crate) struct OpenCodeSource {
     root: OpenCodeRoot,
+    home: CursorHome,
     cadence: OpenCodeCadence,
     cache: Mutex<OpenCodeCache>,
 }
@@ -326,9 +475,38 @@ impl OpenCodeSource {
     fn with_cadence(root: OpenCodeRoot, cadence: OpenCodeCadence) -> Self {
         Self {
             root,
+            home: CursorHome::Runtime(OPENCODE_SOURCE_KEY),
             cadence,
             cache: Mutex::new(OpenCodeCache::default()),
         }
+    }
+
+    /// A reader of a store another module declared, at `database`, keeping
+    /// its cursor at `home`. It reads on the same cadence as the user's store.
+    pub(crate) fn declared(database: PathBuf, home: CursorHome) -> Self {
+        Self {
+            home,
+            ..Self::with_cadence(OpenCodeRoot::Path(database), PRODUCTION_CADENCE)
+        }
+    }
+
+    /// Make the next full drain a full pass from the durable cursor, whatever
+    /// the cadence says.
+    pub(crate) fn require_full_pass(&self) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_full_pass_ms = None;
+    }
+
+    /// Whether a full pass has reached the store's high water since the last
+    /// `require_full_pass`.
+    pub(crate) fn full_pass_reached_high_water(&self) -> bool {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_full_pass_ms
+            .is_some()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -382,8 +560,45 @@ impl OpenCodeSource {
         stop: &AtomicBool,
         mode: DrainMode,
     ) -> Result<OpenCodeDrainOutcome, SourceDrainError> {
-        let result = self.drain_inner(state, recorded_at_ms, page_limit, stop, mode);
-        if result.is_err() || !astrocyte_readers::read_io::retain_harness_connections() {
+        self.drain_with_options(
+            state,
+            recorded_at_ms,
+            page_limit,
+            stop,
+            mode,
+            ReadOptions::default(),
+        )
+    }
+
+    /// One full-tick drain of a declared store, read with `options`.
+    pub(crate) fn drain_declared(
+        &self,
+        state: &SharedState,
+        recorded_at_ms: i64,
+        stop: &AtomicBool,
+        options: ReadOptions<'_>,
+    ) -> Result<OpenCodeDrainOutcome, SourceDrainError> {
+        self.drain_with_options(
+            state,
+            recorded_at_ms,
+            PAGE_LIMIT,
+            stop,
+            DrainMode::Full,
+            options,
+        )
+    }
+
+    fn drain_with_options(
+        &self,
+        state: &SharedState,
+        recorded_at_ms: i64,
+        page_limit: usize,
+        stop: &AtomicBool,
+        mode: DrainMode,
+        options: ReadOptions<'_>,
+    ) -> Result<OpenCodeDrainOutcome, SourceDrainError> {
+        let result = self.drain_inner(state, recorded_at_ms, page_limit, stop, mode, options);
+        if result.is_err() || !self.home.retains_connection() {
             self.cache
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -399,6 +614,7 @@ impl OpenCodeSource {
         page_limit: usize,
         stop: &AtomicBool,
         mode: DrainMode,
+        options: ReadOptions<'_>,
     ) -> Result<OpenCodeDrainOutcome, SourceDrainError> {
         let root = match &self.root {
             OpenCodeRoot::Path(root) => root,
@@ -407,6 +623,7 @@ impl OpenCodeSource {
                 return Err(reason.clone().into());
             }
         };
+        let runtime_key = self.home.runtime_key();
 
         let mut cache = self
             .cache
@@ -415,24 +632,28 @@ impl OpenCodeSource {
         let signature = if mode.is_full() {
             let database = match astrocyte_readers::read_io::open(root) {
                 Ok(database) => {
-                    crate::refresher::harness_drain::record_source_discovery(
-                        state,
-                        OPENCODE_SOURCE_KEY,
-                        root.display(),
-                        true,
-                    );
-                    mode.ensure_runtime(state, OPENCODE_SOURCE_KEY)?;
+                    if let Some(key) = runtime_key {
+                        crate::refresher::harness_drain::record_source_discovery(
+                            state,
+                            key,
+                            root.display(),
+                            true,
+                        );
+                        mode.ensure_runtime(state, key)?;
+                    }
                     database
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     cache.reader = None;
-                    crate::refresher::harness_drain::record_source_discovery(
-                        state,
-                        OPENCODE_SOURCE_KEY,
-                        root.display(),
-                        false,
-                    );
-                    mode.remove_runtime(state, OPENCODE_SOURCE_KEY)?;
+                    if let Some(key) = runtime_key {
+                        crate::refresher::harness_drain::record_source_discovery(
+                            state,
+                            key,
+                            root.display(),
+                            false,
+                        );
+                        mode.remove_runtime(state, key)?;
+                    }
                     return Ok(OpenCodeDrainOutcome {
                         root_absent: true,
                         ..OpenCodeDrainOutcome::default()
@@ -440,7 +661,9 @@ impl OpenCodeSource {
                 }
                 Err(error) => {
                     cache.reader = None;
-                    mode.ensure_runtime(state, OPENCODE_SOURCE_KEY)?;
+                    if let Some(key) = runtime_key {
+                        mode.ensure_runtime(state, key)?;
+                    }
                     return Err(
                         format!("inspect OpenCode database {}: {error}", root.display()).into(),
                     );
@@ -476,6 +699,7 @@ impl OpenCodeSource {
                 recorded_at_ms,
                 page_limit,
                 stop,
+                options,
             );
         }
 
@@ -494,7 +718,7 @@ impl OpenCodeSource {
             .as_ref()
             .expect("opened tail reader")
             .read(root, &request, stop);
-        if !astrocyte_readers::read_io::retain_harness_connections() {
+        if !self.home.retains_connection() {
             cache.reader = None;
         }
         let mut page = match read {
@@ -529,6 +753,7 @@ impl OpenCodeSource {
                 recorded_at_ms,
                 page_limit,
                 stop,
+                options,
             )?;
             outcome.cost.add_assign_saturating(&page.cost);
             return Ok(outcome);
@@ -540,9 +765,15 @@ impl OpenCodeSource {
                 reason: record.reason,
             })
             .collect();
-        let requests = map_messages(root, std::mem::take(&mut page.messages), &mut set_aside);
+        let requests = map_messages(
+            root,
+            std::mem::take(&mut page.messages),
+            &mut set_aside,
+            options.work_class,
+        );
         let committed = commit_page_in_lane(
             state,
+            &self.home,
             &requests,
             &set_aside,
             None,
@@ -573,8 +804,9 @@ impl OpenCodeSource {
         recorded_at_ms: i64,
         page_limit: usize,
         stop: &AtomicBool,
+        options: ReadOptions<'_>,
     ) -> Result<OpenCodeDrainOutcome, SourceDrainError> {
-        let stored = durable_cursor(state)?;
+        let stored = self.home.read_cursor(state)?;
         // A stop during the read abandons the page before anything is
         // written: no event, no cursor advance, no runtime failure. Every
         // OpenCode event has a content-derived identity, so the next start
@@ -590,9 +822,10 @@ impl OpenCodeSource {
                 reason: record.reason,
             })
             .collect();
-        let requests = map_messages(root, page.messages, &mut set_aside);
+        let requests = map_messages(root, page.messages, &mut set_aside, options.work_class);
         let committed = commit_page_with_evidence(
             state,
+            &self.home,
             &requests,
             &set_aside,
             Some(&PageCursor {
@@ -689,23 +922,36 @@ fn map_messages(
     path: &Path,
     messages: Vec<OpenCodeMessage>,
     set_aside: &mut Vec<crate::refresher::SetAsideRecord>,
+    work_class: Option<&str>,
 ) -> Vec<EventRecordRequest> {
     let mut requests = Vec::new();
     for message in messages {
         let locator = format!("{path:?}:message:{}", message.id);
         match map_message(message) {
-            Ok(request) => requests.push(request),
+            Ok(request) => requests.push(stamp_work_class(request, work_class)),
             Err(reason) => set_aside.push(crate::refresher::SetAsideRecord { locator, reason }),
         }
     }
     requests
 }
 
+/// Replace the producer's agent name with a declared work class. Identity is
+/// unchanged: it is derived from producer, lineage and reference only.
+pub(crate) fn stamp_work_class(
+    mut request: EventRecordRequest,
+    work_class: Option<&str>,
+) -> EventRecordRequest {
+    if let Some(work_class) = work_class {
+        request.work_class = Some(work_class.to_owned());
+    }
+    request
+}
+
 /// Where a fully ingested page moves the durable cursor.
-struct PageCursor<'a> {
-    lineage: &'a str,
-    consumed_ordinal: i64,
-    high_water_ordinal: i64,
+pub(crate) struct PageCursor<'a> {
+    pub lineage: &'a str,
+    pub consumed_ordinal: i64,
+    pub high_water_ordinal: i64,
 }
 
 /// Ingest one page and, for a full pass, advance the cursor, in a single
@@ -726,11 +972,20 @@ fn commit_page(
     recorded_at_ms: i64,
     stop_requested: &dyn Fn() -> bool,
 ) -> Result<Vec<RecordDisposition>, SourceDrainError> {
-    commit_page_with_evidence(state, requests, &[], cursor, recorded_at_ms, stop_requested)
+    commit_page_with_evidence(
+        state,
+        &CursorHome::Runtime(OPENCODE_SOURCE_KEY),
+        requests,
+        &[],
+        cursor,
+        recorded_at_ms,
+        stop_requested,
+    )
 }
 
 fn commit_page_with_evidence(
     state: &SharedState,
+    home: &CursorHome,
     requests: &[EventRecordRequest],
     set_aside: &[crate::refresher::SetAsideRecord],
     cursor: Option<&PageCursor<'_>>,
@@ -739,6 +994,7 @@ fn commit_page_with_evidence(
 ) -> Result<Vec<RecordDisposition>, SourceDrainError> {
     commit_page_in_lane(
         state,
+        home,
         requests,
         set_aside,
         cursor,
@@ -748,8 +1004,13 @@ fn commit_page_with_evidence(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are the page and the drain's own context"
+)]
 fn commit_page_in_lane(
     state: &SharedState,
+    home: &CursorHome,
     requests: &[EventRecordRequest],
     set_aside: &[crate::refresher::SetAsideRecord],
     cursor: Option<&PageCursor<'_>>,
@@ -768,7 +1029,7 @@ fn commit_page_in_lane(
         }
         let newly_seen = crate::refresher::harness_drain::record_set_aside_in_tx(
             tx,
-            OPENCODE_SOURCE_KEY,
+            home.source_key(),
             set_aside,
             recorded_at_ms,
         )?;
@@ -791,30 +1052,7 @@ fn commit_page_in_lane(
         let updated = if !mode.is_full() {
             Ok(1)
         } else {
-            match cursor {
-                Some(cursor) => {
-                    let pending_unknown =
-                        i64::from(cursor.consumed_ordinal < cursor.high_water_ordinal);
-                    tx.execute(
-                        "UPDATE source_runtime
-                     SET lineage=?2,consumed_ordinal=?3,high_water_ordinal=?4,
-                         last_success_ms=?5,pending_known=0,pending_unknown=?6
-                     WHERE source_key=?1",
-                        params![
-                            OPENCODE_SOURCE_KEY,
-                            cursor.lineage,
-                            cursor.consumed_ordinal,
-                            cursor.high_water_ordinal,
-                            recorded_at_ms,
-                            pending_unknown,
-                        ],
-                    )
-                }
-                None => tx.execute(
-                    "UPDATE source_runtime SET last_success_ms=?2 WHERE source_key=?1",
-                    params![OPENCODE_SOURCE_KEY, recorded_at_ms],
-                ),
-            }
+            home.record_read_in_tx(tx, cursor, recorded_at_ms)
         }
         .map_err(|error| format!("record OpenCode source runtime: {error}"))?;
         if updated != 1 {
@@ -824,7 +1062,7 @@ fn commit_page_in_lane(
     });
     match committed {
         Ok((dispositions, newly_seen)) => {
-            crate::refresher::harness_drain::warn_set_aside(OPENCODE_SOURCE_KEY, &newly_seen);
+            crate::refresher::harness_drain::warn_set_aside(home.source_key(), &newly_seen);
             Ok(dispositions)
         }
         Err(_) if stopped => Err(SourceDrainError::Stopped),
@@ -832,24 +1070,6 @@ fn commit_page_in_lane(
     }
 }
 
-fn durable_cursor(state: &SharedState) -> Result<Option<OpenCodeCursor>, String> {
-    state.with_conn(|connection| {
-        connection
-            .query_row(
-                "SELECT lineage,consumed_ordinal FROM source_runtime WHERE source_key=?1",
-                [OPENCODE_SOURCE_KEY],
-                |row| {
-                    let lineage = row.get::<_, Option<String>>(0)?;
-                    let ordinal = row.get::<_, Option<i64>>(1)?;
-                    Ok(match (lineage, ordinal) {
-                        (Some(lineage), Some(ordinal)) => Some(OpenCodeCursor { lineage, ordinal }),
-                        _ => None,
-                    })
-                },
-            )
-            .map_err(|error| format!("read OpenCode durable cursor: {error}"))
-    })
-}
 
 fn map_message(message: OpenCodeMessage) -> Result<EventRecordRequest, String> {
     let measurements = [
