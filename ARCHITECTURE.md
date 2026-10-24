@@ -116,7 +116,8 @@ they do full ticks. One full tick:
    Skipped sources are not read and lose their `source_runtime` row, as for absent
    stores.
 3. Consume insula quota events when `qta_connection_file` is set. A stoppable bus
-   thread uses subscriptions named by `cortexkit-bus-naming`. It verifies digests
+   thread binds astrocyte's durable for insula quota events (names from
+   `cortexkit-bus-naming`). It verifies digests
    and acknowledges only after an account commit or a durable request to fetch
    a snapshot next tick. Duplicates do not write. First notices, epochs, gaps and
    invalid bodies require `usage.get` next tick.
