@@ -179,9 +179,12 @@ impl BrocaSource {
                 limit,
                 &self.stop,
             )?;
+            if !read_io::retain_harness_connections() {
+                cache.connection = None;
+            }
             page_from_snapshot(snapshot, path)
         })();
-        if result.is_err() {
+        if result.is_err() || !read_io::retain_harness_connections() {
             cache.connection = None;
         }
         result

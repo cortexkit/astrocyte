@@ -141,33 +141,7 @@ impl Corpus {
     }
 
     pub(super) fn full(&self, state: &SharedState, at: i64) {
-        let _hold = hold_pricing_pass_for_test(state);
-        run_iteration_all(
-            state,
-            &self.producers,
-            self.files.opencode.as_deref(),
-            self.files.pi.as_deref(),
-            self.files.claude_code.as_deref(),
-            self.files.codex.as_deref(),
-            &self
-                .files
-                .harnesses
-                .iter()
-                .map(AsRef::as_ref)
-                .collect::<Vec<_>>(),
-            None,
-            true,
-            &mut PricingWalk::new(PricingBudget::PER_TICK),
-            &self.stop,
-        );
-        // Source clocks are set explicitly so subsequent assertions do not depend on wall time.
-        state
-            .ordered_write(|tx| {
-                tx.execute("UPDATE source_runtime SET last_success_ms=?1", [at])
-                    .map_err(|e| e.to_string())?;
-                Ok(((), true))
-            })
-            .unwrap();
+        full_tick(state, &self.producers, &self.files, &self.stop, at);
     }
 
     fn due(&self, state: &SharedState) {
@@ -183,6 +157,41 @@ impl Corpus {
         );
         assert_eq!(next, FAST_LANE_INTERVAL * 2);
     }
+}
+
+fn full_tick(
+    state: &SharedState,
+    producers: &[Producer],
+    files: &FileSources,
+    stop: &AtomicBool,
+    at: i64,
+) {
+    let _hold = hold_pricing_pass_for_test(state);
+    run_iteration_all(
+        state,
+        producers,
+        files.opencode.as_deref(),
+        files.pi.as_deref(),
+        files.claude_code.as_deref(),
+        files.codex.as_deref(),
+        &files
+            .harnesses
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>(),
+        None,
+        true,
+        &mut PricingWalk::new(PricingBudget::PER_TICK),
+        stop,
+    );
+    // Health timestamps are explicit so assertions do not depend on wall time.
+    state
+        .ordered_write(|tx| {
+            tx.execute("UPDATE source_runtime SET last_success_ms=?1", [at])
+                .map_err(|e| e.to_string())?;
+            Ok(((), true))
+        })
+        .unwrap();
 }
 
 fn runtime(state: &SharedState) -> Vec<Vec<SqlValue>> {
@@ -368,7 +377,14 @@ fn opencode_exclusion_covers_both_fast_readers() {
     corpus.append_v2(1);
     read_io::reset_counts();
     corpus.due(&state);
+    #[cfg(unix)]
     assert_eq!(read_io::counts().connection_opens, 0);
+    #[cfg(windows)]
+    assert_eq!(
+        read_io::counts().connection_opens,
+        1,
+        "only BROCA remains enabled"
+    );
     assert!(rows(&state, "usage_event").is_empty());
     assert_eq!(runtime(&state), health);
     let mut config = state.desired_config();
@@ -398,6 +414,7 @@ fn idle_fast_lane_commits_nothing_and_keeps_full_drain_health() {
     assert_eq!(rows(&state, "usage_event"), events);
 }
 
+#[cfg(unix)]
 fn add_jsonl_inventory(corpus: &mut Corpus) -> usize {
     let root = corpus.directory.path();
     for (directory, file) in [
@@ -435,6 +452,7 @@ fn add_jsonl_inventory(corpus: &mut Corpus) -> usize {
     7
 }
 
+#[cfg(unix)]
 #[test]
 fn idle_fast_cycle_opens_nothing_and_stats_only_hot_files() {
     use astrocyte_readers::read_io;
@@ -471,6 +489,7 @@ fn idle_fast_cycle_opens_nothing_and_stats_only_hot_files() {
     assert_eq!(rows(&state, "usage_event"), events);
 }
 
+#[cfg(unix)]
 #[test]
 fn new_opencode_row_reuses_prepared_statements() {
     use astrocyte_readers::read_io;
@@ -503,6 +522,141 @@ fn new_opencode_row_reuses_prepared_statements() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_sqlite_stores_can_be_deleted_between_fast_cycles() {
+    use astrocyte_readers::read_io;
+    let corpus = Corpus::new();
+    corpus.append(1);
+    corpus.append_v2(1);
+    let state = test_state();
+    corpus.full(&state, NOW);
+    let Corpus {
+        directory,
+        opencode,
+        broca,
+        files,
+        producers,
+        stop,
+        ..
+    } = corpus;
+    // The producer closes its own writers before rebuilding. Reader caches stay alive.
+    drop((opencode, broca));
+    for _ in 0..2 {
+        read_io::reset_counts();
+        run_fast_lane(&state, &producers, &files, NOW, &stop);
+        let counts = read_io::counts();
+        assert_eq!(
+            counts.connection_opens, 3,
+            "v1, v2 and BROCA reopen per read"
+        );
+        assert!(counts.statement_prepares > 0);
+    }
+    for name in ["opencode.db", "broca.db"] {
+        let path = directory.path().join(name);
+        fs::remove_file(&path).unwrap_or_else(|error| {
+            panic!(
+                "reader blocked owner deletion of {}: {error}",
+                path.display()
+            )
+        });
+    }
+    run_fast_lane(&state, &producers, &files, NOW, &stop);
+    assert_eq!(rows(&state, "usage_event").len(), 3);
+    assert_eq!(rows(&state, "broca_step").len(), 1);
+}
+
+#[test]
+fn sqlite_store_replacement_between_cycles_recovers_on_the_next_full_tick() {
+    for observe_absence in [false, true] {
+        let corpus = Corpus::new();
+        // Delete journals keep replacement independent of old WAL sidecars.
+        corpus
+            .opencode
+            .execute_batch("PRAGMA journal_mode=DELETE")
+            .unwrap();
+        corpus
+            .broca
+            .execute_batch("PRAGMA journal_mode=DELETE")
+            .unwrap();
+        corpus.append(1);
+        corpus.append_v2(1);
+        let state = test_state();
+        state.set_recent_steps_now_for_test(NOW + 60_000);
+        corpus.full(&state, current_time_ms());
+        let Corpus {
+            directory,
+            opencode,
+            broca,
+            files,
+            producers,
+            stop,
+            ..
+        } = corpus;
+        drop((opencode, broca));
+        run_fast_lane(&state, &producers, &files, current_time_ms(), &stop);
+        assert_eq!(rows(&state, "usage_event").len(), 3);
+        assert_eq!(rows(&state, "broca_step").len(), 1);
+        for name in ["opencode.db", "broca.db"] {
+            fs::remove_file(directory.path().join(name)).unwrap();
+        }
+        if observe_absence {
+            full_tick(&state, &producers, &files, &stop, current_time_ms());
+            let live: i64 = state.with_conn(|conn| conn.query_row(
+                "SELECT COUNT(*) FROM source_runtime WHERE source_key IN ('opencode','opencode-v2','broca')",
+                [], |row| row.get(0),
+            ).map_err(|error| error.to_string())).unwrap();
+            assert_eq!(live, 0);
+            assert_eq!(rows(&state, "usage_event").len(), 3);
+        }
+        let replacement = Corpus::new();
+        replacement
+            .opencode
+            .execute_batch("PRAGMA journal_mode=DELETE")
+            .unwrap();
+        replacement
+            .broca
+            .execute_batch("PRAGMA journal_mode=DELETE")
+            .unwrap();
+        replacement.append(2);
+        replacement.append_v2(2);
+        replacement
+            .broca
+            .execute(
+                "UPDATE export_meta SET source_instance_id='rebuilt-fast-lane'",
+                [],
+            )
+            .unwrap();
+        let Corpus {
+            directory: rebuilt,
+            opencode,
+            broca,
+            ..
+        } = replacement;
+        drop((opencode, broca));
+        for name in ["opencode.db", "broca.db"] {
+            fs::rename(rebuilt.path().join(name), directory.path().join(name)).unwrap();
+        }
+        full_tick(&state, &producers, &files, &stop, current_time_ms());
+        assert_eq!(rows(&state, "usage_event").len(), 5);
+        assert_eq!(rows(&state, "broca_step").len(), 2);
+        for (session, step) in [
+            ("oc-session", "message-2"),
+            ("oc-v2-session", "v2-message-2"),
+        ] {
+            let reply = crate::ops::dispatch(
+                &state,
+                crate::ops::OP_CACHE_STEPS,
+                json!({"harness":"opencode","session":session}),
+            )
+            .unwrap();
+            let steps = reply["steps"].as_array().unwrap();
+            assert_eq!(steps.len(), 2, "{reply}");
+            assert!(steps.iter().any(|row| row["step_ref"] == step), "{reply}");
+        }
+    }
+}
+
 #[test]
 fn hot_files_expire_but_growth_keeps_them_hot_and_new_files_wait_for_full_tick() {
     use astrocyte_readers::read_io;
@@ -510,7 +664,9 @@ fn hot_files_expire_but_growth_keeps_them_hot_and_new_files_wait_for_full_tick()
     corpus.append(1);
     let at = current_time_ms();
     let old = std::time::SystemTime::now() - Duration::from_secs(600);
-    fs::File::open(&corpus.pi_path)
+    OpenOptions::new()
+        .write(true)
+        .open(&corpus.pi_path)
         .unwrap()
         .set_modified(old)
         .unwrap();

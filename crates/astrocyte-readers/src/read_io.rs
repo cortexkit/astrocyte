@@ -3,6 +3,13 @@
 use std::fs::{File, Metadata, ReadDir};
 use std::path::Path;
 
+/// Unix keeps read connections and statements cached because an open file can
+/// be unlinked. Windows closes both after every harness read: SQLite's Windows
+/// file handling omits FILE_SHARE_DELETE, so an idle handle blocks replacement.
+pub const fn retain_harness_connections() -> bool {
+    !cfg!(windows)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {

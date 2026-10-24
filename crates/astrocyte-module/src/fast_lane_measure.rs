@@ -157,7 +157,12 @@ fn inventory_sources(corpus: &mut super::fast_lane_tests::Corpus) {
             };
             let path = leaves[index % leaves.len()].join(filename);
             fs::write(&path, text).unwrap();
-            fs::File::open(path).unwrap().set_modified(old).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
         }
         let mut found_files = 0;
         let mut found_dirs = 0;

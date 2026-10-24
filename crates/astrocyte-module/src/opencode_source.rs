@@ -383,7 +383,7 @@ impl OpenCodeSource {
         mode: DrainMode,
     ) -> Result<OpenCodeDrainOutcome, SourceDrainError> {
         let result = self.drain_inner(state, recorded_at_ms, page_limit, stop, mode);
-        if result.is_err() {
+        if result.is_err() || !astrocyte_readers::read_io::retain_harness_connections() {
             self.cache
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -494,6 +494,9 @@ impl OpenCodeSource {
             .as_ref()
             .expect("opened tail reader")
             .read(root, &request, stop);
+        if !astrocyte_readers::read_io::retain_harness_connections() {
+            cache.reader = None;
+        }
         let mut page = match read {
             Ok(page) => page,
             Err(error) => {

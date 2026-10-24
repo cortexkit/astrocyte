@@ -110,7 +110,7 @@ impl OpenCodeV2Source {
         mode: DrainMode,
     ) -> Result<Outcome, SourceDrainError> {
         let result = self.drain_inner(state, now, stop, mode);
-        if result.is_err() {
+        if result.is_err() || !read_io::retain_harness_connections() {
             self.cache.lock().unwrap_or_else(|p| p.into_inner()).reader = None;
         }
         result
@@ -199,6 +199,9 @@ impl OpenCodeV2Source {
                     mode.is_full(),
                 )
                 .map_err(read_error)?;
+            if !read_io::retain_harness_connections() {
+                cache.reader = None;
+            }
             // An empty store can acquire its first row between full ticks.
             if !mode.is_full()
                 && cache.front.is_none()
@@ -1075,7 +1078,10 @@ mod tests {
         let source = OpenCodeV2Source::at(path);
         source.drain(&state, 100, &STOP).unwrap();
         source.drain_fast(&state, 101, &STOP).unwrap();
+        #[cfg(unix)]
         assert!(source.cache.lock().unwrap().reader.is_some());
+        #[cfg(windows)]
+        assert!(source.cache.lock().unwrap().reader.is_none());
         let schema: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE name='session_message'",
@@ -1120,7 +1126,15 @@ mod tests {
         }
         read_io::reset_counts();
         source.drain_fast(&state, 102, &STOP).unwrap();
+        #[cfg(unix)]
         assert_eq!(read_io::counts(), read_io::Counts::default());
+        #[cfg(windows)]
+        {
+            let counts = read_io::counts();
+            assert_eq!(counts.connection_opens, 1);
+            assert!(counts.statement_prepares > 0);
+            assert_eq!(counts.metadata_calls, 0);
+        }
         {
             let mut cache = source.cache.lock().unwrap();
             // An obsolete pending row must not survive the full identity check.

@@ -75,11 +75,19 @@ advance `last_success_ms` or clear degraded health. Committed events refresh the
 recent-steps memory through the normal post-commit path. Both lanes run on the
 same refresher thread and use the same stop signal.
 
-Both OpenCode readers and BROCA retain read-only SQLite connections and cached statements
-between fast cycles. Full ticks check the database path for replacement and
-discard an obsolete connection; read failures also discard it. Every read ends
-its transaction before returning, so an idle connection never pins an old WAL
-snapshot or prevents the producer from checkpointing.
+On Unix, both OpenCode readers and BROCA retain read-only SQLite connections
+and cached statements between cycles. Unix permits unlinking an open file.
+Full ticks check the path's identity and reopen after replacement; errors also
+discard the connection. Every read ends its transaction before returning, so
+an idle connection never pins an old WAL snapshot or blocks a checkpoint.
+
+On Windows, all three readers close the connection and its cached statements
+after every fast or full read. The bundled SQLite Windows file handler opens with
+`FILE_SHARE_READ | FILE_SHARE_WRITE`, without `FILE_SHARE_DELETE`, so retaining
+the handle would prevent the producer from deleting or replacing its store.
+Windows idle cycles therefore reopen present stores and prepare statements per
+read; the zero-opens and zero-prepares guarantee applies only on Unix. Cached
+absence of the v2 marker still skips the v2 read on both operating systems.
 
 Full ticks discover OpenCode 2 by its `session_v2` marker. When the marker is
 absent, the fast lane uses that cached result and makes no v2 query or connection

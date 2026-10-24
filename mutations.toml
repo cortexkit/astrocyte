@@ -9,7 +9,7 @@
 
 [[control]]
 id = "fast-lane-opencode-reuses-connection"
-guards = "OpenCode keeps its read-only connection and cached statements across fast cycles"
+guards = "On Unix, OpenCode keeps its read-only connection and cached statements across fast cycles"
 file = "crates/astrocyte-module/src/opencode_source.rs"
 old = 'if cache.reader.is_none() {'
 new = 'if { cache.reader = None; true } { // NON-VACUITY BREAK'
@@ -27,7 +27,7 @@ build_timeout_s = 600
 
 [[control]]
 id = "fast-lane-opencode-v2-reuses-connection"
-guards = "OpenCode 2 keeps its read-only connection and cached statements across fast cycles"
+guards = "On Unix, OpenCode 2 keeps its read-only connection and cached statements across fast cycles"
 file = "crates/astrocyte-module/src/opencode_v2_source.rs"
 old = 'if cache.reader.is_none() {'
 new = 'if { cache.reader = None; true } { // NON-VACUITY BREAK'
@@ -46,7 +46,7 @@ build_timeout_s = 600
 
 [[control]]
 id = "fast-lane-broca-reuses-connection"
-guards = "BROCA keeps its read-only connection and cached statements across fast cycles"
+guards = "On Unix, BROCA keeps its read-only connection and cached statements across fast cycles"
 file = "crates/astrocyte-module/src/broca_source.rs"
 old = 'if cache.connection.is_none() {'
 new = 'if { cache.connection = None; true } { // NON-VACUITY BREAK'
@@ -1937,6 +1937,7 @@ expect_red = [
   "refresher::fast_lane_tests::fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval",
   "refresher::fast_lane_tests::hot_files_expire_but_growth_keeps_them_hot_and_new_files_wait_for_full_tick",
   "refresher::fast_lane_tests::new_opencode_row_reuses_prepared_statements",
+  "refresher::fast_lane_tests::sqlite_store_replacement_between_cycles_recovers_on_the_next_full_tick",
 ]
 only = true
 timeout_s = 300
