@@ -1,0 +1,4 @@
+# Test vectors are exact producer bytes. Tests pin some of them by checksum,
+# so git must never rewrite their line endings when it checks them out (the
+# Windows CI runner converts LF to CRLF for text files by default).
+crates/*/tests/vectors/** -text
