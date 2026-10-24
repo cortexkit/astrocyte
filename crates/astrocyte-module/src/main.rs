@@ -62,6 +62,16 @@ fn main() -> Result<std::process::ExitCode, Box<dyn Error>> {
         println!("{}", version_line());
         return Ok(std::process::ExitCode::SUCCESS);
     }
+    // `ck` lists external command domains by running every `ck-<name>` in its
+    // bin dir once with `--ck-domain` and caching the answer. Astrocyte has no
+    // `ck astrocyte` subcommands, so it declines silently with a non-zero exit
+    // and stays unlisted.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--ck-domain")
+    {
+        return Ok(std::process::ExitCode::FAILURE);
+    }
     // This branch intentionally precedes --subc parsing, store acquisition, and
     // every network operation: config checking is a pure preflight command.
     if let Some(config_path) = parse_check_config_arg(std::env::args_os().skip(1))? {
@@ -78,6 +88,14 @@ fn main() -> Result<std::process::ExitCode, Box<dyn Error>> {
         cortexkit_store_types::resolve_data_home(),
     )) {
         eprintln!("ck-astrocyte: {message}");
+        return Ok(std::process::ExitCode::FAILURE);
+    }
+    // Without `--subc` this process was not started by the supervisor: a
+    // person or another tool ran the binary by hand. Refuse on stderr before
+    // logging starts, so a stray run never writes a false "module stopped"
+    // error into the production log that the real module also writes.
+    if let Err(error) = parse_subc_arg(std::env::args_os().skip(1)) {
+        eprintln!("ck-astrocyte: {error}");
         return Ok(std::process::ExitCode::FAILURE);
     }
     let _log = init_logging()?;
