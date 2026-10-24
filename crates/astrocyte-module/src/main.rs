@@ -697,7 +697,7 @@ impl ModuleHandler for AstrocyteHandler {
 
 /// The flow each route was bound under, for this connection only. Astrocyte
 /// checks no caller identity on its writes, so a route a flow opened is
-/// refused every mutating operation (see `handle_route_request`); reads stay
+/// refused every mutating operation (see `dispatch_route_request`); reads stay
 /// served. Keyed by the full route handle, so a channel reused under a new
 /// epoch never inherits an old flow.
 #[derive(Default)]
@@ -2319,15 +2319,14 @@ mod tests {
         assert_eq!(reason, "catalog_unconfigured");
     }
 
-    /// Every graceful stop in this module hangs off one event: serving
-    /// RETURNING when the daemon's connection closes (EOF). That return is
-    /// what flips the refresher's stop flag and joins it. Serving that
-    /// reconnected, or waited, instead of returning would leave the refresher
-    /// running against a daemon that is gone and every teardown hook unrun --
-    /// silently, because nothing else observes the difference. The serve
-    /// helper has its own fence for this; this one covers astrocyte's owner
-    /// around it. Bounded so a regression fails by name rather than hanging
-    /// the suite.
+    /// The EOF stop path: when the daemon closes its connection, serving must
+    /// RETURN, because that return is what flips the refresher's stop flag
+    /// and joins it. Serving that reconnected, or waited, instead of
+    /// returning would leave the refresher running against a daemon that is
+    /// gone and every teardown hook unrun -- silently, because nothing else
+    /// observes the difference. The serve helper has its own fence for this;
+    /// this one covers astrocyte's owner around it. Bounded so a regression
+    /// fails by name rather than hanging the suite.
     #[tokio::test(flavor = "multi_thread")]
     async fn module_loop_returns_on_daemon_eof_rather_than_reconnecting_or_waiting() {
         let daemon = FakeDaemon::start().await;

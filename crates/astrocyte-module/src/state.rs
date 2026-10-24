@@ -838,8 +838,8 @@ impl SharedState {
         });
     }
 
-    /// Publish the cache steps committed since the last call to
-    /// `usage.cache.subscribe`. Must run only after a commit: a notice for a
+    /// Publish the cache steps committed since the previous publication to
+    /// the notice log behind `usage.cache.subscribe`. Must run only after a commit: a notice for a
     /// step that then rolled back would name a cursor that never existed.
     fn publish_cache_notices(&self, conn: &Connection) {
         if let Err(error) = self.0.cache_notices.publish(conn) {
