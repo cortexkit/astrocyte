@@ -30,9 +30,17 @@ pub fn ckdev_binary() -> PathBuf {
     let binary = dir.join(&name);
     if !binary.exists() {
         std::fs::create_dir_all(&dir).unwrap();
-        let staging = dir.join(format!(".{name}.{}", std::process::id()));
+        // Tests in one binary run on parallel threads of one process, so the
+        // staging name needs the thread as well as the process to be unique.
+        // Another thread may publish first; then its copy is the same build.
+        let thread = format!("{:?}", std::thread::current().id());
+        let thread: String = thread.chars().filter(char::is_ascii_digit).collect();
+        let staging = dir.join(format!(".{name}.{}.{thread}", std::process::id()));
         std::fs::copy(source, &staging).unwrap();
-        std::fs::rename(&staging, &binary).unwrap();
+        if let Err(error) = std::fs::rename(&staging, &binary) {
+            let _ = std::fs::remove_file(&staging);
+            assert!(binary.exists(), "publish {}: {error}", binary.display());
+        }
     }
     binary
 }

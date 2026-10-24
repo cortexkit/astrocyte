@@ -113,7 +113,10 @@ fn the_ck_domain_probe_is_declined_silently() {
     let written = entries_under(&data_home);
     std::fs::remove_dir_all(&home).unwrap();
 
-    assert!(written.is_empty(), "the probe wrote under the data home: {written:?}");
+    assert!(
+        written.is_empty(),
+        "the probe wrote under the data home: {written:?}"
+    );
     assert!(!output.status.success(), "the probe must be declined");
     assert!(
         output.stdout.is_empty() && output.stderr.is_empty(),
