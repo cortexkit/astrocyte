@@ -110,7 +110,7 @@ Harness session-store parsers.
 tracks only `WORKER.md`, the build and test guide.
 
 - Contracts: `docs/module-surface.md` (operations), `docs/money-ingest.md`,
-  `docs/claude-workers-contract.md` (worker roots and acknowledgements).
+  `docs/claude-workers-contract.md`, `docs/thalamus-opencode-sessions-contract.md`.
 - Architecture: `docs/data-model.md`, `docs/harness-readers.md`.
 - Operator guides: `docs/configuration.md`, `docs/operations.md`.
 - `docs/prod-config/astrocyte-v2.jsonc`: an example desired configuration.
