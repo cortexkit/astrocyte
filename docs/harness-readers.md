@@ -81,15 +81,16 @@ and the resume position. `spend.ledger.coverage` reports them.
 
 ## 2. Sources
 
-The source key is the `producer` stored on every event and the key used by
-`harness_ingest.exclude`.
+The source key is normally the `producer` stored on every event and the key used by
+`harness_ingest.exclude`. OpenCode 2 keeps a separate `opencode-v2` runtime and health
+row, but shares the `opencode` producer and configuration key with OpenCode 1.
 
 | Source key | Harness | Store |
 |---|---|---|
 | `claude-code` | Claude Code | `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/**/*.jsonl` |
 | `claude-code-workers` | Claude Code workers declared by thalamus-harness | `<root>/projects/**/*.jsonl` for each declared root |
 | `codex` | Codex CLI | `<CODEX_HOME or ~/.codex>/sessions/` and `archived_sessions/`, `*.jsonl` and `*.jsonl.zst` |
-| `opencode` | OpenCode | `OPENCODE_DB`, else `<XDG data home>/opencode/opencode.db`, table `message` |
+| `opencode` | OpenCode | `OPENCODE_DB`, else `<XDG data home>/opencode/opencode.db`, tables `message` and `session_message` |
 | `pi` | Pi | `PI_CODING_AGENT_SESSION_DIR`, else `<PI_CODING_AGENT_DIR or ~/.pi/agent>/sessions/**/*.jsonl` |
 | `gemini` | Gemini CLI | `<GEMINI_CLI_HOME or ~>/.gemini/tmp/`, `session-*.json(l)` and files under `chats/` |
 | `goose` | Goose | `GOOSE_PATH_ROOT/data/`, else the platform data directory, `sessions/sessions.db`, table `sessions` |
@@ -128,6 +129,7 @@ Each source resolves its store path by these rules, implemented in
 | `codex` | One advancing `token_count` record (`last_token_usage`) | `<turn id>:<n>` for the n-th response of the turn, else `<thread id>:ordinal:<n>` | `session_meta.session_id` |
 | `codex` | One otherwise unconfirmed `token_usage_record` | `<thread id>:request:response:<response id>`, else `<thread id>:request:ordinal:<n>` | `session_meta.session_id` |
 | `opencode` | One assistant `message` row whose tokens are final (`time.completed` or `finish` set) | `message.id` | none |
+| `opencode` | One v2-only assistant `session_message` row with tokens, completed or quiet for one hour | `session_message.id` | none |
 | `pi` | One assistant message with usage | `<namespace>:response:<responseId>`, else a composite of entry id, timestamp, provider, model and counts | none |
 | `pi` | One compaction with usage, or `usage` entry of kind `cache_warm` | `pi:operation:<entry id>` | none |
 | `gemini` | One message with `tokens` | message id | `sessionId` |
@@ -138,6 +140,40 @@ Each source resolves its store path by these rules, implemented in
 
 Rules that affect what is recorded:
 
+- OpenCode 2 is read only when `session_v2` exists; `session_message` alone is
+  not a generation marker because OpenCode 1.18 also creates it. An absent marker
+  leaves no `opencode-v2` runtime row. Excluding `opencode` disables both readers.
+  A completed v2 row is ready immediately, even with a null finish. An incomplete
+  row waits until `time_updated` is at least one hour old (`QUIET_WINDOW`), then
+  records its reported tokens with a null finish. The hour avoids freezing an
+  active stream while still recovering billed calls interrupted by process death.
+  Completed or interrupted rows without tokens record no usage. `time.streamed`
+  and `finish` alone do not settle a recent row. Output excludes reasoning, which
+  is retained as a separate measurement. Agent, provider and model keep their
+  producer spelling, and completed `finish` is stored in `step_detail`.
+- A v2 row whose ID remains in v1 `message` is owned by the v1 reader and skipped
+  through a primary-key lookup. A v2 call already in the ledger under producer
+  `opencode`, absent lineage and the same reference is also skipped, through its
+  derived `event_id`. A recorded v2 call is final: later changes to its source
+  row are ignored, not compared or quarantined. Both kinds of skip are counted
+  in the drain outcome without degrading health. Tests:
+  `v2_migrated_copy_with_v1_owner_produces_no_event_or_quarantine`,
+  `v2_migrated_copy_after_v1_deletion_keeps_ledger_bytes`,
+  `v2_interrupted_completion_is_ignored_with_a_counted_skip`.
+- OpenCode 2 uses a cheap rowid tail and bounded point lookups for pending rows.
+  Only the periodic full pass advances its own durable update-time cursor. Full
+  passes run on startup, while backlogged, after detected replacement, and hourly;
+  they also revisit incomplete rows below the cursor because aging alone does not
+  update them. Evicted pending rows wait for that pass. Idle tail VM work is
+  independent of message history; schema probes contribute a fixed cost for a
+  given schema. Neither reader adds indexes or writes to OpenCode's database.
+- V2-only `project_root` is null. At OpenCode commit `68bc26b7`, the assistant
+  schema has no root (`packages/schema/src/session-message.ts:213-239`). Session
+  `directory` and `path` can be nested locations and change when a session moves
+  (`packages/core/src/session/move.ts:74-101`,
+  `packages/core/src/session/projector.ts:453-553`). They cannot safely identify
+  the immutable worktree where the call happened. The v1 reader continues to use
+  its own per-message root without substituting session coordinates.
 - A Claude Code response is written as one record per content block, each
   carrying the whole response's usage. A later copy with a lower counter
   refuses the call instead of lowering it. A call without `stop_reason` is

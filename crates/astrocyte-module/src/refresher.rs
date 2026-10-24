@@ -31,6 +31,8 @@ mod kimi_source;
 mod omp_source;
 #[path = "opencode_source.rs"]
 pub(crate) mod opencode_source;
+#[path = "opencode_v2_source.rs"]
+pub(crate) mod opencode_v2_source;
 #[path = "pi_source.rs"]
 mod pi_source;
 
@@ -1561,6 +1563,7 @@ fn refresher_kimi_source() -> kimi_source::KimiSource {
 
 fn refresher_harness_sources() -> Vec<Arc<dyn harness_drain::HarnessSource>> {
     vec![
+        Arc::new(opencode_v2_source::registered()),
         Arc::new(refresher_gemini_source()),
         Arc::new(refresher_goose_source()),
         Arc::new(refresher_omp_source()),
@@ -2438,7 +2441,12 @@ fn run_iteration_all(
 /// was in the removed row, is read from its first fact; content-derived event
 /// ids make both re-reads record nothing twice.
 fn ingesting(state: &SharedState, ingest: &config::HarnessIngest, source_key: &str) -> bool {
-    if ingest.ingests(source_key) {
+    let config_key = if source_key == opencode_v2_source::SOURCE_KEY {
+        opencode_source::OPENCODE_SOURCE_KEY
+    } else {
+        source_key
+    };
+    if ingest.ingests(config_key) {
         return true;
     }
     if let Err(error) = harness_drain::remove_runtime_row(state, source_key) {

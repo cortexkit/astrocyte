@@ -958,6 +958,7 @@ expect_red = [
   "refresher::opencode_source::tests::set_aside_good_opencode_rows_are_byte_identical",
   "refresher::opencode_source::tests::set_aside_opencode_bad_row_keeps_good_rows_and_cursor",
   "refresher::opencode_source::tests::tied_timestamp_boundary_is_inclusive_so_no_message_is_skipped",
+  "refresher::opencode_v2_source::tests::v2_migrated_copy_after_v1_deletion_keeps_ledger_bytes",
 ]
 # These tests compare event counts, COMMIT counts and ledger bytes, so their
 # common error message is an equality assertion rather than specific values.
@@ -1797,6 +1798,7 @@ target = "--lib"
 expect_red = [
   "refresher::opencode_source::tests::opencode_finish_is_stored_beside_a_byte_identical_ledger",
   "refresher::pi_source::tests::pi_stop_reason_is_stored_beside_a_byte_identical_ledger",
+  "refresher::opencode_v2_source::tests::v2_malformed_finish_preserves_usage",
 ]
 only = true
 timeout_s = 600
@@ -1945,3 +1947,73 @@ expect_red = ["refresher::broca_source::tests::broca_model_step_retention_is_bou
 only = true
 timeout_s = 300
 build_timeout_s = 600
+
+[[control]]
+id = "opencode-v2-completion-not-finish"
+guards = "A recent OpenCode 2 row cannot settle from finish alone before time.completed"
+file = "crates/astrocyte-readers/src/sessions/opencode_v2.rs"
+old = '        if !completed && !quiet {'
+new = '        if !completed && !quiet && message.finish.is_none() { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/opencode_v2_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::opencode_v2_source::tests::streamed_or_finish_is_not_v2_completion"]
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
+id = "opencode-v2-interrupted-quiet-window"
+guards = "Incomplete OpenCode 2 token snapshots wait one quiet hour before recording"
+file = "crates/astrocyte-readers/src/sessions/opencode_v2.rs"
+old = '        let quiet = now_ms.saturating_sub(updated_at_ms) >= QUIET_WINDOW;'
+new = '        let quiet = true; // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/opencode_v2_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "refresher::opencode_v2_source::tests::streamed_or_finish_is_not_v2_completion",
+  "refresher::opencode_v2_source::tests::v2_quiet_window_crosses_between_drains",
+  "refresher::opencode_v2_source::tests::v2_cursor_and_pending_rows_survive_restarts",
+  "refresher::opencode_v2_source::tests::v2_completion_at_the_cursor_timestamp_is_ingested",
+]
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
+id = "opencode-v2-v1-owner-skip"
+guards = "A migrated assistant with a retained v1 row remains owned by the v1 reader"
+file = "crates/astrocyte-readers/src/sessions/opencode_v2.rs"
+old = '        if legacy'
+new = '        if false && legacy // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/opencode_v2_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::opencode_v2_source::tests::v2_migrated_copy_with_v1_owner_produces_no_event_or_quarantine"]
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
+id = "opencode-v2-ledger-identity-skip"
+guards = "A recorded OpenCode id is never reinterpreted from a migrated or later v2 projection"
+file = "crates/astrocyte-module/src/opencode_v2_source.rs"
+old = '            if already_recorded {'
+new = '            if false && already_recorded { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/opencode_v2_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "refresher::opencode_v2_source::tests::v2_migrated_copy_after_v1_deletion_keeps_ledger_bytes",
+  "refresher::opencode_v2_source::tests::v2_interrupted_completion_is_ignored_with_a_counted_skip",
+  "refresher::opencode_v2_source::tests::v2_cursor_and_pending_rows_survive_restarts",
+  "refresher::opencode_v2_source::tests::v2_only_calls_reach_served_cache_steps_and_sessions_once",
+]
+only = true
+timeout_s = 600
+build_timeout_s = 900

@@ -54,7 +54,7 @@ Shared library; three binaries.
 - `quota_events.rs`, `quota_bus_client.rs`: quota events and attested authentication;
   `quota_events_tests.rs` tests delivery, failover and shutdown.
 - `fusiform_client.rs`: fusiform `catalog.get` and `plan.prices` client.
-- `claude_code_source.rs`, `codex_source.rs`, `opencode_source.rs`, `pi_source.rs`,
+- `claude_code_source.rs`, `codex_source.rs`, `opencode_source.rs`, `opencode_v2_source.rs`, `pi_source.rs`,
   `gemini_source.rs`, `goose_source.rs`, `omp_source.rs`, `kimi_source.rs`: harness
   producers sharing `refresher::harness_drain`, each keeping its own mapping, health
   and cursor rules.
@@ -84,7 +84,7 @@ Harness session-store parsers.
 - `sessions/jsonl_resume.rs`: the resumable append-only JSONL read the JSONL readers
   share (Pi keeps its own).
 - `sessions/roles.rs`: `DerivedRole`, a disjoint token role or why there is none.
-- `sessions/opencode.rs`, `sessions/opencode_schema.rs`: the OpenCode SQLite store.
+- `sessions/opencode.rs`, `sessions/opencode_schema.rs`, `sessions/opencode_v2.rs` read both OpenCode SQLite layouts.
 - `sessions/pi.rs`: Pi JSONL sessions.
 - Most reader files are adapted from the tokscale project; see `THIRD-PARTY-NOTICES.md`.
 - `sessions/mod.rs`, `sessions/utils.rs`: shared session types and helpers.

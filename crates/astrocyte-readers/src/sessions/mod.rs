@@ -16,6 +16,7 @@ mod lenient;
 pub mod omp;
 pub mod opencode;
 pub(crate) mod opencode_schema;
+pub mod opencode_v2;
 pub mod pi;
 pub mod roles;
 mod sqlite_read;

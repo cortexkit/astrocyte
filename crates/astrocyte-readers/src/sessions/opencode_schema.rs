@@ -40,7 +40,7 @@ pub struct OpenCodeScanCost {
 }
 
 impl OpenCodeScanCost {
-    fn add_statement(&mut self, statement: &Statement<'_>) {
+    pub(super) fn add_statement(&mut self, statement: &Statement<'_>) {
         let read = |status| u64::try_from(statement.get_status(status)).unwrap_or(0);
         self.vm_steps = self.vm_steps.saturating_add(read(StatementStatus::VmStep));
         self.fullscan_steps = self
@@ -55,7 +55,7 @@ impl OpenCodeScanCost {
 }
 
 /// Run a single-row query and add its statement's SQLite work to `cost`.
-fn counted_query_row<T, P: rusqlite::Params>(
+pub(super) fn counted_query_row<T, P: rusqlite::Params>(
     connection: &Connection,
     cost: &mut OpenCodeScanCost,
     sql: &str,
@@ -215,7 +215,11 @@ const INTERRUPT_POLL: Duration = Duration::from_millis(20);
 /// Map a SQLite error. SQLITE_INTERRUPT is a stop only when our own stop flag
 /// is set: an interrupt nobody here asked for is a real failure and must not be
 /// swallowed as a quiet shutdown.
-fn sqlite_error(stop: &AtomicBool, context: &str, error: rusqlite::Error) -> OpenCodeReadError {
+pub(super) fn sqlite_error(
+    stop: &AtomicBool,
+    context: &str,
+    error: rusqlite::Error,
+) -> OpenCodeReadError {
     if error.sqlite_error_code() == Some(ErrorCode::OperationInterrupted)
         && stop.load(Ordering::Relaxed)
     {
@@ -312,7 +316,7 @@ pub(super) fn read_tail(
 
 /// Open `db_path` read-only, run `read` inside one read transaction, and make
 /// `stop` able to abort a statement that is already running.
-fn with_read_snapshot<T>(
+pub(super) fn with_read_snapshot<T>(
     db_path: &Path,
     stop: &AtomicBool,
     read: impl FnOnce(&Connection) -> Result<T, OpenCodeReadError>,
