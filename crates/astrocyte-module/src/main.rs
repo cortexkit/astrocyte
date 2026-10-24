@@ -524,11 +524,10 @@ where
 }
 
 /// How the helper's serving future ended, as a stop cause. GOODBYE and EOF
-/// are the daemon's deliberate stops. A reset connection is an error, as it
-/// was before the helper: the supervisor restarts the module either way, and
-/// a clean exit would read as a deliberate stop. Windows reports a killed
-/// daemon as a reset where Unix reports EOF, so a killed daemon exits 1 on
-/// Windows and 0 on Unix, both as before.
+/// are the daemon's deliberate stops. A reset connection is an error: the
+/// supervisor restarts the module either way, and a clean exit would read as
+/// a deliberate stop. Windows reports a killed daemon as a reset where Unix
+/// reports EOF, so a killed daemon exits 1 on Windows and 0 on Unix.
 fn how_serving_ended(
     result: Result<(), SubcModuleError>,
     connection_end: &Mutex<Option<ConnectionEnd>>,
@@ -1302,13 +1301,36 @@ mod tests {
     }
 
     /// The module's next frame. A module that closes the connection instead
-    /// fails the test.
+    /// fails the test. On the module's GOODBYE the stand-in closes its
+    /// sending side, as a real daemon does: a module that stops itself waits
+    /// for that close (within its drain budget) before it closes its socket.
     pub(super) async fn next_frame(stream: &mut TcpStream) -> Frame {
-        tokio::time::timeout(HANG_GUARD, read_frame(stream))
+        let frame = tokio::time::timeout(HANG_GUARD, read_frame(stream))
             .await
             .expect("no frame from the module")
             .unwrap()
-            .expect("the module closed the connection")
+            .expect("the module closed the connection");
+        if frame.header.ty == FrameType::Goodbye && frame.header.channel == 0 {
+            let _ = stream.shutdown().await;
+        }
+        frame
+    }
+
+    /// Read until the module's GOODBYE, which `next_frame` answers by
+    /// closing the stand-in's side.
+    async fn read_until_goodbye(stream: &mut TcpStream) {
+        while next_frame(stream).await.header.ty != FrameType::Goodbye {}
+    }
+
+    /// Read until the module closes its side, then close this one, as a
+    /// daemon does when a module ends the connection without GOODBYE.
+    async fn close_when_the_module_closes(mut stream: TcpStream) {
+        tokio::time::timeout(HANG_GUARD, async {
+            while let Ok(Some(_)) = read_frame(&mut stream).await {}
+        })
+        .await
+        .expect("the module never closed the connection");
+        drop(stream);
     }
 
     pub(super) fn hello_ack() -> Frame {
@@ -1614,7 +1636,7 @@ mod tests {
         let daemon = FakeDaemon::start().await;
         let refresher = IdleRefresher::new();
         let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
-        let _stream = daemon.accept_and_ack().await;
+        let mut stream = daemon.accept_and_ack().await;
         let panicking = Arc::clone(&state);
         assert!(
             tokio::task::spawn_blocking(move || panicking.panic_write_for_test())
@@ -1626,6 +1648,8 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM crash_probe", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 0, "the panicked transaction must roll back");
+        // The crash stops serving on astrocyte's own account, which says GOODBYE.
+        read_until_goodbye(&mut stream).await;
         let result = served(serving, "serving must end after a write panic").await;
         assert!(result.as_ref().unwrap_err().to_string().contains("crash"));
         assert_eq!(finish_process(result), std::process::ExitCode::FAILURE);
@@ -1710,6 +1734,7 @@ mod tests {
         );
         let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(error.code, "internal");
+        close_when_the_module_closes(stream).await;
         let result = served(serving, "handler panic must end serving").await;
         assert!(result
             .as_ref()
@@ -2958,10 +2983,20 @@ mod tests {
                     write_frame(&mut stream, &hello_ack()).await.unwrap();
                     stream.flush().await.unwrap();
                     handshaken.send(()).unwrap();
-                    tokio::task::spawn_blocking(move || daemon_released.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                    // Close on release, or, as a real daemon does, once the
+                    // module's GOODBYE arrives: a module that stops itself
+                    // waits for that close before it closes its socket.
+                    let released = tokio::task::spawn_blocking(move || daemon_released.recv());
+                    tokio::select! {
+                        _ = released => {}
+                        () = async {
+                            while let Ok(Some(frame)) = read_frame(&mut stream).await {
+                                if frame.header.ty == FrameType::Goodbye {
+                                    break;
+                                }
+                            }
+                        } => {}
+                    }
                     drop(stream);
                 });
         });

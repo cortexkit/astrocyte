@@ -69,8 +69,8 @@ Served reads, including `budget.verdict`, use `with_read_op` on a mutex-guarded
 read-only connection opened after migration. In WAL mode a report neither waits for
 nor blocks ingest, and each read sees one ledger snapshot. Refresher reads and reads before
 `spend.event.reprice` and `spend.basis.correct` use the writer via `with_conn`;
-`spend.multiplier.recompute` reads on the reader before writing. The reader needs
-no lease.
+`spend.multiplier.recompute` reads on the reader before writing. The reader cannot
+write, so it needs no lease.
 
 ## Producers
 
