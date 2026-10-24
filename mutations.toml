@@ -1291,33 +1291,39 @@ timeout_s = 600
 
 [[control]]
 id = "claude-workers-absolute-roots"
-guards = "Relative declared Claude worker roots cannot authorize transcript reads"
-file = "crates/astrocyte-module/src/claude_workers_source.rs"
-old = "if !root.path.is_absolute() {"
+guards = "Relative declared Claude worker roots and OpenCode session folders cannot authorize reads"
+file = "crates/astrocyte-module/src/declared_roots.rs"
+old = "if !declared.is_absolute() {"
 new = "if false { // NON-VACUITY BREAK"
 test_file = "crates/astrocyte-module/src/claude_workers_source.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
-expect_red = ["refresher::claude_workers_source::tests::relative_root_is_refused_without_blocking_other_roots"]
+expect_red = [
+    "refresher::claude_workers_source::tests::relative_root_is_refused_without_blocking_other_roots",
+    "refresher::opencode_thalamus_source::tests::relative_entry_is_refused_without_blocking_other_entries",
+]
 only = true
 timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
 id = "claude-workers-canonical-containment"
-guards = "Symlink-resolved declared roots stay inside the harness worker folder"
-file = "crates/astrocyte-module/src/claude_workers_source.rs"
-old = '''if folder
-                .as_ref()
-                .is_some_and(|folder| canonical == *folder || !canonical.starts_with(folder))
-            {'''
+guards = "Symlink-resolved declared roots and session folders stay strictly inside the harness folder"
+file = "crates/astrocyte-module/src/declared_roots.rs"
+old = "if canonical == folder || !canonical.starts_with(folder) {"
 new = "if false { // NON-VACUITY BREAK"
 test_file = "crates/astrocyte-module/src/claude_workers_source.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
-expect_red = ["refresher::claude_workers_source::tests::outside_root_is_refused_without_blocking_other_roots", "refresher::claude_workers_source::tests::escaping_symlink_is_refused_without_blocking_other_roots"]
+expect_red = [
+    "refresher::claude_workers_source::tests::outside_root_is_refused_without_blocking_other_roots",
+    "refresher::claude_workers_source::tests::escaping_symlink_is_refused_without_blocking_other_roots",
+    "refresher::opencode_thalamus_source::tests::outside_entry_is_refused_without_blocking_other_entries",
+    "refresher::opencode_thalamus_source::tests::escaping_symlink_is_refused_without_blocking_other_entries",
+    "refresher::opencode_thalamus_source::tests::the_sessions_folder_itself_is_refused",
+]
 only = true
 timeout_s = 600
 build_timeout_s = 1800
@@ -2162,3 +2168,103 @@ expect_message = "/output|left == right/"
 only = true
 timeout_s = 600
 build_timeout_s = 900
+
+[[control]]
+id = "opencode-thalamus-watermark-after-commit"
+guards = "The OpenCode sessions read watermark commits only with the transaction recording its complete pass"
+file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+old = '''        state.ordered_write(|tx| {
+            record_pass_in_tx(tx, at, complete, stores.as_ref())?;
+            store_watermark_in_tx(tx, watermark, at)?;
+            Ok(((), true))
+        })?;'''
+new = '''        // NON-VACUITY BREAK: the watermark commits in its own transaction first
+        state.ordered_write(|tx| {
+            store_watermark_in_tx(tx, watermark, at)?;
+            Ok(((), true))
+        })?;
+        state.ordered_write(|tx| {
+            record_pass_in_tx(tx, at, complete, stores.as_ref())?;
+            Ok(((), true))
+        })?;'''
+test_file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::opencode_thalamus_source::tests::the_watermark_is_set_only_after_the_pass_commits"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "opencode-thalamus-unreadable-folder-holds-watermark"
+guards = "A declared OpenCode session folder that cannot be read holds the read watermark back"
+file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+old = '''                Err(SourceDrainError::Failed(reason)) => {
+                    complete = false;'''
+new = '''                Err(SourceDrainError::Failed(reason)) => {
+                    // NON-VACUITY BREAK: an unreadable folder no longer holds the watermark'''
+test_file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+    "refresher::opencode_thalamus_source::tests::an_unreadable_folder_holds_the_watermark_and_degrades_but_others_read",
+    "refresher::opencode_thalamus_source::tests::the_watermark_is_none_before_the_first_complete_pass",
+    "refresher::opencode_thalamus_source::tests::the_watermark_is_set_only_after_the_pass_commits",
+]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "opencode-thalamus-done-folder-settles-at-once"
+guards = "A done OpenCode session folder records a call with tokens but no completion without the quiet window"
+file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+old = "        settled: done,"
+new = "        settled: false, // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::opencode_thalamus_source::tests::an_unfinished_call_is_recorded_at_once_in_a_done_folder_and_waits_in_an_active_one"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "opencode-thalamus-owner-work-class"
+guards = "Calls from a declared OpenCode session folder carry the declaring module as work class"
+file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+old = "        work_class: Some(entry.owner_principal.as_str()),"
+new = "        work_class: None, // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+    "refresher::opencode_thalamus_source::tests::declared_calls_keep_the_user_store_identity_and_carry_the_owner",
+    "refresher::opencode_thalamus_source::tests::escaping_symlink_is_refused_without_blocking_other_entries",
+    "refresher::opencode_thalamus_source::tests::outside_entry_is_refused_without_blocking_other_entries",
+    "refresher::opencode_thalamus_source::tests::relative_entry_is_refused_without_blocking_other_entries",
+    "refresher::opencode_thalamus_source::tests::the_sessions_folder_itself_is_refused",
+]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "opencode-thalamus-done-folder-full-pass"
+guards = "A declared OpenCode session folder seen done is read by a full pass before it releases the watermark"
+file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+old = '''        folder.v1.require_full_pass();
+        folder.v2.require_full_pass();'''
+new = "        // NON-VACUITY BREAK: a done folder keeps the hourly full-pass cadence"
+test_file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::opencode_thalamus_source::tests::a_folder_seen_done_gets_a_full_pass_before_it_releases_the_watermark"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
