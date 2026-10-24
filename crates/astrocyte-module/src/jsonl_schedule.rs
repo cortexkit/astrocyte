@@ -249,6 +249,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn distinct_paths_are_due_at_their_own_daily_phases() {
+        let paths = [
+            Path::new("sessions/pi/session-a.jsonl"),
+            Path::new("sessions/pi/session-b.jsonl"),
+        ];
+        let phases = paths.map(|path| phase(path, DAY));
+        assert_ne!(phases[0], phases[1]);
+        for (path, phase) in paths.into_iter().zip(phases) {
+            assert!(
+                (1..DAY).contains(&phase),
+                "fixture must have a nonzero phase"
+            );
+            assert!(!full_due(path, Some(0), phase - 1, DAY));
+            assert!(full_due(path, Some(0), phase, DAY));
+            assert!(!full_due(path, Some(phase), phase + DAY - 1, DAY));
+            assert!(full_due(path, Some(phase), phase + DAY, DAY));
+        }
+    }
+
     struct Tick {
         hashed: u64,
         recorded: usize,

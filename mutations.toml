@@ -56,6 +56,7 @@ runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
 expect_red = [
+  "refresher::claude_workers_source::tests::fast_worker_read_refuses_a_cached_root_redirected_outside",
   "refresher::fast_lane_tests::hot_files_expire_but_growth_keeps_them_hot_and_new_files_wait_for_full_tick",
   "refresher::fast_lane_tests::idle_fast_cycle_opens_nothing_and_stats_only_hot_files",
 ]
@@ -91,7 +92,10 @@ test_file = "crates/astrocyte-module/src/fast_lane_tests.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
-expect_red = ["refresher::fast_lane_tests::fast_lane_never_runs_due_full_passes_or_full_only_sources"]
+expect_red = [
+  "refresher::fast_lane_tests::fast_lane_never_runs_due_full_passes_or_full_only_sources",
+  "refresher::fast_lane_tests::new_opencode_row_reuses_prepared_statements",
+]
 only = true
 timeout_s = 300
 build_timeout_s = 600
@@ -107,6 +111,7 @@ runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
 expect_red = [
+  "refresher::jsonl_schedule::tests::distinct_paths_are_due_at_their_own_daily_phases",
   "refresher::jsonl_schedule::tests::daily_checks_are_not_postponed_by_appends_on_every_tick",
   "refresher::jsonl_schedule::tests::daily_literal_deadline_overrides_quiet_deferral_and_quarantines_old_bytes",
   "refresher::jsonl_schedule::tests::stopped_or_rolled_back_drain_does_not_spend_a_daily_check",
@@ -1909,6 +1914,8 @@ expect_red = [
   "refresher::broca_source::tests::broca_model_step_cursors_survive_reopen_and_expiry_without_reuse",
   "refresher::fast_lane_tests::fast_lane_event_bytes_match_full_drain",
   "refresher::fast_lane_tests::fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval",
+  "refresher::fast_lane_tests::hot_files_expire_but_growth_keeps_them_hot_and_new_files_wait_for_full_tick",
+  "refresher::fast_lane_tests::new_opencode_row_reuses_prepared_statements",
 ]
 only = true
 timeout_s = 300
