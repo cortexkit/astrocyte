@@ -30,13 +30,15 @@ use tokio::sync::{watch, Semaphore};
 
 use crate::state::SharedState;
 
-/// Notices kept for resuming subscribers. Astrocyte commits at most one
-/// step-adding transaction per refresher pass, and the fast lane runs every
-/// 2 seconds, so 1,024 notices cover more than half an hour of continuous
-/// activity: long enough for a phone that lost its connection to resume
-/// without a resync. A notice holds at most `MAX_NOTICE_SESSIONS` session
-/// names, so the log stays within a few megabytes at its fullest, and is
-/// usually a few hundred kilobytes.
+/// Notices kept for resuming subscribers. The refresher commits at most one
+/// step-adding transaction per pass, and its fast lane runs every 2 seconds,
+/// so at that cadence 1,024 notices cover more than half an hour of
+/// continuous activity: long enough for a phone that lost its connection to
+/// resume without a resync. Served writes that add steps publish notices too
+/// and can push old ones out sooner. A notice names at most
+/// `MAX_NOTICE_SESSIONS` sessions; with ordinary session ids of a few dozen
+/// bytes the full log is a few megabytes, and usually a few hundred
+/// kilobytes.
 pub const NOTICE_LOG_CAPACITY: usize = 1_024;
 
 /// Sessions named in one notice. A commit that adds steps to more sessions
