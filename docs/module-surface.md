@@ -62,6 +62,7 @@ Test: `every_operation_name_reaches_its_own_handler`.
 | `spend.multiplier.pace` | read | `quota_provider`, `from_ms`, `to_ms` |
 | `usage.cache.sessions` | read | `since_ms?`, `harness?`, `limit?` |
 | `usage.cache.steps` | read | `harness`, `session`, `limit?`, `after_cursor?` |
+| `usage.cache.subscribe` | read, watch | `after_cursor?` |
 | `spend.event.ingest` | write | see §3.1 |
 | `spend.correction.ingest` | write | see §3.2 |
 | `spend.chargeability.settle` | write | `event_id`, `to_state`, `reason` |
@@ -383,6 +384,62 @@ recently active first. There are at most `limit` sessions (default 50, maximum
 
 It is always read from the store. Test:
 `sessions_report_hit_ratio_busts_limit_and_activity`.
+
+### 4.2 `usage.cache.subscribe`
+
+`usage.cache.subscribe` is a watch: the manifest declares it in
+`operation_delivery` as `"watch"`, and it is the only operation that is. A
+client opens it on a route with the subscription flag, and the request stays
+open. While it is open, astrocyte sends a StreamData notice after each
+committed transaction that adds steps, harness or BROCA. A notice is sent only
+after the commit, never before:
+
+```json
+{"cursor": 4812, "sessions": [{"harness": "pi", "session": "s-1"}]}
+```
+
+`cursor` is the shared step cursor after that commit, and `sessions` names each
+session the commit added steps to, once. A notice never carries step bodies.
+To read them, the client calls `usage.cache.steps` for each session with
+`after_cursor` set to the last cursor it saw. A commit that adds steps to more
+than 64 sessions sends a resync notice instead (see below). Steps that only
+gain a finish reason later are not announced.
+
+Astrocyte keeps the last 1,024 notices in memory. The log starts empty at the
+current cursor whenever astrocyte starts, so cursors do not carry notices
+across a restart.
+
+- With no `after_cursor`, the stream carries the notices published from now on.
+- With an `after_cursor` the log still covers, the stream first replays every
+  notice after it, in order, then continues live.
+- With an older `after_cursor`, the stream starts with one notice
+  `{"cursor": <newest>, "resync": true}`. The client re-reads the sessions it
+  shows, then continues from that cursor; live notices follow.
+- An `after_cursor` newer than the newest cursor astrocyte has recorded is
+  refused `invalid_request`.
+
+A subscription holds no queue of its own. It keeps its place in the notice
+log, and the serve helper's bounded outbound queue slows it down when the
+client reads slowly. If the log drops notices that a subscriber has not been
+sent yet, the subscription ends with the error `lagged`, whose `detail` is
+`{"cursor": <last cursor sent>}`. The client subscribes again with its last
+cursor and gets a resync notice.
+
+A subscription ends when the client cancels it (the error `cancelled`), when
+its route closes (no reply, because the route is gone), or when the daemon
+drains astrocyte or astrocyte stops (a clean stream end, before the daemon's
+GOODBYE). At most 16 subscriptions are open at once; one more is refused
+`subscription_capacity`. While astrocyte is stopping, a new subscription is
+refused `draining`. A request whose params do not decode is refused
+`malformed`.
+
+Tests: `a_notice_is_published_only_after_its_steps_commit`,
+`a_cursor_inside_the_log_replays_the_newer_notices`,
+`a_cursor_older_than_the_log_gets_one_resync_then_live_notices`,
+`a_subscriber_that_falls_behind_the_log_ends_lagged`,
+`a_cancelled_cache_subscription_ends_with_cancelled`,
+`a_drain_ends_every_cache_subscription_before_goodbye`,
+`two_subscribers_both_receive_a_notice`.
 
 ## 5. Calls astrocyte makes
 
