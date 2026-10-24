@@ -410,9 +410,13 @@ const PROJECT_ROOT_SQL: &str = "SELECT project_root FROM usage_event
      WHERE session=?1 AND producer=?2 AND occurred_at_ms>=?3 AND project_root IS NOT NULL
       ORDER BY occurred_at_ms DESC, event_key DESC LIMIT 1";
 
-// New model-step facts always include reasoning inside output, including xAI.
-// Keep the raw counts in broca_step, but expose disjoint output as the session
-// ledger does. An impossible subset has no derived output, not a clamped zero.
+// BROCA counts reasoning tokens inside output_tokens on every model-step fact,
+// for every provider. (Its older session facts did not always: before BROCA
+// changed its usage rules, xAI facts stored reasoning apart from output.)
+// broca_step keeps the counts exactly as sent, and this query reports output
+// minus reasoning, the same split the ledger stores for BROCA session facts.
+// If reasoning exceeds output, which that rule makes impossible, output is
+// reported as absent rather than clamped to zero.
 macro_rules! broca_columns {
     () => {
         "s.cursor,b.run_id || '#' || b.step_id,b.finished_at_ms,b.provider,b.model,
