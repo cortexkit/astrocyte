@@ -184,6 +184,7 @@ runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
 expect_red = [
+  "refresher::jsonl_schedule::tests::distinct_paths_are_due_at_their_own_daily_phases",
   "refresher::jsonl_schedule::tests::daily_checks_are_not_postponed_by_appends_on_every_tick",
   "refresher::jsonl_schedule::tests::daily_literal_deadline_overrides_quiet_deferral_and_quarantines_old_bytes",
   "refresher::pi_source::tests::pi_daily_deadlines_stay_staggered_as_inventory_grows",
