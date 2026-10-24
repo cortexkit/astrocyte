@@ -1668,6 +1668,7 @@ package = "astrocyte-module"
 target = "--lib"
 expect_red = [
   "recent_steps::tests::memory_keeps_the_newest_thousand_steps_and_answers_like_the_store",
+  "refresher::broca_source::tests::broca_model_step_cache_ops_match_memory_store_and_shared_cursors",
   "refresher::pi_source::tests::drained_pi_steps_are_served_alike_from_memory_and_store",
 ]
 only = true
@@ -1699,7 +1700,10 @@ test_file = "crates/astrocyte-module/src/recent_steps.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
-expect_red = ["recent_steps::tests::a_late_finish_reaches_memory"]
+expect_red = [
+  "recent_steps::tests::a_late_finish_reaches_memory",
+  "refresher::broca_source::tests::broca_model_step_cache_ops_match_memory_store_and_shared_cursors",
+]
 only = true
 timeout_s = 600
 build_timeout_s = 900
