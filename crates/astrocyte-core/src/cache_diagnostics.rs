@@ -772,7 +772,7 @@ pub fn steps_reply(
     let steps = window
         .into_iter()
         .zip(derived)
-        .filter(|(row, _)| query.after_cursor.map_or(true, |after| row.cursor > after))
+        .filter(|(row, _)| query.after_cursor.is_none_or(|after| row.cursor > after))
         .map(|(row, derived)| CacheStep {
             cursor: row.cursor,
             step_ref: row.step_ref,
