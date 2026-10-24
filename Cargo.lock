@@ -80,6 +80,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "signal-hook",
+ "subc-client-rs",
+ "subc-control",
  "subc-jsonc",
  "subc-os",
  "subc-protocol",
@@ -1548,6 +1550,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "subc-client-rs"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1ba71a418a7d827d932da30850dd53f5b25d804c9fd1d3bf98cb580e16cac9c"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subc-control",
+ "subc-os",
+ "subc-protocol",
+ "subc-transport",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "subc-control"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86c691fc8e35a2d30000801dc27dfbd54f356529f761a97a776bc239e8381808"
+dependencies = [
+ "serde",
+ "serde_json",
+ "subc-protocol",
+]
+
+[[package]]
 name = "subc-jsonc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1558,9 +1590,9 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.15"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f998e16bbee599d83ef7ee0a37ca29c7d40d4b631b26c1d5d90662c91198dbe3"
+checksum = "d21902a3af5bb8a3fc6c79a3faf550e021d57d130352e95fec6808969957b6c0"
 dependencies = [
  "libc",
  "rustix",
@@ -1569,9 +1601,9 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b6252f827f7763153d01487298f9163d26a58432c5a5d6acba7303ad2390dc2"
+checksum = "587cff68a0d5b98eb85a7231ce00e3a117e3e50314ad6823d42b802afa5461a3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1579,9 +1611,9 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.12.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c174608340d9619c9db01ee322a791d7533da98a5655c6aa0d31735a5c89c03c"
+checksum = "73fcec900a7105be1071e1d478c74831abe936d9d8e4c825a25f7dd9832797e4"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",
@@ -1773,6 +1805,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

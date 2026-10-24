@@ -60,7 +60,12 @@ base64 = { workspace = true }
 futures-util = { workspace = true }
 subc-protocol = { workspace = true }
 subc-transport = { workspace = true }
+# subc-client-rs links subc-control; naming it here holds it to the exact
+# workspace pin, so the wire crates move together.
+subc-control = { workspace = true }
 subc-os = { workspace = true }
+# The shared serve helper owns the daemon connection (src/main.rs).
+subc-client-rs = { workspace = true }
 subc-jsonc = { workspace = true }
 fusiform-protocol = { workspace = true }
 tempfile = { version = "3", optional = true }
