@@ -164,7 +164,7 @@ Rules that affect what is recorded:
   Only the periodic full pass advances its own durable update-time cursor. Full
   passes run on startup, while backlogged, after detected replacement, and hourly;
   they also revisit incomplete rows below the cursor because aging alone does not
-  update them. Evicted pending rows wait for that pass. Idle tail VM work is
+  update them. Evicted pending rows wait for that pass. Idle tail SQLite virtual-machine work is
   independent of message history; schema probes contribute a fixed cost for a
   given schema. Neither reader adds indexes or writes to OpenCode's database.
 - V2-only `project_root` is null. At OpenCode commit `68bc26b7`, the assistant

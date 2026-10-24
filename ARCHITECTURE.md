@@ -99,8 +99,6 @@ BROCA, Claude Code, Codex, OpenCode and Pi set unreadable records aside as
 Only new evidence warns; rereads refresh last-seen time. Coverage reports counts
 without degrading health.
 
-OpenCode 2 has a separate cursor and skips v1-owned or recorded calls.
-
 ## Refresher loop
 
 `start_refresher` runs full ticks on one OS thread every `poll_interval_secs`.
