@@ -114,7 +114,7 @@ Each source resolves its store path by these rules, implemented in
 | `goose` | One session's accumulated usage, not one call | `sessions.id` | `sessions.id` |
 | `omp` | One assistant message with usage | entry `id` | session header `id` |
 | `kimi` | One `StatusUpdate` record | `payload.message_id` | session directory name |
-| `broca` | One `export_facts` row | `fact_id` | none |
+| `broca` | One session or `system_one` spend fact; `model_step` is diagnostic-only | `fact_id` | none |
 
 Rules that affect what is recorded:
 
@@ -170,7 +170,7 @@ Rules that affect what is recorded:
   `opencode_finish_is_stored_beside_a_byte_identical_ledger`,
   `pi_stop_reason_is_stored_beside_a_byte_identical_ledger`,
   `codex_context_window_is_stored_beside_a_byte_identical_ledger`.
-- BROCA writes two kinds of fact into `export_facts`. A segment with no `kind`
+- BROCA writes three kinds of fact into `export_facts`. A segment with no `kind`
   member is a session fact, recorded with its session, harness, project and
   run. A segment with `"kind": "system_one"` comes from one of BROCA's batch
   decision or extraction models. It has no session, so `session`, `harness`
@@ -179,13 +179,28 @@ Rules that affect what is recorded:
   `output_tokens` become `input` and `output` measurements, each only when
   reported, and any other key inside `usage` sets the row aside. Its
   charge-basis provenance (`charge_basis_mapping_version`,
-  `charge_basis_overrides`) is stored as on a session fact. Both kinds use
+  `charge_basis_overrides`) is stored as on a session fact. Both spend kinds use
   `fact_id` as `producer_ref`, so a re-read is an exact redelivery. Two facts
   captured from BROCA's real producer are pinned in
   `crates/astrocyte-module/tests/vectors/broca-system-one/` (test:
   `broca_captured_system_one_facts_are_recorded_with_their_provenance`).
+- A BROCA `model_step` fact is diagnostics, never spend. It goes only into
+  `broca_step`, in the same drain transaction as the other facts and cursor;
+  it never creates an event, measurement or charge. Its required members are
+  `fact_id`, `run_id`, integer `step_id`, `session`, `provider`, `model` and
+  `finished_at_ms`. Unknown members inside `usage` set the row aside, while
+  top-level extensions are ignored. Missing usage and optional timing values
+  remain absent. Output includes reasoning, and input is fresh input only.
+  The cache operations use harness `broca` and the binding's `session`, the
+  same session key as BROCA session spend. The binding's host harness and
+  project root are preserved separately. The host step id is `run_id#step_id`.
+  Exact re-reads do nothing; a changed fact with either identity is set aside
+  as a contradiction, never overwritten. The captured golden is pinned in
+  `crates/astrocyte-module/tests/vectors/broca-model-step/model_step_fact.json`
+  (test: `broca_model_step_golden_records_every_field_without_spend`).
 - A BROCA row is set aside, with the reason, when its segment has any other
-  `kind`, or is a `system_one` fact that is missing a required member or
+  `kind`, or is a `model_step` fact missing a required member, or is a
+  `system_one` fact that is missing a required member or
   carries both or neither of `run_id` and `flow_id`. Such a row is never
   decoded as a session fact. The rows around it are recorded and the cursor
   moves past it. Tests:

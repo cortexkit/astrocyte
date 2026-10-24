@@ -63,6 +63,7 @@ pub struct ExportPage {
     /// The producer's newest position when it served this page.
     pub high_water: SourceCursor,
     pub events: Vec<EventRecordRequest>,
+    pub model_steps: Vec<astrocyte_core::broca_step::ModelStepFact>,
     pub set_aside: Vec<SetAsideRecord>,
     /// This is a producer-provided exact count, not a sequence-number
     /// subtraction. Unknown lag remains explicit when the producer could not
@@ -945,7 +946,7 @@ pub fn drain_once(
             // it in the same transaction as the cursor it records.
             harness_drain::ensure_runtime_row_in_tx(tx, &source_key)
                 .map_err(|error| format!("initialize source runtime: {error}"))?;
-            let newly_seen =
+            let mut newly_seen =
                 harness_drain::record_set_aside_in_tx(tx, &source_key, &page.set_aside, now_ms)?;
             let mut events_recorded = 0;
             let mut quarantined_redeliveries = 0;
@@ -965,6 +966,24 @@ pub fn drain_once(
                     == astrocyte_core::ingest::RecordDisposition::QuarantinedRedelivery
                 {
                     quarantined_redeliveries += 1;
+                }
+            }
+            for step in &page.model_steps {
+                if let Some(reason) = astrocyte_core::broca_step::record_in_tx(tx, step, now_ms)
+                    .map_err(|error| format!("record model_step: {error}"))?
+                {
+                    newly_seen.extend(harness_drain::record_set_aside_in_tx(
+                        tx,
+                        &source_key,
+                        &[SetAsideRecord {
+                            locator: format!(
+                                "model_step:{}:{}#{}",
+                                step.fact_id, step.run_id, step.step_id
+                            ),
+                            reason,
+                        }],
+                        now_ms,
+                    )?);
                 }
             }
             let updated = tx
@@ -1829,6 +1848,21 @@ fn run_tick(
     // a tick, never a whole ledger walk. Anything it enqueues is priced on the
     // next tick.
     reconciler.tick(state, stop);
+    if !stop.load(Ordering::Relaxed) {
+        if let Err(error) = retain_broca_steps(state, current_time_ms()) {
+            tracing::warn!(target: "astrocyte", %error, "BROCA step retention failed");
+        }
+    }
+}
+
+/// Retention shares the refresher's maintenance cadence, one bounded transaction
+/// per tick. It refreshes memory under the writer fence when rows expire.
+pub(crate) fn retain_broca_steps(state: &SharedState, now_ms: i64) -> Result<usize, String> {
+    state.ordered_write(|tx| {
+        let deleted = astrocyte_core::broca_step::expire_in_tx(tx, now_ms)
+            .map_err(|error| format!("BROCA step retention: {error}"))?;
+        Ok((deleted, deleted > 0))
+    })
 }
 
 /// Test fixture over `run_iteration_full` with capacity and catalog absent.
@@ -5150,6 +5184,7 @@ mod tests {
                 ordinal: 1,
             };
             Ok(ExportPage {
+                model_steps: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: cursor.clone(),
                 high_water: cursor,
@@ -6193,6 +6228,7 @@ mod tests {
     impl SourceClient for OnePage {
         fn pull(&self, _since: Option<SourceCursor>, _limit: u32) -> Result<ExportPage, PullError> {
             Ok(ExportPage {
+                model_steps: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: SourceCursor {
                     lineage: "instance-a:3".into(),
@@ -6338,6 +6374,7 @@ mod tests {
                 ordinal: self.seq,
             };
             Ok(ExportPage {
+                model_steps: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: cursor.clone(),
                 high_water: cursor,
@@ -6423,6 +6460,7 @@ mod tests {
             )
             .unwrap();
             Ok(ExportPage {
+                model_steps: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: SourceCursor {
                     lineage: "inst:2".into(),
@@ -6547,6 +6585,7 @@ mod loop_tests {
     impl SourceClient for ReadySource {
         fn pull(&self, _since: Option<SourceCursor>, _limit: u32) -> Result<ExportPage, PullError> {
             Ok(ExportPage {
+                model_steps: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: SourceCursor {
                     lineage: "live:1".into(),
@@ -6676,6 +6715,7 @@ mod loop_tests {
             )
             .unwrap();
             Ok(ExportPage {
+                model_steps: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: SourceCursor {
                     lineage: "pricing:1".into(),
@@ -8489,6 +8529,7 @@ mod harness_ingest_tests {
                 ordinal: 7,
             };
             Ok(ExportPage {
+                model_steps: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: position.clone(),
                 high_water: position,

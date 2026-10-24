@@ -9,8 +9,8 @@
 //! durable cursor and decodes each row with the decoder the `usage.export`
 //! pull used, so an event keeps the identity and payload the pull gave it.
 //! A row whose segment carries `"kind": "system_one"` is a fact from one of
-//! BROCA's batch models and has its own decoder; a row with any other `kind`
-//! is set aside (see [`decode_store_row`]).
+//! BROCA's batch models and has its own decoder. A `model_step` is diagnostic
+//! only; other kinds are set aside (see [`decode_store_row`]).
 //!
 //! When `BROCA_STATE_ROOT` is unset, BROCA writes to the same path, resolving
 //! the data home in the same order as this reader
@@ -34,7 +34,8 @@ use serde_json::Value;
 
 use super::{interrupt_on_stop, ExportPage, PullError, SourceClient, SourceCursor};
 use crate::wire_map::{
-    map_fact, map_system_one_fact, WireSpendSegmentFact, WireSystemOneFact, SYSTEM_ONE_KIND,
+    map_fact, map_system_one_fact, WireModelStepFact, WireSpendSegmentFact, WireSystemOneFact,
+    MODEL_STEP_KIND, SYSTEM_ONE_KIND,
 };
 
 pub(crate) const BROCA_SOURCE_KEY: &str = "broca";
@@ -305,7 +306,8 @@ fn read_snapshot(
 /// Decode one row by the `kind` its segment carries.
 ///
 /// A segment with no `kind` is a session fact and is decoded exactly as the
-/// `usage.export` pull served it. A `system_one` segment is a batch fact. Any
+/// `usage.export` pull served it. A `system_one` segment is a batch fact and
+/// a `model_step` is a diagnostic fact, never a spend event. Any
 /// other `kind`, including a `kind` that is not a string, is refused with the
 /// kind named, so the row is set aside as evidence: decoding it as a session
 /// fact could record a charge under a shape BROCA did not mean.
@@ -313,7 +315,7 @@ fn decode_store_row(
     export_seq: i64,
     fact_id: &str,
     segment_json: &str,
-) -> Result<EventRecordRequest, String> {
+) -> Result<DecodedFact, String> {
     let export_seq = u64::try_from(export_seq)
         .map_err(|_| format!("export_seq {export_seq} of fact {fact_id} is negative"))?;
     let segment: Value = serde_json::from_str(segment_json)
@@ -323,12 +325,25 @@ fn decode_store_row(
     }
     let kind = segment.get("kind").cloned();
     match kind {
-        None => decode_session_segment(export_seq, fact_id, segment),
+        None => decode_session_segment(export_seq, fact_id, segment).map(DecodedFact::Event),
         Some(Value::String(kind)) if kind == SYSTEM_ONE_KIND => {
-            decode_system_one_segment(export_seq, fact_id, segment)
+            decode_system_one_segment(export_seq, fact_id, segment).map(DecodedFact::Event)
+        }
+        Some(Value::String(kind)) if kind == MODEL_STEP_KIND => {
+            let wire: WireModelStepFact = serde_json::from_value(segment)
+                .map_err(|error| format!("decode model_step segment of fact {fact_id}: {error}"))?;
+            refuse_fact_id_mismatch(export_seq, fact_id, &wire.fact_id)?;
+            wire.validate()?;
+            Ok(DecodedFact::ModelStep(wire))
         }
         Some(kind) => Err(format!("segment of fact {fact_id} has unknown kind {kind}")),
     }
+}
+
+#[derive(Debug)]
+enum DecodedFact {
+    Event(EventRecordRequest),
+    ModelStep(WireModelStepFact),
 }
 
 /// Decode a session fact the way `usage.export` served it. `segment_json`
@@ -381,10 +396,12 @@ fn refuse_fact_id_mismatch(
 
 fn page_from_snapshot(snapshot: Snapshot, path: &Path) -> Result<ExportPage, PullError> {
     let mut events = Vec::new();
+    let mut model_steps = Vec::new();
     let mut set_aside = Vec::new();
     for row in &snapshot.rows {
         match decode_store_row(row.export_seq, &row.fact_id, &row.segment_json) {
-            Ok(event) => events.push(event),
+            Ok(DecodedFact::Event(event)) => events.push(event),
+            Ok(DecodedFact::ModelStep(step)) => model_steps.push(step),
             Err(reason) => set_aside.push(crate::refresher::SetAsideRecord {
                 locator: format!(
                     "{path:?}:{}:export_seq:{}",
@@ -406,6 +423,7 @@ fn page_from_snapshot(snapshot: Snapshot, path: &Path) -> Result<ExportPage, Pul
     let high_water = snapshot.high_water.max(consumed);
     Ok(ExportPage {
         events,
+        model_steps,
         set_aside,
         cursor: SourceCursor {
             lineage: snapshot.lineage.clone(),
@@ -424,6 +442,7 @@ fn page_from_snapshot(snapshot: Snapshot, path: &Path) -> Result<ExportPage, Pul
 
 #[cfg(test)]
 mod tests {
+    include!("broca_model_step_tests.rs");
     use super::*;
     use crate::refresher::{drain_once, run_iteration, Producer};
     use crate::state::{test_state, SharedState};

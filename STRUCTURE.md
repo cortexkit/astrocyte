@@ -11,7 +11,7 @@ Crates live in `crates/`, public docs in `docs/`, and gates in `scripts/`.
 
 Domain logic and storage.
 
-- `store.rs`: `MIGRATIONS` (1 to 25), `initialize_connection` and `migrate_store`.
+- `store.rs`: `MIGRATIONS` (1 to 28), `initialize_connection` and `migrate_store`.
   Migration 23 rebuilds integer keys without charge digests, checking FKs before
   commit; startup restores enforcement. VACUUM is a separate offline step.
 - `fact.rs`: event and measurement identity, minted locally.
@@ -30,7 +30,8 @@ Domain logic and storage.
 - `report/hourly.rs`: This module builds and audits hourly summaries and combines
   clean summaries with live base rows for reports.
 - `verdict.rs`: the machine-scoped `budget.verdict` read.
-- `cache_diagnostics.rs`: harness steps per session and their derived cache verdicts.
+- `broca_step.rs`: insert-once BROCA diagnostic facts and bounded retention.
+- `cache_diagnostics.rs`: harness and BROCA steps per session and their cache verdicts.
 - `capacity.rs`: QTA capacity windows, observations, runtime and freshness.
 - `money.rs`: signed nanodollar arithmetic with one rounding site.
 - `canon.rs`: internal exact-integer canonical JSON and SHA-256 hashing.

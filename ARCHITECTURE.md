@@ -22,12 +22,12 @@ The workspace has three crates:
 
 ## Durable state
 
-`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS` (versions 1 to 27).
+`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS` (versions 1 to 28).
 `initialize_connection` enables and verifies foreign keys, probes SQLite JSON, triggers and
 partial indexes, and sets a 5000 ms busy timeout. The read-only report connection
 skips the table-creating probe and copies that timeout.
 
-The [data model](docs/data-model.md#tables) describes every table in version 27 and its write rules.
+The [data model](docs/data-model.md#tables) describes every table in version 28 and its write rules.
 
 Schema 23 uses local integer `event_key` and `charge_key` references, never served
 IDs. Event digests remain the dedup/served identity; charge digests are retired.
@@ -90,7 +90,8 @@ write, so it needs no lease.
 - **Push.** Peers call `spend.event.ingest`, `spend.correction.ingest` and
   `spend.chargeability.settle`; see [retry rules](docs/money-ingest.md).
 
-Every producer writes `usage_event`, `measurement` and `chargeability_transition`.
+Spend facts write `usage_event`, `measurement` and `chargeability_transition`.
+BROCA model steps write only `broca_step` diagnostics, with a shared cache cursor.
 `fact.rs` mints identity locally; `producer_ref` values stay verbatim as provenance.
 
 BROCA, Claude Code, Codex, OpenCode and Pi set unreadable records aside as

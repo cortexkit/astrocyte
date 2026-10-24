@@ -4,6 +4,8 @@
 # then replayed together. Keep this catalogue for silent, costly failures:
 # ledger durability, exactly-once ingestion, trust boundaries and wire contracts.
 # Ordinary logic belongs in ordinary tests.
+# NON-VACUITY BREAK marks a deliberately broken guard. Its named tests must
+# exercise the changed path and fail, proving that the original guard is tested.
 
 [[control]]
 id = "jsonl-daily-literal-deadline"
@@ -1554,7 +1556,7 @@ id = "broca-unknown-kind-not-session"
 guards = "A BROCA fact with an unknown kind is set aside, never decoded as a session fact"
 file = "crates/astrocyte-module/src/broca_source.rs"
 old = 'Some(kind) => Err(format!("segment of fact {fact_id} has unknown kind {kind}")),'
-new = 'Some(_) => decode_session_segment(export_seq, fact_id, segment), // NON-VACUITY BREAK'
+new = 'Some(_) => decode_session_segment(export_seq, fact_id, segment).map(DecodedFact::Event), // NON-VACUITY BREAK'
 test_file = "crates/astrocyte-module/src/broca_source.rs"
 runner = "cargo"
 package = "astrocyte-module"
@@ -1764,3 +1766,130 @@ expect_red = ["refresher::codex_source::tests::codex_context_window_is_stored_be
 only = true
 timeout_s = 600
 build_timeout_s = 900
+
+[[control]]
+id = "broca-model-step-never-spend"
+guards = "BROCA model_step diagnostics never enter the spend ledger"
+file = "crates/astrocyte-module/src/broca_source.rs"
+old = 'Ok(DecodedFact::ModelStep(wire))'
+new = '''
+            { // NON-VACUITY BREAK: route diagnostics into the spend decoder.
+                if wire.step_id < 0 { return Ok(DecodedFact::ModelStep(wire)); }
+                let mut spend = serde_json::to_value(wire).unwrap();
+                spend["charge_basis"] = Value::from("metered_api");
+                decode_session_segment(export_seq, fact_id, spend).map(DecodedFact::Event)
+            }
+'''
+test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "refresher::broca_source::tests::broca_model_step_golden_records_every_field_without_spend",
+  "refresher::broca_source::tests::broca_model_step_mixed_and_set_aside_rows_keep_progress",
+  "refresher::broca_source::tests::broca_model_step_requires_each_identity_member_and_keeps_absence",
+  "refresher::broca_source::tests::broca_model_step_insert_once_and_update_guards_preserve_rows",
+  "refresher::broca_source::tests::broca_model_step_retention_is_bounded_and_preserves_new_rows",
+  "refresher::broca_source::tests::broca_model_step_cache_ops_match_memory_store_and_shared_cursors",
+  "refresher::broca_source::tests::broca_model_step_backlog_page_reports_time_and_vm_steps",
+  "refresher::broca_source::tests::broca_model_step_cursors_survive_reopen_and_expiry_without_reuse",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "broca-model-step-usage-closed"
+guards = "An unknown model_step usage member is set aside instead of dropped"
+file = "crates/astrocyte-core/src/broca_step.rs"
+old = '#[serde(deny_unknown_fields)]'
+new = '// NON-VACUITY BREAK: accept unknown usage members.'
+test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::broca_source::tests::broca_model_step_mixed_and_set_aside_rows_keep_progress"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "broca-model-step-id-required"
+guards = "A missing model_step step_id is evidence, not an invented step zero"
+file = "crates/astrocyte-core/src/broca_step.rs"
+old = '    pub step_id: i64,'
+new = '''
+    #[serde(default)] // NON-VACUITY BREAK
+    pub step_id: i64,
+'''
+test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "refresher::broca_source::tests::broca_model_step_mixed_and_set_aside_rows_keep_progress",
+  "refresher::broca_source::tests::broca_model_step_requires_each_identity_member_and_keeps_absence",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "broca-model-step-contradiction"
+guards = "A changed model_step re-read is set aside and never overwrites the first row"
+file = "crates/astrocyte-core/src/broca_step.rs"
+old = 'return Ok((!same).then(|| {'
+new = 'return Ok((false && !same).then(|| { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::broca_source::tests::broca_model_step_mixed_and_set_aside_rows_keep_progress"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "broca-step-insert-once"
+guards = "INSERT OR REPLACE cannot replace a BROCA diagnostic by either identity"
+file = "crates/astrocyte-core/src/store.rs"
+old = "SELECT RAISE(ABORT, 'broca_step_insert_once');"
+new = "SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::broca_source::tests::broca_model_step_insert_once_and_update_guards_preserve_rows"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "broca-step-no-update"
+guards = "BROCA diagnostic rows cannot be updated"
+file = "crates/astrocyte-core/src/store.rs"
+old = "SELECT RAISE(ABORT, 'broca_step_no_update');"
+new = "SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::broca_source::tests::broca_model_step_insert_once_and_update_guards_preserve_rows"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "broca-step-retention-bounded"
+guards = "BROCA retention deletes at most 500 expired rows per transaction"
+file = "crates/astrocyte-core/src/broca_step.rs"
+old = 'pub const RETENTION_BATCH: usize = 500;'
+new = 'pub const RETENTION_BATCH: usize = 501; // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::broca_source::tests::broca_model_step_retention_is_bounded_and_preserves_new_rows"]
+only = true
+timeout_s = 300
+build_timeout_s = 600

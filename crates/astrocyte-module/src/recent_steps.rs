@@ -33,16 +33,18 @@ const OUTPUT: usize = 3;
 const REASONING: usize = 4;
 /// Bit of `StepRecord::present` saying `context_limit` was stored.
 const CONTEXT_LIMIT_BIT: u8 = 1 << 5;
+const REQUEST_BODY_BIT: u8 = 1 << 6;
 
 /// One step, compactly: the five token counts, the time and cursor, the
 /// context limit, small ids for provider, model and finish, and the host's
-/// step id. 88 bytes plus the step id's text.
+/// step id and request body length. 96 bytes plus the step id's text.
 #[derive(Clone, Debug)]
 pub(crate) struct StepRecord {
     counts: [u64; 5],
     cursor: i64,
     occurred_at_ms: i64,
     context_limit: i64,
+    request_body_len: u64,
     step_ref: Arc<str>,
     /// Ids into `Names`; 0 is "absent".
     provider: u16,
@@ -66,6 +68,10 @@ impl StepRecord {
             cache_read: self.count(CACHE_READ),
             cache_write: self.count(CACHE_WRITE),
         }
+    }
+
+    fn body_len(&self) -> Option<u64> {
+        (self.present & REQUEST_BODY_BIT != 0).then_some(self.request_body_len)
     }
 }
 
@@ -155,6 +161,17 @@ impl RecentSteps {
     /// still does.
     pub(crate) fn advance(&mut self, conn: &Connection, now_ms: i64) -> rusqlite::Result<()> {
         let late = cache::take_late_step_details(conn)?;
+        let expired: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.sqlite_master WHERE name='broca_step_expired')",
+            [],
+            |row| row.get(0),
+        )?;
+        if expired {
+            conn.execute_batch("DROP TABLE temp.broca_step_expired")?;
+            if self.ready {
+                return self.rebuild(conn, now_ms);
+            }
+        }
         if !self.ready {
             return Ok(());
         }
@@ -284,6 +301,7 @@ impl RecentSteps {
         let mut lead = window.lead;
         for record in window.records.range(..start) {
             lead.advance(&record.step_counts());
+            lead.request_body_len = record.body_len();
         }
         let rows = window
             .records
@@ -314,6 +332,7 @@ impl RecentSteps {
             finish: self.names.name(record.finish),
             context_limit: (record.present & CONTEXT_LIMIT_BIT != 0)
                 .then_some(record.context_limit),
+            request_body_len: record.body_len(),
         }
     }
 
@@ -352,11 +371,15 @@ fn encode(names: &mut Names, row: &StepRow) -> Option<StepRecord> {
     if row.context_limit.is_some() {
         present |= CONTEXT_LIMIT_BIT;
     }
+    if row.request_body_len.is_some() {
+        present |= REQUEST_BODY_BIT;
+    }
     Some(StepRecord {
         counts,
         cursor: row.cursor,
         occurred_at_ms: row.occurred_at_ms,
         context_limit: row.context_limit.unwrap_or(0),
+        request_body_len: row.request_body_len.unwrap_or(0),
         step_ref: Arc::from(row.step_ref.as_str()),
         provider: names.id(row.provider.as_deref())?,
         model: names.id(row.model.as_deref())?,
@@ -383,6 +406,7 @@ fn place(window: &mut Window, names: &mut Names, step: &StepRow) -> Result<(), S
     if window.records.len() > MAX_STEPS_PER_SESSION {
         if let Some(dropped) = window.records.pop_front() {
             window.lead.advance(&dropped.step_counts());
+            window.lead.request_body_len = dropped.body_len();
         }
     }
     Ok(())
@@ -413,8 +437,8 @@ mod tests {
     /// The per-step cost the design budgets for: about 80 bytes plus the
     /// step id's text.
     #[test]
-    fn a_kept_step_is_88_bytes_plus_its_id() {
-        assert_eq!(std::mem::size_of::<StepRecord>(), 88);
+    fn a_kept_step_is_96_bytes_plus_its_id() {
+        assert_eq!(std::mem::size_of::<StepRecord>(), 96);
     }
 
     const NOW: i64 = 10 * cache::RECENT_WINDOW_MS;

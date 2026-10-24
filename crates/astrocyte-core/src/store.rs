@@ -3604,6 +3604,79 @@ END;
 CREATE INDEX usage_event_session_time ON usage_event(session, occurred_at_ms);
 "#,
     },
+    Migration {
+        version: 28,
+        statements: r#"-- BROCA model steps are diagnostics, never additional spend.
+CREATE TABLE broca_step (
+    step_key INTEGER PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    step_id INTEGER NOT NULL,
+    fact_id TEXT NOT NULL UNIQUE,
+    lineage_id TEXT,
+    session_ref TEXT,
+    project_root TEXT NOT NULL,
+    harness TEXT NOT NULL,
+    session TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    variant TEXT,
+    wire_family TEXT,
+    input_tokens INTEGER,
+    cached_input_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    output_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    finish_reason TEXT,
+    attempts INTEGER,
+    retried INTEGER,
+    request_body_len INTEGER,
+    request_body_sha256 TEXT,
+    started_at_ms INTEGER,
+    first_content_at_ms INTEGER,
+    finished_at_ms INTEGER NOT NULL,
+    context_limit INTEGER,
+    cache_policy TEXT,
+    agent_id TEXT,
+    agent_run_id TEXT,
+    recorded_at_ms INTEGER NOT NULL,
+    UNIQUE(run_id, step_id)
+);
+CREATE INDEX broca_step_session_time ON broca_step(session, finished_at_ms);
+CREATE INDEX broca_step_expiry ON broca_step(finished_at_ms);
+CREATE TRIGGER broca_step_no_update BEFORE UPDATE ON broca_step
+BEGIN
+    SELECT RAISE(ABORT, 'broca_step_no_update');
+END;
+-- DELETE is allowed for bounded retention; these diagnostics expire after 30 days.
+-- Refuse replacement by either identity, even with recursive triggers disabled.
+CREATE TRIGGER broca_step_insert_once BEFORE INSERT ON broca_step
+WHEN EXISTS (SELECT 1 FROM broca_step WHERE step_key=NEW.step_key
+    OR fact_id=NEW.fact_id OR (run_id=NEW.run_id AND step_id=NEW.step_id))
+BEGIN
+    SELECT RAISE(ABORT, 'broca_step_insert_once');
+END;
+
+-- One durable commit-order cursor covers ledger events and BROCA diagnostics.
+-- Preserve existing event cursors at upgrade. AUTOINCREMENT prevents reuse after
+-- retention deletes the most recently allocated BROCA cursor.
+CREATE TABLE cache_step_sequence (
+    cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key INTEGER UNIQUE REFERENCES usage_event(event_key),
+    broca_step_key INTEGER UNIQUE REFERENCES broca_step(step_key) ON DELETE CASCADE,
+    CHECK ((event_key IS NULL) != (broca_step_key IS NULL))
+);
+INSERT INTO cache_step_sequence(cursor,event_key)
+    SELECT event_key,event_key FROM usage_event ORDER BY event_key;
+CREATE TRIGGER cache_event_cursor AFTER INSERT ON usage_event
+BEGIN
+    INSERT INTO cache_step_sequence(event_key) VALUES (NEW.event_key);
+END;
+CREATE TRIGGER cache_broca_cursor AFTER INSERT ON broca_step
+BEGIN
+    INSERT INTO cache_step_sequence(broca_step_key) VALUES (NEW.step_key);
+END;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -3667,7 +3740,7 @@ mod tests {
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (27, 27, 27)
+            (28, 28, 28)
         );
         assert_eq!(
             store
@@ -3680,7 +3753,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 27, 27)
+            (0, 28, 28)
         );
         assert!(!second.store_ahead());
         store
@@ -3690,7 +3763,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',28,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',29,1)",
                     [],
                 )?;
                 Ok(())
@@ -3699,7 +3772,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 28, 27)
+            (0, 29, 28)
         );
         assert!(ahead.store_ahead());
     }

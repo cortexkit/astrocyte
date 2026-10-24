@@ -1749,6 +1749,7 @@ mod tests {
                 ordinal: 7,
             };
             Ok(ExportPage {
+                model_steps: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: cursor.clone(),
                 high_water: cursor,

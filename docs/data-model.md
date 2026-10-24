@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 27. A schema change appends a migration; an applied
+currently version 28. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -13,6 +13,8 @@ ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 | `usage_event` | Each row records one usage event per producer reference and lineage, together with its pricing projection. | insert; three projection columns, see below |
 | `measurement` | Each row records one immutable event quantity for a role and unit. | insert only |
 | `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
+| `broca_step` | Each row records one BROCA model step for diagnostics, never spend. | insert once; bounded retention deletes |
+| `cache_step_sequence` | Each row maps a ledger event or BROCA step to a durable shared cache cursor. | insert; expired BROCA mappings cascade away |
 | `chargeability_transition` | Each row records the one terminal settlement of an event's chargeability. | insert only |
 | `quarantine_evidence` | Each row preserves a referring event's quantities that contradict its target. | insert |
 | `rejected_delivery` | Each row preserves a redelivery whose payload differs from the stored event. | insert |
@@ -100,6 +102,29 @@ keep their stop reason in `usage_event.terminal_status`. Schema 27 also adds
 the index `usage_event_session_time` on `(session, occurred_at_ms)` for the
 cache-diagnostics reads. Tests: `step_detail_refuses_update_and_delete`,
 `a_redelivery_adds_missing_step_detail_but_never_changes_it`.
+
+`broca_step` (schema 28) stores BROCA's `model_step` diagnostics separately
+from spend. These facts never create `usage_event`, `measurement` or
+`priced_charge` rows. Each step has a unique `fact_id` and `(run_id, step_id)`.
+The row preserves the session binding, including its host harness, the five
+nullable token counts, provider, model, variant, wire family, finish reason,
+attempts and retry flag, request body length and digest, three reported times,
+context limit, cache-policy JSON, agent identity and recording time. Output
+includes reasoning as sent; cache replies subtract reasoning to match the
+ledger's disjoint roles. Missing counts and times stay null.
+
+`broca_step_no_update` and `broca_step_insert_once` refuse updates and
+replacement by either identity. Exact re-reads do nothing; contradictions
+become set-aside evidence. There is no no-delete trigger because retention
+expires steps older than `BROCA_STEP_RETENTION_MS`, currently 30 days after
+`finished_at_ms`. The refresher deletes at most 500 rows per maintenance
+transaction. A step exactly at the cutoff stays until a later tick.
+
+`cache_step_sequence` supplies one durable commit-order cursor for both
+ledger events and BROCA diagnostics. Migration 28 seeds existing events with
+`cursor = event_key`. Insert triggers allocate later cursors from one
+`AUTOINCREMENT` sequence, and retention cannot reuse deleted cursors. The
+mapping is separate from spend and survives process restarts.
 
 ## Event identity
 

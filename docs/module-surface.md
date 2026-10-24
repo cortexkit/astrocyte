@@ -284,10 +284,12 @@ priced is reported with its unpriced population, not as a smaller number.
 
 ### 4.1 Cache diagnostics
 
-These two operations serve the model steps the harness readers recorded, per
-session, with cache verdicts. A harness is a producer whose events are one
+These two operations serve harness steps and BROCA's diagnostic model steps,
+per session, with cache verdicts. A harness is a producer whose events are one
 model step each: `claude-code`, `codex`, `gemini`, `kimi`, `omp`, `opencode` or
-`pi`. A request that fails to decode is refused `malformed`, as everywhere
+`pi`, plus `broca` for its separate diagnostic facts. BROCA uses the binding's
+session key, as its session spend does; the host harness stays in the stored
+binding. A request that fails to decode is refused `malformed`, as everywhere
 else. A request that decodes is refused with one of these codes:
 
 | Code | Condition |
@@ -303,15 +305,21 @@ steps of that window whose cursor is greater are returned. The reply has
 steps than the window) and `undated_steps` (steps without a time, which are
 not placed on the timeline). Each step has these fields:
 
-- `cursor`, the step's ledger key. Keys grow in commit order, so a late step
-  can have a greater cursor than a step that happened after it.
-- `step_ref`, the harness's own id for the step, and `occurred_at_ms`.
+- `cursor`, the durable shared cache-step cursor. It increases across harness
+  events and BROCA steps, survives restarts and is never reused by retention.
+  A late step can have a greater cursor than a step that happened after it.
+- `step_ref`, the harness's own id for the step (`run_id#step_id` for BROCA),
+  and `occurred_at_ms` (BROCA's required `finished_at_ms`).
 - `input`, `cache_read`, `cache_write`, `output` and `reasoning`, each omitted
   when the reader did not store it. `cache_write` sums every cache lifetime
   Claude Code reports.
 - `provider`, `model`, `finish` and `context_limit`. `finish` comes from
   OpenCode's `finish`, Pi's `stopReason`, or the stored stop reason of Claude
-  Code and Oh My Pi. `context_limit` comes from Codex.
+  Code and Oh My Pi, or BROCA's `finish_reason`. `context_limit` comes from
+  Codex or BROCA.
+- `request_body_len` is present when BROCA reported it. On a prompt drop,
+  `request_size` is present when both adjacent steps report body lengths:
+  `smaller` when the current body is shorter, otherwise `not_smaller`.
 - `prompt`, which is input plus cache read plus cache write.
 - `retention`, `verdict` and `prompt_dropped`.
 
@@ -345,6 +353,10 @@ memory, and any other request is answered from the store. Both build the reply
 the same way. Tests: `drained_pi_steps_are_served_alike_from_memory_and_store`,
 `store_steps_are_the_same_whatever_the_window`,
 `prefix_cache_verdicts_cover_every_band_and_edge`.
+
+The memory window is distinct from storage retention. BROCA diagnostics are
+kept for 30 days after the step finished, with at most 500 expired rows deleted
+per maintenance transaction. Harness ledger steps are kept indefinitely.
 
 `usage.cache.sessions` returns `since_ms` (default: 24 hours ago) and
 `sessions`, the harness sessions with a step at or after `since_ms`, most
