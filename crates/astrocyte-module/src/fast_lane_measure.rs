@@ -93,6 +93,104 @@ fn epoch_ms() -> u128 {
         .as_millis()
 }
 
+/// A quiet multi-reader tree exposes directory traversal costs that a single file hides.
+fn inventory_sources(corpus: &mut super::fast_lane_tests::Corpus) {
+    use serde_json::{json, Value};
+    let inventory = [
+        ("claude", 140, 161),
+        ("pi", 229, 219),
+        ("codex", 45, 41),
+        ("gemini", 25, 27),
+        ("omp", 5, 12),
+        ("kimi", 3, 4),
+    ];
+    fs::remove_file(&corpus.pi_path).unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(600);
+    for (name, files, directories) in inventory {
+        let root = corpus.directory.path().join(name);
+        fs::create_dir_all(&root).unwrap();
+        let base = match name {
+            "codex" => root.join("sessions"),
+            "gemini" => root.join("chats"),
+            "kimi" => root.join("group"),
+            _ => root.clone(),
+        };
+        fs::create_dir_all(&base).unwrap();
+        let extra = usize::from(base != root);
+        let leaves = (0..directories - extra)
+            .map(|index| {
+                let path = base.join(format!("directory-{index:03}"));
+                fs::create_dir(&path).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        for index in 0..files {
+            let mut value = match name {
+                "claude" => {
+                    json!({"type":"user","sessionId":format!("session-{index}"),"message":{"role":"user","content":"synthetic"}})
+                }
+                "codex" => {
+                    json!({"type":"session_meta","payload":{"id":format!("session-{index}"),"cwd":"/synthetic"}})
+                }
+                "gemini" => {
+                    json!({"type":"user","role":"user","sessionId":format!("session-{index}")})
+                }
+                "kimi" => json!({"type":"metadata"}),
+                _ => {
+                    json!({"type":"session","id":format!("session-{index}"),"cwd":"/synthetic","timestamp":"2026-09-21T00:00:00Z"})
+                }
+            };
+            value["padding"] = Value::from("");
+            let target = match index {
+                0 => 1024,
+                1 => 50 * 1024,
+                _ => 1024 + index * 997 % (49 * 1024 + 1),
+            };
+            let empty = value.to_string().len() + 1;
+            value["padding"] = Value::from("x".repeat(target - empty));
+            let text = format!("{value}\n");
+            assert_eq!(text.len(), target);
+            let filename = if name == "kimi" {
+                "wire.jsonl".to_string()
+            } else {
+                format!("session-{index:03}.jsonl")
+            };
+            let path = leaves[index % leaves.len()].join(filename);
+            fs::write(&path, text).unwrap();
+            fs::File::open(path).unwrap().set_modified(old).unwrap();
+        }
+        let mut found_files = 0;
+        let mut found_dirs = 0;
+        let mut pending = vec![root];
+        while let Some(path) = pending.pop() {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    found_dirs += 1;
+                    pending.push(entry.path());
+                } else {
+                    found_files += 1;
+                    let metadata = entry.metadata().unwrap();
+                    assert!((1024..=50 * 1024).contains(&metadata.len()));
+                    assert!(metadata.modified().unwrap() <= old);
+                }
+            }
+        }
+        assert_eq!((found_files, found_dirs), (files, directories));
+        println!("INVENTORY reader={name} files={found_files} descendant_dirs={found_dirs} mtime_age_seconds=600 bytes_min=1024 bytes_max=51200");
+    }
+    let root = corpus.directory.path();
+    corpus.files.claude_code = Some(Arc::new(claude_code_source::ClaudeCodeSource::at(
+        root.join("claude"),
+    )));
+    corpus.files.codex = Some(Arc::new(codex_source::CodexSource::at(root.join("codex"))));
+    corpus.files.harnesses = vec![
+        Arc::new(gemini_source::GeminiSource::at(root.join("gemini"))),
+        Arc::new(omp_source::OmpSource::at(root.join("omp"))),
+        Arc::new(kimi_source::KimiSource::at(root.join("kimi"))),
+    ];
+}
+
 const WRITER: &str = r#"
 import json, sqlite3, sys, time
 db, path, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -119,16 +217,39 @@ con.close()
 #[ignore = "five-minute CPU/I/O measurement; run alone under strace, once per scenario"]
 fn measure_fast_lane_five_minutes() {
     let scenario = std::env::var("ASTROCYTE_MEASURE_SCENARIO")
-        .expect("idle-full, idle-fast, active-full or active-fast");
-    assert!(["idle-full", "idle-fast", "active-full", "active-fast"].contains(&scenario.as_str()));
-    let corpus = super::fast_lane_tests::Corpus::new();
+        .expect("set ASTROCYTE_MEASURE_SCENARIO to an idle, active or inventory scenario");
+    assert!([
+        "idle-full",
+        "idle-fast",
+        "active-full",
+        "active-fast",
+        "inventory-idle-full",
+        "inventory-idle-fast"
+    ]
+    .contains(&scenario.as_str()));
+    let mut corpus = super::fast_lane_tests::Corpus::new();
+    let inventory = scenario.starts_with("inventory-");
+    if inventory {
+        inventory_sources(&mut corpus);
+    }
     let state = Arc::new(crate::state::leased_test_state(&corpus.directory));
     state.set_recent_steps_now_for_test(1_790_000_100_000);
     for index in 1..=1000 {
         corpus.append_opencode(index);
-        corpus.append_pi(index);
+        if !inventory {
+            corpus.append_pi(index);
+        }
     }
-    corpus.full(&state, 1_790_000_100_000);
+    run_tick(
+        &state,
+        &corpus.producers,
+        &corpus.files,
+        None,
+        &mut None,
+        &mut PricingWalk::new(PricingBudget::PER_TICK),
+        &mut QueueReconciler::new(QUEUE_RECONCILE_CHUNK, QUEUE_RECONCILE_TICK_BUDGET),
+        &corpus.stop,
+    );
     FAST_ENABLED.store(scenario.ends_with("fast"), Ordering::Relaxed);
     let stop = corpus.stop.clone();
     let loop_state = state.clone();
