@@ -13,8 +13,8 @@ use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::{EventRecordRequest, RecordDisposition, StepDetail};
 use astrocyte_readers::file_identity::{file_identity, same_identity};
 use astrocyte_readers::sessions::opencode::{
-    read_opencode_page, read_opencode_tail, OpenCodeCursor, OpenCodeMessage, OpenCodeReadError,
-    OpenCodeScanCost, OpenCodeTailPage, OpenCodeTailRequest, OpenCodeTotals,
+    read_opencode_page, OpenCodeCursor, OpenCodeMessage, OpenCodeReadError, OpenCodeScanCost,
+    OpenCodeTailPage, OpenCodeTailReader, OpenCodeTailRequest, OpenCodeTotals,
 };
 use rusqlite::params;
 
@@ -120,6 +120,7 @@ impl FileSignature {
 /// full pass from the durable cursor, which does not depend on any of this.
 #[derive(Debug, Default)]
 struct OpenCodeCache {
+    reader: Option<OpenCodeTailReader>,
     /// File identity and size at the last completed drain.
     signature: Option<FileSignature>,
     /// The front-row fingerprint read in the last full pass's snapshot.
@@ -192,6 +193,7 @@ impl OpenCodeCache {
         if replaced || self.front_row_id.as_ref() != Some(&front_row_id) {
             // The tail's rowids referred to the store that was there before.
             self.forget_tail();
+            self.reader = None;
         }
         self.front_row_id = Some(front_row_id);
         self.full_backlog = consumed_ordinal < high_water_ordinal;
@@ -380,6 +382,24 @@ impl OpenCodeSource {
         stop: &AtomicBool,
         mode: DrainMode,
     ) -> Result<OpenCodeDrainOutcome, SourceDrainError> {
+        let result = self.drain_inner(state, recorded_at_ms, page_limit, stop, mode);
+        if result.is_err() {
+            self.cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .reader = None;
+        }
+        result
+    }
+
+    fn drain_inner(
+        &self,
+        state: &SharedState,
+        recorded_at_ms: i64,
+        page_limit: usize,
+        stop: &AtomicBool,
+        mode: DrainMode,
+    ) -> Result<OpenCodeDrainOutcome, SourceDrainError> {
         let root = match &self.root {
             OpenCodeRoot::Path(root) => root,
             OpenCodeRoot::Unresolved(reason) => {
@@ -388,57 +408,63 @@ impl OpenCodeSource {
             }
         };
 
-        let database = match fs::File::open(root) {
-            Ok(database) => {
-                crate::refresher::harness_drain::record_source_discovery(
-                    state,
-                    OPENCODE_SOURCE_KEY,
-                    root.display(),
-                    true,
-                );
-                mode.ensure_runtime(state, OPENCODE_SOURCE_KEY)?;
-                database
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                crate::refresher::harness_drain::record_source_discovery(
-                    state,
-                    OPENCODE_SOURCE_KEY,
-                    root.display(),
-                    false,
-                );
-                mode.remove_runtime(state, OPENCODE_SOURCE_KEY)?;
-                return Ok(OpenCodeDrainOutcome {
-                    root_absent: true,
-                    ..OpenCodeDrainOutcome::default()
-                });
-            }
-            Err(error) => {
-                mode.ensure_runtime(state, OPENCODE_SOURCE_KEY)?;
-                return Err(
-                    format!("inspect OpenCode database {}: {error}", root.display()).into(),
-                );
-            }
-        };
-        let metadata = database.metadata().map_err(|error| {
-            SourceDrainError::from(format!(
-                "inspect OpenCode database {}: {error}",
-                root.display()
-            ))
-        })?;
-        let signature = FileSignature::capture(&database, &metadata);
-
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !mode.is_full()
-            && (cache.front_row_id.is_none()
-                || cache
-                    .signature
-                    .is_some_and(|previous| signature.replaces(&previous)))
-        {
+        let signature = if mode.is_full() {
+            let database = match astrocyte_readers::read_io::open(root) {
+                Ok(database) => {
+                    crate::refresher::harness_drain::record_source_discovery(
+                        state,
+                        OPENCODE_SOURCE_KEY,
+                        root.display(),
+                        true,
+                    );
+                    mode.ensure_runtime(state, OPENCODE_SOURCE_KEY)?;
+                    database
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    cache.reader = None;
+                    crate::refresher::harness_drain::record_source_discovery(
+                        state,
+                        OPENCODE_SOURCE_KEY,
+                        root.display(),
+                        false,
+                    );
+                    mode.remove_runtime(state, OPENCODE_SOURCE_KEY)?;
+                    return Ok(OpenCodeDrainOutcome {
+                        root_absent: true,
+                        ..OpenCodeDrainOutcome::default()
+                    });
+                }
+                Err(error) => {
+                    cache.reader = None;
+                    mode.ensure_runtime(state, OPENCODE_SOURCE_KEY)?;
+                    return Err(
+                        format!("inspect OpenCode database {}: {error}", root.display()).into(),
+                    );
+                }
+            };
+            let metadata = database.metadata().map_err(|error| {
+                SourceDrainError::from(format!(
+                    "inspect OpenCode database {}: {error}",
+                    root.display()
+                ))
+            })?;
+            let signature = FileSignature::capture(&database, &metadata);
+            if cache
+                .signature
+                .is_some_and(|previous| signature.replaces(&previous))
+            {
+                cache.reader = None;
+            }
+            signature
+        } else if let Some(signature) = cache.signature.filter(|_| cache.front_row_id.is_some()) {
+            signature
+        } else {
             return Ok(OpenCodeDrainOutcome::default());
-        }
+        };
         if mode.is_full()
             && cache.choose(&signature, recorded_at_ms, &self.cadence) == OpenCodePass::Full
         {
@@ -460,7 +486,21 @@ impl OpenCodeSource {
             open_rowids: &reread,
             limit: page_limit,
         };
-        let mut page = read_opencode_tail(root, &request, stop).map_err(read_error)?;
+        if cache.reader.is_none() {
+            cache.reader = Some(OpenCodeTailReader::open(root).map_err(read_error)?);
+        }
+        let read = cache
+            .reader
+            .as_ref()
+            .expect("opened tail reader")
+            .read(root, &request, stop);
+        let mut page = match read {
+            Ok(page) => page,
+            Err(error) => {
+                cache.reader = None;
+                return Err(read_error(error));
+            }
+        };
         // A known-empty store can acquire its first row between full ticks. There
         // is no old rowid identity to contradict when the tail starts at zero.
         if !mode.is_full() && cache.front_row_id == Some(None) && page.start_rowid == 0 {
@@ -471,6 +511,7 @@ impl OpenCodeSource {
             // to another store. The full pass in this same tick works out the
             // lineage again and reads from the durable cursor.
             cache.forget_tail();
+            cache.reader = None;
             if !mode.is_full() {
                 return Ok(OpenCodeDrainOutcome {
                     cost: page.cost,

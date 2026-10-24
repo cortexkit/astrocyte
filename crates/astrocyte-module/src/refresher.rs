@@ -91,6 +91,10 @@ pub struct SetAsideRecord {
 pub trait SourceClient: Send + Sync {
     fn pull(&self, since: Option<SourceCursor>, limit: u32) -> Result<ExportPage, PullError>;
 
+    fn pull_fast(&self, since: Option<SourceCursor>, limit: u32) -> Result<ExportPage, PullError> {
+        self.pull(since, limit)
+    }
+
     /// The resolved store path, if known, used when logging whether the store is
     /// present or absent.
     fn resolved_path(&self) -> Option<PathBuf> {
@@ -300,7 +304,6 @@ pub(crate) mod harness_drain {
             .unwrap()
     }
     use std::collections::HashMap;
-    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
 
@@ -345,6 +348,24 @@ pub(crate) mod harness_drain {
     }
 
     impl DrainMode {
+        pub(crate) fn files(
+            self,
+            windows: &std::collections::HashMap<PathBuf, WindowSchedule>,
+            now: i64,
+            walk: impl FnOnce() -> std::io::Result<Vec<PathBuf>>,
+        ) -> std::io::Result<Vec<PathBuf>> {
+            if self.is_full() {
+                walk()
+            } else {
+                let mut files: Vec<_> = windows
+                    .iter()
+                    .filter(|(_, window)| window.hot(now))
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                files.sort();
+                Ok(files)
+            }
+        }
         pub(crate) fn write<T>(
             self,
             state: &SharedState,
@@ -504,7 +525,7 @@ pub(crate) mod harness_drain {
             map: &dyn Fn(PathBuf, usize) -> T,
             files: &mut Vec<T>,
         ) -> std::io::Result<()> {
-            for entry in fs::read_dir(path)? {
+            for entry in astrocyte_readers::read_io::read_dir(path)? {
                 let entry = entry?;
                 let file_type = entry.file_type()?;
                 let path = entry.path();
@@ -552,7 +573,10 @@ pub(crate) mod harness_drain {
                 return Err(reason.clone());
             }
         };
-        match fs::metadata(path) {
+        if !mode.is_full() {
+            return Ok(Some(path));
+        }
+        match astrocyte_readers::read_io::metadata(path) {
             Ok(_) => {
                 record_source_discovery(state, key, path.display(), true);
                 mode.ensure_runtime(state, key)?;
@@ -909,8 +933,6 @@ pub(crate) mod harness_drain {
                 ..JsonlDrainOutcome::default()
             });
         };
-        let files = files_below(root, keep)
-            .map_err(|error| format!("read {root_label} root {}: {error}", root.display()))?;
         let (mut previous_points, previous_verified, previous_windows) = {
             let mut previous = cache
                 .lock()
@@ -921,6 +943,11 @@ pub(crate) mod harness_drain {
                 previous.windows.clone(),
             )
         };
+        let files = mode
+            .files(&previous_windows, recorded_at_ms, || {
+                files_below(root, keep)
+            })
+            .map_err(|error| format!("read {root_label} root {}: {error}", root.display()))?;
         let mut outcome = JsonlDrainOutcome::default();
         let mut next = ResumeCache::default();
         let mut requests = Vec::new();
@@ -928,7 +955,7 @@ pub(crate) mod harness_drain {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            let stat = FileStat::read(&path)
+            let stat = FileStat::read_in_lane(&path, mode)
                 .map_err(|error| format!("stat {label} session {}: {error}", path.display()))?;
             if !mode.is_full() && !stat.fast_changed(previous_windows.get(&path), recorded_at_ms) {
                 if let Some(point) = previous_points.remove(&path) {
@@ -988,6 +1015,15 @@ pub(crate) mod harness_drain {
             }
             for call in parsed.calls {
                 requests.push(map(call)?);
+            }
+        }
+        if !mode.is_full() {
+            next.resume.extend(previous_points);
+            for (path, window) in previous_windows {
+                next.windows.entry(path).or_insert(window);
+            }
+            for (path, verified) in previous_verified {
+                next.prefix_verified_ms.entry(path).or_insert(verified);
             }
         }
         let tally = record_requests_in_lane(
@@ -1062,7 +1098,12 @@ fn drain_once_in_lane(
         .resolved_path()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "<unavailable: source did not provide a resolved path>".into());
-    let page = match source.pull(current.clone(), limit) {
+    let read = if mode.is_full() {
+        source.pull(current.clone(), limit)
+    } else {
+        source.pull_fast(current.clone(), limit)
+    };
+    let page = match read {
         Err(PullError::SourceAbsent) => {
             harness_drain::record_source_discovery(state, source_key, &discovery_path, false);
             mode.remove_runtime(state, source_key)

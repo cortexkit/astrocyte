@@ -41,7 +41,7 @@ pub struct OpenCodeScanCost {
 
 impl OpenCodeScanCost {
     pub(super) fn add_statement(&mut self, statement: &Statement<'_>) {
-        let read = |status| u64::try_from(statement.get_status(status)).unwrap_or(0);
+        let read = |status| u64::try_from(statement.reset_status(status)).unwrap_or(0);
         self.vm_steps = self.vm_steps.saturating_add(read(StatementStatus::VmStep));
         self.fullscan_steps = self
             .fullscan_steps
@@ -62,7 +62,7 @@ pub(super) fn counted_query_row<T, P: rusqlite::Params>(
     params: P,
     map: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
 ) -> rusqlite::Result<T> {
-    let mut statement = connection.prepare(sql)?;
+    let mut statement = crate::read_io::prepare_cached(connection, sql)?;
     let result = statement.query_row(params, map);
     cost.add_statement(&statement);
     result
@@ -309,9 +309,40 @@ pub(super) fn read_tail(
     if request.limit == 0 {
         return Err("OpenCode tail limit must be positive".to_string().into());
     }
-    with_read_snapshot(db_path, stop, |connection| {
-        read_tail_snapshot(connection, request, stop)
-    })
+    OpenCodeTailReader::open(db_path)?.read(db_path, request, stop)
+}
+
+/// A read-only tail connection. Each read ends its snapshot before returning,
+/// leaving the producer free to checkpoint its WAL between reads.
+#[derive(Debug)]
+pub struct OpenCodeTailReader {
+    connection: Connection,
+}
+
+impl OpenCodeTailReader {
+    pub fn open(db_path: &Path) -> Result<Self, OpenCodeReadError> {
+        Ok(Self {
+            connection: super::sqlite_read::open_read_connection(
+                readonly_uri(db_path)?,
+                db_path,
+                "OpenCode",
+            )?,
+        })
+    }
+
+    pub fn read(
+        &self,
+        db_path: &Path,
+        request: &OpenCodeTailRequest<'_>,
+        stop: &AtomicBool,
+    ) -> Result<OpenCodeTailPage, OpenCodeReadError> {
+        if request.limit == 0 {
+            return Err("OpenCode tail limit must be positive".to_string().into());
+        }
+        in_read_snapshot(&self.connection, db_path, stop, |connection| {
+            read_tail_snapshot(connection, request, stop)
+        })
+    }
 }
 
 /// Open `db_path` read-only, run `read` inside one read transaction, and make
@@ -326,7 +357,21 @@ pub(super) fn with_read_snapshot<T>(
     }
 
     let connection =
-        super::sqlite_read::open_read_snapshot(readonly_uri(db_path)?, db_path, "OpenCode")?;
+        super::sqlite_read::open_read_connection(readonly_uri(db_path)?, db_path, "OpenCode")?;
+    in_read_snapshot(&connection, db_path, stop, read)
+}
+
+fn in_read_snapshot<T>(
+    connection: &Connection,
+    db_path: &Path,
+    stop: &AtomicBool,
+    read: impl FnOnce(&Connection) -> Result<T, OpenCodeReadError>,
+) -> Result<T, OpenCodeReadError> {
+    if stop.load(Ordering::Relaxed) {
+        return Err(OpenCodeReadError::Stopped);
+    }
+    crate::read_io::execute(connection, "BEGIN DEFERRED")
+        .map_err(|error| sqlite_error(stop, "begin OpenCode read snapshot", error))?;
 
     // A single statement of the full page read can run for minutes on a large
     // store: the page query has no usable index, so SQLite finishes the whole
@@ -350,11 +395,14 @@ pub(super) fn with_read_snapshot<T>(
                 }
             }
         });
-        let result = read(&connection);
+        let result = read(connection);
         drop(read_done);
         result
     });
-    let finish = connection.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" });
+    let finish = crate::read_io::execute(
+        connection,
+        if result.is_ok() { "COMMIT" } else { "ROLLBACK" },
+    );
     match (result, finish) {
         (Ok(page), Ok(())) => Ok(page),
         (Err(error), _) => Err(error),
@@ -656,15 +704,17 @@ fn read_tail_snapshot(
         cost: OpenCodeScanCost::default(),
     };
 
-    let mut new_rows = connection
-        .prepare(&format!(
+    let mut new_rows = crate::read_io::prepare_cached(
+        connection,
+        &format!(
             "{columns}
              WHERE rowid>?1 AND rowid<=?2 AND {}
              ORDER BY rowid
              LIMIT ?3",
             eligible_row(false)
-        ))
-        .map_err(|error| sqlite_error(stop, "prepare OpenCode tail scan", error))?;
+        ),
+    )
+    .map_err(|error| sqlite_error(stop, "prepare OpenCode tail scan", error))?;
     let mut rows = new_rows
         .query(params![start_rowid, max_rowid, limit])
         .map_err(|error| sqlite_error(stop, "query OpenCode tail scan", error))?;
@@ -682,29 +732,34 @@ fn read_tail_snapshot(
     drop(rows);
     cost.add_statement(&new_rows);
 
-    let mut lookup = connection
-        .prepare(&format!(
-            "{columns} WHERE rowid=?1 AND {}",
-            eligible_row(false)
-        ))
-        .map_err(|error| sqlite_error(stop, "prepare OpenCode open-row lookup", error))?;
-    // Rows above the start were already examined by the range scan above.
-    for &rowid in request
+    if request
         .open_rowids
         .iter()
-        .filter(|&&rowid| rowid <= start_rowid)
+        .any(|rowid| *rowid <= start_rowid)
     {
-        let mut rows = lookup
-            .query([rowid])
-            .map_err(|error| sqlite_error(stop, "query OpenCode open row", error))?;
-        if let Some(row) = rows
-            .next()
-            .map_err(|error| sqlite_error(stop, "step OpenCode open row", error))?
+        let mut lookup = crate::read_io::prepare_cached(
+            connection,
+            &format!("{columns} WHERE rowid=?1 AND {}", eligible_row(false)),
+        )
+        .map_err(|error| sqlite_error(stop, "prepare OpenCode open-row lookup", error))?;
+        // Rows above the start were already examined by the range scan above.
+        for &rowid in request
+            .open_rowids
+            .iter()
+            .filter(|&&rowid| rowid <= start_rowid)
         {
-            take_tail_row(row, &mut page, stop)?;
+            let mut rows = lookup
+                .query([rowid])
+                .map_err(|error| sqlite_error(stop, "query OpenCode open row", error))?;
+            if let Some(row) = rows
+                .next()
+                .map_err(|error| sqlite_error(stop, "step OpenCode open row", error))?
+            {
+                take_tail_row(row, &mut page, stop)?;
+            }
         }
+        cost.add_statement(&lookup);
     }
-    cost.add_statement(&lookup);
     page.cost = cost;
     Ok(page)
 }

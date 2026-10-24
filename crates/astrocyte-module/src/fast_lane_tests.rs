@@ -120,9 +120,14 @@ impl Corpus {
             &self.producers,
             self.files.opencode.as_deref(),
             self.files.pi.as_deref(),
-            None,
-            None,
-            &[],
+            self.files.claude_code.as_deref(),
+            self.files.codex.as_deref(),
+            &self
+                .files
+                .harnesses
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
             None,
             true,
             &mut PricingWalk::new(PricingBudget::PER_TICK),
@@ -248,6 +253,182 @@ fn idle_fast_lane_commits_nothing_and_keeps_full_drain_health() {
     assert_eq!(rows(&state, "usage_event"), events);
 }
 
+fn add_jsonl_inventory(corpus: &mut Corpus) -> usize {
+    let root = corpus.directory.path();
+    for (directory, file) in [
+        ("claude/project", "session.jsonl"),
+        ("codex/sessions/day", "rollout.jsonl"),
+        ("gemini/chats", "session.jsonl"),
+        ("omp/project", "session.jsonl"),
+        ("kimi/group/session", "wire.jsonl"),
+        (
+            "cortexkit/thalamus-harness/claude-workers/worker/projects/project",
+            "session.jsonl",
+        ),
+    ] {
+        let directory = root.join(directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(file), "{}\n").unwrap();
+    }
+    fs::write(root.join("cortexkit/thalamus-harness/claude-workers/roots.json"), json!({
+        "version":1, "roots":[{"worker_id":"w-00000000000000000000000000000001", "path": root.join("cortexkit/thalamus-harness/claude-workers/worker"),
+            "work_class":"subagent", "state":"active"}]
+    }).to_string()).unwrap();
+    corpus.files.claude_code = Some(Arc::new(claude_code_source::ClaudeCodeSource::at(
+        root.join("claude"),
+    )));
+    corpus.files.codex = Some(Arc::new(codex_source::CodexSource::at(root.join("codex"))));
+    corpus.files.harnesses = vec![
+        Arc::new(gemini_source::GeminiSource::at(root.join("gemini"))),
+        Arc::new(omp_source::OmpSource::at(root.join("omp"))),
+        Arc::new(kimi_source::KimiSource::at(root.join("kimi"))),
+        Arc::new(claude_workers_source::ClaudeWorkersSource::from_data_home(
+            root.into(),
+        )),
+    ];
+    7
+}
+
+#[test]
+fn idle_fast_cycle_opens_nothing_and_stats_only_hot_files() {
+    use astrocyte_readers::read_io;
+    let mut corpus = Corpus::new();
+    let hot_files = add_jsonl_inventory(&mut corpus);
+    corpus.append(1);
+    let state = test_state();
+    let at = current_time_ms();
+    corpus.full(&state, at);
+    run_fast_lane(&state, &corpus.producers, &corpus.files, at, &corpus.stop);
+    let health = runtime(&state);
+    let events = rows(&state, "usage_event");
+    for _ in 0..3 {
+        read_io::reset_counts();
+        run_fast_lane(
+            &state,
+            &corpus.producers,
+            &corpus.files,
+            at + 2000,
+            &corpus.stop,
+        );
+        let counts = read_io::counts();
+        assert_eq!(counts.connection_opens, 0, "{counts:?}");
+        assert_eq!(counts.directory_reads, 0, "{counts:?}");
+        assert_eq!(counts.file_opens, 0, "{counts:?}");
+        assert_eq!(
+            counts.metadata_calls, hot_files,
+            "each hot file is statted once: {counts:?}"
+        );
+    }
+    assert_eq!(runtime(&state), health);
+    assert_eq!(rows(&state, "usage_event"), events);
+}
+
+#[test]
+fn new_opencode_row_reuses_prepared_statements() {
+    use astrocyte_readers::read_io;
+    let corpus = Corpus::new();
+    corpus.append(1);
+    let state = test_state();
+    corpus.full(&state, NOW);
+    run_fast_lane(&state, &corpus.producers, &corpus.files, NOW, &corpus.stop);
+    corpus.append_opencode(2);
+    read_io::reset_counts();
+    run_fast_lane(
+        &state,
+        &corpus.producers,
+        &corpus.files,
+        NOW + 2000,
+        &corpus.stop,
+    );
+    let counts = read_io::counts();
+    assert_eq!(counts.connection_opens, 0, "{counts:?}");
+    assert_eq!(counts.statement_prepares, 0, "{counts:?}");
+    assert_eq!(rows(&state, "usage_event").len(), 3);
+    assert_eq!(rows(&state, "step_detail").len(), 3);
+    for connection in [&corpus.opencode, &corpus.broca] {
+        let (busy, _, _): (i64, i64, i64) = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0, "a cached reader must not retain a read snapshot");
+    }
+}
+
+#[test]
+fn hot_files_expire_but_growth_keeps_them_hot_and_new_files_wait_for_full_tick() {
+    use astrocyte_readers::read_io;
+    let corpus = Corpus::new();
+    corpus.append(1);
+    let at = current_time_ms();
+    let old = std::time::SystemTime::now() - Duration::from_secs(600);
+    fs::File::open(&corpus.pi_path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let state = test_state();
+    corpus.full(&state, at);
+    corpus
+        .files
+        .pi
+        .as_ref()
+        .unwrap()
+        .drain(&state, at, &corpus.stop)
+        .unwrap();
+    run_fast_lane(&state, &corpus.producers, &corpus.files, at, &corpus.stop);
+    read_io::reset_counts();
+    run_fast_lane(
+        &state,
+        &corpus.producers,
+        &corpus.files,
+        at + 300_001,
+        &corpus.stop,
+    );
+    assert_eq!(
+        read_io::counts().metadata_calls,
+        0,
+        "an old discovered file eventually leaves the hot set"
+    );
+    corpus.full(&state, at);
+    corpus.append_pi(2);
+    run_fast_lane(
+        &state,
+        &corpus.producers,
+        &corpus.files,
+        at + 2000,
+        &corpus.stop,
+    );
+    read_io::reset_counts();
+    run_fast_lane(
+        &state,
+        &corpus.producers,
+        &corpus.files,
+        at + 4000,
+        &corpus.stop,
+    );
+    assert_eq!(read_io::counts().metadata_calls, 1);
+    assert_eq!(rows(&state, "usage_event").len(), 3);
+    corpus.append_pi(3);
+    let bytes = fs::read_to_string(&corpus.pi_path)
+        .unwrap()
+        .replace("response-3", "new-session-response");
+    fs::write(corpus.pi_path.parent().unwrap().join("new.jsonl"), bytes).unwrap();
+    run_fast_lane(
+        &state,
+        &corpus.producers,
+        &corpus.files,
+        at + 6000,
+        &corpus.stop,
+    );
+    assert_eq!(
+        rows(&state, "usage_event").len(),
+        4,
+        "the existing file grows but the new session waits"
+    );
+    corpus.full(&state, at + 30_000);
+    assert_eq!(rows(&state, "usage_event").len(), 5);
+}
+
 #[test]
 fn fast_lane_event_bytes_match_full_drain() {
     let corpus = Corpus::new();
@@ -332,6 +513,13 @@ fn fast_lane_never_runs_due_full_passes_or_full_only_sources() {
     corpus
         .files
         .opencode
+        .as_ref()
+        .unwrap()
+        .drain(&state, NOW, &corpus.stop)
+        .unwrap();
+    corpus
+        .files
+        .pi
         .as_ref()
         .unwrap()
         .drain(&state, NOW, &corpus.stop)

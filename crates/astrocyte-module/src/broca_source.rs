@@ -23,13 +23,16 @@
 //! Every read is one snapshot, so `export_meta` and the rows read with it
 //! agree.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use astrocyte_core::ingest::EventRecordRequest;
-use rusqlite::{Connection, ErrorCode, OpenFlags};
+use astrocyte_readers::{
+    file_identity::{file_identity, same_identity},
+    read_io,
+};
+use rusqlite::{Connection, ErrorCode};
 use serde_json::Value;
 
 use super::{interrupt_on_stop, ExportPage, PullError, SourceClient, SourceCursor};
@@ -66,8 +69,15 @@ enum BrocaRoot {
 /// the cursor is refused by [`refuse_broca_regression`].
 pub(crate) struct BrocaSource {
     root: BrocaRoot,
+    cache: Mutex<BrocaCache>,
     /// Set on shutdown. A read in progress is interrupted inside SQLite.
     stop: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct BrocaCache {
+    connection: Option<Connection>,
+    signature: Option<(Option<(u64, u64)>, u64)>,
 }
 
 impl BrocaSource {
@@ -97,7 +107,11 @@ impl BrocaSource {
                 "the data home resolved to the relative {data_home:?}; refusing to resolve BROCA's run-index.db"
             ))
         };
-        Self { root, stop }
+        Self {
+            root,
+            stop,
+            cache: Mutex::new(BrocaCache::default()),
+        }
     }
 
     #[cfg(test)]
@@ -105,36 +119,82 @@ impl BrocaSource {
         Self {
             root: BrocaRoot::Path(path.into()),
             stop,
+            cache: Mutex::new(BrocaCache::default()),
         }
     }
-}
-
-impl SourceClient for BrocaSource {
-    /// `PullError::SourceAbsent` when no store exists (BROCA is not
-    /// installed), `PullError::Stopped` when shutdown interrupted the read,
-    /// and `PullError::Unavailable` when a store exists but cannot be read.
-    fn pull(&self, since: Option<SourceCursor>, limit: u32) -> Result<ExportPage, PullError> {
+    fn pull_in_lane(
+        &self,
+        since: Option<SourceCursor>,
+        limit: u32,
+        full: bool,
+    ) -> Result<ExportPage, PullError> {
         let path = match &self.root {
             BrocaRoot::Path(path) => path,
             BrocaRoot::Unresolved(reason) => return Err(PullError::Unavailable(reason.clone())),
         };
-        match fs::metadata(path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(PullError::SourceAbsent)
+        let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        if full {
+            let file = match read_io::open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    cache.connection = None;
+                    return Err(PullError::SourceAbsent);
+                }
+                Err(error) => {
+                    cache.connection = None;
+                    return Err(PullError::Unavailable(format!(
+                        "inspect BROCA store {}: {error}",
+                        path.display()
+                    )));
+                }
+            };
+            let metadata = astrocyte_readers::read_io::file_metadata(&file).map_err(|error| {
+                cache.connection = None;
+                PullError::Unavailable(error.to_string())
+            })?;
+            let signature = (file_identity(&file, &metadata), metadata.len());
+            if cache.signature.is_some_and(|previous| {
+                !same_identity(signature.0, previous.0) || signature.1 < previous.1
+            }) {
+                cache.connection = None;
             }
-            Err(error) => {
-                return Err(PullError::Unavailable(format!(
-                    "inspect BROCA store {}: {error}",
-                    path.display()
-                )))
-            }
+            cache.signature = Some(signature);
         }
         if self.stop.load(Ordering::Relaxed) {
+            cache.connection = None;
             return Err(PullError::Stopped);
         }
-        let snapshot = read_snapshot(path, since.as_ref(), limit, &self.stop)?;
-        page_from_snapshot(snapshot, path)
+        let result = (|| {
+            if cache.connection.is_none() {
+                let connection = read_io::connect(&readonly_uri(path)?)
+                    .map_err(|error| sqlite_error(&self.stop, "open BROCA store", error))?;
+                read_io::execute(&connection, "PRAGMA query_only=ON")
+                    .map_err(|error| sqlite_error(&self.stop, "configure BROCA reader", error))?;
+                cache.connection = Some(connection);
+            }
+            let snapshot = read_snapshot(
+                cache.connection.as_ref().expect("opened BROCA reader"),
+                path,
+                since.as_ref(),
+                limit,
+                &self.stop,
+            )?;
+            page_from_snapshot(snapshot, path)
+        })();
+        if result.is_err() {
+            cache.connection = None;
+        }
+        result
+    }
+}
+
+impl SourceClient for BrocaSource {
+    fn pull(&self, since: Option<SourceCursor>, limit: u32) -> Result<ExportPage, PullError> {
+        self.pull_in_lane(since, limit, true)
+    }
+
+    fn pull_fast(&self, since: Option<SourceCursor>, limit: u32) -> Result<ExportPage, PullError> {
+        self.pull_in_lane(since, limit, false)
     }
 
     fn resolved_path(&self) -> Option<PathBuf> {
@@ -241,22 +301,18 @@ fn sqlite_error(stop: &AtomicBool, context: &str, error: rusqlite::Error) -> Pul
 }
 
 fn read_snapshot(
+    connection: &Connection,
     path: &Path,
     since: Option<&SourceCursor>,
     limit: u32,
     stop: &AtomicBool,
 ) -> Result<Snapshot, PullError> {
     let context = format!("read BROCA store {}", path.display());
-    let connection = Connection::open_with_flags(
-        readonly_uri(path)?,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|error| sqlite_error(stop, &context, error))?;
-    connection
-        .execute_batch("PRAGMA query_only=ON; BEGIN DEFERRED")
+    read_io::execute(connection, "BEGIN DEFERRED")
         .map_err(|error| sqlite_error(stop, &context, error))?;
-    let read = interrupt_on_stop(&connection, stop, || {
-        let mut meta = connection.prepare(
+    let read = interrupt_on_stop(connection, stop, || {
+        let mut meta = read_io::prepare_cached(
+            connection,
             "SELECT source_instance_id,source_epoch,high_water FROM export_meta WHERE id=1",
         )?;
         let (source_instance_id, source_epoch, high_water) = meta.query_row([], |row| {
@@ -270,7 +326,8 @@ fn read_snapshot(
         let start = since
             .filter(|cursor| cursor.lineage == lineage)
             .map_or(0, |cursor| cursor.ordinal);
-        let mut statement = connection.prepare(
+        let mut statement = read_io::prepare_cached(
+            connection,
             "SELECT export_seq,fact_id,segment_json FROM export_facts
              WHERE export_seq > ?1 ORDER BY export_seq LIMIT ?2",
         )?;
@@ -286,14 +343,14 @@ fn read_snapshot(
         #[cfg(all(test, target_os = "linux"))]
         super::fast_lane_measure::note_vm_steps(
             u64::try_from(
-                meta.get_status(rusqlite::StatementStatus::VmStep)
-                    + statement.get_status(rusqlite::StatementStatus::VmStep),
+                meta.reset_status(rusqlite::StatementStatus::VmStep)
+                    + statement.reset_status(rusqlite::StatementStatus::VmStep),
             )
             .unwrap(),
         );
         Ok((source_instance_id, source_epoch, high_water, rows))
     });
-    let finish = connection.execute_batch(if read.is_ok() { "COMMIT" } else { "ROLLBACK" });
+    let finish = read_io::execute(connection, if read.is_ok() { "COMMIT" } else { "ROLLBACK" });
     let (source_instance_id, source_epoch, high_water, rows) =
         read.map_err(|error| sqlite_error(stop, &context, error))?;
     finish.map_err(|error| sqlite_error(stop, &context, error))?;
@@ -704,7 +761,8 @@ mod tests {
             add_fact(&path, seq, fact);
         }
         let state = test_state();
-        drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
+        let reader = source(&path);
+        drain_once(&state, &reader, BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
         let measurements = count(&state, "measurement");
         assert_eq!(count(&state, "usage_event"), 3);
 
@@ -713,8 +771,7 @@ mod tests {
         for (seq, fact) in [(1, "f1"), (2, "f2"), (3, "f3")] {
             add_fact(&path, seq, fact);
         }
-        let outcome =
-            drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 200).unwrap();
+        let outcome = drain_once(&state, &reader, BROCA_SOURCE_KEY, PAGE_LIMIT, 200).unwrap();
 
         assert_eq!(outcome.events_recorded, 3, "every fact is read again");
         assert_eq!(outcome.quarantined_redeliveries, 0);

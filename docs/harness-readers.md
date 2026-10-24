@@ -32,7 +32,7 @@ offset. Appends never renew that deadline. Due files are checked whole, even
 when one oversized file exceeds a soft byte budget. Cold starts and restarts
 still read every file in full.
 
-Every drain still discovers and stats every file. After one observed hour
+Every full drain still discovers and stats every file. After one observed hour
 without change, a complete file with no pending Claude calls may defer its
 window check until five minutes after its last content check. An hour avoids
 backing off ordinary pauses in active sessions. Changed size, modification
@@ -51,9 +51,16 @@ their separate hourly verification policy. Goose stays on full ticks.
 Between full ticks, the refresher's single writer runs a fast lane every two
 seconds (`FAST_LANE_INTERVAL`). It reads OpenCode's rowid tail and BROCA's
 `export_facts` tail. Pi, Oh My Pi, Claude Code, declared Claude workers, Codex,
-Kimi and Gemini JSONL files are read only when their size, modification time or
-identity changed and their modification time is within the last five minutes.
-The readers still discover and stat files, including new files. Codex archives
+Kimi and Gemini JSONL readers retain a hot set from full ticks: files modified
+within the last five minutes, plus newly discovered files. A file that keeps
+growing stays hot. Fast cycles walk no directories and check each hot path with
+metadata only, opening it for content only when size, modification time or the
+replacement hint changes. On Unix, path metadata supplies device and inode
+identity. On Windows, creation time is only a replacement hint. A replacement
+with equal size, modification time and creation time can be missed by a Windows
+fast cycle; the next full tick keeps the real open-handle identity check.
+Brand-new session files wait for discovery on the next full tick, at most
+`poll_interval_secs` (30 seconds in production). Codex archives
 and Gemini JSON documents stay on full ticks. Full-prefix verification, quiet-file
 checks, worker deletion acknowledgements, pricing, quota polling, multiplier
 work, audits and retention keep their existing schedules.
@@ -67,6 +74,12 @@ OpenCode's initial tail seed returns only exact redeliveries. Fast reads never
 advance `last_success_ms` or clear degraded health. Committed events refresh the
 recent-steps memory through the normal post-commit path. Both lanes run on the
 same refresher thread and use the same stop signal.
+
+OpenCode and BROCA retain read-only SQLite connections and cached statements
+between fast cycles. Full ticks check the database path for replacement and
+discard an obsolete connection; read failures also discard it. Every read ends
+its transaction before returning, so an idle connection never pins an old WAL
+snapshot or prevents the producer from checkpointing.
 
 Codex `.jsonl.zst` archives are immutable snapshots, not appendable streams.
 After a verified read, unchanged size, modification time and file identity skip

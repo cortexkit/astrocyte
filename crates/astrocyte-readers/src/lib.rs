@@ -6,6 +6,7 @@
 
 pub mod file_identity;
 pub mod provider_identity;
+pub mod read_io;
 pub mod sessions;
 pub mod sqlite_uri;
 

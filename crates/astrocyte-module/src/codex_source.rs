@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 #[cfg(any(test, feature = "test-support"))]
 use std::ffi::OsString;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,7 +165,11 @@ impl CodexSource {
         let mut present = Vec::new();
         for directory in SESSION_DIRECTORIES {
             let root = home.join(directory);
-            match fs::metadata(&root) {
+            if !mode.is_full() {
+                present.push((directory, root));
+                continue;
+            }
+            match astrocyte_readers::read_io::metadata(&root) {
                 Ok(_) => present.push((directory, root)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -193,26 +198,19 @@ impl CodexSource {
                 ..CodexDrainOutcome::default()
             });
         }
-        let paths = present
-            .iter()
-            .map(|(_, root)| root.display().to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        crate::refresher::harness_drain::record_source_discovery(
-            state,
-            CODEX_SOURCE_KEY,
-            &paths,
-            true,
-        );
-        mode.ensure_runtime(state, CODEX_SOURCE_KEY)?;
-
-        let mut outcome = CodexDrainOutcome::default();
-        let mut files = Vec::new();
-        for (directory, root) in &present {
-            let found = jsonl_files(root)
-                .map_err(|error| format!("read Codex session root {}: {error}", root.display()))?;
-            outcome.files_by_directory.insert(directory, found.len());
-            files.extend(found);
+        if mode.is_full() {
+            let paths = present
+                .iter()
+                .map(|(_, root)| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            crate::refresher::harness_drain::record_source_discovery(
+                state,
+                CODEX_SOURCE_KEY,
+                &paths,
+                true,
+            );
+            mode.ensure_runtime(state, CODEX_SOURCE_KEY)?;
         }
         let (mut previous_points, previous_verified, previous_windows) = {
             let cache = self
@@ -225,6 +223,24 @@ impl CodexSource {
                 cache.windows.clone(),
             )
         };
+
+        let mut outcome = CodexDrainOutcome::default();
+        let files = mode
+            .files(&previous_windows, recorded_at_ms, || {
+                let mut files = Vec::new();
+                for (directory, root) in &present {
+                    let found = jsonl_files(root).map_err(|error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!("read Codex session root {}: {error}", root.display()),
+                        )
+                    })?;
+                    outcome.files_by_directory.insert(directory, found.len());
+                    files.extend(found);
+                }
+                Ok(files)
+            })
+            .map_err(|error| error.to_string())?;
 
         let mut resume_points = HashMap::with_capacity(files.len());
         let mut verified_ms = HashMap::with_capacity(files.len());
@@ -240,7 +256,7 @@ impl CodexSource {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            let stat = crate::refresher::harness_drain::FileStat::read(&path)
+            let stat = crate::refresher::harness_drain::FileStat::read_in_lane(&path, mode)
                 .map_err(|error| format!("stat Codex session {}: {error}", path.display()))?;
             if !mode.is_full()
                 && (is_codex_archive(&path)

@@ -147,13 +147,13 @@ fn read_appended_lines_inner<S>(
     mut on_line: impl FnMut(&mut S, &[u8]),
     fail_on_io_error: bool,
 ) -> std::io::Result<JsonlRead<S>> {
-    let mut file = std::fs::File::open(path)?;
+    let mut file = crate::read_io::open(path)?;
 
     let mut hashed_bytes = 0_u64;
     let mut resumed = None;
     if let Some(previous) = previous {
         let cursor = &previous.cursor;
-        let metadata = file.metadata().ok();
+        let metadata = crate::read_io::file_metadata(&file).ok();
         let long_enough = metadata
             .as_ref()
             .is_some_and(|metadata| metadata.len() >= cursor.offset);
@@ -252,8 +252,7 @@ fn read_appended_lines_inner<S>(
             prefix_hasher: hasher,
             window_start,
             window_sha256,
-            inode: file
-                .metadata()
+            inode: crate::read_io::file_metadata(&file)
                 .ok()
                 .as_ref()
                 .and_then(|metadata| inode_of(&file, metadata)),

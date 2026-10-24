@@ -8,6 +8,62 @@
 # exercise the changed path and fail, proving that the original guard is tested.
 
 [[control]]
+id = "fast-lane-opencode-reuses-connection"
+guards = "OpenCode keeps its read-only connection and cached statements across fast cycles"
+file = "crates/astrocyte-module/src/opencode_source.rs"
+old = 'if cache.reader.is_none() {'
+new = 'if { cache.reader = None; true } { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/fast_lane_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "refresher::fast_lane_tests::idle_fast_cycle_opens_nothing_and_stats_only_hot_files",
+  "refresher::fast_lane_tests::new_opencode_row_reuses_prepared_statements",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "fast-lane-broca-reuses-connection"
+guards = "BROCA keeps its read-only connection and cached statements across fast cycles"
+file = "crates/astrocyte-module/src/broca_source.rs"
+old = 'if cache.connection.is_none() {'
+new = 'if { cache.connection = None; true } { // NON-VACUITY BREAK'
+test_file = "crates/astrocyte-module/src/fast_lane_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "refresher::fast_lane_tests::idle_fast_cycle_opens_nothing_and_stats_only_hot_files",
+  "refresher::fast_lane_tests::new_opencode_row_reuses_prepared_statements",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "fast-lane-jsonl-never-walks"
+guards = "Fast JSONL reads use the full tick's hot inventory instead of walking directories"
+file = "crates/astrocyte-module/src/refresher.rs"
+old = '''            if self.is_full() {
+                walk()'''
+new = '''            if true || self.is_full() { // NON-VACUITY BREAK
+                walk()'''
+test_file = "crates/astrocyte-module/src/fast_lane_tests.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "refresher::fast_lane_tests::hot_files_expire_but_growth_keeps_them_hot_and_new_files_wait_for_full_tick",
+  "refresher::fast_lane_tests::idle_fast_cycle_opens_nothing_and_stats_only_hot_files",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
 id = "fast-lane-idle-no-commit"
 guards = "An unchanged fast tail, including exact seed redeliveries, never commits"
 file = "crates/astrocyte-module/src/state.rs"
@@ -80,13 +136,16 @@ build_timeout_s = 600
 id = "jsonl-quiet-metadata-wakeup"
 guards = "Changed size, mtime or identity wakes a quiet file before its content deadline"
 file = "crates/astrocyte-module/src/jsonl_schedule.rs"
-old = '            && self.stat.same(stat)'
+old = '            && stat.same(&self.stat)'
 new = '            && { let _ = stat; true } // NON-VACUITY BREAK'
 test_file = "crates/astrocyte-module/src/jsonl_schedule.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
-expect_red = ["refresher::jsonl_schedule::tests::quiet_metadata_change_wakes_before_the_window_deadline"]
+expect_red = [
+  "refresher::jsonl_schedule::tests::full_stat_never_reuses_an_unknown_handle_identity",
+  "refresher::jsonl_schedule::tests::quiet_metadata_change_wakes_before_the_window_deadline",
+]
 only = true
 timeout_s = 300
 build_timeout_s = 600
@@ -1241,7 +1300,10 @@ build_timeout_s = 1800
 id = "claude-workers-canonical-containment"
 guards = "Symlink-resolved declared roots stay inside the harness worker folder"
 file = "crates/astrocyte-module/src/claude_workers_source.rs"
-old = "if canonical == folder || !canonical.starts_with(&folder) {"
+old = '''if folder
+                .as_ref()
+                .is_some_and(|folder| canonical == *folder || !canonical.starts_with(folder))
+            {'''
 new = "if false { // NON-VACUITY BREAK"
 test_file = "crates/astrocyte-module/src/claude_workers_source.rs"
 runner = "cargo"
@@ -1557,8 +1619,8 @@ build_timeout_s = 600
 id = "codex-archive-no-redecompress"
 guards = "Unchanged verified archives skip decoding until their daily deadline"
 file = "crates/astrocyte-module/src/jsonl_schedule.rs"
-old = 'self.ready && !full_due && self.stat.same(stat) && now >= self.checked_ms'
-new = 'false && self.ready && !full_due && self.stat.same(stat) && now >= self.checked_ms // NON-VACUITY BREAK'
+old = 'self.ready && !full_due && stat.same(&self.stat) && now >= self.checked_ms'
+new = 'false && self.ready && !full_due && stat.same(&self.stat) && now >= self.checked_ms // NON-VACUITY BREAK'
 test_file = "crates/astrocyte-module/src/codex_source.rs"
 runner = "cargo"
 package = "astrocyte-module"

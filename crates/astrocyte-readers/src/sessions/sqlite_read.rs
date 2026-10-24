@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use std::path::Path;
 
 /// Open a harness-owned store without write authority, inside one deferred
@@ -8,18 +8,25 @@ pub(super) fn open_read_snapshot(
     path: &Path,
     harness: &str,
 ) -> Result<Connection, String> {
-    let connection = Connection::open_with_flags(
-        uri,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|error| {
+    let connection = open_read_connection(uri, path, harness)?;
+    connection
+        .execute_batch("BEGIN DEFERRED")
+        .map_err(|error| format!("begin {harness} read snapshot {}: {error}", path.display()))?;
+    Ok(connection)
+}
+
+pub(super) fn open_read_connection(
+    uri: String,
+    path: &Path,
+    harness: &str,
+) -> Result<Connection, String> {
+    let connection = crate::read_io::connect(&uri).map_err(|error| {
         format!(
             "open {harness} database {} read-only: {error}",
             path.display()
         )
     })?;
-    connection
-        .execute_batch("PRAGMA query_only=ON; BEGIN DEFERRED")
+    crate::read_io::execute(&connection, "PRAGMA query_only=ON")
         .map_err(|error| format!("begin {harness} read snapshot {}: {error}", path.display()))?;
     Ok(connection)
 }

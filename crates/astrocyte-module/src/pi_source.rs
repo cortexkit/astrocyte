@@ -4,6 +4,7 @@ use super::harness_drain::DrainMode;
 use std::collections::{BTreeMap, HashMap};
 #[cfg(any(test, feature = "test-support"))]
 use std::ffi::OsString;
+#[cfg(test)]
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -258,37 +259,38 @@ impl PiSource {
             }
         };
 
-        match fs::metadata(root) {
-            Ok(_) => {
-                crate::refresher::harness_drain::record_source_discovery(
-                    state,
-                    PI_SOURCE_KEY,
-                    root.display(),
-                    true,
-                );
-                mode.ensure_runtime(state, PI_SOURCE_KEY)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                crate::refresher::harness_drain::record_source_discovery(
-                    state,
-                    PI_SOURCE_KEY,
-                    root.display(),
-                    false,
-                );
-                mode.remove_runtime(state, PI_SOURCE_KEY)?;
-                return Ok(PiDrainOutcome {
-                    root_absent: true,
-                    ..PiDrainOutcome::default()
-                });
-            }
-            Err(error) => {
-                mode.ensure_runtime(state, PI_SOURCE_KEY)?;
-                return Err(format!("inspect Pi session root {}: {error}", root.display()).into());
+        if mode.is_full() {
+            match astrocyte_readers::read_io::metadata(root) {
+                Ok(_) => {
+                    crate::refresher::harness_drain::record_source_discovery(
+                        state,
+                        PI_SOURCE_KEY,
+                        root.display(),
+                        true,
+                    );
+                    mode.ensure_runtime(state, PI_SOURCE_KEY)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    crate::refresher::harness_drain::record_source_discovery(
+                        state,
+                        PI_SOURCE_KEY,
+                        root.display(),
+                        false,
+                    );
+                    mode.remove_runtime(state, PI_SOURCE_KEY)?;
+                    return Ok(PiDrainOutcome {
+                        root_absent: true,
+                        ..PiDrainOutcome::default()
+                    });
+                }
+                Err(error) => {
+                    mode.ensure_runtime(state, PI_SOURCE_KEY)?;
+                    return Err(
+                        format!("inspect Pi session root {}: {error}", root.display()).into(),
+                    );
+                }
             }
         }
-
-        let files = jsonl_files(root)
-            .map_err(|error| format!("read Pi session root {}: {error}", root.display()))?;
         let (cached_resume, cached_verified, cached_header_scans, cached_windows) = {
             let cache = self
                 .cache
@@ -301,6 +303,9 @@ impl PiSource {
                 cache.windows.clone(),
             )
         };
+        let files = mode
+            .files(&cached_windows, recorded_at_ms, || jsonl_files(root))
+            .map_err(|error| format!("read Pi session root {}: {error}", root.display()))?;
         // A windowed drain skips records outside the requested time range.
         // Saving its offset would make later drains resume past those skipped
         // records and never ingest them, so a windowed drain neither resumes
@@ -330,7 +335,7 @@ impl PiSource {
             }
             // Stat every file, including deferred ones. Metadata can wake a
             // quiet file but cannot extend either content-check deadline.
-            let stat = FileStat::read(&path)
+            let stat = FileStat::read_in_lane(&path, mode)
                 .map_err(|error| format!("open Pi session file {}: {error}", path.display()))?;
             if !mode.is_full() && !stat.fast_changed(cached_windows.get(&path), recorded_at_ms) {
                 continue;
@@ -620,7 +625,7 @@ fn session_header_timestamp(
     };
     let read_error =
         |error: std::io::Error| format!("read Pi session header {}: {error}", path.display());
-    let mut file = fs::File::open(path)
+    let mut file = astrocyte_readers::read_io::open(path)
         .map_err(|error| format!("open Pi session file {}: {error}", path.display()))?;
     file.seek(SeekFrom::Start(start)).map_err(read_error)?;
     let mut reader = BufReader::new(file);

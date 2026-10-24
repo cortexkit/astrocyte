@@ -103,7 +103,7 @@ without degrading health.
 
 `start_refresher` runs full ticks on one OS thread every `poll_interval_secs`.
 Between ticks, `FAST_LANE_INTERVAL` (two seconds) runs OpenCode's rowid tail,
-BROCA's fact tail and JSONL readers for recently changed files. An idle tail
+BROCA's fact tail and JSONL readers for hot files discovered on full ticks. An idle tail
 commits nothing; only full drains advance `last_success_ms`. Both lanes share
 ingestion and post-commit memory refresh under the writer fence. Tails never
 run full passes or maintenance, and stop requests interrupt their reads as

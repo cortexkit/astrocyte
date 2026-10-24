@@ -1233,7 +1233,7 @@ pub fn parse_pi_file_resumable(
 ) -> PiResumableParse {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Ok(mut file) = crate::read_io::open(path) else {
         return PiResumableParse::default();
     };
 
@@ -1241,7 +1241,7 @@ pub fn parse_pi_file_resumable(
     let mut hashed_bytes = 0_u64;
     let mut resumed = None;
     if let Some(previous) = previous {
-        let metadata = file.metadata().ok();
+        let metadata = crate::read_io::file_metadata(&file).ok();
         let long_enough = metadata
             .as_ref()
             .is_some_and(|metadata| metadata.len() >= previous.offset);
@@ -1428,8 +1428,7 @@ pub fn parse_pi_file_resumable(
             skipped_lines,
         };
     };
-    let inode = file
-        .metadata()
+    let inode = crate::read_io::file_metadata(&file)
         .ok()
         .as_ref()
         .and_then(|metadata| inode_of(&file, metadata));

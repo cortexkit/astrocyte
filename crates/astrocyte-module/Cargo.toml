@@ -74,5 +74,6 @@ libc = "0.2"
 signal-hook = { version = "0.4", default-features = false }
 
 [dev-dependencies]
+astrocyte-readers = { workspace = true, features = ["test-support"] }
 astrocyte-module = { path = ".", features = ["test-support"] }
 tempfile = "3"

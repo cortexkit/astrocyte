@@ -9,6 +9,9 @@ repository = "https://github.com/cortexkit/astrocyte"
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 chrono = { workspace = true }
 serde = { workspace = true }

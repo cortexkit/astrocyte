@@ -41,25 +41,74 @@ pub(crate) struct FileStat {
     pub(crate) len: u64,
     modified: Option<SystemTime>,
     identity: Option<(u64, u64)>,
+    created: Option<SystemTime>,
+    path_only: bool,
 }
 
 impl FileStat {
-    pub(crate) fn fast_changed(&self, previous: Option<&WindowSchedule>, now_ms: i64) -> bool {
-        let recent = self
-            .modified
+    pub(crate) fn fast_changed(&self, previous: Option<&WindowSchedule>, _now_ms: i64) -> bool {
+        previous.is_none_or(|window| !self.same(&window.stat))
+    }
+
+    fn recent(&self, now_ms: i64) -> bool {
+        self.modified
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .and_then(|age| i64::try_from(age.as_millis()).ok())
-            .is_some_and(|modified| now_ms.saturating_sub(modified) <= 5 * 60 * 1000);
-        recent && previous.is_none_or(|window| !window.stat.same(self))
+            .is_some_and(|modified| (0..=QUIET_CHECK_MS).contains(&now_ms.saturating_sub(modified)))
     }
 
     pub(crate) fn read(path: &Path) -> std::io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let metadata = file.metadata()?;
+        let file = astrocyte_readers::read_io::open(path)?;
+        let metadata = astrocyte_readers::read_io::file_metadata(&file)?;
+        Self::from_metadata(&metadata, inode_of(&file, &metadata), false)
+    }
+
+    pub(crate) fn read_in_lane(
+        path: &Path,
+        mode: super::harness_drain::DrainMode,
+    ) -> std::io::Result<Self> {
+        if mode.is_full() {
+            return Self::read(path);
+        }
+        let metadata = astrocyte_readers::read_io::symlink_metadata(path)?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other(
+                "cached transcript is no longer a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            Some((metadata.dev(), metadata.ino()))
+        };
+        #[cfg(not(unix))]
+        let identity = None;
+        Self::from_metadata(&metadata, identity, true)
+    }
+
+    fn from_metadata(
+        metadata: &std::fs::Metadata,
+        identity: Option<(u64, u64)>,
+        path_only: bool,
+    ) -> std::io::Result<Self> {
         let stat = Self {
             len: metadata.len(),
             modified: metadata.modified().ok(),
-            identity: inode_of(&file, &metadata),
+            identity,
+            path_only,
+            created: {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    (metadata.creation_time() != 0)
+                        .then(|| metadata.created().ok())
+                        .flatten()
+                }
+                #[cfg(not(windows))]
+                {
+                    metadata.created().ok()
+                }
+            },
         };
         #[cfg(test)]
         {
@@ -79,7 +128,17 @@ impl FileStat {
         self.len == other.len
             && self.modified.is_some()
             && self.modified == other.modified
-            && same_identity(self.identity, other.identity)
+            && self.same_file(other)
+    }
+
+    fn same_file(&self, other: &Self) -> bool {
+        if self.identity.is_some() && other.identity.is_some() {
+            return same_identity(self.identity, other.identity);
+        }
+        // Unix path metadata carries device/inode. Windows fast reads use only
+        // creation time as a replacement hint: equal size, mtime and creation
+        // time can hide a replacement until a full tick checks handle identity.
+        cfg!(windows) && self.path_only && self.created.is_some() && self.created == other.created
     }
 }
 
@@ -99,10 +158,15 @@ pub(crate) struct WindowSchedule {
 }
 
 impl WindowSchedule {
+    pub(crate) fn hot(&self, now: i64) -> bool {
+        // If the observed time moves backward, keep checking conservatively
+        // until a full tick resets the content deadlines against the new time.
+        self.stat.recent(now) || now.saturating_sub(self.changed_ms) <= QUIET_CHECK_MS
+    }
     /// Skip archive decompression between daily full-file verifications when
     /// its size, modification time and file identity have not changed.
     pub(crate) fn defer_archive(&self, stat: &FileStat, now: i64, full_due: bool) -> bool {
-        self.ready && !full_due && self.stat.same(stat) && now >= self.checked_ms
+        self.ready && !full_due && stat.same(&self.stat) && now >= self.checked_ms
     }
 
     pub(crate) fn defer(&self, stat: &FileStat, now: i64, full_due: bool) -> bool {
@@ -110,7 +174,7 @@ impl WindowSchedule {
         // Stat can only wake a file early; it never renews the content deadline.
         self.ready
             && !full_due
-            && self.stat.same(stat)
+            && stat.same(&self.stat)
             && now >= self.checked_ms
             && now.saturating_sub(self.changed_ms) >= QUIET_AFTER_MS
             && now.saturating_sub(self.checked_ms) < QUIET_CHECK_MS
@@ -124,7 +188,7 @@ impl WindowSchedule {
         ready: bool,
     ) -> Self {
         let changed_ms = previous
-            .filter(|previous| unchanged && previous.stat.same(&stat) && now >= previous.checked_ms)
+            .filter(|previous| unchanged && stat.same(&previous.stat) && now >= previous.checked_ms)
             .map_or(now, |previous| previous.changed_ms);
         Self {
             stat,
@@ -137,6 +201,27 @@ impl WindowSchedule {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn full_stat_never_reuses_an_unknown_handle_identity() {
+        let stat = super::FileStat {
+            len: 1,
+            modified: Some(std::time::UNIX_EPOCH),
+            created: Some(std::time::UNIX_EPOCH),
+            identity: None,
+            path_only: false,
+        };
+        let window = super::WindowSchedule::after_read(None, stat.clone(), 0, false, true);
+        assert!(!window.defer(&stat, 60 * 60 * 1000, false));
+        assert!(!window.defer_archive(&stat, 1, false));
+        assert!(!stat.same(&stat));
+        let mut fast = stat.clone();
+        fast.path_only = true;
+        assert_eq!(fast.same(&stat), cfg!(windows));
+        assert_eq!(fast.fast_changed(Some(&window), 1), !cfg!(windows));
+        let mut fast_window = super::WindowSchedule::after_read(None, fast, 0, false, true);
+        fast_window.changed_ms = -60 * 60 * 1000;
+        assert!(!fast_window.defer(&stat, 1, false));
+    }
     use super::*;
     use crate::refresher::{
         claude_code_source::ClaudeCodeSource, codex_source::CodexSource,

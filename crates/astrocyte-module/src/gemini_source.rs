@@ -174,8 +174,6 @@ impl GeminiSource {
                 ..GeminiDrainOutcome::default()
             });
         };
-        let files = files_below(root, &is_gemini_chat_recording)
-            .map_err(|error| format!("read Gemini CLI root {}: {error}", root.display()))?;
         let previous = std::mem::take(
             &mut *self
                 .cache
@@ -188,6 +186,11 @@ impl GeminiSource {
             previous.jsonl.windows,
         );
         let previous_documents = previous.documents;
+        let files = mode
+            .files(&previous_windows, recorded_at_ms, || {
+                files_below(root, &is_gemini_chat_recording)
+            })
+            .map_err(|error| format!("read Gemini CLI root {}: {error}", root.display()))?;
 
         let mut outcome = GeminiDrainOutcome {
             files_found: files.len(),
@@ -210,7 +213,7 @@ impl GeminiSource {
             {
                 let previous = previous_points.remove(&path);
                 let verified = previous_verified.get(&path).copied();
-                let stat = FileStat::read(&path)
+                let stat = FileStat::read_in_lane(&path, mode)
                     .map_err(|error| format!("stat Gemini JSONL {}: {error}", path.display()))?;
                 if !mode.is_full()
                     && !stat.fast_changed(previous_windows.get(&path), recorded_at_ms)
@@ -307,6 +310,9 @@ impl GeminiSource {
             .map(map_call)
             .collect::<Result<Vec<_>, _>>()?;
 
+        if !mode.is_full() {
+            next.jsonl.resume.extend(previous_points);
+        }
         let tally = record_requests_in_lane(
             state,
             GEMINI_SOURCE_KEY,

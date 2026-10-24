@@ -16,7 +16,7 @@ use crate::TokenBreakdown;
 
 pub use super::opencode_schema::{
     OpenCodeCursor, OpenCodeOpenRow, OpenCodePage, OpenCodeReadError, OpenCodeScanCost,
-    OpenCodeTailPage, OpenCodeTailRequest,
+    OpenCodeTailPage, OpenCodeTailReader, OpenCodeTailRequest,
 };
 
 /// A usage-bearing assistant message read from OpenCode's `message` table.

@@ -52,6 +52,7 @@ struct ReadThrough {
 #[derive(Default)]
 struct Cache {
     roots: Vec<Root>,
+    validated_roots: Vec<Root>,
     resumes: HashMap<PathBuf, ClaudeCodeCache>,
     // A resumed read emits a refused call only once. Remember that it was not
     // recorded, so a later empty read cannot authorize deleting its transcript.
@@ -97,60 +98,76 @@ impl ClaudeWorkersSource {
             .cache
             .lock()
             .map_err(|_| "Claude workers cache lock poisoned".to_string())?;
-        if cache.ack.is_none() {
+        if mode.is_full() && cache.ack.is_none() {
             cache.ack = Some(read_ack(&paths.ack)?);
         }
         let mut degraded = None;
-        match fs::read(&paths.roots) {
-            Ok(bytes) => {
-                let value: Result<serde_json::Value, _> = serde_json::from_slice(&bytes);
-                match value {
-                    Ok(value)
-                        if value
-                            .get("version")
-                            .and_then(serde_json::Value::as_u64)
-                            .is_some_and(|v| v != 1) =>
-                    {
-                        return Err("unknown Claude worker roots version".to_string().into());
-                    }
-                    Ok(value) => match decode_registry(value) {
-                        Ok(roots) => cache.roots = roots,
-                        Err(reason) => degraded = Some(reason),
-                    },
-                    Err(error) => degraded = Some(format!("decode Claude worker roots: {error}")),
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                mode.remove_runtime(state, SOURCE_KEY)?;
-                cache.roots.clear();
-                cache.resumes.clear();
-                cache.blocked.clear();
-                if mode.is_full()
-                    && !cache
-                        .ack
-                        .as_ref()
-                        .expect("ack loaded")
-                        .read_through
-                        .is_empty()
-                {
-                    update_ack(
-                        paths,
-                        &mut cache,
-                        Ack {
-                            version: 1,
-                            read_through: vec![],
+        if mode.is_full() {
+            match fs::read(&paths.roots) {
+                Ok(bytes) => {
+                    let value: Result<serde_json::Value, _> = serde_json::from_slice(&bytes);
+                    match value {
+                        Ok(value)
+                            if value
+                                .get("version")
+                                .and_then(serde_json::Value::as_u64)
+                                .is_some_and(|v| v != 1) =>
+                        {
+                            return Err("unknown Claude worker roots version".to_string().into());
+                        }
+                        Ok(value) => match decode_registry(value) {
+                            Ok(roots) => cache.roots = roots,
+                            Err(reason) => degraded = Some(reason),
                         },
-                    )?;
+                        Err(error) => {
+                            degraded = Some(format!("decode Claude worker roots: {error}"))
+                        }
+                    }
                 }
-                return Ok(None);
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    mode.remove_runtime(state, SOURCE_KEY)?;
+                    cache.roots.clear();
+                    cache.validated_roots.clear();
+                    cache.resumes.clear();
+                    cache.blocked.clear();
+                    if mode.is_full()
+                        && !cache
+                            .ack
+                            .as_ref()
+                            .expect("ack loaded")
+                            .read_through
+                            .is_empty()
+                    {
+                        update_ack(
+                            paths,
+                            &mut cache,
+                            Ack {
+                                version: 1,
+                                read_through: vec![],
+                            },
+                        )?;
+                    }
+                    return Ok(None);
+                }
+                Err(error) => degraded = Some(format!("read Claude worker roots: {error}")),
             }
-            Err(error) => degraded = Some(format!("read Claude worker roots: {error}")),
         }
         let registry_valid = degraded.is_none();
         mode.ensure_runtime(state, SOURCE_KEY)?;
-        let folder = fs::canonicalize(paths.roots.parent().expect("roots parent"))
-            .map_err(|e| format!("resolve Claude worker folder: {e}"))?;
-        let roots = cache.roots.clone();
+        let folder = if mode.is_full() {
+            Some(
+                fs::canonicalize(paths.roots.parent().expect("roots parent"))
+                    .map_err(|e| format!("resolve Claude worker folder: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let roots = if mode.is_full() {
+            cache.roots.clone()
+        } else {
+            cache.validated_roots.clone()
+        };
+        let mut validated_roots = Vec::new();
         let mut next_resumes = HashMap::new();
         let mut ready = HashSet::new();
         let mut refs_by_worker = HashMap::new();
@@ -169,22 +186,29 @@ impl ClaudeWorkersSource {
                 );
                 continue;
             }
-            let canonical = match fs::canonicalize(&root.path) {
-                Ok(path) => path,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    warn_once(
-                        &mut cache,
-                        format!("skip deleted worker root {}", root.path.display()),
-                    );
-                    continue;
+            let canonical = if mode.is_full() {
+                match fs::canonicalize(&root.path) {
+                    Ok(path) => path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        warn_once(
+                            &mut cache,
+                            format!("skip deleted worker root {}", root.path.display()),
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(
+                            format!("resolve worker root {}: {error}", root.path.display()).into(),
+                        )
+                    }
                 }
-                Err(error) => {
-                    return Err(
-                        format!("resolve worker root {}: {error}", root.path.display()).into(),
-                    )
-                }
+            } else {
+                root.path.clone()
             };
-            if canonical == folder || !canonical.starts_with(&folder) {
+            if folder
+                .as_ref()
+                .is_some_and(|folder| canonical == *folder || !canonical.starts_with(folder))
+            {
                 warn_once(
                     &mut cache,
                     format!(
@@ -194,9 +218,17 @@ impl ClaudeWorkersSource {
                 );
                 continue;
             }
+            let mut validated = root.clone();
+            validated.path = canonical.clone();
+            validated_roots.push(validated);
             let projects = canonical.join("projects");
             let previous = cache.resumes.get(&canonical).cloned().unwrap_or_default();
-            let read = match fs::metadata(&projects) {
+            let presence = if mode.is_full() {
+                astrocyte_readers::read_io::metadata(&projects).map(|_| ())
+            } else {
+                Ok(())
+            };
+            let read = match presence {
                 Ok(_) => claude_code_source::read_projects(
                     &projects,
                     &previous,
@@ -256,6 +288,9 @@ impl ClaudeWorkersSource {
         );
         commit?;
         cache.resumes = next_resumes;
+        if mode.is_full() {
+            cache.validated_roots = validated_roots;
+        }
         for (id, refs) in refs_by_worker {
             if outcome.quarantined_refs.iter().any(|r| refs.contains(r)) {
                 blocked.insert(id);
@@ -562,6 +597,36 @@ mod tests {
         f.tick(200);
         assert_eq!(f.events()[0].2.as_deref(), Some("custom verbatim class"));
         assert_eq!(f.runtime(), Some((Some(200), false)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fast_worker_read_refuses_a_cached_root_redirected_outside() {
+        let f = Fixture::new();
+        f.call(WORKER, "worker", true);
+        f.declare(vec![f.root(WORKER, false)]);
+        f.tick(100);
+        let events = f.events();
+        let ack = f.acks();
+        let outside = f.temp.path().join("outside");
+        write_call(&outside, "worker", true);
+        let transcript = outside.join("projects/project/session/subagents/worker.jsonl");
+        let bytes = fs::read_to_string(&transcript)
+            .unwrap()
+            .replace("worker", "escaped");
+        fs::write(transcript, bytes).unwrap();
+        fs::rename(f.folder.join(WORKER), f.folder.join("original")).unwrap();
+        std::os::unix::fs::symlink(outside, f.folder.join(WORKER)).unwrap();
+        astrocyte_readers::read_io::reset_counts();
+        assert!(f
+            .source
+            .drain_fast(&f.state, 200, &AtomicBool::new(false))
+            .is_err());
+        assert_eq!(f.events(), events);
+        assert_eq!(f.acks(), ack);
+        let counts = astrocyte_readers::read_io::counts();
+        assert_eq!(counts.file_opens, 0);
+        assert_eq!(counts.directory_reads, 0);
     }
 
     #[test]

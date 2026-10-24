@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(any(test, feature = "test-support"))]
 use std::ffi::OsString;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -170,39 +171,40 @@ impl ClaudeCodeSource {
             }
         };
 
-        match fs::metadata(root) {
-            Ok(_) => {
-                crate::refresher::harness_drain::record_source_discovery(
-                    state,
-                    CLAUDE_CODE_SOURCE_KEY,
-                    root.display(),
-                    true,
-                );
-                mode.ensure_runtime(state, CLAUDE_CODE_SOURCE_KEY)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                crate::refresher::harness_drain::record_source_discovery(
-                    state,
-                    CLAUDE_CODE_SOURCE_KEY,
-                    root.display(),
-                    false,
-                );
-                mode.remove_runtime(state, CLAUDE_CODE_SOURCE_KEY)?;
-                return Ok(ClaudeCodeDrainOutcome {
-                    root_absent: true,
-                    ..ClaudeCodeDrainOutcome::default()
-                });
-            }
-            Err(error) => {
-                mode.ensure_runtime(state, CLAUDE_CODE_SOURCE_KEY)?;
-                return Err(format!(
-                    "inspect Claude Code projects root {}: {error}",
-                    root.display()
-                )
-                .into());
+        if mode.is_full() {
+            match astrocyte_readers::read_io::metadata(root) {
+                Ok(_) => {
+                    crate::refresher::harness_drain::record_source_discovery(
+                        state,
+                        CLAUDE_CODE_SOURCE_KEY,
+                        root.display(),
+                        true,
+                    );
+                    mode.ensure_runtime(state, CLAUDE_CODE_SOURCE_KEY)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    crate::refresher::harness_drain::record_source_discovery(
+                        state,
+                        CLAUDE_CODE_SOURCE_KEY,
+                        root.display(),
+                        false,
+                    );
+                    mode.remove_runtime(state, CLAUDE_CODE_SOURCE_KEY)?;
+                    return Ok(ClaudeCodeDrainOutcome {
+                        root_absent: true,
+                        ..ClaudeCodeDrainOutcome::default()
+                    });
+                }
+                Err(error) => {
+                    mode.ensure_runtime(state, CLAUDE_CODE_SOURCE_KEY)?;
+                    return Err(format!(
+                        "inspect Claude Code projects root {}: {error}",
+                        root.display()
+                    )
+                    .into());
+                }
             }
         }
-
         let previous = self
             .cache
             .lock()
@@ -261,8 +263,28 @@ pub(crate) fn read_projects(
     stop: &AtomicBool,
     mode: DrainMode,
 ) -> Result<ClaudeCodeRead, SourceDrainError> {
-    let files = jsonl_files(root)
-        .map_err(|error| format!("read Claude Code projects root {}: {error}", root.display()))?;
+    let files = if mode.is_full() {
+        jsonl_files(root)
+    } else {
+        mode.files(&previous.windows, recorded_at_ms, || {
+            jsonl_files(root).map(|files| files.into_iter().map(|(path, _)| path).collect())
+        })
+        .map(|files| {
+            files
+                .into_iter()
+                .map(|path| {
+                    let depth = path
+                        .strip_prefix(root)
+                        .expect("cached path below root")
+                        .components()
+                        .count()
+                        .saturating_sub(1);
+                    (path, depth)
+                })
+                .collect()
+        })
+    }
+    .map_err(|error| format!("read Claude Code projects root {}: {error}", root.display()))?;
     let mut previous_points = previous.resume.clone();
     let previous_verified = &previous.prefix_verified_ms;
 
@@ -282,10 +304,24 @@ pub(crate) fn read_projects(
             return Err(SourceDrainError::Stopped);
         }
         *outcome.files_by_depth.entry(depth).or_default() += 1;
-        let stat = crate::refresher::harness_drain::FileStat::read(&path)
+        let stat = crate::refresher::harness_drain::FileStat::read_in_lane(&path, mode)
             .map_err(|error| format!("stat Claude Code session {}: {error}", path.display()))?;
         if !mode.is_full() && !stat.fast_changed(previous.windows.get(&path), recorded_at_ms) {
             continue;
+        }
+        if !mode.is_full() && work_class.is_some() {
+            // Cached worker roots are checked only on full ticks. Before reading
+            // changed content, reject a directory redirected outside that root.
+            let canonical = std::fs::canonicalize(&path).map_err(|error| {
+                format!("resolve worker transcript {}: {error}", path.display())
+            })?;
+            if !canonical.starts_with(root) {
+                return Err(format!(
+                    "worker transcript outside declared projects: {}",
+                    path.display()
+                )
+                .into());
+            }
         }
         resume_points.remove(&path);
         let point = previous_points.remove(&path);
