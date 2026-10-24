@@ -45,8 +45,8 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-# `signal`: SIGTERM ends the serve loop through the same stop-and-join path
-# as daemon EOF (see `stop_signal` in src/main.rs).
+# `signal`: SIGTERM stops serving through the same stop-and-join path as
+# daemon EOF (see `serve_module` in src/main.rs).
 tokio = { workspace = true, features = ["signal"] }
 rusqlite = { workspace = true }
 cortexkit-store = { workspace = true }

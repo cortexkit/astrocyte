@@ -21,6 +21,14 @@ see [operations](operations.md).
   people and is not a stable interface.
 - A body that does not decode as `{method, params}` is refused
   `invalid_request`.
+- A reply larger than the daemon delivers (4 MiB, counting the 21-byte
+  frame header) is replaced by a refusal `frame_too_large` whose `detail` is
+  `{"size": <reply bytes>, "limit": <limit>}`, on the request's own route and
+  correlation id. Test:
+  `oversized_route_reply_is_refused_frame_too_large_on_its_own_correlation`.
+- A request whose handler panics is refused `internal`, and the module then
+  stops with a non-zero exit, because a panic may have left shared state
+  broken. Test: `handler_panic_replies_before_serving_ends_with_nonzero_exit`.
 - A route opened by a subc flow (work that runs for its owner without the
   owner present) may call the read operations. Every write
   operation on such a route is refused `flow_scopes_unsupported` before
