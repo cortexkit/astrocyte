@@ -169,8 +169,9 @@ pub(crate) struct ReadOptions<'a> {
     pub work_class: Option<&'a str>,
     /// No further write can come to the store, so an OpenCode 2 call with
     /// tokens but no completion is final now rather than after the quiet
-    /// window. OpenCode 1 rows carry their tokens only once `finish` or
-    /// `time.completed` is written, so its reader has nothing to wait for.
+    /// window. OpenCode 1 writes a row's real token counts together with
+    /// `finish` (it keeps zeros while the call streams), so its reader, which
+    /// waits for `finish` or `time.completed`, has nothing more to settle.
     pub settled: bool,
 }
 

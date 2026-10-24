@@ -59,7 +59,8 @@ pub(crate) enum Contained {
     Inside(PathBuf),
     /// The path is refused, for the reason given. Other entries still read.
     Refused(String),
-    /// Nothing exists at the path any more: the harness module erased it.
+    /// Nothing exists at the path: the harness module erased it, or has not
+    /// created it yet.
     Gone,
 }
 

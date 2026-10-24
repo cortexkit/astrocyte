@@ -85,9 +85,9 @@ enum FolderRead {
     Gone,
     /// Read and committed.
     Read {
-        /// Every call the folder will ever hold is recorded: it is `active`
-        /// (whose later calls the watermark does not promise), or `done` and
-        /// settled.
+        /// Whether the folder lets the watermark move: an `active` folder
+        /// always does, since the watermark promises nothing about calls in a
+        /// folder that is not done yet; a `done` one only once it is settled.
         recorded_all: bool,
         quarantined: usize,
     },
@@ -116,9 +116,10 @@ impl OpenCodeThalamusSource {
     }
 
     /// One full pass over every declared folder. The watermark moves only when
-    /// the roots file was usable and every folder that still exists was read,
-    /// and only in the transaction that records the pass, after every
-    /// folder's own transaction has committed.
+    /// the roots file was usable and every declared folder that passes the
+    /// containment rule and still has its `opencode.db` was read, and only in
+    /// the transaction that records the pass, after every folder's own
+    /// transaction has committed.
     fn drain(
         &self,
         state: &SharedState,
@@ -165,9 +166,14 @@ impl OpenCodeThalamusSource {
         // lacks, so its pass cannot release anything.
         let mut complete = declarations_known;
         let mut quarantined = 0;
-        let mut kept = HashMap::new();
+        let mut seen = HashSet::new();
         let entries = cache.entries.clone();
+        // Borrow the cache's fields apart, through the guard, so a folder's
+        // reader and the warned set can both be held in the loop.
+        let cache = &mut *cache;
         for entry in &entries {
+            // A stop leaves every folder reader in the cache, so the next
+            // pass resumes from the same in-memory positions.
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
@@ -188,12 +194,13 @@ impl OpenCodeThalamusSource {
                     continue;
                 }
             };
-            let mut reader = cache
+            seen.insert(canonical.clone());
+            let reader = cache
                 .folders
-                .remove(&canonical)
-                .unwrap_or_else(|| Folder::new(&canonical));
+                .entry(canonical.clone())
+                .or_insert_with(|| Folder::new(&canonical));
             let database = canonical.join("opencode.db");
-            match read_folder(&mut reader, entry, &database, state, at, stop) {
+            match read_folder(reader, entry, &database, state, at, stop) {
                 Ok(FolderRead::Gone) => {}
                 Ok(FolderRead::Read {
                     recorded_all,
@@ -217,14 +224,13 @@ impl OpenCodeThalamusSource {
                     problems.push(reason);
                 }
             }
-            kept.insert(canonical, reader);
         }
+        cache.folders.retain(|path, _| seen.contains(path));
         let stores = declarations_known.then(|| {
-            kept.keys()
+            seen.iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect::<HashSet<_>>()
         });
-        cache.folders = kept;
 
         let watermark = complete.then(|| at.saturating_sub(WATERMARK_MARGIN_MS));
         state.ordered_write(|tx| {
