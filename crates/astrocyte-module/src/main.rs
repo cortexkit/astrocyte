@@ -524,11 +524,10 @@ where
 }
 
 /// How the helper's serving future ended, as a stop cause. GOODBYE and EOF
-/// are the daemon's deliberate stops. A reset connection is an error, as it
-/// was before the helper: the supervisor restarts the module either way, and
-/// a clean exit would read as a deliberate stop. Windows reports a killed
-/// daemon as a reset where Unix reports EOF, so a killed daemon exits 1 on
-/// Windows and 0 on Unix, both as before.
+/// are the daemon's deliberate stops. A reset connection is an error: the
+/// supervisor restarts the module either way, and a clean exit would read as
+/// a deliberate stop. Windows reports a killed daemon as a reset where Unix
+/// reports EOF, so a killed daemon exits 1 on Windows and 0 on Unix.
 fn how_serving_ended(
     result: Result<(), SubcModuleError>,
     connection_end: &Mutex<Option<ConnectionEnd>>,

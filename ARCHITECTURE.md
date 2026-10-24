@@ -27,7 +27,7 @@ The workspace has three crates:
 partial indexes, and sets a 5000 ms busy timeout. The read-only report connection
 skips the table-creating probe and copies that timeout.
 
-The [data model](docs/data-model.md#tables) describes each table in version 28.
+The [data model](docs/data-model.md#tables) describes every table in version 28 and its write rules.
 
 Schema 23 uses local integer `event_key` and `charge_key` references, never served
 IDs. Event digests remain the dedup/served identity; charge digests are retired.
@@ -54,7 +54,7 @@ The audit compares summaries against base rows, requeues discrepancies and start
 its next pass a day after the previous pass completes. Charge writers must
 update the event header before inserting heads; the existing generation-and-basis
 guard checks agreement, not transaction identity. The [data model](docs/data-model.md#hourly-summaries)
-has the details.
+explains the grain, arithmetic, invalidation rules and maintenance budgets.
 
 ## Write ordering
 
@@ -69,8 +69,8 @@ Served reads, including `budget.verdict`, use `with_read_op` on a mutex-guarded
 read-only connection opened after migration. In WAL mode a report neither waits for
 nor blocks ingest, and each read sees one ledger snapshot. Refresher reads and reads before
 `spend.event.reprice` and `spend.basis.correct` use the writer via `with_conn`;
-`spend.multiplier.recompute` reads on the reader before writing. The reader needs
-no lease.
+`spend.multiplier.recompute` reads on the reader before writing. The reader cannot
+write, so it needs no lease.
 
 ## Producers
 
@@ -211,10 +211,6 @@ surface; dispatch and the manifest both use it.
 | `usage.cache.sessions` | read, harness sessions with hit ratio and busts |
 | `usage.cache.steps` | read, one session's steps with cache verdicts |
 | `usage.cache.subscribe` | read, a watch: a notice per commit adding steps |
-
-`usage.cache.steps` answers from memory (the newest 1,000 steps of up to 200
-sessions active in the last day), else from the store. The memory and the
-subscription's notice log both advance after each commit.
 
 Astrocyte calls QTA `usage.get` and fusiform `catalog.status`, `catalog.get` and
 `plan.prices`. The contract is the [module surface](docs/module-surface.md).
