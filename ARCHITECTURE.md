@@ -211,6 +211,7 @@ surface; dispatch and the manifest both use it.
 | `usage.cache.steps` | read, one session's steps with cache verdicts |
 | `usage.steps.subscribe` | read, watch |
 | `usage.steps.read` | read, live step feed |
+| `watermark.get` | read, log-read watermark |
 
 Astrocyte calls QTA `usage.get` and fusiform `catalog.status`, `catalog.get` and
 `plan.prices`. The contract is the [module surface](docs/module-surface.md).

@@ -47,6 +47,8 @@ async-nats = { version = "=0.50.0", default-features = false, features = ["jetst
 base64 = "=0.22.1"
 futures-util = "0.3"
 fusiform-protocol = "=0.30.0"
+# The `log-read-watermark/v1` wire types (`watermark` module).
+cortexkit-role-llm-runner = "=0.7.1"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

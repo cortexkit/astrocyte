@@ -2307,3 +2307,37 @@ expect_red = ["refresher::opencode_thalamus_source::tests::two_entries_resolving
 only = true
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "watermark-get-answers-only-mapped-principals"
+guards = "watermark.get answers only a bind principal in READ_SOURCES; a local app or any other module is refused not_a_read_source"
+file = "crates/astrocyte-module/src/ops.rs"
+old = "        Some(Principal::Reserved { module_id }) => READ_SOURCES"
+new = """
+        _ if true => READ_SOURCES.first(), // NON-VACUITY BREAK: answer any principal
+        Some(Principal::Reserved { module_id }) => READ_SOURCES"""
+test_file = "crates/astrocyte-module/src/main.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--bin ck-astrocyte"
+expect_red = ["tests::watermark_get_refuses_every_caller_astrocyte_does_not_read"]
+expect_message = "served: "
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "watermark-get-refuses-excluded-source"
+guards = "watermark.get refuses not_a_read_source while the caller's source is excluded in harness_ingest, so THALAMUS erases nothing on a frozen watermark"
+file = "crates/astrocyte-module/src/ops.rs"
+old = "        .ingests(source.source_key)"
+new = "        .ingests(source.source_key) && false // NON-VACUITY BREAK: serve an excluded source"
+test_file = "crates/astrocyte-module/src/main.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--bin ck-astrocyte"
+expect_red = ["tests::watermark_get_refuses_thalamus_while_its_source_is_excluded"]
+expect_message = "served: "
+only = true
+timeout_s = 600
+build_timeout_s = 1800

@@ -446,25 +446,17 @@ fn store_watermark_in_tx(
 
 /// The read watermark in Unix milliseconds: every call in a declared folder
 /// whose `done_at_ms` is at or before it has been recorded. `None` until the
-/// first complete pass.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the served watermark.get operation reads it once it is added"
-    )
-)]
-pub(crate) fn watermark_ms(state: &SharedState) -> Result<Option<i64>, String> {
-    state.with_conn(|connection| {
-        connection
-            .query_row(
-                "SELECT watermark_ms FROM read_watermark WHERE source_key=?1",
-                [SOURCE_KEY],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("read {SOURCE_KEY} read watermark: {e}"))
-    })
+/// first complete pass. `watermark.get` reads it on the store's read-only
+/// connection (see `ops::watermark_get`).
+pub(crate) fn watermark_ms(connection: &rusqlite::Connection) -> Result<Option<i64>, String> {
+    connection
+        .query_row(
+            "SELECT watermark_ms FROM read_watermark WHERE source_key=?1",
+            [SOURCE_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("read {SOURCE_KEY} read watermark: {e}"))
 }
 
 #[cfg(test)]
@@ -624,7 +616,7 @@ mod tests {
         }
 
         fn watermark(&self) -> Option<i64> {
-            watermark_ms(&self.state).unwrap()
+            self.state.with_conn(watermark_ms).unwrap()
         }
 
         fn degraded(&self) -> Option<String> {

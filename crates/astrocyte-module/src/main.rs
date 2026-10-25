@@ -21,6 +21,7 @@ use std::{
 };
 
 use astrocyte_core::store::MIGRATIONS;
+use cortexkit_role_llm_runner::watermark::LOG_READ_WATERMARK_V1;
 use cortexkit_store::{open_sqlite, Isolation, StorageBackend, StorageDescriptor};
 use cortexkit_store_types::module_store_path;
 use serde::Deserialize;
@@ -33,12 +34,13 @@ use subc_client_rs::{
 };
 use subc_protocol::{
     manifest::{
-        build_provenance_from_source, BuildGitShaAbsenceReason, BuildGitShaSource, Concurrency,
-        ConsumerRole, GitTreeState, ManagementOperation, ManagementOperationKind, ModuleManifest,
-        OperationDelivery, ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind,
-        SignalAnchor, SignalCadence, TrustTier,
+        build_provenance_from_source, BuildGitShaAbsenceReason, BuildGitShaSource,
+        CapabilityDeclarations, Concurrency, ConsumerRole, GitTreeState, ManagementOperation,
+        ManagementOperationKind, ModuleManifest, OperationDelivery, ProviderRole,
+        SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor, SignalCadence,
+        TrustTier,
     },
-    SUBC_MODULE_ID_ENV,
+    Principal, SUBC_MODULE_ID_ENV,
 };
 
 use config::DEFAULT_MODULE_ID;
@@ -662,6 +664,15 @@ impl ModuleHandler for AstrocyteHandler {
                 step_feed::read_outcome(&self.state, request.params)
             });
         }
+        if request.method == ops::OP_WATERMARK_GET {
+            // A read on the reader connection, answered for the principal
+            // the daemon attested when this route was bound, never for one
+            // the request names.
+            let outcome = tokio::task::block_in_place(|| {
+                ops::watermark_get(&self.state, route.principal.as_ref(), request.params)
+            });
+            return route_reply(&request.method, outcome);
+        }
         dispatch_route_request(&self.state, request, route.flow)
     }
 
@@ -689,6 +700,7 @@ impl ModuleHandler for AstrocyteHandler {
             RouteBind {
                 flow,
                 may_read_feed,
+                principal: request.principal.clone(),
             },
         );
         BindDecision::accept()
@@ -725,12 +737,15 @@ struct RouteBind {
     /// Whether the bind's principal may use the live step feed (see
     /// `step_feed::may_read_feed`).
     may_read_feed: bool,
+    /// The caller the daemon attested at bind. `watermark.get` answers for
+    /// this principal only (see `ops::watermark_get`).
+    principal: Option<Principal>,
 }
 
 /// Each bound route's `RouteBind`, keyed by the full route handle, so a
 /// channel reused under a new epoch never inherits an old flow or an old
 /// principal's access. A route with no recorded bind gets the default: no
-/// flow and no feed access.
+/// flow, no feed access and no principal.
 #[derive(Default)]
 struct RouteBinds(Mutex<HashMap<RouteHandle, RouteBind>>);
 
@@ -887,11 +902,19 @@ fn dispatch_route_request(
     // Dispatch performs synchronous SQLite work and may bridge the fusiform
     // socket through its current-thread runtime. Leave the daemon executor
     // before entering that blocking boundary.
-    match tokio::task::block_in_place(|| ops::dispatch(state, &request.method, request.params)) {
+    let outcome =
+        tokio::task::block_in_place(|| ops::dispatch(state, &request.method, request.params));
+    route_reply(&request.method, outcome)
+}
+
+/// One unary operation's answer as the route reply: `{"result": ...}`, or
+/// the operation's own refusal.
+fn route_reply(method: &str, outcome: ops::OpResult) -> HandlerOutcome {
+    match outcome {
         Ok(result) => match serde_json::to_vec(&json!({ "result": result })) {
             Ok(body) => HandlerOutcome::Response(body),
             Err(error) => {
-                tracing::error!(target: "astrocyte", method = request.method, %error,
+                tracing::error!(target: "astrocyte", method, %error,
                     "route reply could not be encoded");
                 refusal("internal", "request could not be completed".to_string())
             }
@@ -979,7 +1002,14 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
             OperationDelivery::WATCH,
         )]))
         .consumes(declared_consumers(desired))
-        .capabilities(None)
+        // `watermark.get` is the one operation of `log-read-watermark/v1`.
+        // subc-protocol keeps capability claims in this block's `provides`,
+        // apart from the role declarations in the manifest's own `provides`.
+        .capabilities(Some(CapabilityDeclarations {
+            provides: vec![LOG_READ_WATERMARK_V1.to_string()],
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        }))
         .self_signals(Some(self_signal_declarations(desired)))
         .provenance(Some(provenance))
         .build()
@@ -1233,6 +1263,7 @@ impl Error for ModuleError {}
 mod tests {
     use super::*;
     use crate::test_support::{self as refresher, test_state, HANG_GUARD};
+    use cortexkit_role_llm_runner::watermark::{WatermarkReply, NOT_A_READ_SOURCE};
     use subc_protocol::{
         session::{ModuleControlRequest, ModuleControlResponse},
         ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
@@ -2017,6 +2048,7 @@ mod tests {
                 "usage.cache.steps",
                 "usage.steps.read",
                 "usage.steps.subscribe",
+                "watermark.get",
             ])
         );
     }
@@ -2683,6 +2715,22 @@ mod tests {
         );
     }
 
+    /// The manifest claims `log-read-watermark/v1`, the capability
+    /// `watermark.get` serves, in the capability block, which the daemon
+    /// validates at HELLO.
+    #[test]
+    fn manifest_provides_the_log_read_watermark_capability() {
+        let manifest = manifest("astrocyte", &config::intentional_empty().config);
+        manifest.validate_capability_grammar().unwrap();
+        let wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            wire["capabilities"]["provides"],
+            json!(["log-read-watermark/v1"])
+        );
+        subc_protocol::manifest::validate_manifest_capability_grammar(&wire).unwrap();
+        assert!(ops::PUBLIC_OPERATION_NAMES.contains(&ops::OP_WATERMARK_GET));
+    }
+
     /// Two subscribers, a local app and Callosum's phone route, both get a
     /// notice naming the newest feed cursor after a commit that adds a step.
     #[tokio::test(flavor = "multi_thread")]
@@ -2809,6 +2857,240 @@ mod tests {
         assert_eq!(page["next"], Value::Null);
         drop(stream);
         let _ = served(serving, "serving did not end at EOF").await;
+    }
+
+    /// THALAMUS's principal as the daemon attests it at bind.
+    fn thalamus_harness() -> Principal {
+        Principal::Reserved {
+            module_id: "thalamus-harness".into(),
+        }
+    }
+
+    /// The capability crate's own `log-read-watermark.json` vectors.
+    fn watermark_vectors() -> Value {
+        let file = cortexkit_role_llm_runner::vectors::file("log-read-watermark.json")
+            .expect("the crate ships log-read-watermark.json");
+        let vectors: Value = serde_json::from_str(file).unwrap();
+        assert_eq!(vectors["capability"], LOG_READ_WATERMARK_V1);
+        assert_eq!(vectors["op"], ops::OP_WATERMARK_GET);
+        vectors
+    }
+
+    /// Send `watermark.get` with `params` on route `channel` and return the
+    /// module's reply to it.
+    async fn ask_watermark(
+        stream: &mut TcpStream,
+        channel: u16,
+        corr: u64,
+        params: Value,
+    ) -> Frame {
+        let body = serde_json::to_vec(&json!({"method": ops::OP_WATERMARK_GET, "params": params}))
+            .unwrap();
+        send(
+            stream,
+            route_frame(FrameType::Request, channel, 1, corr, body),
+        )
+        .await;
+        frame_for(stream, channel, corr).await
+    }
+
+    fn answer_of(frame: &Frame) -> Value {
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        serde_json::from_slice::<Value>(&frame.body).unwrap()["result"].clone()
+    }
+
+    fn refusal_code_of(frame: &Frame) -> String {
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Error,
+            "served: {}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        serde_json::from_slice::<ErrorBody>(&frame.body)
+            .unwrap()
+            .code
+    }
+
+    /// Store the OpenCode-for-THALAMUS read watermark as a committed read
+    /// pass leaves it.
+    fn store_thalamus_watermark(state: &SharedState, watermark_ms: u64) {
+        let watermark_ms = i64::try_from(watermark_ms).unwrap();
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO read_watermark (source_key,watermark_ms,updated_at_ms)
+                     VALUES ('opencode-thalamus',?1,?1)",
+                    [watermark_ms],
+                )
+                .map_err(|error| error.to_string())
+            })
+            .unwrap();
+    }
+
+    /// The crate's vectors through the real serving path, on a route bound
+    /// as `thalamus-harness`: `null` (present, not omitted) before any read
+    /// pass, the stored value once one is stored, and `invalid_params` for
+    /// every request with a member.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watermark_get_answers_thalamus_harness_as_the_crate_vectors_pin() {
+        let vectors = watermark_vectors();
+        let replies = vectors["replies"].as_array().unwrap();
+        let null_reply = replies
+            .iter()
+            .find(|reply| reply["watermark_ms"].is_null())
+            .unwrap();
+        let stored_reply = replies
+            .iter()
+            .find(|reply| reply["watermark_ms"].is_u64())
+            .unwrap();
+        let state = Arc::new(test_state());
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        bind_as(&mut stream, 5, 1, thalamus_harness(), "h").await;
+
+        let before = ask_watermark(&mut stream, 5, 10, vectors["request"].clone()).await;
+        assert_eq!(answer_of(&before), *null_reply);
+        let decoded: WatermarkReply = serde_json::from_value(answer_of(&before)).unwrap();
+        assert_eq!(decoded, WatermarkReply::new(None));
+
+        let invalid = vectors["invalid_requests"].as_array().unwrap();
+        assert!(!invalid.is_empty());
+        for (corr, params) in (20..).zip(invalid) {
+            let refused = ask_watermark(&mut stream, 5, corr, params.clone()).await;
+            assert_eq!(refusal_code_of(&refused), "invalid_params", "{params}");
+        }
+
+        store_thalamus_watermark(&state, stored_reply["watermark_ms"].as_u64().unwrap());
+        let after = ask_watermark(&mut stream, 5, 30, vectors["request"].clone()).await;
+        assert_eq!(answer_of(&after), *stored_reply);
+
+        drop(stream);
+        let _ = served(serving, "serving did not end at EOF").await;
+    }
+
+    /// A local app, other modules and an unverified caller are refused
+    /// `not_a_read_source` even while a watermark is stored, and no value
+    /// is served to them; the THALAMUS route beside them gets the value.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watermark_get_refuses_every_caller_astrocyte_does_not_read() {
+        let vectors = watermark_vectors();
+        let refusal = vectors["refusal"]["code"].as_str().unwrap();
+        assert_eq!(refusal, NOT_A_READ_SOURCE);
+        let state = Arc::new(test_state());
+        store_thalamus_watermark(&state, 1_700_000_000_000);
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        let module = |module_id: &str| Principal::Reserved {
+            module_id: module_id.into(),
+        };
+        let callers = [
+            (5, Principal::Direct),
+            (6, module("prefrontal-core")),
+            (7, module("broca")),
+            (8, Principal::Unverified),
+        ];
+        for (corr, (channel, principal)) in (1..).zip(&callers) {
+            bind_as(&mut stream, *channel, corr, principal.clone(), "h").await;
+        }
+        bind_as(&mut stream, 9, 9, thalamus_harness(), "h").await;
+        for (channel, principal) in &callers {
+            let refused = ask_watermark(&mut stream, *channel, 10, json!({})).await;
+            assert_eq!(refusal_code_of(&refused), refusal, "{principal:?}");
+        }
+        let served_value = ask_watermark(&mut stream, 9, 10, json!({})).await;
+        assert_eq!(
+            answer_of(&served_value),
+            json!({"watermark_ms": 1_700_000_000_000_u64})
+        );
+        drop(stream);
+        let _ = served(serving, "serving did not end at EOF").await;
+    }
+
+    /// While `opencode-thalamus` is excluded in `harness_ingest`, or all
+    /// ingestion is off, THALAMUS itself is refused `not_a_read_source`
+    /// although a watermark is stored, so it erases nothing on a progress
+    /// value astrocyte is no longer moving. Back on, the value is served.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watermark_get_refuses_thalamus_while_its_source_is_excluded() {
+        let state = Arc::new(test_state());
+        store_thalamus_watermark(&state, 1_700_000_000_000);
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        bind_as(&mut stream, 5, 1, thalamus_harness(), "h").await;
+        let ingest = |enabled: bool, exclude: &[&str]| {
+            let mut desired = config::intentional_empty().config;
+            desired.harness_ingest = config::HarnessIngest {
+                enabled,
+                exclude: exclude.iter().map(|key| (*key).to_string()).collect(),
+            };
+            desired
+        };
+
+        state.publish_desired(ingest(true, &["opencode-thalamus"]), 2);
+        let excluded = ask_watermark(&mut stream, 5, 10, json!({})).await;
+        assert_eq!(refusal_code_of(&excluded), NOT_A_READ_SOURCE);
+        state.publish_desired(ingest(false, &[]), 3);
+        let all_off = ask_watermark(&mut stream, 5, 11, json!({})).await;
+        assert_eq!(refusal_code_of(&all_off), NOT_A_READ_SOURCE);
+        // Excluding a different source leaves THALAMUS's answer alone.
+        state.publish_desired(ingest(true, &["opencode"]), 4);
+        let other_excluded = ask_watermark(&mut stream, 5, 12, json!({})).await;
+        assert_eq!(
+            answer_of(&other_excluded),
+            json!({"watermark_ms": 1_700_000_000_000_u64})
+        );
+        drop(stream);
+        let _ = served(serving, "serving did not end at EOF").await;
+    }
+
+    /// The principal recorded at bind is dropped when the route goes and
+    /// when the connection ends, so a later route on the same channel and
+    /// epoch never answers as THALAMUS without its own bind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_bind_principal_is_forgotten_when_the_route_or_connection_goes() {
+        use subc_protocol::{BindIdentity, RouteTarget};
+        let handler = AstrocyteHandler {
+            state: Arc::new(test_state()),
+            routes: RouteBinds::default(),
+            connection_end: Arc::new(Mutex::new(None)),
+            subscriptions_stopping: tokio::sync::watch::channel(false).0,
+        };
+        let handle = RouteHandle::detached(5, 1);
+        let bind = RouteBindRequest::new(
+            handle,
+            RouteTarget::ManagementSurface {
+                module_id: DEFAULT_MODULE_ID.to_string(),
+            },
+            BindIdentity::new("/tmp/p", "h", "s"),
+        )
+        .with_principal(thalamus_harness());
+
+        handler.on_bind(&bind).await;
+        assert_eq!(
+            handler.routes.of(handle).principal,
+            Some(thalamus_harness())
+        );
+        handler.on_route_gone(&handle).await;
+        assert_eq!(handler.routes.of(handle).principal, None);
+
+        handler.on_bind(&bind).await;
+        assert_eq!(
+            handler.routes.of(handle).principal,
+            Some(thalamus_harness())
+        );
+        handler.on_connection_end(ConnectionEnd::Eof).await;
+        assert_eq!(handler.routes.of(handle).principal, None);
     }
 
     /// A subscriber's Cancel ends its subscription with a `cancelled`

@@ -68,6 +68,8 @@ subc-os = { workspace = true }
 subc-client-rs = { workspace = true }
 subc-jsonc = { workspace = true }
 fusiform-protocol = { workspace = true }
+# `watermark.get` serves the `log-read-watermark/v1` types from this crate.
+cortexkit-role-llm-runner = { workspace = true }
 tempfile = { version = "3", optional = true }
 
 # `emulate_default_handler`: after a SIGTERM stop has finished, the process
@@ -82,3 +84,5 @@ signal-hook = { version = "0.4", default-features = false }
 astrocyte-readers = { workspace = true, features = ["test-support"] }
 astrocyte-module = { path = ".", features = ["test-support"] }
 tempfile = "3"
+# The crate's own `log-read-watermark.json` vectors, replayed through the handler.
+cortexkit-role-llm-runner = { workspace = true, features = ["test-vectors"] }

@@ -100,7 +100,9 @@ folder no further write can come, so such a call is recorded on the next read.
 ## 4. Read watermark (served by astrocyte)
 
 Astrocyte provides `log-read-watermark/v1` from the llm-runner contract
-(version 0.7.1, point 5). `watermark.get {}` returns `{watermark_ms: T}`:
+(`cortexkit-role-llm-runner` 0.7.1, §9.15), declared in its manifest's
+`capabilities.provides`. `watermark.get {}` returns `{watermark_ms: T}`;
+a request with any member is refused `invalid_params`:
 
 - T is the start of astrocyte's most recent complete read pass over every
   declared folder, minus 60 seconds, reported only after that pass's
@@ -118,9 +120,10 @@ Astrocyte provides `log-read-watermark/v1` from the llm-runner contract
   seconds in the shipped configuration). A `done` folder can therefore
   normally be erased about two to three minutes after its `done_at_ms`.
 - `{watermark_ms: null}` means no complete pass yet: erase nothing.
-- Astrocyte answers only the daemon-attested `thalamus-harness` principal.
-  Any other caller, and every caller while `opencode-thalamus` is excluded in
-  `harness_ingest`, is refused with `not_a_read_source`.
+- Astrocyte answers only the `thalamus-harness` principal the daemon attested
+  when the route was bound. Any other caller, and every caller while
+  `opencode-thalamus` is excluded in `harness_ingest` (or `enabled` is
+  `false`), is refused with `not_a_read_source`.
 
 ## 5. Erasing a finished session (harness module)
 

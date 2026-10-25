@@ -64,6 +64,7 @@ Test: `every_operation_name_reaches_its_own_handler`.
 | `usage.cache.steps` | read | `harness`, `session`, `limit?`, `after_cursor?` |
 | `usage.steps.subscribe` | read, watch | none |
 | `usage.steps.read` | read | `after?`, `limit?` |
+| `watermark.get` | read | none |
 | `spend.event.ingest` | write | see §3.1 |
 | `spend.correction.ingest` | write | see §3.2 |
 | `spend.chargeability.settle` | write | `event_id`, `to_state`, `reason` |
@@ -568,6 +569,34 @@ Tests: `a_notice_is_sent_only_after_its_steps_commit`,
 `a_subscriber_that_falls_behind_its_queue_ends_lagged`,
 `a_drain_ends_every_step_subscription_before_goodbye`,
 `two_subscribers_both_receive_a_notice`.
+
+### 4.3 Read watermark (`log-read-watermark/v1`)
+
+`watermark.get` tells a module how far astrocyte has durably read the logs
+that module writes, so the module can erase logs that have been recorded.
+Astrocyte declares the capability in the manifest's `capabilities.provides`.
+The names and wire types are the `watermark` module of
+`cortexkit-role-llm-runner` (0.7.1, contract §9.15).
+
+- The request is `{}`; any member is refused `invalid_params`.
+- Astrocyte answers for the principal the daemon attested when the route was
+  bound, never for a module the request names. It forgets that principal when
+  the route goes or the connection ends.
+- A module principal maps to one reader source. Today the only row is
+  `thalamus-harness` → `opencode-thalamus` (the
+  [THALAMUS sessions contract](thalamus-opencode-sessions-contract.md) §4).
+- Reply `{"watermark_ms": <u64>}`, the source's stored watermark, read on the
+  read-only connection; `{"watermark_ms": null}` (present, not omitted)
+  before the source's first complete read pass.
+- Refusal `not_a_read_source`: the caller is not in that table (a local app's
+  `Direct` principal, any other module), or its source is excluded in
+  `harness_ingest` (named in `exclude`, or `enabled: false`).
+
+Tests: `watermark_get_answers_thalamus_harness_as_the_crate_vectors_pin`,
+`watermark_get_refuses_every_caller_astrocyte_does_not_read`,
+`watermark_get_refuses_thalamus_while_its_source_is_excluded`,
+`the_bind_principal_is_forgotten_when_the_route_or_connection_goes`,
+`manifest_provides_the_log_read_watermark_capability`.
 
 ## 5. Calls astrocyte makes
 

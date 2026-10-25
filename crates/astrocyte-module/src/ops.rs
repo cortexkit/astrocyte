@@ -6,8 +6,13 @@
 
 use astrocyte_core::report::{ReportError, ReportRequest};
 use astrocyte_core::verdict::VerdictRequest;
+use cortexkit_role_llm_runner::watermark::{
+    WatermarkReply, WatermarkRequest, NOT_A_READ_SOURCE, WATERMARK_GET,
+};
 use serde_json::{json, Value};
+use subc_protocol::Principal;
 
+use crate::refresher::opencode_thalamus_source;
 use crate::state::{now_ms, SharedState};
 
 pub const OP_VERDICT: &str = "budget.verdict";
@@ -36,10 +41,34 @@ pub const OP_CACHE_STEPS: &str = "usage.cache.steps";
 /// serving handler checks that before either reaches its code.
 pub const OP_STEPS_SUBSCRIBE: &str = "usage.steps.subscribe";
 pub const OP_STEPS_READ: &str = "usage.steps.read";
+/// `log-read-watermark/v1`: how far astrocyte has durably read the calling
+/// module's own logs (see `watermark_get`). The serving handler answers it for
+/// the principal the daemon attested at route bind. The name is the capability
+/// crate's `WATERMARK_GET`. It is written out as a literal because the doc
+/// checks in `scripts/check_doc_references.py` read served names from string
+/// literals in this file; the assertion below stops the build if the two differ.
+pub const OP_WATERMARK_GET: &str = "watermark.get";
+const _: () = assert!(same_str(OP_WATERMARK_GET, WATERMARK_GET));
+
+/// Byte equality of two strings, usable in a constant assertion.
+const fn same_str(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
 
 /// The closed public surface consumed by dispatch, the manifest, and the schema
 /// artifact. Exact name-set parity prevents a same-sized but incorrect surface.
-pub const PUBLIC_OPERATION_NAMES: [&str; 22] = [
+pub const PUBLIC_OPERATION_NAMES: [&str; 23] = [
     OP_VERDICT,
     OP_REPORT,
     OP_EVENT_INGEST,
@@ -62,6 +91,7 @@ pub const PUBLIC_OPERATION_NAMES: [&str; 22] = [
     OP_CACHE_STEPS,
     OP_STEPS_SUBSCRIBE,
     OP_STEPS_READ,
+    OP_WATERMARK_GET,
 ];
 
 /// Versioned, committed operation-schema artifact embedded in the serving
@@ -282,6 +312,7 @@ fn operation_params_schema(name: &str) -> Value {
             &[],
             json!({"after": optional_string, "limit": optional_u32}),
         ),
+        OP_WATERMARK_GET => closed_object(&[], json!({})),
         other => unreachable!("operation {other} is served without a params schema"),
     }
 }
@@ -342,6 +373,10 @@ pub fn dispatch(state: &SharedState, method: &str, params: Value) -> OpResult {
         OP_STEPS_READ => crate::step_feed::read(state, params)
             .map(|page| json!(page))
             .map_err(|refusal| (refusal.code, refusal.message)),
+        // Dispatch knows no route principal, so the request is decoded and
+        // then refused as if from a caller astrocyte does not read. The
+        // serving handler answers it with the route's bind principal.
+        OP_WATERMARK_GET => watermark_get(state, None, params),
         other => Err(("unknown_method".into(), format!("unknown method '{other}'"))),
     }
 }
@@ -784,6 +819,86 @@ fn map_cache_error(error: astrocyte_core::cache_diagnostics::CacheError) -> (Str
     }
 }
 
+/// A module whose own logs astrocyte reads, and the reader source that holds
+/// its read watermark.
+struct ReadSource {
+    /// The module id the daemon attests at route bind (`Principal::Reserved`).
+    module_id: &'static str,
+    /// The source's key in `harness_ingest.exclude` and `read_watermark`.
+    source_key: &'static str,
+    /// The stored watermark, read inside a read transaction.
+    watermark_ms: fn(&rusqlite::Connection) -> Result<Option<i64>, String>,
+}
+
+/// Who `watermark.get` answers, and with which source. A caller only ever
+/// learns its own source's progress: the request names no source, so no
+/// module can ask about another's logs. A module gets a row here once one of
+/// astrocyte's readers keeps a watermark for its logs.
+const READ_SOURCES: [ReadSource; 1] = [ReadSource {
+    module_id: "thalamus-harness",
+    source_key: opencode_thalamus_source::SOURCE_KEY,
+    watermark_ms: opencode_thalamus_source::watermark_ms,
+}];
+
+/// `watermark.get` for the route's bind principal: the stored watermark of
+/// the caller's own source, `null` before its first complete read pass. A
+/// caller with no row in `READ_SOURCES` (a local app, any other module, no
+/// principal) and a source excluded in `harness_ingest` are both refused
+/// `not_a_read_source`. A member in the request is refused `invalid_params`,
+/// as the capability contract fixes.
+pub fn watermark_get(
+    state: &SharedState,
+    principal: Option<&Principal>,
+    params: Value,
+) -> OpResult {
+    let _: WatermarkRequest = serde_json::from_value(params).map_err(|error| {
+        (
+            "invalid_params".into(),
+            format!("watermark params: {error}"),
+        )
+    })?;
+    let source = match principal {
+        Some(Principal::Reserved { module_id }) => READ_SOURCES
+            .iter()
+            .find(|source| source.module_id == module_id),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        (
+            NOT_A_READ_SOURCE.into(),
+            "astrocyte reads no logs written by this caller".into(),
+        )
+    })?;
+    if !state
+        .desired_config()
+        .harness_ingest
+        .ingests(source.source_key)
+    {
+        return Err((
+            NOT_A_READ_SOURCE.into(),
+            format!(
+                "{} is excluded in harness_ingest, so astrocyte does not read it",
+                source.source_key
+            ),
+        ));
+    }
+    let stored = read_value(state, |connection| {
+        (source.watermark_ms)(connection).map_err(|error| ("internal".into(), error))
+    })?;
+    let watermark_ms = stored
+        .map(|ms| {
+            u64::try_from(ms).map_err(|_| {
+                (
+                    "internal".into(),
+                    format!("stored {} watermark {ms} is negative", source.source_key),
+                )
+            })
+        })
+        .transpose()?;
+    serde_json::to_value(WatermarkReply::new(watermark_ms))
+        .map_err(|error| ("internal".into(), format!("watermark reply: {error}")))
+}
+
 /// Run a served read-only operation on the store's reader connection, in one
 /// read transaction (see `SharedState::with_read_op`), so the report neither
 /// waits for nor holds up the writer. Only for operations that never write.
@@ -1119,6 +1234,7 @@ mod tests {
             "usage.cache.steps",
             "usage.steps.read",
             "usage.steps.subscribe",
+            "watermark.get",
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -1144,7 +1260,7 @@ mod tests {
     #[test]
     fn every_operation_name_reaches_its_own_handler() {
         // Each operation is paired with the marker its own handler writes.
-        const ROUTES: [(&str, &str); 22] = HANDLER_MARKERS;
+        const ROUTES: [(&str, &str); 23] = HANDLER_MARKERS;
 
         // The markers only discriminate while none of them is a prefix of
         // another: three of these begin with the word "subscription", and if
@@ -1180,7 +1296,7 @@ mod tests {
         for (name, marker) in ROUTES {
             let (code, message) = dispatch(&state, name, json!({"astrocyte_probe": true}))
                 .expect_err("an unknown field is refused by every request type on this surface");
-            assert_eq!(code, "malformed", "{name}");
+            assert_eq!(code, decode_refusal_code(name), "{name}");
             assert!(
                 message.starts_with(marker),
                 "{name} was answered by a handler that reported {message:?}, \
@@ -1193,7 +1309,7 @@ mod tests {
     /// request-decoding error. A refusal with code `malformed` and a message
     /// starting with that literal came from the decoder; any other answer
     /// means the decoder accepted the params.
-    const HANDLER_MARKERS: [(&str, &str); 22] = [
+    const HANDLER_MARKERS: [(&str, &str); 23] = [
         (OP_VERDICT, "verdict params: "),
         (OP_REPORT, "report params: "),
         (OP_EVENT_INGEST, "event params: "),
@@ -1216,7 +1332,19 @@ mod tests {
         (OP_CACHE_STEPS, "cache steps params: "),
         (OP_STEPS_SUBSCRIBE, "steps subscribe params: "),
         (OP_STEPS_READ, "steps read params: "),
+        (OP_WATERMARK_GET, "watermark params: "),
     ];
+
+    /// The code a request-decoding refusal carries. `watermark.get` belongs
+    /// to the `log-read-watermark/v1` capability, whose contract names
+    /// `invalid_params`; every other operation here says `malformed`.
+    fn decode_refusal_code(name: &str) -> &'static str {
+        if name == OP_WATERMARK_GET {
+            "invalid_params"
+        } else {
+            "malformed"
+        }
+    }
 
     /// Valid params for one operation, plus one params value both the decoder
     /// and the published schema must refuse.
@@ -1419,6 +1547,13 @@ mod tests {
                 ],
                 json!({"limit": -1}),
             ),
+            // The request has no members, so the refused sample is an
+            // unknown member, as the capability's vectors refuse.
+            sample(
+                OP_WATERMARK_GET,
+                vec![json!({})],
+                json!({"module": "another-module"}),
+            ),
         ]
     }
 
@@ -1547,7 +1682,9 @@ mod tests {
             .map(|(_, marker)| *marker)
             .unwrap_or_else(|| panic!("{name} has no handler marker"));
         match dispatch(state, name, params.clone()) {
-            Err((code, message)) if code == "malformed" && message.starts_with(marker) => {
+            Err((code, message))
+                if code == decode_refusal_code(name) && message.starts_with(marker) =>
+            {
                 Some(message)
             }
             _ => None,
