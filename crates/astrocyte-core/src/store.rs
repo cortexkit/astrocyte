@@ -3745,6 +3745,101 @@ CREATE TABLE read_watermark (
 ) WITHOUT ROWID;
 "#,
     },
+    Migration {
+        version: 31,
+        statements: r#"-- REPLACE deletes conflicting rows without firing DELETE triggers when
+-- recursive_triggers is off. Check every unique identity before insertion so
+-- immutable content cannot be replaced, regardless of the writer's pragmas.
+-- Separate EXISTS probes let each identity use its own unique index.
+-- Rowid tables with non-integer primary keys also have a hidden unique rowid.
+CREATE TRIGGER usage_event_insert_once BEFORE INSERT ON usage_event
+WHEN EXISTS (SELECT 1 FROM usage_event WHERE event_key=NEW.event_key)
+  OR EXISTS (SELECT 1 FROM usage_event WHERE event_id=NEW.event_id)
+  OR EXISTS (SELECT 1 FROM usage_event WHERE producer=NEW.producer
+      AND producer_lineage=NEW.producer_lineage AND producer_ref=NEW.producer_ref)
+BEGIN
+    SELECT RAISE(ABORT, 'usage_event_insert_once');
+END;
+CREATE TRIGGER measurement_insert_once BEFORE INSERT ON measurement
+WHEN EXISTS (SELECT 1 FROM measurement WHERE rowid=NEW.rowid)
+  OR EXISTS (SELECT 1 FROM measurement WHERE event_key=NEW.event_key
+    AND role=NEW.role AND unit=NEW.unit)
+BEGIN
+    SELECT RAISE(ABORT, 'measurement_insert_once');
+END;
+CREATE TRIGGER chargeability_transition_insert_once BEFORE INSERT ON chargeability_transition
+WHEN EXISTS (SELECT 1 FROM chargeability_transition WHERE event_key=NEW.event_key)
+BEGIN
+    SELECT RAISE(ABORT, 'chargeability_transition_insert_once');
+END;
+CREATE TRIGGER priced_charge_insert_once BEFORE INSERT ON priced_charge
+WHEN EXISTS (SELECT 1 FROM priced_charge WHERE charge_key=NEW.charge_key)
+  OR EXISTS (SELECT 1 FROM priced_charge WHERE supersedes=NEW.supersedes)
+  OR EXISTS (SELECT 1 FROM priced_charge WHERE event_key=NEW.event_key
+      AND role=NEW.role AND unit=NEW.unit AND pricing_generation=NEW.pricing_generation)
+  OR (NEW.supersedes IS NULL AND EXISTS (SELECT 1 FROM priced_charge
+      WHERE event_key=NEW.event_key AND role=NEW.role AND unit=NEW.unit AND supersedes IS NULL))
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_insert_once');
+END;
+CREATE TRIGGER adjustment_insert_once BEFORE INSERT ON adjustment
+WHEN EXISTS (SELECT 1 FROM adjustment WHERE rowid=NEW.rowid)
+  OR EXISTS (SELECT 1 FROM adjustment WHERE adjustment_id=NEW.adjustment_id)
+  OR EXISTS (SELECT 1 FROM adjustment WHERE correction_id=NEW.correction_id)
+BEGIN
+    SELECT RAISE(ABORT, 'adjustment_insert_once');
+END;
+CREATE TRIGGER statement_insert_once BEFORE INSERT ON statement
+WHEN EXISTS (SELECT 1 FROM statement WHERE rowid=NEW.rowid)
+  OR EXISTS (SELECT 1 FROM statement WHERE statement_id=NEW.statement_id)
+  OR EXISTS (SELECT 1 FROM statement WHERE provider=NEW.provider AND account_ref=NEW.account_ref
+      AND period_start_ms=NEW.period_start_ms AND period_end_ms=NEW.period_end_ms)
+BEGIN
+    SELECT RAISE(ABORT, 'statement_insert_once');
+END;
+CREATE TRIGGER statement_line_insert_once BEFORE INSERT ON statement_line
+WHEN EXISTS (SELECT 1 FROM statement_line WHERE rowid=NEW.rowid)
+  OR EXISTS (SELECT 1 FROM statement_line WHERE statement_line_id=NEW.statement_line_id)
+  OR EXISTS (SELECT 1 FROM statement_line WHERE statement_id=NEW.statement_id AND line_id=NEW.line_id)
+BEGIN
+    SELECT RAISE(ABORT, 'statement_line_insert_once');
+END;
+CREATE TRIGGER match_attempt_insert_once BEFORE INSERT ON match_attempt
+WHEN EXISTS (SELECT 1 FROM match_attempt WHERE rowid=NEW.rowid)
+  OR EXISTS (SELECT 1 FROM match_attempt WHERE attempt_id=NEW.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'match_attempt_insert_once');
+END;
+CREATE TRIGGER statement_import_insert_once BEFORE INSERT ON statement_import
+WHEN EXISTS (SELECT 1 FROM statement_import WHERE rowid=NEW.rowid)
+  OR EXISTS (SELECT 1 FROM statement_import WHERE import_id=NEW.import_id)
+BEGIN
+    SELECT RAISE(ABORT, 'statement_import_insert_once');
+END;
+CREATE TRIGGER account_subscription_insert_once BEFORE INSERT ON account_subscription
+WHEN EXISTS (SELECT 1 FROM account_subscription WHERE rowid=NEW.rowid)
+  OR EXISTS (SELECT 1 FROM account_subscription WHERE provider=NEW.provider
+    AND account_ref=NEW.account_ref AND effective_from_ms=NEW.effective_from_ms)
+  OR (NEW.effective_to_ms IS NULL AND EXISTS (SELECT 1 FROM account_subscription
+      WHERE provider=NEW.provider AND account_ref=NEW.account_ref AND effective_to_ms IS NULL))
+BEGIN
+    SELECT RAISE(ABORT, 'account_subscription_insert_once');
+END;
+CREATE TRIGGER multiplier_observation_insert_once BEFORE INSERT ON multiplier_observation
+WHEN EXISTS (SELECT 1 FROM multiplier_observation WHERE observation_id=NEW.observation_id)
+  OR EXISTS (SELECT 1 FROM multiplier_observation WHERE supersedes=NEW.supersedes)
+  OR (NEW.supersedes IS NULL AND EXISTS (SELECT 1 FROM multiplier_observation
+      WHERE quota_provider=NEW.quota_provider AND observation_day=NEW.observation_day AND supersedes IS NULL))
+BEGIN
+    SELECT RAISE(ABORT, 'multiplier_observation_insert_once');
+END;
+CREATE TRIGGER step_feed_insert_once BEFORE INSERT ON step_feed
+WHEN EXISTS (SELECT 1 FROM step_feed WHERE feed_cursor=NEW.feed_cursor)
+BEGIN
+    SELECT RAISE(ABORT, 'step_feed_insert_once');
+END;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -3808,7 +3903,7 @@ mod tests {
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (30, 30, 30)
+            (31, 31, 31)
         );
         assert_eq!(
             store
@@ -3821,7 +3916,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 30, 30)
+            (0, 31, 31)
         );
         assert!(!second.store_ahead());
         store
@@ -3831,7 +3926,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',31,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',32,1)",
                     [],
                 )?;
                 Ok(())
@@ -3840,7 +3935,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 31, 30)
+            (0, 32, 31)
         );
         assert!(ahead.store_ahead());
     }
@@ -4005,6 +4100,264 @@ mod tests {
         )?;
         tx.commit()
     }
+
+    fn replace_guard_store() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version < 31) {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        seed_integer_chains(&conn);
+        conn.execute_batch("INSERT INTO usage_event (event_key,event_id,producer,producer_lineage,producer_ref,charge_basis,recorded_at_ms)
+                VALUES (30,'unpriced','fixture','lineage','unpriced','metered_api',1);
+            INSERT INTO chargeability_transition VALUES (10,'unresolved','billed','later','later_record',2);
+            INSERT INTO adjustment (adjustment_id,event_key,currency,amount_nanos,reason,occurred_at_ms,recorded_at_ms,origin,correction_id)
+                VALUES ('adj',10,'USD',-5,'refund',2,2,'operator','retry');
+            INSERT INTO statement VALUES ('s','provider','account',0,10,'USD',2);
+            INSERT INTO statement_line VALUES ('l','s','line',2,'line',1,'token',1,'USD',NULL,'settled',10);
+            INSERT INTO match_attempt VALUES ('attempt','l','settled',10,3000,3000,2);
+            INSERT INTO statement_import VALUES ('import','s',printf('%064d',0),'fixture.csv',2,NULL,'created',1,0,0,1,0,0,0,0,0);
+            INSERT INTO account_subscription VALUES ('account','provider','plan',100,'USD',2,'month',0,NULL,NULL);
+            INSERT INTO step_detail(event_key,finish) VALUES (10,'stop');
+            INSERT INTO broca_step(step_key,run_id,step_id,fact_id,project_root,harness,session,provider,model,finished_at_ms,recorded_at_ms)
+                VALUES (1,'run',1,'fact','/project','broca','session','provider','model',1,1);
+            INSERT INTO step_feed VALUES (1,'broca','step','runner','session',1,'{}');").unwrap();
+        insert_multiplier_row(&conn, "provider", "2026-01-02", Some(None)).unwrap();
+        let before = all_rows(&conn);
+        conn.execute_batch(MIGRATIONS.last().unwrap().statements)
+            .unwrap();
+        assert_eq!(all_rows(&conn), before, "migration must not rewrite rows");
+        // An external writer may leave foreign_keys and recursive_triggers off.
+        // Clear cache_step_sequence so its unique event/step indexes cannot hide
+        // a missing insert-once guard by rejecting REPLACE for a different reason.
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF; PRAGMA recursive_triggers=OFF;
+            DELETE FROM cache_step_sequence;
+            DROP TRIGGER account_subscription_no_overlap;",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn refuse_replacements(conn: &Connection, table: &str, filter: &str, changes: &[(&str, &str)]) {
+        let insert =
+            clone_insert(conn, table, changes).replace("LIMIT 1", &format!("{filter} LIMIT 1"));
+        let insert = if let Some((_, rowid)) = changes.iter().find(|(name, _)| *name == "rowid") {
+            insert.replacen(" (", " (rowid,", 1).replacen(
+                " SELECT ",
+                &format!(" SELECT {rowid},"),
+                1,
+            )
+        } else {
+            insert
+        };
+        for verb in ["INSERT OR REPLACE", "REPLACE"] {
+            let sql = insert.replacen("INSERT", verb, 1);
+            let before = all_rows(conn);
+            let result = conn.execute(&sql, []);
+            assert_eq!(all_rows(conn), before, "{sql}: returned {result:?}");
+            let error = result.expect_err("REPLACE must be refused");
+            assert!(
+                error.to_string().contains(&format!("{table}_insert_once")),
+                "{sql}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_event_refuses_replace() {
+        let conn = replace_guard_store();
+        for keys in [
+            vec![],
+            vec![("event_key", "40")],
+            vec![("event_key", "40"), ("event_id", "'other'")],
+        ] {
+            let mut changes = vec![("recorded_at_ms", "9")];
+            changes.extend(keys);
+            refuse_replacements(&conn, "usage_event", "WHERE event_key=30", &changes);
+        }
+    }
+
+    #[test]
+    fn priced_charge_refuses_replace() {
+        let conn = replace_guard_store();
+        refuse_replacements(&conn, "priced_charge", "", &[("recorded_at_ms", "9")]);
+        refuse_replacements(
+            &conn,
+            "priced_charge",
+            "",
+            &[("charge_key", "101"), ("recorded_at_ms", "9")],
+        );
+        conn.execute_batch("UPDATE usage_event SET pricing_generation=2 WHERE event_key=10")
+            .unwrap();
+        refuse_replacements(
+            &conn,
+            "priced_charge",
+            "",
+            &[
+                ("charge_key", "101"),
+                ("pricing_generation", "2"),
+                ("recorded_at_ms", "9"),
+            ],
+        );
+        conn.execute_batch(&integer_charge(101, 10, "input", "token", 2, Some(100)))
+            .unwrap();
+        conn.execute_batch("UPDATE usage_event SET pricing_generation=3 WHERE event_key=10")
+            .unwrap();
+        refuse_replacements(
+            &conn,
+            "priced_charge",
+            "WHERE charge_key=101",
+            &[
+                ("charge_key", "102"),
+                ("pricing_generation", "3"),
+                ("recorded_at_ms", "9"),
+            ],
+        );
+    }
+
+    #[test]
+    fn multiplier_observation_refuses_replace() {
+        let conn = replace_guard_store();
+        refuse_replacements(
+            &conn,
+            "multiplier_observation",
+            "",
+            &[("snapshot_at_ms", "9")],
+        );
+        refuse_replacements(
+            &conn,
+            "multiplier_observation",
+            "",
+            &[("observation_id", "2"), ("snapshot_at_ms", "9")],
+        );
+        insert_multiplier_row(&conn, "provider", "2026-01-02", Some(Some(1))).unwrap();
+        refuse_replacements(
+            &conn,
+            "multiplier_observation",
+            "WHERE observation_id=2",
+            &[("observation_id", "3"), ("snapshot_at_ms", "9")],
+        );
+    }
+
+    macro_rules! replace_guard_test {
+        ($name:ident, $table:literal, $($changes:expr),+ $(,)?) => {
+            #[test]
+            fn $name() {
+                let conn = replace_guard_store();
+                $(refuse_replacements(&conn, $table, "", $changes);)+
+            }
+        };
+    }
+
+    replace_guard_test!(
+        measurement_refuses_replace,
+        "measurement",
+        &[("quantity_units", "9")],
+        &[
+            ("rowid", "rowid"),
+            ("role", "'changed'"),
+            ("quantity_units", "9")
+        ]
+    );
+    replace_guard_test!(
+        chargeability_transition_refuses_replace,
+        "chargeability_transition",
+        &[("reason", "'changed'")]
+    );
+    replace_guard_test!(
+        adjustment_refuses_replace,
+        "adjustment",
+        &[("amount_nanos", "9")],
+        &[("adjustment_id", "'other'"), ("amount_nanos", "9")],
+        &[
+            ("rowid", "rowid"),
+            ("adjustment_id", "'other'"),
+            ("correction_id", "NULL"),
+            ("amount_nanos", "9")
+        ]
+    );
+    replace_guard_test!(
+        statement_refuses_replace,
+        "statement",
+        &[("amount_exponent", "3")],
+        &[("statement_id", "'other'"), ("amount_exponent", "3")],
+        &[
+            ("rowid", "rowid"),
+            ("statement_id", "'other'"),
+            ("provider", "'other'"),
+            ("amount_exponent", "3")
+        ]
+    );
+    replace_guard_test!(
+        statement_line_refuses_replace,
+        "statement_line",
+        &[("description", "'changed'")],
+        &[
+            ("statement_line_id", "'other'"),
+            ("description", "'changed'")
+        ],
+        &[
+            ("rowid", "rowid"),
+            ("statement_line_id", "'other'"),
+            ("line_id", "'other'"),
+            ("description", "'changed'")
+        ]
+    );
+    replace_guard_test!(
+        match_attempt_refuses_replace,
+        "match_attempt",
+        &[("vendor_amount_nanos", "9")],
+        &[
+            ("rowid", "rowid"),
+            ("attempt_id", "'other'"),
+            ("vendor_amount_nanos", "9")
+        ]
+    );
+    replace_guard_test!(
+        statement_import_refuses_replace,
+        "statement_import",
+        &[("source_path", "'changed.csv'")],
+        &[
+            ("rowid", "rowid"),
+            ("import_id", "'other'"),
+            ("source_path", "'changed.csv'")
+        ]
+    );
+    // The overlap validator is removed in the fixture so it cannot hide a
+    // missing insert-once guard; production retains both independent guards.
+    replace_guard_test!(
+        account_subscription_refuses_replace,
+        "account_subscription",
+        &[("operator", "'changed'")],
+        &[("effective_from_ms", "1"), ("operator", "'changed'")],
+        &[
+            ("rowid", "rowid"),
+            ("provider", "'other'"),
+            ("operator", "'changed'")
+        ]
+    );
+    replace_guard_test!(
+        step_detail_refuses_replace,
+        "step_detail",
+        &[("finish", "'changed'")]
+    );
+    replace_guard_test!(
+        broca_step_refuses_replace,
+        "broca_step",
+        &[("recorded_at_ms", "9")],
+        &[("step_key", "2"), ("recorded_at_ms", "9")],
+        &[
+            ("step_key", "2"),
+            ("fact_id", "'other'"),
+            ("recorded_at_ms", "9")
+        ]
+    );
+    replace_guard_test!(
+        step_feed_refuses_replace,
+        "step_feed",
+        &[("row_json", "'{\"changed\":true}'")]
+    );
 
     fn integer_store() -> Connection {
         let mut conn = open_memory();

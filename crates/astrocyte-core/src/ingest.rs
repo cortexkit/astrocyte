@@ -1395,6 +1395,147 @@ mod tests {
         assert_eq!(count(&tx, "chargeability_transition"), 0);
     }
 
+    #[test]
+    #[ignore = "deterministic 10,000-event insert-once VM-step and WAL comparison"]
+    fn insert_once_ingest_cost() {
+        struct ProfileSteps<'a> {
+            conn: &'a mut Connection,
+            steps: Box<u64>,
+        }
+        unsafe extern "C" fn profile(
+            _mask: std::os::raw::c_uint,
+            context: *mut std::ffi::c_void,
+            statement: *mut std::ffi::c_void,
+            _elapsed: *mut std::ffi::c_void,
+        ) -> std::os::raw::c_int {
+            // SQLite calls PROFILE synchronously while the boxed counter is
+            // alive. VM_STEP includes trigger programs, unlike elapsed time.
+            unsafe {
+                *context.cast::<u64>() += u64::try_from(rusqlite::ffi::sqlite3_stmt_status(
+                    statement.cast(),
+                    rusqlite::ffi::SQLITE_STMTSTATUS_VM_STEP,
+                    1,
+                ))
+                .unwrap();
+            }
+            0
+        }
+        impl<'a> ProfileSteps<'a> {
+            fn new(conn: &'a mut Connection) -> Self {
+                let mut counter = Self {
+                    conn,
+                    steps: Box::new(0),
+                };
+                let status = unsafe {
+                    rusqlite::ffi::sqlite3_trace_v2(
+                        counter.conn.handle(),
+                        rusqlite::ffi::SQLITE_TRACE_PROFILE as u32,
+                        Some(profile),
+                        (&mut *counter.steps as *mut u64).cast(),
+                    )
+                };
+                assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+                counter
+            }
+        }
+        impl Drop for ProfileSteps<'_> {
+            fn drop(&mut self) {
+                // Unregister before freeing the callback's boxed context,
+                // including when an assertion unwinds the measurement loop.
+                unsafe {
+                    rusqlite::ffi::sqlite3_trace_v2(
+                        self.conn.handle(),
+                        0,
+                        None,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+        }
+
+        let directory =
+            std::env::temp_dir().join(format!("astrocyte-insert-once-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let requests: Vec<_> = (0..10_000)
+            .map(|index| {
+                request(
+                    &format!("event-{index}"),
+                    None,
+                    vec![
+                        measurement("input", Some(20)),
+                        measurement("output", Some(10)),
+                        measurement("cache_read", Some(5)),
+                        measurement("reasoning", Some(2)),
+                    ],
+                )
+            })
+            .collect();
+        eprintln!("SQLite {}: 10,000 record_event transactions, four measurements/event, FULL synchronous, 4096-byte pages", rusqlite::version());
+        let mut results = Vec::new();
+        for (label, guarded, recursive) in [
+            ("baseline", false, false),
+            ("recursive", false, true),
+            ("insert_once", true, false),
+            ("both", true, true),
+            ("insert_once_repeat", true, false),
+        ] {
+            let path = directory.join(format!("{label}.db"));
+            let mut conn = Connection::open(&path).unwrap();
+            initialize_connection(&conn).unwrap();
+            conn.execute_batch(
+                "PRAGMA page_size=4096; PRAGMA journal_mode=WAL;
+                PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=FULL;",
+            )
+            .unwrap();
+            for migration in MIGRATIONS.iter().filter(|m| guarded || m.version < 31) {
+                conn.execute_batch(migration.statements).unwrap();
+            }
+            conn.pragma_update(None, "recursive_triggers", recursive)
+                .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            let steps = {
+                let counter = ProfileSteps::new(&mut conn);
+                for request in &requests {
+                    let outcome = record_event(counter.conn, request, 2_000).unwrap();
+                    assert_eq!(outcome.disposition, RecordDisposition::Recorded);
+                }
+                *counter.steps
+            };
+            assert_eq!(count(&conn, "usage_event"), 10_000);
+            assert_eq!(count(&conn, "measurement"), 40_000);
+            let frames: (i64, i64, i64) = conn
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(frames.0, 0);
+            assert_eq!(frames.1, frames.2);
+            eprintln!(
+                "{label}: vm_steps={steps}, wal_frames={}, checkpointed={}",
+                frames.1, frames.2
+            );
+            results.push((steps, frames.1));
+            drop(conn);
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_eq!(
+            results[0], results[1],
+            "recursive triggers must not change ordinary ingest work"
+        );
+        assert_eq!(results[2], results[3]);
+        assert_eq!(
+            results[2], results[4],
+            "fixed input must give repeatable counters"
+        );
+        assert!(
+            results[2].0 > results[0].0,
+            "insert-once probes must be counted"
+        );
+        assert_eq!(results[2].1, results[0].1, "guards must not add WAL writes");
+        std::fs::remove_dir(directory).unwrap();
+    }
+
     fn count(conn: &Connection, table: &str) -> i64 {
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
             row.get(0)

@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 30. A schema change appends a migration; an applied
+currently version 31. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -58,13 +58,33 @@ in the table above means both of these exist:
 - `usage_event_no_delete`, `measurement_no_update`, `measurement_no_delete`
 - `chargeability_transition_no_update`, `chargeability_transition_no_delete`
 - `priced_charge_no_update`, `priced_charge_no_delete`
+- `adjustment_no_update`, `adjustment_no_delete`
 - `statement_no_update`, `statement_no_delete`, `statement_line_no_delete`
 - `match_attempt_no_update`, `match_attempt_no_delete`
 - `statement_import_no_update`, `statement_import_no_delete`
 - `multiplier_observation_no_update`, `multiplier_observation_no_delete`
 - `account_subscription_no_delete`
-- `step_detail_no_update`, `step_detail_no_delete`, and `step_detail_insert_once`,
-  which also stops `INSERT OR REPLACE` from replacing a row
+- `step_detail_no_update`, `step_detail_no_delete`
+
+Each of these tables also has a `BEFORE INSERT` trigger named
+`<table>_insert_once`. The same protection applies to `broca_step` and
+`step_feed`, whose rows cannot be updated but can be deleted for retention.
+The triggers refuse an insert that collides with an existing unique identity,
+including secondary and partial unique indexes and hidden rowids. This stops
+both `INSERT OR REPLACE` and `REPLACE INTO` from silently deleting the old row
+and inserting new content. SQLite normally skips delete triggers for those
+implicit deletions when `recursive_triggers` is off. The insert-once guards
+work even for an external writer with that default setting; connections do not
+need to enable recursive triggers.
+
+A duplicate insert raises `ABORT` even with `INSERT OR IGNORE` or
+`ON CONFLICT DO NOTHING`. Ledger redelivery and other idempotent writes must
+look up the existing identity before inserting, as the ingest and statement
+paths already do. Mutable queues, cursors, capacity observations and hourly
+summary tables retain their existing conflict handling. Migration 31 adds only
+triggers and does not rewrite stored rows. Tests named `<table>_refuses_replace`
+exercise both replacement spellings and compare every stored column before
+and after each refusal.
 
 `usage_event_update_guard` lets exactly three columns of an event move, all
 projections the ledger maintains: `pricing_generation` advances by one per

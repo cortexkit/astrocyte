@@ -1856,7 +1856,7 @@ test_file = "crates/astrocyte-core/src/ingest.rs"
 runner = "cargo"
 package = "astrocyte-core"
 target = "--lib"
-expect_red = ["ingest::tests::step_detail_refuses_update_and_delete"]
+expect_red = ["ingest::tests::step_detail_refuses_update_and_delete", "store::tests::step_detail_refuses_replace"]
 only = true
 timeout_s = 300
 build_timeout_s = 600
@@ -2341,3 +2341,198 @@ expect_message = "served: "
 only = true
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "ledger-usage-event-insert-once"
+guards = "REPLACE cannot overwrite a usage event through any unique identity"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'usage_event_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::usage_event_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-measurement-insert-once"
+guards = "REPLACE cannot overwrite a measurement"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'measurement_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::measurement_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-chargeability-transition-insert-once"
+guards = "REPLACE cannot overwrite a terminal chargeability transition"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'chargeability_transition_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::chargeability_transition_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-priced-charge-insert-once"
+guards = "REPLACE cannot overwrite a priced charge or replace a chain identity"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'priced_charge_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::priced_charge_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-adjustment-insert-once"
+guards = "REPLACE cannot overwrite an adjustment by its key, correction identity or rowid"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'adjustment_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::adjustment_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-statement-insert-once"
+guards = "REPLACE cannot overwrite a statement by any unique identity"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'statement_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::statement_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-statement-line-insert-once"
+guards = "REPLACE cannot overwrite statement line content or its match projection"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'statement_line_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::statement_line_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-match-attempt-insert-once"
+guards = "REPLACE cannot overwrite a stored match attempt"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'match_attempt_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::match_attempt_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-statement-import-insert-once"
+guards = "REPLACE cannot overwrite statement import provenance"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'statement_import_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::statement_import_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-account-subscription-insert-once"
+guards = "REPLACE cannot overwrite subscription history even without the overlap validator"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'account_subscription_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::account_subscription_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-multiplier-observation-insert-once"
+guards = "REPLACE cannot overwrite a multiplier observation or replace a chain identity"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'multiplier_observation_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::multiplier_observation_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-step-feed-insert-once"
+guards = "REPLACE cannot overwrite a live feed emission by its cursor"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'step_feed_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::step_feed_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "ledger-broca-step-insert-once"
+guards = "The ledger-wide replacement probes detect an unguarded BROCA diagnostic"
+file = "crates/astrocyte-core/src/store.rs"
+old = "    SELECT RAISE(ABORT, 'broca_step_insert_once');"
+new = "    SELECT 1; -- NON-VACUITY BREAK"
+test_file = "crates/astrocyte-core/src/store.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::broca_step_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
