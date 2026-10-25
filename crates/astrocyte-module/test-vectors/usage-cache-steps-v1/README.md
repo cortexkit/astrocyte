@@ -44,11 +44,12 @@ second for a redelivery of the first.
 - `ses_ck_required_only` (`omp`): one dated step with no member beyond the
   required ones, and one undated step the reply counts.
 
-`request_body_len` and `request_size` are optional members. A step carries them
-only when its source reports a request body length, and the handler compares
-the lengths of two adjacent steps to choose `smaller` or `not_smaller` on a
-prompt drop. No harness reader reports one today, so no vector here has them,
-and a decoder must accept them appearing.
+`request_body_len` and `request_size` are optional members that appear only for
+a step whose source reports a request body length. The handler reports a body
+length only from a source that provides one; on a prompt drop it compares two
+adjacent lengths to choose `smaller` or `not_smaller`. No source reports one
+today, so no vector here carries either member, and a decoder must still accept
+them appearing.
 
 ## Replies
 
@@ -75,7 +76,7 @@ and must not depend on their order.
 | File | Request | Refusal |
 |---|---|---|
 | `rejected/reply-zero-limit.json` | `limit` 0 | `invalid_request`: the limit must be at least 1. |
-| `rejected/reply-unknown-harness.json` | `harness` `cursor` | `unknown_harness`: only `broca`, `claude-code`, `codex`, `gemini`, `kimi`, `omp`, `opencode` and `pi` are served. |
+| `rejected/reply-unknown-harness.json` | `harness` `cursor` | `unknown_harness`: only `claude-code`, `codex`, `gemini`, `kimi`, `omp`, `opencode` and `pi` are served (BROCA's step log is not served here). |
 | `rejected/reply-unknown-member.json` | an extra `page` member | `malformed`: the request is a closed object, so a member it does not define is refused, never ignored. |
 
 A request whose `harness` or `session` is missing, or whose members have the

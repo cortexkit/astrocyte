@@ -379,9 +379,9 @@ per maintenance transaction. Harness ledger steps are kept indefinitely.
 Sample replies, published for a client to pin its decoder against, live in
 `crates/astrocyte-module/test-vectors/usage-cache-steps-v1/`, with the request
 that produced each one. The step `cursor` is the cache-step cursor, a
-different cursor space from the live feed's `cN` cursors: it counts harness
-events and BROCA steps together, so two rows with the same number in a cache
-read and a feed read are not the same step. To join a session's history with
+different cursor space from the live feed's `cN` cursors: it numbers recorded
+steps in their own order, so two rows with the same number in a cache read and
+a feed read are not the same step. To join a session's history with
 the live feed, an app matches rows by (`harness`, `step_ref`) and replaces its
 stored copy of a matched step with the newer row, and never compares a
 cache-step cursor with a feed cursor.
