@@ -24,27 +24,41 @@ request frame is checked by
 `the_after_cursor_request_serves_the_steps_past_its_cursor`, which serves its
 params and compares the result with `reply-streaming.json`.
 
-The store holds four sessions, and each reply reads one of them:
+The store holds five sessions, and each reply reads one of them. Every step is
+written by the ingest call its harness reader makes, with that reader's
+measurements: Oh My Pi (`omp`) reports input, its cache read and write, the
+visible output and the reasoning count apart, and keeps its stop reason; Codex
+reports an implicit cache read, no cache write, and the model's context window.
+No session shares a step id with another, because the ledger would take the
+second for a redelivery of the first.
 
-- `ses_ck_phone_stream` (`pi`): three steps, so they fit the default limit of
+- `ses_ck_phone_stream` (`omp`): three steps, so they fit the default limit of
   200 and the session has no older step. Their verdicts are `cold_start`,
   `stable`, and then `bust` with a retention of 0.376.
-- `ses_ck_phone_undated` (`pi`): two steps without a time, which a reply
+- `ses_ck_phone_undated` (`omp`): two steps without a time, which a reply
   counts and does not place on the timeline, and one dated step.
-- `ses_ck_broca_diag` (`broca`): three BROCA diagnostic steps. They are the
-  only steps with `request_body_len`, and the third drops the prompt, so it
-  carries `request_size`.
-- `ses_ck_required_only` (`pi`): one dated step with no member beyond the
+- `ses_ck_omp_diag` (`omp`): three steps that together carry every member an
+  OMP row has.
+- `ses_ck_codex_window` (`codex`): two steps that carry a `context_limit`,
+  which only Codex reports.
+- `ses_ck_required_only` (`omp`): one dated step with no member beyond the
   required ones, and one undated step the reply counts.
+
+`request_body_len` and `request_size` are optional members. A step carries them
+only when its source reports a request body length, and the handler compares
+the lengths of two adjacent steps to choose `smaller` or `not_smaller` on a
+prompt drop. No harness reader reports one today, so no vector here has them,
+and a decoder must accept them appearing.
 
 ## Replies
 
 | File | Pins |
 |---|---|
-| `reply-streaming.json` | A whole session in one page: `harness`, `session`, `earlier_steps` false, `undated_steps` 0, and the step members `cursor`, `step_ref`, `occurred_at_ms`, `input`, `cache_read`, `cache_write`, `output`, `reasoning`, `provider`, `model`, `finish`, `context_limit`, `prompt`, `retention`, `verdict` and `prompt_dropped`. `output` includes `reasoning` (1,200 + 500), and `cache_write` sums the split 5-minute and 1-hour writes. |
+| `reply-streaming.json` | A whole session in one page: `harness`, `session`, `earlier_steps` false, `undated_steps` 0, and the step members `cursor`, `step_ref`, `occurred_at_ms`, `input`, `cache_read`, `cache_write`, `output`, `reasoning`, `provider`, `model`, `finish`, `prompt`, `retention`, `verdict` and `prompt_dropped`. `output` includes `reasoning` (1,200 + 500), and `cache_write` sums the split 5-minute and 1-hour writes. `context_limit` is absent, because OMP reports none. |
 | `reply-earlier-steps.json` | The same session read with `limit` 1, so the page is the newest step and `earlier_steps` is true. The verdict still comes from the whole session, not from the page. |
 | `reply-undated-steps.json` | `undated_steps` 2: steps without a time are counted, not placed on the timeline. |
-| `reply-row-every-member.json` | Every member the handler can emit for a step: those of `reply-streaming.json` plus `request_body_len` and `request_size`. The third step has `prompt_dropped` true and `request_size` `smaller`, and a retention above 0. `not_smaller` is not shown here: the handler serves it on a prompt drop when both adjacent steps report a request body and the current one is not shorter than the previous one, and no fixture here is shaped that way. A decoder must still accept it. |
+| `reply-row-every-member.json` | Every member an OMP step can have, on three steps: both sides of a stable verdict (a retention of 0.970), a `full_bust` with a retention of 0.0, `output` as visible output plus reasoning (98 from 68 and 30), the provider, model and stop reason, and a `prompt_dropped` with no `request_size` because the reader reports no body length. |
+| `reply-context-window.json` | The one member only a Codex step carries, `context_limit`, on both steps. Codex keeps no stop reason and reports no cache write, so `finish` and `cache_write` are absent, as `prompt` is the uncached input plus the cache read. No single harness carries both `finish` and `context_limit`, which is why this is a second vector: OMP gives `finish`, Codex gives `context_limit`. |
 | `reply-row-required-only.json` | A step with only the members every step carries: `cursor`, `step_ref`, `occurred_at_ms`, `prompt`, `verdict` and `prompt_dropped`. No absent member appears, and none is served as zero. |
 
 A step's members are serialised by name, so a client decodes an object by key

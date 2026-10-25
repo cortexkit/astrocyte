@@ -18,7 +18,7 @@ use crate::state::SharedState;
 #[path = "cache_steps_vectors/store.rs"]
 mod store;
 
-use store::{BrocaStep, BROCA, DAY_MS, PI};
+use store::{CODEX, DAY_MS, OMP};
 
 const OP: &str = crate::ops::OP_CACHE_STEPS;
 
@@ -48,8 +48,10 @@ fn served(state: &SharedState, params: serde_json::Value) -> Vec<u8> {
 const STREAMING: &str = "ses_ck_phone_stream";
 /// The session whose two steps have no time.
 const UNDATED: &str = "ses_ck_phone_undated";
-/// The BROCA session whose steps carry every member a reply can have.
-const BROCA_SESSION: &str = "ses_ck_broca_diag";
+/// The OMP session whose steps carry every member an OMP row can have.
+const EVERY_MEMBER: &str = "ses_ck_omp_diag";
+/// The Codex session: the steps that carry a context window.
+const CONTEXT_WINDOW: &str = "ses_ck_codex_window";
 /// The session whose only dated step carries nothing beyond the required.
 const REQUIRED_ONLY: &str = "ses_ck_required_only";
 
@@ -101,34 +103,38 @@ fn vectors() -> Vec<Vector> {
     vec![
         vector(
             "reply-streaming.json",
-            json!({"harness": PI, "session": STREAMING}),
+            json!({"harness": OMP, "session": STREAMING}),
         ),
         vector(
             "reply-earlier-steps.json",
-            json!({"harness": PI, "session": STREAMING, "limit": 1}),
+            json!({"harness": OMP, "session": STREAMING, "limit": 1}),
         ),
         vector(
             "reply-undated-steps.json",
-            json!({"harness": PI, "session": UNDATED}),
+            json!({"harness": OMP, "session": UNDATED}),
         ),
         vector(
             "reply-row-every-member.json",
-            json!({"harness": BROCA, "session": BROCA_SESSION}),
+            json!({"harness": OMP, "session": EVERY_MEMBER}),
+        ),
+        vector(
+            "reply-context-window.json",
+            json!({"harness": CODEX, "session": CONTEXT_WINDOW}),
         ),
         vector(
             "reply-row-required-only.json",
-            json!({"harness": PI, "session": REQUIRED_ONLY}),
+            json!({"harness": OMP, "session": REQUIRED_ONLY}),
         ),
         // The step after the streaming session's first: its window stays the
         // same, and only the rows past that cursor are served.
         vector(
             AFTER_CURSOR,
-            json!({"harness": PI, "session": STREAMING, "limit": 2, "after_cursor": 1}),
+            json!({"harness": OMP, "session": STREAMING, "limit": 2, "after_cursor": 1}),
         ),
         // A limit is a whole number from 1, so zero is refused.
         vector(
             "rejected/reply-zero-limit.json",
-            json!({"harness": PI, "session": STREAMING, "limit": 0}),
+            json!({"harness": OMP, "session": STREAMING, "limit": 0}),
         ),
         // A harness this operation cannot serve has no steps to answer with.
         vector(
@@ -139,7 +145,7 @@ fn vectors() -> Vec<Vector> {
         // quietly ignored, because a caller would never learn it was unused.
         vector(
             "rejected/reply-unknown-member.json",
-            json!({"harness": PI, "session": STREAMING, "page": 2}),
+            json!({"harness": OMP, "session": STREAMING, "page": 2}),
         ),
     ]
 }
@@ -161,41 +167,18 @@ fn streaming_steps() -> Vec<store::Step<'static>> {
         cache_write: Some(write),
         output: Some(output),
         reasoning,
-        provider: Some("anthropic"),
-        model: Some("claude-sonnet-4"),
-        finish: Some(finish),
-        context_limit: Some(200_000),
+        provider: Some("openai-codex"),
+        model: Some("gpt-5.6-luna"),
+        finish: None,
+        terminal_status: Some(finish),
+        context_limit: None,
         at: at(second),
-        ..harness_step(PI, STREAMING, step_ref)
+        ..harness_step(OMP, STREAMING, step_ref)
     };
     vec![
-        series(
-            "exp-pipeline:0:request",
-            1,
-            0,
-            16_000,
-            800,
-            None,
-            "tool_use",
-        ),
-        series(
-            "exp-pipeline:1:request",
-            2,
-            15_900,
-            16_000,
-            1_200,
-            Some(500),
-            "tool_use",
-        ),
-        series(
-            "exp-pipeline:2:request",
-            3,
-            12_000,
-            16_000,
-            1_000,
-            Some(400),
-            "end_turn",
-        ),
+        series("stream-0", 1, 0, 16_000, 800, None, "toolUse"),
+        series("stream-1", 2, 15_900, 16_000, 1_200, Some(500), "toolUse"),
+        series("stream-2", 3, 12_000, 16_000, 1_000, Some(400), "stop"),
     ]
 }
 
@@ -203,22 +186,22 @@ fn streaming_steps() -> Vec<store::Step<'static>> {
 fn undated_steps() -> Vec<store::Step<'static>> {
     let first = store::Step {
         input: Some(30),
-        model: Some("claude-sonnet-4"),
-        ..harness_step(PI, UNDATED, "undated-session:0")
+        model: Some("gpt-5.6-luna"),
+        ..harness_step(OMP, UNDATED, "entry-undated-0")
     };
     let dated = store::Step {
         input: Some(40),
         cache_read: Some(960),
         output: Some(120),
-        provider: Some("anthropic"),
-        model: Some("claude-sonnet-4"),
+        provider: Some("openai-codex"),
+        model: Some("gpt-5.6-luna"),
         at: at(1),
-        ..harness_step(PI, UNDATED, "undated-session:1")
+        ..harness_step(OMP, UNDATED, "entry-undated-1")
     };
     let second = store::Step {
         output: Some(90),
-        model: Some("claude-sonnet-4"),
-        ..harness_step(PI, UNDATED, "undated-session:2")
+        model: Some("gpt-5.6-luna"),
+        ..harness_step(OMP, UNDATED, "entry-undated-2")
     };
     vec![first, dated, second]
 }
@@ -229,52 +212,70 @@ fn required_only_steps() -> Vec<store::Step<'static>> {
     vec![
         store::Step {
             at: at(1),
-            ..harness_step(PI, REQUIRED_ONLY, "required-step-1")
+            ..harness_step(OMP, REQUIRED_ONLY, "required-step-1")
         },
-        harness_step(PI, REQUIRED_ONLY, "required-step-2"),
+        harness_step(OMP, REQUIRED_ONLY, "required-step-2"),
     ]
 }
 
-/// The BROCA steps whose first has no count at all, whose second reads its
-/// cache, and whose third reads less of a prompt more than 15,000 tokens
-/// smaller, so it is a prompt drop and carries `request_size` `smaller`: its
-/// request body is shorter than the second step's.
-fn broca_fixture() -> Vec<BrocaStep<'static>> {
-    let step_of = |step_id: i64,
+/// The OMP session whose steps carry every member an OMP row can have: the
+/// five counts (the reasoning apart from the visible output), the provider,
+/// model and stop reason from the reader, and a context window OMP does not
+/// report, so its steps have no `context_limit`.
+fn every_member_steps() -> Vec<store::Step<'static>> {
+    let step_of = |entry: &'static str,
                    second: i64,
-                   counts: Option<(i64, i64, i64, i64, i64)>,
-                   finish: &'static str,
-                   body_len: i64| {
-        let (input, cached, write, output, reasoning) = counts.unwrap_or((0, 0, 0, 0, 0));
-        BrocaStep {
-            step_id,
-            finished_at_ms: DAY_MS + second * 1_000,
-            input: counts.map(|_| input),
-            cached_input: counts.map(|_| cached),
-            cache_write: counts.map(|_| write),
-            output: counts.map(|_| output),
-            reasoning: counts.map(|_| reasoning),
-            finish: Some(finish),
-            context_limit: Some(200_000),
-            request_body_len: Some(body_len),
-        }
+                   input: u64,
+                   read: u64,
+                   visible: Option<u64>,
+                   reasoning: Option<u64>,
+                   stop: Option<&'static str>| store::Step {
+        // The harness is set by `harness_step`; the provider, model and stop
+        // reason are what OMP's reader records for one assistant message.
+        input: Some(input),
+        cache_read: Some(read),
+        cache_write: Some(0),
+        output: visible,
+        reasoning,
+        provider: Some("openai-codex"),
+        model: Some("gpt-5.6-luna"),
+        finish: None,
+        terminal_status: stop,
+        context_limit: None,
+        at: at(second),
+        ..harness_step(OMP, EVERY_MEMBER, entry)
     };
     vec![
-        step_of(1, 4, None, "end_turn", 120_000),
         step_of(
-            2,
-            5,
-            Some((180, 30_000, 1_000, 2_600, 1_800)),
-            "tool_use",
-            90_000,
+            "every-0",
+            4,
+            858,
+            28_416,
+            Some(68),
+            Some(30),
+            Some("toolUse"),
         ),
-        step_of(
-            3,
-            6,
-            Some((180, 12_000, 500, 1_400, 900)),
-            "end_turn",
-            7_400,
-        ),
+        step_of("every-1", 5, 902, 28_400, Some(26), None, Some("stop")),
+        step_of("every-2", 6, 1_204, 0, Some(40), Some(12), Some("aborted")),
+    ]
+}
+
+/// The Codex session whose steps carry a context window: its reader keeps
+/// the model's window in `step_detail` and stores its implicit cache read.
+fn context_window_steps() -> Vec<store::Step<'static>> {
+    let step_of = |entry: &'static str, second: i64, input: u64, read: u64| store::Step {
+        input: Some(input),
+        cache_read: Some(read),
+        output: Some(120),
+        provider: Some("openai"),
+        model: Some("gpt-5.6"),
+        context_limit: Some(258_400),
+        at: at(second),
+        ..harness_step(CODEX, CONTEXT_WINDOW, entry)
+    };
+    vec![
+        step_of("token-count-1", 7, 400, 0),
+        step_of("token-count-2", 8, 50, 300),
     ]
 }
 
@@ -287,7 +288,9 @@ fn frozen_state() -> SharedState {
     store::record(&streaming_steps(), &state);
     store::record(&undated_steps(), &state);
     store::record(&required_only_steps(), &state);
-    store::record_broca(&state, BROCA_SESSION, &broca_fixture());
+    store::record(&every_member_steps(), &state);
+    store::record(&context_window_steps(), &state);
+
     state.rebuild_recent_steps();
     state
 }
@@ -437,7 +440,7 @@ fn every_frame_pins_the_case_its_name_names() {
     };
 
     let streaming = result("reply-streaming.json");
-    assert_eq!(streaming["harness"], PI);
+    assert_eq!(streaming["harness"], OMP);
     assert_eq!(streaming["session"], STREAMING);
     assert_eq!(streaming["earlier_steps"], false);
     assert_eq!(streaming["undated_steps"], 0);
@@ -462,23 +465,51 @@ fn every_frame_pins_the_case_its_name_names() {
     assert_eq!(undated["earlier_steps"], false);
     assert_eq!(count(&undated), 1);
 
-    // Only a step that dropped its prompt carries a request size: the third
-    // BROCA step shrank its request body against the second one. The steps
-    // where no prompt dropped must carry none.
+    // The OMP session's steps carry every member an OMP row has: the five
+    // counts, with `output` the visible output plus reasoning, the provider,
+    // model and stop reason, and no context window, which OMP does not report.
     let every = result("reply-row-every-member.json");
-    assert_eq!(every["harness"], BROCA);
-    let sizes = every["steps"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|step| step["request_size"].as_str().map(str::to_string))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        sizes,
-        [None, None, Some("smaller".to_string())],
-        "a prompt drop must carry its request size, and nothing else may"
-    );
+    assert_eq!(every["harness"], OMP);
     assert_eq!(count(&every), 3);
+    let steps = every["steps"].as_array().unwrap().clone();
+    assert_eq!(steps[0]["input"], 858);
+    assert_eq!(steps[0]["cache_read"], 28_416);
+    assert_eq!(steps[0]["cache_write"], 0);
+    assert_eq!(steps[0]["output"], 98, "68 visible plus 30 reasoning");
+    assert_eq!(steps[0]["reasoning"], 30);
+    assert_eq!(steps[0]["provider"], "openai-codex");
+    assert_eq!(steps[0]["model"], "gpt-5.6-luna");
+    assert_eq!(steps[0]["finish"], "toolUse");
+    assert!(steps[0].get("context_limit").is_none(), "{}", steps[0]);
+    assert_eq!(steps[1]["verdict"], "stable");
+    assert_eq!(
+        steps[1]["retention"], 0.970_144_155_223_064_9,
+        "{}",
+        steps[1]
+    );
+    assert_eq!(steps[2]["verdict"], "full_bust");
+    assert_eq!(steps[2]["retention"], 0.0, "{}", steps[2]);
+    // No harness reader reports a request body length, so no harness step
+    // carries `request_body_len` or `request_size`.
+    for step in &steps {
+        assert!(step.get("request_body_len").is_none(), "{step}");
+        assert!(step.get("request_size").is_none(), "{step}");
+    }
+    // The third step's prompt is 28,098 tokens smaller, which is a drop. It
+    // carries no request size, because no harness reader reports a body length.
+    assert_eq!(steps[2]["prompt_dropped"], true, "{}", steps[2]);
+
+    // Codex is the one harness whose reader keeps a context window.
+    let window = result("reply-context-window.json");
+    assert_eq!(window["harness"], CODEX);
+    assert_eq!(count(&window), 2);
+    for step in window["steps"].as_array().unwrap() {
+        assert_eq!(step["context_limit"], 258_400, "{step}");
+        assert_eq!(step["provider"], "openai", "{step}");
+        assert_eq!(step["model"], "gpt-5.6", "{step}");
+        assert!(step.get("finish").is_none(), "Codex stores no stop reason");
+        assert!(step.get("cache_write").is_none(), "Codex writes no cache");
+    }
 
     let required = result("reply-row-required-only.json");
     assert_eq!(count(&required), 1);
