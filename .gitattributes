@@ -2,3 +2,4 @@
 # so git must never rewrite their line endings when it checks them out (the
 # Windows CI runner converts LF to CRLF for text files by default).
 crates/*/tests/vectors/** -text
+crates/*/test-vectors/** -text
