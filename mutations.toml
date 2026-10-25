@@ -2132,6 +2132,38 @@ timeout_s = 600
 build_timeout_s = 900
 
 [[control]]
+id = "step-feed-session-read-filter"
+guards = "A filtered live step read returns only the requested harness and session, paging matching rows only"
+file = "crates/astrocyte-core/src/step_feed.rs"
+old = "AND f.harness=?4 AND f.session=?5"
+new = "AND (?4 IS NOT NULL OR ?5 IS NOT NULL)"
+test_file = "crates/astrocyte-module/src/step_feed.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["step_feed::tests::filtered_reads_page_only_the_sessions_latest_rows"]
+expect_message = "filtered pagination counted an unrelated row"
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
+id = "step-feed-session-notice-filter"
+guards = "Only appends matching a subscription's harness and session occupy its notice queue"
+file = "crates/astrocyte-module/src/step_feed.rs"
+old = "if !changed.contains(filter) {"
+new = "if !changed.contains(filter) && false {"
+test_file = "crates/astrocyte-module/src/step_feed.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["step_feed::tests::filtered_subscriptions_only_queue_their_sessions_appends"]
+expect_message = "an unrelated append occupied the filtered queue"
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
 id = "step-feed-principal-allow-list"
 guards = "The live step feed is served only to Direct principals and Callosum's fed-phone routes"
 file = "crates/astrocyte-module/src/step_feed.rs"

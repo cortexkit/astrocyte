@@ -3840,6 +3840,12 @@ BEGIN
 END;
 "#,
     },
+    Migration {
+        version: 32,
+        statements: r#"
+CREATE INDEX step_feed_session_cursor ON step_feed(harness,session,feed_cursor);
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.

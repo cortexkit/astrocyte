@@ -62,8 +62,8 @@ Test: `every_operation_name_reaches_its_own_handler`.
 | `spend.multiplier.pace` | read | `quota_provider`, `from_ms`, `to_ms` |
 | `usage.cache.sessions` | read | `since_ms?`, `harness?`, `limit?` |
 | `usage.cache.steps` | read | `harness`, `session`, `limit?`, `after_cursor?` |
-| `usage.steps.subscribe` | read, watch | none |
-| `usage.steps.read` | read | `after?`, `limit?` |
+| `usage.steps.subscribe` | read, watch | `harness?`, `session?` |
+| `usage.steps.read` | read | `after?`, `limit?`, `harness?`, `session?` |
 | `watermark.get` | read | none |
 | `spend.event.ingest` | write | see §3.1 |
 | `spend.correction.ingest` | write | see §3.2 |
@@ -322,8 +322,8 @@ not placed on the timeline). Each step has these fields:
 - `step_ref`, the harness's own id for the step, and `occurred_at_ms`
   (BROCA's required `finished_at_ms`). BROCA steps read from BROCA's export
   facts use `run_id#step_id`; that diagnostics table is being retired, and the
-  reader of BROCA's durable step log will use the per-attempt form
-  `run_id#step_id#attempt` described in section 4.2.
+  reader of BROCA's durable step log will use the event's `attempt_id`, a random
+  id per provider attempt, as described in section 4.2.
 - `input`, `cache_read`, `cache_write`, `output` and `reasoning`, each omitted
   when the reader did not store it. `cache_write` sums every cache lifetime
   Claude Code reports.
@@ -424,7 +424,9 @@ can take a few seconds to be committed.
 
 #### `usage.steps.subscribe`
 
-Request: `{}`. Any member is refused `malformed`.
+The request is `{}` or `{"harness": "pi", "session": "session-id"}`.
+`harness` and `session` are optional, but must come together; one alone is
+refused `invalid_request`. Unknown members are refused `malformed`.
 
 Each notice is one StreamData frame:
 
@@ -434,6 +436,9 @@ Each notice is one StreamData frame:
 
 `through` is the newest committed cursor. Notices are coalesced: at most four
 a second, and a notice may cover many steps or none that the caller may see.
+With a session filter, a notice is sent only when a row whose own `harness`
+and `session` match exactly is appended. The notice still carries the newest
+committed cursor across the whole feed. Without a filter, notices are unchanged.
 
 | How it ends | Meaning |
 |---|---|
@@ -442,14 +447,24 @@ a second, and a notice may cover many steps or none that the caller may see.
 | Caller's Cancel | Ended by the caller. The caller may still receive Error `cancelled` (the daemon may drop it) and treats it as the normal end. |
 
 Opening refusals: `not_permitted`, `subscription_capacity` (more than 16 open
-subscriptions), `draining` (astrocyte is stopping), `malformed`.
+subscriptions), `draining` (astrocyte is stopping), `malformed`, and
+`invalid_request` (only one filter member was supplied).
 
 #### `usage.steps.read`
 
-Request: `{"after": "<cursor>", "limit": 200}`. Both members are optional.
+The request is `{"after": "<cursor>", "limit": 200, "harness": "pi", "session": "session-id"}`.
+All members are optional. `harness` and `session` must come together; one alone
+is refused `invalid_request`. Unknown members are refused `malformed`.
 Without `after`, the read starts at the oldest row the feed still holds. The
 feed holds the rows committed in the last 24 hours. `limit` defaults to 200,
 with a maximum of 1,000.
+With a session filter, only rows whose own `harness` and `session` match exactly
+are returned, still excluding superseded identities. `limit` bounds the rows
+returned, not the unrelated rows between them. `through` remains the newest
+cursor across the whole feed. `next` is the last returned row's cursor while
+more matching rows exist up to `through`, and null when no matching rows remain.
+A filtered page is never empty with a non-null `next`. Cursor expiry is unchanged.
+Without a filter, the read and its reply are unchanged.
 
 Reply:
 
@@ -497,9 +512,9 @@ present for runners whose history is the host harness's own record),
 `harness` is the event's `harness` (the hosting program, such as
 `claude-code` or `opencode`) and `step_ref` is `harness_step_ref`, so
 astrocyte's later read of the harness store replaces the row. Otherwise
-`harness` is the event's `runner` and `step_ref` is
-`<run_id>#<step_id>#<attempt>`, one row per provider request actually sent,
-retries included, matching astrocyte's read of that runner's durable step
+`harness` is the event's `runner` and `step_ref` is the event's `attempt_id`, a
+random id per provider attempt. There is one row per provider request actually
+sent, retries included, matching astrocyte's read of that runner's durable step
 log. A step with no durable record stays a live-only row with
 `source: "runner"`.
 

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use astrocyte_core::step_feed::{self as feed, FeedError, FeedPage, FeedReadRequest};
+use astrocyte_core::step_feed::{self as feed, FeedError, FeedFilter, FeedPage, FeedReadRequest};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -54,14 +54,20 @@ pub fn may_read_feed(principal: Option<&Principal>, harness: &str) -> bool {
     }
 }
 
-/// `usage.steps.subscribe` params: none.
+/// `usage.steps.subscribe` params, optionally selecting one session.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FeedSubscribeRequest {}
+pub struct FeedSubscribeRequest {
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub session: Option<String>,
+}
 
 struct Subscriber {
     queue: mpsc::Sender<i64>,
     lagged: AtomicBool,
+    filter: Option<FeedFilter>,
 }
 
 #[derive(Default)]
@@ -152,39 +158,61 @@ impl FeedHub {
         late: &[i64],
     ) -> rusqlite::Result<()> {
         conn.execute_batch("SAVEPOINT step_feed")?;
-        let appended = feed::append_changes(conn, now_ms, late).and_then(|_| feed::through(conn));
-        let through = match appended {
-            Ok(through) => {
+        let appended = (|| {
+            let before = feed::through(conn)?;
+            feed::append_changes(conn, now_ms, late)?;
+            let through = feed::through(conn)?;
+            // Read only the appended cursor range, not the retained feed, to
+            // decide which session subscriptions need a notice.
+            let changed = conn
+                .prepare_cached("SELECT harness,session FROM step_feed WHERE feed_cursor>?1")?
+                .query_map([before], |row| {
+                    Ok(FeedFilter {
+                        harness: row.get(0)?,
+                        session: row.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<_, rusqlite::Error>((through, changed))
+        })();
+        let (through, changed) = match appended {
+            Ok(appended) => {
                 conn.execute_batch("RELEASE step_feed")?;
-                through
+                appended
             }
             Err(error) => {
                 let _ = conn.execute_batch("ROLLBACK TO step_feed; RELEASE step_feed");
                 return Err(error);
             }
         };
-        self.notify(through);
+        self.notify(through, &changed);
         Ok(())
     }
 
-    /// Queue `through` for every subscriber when it is newer than the last
-    /// cursor told. A subscriber whose queue is full is marked lagged and
-    /// dropped from the hub.
-    fn notify(&self, through: i64) {
+    /// Queue a newer `through` for unfiltered subscribers and those whose
+    /// session gained a row. A full queue marks its subscriber lagged and
+    /// drops it from the hub.
+    fn notify(&self, through: i64, changed: &[FeedFilter]) {
         let mut hub = self.lock();
         if hub.through.is_some_and(|told| told >= through) {
             return;
         }
         hub.through = Some(through);
-        hub.subscribers
-            .retain(|subscriber| match subscriber.queue.try_send(through) {
+        hub.subscribers.retain(|subscriber| {
+            if let Some(filter) = &subscriber.filter {
+                if !changed.contains(filter) {
+                    return true;
+                }
+            }
+            match subscriber.queue.try_send(through) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     subscriber.lagged.store(true, Ordering::Release);
                     false
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
-            });
+            }
+        });
     }
 
     /// The newest feed cursor told to subscribers.
@@ -252,9 +280,14 @@ pub async fn subscribe(
     sink: &dyn NoticeSink,
     mut stopping: watch::Receiver<bool>,
 ) -> HandlerOutcome {
-    if let Err(error) = serde_json::from_value::<FeedSubscribeRequest>(params) {
-        return refusal("malformed", format!("steps subscribe params: {error}"));
-    }
+    let request = match serde_json::from_value::<FeedSubscribeRequest>(params) {
+        Ok(request) => request,
+        Err(error) => return refusal("malformed", format!("steps subscribe params: {error}")),
+    };
+    let filter = match FeedFilter::from_pair(request.harness, request.session) {
+        Ok(filter) => filter,
+        Err(message) => return refusal("invalid_request", message),
+    };
     if *stopping.borrow() {
         return refusal(
             "draining",
@@ -272,6 +305,7 @@ pub async fn subscribe(
     let subscriber = Arc::new(Subscriber {
         queue: queue_sender,
         lagged: AtomicBool::new(false),
+        filter,
     });
     let opened_at = {
         let mut hub_state = hub.lock();
@@ -580,6 +614,120 @@ mod tests {
         assert_eq!(refused.code, "invalid_request");
     }
 
+    #[test]
+    fn unfiltered_read_keeps_its_reply_bytes() {
+        let state = test_state();
+        let step = TestStep::now("s", "s:1");
+        record_steps_for_test(&state, "pi", &[step], false).unwrap();
+        let HandlerOutcome::Response(body) = read_outcome(&state, json!({})) else {
+            panic!("unfiltered read did not return a response");
+        };
+        let body = String::from_utf8(body).unwrap();
+        let time = format!("\"occurred_at_ms\":{}", step.occurred_at_ms);
+        assert_eq!(body.matches(&time).count(), 1);
+        assert_eq!(
+            body.replace(&time, "\"occurred_at_ms\":0").as_bytes(),
+            br#"{"result":{"next":null,"rows":[{"cache_read":100,"cursor":"c1","harness":"pi","input":10,"model":"model","occurred_at_ms":0,"output":3,"prompt":110,"prompt_dropped":false,"provider":"anthropic","session":"s","source":"file","step_ref":"s:1","verdict":"cold_start"}],"through":"c1"}}"#
+        );
+    }
+
+    #[test]
+    fn filtered_reads_page_only_the_sessions_latest_rows() {
+        let state = test_state();
+        let at = now_ms();
+        for (harness, session, reference, time) in [
+            ("pi", "chosen", "later", at),
+            ("pi", "other", "other", at),
+            ("opencode", "chosen", "other-harness", at),
+            ("pi", "chosen", "earlier", at - 1_000),
+            ("pi", "other", "tail", at + 1_000),
+        ] {
+            record_steps_for_test(
+                &state,
+                harness,
+                &[step(session, reference, time, 100)],
+                false,
+            )
+            .unwrap();
+        }
+        let first = read_page(
+            &state,
+            json!({"harness": "pi", "session": "chosen", "limit": 1}),
+        );
+        assert_eq!(first["through"], "c6");
+        assert_eq!(
+            first["next"], "c4",
+            "filtered pagination counted an unrelated row"
+        );
+        assert_eq!(first["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(first["rows"][0]["step_ref"], "earlier");
+        let last = read_page(
+            &state,
+            json!({"harness": "pi", "session": "chosen", "limit": 1, "after": first["next"]}),
+        );
+        assert_eq!(last["through"], "c6");
+        assert_eq!(last["next"], Value::Null);
+        assert_eq!(last["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(last["rows"][0]["step_ref"], "later");
+        assert_eq!(last["rows"][0]["cursor"], "c5");
+        assert_ne!(last["rows"][0]["verdict"], "cold_start");
+        for page in [&first, &last] {
+            assert_eq!(page["rows"][0]["harness"], "pi");
+            assert_eq!(page["rows"][0]["session"], "chosen");
+        }
+        for params in [
+            json!({"harness": "pi", "session": "chosen", "after": "c6"}),
+            json!({"harness": "PI", "session": "chosen"}),
+            json!({"harness": "pi", "session": "Chosen"}),
+        ] {
+            let empty = read_page(&state, params);
+            assert_eq!(empty, json!({"rows": [], "next": null, "through": "c6"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn feed_filters_require_a_pair_and_keep_unknown_members_malformed() {
+        let state = test_state();
+        let (sent, _notices) = mpsc::unbounded_channel();
+        let (entered, _entered) = mpsc::unbounded_channel();
+        let sink = TestSink {
+            sent,
+            entered,
+            permits: Arc::new(Semaphore::new(0)),
+        };
+        let (_stop, stopping) = watch::channel(false);
+        for (params, expected) in [
+            (json!({"harness": "pi"}), "invalid_request"),
+            (json!({"session": "s"}), "invalid_request"),
+            (json!({"harness": "pi", "session": null}), "invalid_request"),
+            (json!({"harness": null, "session": "s"}), "invalid_request"),
+            (json!({"unknown": "s"}), "malformed"),
+            (json!({"harness": 1, "session": "s"}), "malformed"),
+        ] {
+            let refused = read(&state, params.clone()).err().unwrap();
+            assert_eq!(refused.code, expected);
+            let outcome = tokio::time::timeout(
+                HANG_GUARD,
+                subscribe(&state, params, &sink, stopping.clone()),
+            )
+            .await
+            .expect("an invalid filter opened a subscription instead of being refused");
+            let HandlerOutcome::Error { code, .. } = outcome else {
+                panic!("invalid filter was not refused: {outcome:?}");
+            };
+            assert_eq!(code, expected);
+            assert_eq!(state.step_feed().open_subscriptions(), 0);
+        }
+        assert_eq!(
+            read_page(&state, json!({"harness": null, "session": null})),
+            read_page(&state, json!({}))
+        );
+        assert_eq!(
+            read_page(&state, json!({"harness": "", "session": ""})),
+            json!({"rows": [], "next": null, "through": "c0"})
+        );
+    }
+
     /// A step that arrives late, earlier in its session than a step already
     /// in the feed, changes that later step's verdict: the later step's whole
     /// row is sent again at a new cursor, and a read returns only its newest
@@ -648,6 +796,90 @@ mod tests {
         let fresh = read_page(&state, json!({}));
         assert_eq!(fresh["rows"], json!([]));
         assert_eq!(fresh["through"], held["through"]);
+        let refused = read(
+            &state,
+            json!({"after": "c0", "harness": "pi", "session": "s"}),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(refused.code, "cursor_expired");
+        assert_eq!(refused.detail, Some(json!({"through": held["through"]})));
+    }
+
+    struct ByteSink(mpsc::UnboundedSender<Vec<u8>>);
+
+    #[async_trait]
+    impl NoticeSink for ByteSink {
+        async fn emit(&self, notice: Vec<u8>) -> Result<(), String> {
+            self.0.send(notice).map_err(|error| error.to_string())
+        }
+
+        async fn ended(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn filtered_subscriptions_only_queue_their_sessions_appends() {
+        let state = test_state();
+        let (stop, stopping) = watch::channel(false);
+        let (filtered_tx, mut filtered) = mpsc::unbounded_channel();
+        let (all_tx, mut all) = mpsc::unbounded_channel();
+        let mut serving = Vec::new();
+        for (params, sender) in [
+            (json!({"harness": "pi", "session": "chosen"}), filtered_tx),
+            (json!({}), all_tx),
+        ] {
+            let state = state.clone();
+            let stopping = stopping.clone();
+            serving.push(tokio::spawn(async move {
+                subscribe(&state, params, &ByteSink(sender), stopping).await
+            }));
+        }
+        tokio::time::timeout(HANG_GUARD, async {
+            while state.step_feed().lock().subscribers.len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscriptions never registered");
+        for (harness, session, reference) in [
+            ("pi", "other", "other"),
+            ("opencode", "chosen", "other-harness"),
+        ] {
+            record_steps_for_test(&state, harness, &[TestStep::now(session, reference)], false)
+                .unwrap();
+            // Publication is synchronous; an unrelated append must not even
+            // occupy a filtered queue slot or cause that subscriber to lag.
+            let hub = state.step_feed().lock();
+            let subscriber = hub.subscribers.iter().find(|s| s.filter.is_some()).unwrap();
+            assert_eq!(
+                subscriber.queue.capacity(),
+                SUBSCRIBER_QUEUE,
+                "an unrelated append occupied the filtered queue"
+            );
+        }
+        let unfiltered = tokio::time::timeout(HANG_GUARD, all.recv())
+            .await
+            .expect("unfiltered subscription was not notified")
+            .unwrap();
+        assert_eq!(unfiltered, br#"{"through":"c2"}"#);
+        assert!(filtered.try_recv().is_err());
+        record_steps_for_test(&state, "pi", &[TestStep::now("chosen", "own")], false).unwrap();
+        let own = tokio::time::timeout(HANG_GUARD, filtered.recv())
+            .await
+            .expect("filtered subscription was not notified")
+            .unwrap();
+        assert_eq!(own, br#"{"through":"c3"}"#);
+        stop.send(true).unwrap();
+        for task in serving {
+            let outcome = tokio::time::timeout(HANG_GUARD, task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(outcome, HandlerOutcome::Streamed));
+        }
+        assert_eq!(state.step_feed().open_subscriptions(), 0);
     }
 
     /// Served rows report `output` with reasoning inside it, on the feed and

@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 31. A schema change appends a migration; an applied
+currently version 32. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -164,6 +164,8 @@ append is caught up on the next commit, and `pruned_through`, the newest
 deleted feed cursor, below which a read is refused `cursor_expired`.
 Migration 29 starts the feed at the store's current cache cursor, so an
 upgraded store does not replay its history.
+Migration 32 adds the `(harness, session, feed_cursor)` index so filtered live
+reads seek directly to a session's rows rather than scanning the feed.
 
 `declared_store_cursor` and `read_watermark` (schema 30) serve harness stores
 that another module declares, which today are the private OpenCode data

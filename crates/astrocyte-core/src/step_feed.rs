@@ -59,7 +59,44 @@ pub struct FeedReadRequest {
     pub after: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub session: Option<String>,
 }
+
+/// Selects feed rows by their exact `harness` and `session` values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedFilter {
+    pub harness: String,
+    pub session: String,
+}
+
+impl FeedFilter {
+    pub fn from_pair(
+        harness: Option<String>,
+        session: Option<String>,
+    ) -> Result<Option<Self>, &'static str> {
+        match (harness, session) {
+            (None, None) => Ok(None),
+            (Some(harness), Some(session)) => Ok(Some(Self { harness, session })),
+            _ => Err("harness and session must come together"),
+        }
+    }
+}
+
+const READ_SQL: &str = "SELECT f.feed_cursor,f.row_json FROM step_feed f
+    WHERE f.feed_cursor>?1 AND f.feed_cursor<=?2
+      AND NOT EXISTS (SELECT 1 FROM step_feed n WHERE n.harness=f.harness
+          AND n.step_ref=f.step_ref AND n.feed_cursor>f.feed_cursor AND n.feed_cursor<=?2)
+    ORDER BY f.feed_cursor LIMIT ?3";
+
+const FILTERED_READ_SQL: &str = "SELECT f.feed_cursor,f.row_json FROM step_feed f
+    WHERE f.feed_cursor>?1 AND f.feed_cursor<=?2
+      AND f.harness=?4 AND f.session=?5
+      AND NOT EXISTS (SELECT 1 FROM step_feed n WHERE n.harness=f.harness
+          AND n.step_ref=f.step_ref AND n.feed_cursor>f.feed_cursor AND n.feed_cursor<=?2)
+    ORDER BY f.feed_cursor LIMIT ?3";
 
 /// One `usage.steps.read` reply.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -242,6 +279,8 @@ fn prune(conn: &Connection, window_start: i64) -> rusqlite::Result<()> {
 /// identity with a newer row) are left out; the newer row is in this page or
 /// a later one.
 pub fn read(conn: &Connection, request: FeedReadRequest) -> Result<FeedPage, FeedError> {
+    let filter = FeedFilter::from_pair(request.harness, request.session)
+        .map_err(|message| refused("invalid_request", message.into()))?;
     let limit = request.limit.unwrap_or(READ_DEFAULT_LIMIT);
     if limit == 0 {
         return Err(refused(
@@ -283,18 +322,20 @@ pub fn read(conn: &Connection, request: FeedReadRequest) -> Result<FeedPage, Fee
         }));
     }
     let fetch = i64::from(limit) + 1;
-    let mut statement = conn.prepare_cached(
-        "SELECT f.feed_cursor,f.row_json FROM step_feed f
-          WHERE f.feed_cursor>?1 AND f.feed_cursor<=?2
-            AND NOT EXISTS (SELECT 1 FROM step_feed n WHERE n.harness=f.harness
-                AND n.step_ref=f.step_ref AND n.feed_cursor>f.feed_cursor AND n.feed_cursor<=?2)
-          ORDER BY f.feed_cursor LIMIT ?3",
-    )?;
-    let mut rows = statement
-        .query_map(params![after, through, fetch], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let decode_row =
+        |row: &rusqlite::Row<'_>| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?));
+    let mut rows = if let Some(filter) = filter {
+        conn.prepare_cached(FILTERED_READ_SQL)?
+            .query_map(
+                params![after, through, fetch, filter.harness, filter.session],
+                decode_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        conn.prepare_cached(READ_SQL)?
+            .query_map(params![after, through, fetch], decode_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
     let more = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
     rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     let next = if more {
@@ -321,4 +362,70 @@ pub fn read(conn: &Connection, request: FeedReadRequest) -> Result<FeedPage, Fee
         next,
         through: encode_cursor(through),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{initialize_connection, MIGRATIONS};
+
+    fn conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in MIGRATIONS {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn filtered_read_seeks_the_session_cursor_index() {
+        let conn = conn();
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {FILTERED_READ_SQL}"))
+            .unwrap()
+            .query_map(params![0, 100, 3, "pi", "chosen"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        println!("filtered read query plan: {plan:?}");
+        assert!(
+            plan.iter().any(|line| {
+                line.contains("SEARCH f USING INDEX step_feed_session_cursor")
+                    && line.contains("harness=? AND session=? AND feed_cursor>?")
+            }),
+            "filtered read must seek its session cursor index: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("SCAN ")),
+            "filtered read must not scan step_feed: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_newer_identity_in_another_session_supersedes_a_filtered_row() {
+        let conn = conn();
+        for session in ["chosen", "other"] {
+            let body = serde_json::json!({
+                "harness": "pi", "session": session, "step_ref": "same", "source": "file"
+            });
+            conn.execute(
+                "INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
+                 VALUES ('pi','same','file',?1,0,?2)",
+                params![session, body.to_string()],
+            )
+            .unwrap();
+        }
+        let page = read(
+            &conn,
+            serde_json::from_value(serde_json::json!({"harness": "pi", "session": "chosen"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(page.rows.is_empty());
+        assert_eq!(page.next, None);
+        assert_eq!(page.through, "c2");
+    }
 }

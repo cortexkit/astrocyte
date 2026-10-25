@@ -307,10 +307,16 @@ fn operation_params_schema(name: &str) -> Value {
                 "after_cursor": optional_i64,
             }),
         ),
-        OP_STEPS_SUBSCRIBE => closed_object(&[], json!({})),
+        OP_STEPS_SUBSCRIBE => closed_object(
+            &[],
+            json!({"harness": optional_string, "session": optional_string}),
+        ),
         OP_STEPS_READ => closed_object(
             &[],
-            json!({"after": optional_string, "limit": optional_u32}),
+            json!({
+                "after": optional_string, "limit": optional_u32,
+                "harness": optional_string, "session": optional_string,
+            }),
         ),
         OP_WATERMARK_GET => closed_object(&[], json!({})),
         other => unreachable!("operation {other} is served without a params schema"),
@@ -1537,13 +1543,25 @@ mod tests {
                 ],
                 json!({"harness": "pi", "session": 1}),
             ),
-            sample(OP_STEPS_SUBSCRIBE, vec![json!({})], json!({"after": "c0"})),
+            sample(
+                OP_STEPS_SUBSCRIBE,
+                vec![
+                    json!({}),
+                    json!({"harness": "pi", "session": "s"}),
+                    json!({"harness": null, "session": null}),
+                    json!({"harness": "pi"}),
+                ],
+                json!({"after": "c0"}),
+            ),
             sample(
                 OP_STEPS_READ,
                 vec![
                     json!({}),
                     json!({"after": "c0", "limit": 5}),
                     json!({"after": null, "limit": null}),
+                    json!({"harness": "pi", "session": "s", "limit": 2}),
+                    json!({"harness": null, "session": null}),
+                    json!({"session": "s"}),
                 ],
                 json!({"limit": -1}),
             ),
