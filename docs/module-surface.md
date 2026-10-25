@@ -438,7 +438,7 @@ a second, and a notice may cover many steps or none that the caller may see.
 |---|---|
 | StreamEnd | Astrocyte is stopping or the route closed. Subscribe again. |
 | Error `lagged`, detail `{"through": "<last notified cursor>"}` | The subscriber fell behind its queue bound. Subscribe again and read from the last cursor it holds. |
-| Caller's Cancel | Ended by the caller; no further frame. |
+| Caller's Cancel | Ended by the caller. The caller may still receive Error `cancelled` (the daemon may drop it) and treats it as the normal end. |
 
 Opening refusals: `not_permitted`, `subscription_capacity` (more than 16 open
 subscriptions), `draining` (astrocyte is stopping), `malformed`.
