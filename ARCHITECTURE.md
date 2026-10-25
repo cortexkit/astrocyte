@@ -27,7 +27,7 @@ The workspace has three crates:
 partial indexes, and sets a 5000 ms busy timeout. The read-only report connection
 skips the table-creating probe and copies that timeout.
 
-The [data model](docs/data-model.md#tables) describes each table in version 29.
+The [data model](docs/data-model.md#tables) describes every table in version 29 and its write rules.
 
 Schema 23 uses local integer `event_key` and `charge_key` references, never served
 IDs. Event digests remain the dedup/served identity; charge digests are retired.
@@ -54,7 +54,7 @@ The audit compares summaries against base rows, requeues discrepancies and start
 its next pass a day after the previous pass completes. Charge writers must
 update the event header before inserting heads; the existing generation-and-basis
 guard checks agreement, not transaction identity. The [data model](docs/data-model.md#hourly-summaries)
-has the details.
+explains the grain, arithmetic, invalidation rules and maintenance budgets.
 
 ## Write ordering
 
@@ -130,8 +130,8 @@ maintenance, and stop requests interrupt both lanes. One full tick:
    catch any write path that failed to enqueue.
 
 The `subc-client-rs` serve helper owns the connection. A refresher end, reset or
-handler panic exits 1; a panic is answered `internal`. EOF and GOODBYE exit 0;
-SIGTERM stops cleanly, then re-raises.
+handler panic exits 1, and a panic is answered `internal`. EOF and GOODBYE exit
+0. On Unix, SIGTERM stops cleanly, then re-raises.
 
 The ckbus route shares HELLO's single nonce handoff. Daemon validation of
 `consumer_identity` stamps its principal; nonces stay out of diagnostics.
@@ -211,10 +211,6 @@ surface; dispatch and the manifest both use it.
 | `usage.cache.steps` | read, one session's steps with cache verdicts |
 | `usage.steps.subscribe` | read, watch |
 | `usage.steps.read` | read, live step feed |
-
-`usage.cache.steps` answers from memory (the newest 1,000 steps of up to 200
-sessions active in the last day), else from the store. Memory and the step
-feed advance after each commit.
 
 Astrocyte calls QTA `usage.get` and fusiform `catalog.status`, `catalog.get` and
 `plan.prices`. The contract is the [module surface](docs/module-surface.md).

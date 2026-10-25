@@ -544,9 +544,12 @@ detail `{"through": "<newest cursor>"}`: reload per-session history with
   feed position.
 - A step that happened more than 24 hours before it is committed (a first
   read of old history) is not added to the feed; `usage.cache.steps` serves
-  it. Rows are deleted 24 hours after they were committed.
-- In this version every row has `source: "file"`. Runner rows join once the
-  bus grants astrocyte its `live` root. `cache_write_5m`, `cache_write_1h`
+  it. Rows become eligible for deletion 24 hours after they were committed;
+  each feed append deletes up to 1,000 of them, so a cursor stays readable
+  until the deletion reaches it.
+- In this version every row has `source: "file"`. Runner rows join once
+  astrocyte consumes the `step.finished.v1` events runners publish on the
+  bus. `cache_write_5m`, `cache_write_1h`
   and `run_id` are not sent yet.
 - The phone's device label is the route's bind identity `harness`
   (`fed-phone:<fingerprint>`), as Callosum stamps it; the principal must be

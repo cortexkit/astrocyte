@@ -10,9 +10,10 @@
 //! of its session arrived late) is appended again at a new cursor, and the
 //! newest row for an identity wins.
 //!
-//! The feed keeps the rows committed in the last 24 hours. A read from a
-//! cursor older than that is refused `cursor_expired`, and the client reloads
-//! per-session history with `usage.cache.steps`.
+//! Rows become eligible for deletion 24 hours after they were committed, and
+//! each feed append deletes up to 1,000 of them. A read from a cursor at or
+//! before the newest deleted cursor is refused `cursor_expired`, and the
+//! client reloads per-session history with `usage.cache.steps`.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -32,8 +33,8 @@ const PRUNE_BATCH: i64 = 1_000;
 /// Where a feed row's step came from.
 ///
 /// Every row today is `File`: a step read from a harness store or a runner's
-/// durable log. Steps a runner announces on the bus (`step.finished.v1`) will
-/// enter as `runner` rows once the bus grants astrocyte its `live` root; the
+/// durable log. Once astrocyte consumes the `step.finished.v1` events runners
+/// publish on the bus, those steps enter as `runner` rows; the
 /// durable read of the same step then appends its `file` row, which wins as
 /// the newer row for the identity. The table's `source` column already
 /// accepts both values.
