@@ -83,6 +83,7 @@ signal-hook = { version = "0.4", default-features = false }
 [dev-dependencies]
 astrocyte-readers = { workspace = true, features = ["test-support"] }
 astrocyte-module = { path = ".", features = ["test-support"] }
+cortexkit-usage-steps = "=0.2.0"
 tempfile = "3"
 # The `cortexkit-role-llm-runner` crate's `log-read-watermark.json` vectors,
 # replayed through the serving handler.

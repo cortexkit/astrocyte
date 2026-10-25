@@ -73,6 +73,7 @@ dependencies = [
  "cortexkit-role-llm-runner",
  "cortexkit-store",
  "cortexkit-store-types",
+ "cortexkit-usage-steps",
  "fusiform-protocol",
  "futures-util",
  "libc",
@@ -382,6 +383,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94feb32be066be355bd3191fdf3de1f733a54a9cb84932413145b7b7f4b2135e"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "cortexkit-usage-steps"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3aad9a36bcb764ff58b993bb93117d07254f56a1e11452c85da4223c33e5849"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
