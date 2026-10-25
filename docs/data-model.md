@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 32. A schema change appends a migration; an applied
+currently version 33. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -13,8 +13,7 @@ ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 | `usage_event` | Each row records one usage event per producer reference and lineage, together with its pricing projection. | insert; three projection columns, see below |
 | `measurement` | Each row records one immutable event quantity for a role and unit. | insert only |
 | `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
-| `broca_step` | Each row records one BROCA model step for diagnostics, never spend. | insert once; bounded retention deletes |
-| `cache_step_sequence` | Each row maps a ledger event or BROCA step to a durable shared cache cursor. | insert; expired BROCA mappings cascade away |
+| `cache_step_sequence` | Each row maps a ledger event to a durable cache cursor. | insert |
 | `step_feed` | Each row is one emission of a served cache step for `usage.steps.read`; the newest row for a harness and step wins. | insert; rows older than 24 hours are deleted |
 | `step_feed_state` | The row records the cache cursor the feed has caught up to and the newest feed cursor retention deleted. | one row |
 | `chargeability_transition` | Each row records the one terminal settlement of an event's chargeability. | insert only |
@@ -67,8 +66,8 @@ in the table above means both of these exist:
 - `step_detail_no_update`, `step_detail_no_delete`
 
 Each of these tables also has a `BEFORE INSERT` trigger named
-`<table>_insert_once`. The same protection applies to `broca_step` and
-`step_feed`, whose rows cannot be updated but can be deleted for retention.
+`<table>_insert_once`. The same protection applies to `step_feed`, whose rows
+cannot be updated but can be deleted for retention.
 The triggers refuse an insert that collides with an existing unique identity,
 including secondary and partial unique indexes and hidden rowids. This stops
 both `INSERT OR REPLACE` and `REPLACE INTO` from silently deleting the old row
@@ -127,29 +126,15 @@ the index `usage_event_session_time` on `(session, occurred_at_ms)` for the
 cache-diagnostics reads. Tests: `step_detail_refuses_update_and_delete`,
 `a_redelivery_adds_missing_step_detail_but_never_changes_it`.
 
-`broca_step` (schema 28) stores BROCA's `model_step` diagnostics separately
-from spend. These facts never create `usage_event`, `measurement` or
-`priced_charge` rows. Each step has a unique `fact_id` and `(run_id, step_id)`.
-The row preserves the session binding, including its host harness, the five
-nullable token counts, provider, model, variant, wire family, finish reason,
-attempts and retry flag, request body length and digest, three reported times,
-context limit, cache-policy JSON, agent identity and recording time. Output
-includes reasoning as sent. Cache reads first split it into the ledger's
-disjoint roles, and served rows then add reasoning back into output, the
-fleet convention. Missing counts and times stay null.
-
-`broca_step_no_update` and `broca_step_insert_once` refuse updates and
-replacement by either identity. Exact re-reads do nothing; contradictions
-become set-aside evidence. There is no no-delete trigger because retention
-expires steps older than `BROCA_STEP_RETENTION_MS`, currently 30 days after
-`finished_at_ms`. The refresher deletes at most 500 rows per maintenance
-transaction. A step exactly at the cutoff stays until a later tick.
-
-`cache_step_sequence` supplies one durable commit-order cursor for both
-ledger events and BROCA diagnostics. Migration 28 seeds existing events with
-`cursor = event_key`. Insert triggers allocate later cursors from one
-`AUTOINCREMENT` sequence, and retention cannot reuse deleted cursors. The
-mapping is separate from spend and survives process restarts.
+`cache_step_sequence` supplies a durable commit-order cursor for ledger events.
+Migration 28 seeds existing events with `cursor = event_key`. The event insert
+trigger allocates later cursors from an `AUTOINCREMENT` sequence. Migration 33
+removes abandoned BROCA diagnostic storage and rebuilds the cursor table with
+only event keys. It preserves every cursor and the sequence high water, even
+when that high water exceeds every surviving cursor. The migration refuses
+stores containing BROCA diagnostic cursor rows rather than discarding them.
+BROCA steps will arrive from its step log. The cursor mapping is separate from
+spend and survives process restarts.
 
 `step_feed` (schema 29) is the live step feed. After each commit, astrocyte
 recomputes the served rows of each session that gained or changed steps and

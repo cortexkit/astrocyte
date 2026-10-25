@@ -295,12 +295,11 @@ priced is reported with its unpriced population, not as a smaller number.
 
 ### 4.1 Cache diagnostics
 
-These two operations serve harness steps and BROCA's diagnostic model steps,
-per session, with cache verdicts. A harness is a producer whose events are one
+These two operations serve harness steps per session, with cache verdicts.
+A harness is a producer whose events are one
 model step each: `claude-code`, `codex`, `gemini`, `kimi`, `omp`, `opencode` or
-`pi`, plus `broca` for its separate diagnostic facts. BROCA uses the binding's
-session key, as its session spend does; the host harness stays in the stored
-binding. A request that fails to decode is refused `malformed`, as everywhere
+`pi`. BROCA steps will arrive from its step log, not its exported spend facts.
+A request that fails to decode is refused `malformed`, as everywhere
 else. A request that decodes is refused with one of these codes:
 
 | Code | Condition |
@@ -316,14 +315,12 @@ steps of that window whose cursor is greater are returned. The reply has
 steps than the window) and `undated_steps` (steps without a time, which are
 not placed on the timeline). Each step has these fields:
 
-- `cursor`, the durable shared cache-step cursor. It increases across harness
-  events and BROCA steps, survives restarts and is never reused by retention.
+- `cursor`, the durable cache-step cursor. It increases across harness
+  events, survives restarts and is never reused.
   A late step can have a greater cursor than a step that happened after it.
-- `step_ref`, the harness's own id for the step, and `occurred_at_ms`
-  (BROCA's required `finished_at_ms`). BROCA steps read from BROCA's export
-  facts use `run_id#step_id`; that diagnostics table is being retired, and the
-  reader of BROCA's durable step log will use the event's `attempt_id`, a random
-  id per provider attempt, as described in section 4.2.
+- `step_ref`, the harness's own id for the step, and `occurred_at_ms`.
+  BROCA's step-log reader will use the event's `attempt_id`, a random id per
+  provider attempt, as described in section 4.2.
 - `input`, `cache_read`, `cache_write`, `output` and `reasoning`, each omitted
   when the reader did not store it. `cache_write` sums every cache lifetime
   Claude Code reports.
@@ -335,9 +332,8 @@ not placed on the timeline). Each step has these fields:
   Test: `served_output_includes_reasoning_on_both_reads`.
 - `provider`, `model`, `finish` and `context_limit`. `finish` comes from
   OpenCode's `finish`, Pi's `stopReason`, or the stored stop reason of Claude
-  Code and Oh My Pi, or BROCA's `finish_reason`. `context_limit` comes from
-  Codex or BROCA.
-- `request_body_len` is present when BROCA reported it. On a prompt drop,
+  Code and Oh My Pi. `context_limit` comes from Codex.
+- `request_body_len` is optional and is not populated by the current readers. On a prompt drop,
   `request_size` is present when both adjacent steps report body lengths:
   `smaller` when the current body is shorter, otherwise `not_smaller`.
 - `prompt`, which is input plus cache read plus cache write.

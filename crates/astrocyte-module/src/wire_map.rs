@@ -6,9 +6,6 @@ use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::{EventRecordRequest, MeasurementInput};
 use serde::Deserialize;
 
-pub use astrocyte_core::broca_step::ModelStepFact as WireModelStepFact;
-pub(crate) const MODEL_STEP_KIND: &str = "model_step";
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct WireSpendSegmentFact {
     /// The row's `export_seq` column. The stored segment JSON does not carry

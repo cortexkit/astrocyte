@@ -13,10 +13,9 @@
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
-/// Producers whose events are one model step each. Goose records one total
-/// per session and is not included. BROCA reads its own diagnostic facts.
-pub const CACHE_HARNESSES: [&str; 8] = [
-    "broca",
+/// Producers whose events are one model step each. Goose and BROCA record
+/// session spend totals, not steps. BROCA steps will arrive from its step log.
+pub const CACHE_HARNESSES: [&str; 7] = [
     "claude-code",
     "codex",
     "gemini",
@@ -26,8 +25,7 @@ pub const CACHE_HARNESSES: [&str; 8] = [
     "pi",
 ];
 
-/// The ledger-backed members of [`CACHE_HARNESSES`] as an SQL list. BROCA
-/// session spend is deliberately excluded; only its diagnostic steps qualify.
+/// The members of [`CACHE_HARNESSES`] as an SQL list.
 macro_rules! harnesses_sql {
     () => {
         "('claude-code','codex','gemini','kimi','omp','opencode','pi')"
@@ -412,60 +410,6 @@ const PROJECT_ROOT_SQL: &str = "SELECT project_root FROM usage_event
      WHERE session=?1 AND producer=?2 AND occurred_at_ms>=?3 AND project_root IS NOT NULL
       ORDER BY occurred_at_ms DESC, event_key DESC LIMIT 1";
 
-// BROCA counts reasoning tokens inside output_tokens on every model-step fact,
-// for every provider. (Its older session facts did not always: before BROCA
-// changed its usage rules, xAI facts stored reasoning apart from output.)
-// broca_step keeps the counts exactly as sent, and this query reports output
-// minus reasoning, the same split the ledger stores for BROCA session facts.
-// If reasoning exceeds output, which that rule makes impossible, output is
-// reported as absent rather than clamped to zero.
-macro_rules! broca_columns {
-    () => {
-        "s.cursor,b.run_id || '#' || b.step_id,b.finished_at_ms,b.provider,b.model,
-         b.finish_reason,b.context_limit,b.input_tokens,b.cached_input_tokens,b.cache_write_tokens,
-         CASE WHEN b.reasoning_tokens IS NULL THEN b.output_tokens
-              WHEN b.output_tokens>=b.reasoning_tokens THEN b.output_tokens-b.reasoning_tokens END,
-         b.reasoning_tokens,b.request_body_len
-         FROM broca_step b JOIN cache_step_sequence s ON s.broca_step_key=b.step_key"
-    };
-}
-const BROCA_WINDOW_SQL: &str =
-    concat!("SELECT ", broca_columns!(),
-    " WHERE b.session=?1 AND ?2='broca' ORDER BY b.finished_at_ms DESC,b.step_key DESC LIMIT ?3");
-const BROCA_EARLIER_SQL: &str = "SELECT EXISTS(SELECT 1 FROM broca_step b
-    JOIN cache_step_sequence s ON s.broca_step_key=b.step_key
-    WHERE b.session=?1 AND ?2='broca' AND (b.finished_at_ms,s.cursor)<(?3,?4))";
-const BROCA_BASELINE_SQL: &str = concat!(
-    "SELECT ",
-    broca_columns!(),
-    " WHERE b.session=?1 AND ?2='broca' AND (b.finished_at_ms,s.cursor)<(?3,?4)",
-    " AND b.cached_input_tokens IS NOT NULL ORDER BY b.finished_at_ms DESC,b.step_key DESC LIMIT 1"
-);
-const BROCA_PREVIOUS_SQL: &str = "SELECT b.request_body_len FROM broca_step b
-    JOIN cache_step_sequence s ON s.broca_step_key=b.step_key
-    WHERE b.session=?1 AND (b.finished_at_ms,s.cursor)<(?2,?3)
-    ORDER BY b.finished_at_ms DESC,b.step_key DESC LIMIT 1";
-const BROCA_READS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM broca_step
-    WHERE session=?1 AND ?2='broca' AND cached_input_tokens>0)";
-const BROCA_AFTER_SQL: &str = concat!(
-    "SELECT 'broca',b.session,",
-    broca_columns!(),
-    " WHERE s.cursor>?1 ORDER BY s.cursor"
-);
-const BROCA_SINCE_SQL: &str = concat!("SELECT ", broca_columns!(),
-    " WHERE b.session=?1 AND ?2='broca' AND b.finished_at_ms>=?3 ORDER BY b.finished_at_ms,b.step_key");
-const BROCA_PROJECT_SQL: &str = "SELECT project_root FROM broca_step
-    WHERE session=?1 AND ?2='broca' AND finished_at_ms>=?3
-    ORDER BY finished_at_ms DESC,step_key DESC LIMIT 1";
-
-fn source_sql<'a>(producer: &str, ledger: &'a str, broca: &'a str) -> &'a str {
-    if producer == "broca" {
-        broca
-    } else {
-        ledger
-    }
-}
-
 fn count(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<u64>> {
     row.get::<_, Option<i64>>(column)?
         .map(|value| {
@@ -513,7 +457,7 @@ pub fn load_session(
     limit: usize,
 ) -> rusqlite::Result<SessionSteps> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let mut statement = conn.prepare_cached(source_sql(producer, WINDOW_SQL, BROCA_WINDOW_SQL))?;
+    let mut statement = conn.prepare_cached(WINDOW_SQL)?;
     let mut rows = statement
         .query_map(params![session, producer, limit], step_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -537,17 +481,15 @@ fn lead_before(
     session: &str,
     step: &StepRow,
 ) -> rusqlite::Result<Lead> {
-    let earlier_steps = conn
-        .prepare_cached(source_sql(producer, EARLIER_SQL, BROCA_EARLIER_SQL))?
-        .query_row(
-            params![session, producer, step.occurred_at_ms, step.cursor],
-            |row| row.get::<_, bool>(0),
-        )?;
+    let earlier_steps = conn.prepare_cached(EARLIER_SQL)?.query_row(
+        params![session, producer, step.occurred_at_ms, step.cursor],
+        |row| row.get::<_, bool>(0),
+    )?;
     if !earlier_steps {
         return Ok(Lead::default());
     }
     let baseline = conn
-        .prepare_cached(source_sql(producer, BASELINE_SQL, BROCA_BASELINE_SQL))?
+        .prepare_cached(BASELINE_SQL)?
         .query_row(
             params![session, producer, step.occurred_at_ms, step.cursor],
             step_row,
@@ -556,16 +498,7 @@ fn lead_before(
     Ok(Lead {
         earlier_steps,
         baseline: baseline.map(|step| step.counts()),
-        request_body_len: if producer == "broca" {
-            conn.prepare_cached(BROCA_PREVIOUS_SQL)?
-                .query_row(params![session, step.occurred_at_ms, step.cursor], |row| {
-                    count(row, 0)
-                })
-                .optional()?
-                .flatten()
-        } else {
-            None
-        },
+        request_body_len: None,
     })
 }
 
@@ -576,14 +509,11 @@ pub(crate) fn session_reads_cache(
     producer: &str,
     session: &str,
 ) -> rusqlite::Result<bool> {
-    conn.prepare_cached(source_sql(producer, READS_CACHE_SQL, BROCA_READS_SQL))?
+    conn.prepare_cached(READS_CACHE_SQL)?
         .query_row(params![session, producer], |row| row.get(0))
 }
 
 fn undated_steps(conn: &Connection, producer: &str, session: &str) -> rusqlite::Result<u64> {
-    if producer == "broca" {
-        return Ok(0);
-    }
     let undated: i64 = conn
         .prepare_cached(UNDATED_SQL)?
         .query_row(params![session, producer], |row| row.get(0))?;
@@ -601,25 +531,11 @@ pub fn active_sessions(
 ) -> rusqlite::Result<Vec<(String, String, i64)>> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let mut statement = conn.prepare_cached(ACTIVE_SESSIONS_SQL)?;
-    let mut sessions = statement
+    let sessions = statement
         .query_map(params![since_ms, producer, limit], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<rusqlite::Result<Vec<(String, String, i64)>>>()?;
-    if producer.is_none_or(|p| p == "broca") {
-        sessions.extend(
-            conn.prepare_cached(
-                "SELECT 'broca',session,MAX(finished_at_ms) FROM broca_step
-            WHERE finished_at_ms>=?1 GROUP BY session ORDER BY 3 DESC,session LIMIT ?2",
-            )?
-            .query_map(params![since_ms, limit], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<rusqlite::Result<Vec<(String, String, i64)>>>()?,
-        );
-        sessions.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| (&a.0, &a.1).cmp(&(&b.0, &b.1))));
-        sessions.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    }
     Ok(sessions)
 }
 
@@ -629,15 +545,9 @@ pub fn steps_recorded_after(
     after_event_key: i64,
 ) -> rusqlite::Result<Vec<RecordedStep>> {
     let mut statement = conn.prepare_cached(RECORDED_AFTER_SQL)?;
-    let mut steps = statement
+    let steps = statement
         .query_map([after_event_key], recorded_step)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    steps.extend(
-        conn.prepare_cached(BROCA_AFTER_SQL)?
-            .query_map([after_event_key], recorded_step)?
-            .collect::<rusqlite::Result<Vec<_>>>()?,
-    );
-    steps.sort_by_key(|record| record.step.as_ref().map_or(0, |step| step.cursor));
     Ok(steps)
 }
 
@@ -936,15 +846,13 @@ pub struct ChangedSession {
 }
 
 /// `(producer, session, occurred_at_ms)` of every dated step whose cache
-/// cursor is in `(?1, ?2]`, harness steps and BROCA steps alike.
+/// cursor is in `(?1, ?2]`.
 const DATED_STEPS_BETWEEN_SQL: &str = concat!(
     "SELECT e.producer,e.session,e.occurred_at_ms FROM cache_step_sequence s",
     " JOIN usage_event e ON e.event_key=s.event_key",
     " WHERE s.cursor>?1 AND s.cursor<=?2 AND e.session IS NOT NULL",
     " AND e.occurred_at_ms IS NOT NULL AND e.producer IN ",
-    harnesses_sql!(),
-    " UNION ALL SELECT 'broca',b.session,b.finished_at_ms FROM cache_step_sequence s",
-    " JOIN broca_step b ON b.step_key=s.broca_step_key WHERE s.cursor>?1 AND s.cursor<=?2"
+    harnesses_sql!()
 );
 const DATED_STEP_BY_KEY_SQL: &str = concat!(
     "SELECT producer,session,occurred_at_ms FROM usage_event WHERE event_key=?1",
@@ -958,9 +866,6 @@ const READ_CACHE_THROUGH_SQL: &str = "SELECT EXISTS (SELECT 1 FROM usage_event e
      JOIN measurement m ON m.event_key=e.event_key
      WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL AND s.cursor<=?3
        AND m.role='cache_read' AND m.quantity_exponent=0 AND m.quantity_units>0)";
-const BROCA_READ_CACHE_THROUGH_SQL: &str = "SELECT EXISTS(SELECT 1 FROM broca_step b
-     JOIN cache_step_sequence s ON s.broca_step_key=b.step_key
-     WHERE b.session=?1 AND ?2='broca' AND s.cursor<=?3 AND b.cached_input_tokens>0)";
 
 /// The sessions with a dated step whose cache cursor is in `(after,
 /// through]`, plus the sessions of the events in `late_keys` (events that
@@ -1018,12 +923,8 @@ pub fn session_read_cache_through(
     session: &str,
     through: i64,
 ) -> rusqlite::Result<bool> {
-    conn.prepare_cached(source_sql(
-        producer,
-        READ_CACHE_THROUGH_SQL,
-        BROCA_READ_CACHE_THROUGH_SQL,
-    ))?
-    .query_row(params![session, producer, through], |row| row.get(0))
+    conn.prepare_cached(READ_CACHE_THROUGH_SQL)?
+        .query_row(params![session, producer, through], |row| row.get(0))
 }
 
 /// Every dated step of one session at or after `since_ms`, oldest first,
@@ -1036,7 +937,7 @@ pub fn session_steps_since(
     since_ms: i64,
 ) -> rusqlite::Result<Vec<CacheStep>> {
     let rows = conn
-        .prepare_cached(source_sql(producer, SINCE_SQL, BROCA_SINCE_SQL))?
+        .prepare_cached(SINCE_SQL)?
         .query_map(params![session, producer, since_ms], step_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let Some(first) = rows.first() else {
@@ -1148,7 +1049,7 @@ fn session_summary(
     last_activity_ms: i64,
 ) -> rusqlite::Result<CacheSession> {
     let rows = conn
-        .prepare_cached(source_sql(&producer, SINCE_SQL, BROCA_SINCE_SQL))?
+        .prepare_cached(SINCE_SQL)?
         .query_map(params![session, producer, since_ms], step_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let lead = match rows.first() {
@@ -1178,7 +1079,7 @@ fn session_summary(
     #[allow(clippy::cast_precision_loss)] // A ratio of token counts; rounding is harmless.
     let hit_ratio = (prompt > 0).then(|| read as f64 / prompt as f64);
     let project_root = conn
-        .prepare_cached(source_sql(&producer, PROJECT_ROOT_SQL, BROCA_PROJECT_SQL))?
+        .prepare_cached(PROJECT_ROOT_SQL)?
         .query_row(params![session, producer, since_ms], |row| row.get(0))
         .optional()?;
     Ok(CacheSession {
@@ -1448,15 +1349,8 @@ mod tests {
 
     #[test]
     fn the_sql_harness_list_excludes_broca_session_spend() {
-        let listed = format!(
-            "('{}')",
-            CACHE_HARNESSES
-                .iter()
-                .copied()
-                .filter(|p| *p != "broca")
-                .collect::<Vec<_>>()
-                .join("','")
-        );
+        assert!(!CACHE_HARNESSES.contains(&"broca"));
+        let listed = format!("('{}')", CACHE_HARNESSES.join("','"));
         assert_eq!(listed, harnesses_sql!());
     }
 
@@ -2055,10 +1949,7 @@ mod tests {
         );
         let started = Instant::now();
         conn.execute_batch(MIGRATIONS[27].statements).unwrap();
-        println!(
-            "migration 28 (broca_step, shared cursors) took {:?}",
-            started.elapsed()
-        );
+        println!("migration 28 (shared cursors) took {:?}", started.elapsed());
 
         let explain = |label: &str, sql: &str| {
             let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();

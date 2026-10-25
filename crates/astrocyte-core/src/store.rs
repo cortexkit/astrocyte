@@ -94,34 +94,30 @@ fn probe_sqlite_capabilities(conn: &Connection) -> rusqlite::Result<()> {
 /// Migrates the leased writer before it is shared with readers or writers.
 /// SQLite requires foreign keys off outside the rebuild transaction: otherwise
 /// dropping the old self-referencing charge table deletes every text index row
-/// individually. Migration 23 checks the rebuilt foreign keys before commit.
+/// individually. Migrations 23 and 33 check rebuilt foreign keys before commit.
 pub fn migrate_store(store: &SqliteStore) -> Result<MigrationOutcome, StoreError> {
     store.with_conn(|conn| set_foreign_keys(conn, true))?;
-    let through22 = MIGRATIONS.partition_point(|migration| migration.version <= 22);
-    let earlier = store.migrate("astrocyte", &MIGRATIONS[..through22])?;
-    if earlier.recorded >= 23 {
-        let mut outcome = store.migrate("astrocyte", MIGRATIONS)?;
-        outcome.applied += earlier.applied;
-        return Ok(outcome);
+    let mut applied = 0;
+    for version in [23, 33] {
+        let before = MIGRATIONS.partition_point(|migration| migration.version < version);
+        let earlier = store.migrate("astrocyte", &MIGRATIONS[..before])?;
+        applied += earlier.applied;
+        if earlier.recorded >= version {
+            continue;
+        }
+        let mut restore = ForeignKeyRestore {
+            store,
+            active: true,
+        };
+        store.with_conn(|conn| set_foreign_keys(conn, false))?;
+        let rebuilt = store.migrate("astrocyte", &MIGRATIONS[..=before]);
+        // Restore enforcement even when the transaction failed. Drop also attempts
+        // restoration during unwinding, before startup can hand the store to callers.
+        restore.restore()?;
+        applied += rebuilt?.applied;
     }
-
-    let mut restore = ForeignKeyRestore {
-        store,
-        active: true,
-    };
-    store.with_conn(|conn| set_foreign_keys(conn, false))?;
-    let through23 = MIGRATIONS.partition_point(|migration| migration.version <= 23);
-    let rebuilt = store.migrate("astrocyte", &MIGRATIONS[..through23]);
-    // Restore enforcement even when the transaction failed. Drop also attempts
-    // restoration during unwinding, before startup can hand the store to callers.
-    restore.restore()?;
-    let mut outcome = rebuilt?;
-    outcome.applied += earlier.applied;
-    if through23 < MIGRATIONS.len() {
-        let mut later = store.migrate("astrocyte", MIGRATIONS)?;
-        later.applied += outcome.applied;
-        outcome = later;
-    }
+    let mut outcome = store.migrate("astrocyte", MIGRATIONS)?;
+    outcome.applied += applied;
     Ok(outcome)
 }
 
@@ -3846,12 +3842,61 @@ END;
 CREATE INDEX step_feed_session_cursor ON step_feed(harness,session,feed_cursor);
 "#,
     },
+    Migration {
+        version: 33,
+        statements: r#"-- BROCA steps come from its step log, not export_facts. Refuse to
+-- discard any diagnostic cursor that an older reader may have recorded.
+CREATE TEMP TABLE astrocyte_v33_guard (invalid INTEGER);
+CREATE TEMP TRIGGER astrocyte_v33_no_broca_cursors BEFORE INSERT ON astrocyte_v33_guard
+WHEN NEW.invalid != 0
+BEGIN
+    SELECT RAISE(ABORT, 'cache_step_sequence_has_broca_steps');
+END;
+INSERT INTO astrocyte_v33_guard SELECT EXISTS (
+    SELECT 1 FROM cache_step_sequence WHERE broca_step_key IS NOT NULL);
+
+-- AUTOINCREMENT's high water may exceed every surviving cursor. Preserve it
+-- separately so rebuilding the table cannot reuse a cursor already served.
+CREATE TEMP TABLE astrocyte_v33_sequence AS
+    SELECT seq FROM sqlite_sequence WHERE name='cache_step_sequence';
+DROP TRIGGER cache_event_cursor;
+DROP TRIGGER cache_broca_cursor;
+CREATE TABLE cache_step_sequence_new (
+    cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key INTEGER NOT NULL UNIQUE REFERENCES usage_event(event_key)
+);
+INSERT INTO cache_step_sequence_new(cursor,event_key)
+    SELECT cursor,event_key FROM cache_step_sequence;
+DROP TABLE cache_step_sequence;
+ALTER TABLE cache_step_sequence_new RENAME TO cache_step_sequence;
+DELETE FROM sqlite_sequence WHERE name='cache_step_sequence';
+INSERT INTO sqlite_sequence(name,seq)
+    SELECT 'cache_step_sequence',seq FROM astrocyte_v33_sequence;
+CREATE TRIGGER cache_event_cursor AFTER INSERT ON usage_event
+BEGIN
+    INSERT INTO cache_step_sequence(event_key) VALUES (NEW.event_key);
+END;
+DROP TABLE broca_step;
+
+-- Check all foreign keys before the migration transaction can commit.
+CREATE TEMP TRIGGER astrocyte_v33_foreign_keys BEFORE INSERT ON astrocyte_v33_guard
+WHEN NEW.invalid != 0
+BEGIN
+    SELECT RAISE(ABORT, 'cache_step_sequence_foreign_key_check');
+END;
+DROP TRIGGER astrocyte_v33_no_broca_cursors;
+INSERT INTO astrocyte_v33_guard SELECT count(*) FROM pragma_foreign_key_check;
+DROP TABLE astrocyte_v33_guard;
+DROP TABLE astrocyte_v33_sequence;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 #[cfg(test)]
 mod tests {
+    include!("store_v33_tests.rs");
 
     fn migration_store() -> (TempStoreDirectory, SqliteStore) {
         let directory = TempStoreDirectory::new();
@@ -3909,7 +3954,7 @@ mod tests {
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (32, 32, 32)
+            (33, 33, 33)
         );
         assert_eq!(
             store
@@ -3922,7 +3967,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 32, 32)
+            (0, 33, 33)
         );
         assert!(!second.store_ahead());
         store
@@ -3932,7 +3977,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',33,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',34,1)",
                     [],
                 )?;
                 Ok(())
@@ -3941,7 +3986,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 33, 32)
+            (0, 34, 33)
         );
         assert!(ahead.store_ahead());
     }
@@ -4125,8 +4170,6 @@ mod tests {
             INSERT INTO statement_import VALUES ('import','s',printf('%064d',0),'fixture.csv',2,NULL,'created',1,0,0,1,0,0,0,0,0);
             INSERT INTO account_subscription VALUES ('account','provider','plan',100,'USD',2,'month',0,NULL,NULL);
             INSERT INTO step_detail(event_key,finish) VALUES (10,'stop');
-            INSERT INTO broca_step(step_key,run_id,step_id,fact_id,project_root,harness,session,provider,model,finished_at_ms,recorded_at_ms)
-                VALUES (1,'run',1,'fact','/project','broca','session','provider','model',1,1);
             INSERT INTO step_feed VALUES (1,'broca','step','runner','session',1,'{}');").unwrap();
         insert_multiplier_row(&conn, "provider", "2026-01-02", Some(None)).unwrap();
         let before = all_rows(&conn);
@@ -4353,17 +4396,6 @@ mod tests {
         step_detail_refuses_replace,
         "step_detail",
         &[("finish", "'changed'")]
-    );
-    replace_guard_test!(
-        broca_step_refuses_replace,
-        "broca_step",
-        &[("recorded_at_ms", "9")],
-        &[("step_key", "2"), ("recorded_at_ms", "9")],
-        &[
-            ("step_key", "2"),
-            ("fact_id", "'other'"),
-            ("recorded_at_ms", "9")
-        ]
     );
     replace_guard_test!(
         step_feed_refuses_replace,

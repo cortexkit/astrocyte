@@ -4,7 +4,6 @@
 //! Settlement, pricing, statements, subscriptions, reconciliation, reads, and
 //! serving are built on top of these producer-neutral records.
 
-pub mod broca_step;
 pub mod cache_diagnostics;
 pub mod canon;
 pub mod capacity;

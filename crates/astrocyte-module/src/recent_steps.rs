@@ -167,17 +167,6 @@ impl RecentSteps {
         late: &[i64],
         now_ms: i64,
     ) -> rusqlite::Result<()> {
-        let expired: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM temp.sqlite_master WHERE name='broca_step_expired')",
-            [],
-            |row| row.get(0),
-        )?;
-        if expired {
-            conn.execute_batch("DROP TABLE temp.broca_step_expired")?;
-            if self.ready {
-                return self.rebuild(conn, now_ms);
-            }
-        }
         if !self.ready {
             return Ok(());
         }

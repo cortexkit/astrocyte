@@ -1,7 +1,7 @@
 use super::*;
 use crate::state::{test_state, transaction_commits_for_test};
 use rusqlite::{types::Value as SqlValue, Connection};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -80,13 +80,8 @@ impl Corpus {
     pub(super) fn append(&self, index: i64) {
         self.append_opencode(index);
         self.append_pi(index);
-        let mut fact: Value = serde_json::from_str(include_str!(
-            "../tests/vectors/broca-model-step/model_step_fact.json"
-        ))
-        .unwrap();
         let id = format!("fast-fact-{index}");
-        fact["fact_id"] = json!(id);
-        fact["step_id"] = json!(index);
+        let fact = json!({"kind":"model_step","fact_id":id,"step_id":index});
         self.broca
             .execute(
                 "INSERT INTO export_facts VALUES(?1,?2,'run-golden',?3)",
@@ -214,7 +209,7 @@ fn rows(state: &SharedState, table: &str) -> Vec<Vec<SqlValue>> {
 }
 
 #[test]
-fn fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval() {
+fn fresh_steps_are_served_and_unknown_broca_facts_are_set_aside_on_the_next_fast_interval() {
     let corpus = Corpus::new();
     let state = test_state();
     state.set_recent_steps_now_for_test(NOW);
@@ -238,11 +233,7 @@ fn fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval() {
         Duration::from_secs(30),
         &mut next,
     );
-    for (harness, session) in [
-        ("opencode", "oc-session"),
-        ("pi", "pi-session"),
-        ("broca", "golden-session"),
-    ] {
+    for (harness, session) in [("opencode", "oc-session"), ("pi", "pi-session")] {
         assert_eq!(query(harness, session)["steps"], json!([]));
     }
     corpus.due(&state);
@@ -251,7 +242,6 @@ fn fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval() {
     for (harness, session, step, input, output) in [
         ("opencode", "oc-session", "message-1", 3, 13 + 2),
         ("pi", "pi-session", "pi:response:response-1", 11, 7),
-        ("broca", "golden-session", "run-golden#1", 3, 512 + 128),
     ] {
         let reply = query(harness, session);
         assert_eq!(
@@ -267,8 +257,9 @@ fn fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval() {
     assert_eq!(
         rows(&state, "usage_event").len(),
         2,
-        "BROCA diagnostics are not spend"
+        "unknown BROCA facts are not spend"
     );
+    harness_drain::assert_set_aside(&state, "broca", 1);
 }
 
 #[test]
@@ -566,7 +557,6 @@ fn windows_sqlite_stores_can_be_deleted_between_fast_cycles() {
     }
     run_fast_lane(&state, &producers, &files, NOW, &stop);
     assert_eq!(rows(&state, "usage_event").len(), 3);
-    assert_eq!(rows(&state, "broca_step").len(), 1);
 }
 
 #[test]
@@ -599,7 +589,6 @@ fn sqlite_store_replacement_between_cycles_recovers_on_the_next_full_tick() {
         drop((opencode, broca));
         run_fast_lane(&state, &producers, &files, current_time_ms(), &stop);
         assert_eq!(rows(&state, "usage_event").len(), 3);
-        assert_eq!(rows(&state, "broca_step").len(), 1);
         for name in ["opencode.db", "broca.db"] {
             fs::remove_file(directory.path().join(name)).unwrap();
         }
@@ -642,7 +631,6 @@ fn sqlite_store_replacement_between_cycles_recovers_on_the_next_full_tick() {
         }
         full_tick(&state, &producers, &files, &stop, current_time_ms());
         assert_eq!(rows(&state, "usage_event").len(), 5);
-        assert_eq!(rows(&state, "broca_step").len(), 2);
         for (session, step) in [
             ("oc-session", "message-2"),
             ("oc-v2-session", "v2-message-2"),
@@ -782,7 +770,6 @@ fn fast_lane_event_bytes_match_full_drain() {
         "usage_event",
         "measurement",
         "step_detail",
-        "broca_step",
         "pricing_pending",
     ] {
         assert!(

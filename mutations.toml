@@ -1456,7 +1456,14 @@ test_file = "crates/astrocyte-core/src/store.rs"
 runner = "cargo"
 package = "astrocyte-core"
 target = "--lib"
-expect_red = ["store::tests::schema_v23_runner_applies_once_and_returns_the_final_store_ahead_outcome", "store::tests::schema_v23_runner_checks_rebuilt_fks_and_rolls_back_to_22_with_enforcement_restored", "store::tests::schema_v23_runner_restores_foreign_keys_during_unwinding"]
+expect_red = [
+  "store::tests::schema_v23_runner_applies_once_and_returns_the_final_store_ahead_outcome",
+  "store::tests::schema_v23_runner_checks_rebuilt_fks_and_rolls_back_to_22_with_enforcement_restored",
+  "store::tests::schema_v23_runner_restores_foreign_keys_during_unwinding",
+  "store::tests::schema_v33_preserves_cursor_bytes_and_other_table_rows",
+  "store::tests::schema_v33_refuses_broca_cursors_and_restores_schema_rows_and_foreign_keys",
+  "store::tests::schema_v33_checks_foreign_keys_before_commit",
+]
 only = true
 timeout_s = 600
 build_timeout_s = 1800
@@ -1679,12 +1686,60 @@ id = "broca-unknown-kind-not-session"
 guards = "A BROCA fact with an unknown kind is set aside, never decoded as a session fact"
 file = "crates/astrocyte-module/src/broca_source.rs"
 old = 'Some(kind) => Err(format!("segment of fact {fact_id} has unknown kind {kind}")),'
-new = 'Some(_) => decode_session_segment(export_seq, fact_id, segment).map(DecodedFact::Event), // NON-VACUITY BREAK'
+new = 'Some(_) => decode_session_segment(export_seq, fact_id, segment), // NON-VACUITY BREAK'
 test_file = "crates/astrocyte-module/src/broca_source.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
 expect_red = ["refresher::broca_source::tests::set_aside_unknown_kind_and_malformed_system_one_rows_keep_good_rows_and_progress"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "cache-cursor-rebuild-preserves-sequence"
+guards = "Rebuilding cache cursors cannot reuse an already served cursor above the surviving maximum"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''DELETE FROM sqlite_sequence WHERE name='cache_step_sequence';
+INSERT INTO sqlite_sequence(name,seq)
+    SELECT 'cache_step_sequence',seq FROM astrocyte_v33_sequence;'''
+new = '-- NON-VACUITY BREAK: keep only the copied rows high water.'
+test_file = "crates/astrocyte-core/src/store_v33_tests.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v33_carries_sequence_above_max_and_new_harness_steps_get_cursors"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "cache-cursor-rebuild-refuses-broca-rows"
+guards = "A cursor-table rebuild with BROCA rows aborts explicitly instead of discarding diagnostic cursors"
+file = "crates/astrocyte-core/src/store.rs"
+old = '''INSERT INTO astrocyte_v33_guard SELECT EXISTS (
+    SELECT 1 FROM cache_step_sequence WHERE broca_step_key IS NOT NULL);'''
+new = '-- NON-VACUITY BREAK: skip the BROCA cursor pre-check.'
+test_file = "crates/astrocyte-core/src/store_v33_tests.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v33_refuses_broca_cursors_and_restores_schema_rows_and_foreign_keys"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "cache-cursor-rebuild-checks-foreign-keys"
+guards = "The cursor-table rebuild checks foreign keys before committing with enforcement disabled"
+file = "crates/astrocyte-core/src/store.rs"
+old = 'INSERT INTO astrocyte_v33_guard SELECT count(*) FROM pragma_foreign_key_check;'
+new = '-- NON-VACUITY BREAK: skip the rebuilt foreign-key check.'
+test_file = "crates/astrocyte-core/src/store_v33_tests.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["store::tests::schema_v33_checks_foreign_keys_before_commit"]
 only = true
 timeout_s = 300
 build_timeout_s = 600
@@ -1791,7 +1846,6 @@ package = "astrocyte-module"
 target = "--lib"
 expect_red = [
   "recent_steps::tests::memory_keeps_the_newest_thousand_steps_and_answers_like_the_store",
-  "refresher::broca_source::tests::broca_model_step_cache_ops_match_memory_store_and_shared_cursors",
   "refresher::pi_source::tests::drained_pi_steps_are_served_alike_from_memory_and_store",
 ]
 only = true
@@ -1825,7 +1879,6 @@ package = "astrocyte-module"
 target = "--lib"
 expect_red = [
   "recent_steps::tests::a_late_finish_reaches_memory",
-  "refresher::broca_source::tests::broca_model_step_cache_ops_match_memory_store_and_shared_cursors",
 ]
 only = true
 timeout_s = 600
@@ -1894,138 +1947,6 @@ expect_red = ["refresher::codex_source::tests::codex_context_window_is_stored_be
 only = true
 timeout_s = 600
 build_timeout_s = 900
-
-[[control]]
-id = "broca-model-step-never-spend"
-guards = "BROCA model_step diagnostics never enter the spend ledger"
-file = "crates/astrocyte-module/src/broca_source.rs"
-old = 'Ok(DecodedFact::ModelStep(wire))'
-new = '''
-            { // NON-VACUITY BREAK: route diagnostics into the spend decoder.
-                if wire.step_id < 0 { return Ok(DecodedFact::ModelStep(wire)); }
-                let mut spend = serde_json::to_value(wire).unwrap();
-                spend["charge_basis"] = Value::from("metered_api");
-                decode_session_segment(export_seq, fact_id, spend).map(DecodedFact::Event)
-            }
-'''
-test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
-runner = "cargo"
-package = "astrocyte-module"
-target = "--lib"
-expect_red = [
-  "refresher::broca_source::tests::broca_model_step_golden_records_every_field_without_spend",
-  "refresher::broca_source::tests::broca_model_step_mixed_and_set_aside_rows_keep_progress",
-  "refresher::broca_source::tests::broca_model_step_requires_each_identity_member_and_keeps_absence",
-  "refresher::broca_source::tests::broca_model_step_insert_once_and_update_guards_preserve_rows",
-  "refresher::broca_source::tests::broca_model_step_retention_is_bounded_and_preserves_new_rows",
-  "refresher::broca_source::tests::broca_model_step_cache_ops_match_memory_store_and_shared_cursors",
-  "refresher::broca_source::tests::broca_model_step_backlog_page_reports_time_and_vm_steps",
-  "refresher::broca_source::tests::broca_model_step_cursors_survive_reopen_and_expiry_without_reuse",
-  "refresher::fast_lane_tests::fast_lane_event_bytes_match_full_drain",
-  "refresher::fast_lane_tests::fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval",
-  "refresher::fast_lane_tests::hot_files_expire_but_growth_keeps_them_hot_and_new_files_wait_for_full_tick",
-  "refresher::fast_lane_tests::new_opencode_row_reuses_prepared_statements",
-  "refresher::fast_lane_tests::sqlite_store_replacement_between_cycles_recovers_on_the_next_full_tick",
-]
-only = true
-timeout_s = 300
-build_timeout_s = 600
-
-[[control]]
-id = "broca-model-step-usage-closed"
-guards = "An unknown model_step usage member is set aside instead of dropped"
-file = "crates/astrocyte-core/src/broca_step.rs"
-old = '#[serde(deny_unknown_fields)]'
-new = '// NON-VACUITY BREAK: accept unknown usage members.'
-test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
-runner = "cargo"
-package = "astrocyte-module"
-target = "--lib"
-expect_red = ["refresher::broca_source::tests::broca_model_step_mixed_and_set_aside_rows_keep_progress"]
-only = true
-timeout_s = 300
-build_timeout_s = 600
-
-[[control]]
-id = "broca-model-step-id-required"
-guards = "A missing model_step step_id is evidence, not an invented step zero"
-file = "crates/astrocyte-core/src/broca_step.rs"
-old = '    pub step_id: i64,'
-new = '''
-    #[serde(default)] // NON-VACUITY BREAK
-    pub step_id: i64,
-'''
-test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
-runner = "cargo"
-package = "astrocyte-module"
-target = "--lib"
-expect_red = [
-  "refresher::broca_source::tests::broca_model_step_mixed_and_set_aside_rows_keep_progress",
-  "refresher::broca_source::tests::broca_model_step_requires_each_identity_member_and_keeps_absence",
-]
-only = true
-timeout_s = 300
-build_timeout_s = 600
-
-[[control]]
-id = "broca-model-step-contradiction"
-guards = "A changed model_step re-read is set aside and never overwrites the first row"
-file = "crates/astrocyte-core/src/broca_step.rs"
-old = 'return Ok((!same).then(|| {'
-new = 'return Ok((false && !same).then(|| { // NON-VACUITY BREAK'
-test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
-runner = "cargo"
-package = "astrocyte-module"
-target = "--lib"
-expect_red = ["refresher::broca_source::tests::broca_model_step_mixed_and_set_aside_rows_keep_progress"]
-only = true
-timeout_s = 300
-build_timeout_s = 600
-
-[[control]]
-id = "broca-step-insert-once"
-guards = "INSERT OR REPLACE cannot replace a BROCA diagnostic by either identity"
-file = "crates/astrocyte-core/src/store.rs"
-old = "SELECT RAISE(ABORT, 'broca_step_insert_once');"
-new = "SELECT 1; -- NON-VACUITY BREAK"
-test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
-runner = "cargo"
-package = "astrocyte-module"
-target = "--lib"
-expect_red = ["refresher::broca_source::tests::broca_model_step_insert_once_and_update_guards_preserve_rows"]
-only = true
-timeout_s = 300
-build_timeout_s = 600
-
-[[control]]
-id = "broca-step-no-update"
-guards = "BROCA diagnostic rows cannot be updated"
-file = "crates/astrocyte-core/src/store.rs"
-old = "SELECT RAISE(ABORT, 'broca_step_no_update');"
-new = "SELECT 1; -- NON-VACUITY BREAK"
-test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
-runner = "cargo"
-package = "astrocyte-module"
-target = "--lib"
-expect_red = ["refresher::broca_source::tests::broca_model_step_insert_once_and_update_guards_preserve_rows"]
-only = true
-timeout_s = 300
-build_timeout_s = 600
-
-[[control]]
-id = "broca-step-retention-bounded"
-guards = "BROCA retention deletes at most 500 expired rows per transaction"
-file = "crates/astrocyte-core/src/broca_step.rs"
-old = 'pub const RETENTION_BATCH: usize = 500;'
-new = 'pub const RETENTION_BATCH: usize = 501; // NON-VACUITY BREAK'
-test_file = "crates/astrocyte-module/src/broca_model_step_tests.rs"
-runner = "cargo"
-package = "astrocyte-module"
-target = "--lib"
-expect_red = ["refresher::broca_source::tests::broca_model_step_retention_is_bounded_and_preserves_new_rows"]
-only = true
-timeout_s = 300
-build_timeout_s = 600
 
 [[control]]
 id = "opencode-v2-completion-not-finish"
@@ -2199,8 +2120,7 @@ package = "astrocyte-module"
 target = "--lib"
 expect_red = [
   "step_feed::tests::served_output_includes_reasoning_on_both_reads",
-  "refresher::broca_source::tests::broca_model_step_cache_ops_match_memory_store_and_shared_cursors",
-  "refresher::fast_lane_tests::fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval",
+  "refresher::fast_lane_tests::fresh_steps_are_served_and_unknown_broca_facts_are_set_aside_on_the_next_fast_interval",
   "refresher::fast_lane_tests::fresh_v2_only_completed_row_is_served_on_the_next_fast_interval",
 ]
 expect_message = "/output|left == right/"
@@ -2556,21 +2476,6 @@ runner = "cargo"
 package = "astrocyte-core"
 target = "--lib"
 expect_red = ["store::tests::step_feed_refuses_replace"]
-only = true
-timeout_s = 300
-build_timeout_s = 600
-
-[[control]]
-id = "ledger-broca-step-insert-once"
-guards = "The ledger-wide replacement probes detect an unguarded BROCA diagnostic"
-file = "crates/astrocyte-core/src/store.rs"
-old = "    SELECT RAISE(ABORT, 'broca_step_insert_once');"
-new = "    SELECT 1; -- NON-VACUITY BREAK"
-test_file = "crates/astrocyte-core/src/store.rs"
-runner = "cargo"
-package = "astrocyte-core"
-target = "--lib"
-expect_red = ["store::tests::broca_step_refuses_replace"]
 only = true
 timeout_s = 300
 build_timeout_s = 600

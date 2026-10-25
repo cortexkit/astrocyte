@@ -429,7 +429,6 @@ pub(crate) mod tests {
     impl SourceClient for OneEvent {
         fn pull(&self, _since: Option<SourceCursor>, _limit: u32) -> Result<ExportPage, PullError> {
             Ok(ExportPage {
-                model_steps: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: SourceCursor {
                     lineage: "fusiform-loop-test:1".into(),
