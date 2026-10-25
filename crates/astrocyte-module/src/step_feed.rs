@@ -54,7 +54,8 @@ pub fn may_read_feed(principal: Option<&Principal>, harness: &str) -> bool {
     }
 }
 
-/// `usage.steps.subscribe` params, optionally selecting one session.
+/// `usage.steps.subscribe` params. `harness` and `session` select one session
+/// and must be supplied together.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeedSubscribeRequest {
@@ -189,8 +190,9 @@ impl FeedHub {
         Ok(())
     }
 
-    /// Queue a newer `through` for unfiltered subscribers and those whose
-    /// session gained a row. A full queue marks its subscriber lagged and
+    /// Queue a newer `through` for unfiltered subscribers and for subscribers
+    /// whose exact `(harness, session)` pair gained a row. A full queue marks
+    /// its subscriber lagged and
     /// drops it from the hub.
     fn notify(&self, through: i64, changed: &[FeedFilter]) {
         let mut hub = self.lock();

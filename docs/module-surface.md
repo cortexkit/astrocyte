@@ -437,8 +437,11 @@ Each notice is one StreamData frame:
 `through` is the newest committed cursor. Notices are coalesced: at most four
 a second, and a notice may cover many steps or none that the caller may see.
 With a session filter, a notice is sent only when a row whose own `harness`
-and `session` match exactly is appended. The notice still carries the newest
-committed cursor across the whole feed. Without a filter, notices are unchanged.
+and `session` match exactly is appended. Its `through` is the feed-wide cursor
+committed with that row; later unrelated rows do not advance it, so it may be
+older than the feed's newest cursor. A caller reads `after` its own last cursor
+with the same filter, so this changes nothing it needs. Without a filter,
+notices are unchanged.
 
 | How it ends | Meaning |
 |---|---|
@@ -506,7 +509,9 @@ Reply:
   arrived late), the whole row is sent again at a new cursor. The last row for
   an identity wins: apps replace, never append.
 
-A row from a runner's `step.finished.v1` event takes its identity from the
+Runner rows are not served yet: the feed carries only rows from astrocyte's own
+reads (`source: "file"`) until it consumes runners' step events. When it does,
+a row from a runner's `step.finished.v1` event takes its identity from the
 event. When the event carries `harness_step_ref` (runner contract 14.3,
 present for runners whose history is the host harness's own record),
 `harness` is the event's `harness` (the hosting program, such as
