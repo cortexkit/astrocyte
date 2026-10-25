@@ -19,7 +19,10 @@ every reply again through the real dispatch, over a store it builds in the
 test, and asserts the bytes equal these files, so the vectors cannot drift
 from the code. `published_sha256sums_cover_every_file` checks `SHA256SUMS`.
 `every_frame_pins_the_case_its_name_names` reads the served frames and checks
-that each still carries the case it is published for.
+that each reply and refusal still carries the case it is published for. The
+request frame is checked by
+`the_after_cursor_request_serves_the_steps_past_its_cursor`, which serves its
+params and compares the result with `reply-streaming.json`.
 
 The store holds four sessions, and each reply reads one of them:
 
@@ -41,7 +44,7 @@ The store holds four sessions, and each reply reads one of them:
 | `reply-streaming.json` | A whole session in one page: `harness`, `session`, `earlier_steps` false, `undated_steps` 0, and the step members `cursor`, `step_ref`, `occurred_at_ms`, `input`, `cache_read`, `cache_write`, `output`, `reasoning`, `provider`, `model`, `finish`, `context_limit`, `prompt`, `retention`, `verdict` and `prompt_dropped`. `output` includes `reasoning` (1,200 + 500), and `cache_write` sums the split 5-minute and 1-hour writes. |
 | `reply-earlier-steps.json` | The same session read with `limit` 1, so the page is the newest step and `earlier_steps` is true. The verdict still comes from the whole session, not from the page. |
 | `reply-undated-steps.json` | `undated_steps` 2: steps without a time are counted, not placed on the timeline. |
-| `reply-row-every-member.json` | Every member the handler can emit for a step: those of `reply-streaming.json` plus `request_body_len` and `request_size`. The third step has `prompt_dropped` true and `request_size` `smaller`, and a retention above 0. `not_smaller` (a prompt drop whose request body did not shrink) is not shown, because a drop needs tens of thousands of tokens fewer and the invented bodies stay small; a decoder must still accept it. |
+| `reply-row-every-member.json` | Every member the handler can emit for a step: those of `reply-streaming.json` plus `request_body_len` and `request_size`. The third step has `prompt_dropped` true and `request_size` `smaller`, and a retention above 0. `not_smaller` is not shown here: the handler serves it on a prompt drop when both adjacent steps report a request body and the current one is not shorter than the previous one, and no fixture here is shaped that way. A decoder must still accept it. |
 | `reply-row-required-only.json` | A step with only the members every step carries: `cursor`, `step_ref`, `occurred_at_ms`, `prompt`, `verdict` and `prompt_dropped`. No absent member appears, and none is served as zero. |
 
 A step's members are serialised by name, so a client decodes an object by key
@@ -62,5 +65,5 @@ and must not depend on their order.
 | `rejected/reply-unknown-member.json` | an extra `page` member | `malformed`: the request is a closed object, so a member it does not define is refused, never ignored. |
 
 A request whose `harness` or `session` is missing, or whose members have the
-wrong type, is refused `malformed` too. The decoder's text names the member, so
-those frames are not published as fixed bytes.
+wrong type, is refused `malformed` too. The request decoder's error text names
+the member, so those frames are not published as fixed bytes.

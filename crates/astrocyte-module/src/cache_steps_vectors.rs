@@ -1,11 +1,14 @@
 //! Published `usage.cache.steps` reply vectors, regenerated from the real
 //! handler and compared byte for byte with the files the phone app decodes.
 //!
-//! Each frame is served by [`crate::ops::dispatch`], the operation's real
-//! dispatch, over a store this module builds from invented rows: no real
-//! session, model or count is published. A reply keeps its bytes while its
-//! members, their names and their omission rules stay put, so changing any of
-//! them fails here, and the published files move only on purpose.
+//! Every reply and refusal is answered by `crate::ops::dispatch`, the
+//! operation's real dispatch, over a store this module builds from invented
+//! rows: no real session, model or count is published. A reply keeps its bytes
+//! while its members, their names and their omission rules stay put, so
+//! changing any of them fails here, and the published files move only on
+//! purpose. One published file is a request rather than an answer: it is
+//! serialised from its params, because it pins the request member that no
+//! reply's request shows.
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -91,7 +94,8 @@ struct Vector {
     params: serde_json::Value,
 }
 
-/// Every published frame, all served from one store holding all the fixtures.
+/// Every published reply and refusal, served from one store holding all the
+/// fixtures, beside the one published request frame and its params.
 fn vectors() -> Vec<Vector> {
     let vector = |file: &'static str, params: serde_json::Value| Vector { file, params };
     vec![
@@ -343,9 +347,10 @@ fn the_after_cursor_request_serves_the_steps_past_its_cursor() {
     assert_eq!(window["result"]["steps"], serde_json::json!(streamed[1..]));
 }
 
-/// Every published frame is served again by the real handler and must match
-/// the committed bytes exactly. A member that is renamed, reordered, dropped
-/// or newly omitted changes those bytes and fails here.
+/// Every published file is regenerated and must match the committed bytes
+/// exactly: a reply through the real handler, the one request frame from its
+/// params. A member that is renamed, reordered, dropped or newly omitted
+/// changes those bytes and fails here.
 #[test]
 fn published_replies_are_the_served_bytes() {
     for (file, body) in received() {
@@ -403,8 +408,9 @@ fn published_sha256sums_cover_every_file() {
     }
 }
 
-/// What each published frame asks of a decoder, read from the frame the
-/// handler serves rather than trusted to match the file's name.
+/// What each published reply or refusal asks of a decoder, read from the
+/// frame the handler serves rather than trusted to match the file's name. The
+/// request frame is checked by `the_after_cursor_request_serves_the_steps_past_its_cursor`.
 #[test]
 fn every_frame_pins_the_case_its_name_names() {
     use serde_json::Value;
