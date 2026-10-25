@@ -18,6 +18,7 @@ pub mod reconcile;
 pub mod report;
 pub mod statement;
 pub mod statement_import;
+pub mod step_feed;
 pub mod store;
 pub mod subscription;
 pub mod verdict;

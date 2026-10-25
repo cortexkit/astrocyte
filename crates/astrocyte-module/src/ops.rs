@@ -30,13 +30,16 @@ pub const OP_MULTIPLIER_PACE: &str = "spend.multiplier.pace";
 pub const OP_MULTIPLIER_RECOMPUTE: &str = "spend.multiplier.recompute";
 pub const OP_CACHE_SESSIONS: &str = "usage.cache.sessions";
 pub const OP_CACHE_STEPS: &str = "usage.cache.steps";
-/// A watch: served as a stream of notices, not through `dispatch`. See
-/// `cache_notices`.
-pub const OP_CACHE_SUBSCRIBE: &str = "usage.cache.subscribe";
+/// The live step feed (`step_feed`). The subscription is a watch, served as a
+/// stream of notices by the serving handler, not through `dispatch`. Both
+/// are served only to the principals `step_feed::may_read_feed` admits; the
+/// serving handler checks that before either reaches its code.
+pub const OP_STEPS_SUBSCRIBE: &str = "usage.steps.subscribe";
+pub const OP_STEPS_READ: &str = "usage.steps.read";
 
 /// The closed public surface consumed by dispatch, the manifest, and the schema
 /// artifact. Exact name-set parity prevents a same-sized but incorrect surface.
-pub const PUBLIC_OPERATION_NAMES: [&str; 21] = [
+pub const PUBLIC_OPERATION_NAMES: [&str; 22] = [
     OP_VERDICT,
     OP_REPORT,
     OP_EVENT_INGEST,
@@ -57,7 +60,8 @@ pub const PUBLIC_OPERATION_NAMES: [&str; 21] = [
     OP_MULTIPLIER_RECOMPUTE,
     OP_CACHE_SESSIONS,
     OP_CACHE_STEPS,
-    OP_CACHE_SUBSCRIBE,
+    OP_STEPS_SUBSCRIBE,
+    OP_STEPS_READ,
 ];
 
 /// Versioned, committed operation-schema artifact embedded in the serving
@@ -273,7 +277,11 @@ fn operation_params_schema(name: &str) -> Value {
                 "after_cursor": optional_i64,
             }),
         ),
-        OP_CACHE_SUBSCRIBE => closed_object(&[], json!({"after_cursor": optional_i64})),
+        OP_STEPS_SUBSCRIBE => closed_object(&[], json!({})),
+        OP_STEPS_READ => closed_object(
+            &[],
+            json!({"after": optional_string, "limit": optional_u32}),
+        ),
         other => unreachable!("operation {other} is served without a params schema"),
     }
 }
@@ -330,7 +338,10 @@ pub fn dispatch(state: &SharedState, method: &str, params: Value) -> OpResult {
         OP_MULTIPLIER_RECOMPUTE => op_multiplier_recompute(state, params),
         OP_CACHE_SESSIONS => op_cache_sessions(state, params),
         OP_CACHE_STEPS => op_cache_steps(state, params),
-        OP_CACHE_SUBSCRIBE => op_cache_subscribe(params),
+        OP_STEPS_SUBSCRIBE => op_steps_subscribe(params),
+        OP_STEPS_READ => crate::step_feed::read(state, params)
+            .map(|page| json!(page))
+            .map_err(|refusal| (refusal.code, refusal.message)),
         other => Err(("unknown_method".into(), format!("unknown method '{other}'"))),
     }
 }
@@ -745,20 +756,20 @@ fn op_cache_steps(state: &SharedState, params: Value) -> OpResult {
     })
 }
 
-/// `usage.cache.subscribe` is a stream, which the serving handler opens
-/// before dispatch (see `cache_notices::subscribe`). Reached here, it is a
-/// unary call, and is refused once its params decode.
-fn op_cache_subscribe(params: Value) -> OpResult {
-    let _: crate::cache_notices::CacheSubscribeRequest =
+/// `usage.steps.subscribe` is a stream, which the serving handler opens
+/// before dispatch (see `step_feed::subscribe`). Reached here, it is a unary
+/// call, and is refused once its params decode.
+fn op_steps_subscribe(params: Value) -> OpResult {
+    let _: crate::step_feed::FeedSubscribeRequest =
         serde_json::from_value(params).map_err(|error| {
             (
                 "malformed".into(),
-                format!("cache subscribe params: {error}"),
+                format!("steps subscribe params: {error}"),
             )
         })?;
     Err((
         "invalid_request".into(),
-        format!("{OP_CACHE_SUBSCRIBE} is a subscription and is served only as a stream"),
+        format!("{OP_STEPS_SUBSCRIBE} is a subscription and is served only as a stream"),
     ))
 }
 
@@ -1106,7 +1117,8 @@ mod tests {
             "spend.workclass.report",
             "usage.cache.sessions",
             "usage.cache.steps",
-            "usage.cache.subscribe",
+            "usage.steps.read",
+            "usage.steps.subscribe",
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -1132,7 +1144,7 @@ mod tests {
     #[test]
     fn every_operation_name_reaches_its_own_handler() {
         // Each operation is paired with the marker its own handler writes.
-        const ROUTES: [(&str, &str); 21] = HANDLER_MARKERS;
+        const ROUTES: [(&str, &str); 22] = HANDLER_MARKERS;
 
         // The markers only discriminate while none of them is a prefix of
         // another: three of these begin with the word "subscription", and if
@@ -1181,7 +1193,7 @@ mod tests {
     /// request-decoding error. A refusal with code `malformed` and a message
     /// starting with that literal came from the decoder; any other answer
     /// means the decoder accepted the params.
-    const HANDLER_MARKERS: [(&str, &str); 21] = [
+    const HANDLER_MARKERS: [(&str, &str); 22] = [
         (OP_VERDICT, "verdict params: "),
         (OP_REPORT, "report params: "),
         (OP_EVENT_INGEST, "event params: "),
@@ -1202,7 +1214,8 @@ mod tests {
         (OP_MULTIPLIER_RECOMPUTE, "multiplier recompute params: "),
         (OP_CACHE_SESSIONS, "cache sessions params: "),
         (OP_CACHE_STEPS, "cache steps params: "),
-        (OP_CACHE_SUBSCRIBE, "cache subscribe params: "),
+        (OP_STEPS_SUBSCRIBE, "steps subscribe params: "),
+        (OP_STEPS_READ, "steps read params: "),
     ];
 
     /// Valid params for one operation, plus one params value both the decoder
@@ -1396,14 +1409,15 @@ mod tests {
                 ],
                 json!({"harness": "pi", "session": 1}),
             ),
+            sample(OP_STEPS_SUBSCRIBE, vec![json!({})], json!({"after": "c0"})),
             sample(
-                OP_CACHE_SUBSCRIBE,
+                OP_STEPS_READ,
                 vec![
                     json!({}),
-                    json!({"after_cursor": 7}),
-                    json!({"after_cursor": null}),
+                    json!({"after": "c0", "limit": 5}),
+                    json!({"after": null, "limit": null}),
                 ],
-                json!({"after_cursor": "7"}),
+                json!({"limit": -1}),
             ),
         ]
     }

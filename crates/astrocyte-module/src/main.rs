@@ -8,7 +8,7 @@
 
 #[cfg(test)]
 use astrocyte_module::test_support;
-use astrocyte_module::{cache_notices, config, ops, state};
+use astrocyte_module::{config, ops, state, step_feed};
 
 use std::{
     collections::HashMap,
@@ -423,7 +423,7 @@ where
     let subscriptions_stopping = tokio::sync::watch::Sender::new(false);
     let handler = AstrocyteHandler {
         state: Arc::clone(&state),
-        flows: FlowRoutes::default(),
+        routes: RouteBinds::default(),
         connection_end: Arc::clone(&connection_end),
         subscriptions_stopping: subscriptions_stopping.clone(),
     };
@@ -622,10 +622,10 @@ impl LoopEnd {
 /// health and how the connection ended.
 struct AstrocyteHandler {
     state: Arc<SharedState>,
-    flows: FlowRoutes,
+    routes: RouteBinds,
     connection_end: Arc<Mutex<Option<ConnectionEnd>>>,
     /// Set when the daemon starts draining astrocyte, when the connection
-    /// ends and when astrocyte stops itself. Every open `usage.cache.subscribe`
+    /// ends and when astrocyte stops itself. Every open `usage.steps.subscribe`
     /// stream ends then, and new ones are refused.
     subscriptions_stopping: tokio::sync::watch::Sender<bool>,
 }
@@ -637,18 +637,32 @@ impl ModuleHandler for AstrocyteHandler {
             Ok(request) => request,
             Err(refusal) => return refusal,
         };
-        // A subscription only reads, so a flow's route may open one too.
-        if request.method == ops::OP_CACHE_SUBSCRIBE {
-            return cache_notices::subscribe(
-                &self.state,
-                request.params,
-                &ctx,
-                self.subscriptions_stopping.subscribe(),
-            )
-            .await;
+        let route = self.routes.of(ctx.route_handle());
+        if request.method == ops::OP_STEPS_SUBSCRIBE || request.method == ops::OP_STEPS_READ {
+            if !route.may_read_feed {
+                return refusal(
+                    "not_permitted",
+                    format!(
+                        "{} is served only to local apps and Callosum's phone routes",
+                        request.method
+                    ),
+                );
+            }
+            // Both only read, so a flow's route may use them too.
+            if request.method == ops::OP_STEPS_SUBSCRIBE {
+                return step_feed::subscribe(
+                    &self.state,
+                    request.params,
+                    &ctx,
+                    self.subscriptions_stopping.subscribe(),
+                )
+                .await;
+            }
+            return tokio::task::block_in_place(|| {
+                step_feed::read_outcome(&self.state, request.params)
+            });
         }
-        let flow = self.flows.flow_of(ctx.route_handle());
-        dispatch_route_request(&self.state, request, flow)
+        dispatch_route_request(&self.state, request, route.flow)
     }
 
     /// Open subscriptions can be held for hours, so they get a pool of
@@ -656,8 +670,7 @@ impl ModuleHandler for AstrocyteHandler {
     /// The pool has a few slots more than the subscription limit, so a
     /// subscription over the limit still gets a slot to be refused in.
     fn request_pools(&self) -> RequestPools {
-        RequestPools::new()
-            .with_long_held(cache_notices::MAX_CACHE_SUBSCRIPTIONS + 4, classify_request)
+        RequestPools::new().with_long_held(step_feed::MAX_FEED_SUBSCRIPTIONS + 4, classify_request)
     }
 
     async fn on_draining(&self, _reason: RouteCloseReason, _deadline: std::time::SystemTime) {
@@ -665,16 +678,24 @@ impl ModuleHandler for AstrocyteHandler {
     }
 
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
-        let flow_id = request
+        let flow = request
             .scope
             .as_ref()
             .and_then(|stamp| stamp.attributes.flow_id.clone());
-        self.flows.record_bind(request.handle, flow_id);
+        let may_read_feed =
+            step_feed::may_read_feed(request.principal.as_ref(), &request.identity.harness);
+        self.routes.record_bind(
+            request.handle,
+            RouteBind {
+                flow,
+                may_read_feed,
+            },
+        );
         BindDecision::accept()
     }
 
     async fn on_route_gone(&self, handle: &RouteHandle) {
-        self.flows.forget(*handle);
+        self.routes.forget(*handle);
     }
 
     async fn health(&self) -> HealthReport {
@@ -690,31 +711,36 @@ impl ModuleHandler for AstrocyteHandler {
             .connection_end
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(end);
-        self.flows.clear();
+        self.routes.clear();
     }
 }
 
-/// The flow each route was bound under, for this connection only. Astrocyte
-/// checks no caller identity on its writes, so a route a flow opened is
-/// refused every mutating operation (see `dispatch_route_request`); reads stay
-/// served. Keyed by the full route handle, so a channel reused under a new
-/// epoch never inherits an old flow.
-#[derive(Default)]
-struct FlowRoutes(Mutex<HashMap<RouteHandle, String>>);
+/// What a route's bind decided, for this connection only.
+#[derive(Clone, Debug, Default)]
+struct RouteBind {
+    /// The flow the route was opened under. Astrocyte checks no caller
+    /// identity on its writes, so a route a flow opened is refused every
+    /// mutating operation (see `dispatch_route_request`); reads stay served.
+    flow: Option<String>,
+    /// Whether the bind's principal may use the live step feed (see
+    /// `step_feed::may_read_feed`).
+    may_read_feed: bool,
+}
 
-impl FlowRoutes {
-    /// Every bind replaces what the route held before, so a route opened
-    /// without a flow is never refused by a stale entry.
-    fn record_bind(&self, route: RouteHandle, flow_id: Option<String>) {
-        let mut routes = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        match flow_id {
-            Some(flow_id) => {
-                routes.insert(route, flow_id);
-            }
-            None => {
-                routes.remove(&route);
-            }
-        }
+/// Each bound route's `RouteBind`, keyed by the full route handle, so a
+/// channel reused under a new epoch never inherits an old flow or an old
+/// principal's access. A route with no recorded bind gets the default: no
+/// flow and no feed access.
+#[derive(Default)]
+struct RouteBinds(Mutex<HashMap<RouteHandle, RouteBind>>);
+
+impl RouteBinds {
+    /// Every bind replaces what the route held before.
+    fn record_bind(&self, route: RouteHandle, bind: RouteBind) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(route, bind);
     }
 
     fn forget(&self, route: RouteHandle) {
@@ -731,12 +757,13 @@ impl FlowRoutes {
             .clear();
     }
 
-    fn flow_of(&self, route: RouteHandle) -> Option<String> {
+    fn of(&self, route: RouteHandle) -> RouteBind {
         self.0
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .get(&route)
             .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -792,19 +819,19 @@ fn refusal(code: &str, message: String) -> HandlerOutcome {
 }
 
 /// The serve helper's pool for a request, from a peek at its body: a
-/// `usage.cache.subscribe` request is long-held. Only the first bytes are
+/// `usage.steps.subscribe` request is long-held. Only the first bytes are
 /// read, because this runs on the task that reads every frame; a request
 /// that puts its method name further in uses the default pool, which only
 /// costs it the separate pool.
 fn classify_request(body: &[u8]) -> RequestClass {
     const PEEK: usize = 512;
-    let needle = format!("\"{}\"", ops::OP_CACHE_SUBSCRIBE);
+    let needle = format!("\"{}\"", ops::OP_STEPS_SUBSCRIBE);
     let head = &body[..body.len().min(PEEK)];
     if head
         .windows(needle.len())
         .any(|window| window == needle.as_bytes())
     {
-        RequestClass::long_held().with_op(ops::OP_CACHE_SUBSCRIBE)
+        RequestClass::long_held().with_op(ops::OP_STEPS_SUBSCRIBE)
     } else {
         RequestClass::default_pool()
     }
@@ -945,10 +972,10 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
             observability: Vec::new(),
             identity_scope: Vec::new(),
         }])
-        // The one watch: `usage.cache.subscribe` streams notices until the
+        // The one watch: `usage.steps.subscribe` streams notices until the
         // subscriber cancels. Every other operation is a unary call.
         .operation_delivery(std::collections::BTreeMap::from([(
-            ops::OP_CACHE_SUBSCRIBE.to_string(),
+            ops::OP_STEPS_SUBSCRIBE.to_string(),
             OperationDelivery::WATCH,
         )]))
         .consumes(declared_consumers(desired))
@@ -1382,7 +1409,26 @@ mod tests {
         .unwrap()
     }
 
+    /// A bind from a local app: the daemon's `Direct` principal.
     pub(super) fn bind_body(channel: u16, epoch: u32, flow_id: Option<&str>) -> Vec<u8> {
+        bind_body_as(
+            channel,
+            epoch,
+            flow_id,
+            subc_protocol::Principal::Direct,
+            "h",
+        )
+    }
+
+    /// A bind with the principal the daemon attested and the identity's
+    /// harness, where Callosum names the device (`fed-phone:<fingerprint>`).
+    pub(super) fn bind_body_as(
+        channel: u16,
+        epoch: u32,
+        flow_id: Option<&str>,
+        principal: subc_protocol::Principal,
+        harness: &str,
+    ) -> Vec<u8> {
         use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
         use subc_protocol::{BindIdentity, Principal, RouteTarget};
         let scope = flow_id.map(|flow_id| {
@@ -1403,8 +1449,8 @@ mod tests {
             target: RouteTarget::ManagementSurface {
                 module_id: DEFAULT_MODULE_ID.to_string(),
             },
-            identity: BindIdentity::new("/tmp/p", "h", "s"),
-            principal: None,
+            identity: BindIdentity::new("/tmp/p", harness, "s"),
+            principal: Some(principal),
             consumer_capabilities: None,
             role_versions: None,
             admission_facts: None,
@@ -1969,7 +2015,8 @@ mod tests {
                 "spend.workclass.report",
                 "usage.cache.sessions",
                 "usage.cache.steps",
-                "usage.cache.subscribe",
+                "usage.steps.read",
+                "usage.steps.subscribe",
             ])
         );
     }
@@ -2534,32 +2581,45 @@ mod tests {
         let _ = served(serving, "serving did not end at EOF").await;
     }
 
-    /// A `usage.cache.subscribe` request as a client opens it: flagged as a
-    /// held-open subscription, resuming after `after_cursor`.
-    fn subscribe_request(channel: u16, corr: u64, after_cursor: i64) -> Frame {
+    /// A `usage.steps.subscribe` request as a client opens it: flagged as a
+    /// held-open subscription.
+    fn subscribe_request(channel: u16, corr: u64) -> Frame {
         let mut frame = route_frame(
             FrameType::Request,
             channel,
             1,
             corr,
-            serde_json::to_vec(&json!({
-                "method": ops::OP_CACHE_SUBSCRIBE,
-                "params": {"after_cursor": after_cursor},
-            }))
-            .unwrap(),
+            serde_json::to_vec(&json!({"method": ops::OP_STEPS_SUBSCRIBE, "params": {}})).unwrap(),
         );
         frame.header.flags = Flags(frame.header.flags.0 | subc_protocol::FLAG_SUBSCRIPTION);
         frame
     }
 
-    /// The store's newest step cursor, to subscribe after.
-    fn newest_cursor(state: &SharedState) -> i64 {
-        state
-            .with_conn(|conn| {
-                astrocyte_core::cache_diagnostics::last_event_key(conn)
-                    .map_err(|error| error.to_string())
-            })
-            .unwrap()
+    fn read_request(channel: u16, corr: u64) -> Frame {
+        route_frame(
+            FrameType::Request,
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&json!({"method": ops::OP_STEPS_READ, "params": {}})).unwrap(),
+        )
+    }
+
+    /// Bind channel `channel` as `principal` with identity harness `harness`.
+    async fn bind_as(
+        stream: &mut TcpStream,
+        channel: u16,
+        corr: u64,
+        principal: subc_protocol::Principal,
+        harness: &str,
+    ) {
+        send(
+            stream,
+            control_request(corr, bind_body_as(channel, 1, None, principal, harness)),
+        )
+        .await;
+        let ack = frame_for(stream, 0, corr).await;
+        assert_eq!(ack.header.ty, FrameType::Response, "route.bind refused");
     }
 
     /// The next frame for request `corr` on `channel`, skipping others.
@@ -2572,49 +2632,84 @@ mod tests {
         }
     }
 
-    fn notice_sessions(frame: &Frame) -> Value {
+    fn notice_through(frame: &Frame) -> String {
         assert_eq!(
             frame.header.ty,
             FrameType::StreamData,
             "{}",
             String::from_utf8_lossy(&frame.body)
         );
-        serde_json::from_slice::<Value>(&frame.body).unwrap()["sessions"].clone()
+        serde_json::from_slice::<Value>(&frame.body).unwrap()["through"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
-    /// The manifest declares `usage.cache.subscribe`, and only it, as a
+    async fn record_now(state: &Arc<SharedState>, session: &'static str, step_ref: &'static str) {
+        let recording = Arc::clone(state);
+        tokio::task::spawn_blocking(move || {
+            step_feed::record_steps_for_test(
+                &recording,
+                "pi",
+                &[step_feed::TestStep::now(session, step_ref)],
+                false,
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn wait_for_subscriptions(state: &SharedState, open: usize) {
+        tokio::time::timeout(HANG_GUARD, async {
+            while state.step_feed().open_subscriptions() < open {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the subscriptions never opened");
+    }
+
+    /// The manifest declares `usage.steps.subscribe`, and only it, as a
     /// watch, which is what lets the daemon route a subscription to it.
     #[test]
-    fn manifest_declares_the_cache_subscription_as_the_only_watch() {
+    fn manifest_declares_the_step_subscription_as_the_only_watch() {
         let manifest = manifest("astrocyte", &config::intentional_empty().config);
-        assert!(manifest.is_watch_operation(ops::OP_CACHE_SUBSCRIBE));
+        assert!(manifest.is_watch_operation(ops::OP_STEPS_SUBSCRIBE));
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire["operation_delivery"],
-            json!({"usage.cache.subscribe": "watch"})
+            json!({"usage.steps.subscribe": "watch"})
         );
     }
 
-    /// Two subscribers on two routes both receive the notice for a commit
-    /// that adds a step, as StreamData on their own request.
+    /// Two subscribers, a local app and Callosum's phone route, both get a
+    /// notice naming the newest feed cursor after a commit that adds a step.
     #[tokio::test(flavor = "multi_thread")]
     async fn two_subscribers_both_receive_a_notice() {
+        use subc_protocol::Principal;
         let state = Arc::new(test_state());
         let daemon = FakeDaemon::start().await;
         let refresher = IdleRefresher::new();
         let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
         let mut stream = daemon.accept_and_ack().await;
-        bind(&mut stream, 5, 1, 1).await;
-        bind(&mut stream, 6, 1, 2).await;
-        let after = newest_cursor(&state);
-        send(&mut stream, subscribe_request(5, 10, after)).await;
-        send(&mut stream, subscribe_request(6, 11, after)).await;
-        let recording = Arc::clone(&state);
-        tokio::task::spawn_blocking(move || {
-            cache_notices::record_step_for_test(&recording, "pi", "s-1", "s-1:1");
-        })
-        .await
-        .unwrap();
+        bind_as(&mut stream, 5, 1, Principal::Direct, "h").await;
+        let callosum = Principal::Reserved {
+            module_id: "callosum".into(),
+        };
+        bind_as(
+            &mut stream,
+            6,
+            2,
+            callosum,
+            "fed-phone:0123456789abcdef0123456789abcdef",
+        )
+        .await;
+        send(&mut stream, subscribe_request(5, 10)).await;
+        send(&mut stream, subscribe_request(6, 11)).await;
+        wait_for_subscriptions(&state, 2).await;
+        record_now(&state, "s-1", "s-1:1").await;
+        let newest = astrocyte_core::step_feed::encode_cursor(state.step_feed().through().unwrap());
         let mut seen = HashMap::new();
         while seen.len() < 2 {
             let frame = next_frame(&mut stream).await;
@@ -2623,12 +2718,85 @@ mod tests {
             }
         }
         for key in [(5, 10), (6, 11)] {
-            assert_eq!(
-                notice_sessions(&seen[&key]),
-                json!([{"harness": "pi", "session": "s-1"}]),
-                "{key:?}"
-            );
+            assert_eq!(notice_through(&seen[&key]), newest, "{key:?}");
         }
+        drop(stream);
+        let _ = served(serving, "serving did not end at EOF").await;
+    }
+
+    /// A simulator and another computer, both on Callosum's routes, are
+    /// refused `not_permitted` on both feed operations, as is a route whose
+    /// principal is another module; nothing is served to them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_feed_is_refused_to_simulators_computers_and_other_modules() {
+        use subc_protocol::Principal;
+        let state = Arc::new(test_state());
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        let callosum = || Principal::Reserved {
+            module_id: "callosum".into(),
+        };
+        let fingerprint = "0123456789abcdef0123456789abcdef";
+        let routes = [
+            (5, callosum(), format!("fed-sim:{fingerprint}")),
+            (6, callosum(), format!("fed-computer:{fingerprint}")),
+            (
+                7,
+                Principal::Reserved {
+                    module_id: "prefrontal-core".into(),
+                },
+                format!("fed-phone:{fingerprint}"),
+            ),
+        ];
+        for (index, (channel, principal, harness)) in routes.iter().enumerate() {
+            let corr = u64::try_from(index).unwrap() + 1;
+            bind_as(&mut stream, *channel, corr, principal.clone(), harness).await;
+        }
+        for (channel, _, harness) in &routes {
+            let corr = u64::from(*channel) * 10;
+            send(&mut stream, subscribe_request(*channel, corr)).await;
+            send(&mut stream, read_request(*channel, corr + 1)).await;
+            for corr in [corr, corr + 1] {
+                let refused = frame_for(&mut stream, *channel, corr).await;
+                assert_eq!(refused.header.ty, FrameType::Error, "{harness}");
+                let body: ErrorBody = serde_json::from_slice(&refused.body).unwrap();
+                assert_eq!(
+                    body.code, "not_permitted",
+                    "a feed call was served to {harness}"
+                );
+            }
+        }
+        assert_eq!(state.step_feed().open_subscriptions(), 0);
+        drop(stream);
+        let _ = served(serving, "serving did not end at EOF").await;
+    }
+
+    /// A local app's read over the real serving path returns the committed
+    /// step as a feed row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_app_reads_the_feed() {
+        let state = Arc::new(test_state());
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        bind(&mut stream, 5, 1, 1).await;
+        record_now(&state, "s-1", "s-1:1").await;
+        send(&mut stream, read_request(5, 10)).await;
+        let reply = frame_for(&mut stream, 5, 10).await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        let page: Value = serde_json::from_slice::<Value>(&reply.body).unwrap()["result"].clone();
+        assert_eq!(page["rows"].as_array().unwrap().len(), 1, "{page}");
+        assert_eq!(page["rows"][0]["step_ref"], "s-1:1");
+        assert_eq!(page["rows"][0]["source"], "file");
+        assert_eq!(page["next"], Value::Null);
         drop(stream);
         let _ = served(serving, "serving did not end at EOF").await;
     }
@@ -2636,22 +2804,17 @@ mod tests {
     /// A subscriber's Cancel ends its subscription with a `cancelled`
     /// refusal on its own correlation id, and frees its slot.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_cancelled_cache_subscription_ends_with_cancelled() {
+    async fn a_cancelled_step_subscription_ends_with_cancelled() {
         let state = Arc::new(test_state());
         let daemon = FakeDaemon::start().await;
         let refresher = IdleRefresher::new();
         let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
         let mut stream = daemon.accept_and_ack().await;
         bind(&mut stream, 5, 1, 1).await;
-        let after = newest_cursor(&state);
-        send(&mut stream, subscribe_request(5, 10, after)).await;
-        let recording = Arc::clone(&state);
-        tokio::task::spawn_blocking(move || {
-            cache_notices::record_step_for_test(&recording, "pi", "s-1", "s-1:1");
-        })
-        .await
-        .unwrap();
-        notice_sessions(&frame_for(&mut stream, 5, 10).await);
+        send(&mut stream, subscribe_request(5, 10)).await;
+        wait_for_subscriptions(&state, 1).await;
+        record_now(&state, "s-1", "s-1:1").await;
+        notice_through(&frame_for(&mut stream, 5, 10).await);
         send(
             &mut stream,
             route_frame(FrameType::Cancel, 5, 1, 10, Vec::new()),
@@ -2661,7 +2824,7 @@ mod tests {
         assert_eq!(ended.header.ty, FrameType::Error);
         let refusal: ErrorBody = serde_json::from_slice(&ended.body).unwrap();
         assert_eq!(refusal.code, "cancelled");
-        assert_eq!(state.cache_notices().open_subscriptions(), 0);
+        assert_eq!(state.step_feed().open_subscriptions(), 0);
         drop(stream);
         let _ = served(serving, "serving did not end at EOF").await;
     }
@@ -2670,7 +2833,7 @@ mod tests {
     /// before the daemon's GOODBYE, so no subscription holds the drain open,
     /// and serving then stops with the goodbye cause.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_drain_ends_every_cache_subscription_before_goodbye() {
+    async fn a_drain_ends_every_step_subscription_before_goodbye() {
         use subc_protocol::session::ModuleControlCommand;
         let state = Arc::new(test_state());
         let daemon = FakeDaemon::start().await;
@@ -2679,16 +2842,9 @@ mod tests {
         let mut stream = daemon.accept_and_ack().await;
         bind(&mut stream, 5, 1, 1).await;
         bind(&mut stream, 6, 1, 2).await;
-        let after = newest_cursor(&state);
-        send(&mut stream, subscribe_request(5, 10, after)).await;
-        send(&mut stream, subscribe_request(6, 11, after)).await;
-        tokio::time::timeout(HANG_GUARD, async {
-            while state.cache_notices().open_subscriptions() < 2 {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the subscriptions never opened");
+        send(&mut stream, subscribe_request(5, 10)).await;
+        send(&mut stream, subscribe_request(6, 11)).await;
+        wait_for_subscriptions(&state, 2).await;
         let deadline_ms = u64::try_from(now_ms() + 20_000).unwrap();
         send(
             &mut stream,
@@ -2721,7 +2877,7 @@ mod tests {
                 ((6, 11), FrameType::StreamEnd)
             ])
         );
-        assert_eq!(state.cache_notices().open_subscriptions(), 0);
+        assert_eq!(state.step_feed().open_subscriptions(), 0);
         send(
             &mut stream,
             Frame::build(

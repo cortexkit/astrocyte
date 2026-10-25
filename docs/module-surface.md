@@ -62,7 +62,8 @@ Test: `every_operation_name_reaches_its_own_handler`.
 | `spend.multiplier.pace` | read | `quota_provider`, `from_ms`, `to_ms` |
 | `usage.cache.sessions` | read | `since_ms?`, `harness?`, `limit?` |
 | `usage.cache.steps` | read | `harness`, `session`, `limit?`, `after_cursor?` |
-| `usage.cache.subscribe` | read, watch | `after_cursor?` |
+| `usage.steps.subscribe` | read, watch | none |
+| `usage.steps.read` | read | `after?`, `limit?` |
 | `spend.event.ingest` | write | see §3.1 |
 | `spend.correction.ingest` | write | see §3.2 |
 | `spend.chargeability.settle` | write | `event_id`, `to_state`, `reason` |
@@ -317,11 +318,20 @@ not placed on the timeline). Each step has these fields:
 - `cursor`, the durable shared cache-step cursor. It increases across harness
   events and BROCA steps, survives restarts and is never reused by retention.
   A late step can have a greater cursor than a step that happened after it.
-- `step_ref`, the harness's own id for the step (`run_id#step_id` for BROCA),
-  and `occurred_at_ms` (BROCA's required `finished_at_ms`).
+- `step_ref`, the harness's own id for the step, and `occurred_at_ms`
+  (BROCA's required `finished_at_ms`). BROCA steps read from BROCA's export
+  facts use `run_id#step_id`; that diagnostics table is being retired, and the
+  reader of BROCA's durable step log will use the per-attempt form
+  `run_id#step_id#attempt` described in section 4.2.
 - `input`, `cache_read`, `cache_write`, `output` and `reasoning`, each omitted
   when the reader did not store it. `cache_write` sums every cache lifetime
   Claude Code reports.
+- `output` includes reasoning, the fleet convention: `reasoning` is a
+  breakdown inside `output`. The ledger stores the two disjoint, and a served
+  row adds them: `output` is the stored output plus the stored reasoning when
+  both are present, the stored output when reasoning is absent, and omitted
+  when no output was stored. A count is never made up from reasoning alone.
+  Test: `served_output_includes_reasoning_on_both_reads`.
 - `provider`, `model`, `finish` and `context_limit`. `finish` comes from
   OpenCode's `finish`, Pi's `stopReason`, or the stored stop reason of Claude
   Code and Oh My Pi, or BROCA's `finish_reason`. `context_limit` comes from
@@ -330,7 +340,9 @@ not placed on the timeline). Each step has these fields:
   `request_size` is present when both adjacent steps report body lengths:
   `smaller` when the current body is shorter, otherwise `not_smaller`.
 - `prompt`, which is input plus cache read plus cache write.
-- `retention`, `verdict` and `prompt_dropped`.
+- `retention`, `verdict` and `prompt_dropped`. `retention` is served
+  unrounded and unclamped: a non-negative number that may exceed 1 when a step
+  reads more cache than expected.
 
 The verdict is one of `cold_start`, `stable`, `warning`, `bust`, `full_bust`
 and `unknown`. It is computed over the whole session in time order, so a
@@ -385,7 +397,7 @@ recently active first. There are at most `limit` sessions (default 50, maximum
 It is always read from the store. Test:
 `sessions_report_hit_ratio_busts_limit_and_activity`.
 
-### 4.2 Live step feed (contract v1, not yet served)
+### 4.2 Live step feed (contract v1)
 
 Apps follow cache diagnostics live through two operations: a subscription
 that only says new steps exist, and a paged read that returns them. Apps talk
@@ -477,6 +489,19 @@ Reply:
   arrives late, or a verdict recomputed because an earlier step of its session
   arrived late), the whole row is sent again at a new cursor. The last row for
   an identity wins: apps replace, never append.
+
+A row from a runner's `step.finished.v1` event takes its identity from the
+event. When the event carries `harness_step_ref` (runner contract 14.3,
+present for runners whose history is the host harness's own record),
+`harness` is the event's `harness` (the hosting program, such as
+`claude-code` or `opencode`) and `step_ref` is `harness_step_ref`, so
+astrocyte's later read of the harness store replaces the row. Otherwise
+`harness` is the event's `runner` and `step_ref` is
+`<run_id>#<step_id>#<attempt>`, one row per provider request actually sent,
+retries included, matching astrocyte's read of that runner's durable step
+log. A step with no durable record stays a live-only row with
+`source: "runner"`.
+
 - `source` is `file` for a step astrocyte read from a harness store or a
   runner's durable log, and `runner` for a step known so far only from a
   runner's bus event.
@@ -490,8 +515,8 @@ Reply:
   steps), `provider`, `model`, `input`, `cache_read`, `cache_write`,
   `cache_write_5m`, `cache_write_1h`, `output`, `reasoning`, `finish`,
   `context_limit`, `request_body_len`, `retention`, `request_size`.
-- Counts are disjoint: `output` never includes `reasoning`, and
-  `cache_write` is the sum of every cache lifetime. `cache_write_5m` and
+- `output` includes `reasoning`, which is a breakdown inside it, as in
+  section 4.1, and `cache_write` is the sum of every cache lifetime. `cache_write_5m` and
   `cache_write_1h` are present only when the source split them.
 - `prompt`, `retention`, `verdict` (`cold_start`, `stable`, `warning`, `bust`,
   `full_bust`, `unknown`), `prompt_dropped` and `request_size` (`smaller`,
@@ -506,6 +531,40 @@ Refusals: `malformed` (undecodable, or an unknown member), `invalid_request`
 detail `{"through": "<newest cursor>"}`: reload per-session history with
 `usage.cache.sessions` and `usage.cache.steps`, then read from `through`), and
 `not_permitted`.
+
+#### How astrocyte serves the feed
+
+- The feed is the `step_feed` table (see the [data model](data-model.md)).
+  After each commit that adds steps or changes a step's stored detail,
+  astrocyte recomputes the served rows of each affected session, from the
+  earliest changed step onward, and appends every row that differs from the
+  newest row stored for its `harness` and `step_ref`. That append is its own
+  transaction, run after the commit that recorded the steps; subscribers are
+  told only once it has committed. A cursor is `c` followed by the row's
+  feed position.
+- A step that happened more than 24 hours before it is committed (a first
+  read of old history) is not added to the feed; `usage.cache.steps` serves
+  it. Rows are deleted 24 hours after they were committed.
+- In this version every row has `source: "file"`. Runner rows join once the
+  bus grants astrocyte its `live` root. `cache_write_5m`, `cache_write_1h`
+  and `run_id` are not sent yet.
+- The phone's device label is the route's bind identity `harness`
+  (`fed-phone:<fingerprint>`), as Callosum stamps it; the principal must be
+  `reserved:callosum` as well.
+- A subscriber's queue holds 64 cursors. A subscriber whose notices are held
+  up for longer than that ends `lagged`.
+- The serve helper always answers a cancelled request; a cancelled
+  subscription's last frame is the error `cancelled`, which the daemon may
+  drop because the caller asked to stop.
+
+Tests: `a_notice_is_sent_only_after_its_steps_commit`,
+`reads_page_through_the_feed_in_commit_order`,
+`a_verdict_changed_by_a_late_earlier_step_is_sent_again`,
+`a_read_from_beyond_the_window_is_refused_cursor_expired`,
+`the_feed_is_refused_to_simulators_computers_and_other_modules`,
+`a_subscriber_that_falls_behind_its_queue_ends_lagged`,
+`a_drain_ends_every_step_subscription_before_goodbye`,
+`two_subscribers_both_receive_a_notice`.
 
 ## 5. Calls astrocyte makes
 

@@ -2092,50 +2092,73 @@ timeout_s = 600
 build_timeout_s = 900
 
 [[control]]
-id = "cache-notice-after-commit"
-guards = "A cache step notice is published only after its transaction commits, never for steps that roll back"
+id = "step-feed-notice-after-commit"
+guards = "Live step feed rows are appended and subscribers told only after the steps' transaction commits"
 file = "crates/astrocyte-module/src/state.rs"
 old = "outcome = Some(run_ordered_transaction(conn, operation, skip_unchanged));"
 new = """
-outcome = Some(run_ordered_transaction(conn, |tx: &Transaction<'_>| { let output = operation(tx); self.publish_cache_notices(tx); output }, skip_unchanged)); // NON-VACUITY BREAK: publish before commit"""
-test_file = "crates/astrocyte-module/src/cache_notices.rs"
+outcome = Some(run_ordered_transaction(conn, |tx: &Transaction<'_>| { let output = operation(tx); self.publish_step_feed(tx, &[]); output }, skip_unchanged)); // NON-VACUITY BREAK: emit before commit"""
+test_file = "crates/astrocyte-module/src/step_feed.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
-expect_red = ["cache_notices::tests::a_notice_is_published_only_after_its_steps_commit"]
-expect_message = "a rolled-back transaction published a notice"
+expect_red = ["step_feed::tests::a_notice_is_sent_only_after_its_steps_commit"]
+expect_message = "subscribers were told of a transaction that rolled back"
 only = true
 timeout_s = 600
 build_timeout_s = 900
 
 [[control]]
-id = "cache-subscribe-resync"
-guards = "A subscription resuming from a cursor older than the notice log starts with one resync notice"
-file = "crates/astrocyte-module/src/cache_notices.rs"
-old = "Some(cursor) if cursor < log.floor => Ok(Start::Resync(high_water)),"
-new = "Some(cursor) if false && cursor < log.floor => Ok(Start::Resync(high_water)), // NON-VACUITY BREAK"
-test_file = "crates/astrocyte-module/src/cache_notices.rs"
+id = "step-feed-reemit-on-change"
+guards = "A step whose served fields change is appended to the live step feed again at a new cursor"
+file = "crates/astrocyte-core/src/step_feed.rs"
+old = "if newest_body(conn, producer, &step.step_ref)?.as_deref() == Some(body.as_str()) {"
+new = "if newest_body(conn, producer, &step.step_ref)?.is_some() { // NON-VACUITY BREAK: skip re-emission on change"
+test_file = "crates/astrocyte-module/src/step_feed.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
-expect_red = ["cache_notices::tests::a_cursor_older_than_the_log_gets_one_resync_then_live_notices"]
-expect_message = "the subscription ended"
+expect_red = ["step_feed::tests::a_verdict_changed_by_a_late_earlier_step_is_sent_again"]
+expect_message = "was not sent again"
 only = true
 timeout_s = 600
 build_timeout_s = 900
 
 [[control]]
-id = "cache-subscribe-cancel"
-guards = "A subscriber's cancel ends its cache subscription"
-file = "crates/astrocyte-module/src/cache_notices.rs"
-old = "() = sink.ended() => {"
-new = "() = std::future::pending::<()>() => { // NON-VACUITY BREAK: ignore cancel"
-test_file = "crates/astrocyte-module/src/cache_notices.rs"
+id = "step-feed-principal-allow-list"
+guards = "The live step feed is served only to Direct principals and Callosum's fed-phone routes"
+file = "crates/astrocyte-module/src/step_feed.rs"
+old = "        Some(Principal::Direct) => true,"
+new = """
+        _ if true => true, // NON-VACUITY BREAK: admit any principal
+        Some(Principal::Direct) => true,"""
+test_file = "crates/astrocyte-module/src/main.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--bin ck-astrocyte"
+expect_red = ["tests::the_feed_is_refused_to_simulators_computers_and_other_modules"]
+expect_message = "a feed call was served to"
+only = true
+timeout_s = 600
+build_timeout_s = 900
+
+[[control]]
+id = "served-output-includes-reasoning"
+guards = "Served cache rows report output with reasoning inside it, while the ledger keeps them disjoint"
+file = "crates/astrocyte-core/src/cache_diagnostics.rs"
+old = "output: served_output(row.output, row.reasoning),"
+new = "output: row.output, // NON-VACUITY BREAK: serve disjoint output"
+test_file = "crates/astrocyte-module/src/step_feed.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
-expect_red = ["cache_notices::tests::a_cancelled_subscription_ends"]
-expect_message = "the subscription did not end"
+expect_red = [
+  "step_feed::tests::served_output_includes_reasoning_on_both_reads",
+  "refresher::broca_source::tests::broca_model_step_cache_ops_match_memory_store_and_shared_cursors",
+  "refresher::fast_lane_tests::fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval",
+  "refresher::fast_lane_tests::fresh_v2_only_completed_row_is_served_on_the_next_fast_interval",
+]
+expect_message = "/output|left == right/"
 only = true
 timeout_s = 600
 build_timeout_s = 900

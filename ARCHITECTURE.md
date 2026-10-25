@@ -22,12 +22,12 @@ The workspace has three crates:
 
 ## Durable state
 
-`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS` (versions 1 to 28).
+`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS` (versions 1 to 29).
 `initialize_connection` enables and verifies foreign keys, probes SQLite JSON, triggers and
 partial indexes, and sets a 5000 ms busy timeout. The read-only report connection
 skips the table-creating probe and copies that timeout.
 
-The [data model](docs/data-model.md#tables) describes each table in version 28.
+The [data model](docs/data-model.md#tables) describes each table in version 29.
 
 Schema 23 uses local integer `event_key` and `charge_key` references, never served
 IDs. Event digests remain the dedup/served identity; charge digests are retired.
@@ -205,15 +205,16 @@ surface; dispatch and the manifest both use it.
 | `spend.event.reprice` | write, operator repricing |
 | `spend.basis.correct` | write, charge-basis correction |
 | `spend.multiplier.report` | read, multiplier heads by day |
-| `spend.multiplier.pace` | read, hourly usage by producer and work class at the latest head's rates |
-| `spend.multiplier.recompute` | write, operator recompute of a multiplier day |
+| `spend.multiplier.pace` | read, hourly usage at the latest head's rates |
+| `spend.multiplier.recompute` | write, operator recompute |
 | `usage.cache.sessions` | read, harness sessions with hit ratio and busts |
 | `usage.cache.steps` | read, one session's steps with cache verdicts |
-| `usage.cache.subscribe` | read, a watch: a notice per commit adding steps |
+| `usage.steps.subscribe` | read, watch |
+| `usage.steps.read` | read, live step feed |
 
 `usage.cache.steps` answers from memory (the newest 1,000 steps of up to 200
-sessions active in the last day), else from the store. The memory and the
-subscription's notice log both advance after each commit.
+sessions active in the last day), else from the store. Memory and the step
+feed advance after each commit.
 
 Astrocyte calls QTA `usage.get` and fusiform `catalog.status`, `catalog.get` and
 `plan.prices`. The contract is the [module surface](docs/module-surface.md).

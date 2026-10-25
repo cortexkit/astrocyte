@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 28. A schema change appends a migration; an applied
+currently version 29. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -15,6 +15,8 @@ ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 | `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
 | `broca_step` | Each row records one BROCA model step for diagnostics, never spend. | insert once; bounded retention deletes |
 | `cache_step_sequence` | Each row maps a ledger event or BROCA step to a durable shared cache cursor. | insert; expired BROCA mappings cascade away |
+| `step_feed` | Each row is one emission of a served cache step for `usage.steps.read`; the newest row for a harness and step wins. | insert; rows older than 24 hours are deleted |
+| `step_feed_state` | The row records the cache cursor the feed has caught up to and the newest feed cursor retention deleted. | one row |
 | `chargeability_transition` | Each row records the one terminal settlement of an event's chargeability. | insert only |
 | `quarantine_evidence` | Each row preserves a referring event's quantities that contradict its target. | insert |
 | `rejected_delivery` | Each row preserves a redelivery whose payload differs from the stored event. | insert |
@@ -110,8 +112,9 @@ The row preserves the session binding, including its host harness, the five
 nullable token counts, provider, model, variant, wire family, finish reason,
 attempts and retry flag, request body length and digest, three reported times,
 context limit, cache-policy JSON, agent identity and recording time. Output
-includes reasoning as sent; cache replies subtract reasoning to match the
-ledger's disjoint roles. Missing counts and times stay null.
+includes reasoning as sent. Cache reads first split it into the ledger's
+disjoint roles, and served rows then add reasoning back into output, the
+fleet convention. Missing counts and times stay null.
 
 `broca_step_no_update` and `broca_step_insert_once` refuse updates and
 replacement by either identity. Exact re-reads do nothing; contradictions
@@ -125,6 +128,20 @@ ledger events and BROCA diagnostics. Migration 28 seeds existing events with
 `cursor = event_key`. Insert triggers allocate later cursors from one
 `AUTOINCREMENT` sequence, and retention cannot reuse deleted cursors. The
 mapping is separate from spend and survives process restarts.
+
+`step_feed` (schema 29) is the live step feed. After each commit, astrocyte
+recomputes the served rows of each session that gained or changed steps and
+appends the rows whose served fields differ from the newest row stored for
+the same `(harness, step_ref)`, in a transaction of its own. `feed_cursor` is
+an `AUTOINCREMENT` key, so cursors grow in commit order, survive restarts and
+are never reused. `row_json` is the served row without its cursor.
+`step_feed_no_update` refuses updates; rows committed more than 24 hours ago
+are deleted, at most 1,000 per append. `step_feed_state` holds the cache
+cursor the feed has caught up to, so a crash between a commit and its feed
+append is caught up on the next commit, and `pruned_through`, the newest
+deleted feed cursor, below which a read is refused `cursor_expired`.
+Migration 29 starts the feed at the store's current cache cursor, so an
+upgraded store does not replay its history.
 
 ## Event identity
 

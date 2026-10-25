@@ -392,7 +392,8 @@ fn broca_model_step_cache_ops_match_memory_store_and_shared_cursors() {
             Some(u64::try_from(len).unwrap())
         );
         assert_eq!(stored.steps[0].request_size, size);
-        assert_eq!(stored.steps[0].output, Some(512));
+        // Served output includes reasoning, as BROCA sent it.
+        assert_eq!(stored.steps[0].output, Some(512 + 128));
         assert_eq!(stored.steps[0].reasoning, Some(128));
         assert!(stored.steps[0].cursor > last);
         last = stored.steps[0].cursor;

@@ -3677,6 +3677,45 @@ BEGIN
 END;
 "#,
     },
+    Migration {
+        version: 29,
+        statements: r#"-- The live step feed behind usage.steps.read. Each row is one emission of a
+-- served cache step: a step's row is appended again, at a new feed_cursor,
+-- whenever any served field of it changes, and the newest row for a
+-- (harness, step_ref) wins. AUTOINCREMENT keeps cursors from being reused
+-- after the 24-hour retention deletes the newest rows. row_json is the served
+-- row without its cursor.
+CREATE TABLE step_feed (
+    feed_cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+    harness TEXT NOT NULL,
+    step_ref TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('file', 'runner')),
+    session TEXT NOT NULL,
+    committed_at_ms INTEGER NOT NULL,
+    row_json TEXT NOT NULL
+);
+CREATE INDEX step_feed_identity ON step_feed(harness, step_ref, feed_cursor);
+CREATE INDEX step_feed_committed ON step_feed(committed_at_ms);
+-- Rows are never edited. DELETE is allowed for the 24-hour retention.
+CREATE TRIGGER step_feed_no_update BEFORE UPDATE ON step_feed
+BEGIN
+    SELECT RAISE(ABORT, 'step_feed_no_update');
+END;
+-- The cache cursor the feed has caught up to, and the newest feed cursor that
+-- retention has deleted. Starting at the current cache cursor means an
+-- upgraded store does not replay its history into the feed.
+CREATE TABLE step_feed_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    cache_high_water INTEGER NOT NULL,
+    pruned_through INTEGER NOT NULL
+);
+INSERT INTO step_feed_state(id, cache_high_water, pruned_through) VALUES (
+    1,
+    COALESCE((SELECT seq FROM sqlite_sequence WHERE name='cache_step_sequence'), 0),
+    0
+);
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -3740,7 +3779,7 @@ mod tests {
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (28, 28, 28)
+            (29, 29, 29)
         );
         assert_eq!(
             store
@@ -3753,7 +3792,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 28, 28)
+            (0, 29, 29)
         );
         assert!(!second.store_ahead());
         store
@@ -3763,7 +3802,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',29,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',30,1)",
                     [],
                 )?;
                 Ok(())
@@ -3772,7 +3811,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 29, 28)
+            (0, 30, 29)
         );
         assert!(ahead.store_ahead());
     }

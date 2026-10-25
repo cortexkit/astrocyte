@@ -157,10 +157,16 @@ impl RecentSteps {
 
     /// Fold in what was committed since the last call. Runs after a commit,
     /// on the writer's connection, under the writer fence, so nothing is
-    /// committed meanwhile. On failure memory stops answering; the store
-    /// still does.
-    pub(crate) fn advance(&mut self, conn: &Connection, now_ms: i64) -> rusqlite::Result<()> {
-        let late = cache::take_late_step_details(conn)?;
+    /// committed meanwhile. `late` are the events that gained a
+    /// `step_detail` row since the last call (the caller takes them with
+    /// `cache::take_late_step_details`, because the live step feed needs
+    /// them too). On failure memory stops answering; the store still does.
+    pub(crate) fn advance(
+        &mut self,
+        conn: &Connection,
+        late: &[i64],
+        now_ms: i64,
+    ) -> rusqlite::Result<()> {
         let expired: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM temp.sqlite_master WHERE name='broca_step_expired')",
             [],
@@ -175,7 +181,7 @@ impl RecentSteps {
         if !self.ready {
             return Ok(());
         }
-        let result = self.fold_in(conn, &late, now_ms);
+        let result = self.fold_in(conn, late, now_ms);
         if result.is_err() {
             *self = Self::default();
         }

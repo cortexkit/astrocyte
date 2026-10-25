@@ -267,6 +267,8 @@ pub struct StepRow {
     /// Every cache-write measurement summed; Claude Code stores its 5-minute
     /// and 1-hour writes separately.
     pub cache_write: Option<u64>,
+    /// Output as the ledger stores it: disjoint from `reasoning`. Served rows
+    /// add reasoning back in (see `served_output`).
     pub output: Option<u64>,
     pub reasoning: Option<u64>,
     pub provider: Option<String>,
@@ -569,7 +571,11 @@ fn lead_before(
 
 /// Whether any dated step of the session read a positive number of cached
 /// tokens.
-fn session_reads_cache(conn: &Connection, producer: &str, session: &str) -> rusqlite::Result<bool> {
+pub(crate) fn session_reads_cache(
+    conn: &Connection,
+    producer: &str,
+    session: &str,
+) -> rusqlite::Result<bool> {
     conn.prepare_cached(source_sql(producer, READS_CACHE_SQL, BROCA_READS_SQL))?
         .query_row(params![session, producer], |row| row.get(0))
 }
@@ -895,7 +901,7 @@ pub fn steps_reply(
                 input: row.input,
                 cache_read: row.cache_read,
                 cache_write: row.cache_write,
-                output: row.output,
+                output: served_output(row.output, row.reasoning),
                 reasoning: row.reasoning,
                 provider: row.provider,
                 model: row.model,
@@ -918,6 +924,142 @@ pub fn steps_reply(
         earlier_steps: lead.earlier_steps,
         undated_steps,
     }
+}
+
+/// A session that gained or changed steps, and the earliest time among
+/// them. The live step feed recomputes the session's served rows from there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedSession {
+    pub producer: String,
+    pub session: String,
+    pub earliest_ms: i64,
+}
+
+/// `(producer, session, occurred_at_ms)` of every dated step whose cache
+/// cursor is in `(?1, ?2]`, harness steps and BROCA steps alike.
+const DATED_STEPS_BETWEEN_SQL: &str = concat!(
+    "SELECT e.producer,e.session,e.occurred_at_ms FROM cache_step_sequence s",
+    " JOIN usage_event e ON e.event_key=s.event_key",
+    " WHERE s.cursor>?1 AND s.cursor<=?2 AND e.session IS NOT NULL",
+    " AND e.occurred_at_ms IS NOT NULL AND e.producer IN ",
+    harnesses_sql!(),
+    " UNION ALL SELECT 'broca',b.session,b.finished_at_ms FROM cache_step_sequence s",
+    " JOIN broca_step b ON b.step_key=s.broca_step_key WHERE s.cursor>?1 AND s.cursor<=?2"
+);
+const DATED_STEP_BY_KEY_SQL: &str = concat!(
+    "SELECT producer,session,occurred_at_ms FROM usage_event WHERE event_key=?1",
+    " AND session IS NOT NULL AND occurred_at_ms IS NOT NULL AND producer IN ",
+    harnesses_sql!()
+);
+/// Whether a dated step of the session with a cache cursor at or below `?3`
+/// read a positive number of cached tokens.
+const READ_CACHE_THROUGH_SQL: &str = "SELECT EXISTS (SELECT 1 FROM usage_event e
+     JOIN cache_step_sequence s ON s.event_key=e.event_key
+     JOIN measurement m ON m.event_key=e.event_key
+     WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL AND s.cursor<=?3
+       AND m.role='cache_read' AND m.quantity_exponent=0 AND m.quantity_units>0)";
+const BROCA_READ_CACHE_THROUGH_SQL: &str = "SELECT EXISTS(SELECT 1 FROM broca_step b
+     JOIN cache_step_sequence s ON s.broca_step_key=b.step_key
+     WHERE b.session=?1 AND ?2='broca' AND s.cursor<=?3 AND b.cached_input_tokens>0)";
+
+/// The sessions with a dated step whose cache cursor is in `(after,
+/// through]`, plus the sessions of the events in `late_keys` (events that
+/// gained a `step_detail` row after they were recorded), each once with its
+/// earliest changed time.
+pub fn changed_sessions(
+    conn: &Connection,
+    after: i64,
+    through: i64,
+    late_keys: &[i64],
+) -> rusqlite::Result<Vec<ChangedSession>> {
+    let mut earliest = std::collections::BTreeMap::<(String, String), i64>::new();
+    let mut note = |producer: String, session: String, at: i64| {
+        earliest
+            .entry((producer, session))
+            .and_modify(|earliest| *earliest = (*earliest).min(at))
+            .or_insert(at);
+    };
+    if through > after {
+        let mut statement = conn.prepare_cached(DATED_STEPS_BETWEEN_SQL)?;
+        let rows = statement.query_map(params![after, through], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        for row in rows {
+            let (producer, session, at) = row?;
+            note(producer, session, at);
+        }
+    }
+    let mut statement = conn.prepare_cached(DATED_STEP_BY_KEY_SQL)?;
+    for key in late_keys {
+        if let Some((producer, session, at)) = statement
+            .query_row([key], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .optional()?
+        {
+            note(producer, session, at);
+        }
+    }
+    Ok(earliest
+        .into_iter()
+        .map(|((producer, session), earliest_ms)| ChangedSession {
+            producer,
+            session,
+            earliest_ms,
+        })
+        .collect())
+}
+
+/// Whether a dated step of the session recorded at or before cache cursor
+/// `through` read a positive number of cached tokens. When this is false
+/// but the whole session now reads its cache, every earlier `unknown`
+/// verdict of a prefix-cache session can change.
+pub fn session_read_cache_through(
+    conn: &Connection,
+    producer: &str,
+    session: &str,
+    through: i64,
+) -> rusqlite::Result<bool> {
+    conn.prepare_cached(source_sql(
+        producer,
+        READ_CACHE_THROUGH_SQL,
+        BROCA_READ_CACHE_THROUGH_SQL,
+    ))?
+    .query_row(params![session, producer, through], |row| row.get(0))
+}
+
+/// Every dated step of one session at or after `since_ms`, oldest first,
+/// built exactly as `usage.cache.steps` serves them: the verdicts are
+/// computed over the whole session in time order.
+pub fn session_steps_since(
+    conn: &Connection,
+    producer: &str,
+    session: &str,
+    since_ms: i64,
+) -> rusqlite::Result<Vec<CacheStep>> {
+    let rows = conn
+        .prepare_cached(source_sql(producer, SINCE_SQL, BROCA_SINCE_SQL))?
+        .query_map(params![session, producer, since_ms], step_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let Some(first) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let lead = lead_before(conn, producer, session, first)?;
+    let query = StepsQuery {
+        producer: producer.to_string(),
+        session: session.to_string(),
+        limit: rows.len(),
+        after_cursor: None,
+    };
+    let reads_cache = session_reads_cache(conn, producer, session)?;
+    Ok(steps_reply(&query, rows, lead, reads_cache, 0).steps)
+}
+
+/// The `output` a served row reports. The fleet reports reasoning as a
+/// breakdown inside output, while the ledger stores the two disjoint (see
+/// `StepRow::output`), so a served row adds them back together. Without a
+/// stored output the row has none: a count is never made up from reasoning
+/// alone.
+pub fn served_output(output: Option<u64>, reasoning: Option<u64>) -> Option<u64> {
+    output.map(|output| output.saturating_add(reasoning.unwrap_or(0)))
 }
 
 /// `usage.cache.steps` answered from the store.

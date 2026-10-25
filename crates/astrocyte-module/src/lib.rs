@@ -3,7 +3,6 @@
 //! Shared metering integrations for the daemon and management consumers.
 //! Keeping these modules here gives their unit tests one owning test target.
 
-pub mod cache_notices;
 mod capacity_map;
 pub mod config;
 mod fusiform_client;
@@ -17,6 +16,7 @@ mod quota_events;
 mod recent_steps;
 mod refresher;
 pub mod state;
+pub mod step_feed;
 mod wire_map;
 
 pub use refresher::{hydrate_startup, start_refresher};

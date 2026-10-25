@@ -68,8 +68,8 @@ struct Inner {
     /// Recent harness steps kept for `usage.cache.steps`. Lock order: this
     /// mutex before either store connection, never the other way round.
     recent_steps: Mutex<crate::recent_steps::RecentSteps>,
-    /// Notices of committed cache steps for `usage.cache.subscribe`.
-    cache_notices: crate::cache_notices::NoticeLog,
+    /// The live step feed's subscriptions (`usage.steps.subscribe`).
+    step_feed: crate::step_feed::FeedHub,
     /// Test-only clock for the recent-steps memory, whose 24-hour window is
     /// otherwise measured from the wall clock. See `set_recent_steps_now_for_test`.
     #[cfg(test)]
@@ -301,7 +301,7 @@ impl SharedState {
             source_discovery: Mutex::new(HashMap::new()),
             quota_bus: crate::quota_events::Control::default(),
             recent_steps: Mutex::new(crate::recent_steps::RecentSteps::default()),
-            cache_notices: crate::cache_notices::NoticeLog::default(),
+            step_feed: crate::step_feed::FeedHub::default(),
             #[cfg(test)]
             recent_steps_now: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
@@ -822,35 +822,39 @@ impl SharedState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let advanced = self.with_conn(|conn| {
-            memory
-                .advance(conn, now_ms)
-                .map_err(|error| describe_sqlite_error(&error))
+            let late = astrocyte_core::cache_diagnostics::take_late_step_details(conn)
+                .map_err(|error| describe_sqlite_error(&error))?;
+            let advanced = memory
+                .advance(conn, &late, now_ms)
+                .map_err(|error| describe_sqlite_error(&error));
+            if let Err(error) = advanced {
+                tracing::warn!(target: "astrocyte", %error,
+                    "recent cache steps not advanced; usage.cache.steps reads the store");
+            }
+            // After memory, so a subscriber told of a step finds it there.
+            self.publish_step_feed(conn, &late);
+            Ok(())
         });
         if let Err(error) = advanced {
             tracing::warn!(target: "astrocyte", %error,
-                "recent cache steps not advanced; usage.cache.steps reads the store");
+                "late step details not read after a commit; cache memory and feed not advanced");
         }
-        drop(memory);
-        // After memory, so a subscriber told of a step finds it there.
-        let _ = self.with_conn(|conn| {
-            self.publish_cache_notices(conn);
-            Ok(())
-        });
     }
 
-    /// Publish the cache steps committed since the previous publication to
-    /// the notice log behind `usage.cache.subscribe`. Must run only after a commit: a notice for a
-    /// step that then rolled back would name a cursor that never existed.
-    fn publish_cache_notices(&self, conn: &Connection) {
-        if let Err(error) = self.0.cache_notices.publish(conn) {
+    /// Append the steps committed since the last call to the live step feed,
+    /// then tell `usage.steps.subscribe` subscribers. Must run only after the
+    /// commit that recorded the steps: a notice for a step that then rolled
+    /// back would announce a row that never existed.
+    fn publish_step_feed(&self, conn: &Connection, late: &[i64]) {
+        if let Err(error) = self.0.step_feed.publish(conn, now_ms(), late) {
             tracing::warn!(target: "astrocyte", error = %describe_sqlite_error(&error),
-                "cache step notices not published");
+                "live step feed not advanced");
         }
     }
 
-    /// The notice log behind `usage.cache.subscribe`.
-    pub fn cache_notices(&self) -> &crate::cache_notices::NoticeLog {
-        &self.0.cache_notices
+    /// The live step feed's subscriptions.
+    pub fn step_feed(&self) -> &crate::step_feed::FeedHub {
+        &self.0.step_feed
     }
 
     /// Fill the recent-steps memory from the store: the sessions active in

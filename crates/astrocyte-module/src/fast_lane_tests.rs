@@ -246,10 +246,12 @@ fn fresh_opencode_broca_and_jsonl_steps_are_served_on_the_next_fast_interval() {
         assert_eq!(query(harness, session)["steps"], json!([]));
     }
     corpus.due(&state);
+    // Served output includes reasoning, the fleet convention; the ledger
+    // stores the two disjoint.
     for (harness, session, step, input, output) in [
-        ("opencode", "oc-session", "message-1", 3, 13),
-        ("pi", "pi-session", "pi:response:response-1", 11, 5),
-        ("broca", "golden-session", "run-golden#1", 3, 512),
+        ("opencode", "oc-session", "message-1", 3, 13 + 2),
+        ("pi", "pi-session", "pi:response:response-1", 11, 7),
+        ("broca", "golden-session", "run-golden#1", 3, 512 + 128),
     ] {
         let reply = query(harness, session);
         assert_eq!(
@@ -301,7 +303,8 @@ fn fresh_v2_only_completed_row_is_served_on_the_next_fast_interval() {
     assert_eq!(reply["steps"].as_array().unwrap().len(), 1, "{reply}");
     assert_eq!(reply["steps"][0]["step_ref"], "v2-message-1");
     assert_eq!(reply["steps"][0]["input"], 3);
-    assert_eq!(reply["steps"][0]["output"], 13);
+    // Served output includes the step's 17 reasoning tokens.
+    assert_eq!(reply["steps"][0]["output"], 13 + 17);
     assert_eq!(reply["steps"][0]["finish"], "stop");
     assert_eq!(rows(&state, "usage_event").len(), 1);
     assert_eq!(runtime(&state), health);

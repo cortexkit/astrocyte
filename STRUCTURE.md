@@ -11,7 +11,7 @@ Crates live in `crates/`, public docs in `docs/`, and gates in `scripts/`.
 
 Domain logic and storage.
 
-- `store.rs`: `MIGRATIONS` (1 to 28), `initialize_connection` and `migrate_store`.
+- `store.rs`: `MIGRATIONS` (1 to 29), `initialize_connection` and `migrate_store`.
   Migration 23 rebuilds integer keys without charge digests, checking FKs before
   commit; startup restores enforcement. VACUUM is a separate offline step.
 - `fact.rs`: event and measurement identity, minted locally.
@@ -32,6 +32,7 @@ Domain logic and storage.
 - `verdict.rs`: the machine-scoped `budget.verdict` read.
 - `broca_step.rs`: insert-once BROCA diagnostic facts and bounded retention.
 - `cache_diagnostics.rs`: harness and BROCA steps per session and their cache verdicts.
+- `step_feed.rs`: the live step feed: table, change detection, paged read.
 - `capacity.rs`: QTA capacity windows, observations, runtime and freshness.
 - `money.rs`: signed nanodollar arithmetic with one rounding site.
 - `canon.rs`: internal exact-integer canonical JSON and SHA-256 hashing.
@@ -46,7 +47,7 @@ Shared library; three binaries.
 - `ops.rs`: `PUBLIC_OPERATION_NAMES` and `dispatch` for the served operations.
 - `state.rs`: `SharedState`, the writer fence, the public projection and health.
 - `recent_steps.rs`: the in-memory recent steps behind `usage.cache.steps`.
-- `cache_notices.rs`: the notice log behind `usage.cache.subscribe`.
+- `step_feed.rs`: serving the live step feed and who may read it.
 - `config.rs`: closed desired-configuration decoding and canonical identity.
 - `refresher.rs`: the background loop (drains, capacity poll, pricing pass, pricing
   queue reconciliation, the daily multiplier stage and its operator recompute).
