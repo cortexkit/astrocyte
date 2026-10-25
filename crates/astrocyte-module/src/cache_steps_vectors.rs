@@ -165,7 +165,15 @@ fn streaming_steps() -> Vec<store::Step<'static>> {
         ..harness_step(PI, STREAMING, step_ref)
     };
     vec![
-        series("exp-pipeline:0:request", 1, 0, 16_000, 800, None, "tool_use"),
+        series(
+            "exp-pipeline:0:request",
+            1,
+            0,
+            16_000,
+            800,
+            None,
+            "tool_use",
+        ),
         series(
             "exp-pipeline:1:request",
             2,
@@ -291,7 +299,10 @@ fn received() -> Vec<(&'static str, Vec<u8>)> {
         .into_iter()
         .map(|Vector { file, params }| {
             if file == AFTER_CURSOR {
-                return (file, serde_json::to_vec(&json!({"method": OP, "params": params})).unwrap());
+                return (
+                    file,
+                    serde_json::to_vec(&json!({"method": OP, "params": params})).unwrap(),
+                );
             }
             (file, served(&state, params))
         })
@@ -306,7 +317,12 @@ fn the_after_cursor_request_serves_the_steps_past_its_cursor() {
     let state = frozen_state();
     let frames = received()
         .into_iter()
-        .map(|(file, body)| (file, serde_json::from_slice::<serde_json::Value>(&body).unwrap()))
+        .map(|(file, body)| {
+            (
+                file,
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            )
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(
         frames[AFTER_CURSOR]["method"], OP,
@@ -333,11 +349,11 @@ fn the_after_cursor_request_serves_the_steps_past_its_cursor() {
 #[test]
 fn published_replies_are_the_served_bytes() {
     for (file, body) in received() {
-        let expected = std::fs::read(format!("{DIR}/{file}"))
-            .unwrap_or_else(|error| panic!("read test-vectors/usage-cache-steps-v1/{file}: {error}"));
+        let expected = std::fs::read(format!("{DIR}/{file}")).unwrap_or_else(|error| {
+            panic!("read test-vectors/usage-cache-steps-v1/{file}: {error}")
+        });
         assert_eq!(
-            body,
-            expected,
+            body, expected,
             "{file} no longer matches the bytes the handler serves"
         );
     }
