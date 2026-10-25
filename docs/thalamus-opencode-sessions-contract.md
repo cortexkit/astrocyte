@@ -61,9 +61,12 @@ rename).
 - `state`: `active` while the session may still write, including while its
   server is stopped for idleness. It becomes `done` only when the session
   ends for good: it expired, was released or was deleted. `done_at_ms` (Unix
-  milliseconds) is set when the state becomes `done` and must not be earlier
-  than the exit of the session's last OpenCode server; it is null while
-  active.
+  milliseconds) is null while active. It is the time of the roots-file write
+  that first marks the entry `done`, made after the session's last OpenCode
+  server has exited. It must not be an earlier recorded time, such as the
+  server's exit time: astrocyte only applies the done-folder rules to a folder
+  once a read sees it marked `done`, so a `done_at_ms` from before that write
+  could fall behind a watermark that never covered the folder as done.
 
 Unknown fields, at the top level or in an entry, are ignored, so either side
 can add fields without a coordinated release. A changed meaning bumps
