@@ -2612,6 +2612,10 @@ target = "--lib"
 expect_red = [
   "multiplier::tests::input_audio_catalog_rate_preserves_token_valuation_and_prices_audio",
   "pricing::tests::input_audio_catalog_rate_preserves_token_charges_and_prices_audio",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
 
 [[control]]
 id = "cache-steps-published-reply-members"
