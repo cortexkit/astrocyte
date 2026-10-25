@@ -2754,13 +2754,23 @@ mod tests {
             let corr = u64::try_from(index).unwrap() + 1;
             bind_as(&mut stream, *channel, corr, principal.clone(), harness).await;
         }
+        // The read first: it answers at once whether or not it is served,
+        // where an admitted subscription would only wait for notices.
         for (channel, _, harness) in &routes {
             let corr = u64::from(*channel) * 10;
-            send(&mut stream, subscribe_request(*channel, corr)).await;
-            send(&mut stream, read_request(*channel, corr + 1)).await;
-            for corr in [corr, corr + 1] {
+            for request in [
+                read_request(*channel, corr),
+                subscribe_request(*channel, corr + 1),
+            ] {
+                let corr = request.header.corr;
+                send(&mut stream, request).await;
                 let refused = frame_for(&mut stream, *channel, corr).await;
-                assert_eq!(refused.header.ty, FrameType::Error, "{harness}");
+                assert_eq!(
+                    refused.header.ty,
+                    FrameType::Error,
+                    "a feed call was served to {harness}: {}",
+                    String::from_utf8_lossy(&refused.body)
+                );
                 let body: ErrorBody = serde_json::from_slice(&refused.body).unwrap();
                 assert_eq!(
                     body.code, "not_permitted",
