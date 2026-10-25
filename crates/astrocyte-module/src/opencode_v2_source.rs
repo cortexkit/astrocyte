@@ -97,7 +97,9 @@ impl OpenCodeV2Source {
     }
 
     /// A reader of a store another module declared, at `database`, keeping
-    /// its cursor at `home`. It reads on the same cadence as the user's store.
+    /// its cursor at `home`. Its source drains it on full refresher ticks only,
+    /// never in the fast lane. Within those ticks it chooses between tail reads
+    /// and full passes by the same rules as the user's store.
     pub(crate) fn declared(database: PathBuf, home: CursorHome) -> Self {
         Self {
             root: Ok(database),

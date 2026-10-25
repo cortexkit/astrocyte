@@ -104,9 +104,13 @@ impl CursorHome {
         )
     }
 
-    /// Record a committed read in `tx`: the new durable cursor after a full
-    /// page, or only the success time after a tail read. Returns the rows
-    /// changed, which is 1 unless the source's runtime row has disappeared.
+    /// Record a committed read in `tx`. For the user's own store, a full page
+    /// advances the cursor in the `source_runtime` row and records the success
+    /// time, and a tail read records only the success time. For a declared
+    /// store, a full page writes its `declared_store_cursor` row and a tail
+    /// read writes nothing: the declaring source records its success once its
+    /// whole pass has committed. Returns the rows changed, which is 1 unless
+    /// the source's runtime row has disappeared.
     pub(crate) fn record_read_in_tx(
         &self,
         tx: &rusqlite::Transaction<'_>,
@@ -485,7 +489,9 @@ impl OpenCodeSource {
     }
 
     /// A reader of a store another module declared, at `database`, keeping
-    /// its cursor at `home`. It reads on the same cadence as the user's store.
+    /// its cursor at `home`. Its source drains it on full refresher ticks only,
+    /// never in the fast lane. Within those ticks it chooses between tail reads
+    /// and full passes by the same rules as the user's store.
     pub(crate) fn declared(database: PathBuf, home: CursorHome) -> Self {
         Self {
             home,

@@ -265,8 +265,11 @@ Rules that affect what is recorded:
   degrades the source. An unreadable or malformed file, including one that
   names a folder twice, keeps the last good entry list and degrades the source.
 - Each folder's `opencode.db` is read with the OpenCode 1 and OpenCode 2
-  readers described above, on the same cadence and under the same event
-  rules, so a call keeps producer `opencode` and OpenCode's message id. Only
+  readers described above and under the same event rules, so a call keeps
+  producer `opencode` and OpenCode's message id. The folders are read on full
+  refresher ticks only, never in the fast lane; within those ticks each reader
+  chooses between tail reads and full passes by the same rules as for the
+  user's store. Only
   `work_class` differs: it is the entry's `owner_principal`, verbatim, in
   place of the agent name. Each folder and layout keeps its own durable cursor
   in `declared_store_cursor`, while the whole source shares one
@@ -281,9 +284,10 @@ Rules that affect what is recorded:
   `declared_calls_keep_the_user_store_identity_and_carry_the_owner`,
   `an_unfinished_call_is_recorded_at_once_in_a_done_folder_and_waits_in_an_active_one`,
   `a_folder_seen_done_gets_a_full_pass_before_it_releases_the_watermark`.
-- After every full pass over the declared folders, the source stores its read
-  watermark (`read_watermark`, see the [data model](data-model.md)): the
-  pass's start minus 60 seconds, in the transaction that records the pass.
+- After every complete pass over the declared folders, the source stores its
+  read watermark (`read_watermark`, see the [data model](data-model.md)) in
+  the transaction that records the pass. The stored value is the greater of
+  the value already stored and the pass's start minus 60 seconds.
   A pass is complete, and moves the watermark, only when the roots file was
   usable, every `done` folder has been read by a full pass to its high water,
   and every declared folder that still has its `opencode.db` was read and
@@ -291,11 +295,16 @@ Rules that affect what is recorded:
   reason, such as a corrupt file, holds the watermark back and degrades the
   source until it reads; the other folders are still read. A folder whose
   `opencode.db` is gone, including one erased during the pass, is skipped
-  without degrading, and its cursor is deleted. A record that is set aside as
+  without degrading. Its cursor is deleted when the folder itself is erased or
+  is no longer declared. When two entries name different paths that resolve to
+  one folder, the folder is read once, for the first entry; the second entry is
+  skipped, the source is degraded and the watermark is held, because the
+  folder's owner is ambiguous. A record that is set aside as
   evidence counts as read. Excluding `opencode-thalamus` in `harness_ingest`
   reads nothing, removes the runtime row and leaves the watermark as it was.
   Tests: `an_unreadable_folder_holds_the_watermark_and_degrades_but_others_read`,
   `erasing_a_folder_between_ticks_neither_blocks_nor_degrades`,
+  `two_entries_resolving_to_one_folder_read_it_once_and_hold_the_watermark`,
   `a_set_aside_record_does_not_hold_the_watermark`,
   `excluded_sessions_are_not_read_and_runtime_is_removed`.
 - A timestamp that is absent or does not parse leaves the event undated. A

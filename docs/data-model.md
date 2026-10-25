@@ -157,12 +157,12 @@ folder path and its layout (`opencode-1` or `opencode-2`). The `lineage`,
 events its page recorded, and it is deleted once its folder is erased or is
 no longer declared, because a new session always gets a new folder.
 
-`read_watermark` holds one row per reader source. `watermark_ms` is the start
-of the source's most recent complete pass over every declared store, minus 60
-seconds. It is written only in the transaction that records that pass, after
-every store's own transaction has committed, and it never decreases: the
-writer keeps the larger of the stored and the new value, so neither a restart
-nor a clock that stepped back can lower it. `updated_at_ms` is when a complete
+`read_watermark` holds one row per reader source. `watermark_ms` is the
+greater of the stored value and the start of the source's latest complete pass
+over every declared store minus 60 seconds. It is written only in the
+transaction that records that pass, after every store's own transaction has
+committed. Because the writer keeps the greater value, the watermark never
+decreases, so neither a restart nor a clock that stepped back can lower it. `updated_at_ms` is when a complete
 pass last confirmed it. No row means no complete pass yet. Excluding the
 source in `harness_ingest`, or the roots file disappearing, leaves the row
 unchanged. Tests: `the_watermark_is_set_only_after_the_pass_commits`,

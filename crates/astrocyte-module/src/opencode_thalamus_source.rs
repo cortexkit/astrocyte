@@ -4,9 +4,10 @@
 //! `docs/thalamus-opencode-sessions-contract.md`.
 //!
 //! Each declared folder's `opencode.db` is read with the same OpenCode 1 and
-//! OpenCode 2 readers as the user's own store, on the same cadence, each with
-//! its own durable cursor per folder. Calls keep producer `opencode` and
-//! OpenCode's message id, and carry the declaring module as `work_class`.
+//! OpenCode 2 readers as the user's own store, each with its own durable
+//! cursor per folder. The folders are read on full refresher ticks only, never
+//! in the fast lane. Calls keep producer `opencode` and OpenCode's message id,
+//! and carry the declaring module as `work_class`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -194,7 +195,19 @@ impl OpenCodeThalamusSource {
                     continue;
                 }
             };
-            seen.insert(canonical.clone());
+            // Two entries can name different in-root paths that resolve to one
+            // folder, for example through a symlink. The first is read; the
+            // second is skipped, because reading it again could record the
+            // same calls under another owner. The owner is then ambiguous, so
+            // the pass cannot release the watermark.
+            if !seen.insert(canonical.clone()) {
+                complete = false;
+                problems.push(format!(
+                    "two OpenCode session entries resolve to one folder: {}",
+                    canonical.display()
+                ));
+                continue;
+            }
             let reader = cache
                 .folders
                 .entry(canonical.clone())
@@ -327,8 +340,10 @@ fn gone(path: &Path) -> bool {
     )
 }
 
-/// Entries are keyed by path, so two entries naming one folder leave its
-/// owner ambiguous; the file is then treated as malformed.
+/// Entries are keyed by path, so two entries with the same declared path
+/// leave the folder's owner ambiguous, and the file is then treated as
+/// malformed. This compares the declared text only. Different paths that
+/// resolve to one folder are caught after containment, in `drain`.
 fn check_paths_unique(entries: &[Entry]) -> Result<(), String> {
     let mut paths = HashSet::new();
     if entries.iter().all(|entry| paths.insert(&entry.path)) {
@@ -929,6 +944,57 @@ mod tests {
     }
 
     #[test]
+    fn two_entries_resolving_to_one_folder_read_it_once_and_hold_the_watermark() {
+        for layout in LAYOUTS {
+            let f = Fixture::new();
+            f.call(ONE, layout, "one", true, CREATED);
+            f.call(ONE, layout, "two", true, CREATED);
+            // A second, different path to the same folder, under another owner.
+            // It is built from the temporary directory's own path rather than
+            // the canonical one: on Windows the canonical path is a verbatim
+            // `\\?\` path, onto which a joined `..` is resolved as text.
+            fs::create_dir_all(f.folder.join(TWO)).unwrap();
+            let mut alias = f.entry(ONE, true);
+            alias["path"] = json!(f
+                .temp
+                .path()
+                .join("cortexkit/thalamus-harness/opencode-sessions")
+                .join(TWO)
+                .join("..")
+                .join(ONE));
+            alias["owner_principal"] = json!("magic-context");
+            f.declare(vec![f.entry(ONE, true), alias]);
+            f.tick(T0);
+            f.tick(T0 + TICK);
+            assert_eq!(
+                f.events(),
+                vec![
+                    ("one".into(), "opencode".into(), Some(OWNER.into())),
+                    ("two".into(), "opencode".into(), Some(OWNER.into())),
+                ],
+                "{layout:?}: {:?}",
+                f.degraded()
+            );
+            let rejected: i64 = f
+                .state
+                .with_conn(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM rejected_delivery", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|e| e.to_string())
+                })
+                .unwrap();
+            assert_eq!(rejected, 0, "{layout:?}: the folder was read a second time");
+            assert!(
+                f.degraded()
+                    .is_some_and(|reason| reason.contains("resolve to one folder")),
+                "{layout:?}"
+            );
+            assert_eq!(f.watermark(), None, "{layout:?}");
+        }
+    }
+
+    #[test]
     fn duplicate_folder_entries_are_malformed() {
         let f = Fixture::new();
         f.call(ONE, Layout::V2, "first", true, CREATED);
@@ -1285,7 +1351,9 @@ mod tests {
             f.call(ONE, layout, "one", true, CREATED);
             f.declare(vec![f.entry(ONE, false)]);
             f.tick(T0);
-            // A tail read: the reader that a user's store would keep open.
+            // A tail read on the second tick. The declared reader must close
+            // its connection after it, or the owner could not delete the
+            // database below.
             f.call(ONE, layout, "two", true, CREATED);
             f.tick(T0 + TICK);
             let database = f.database(ONE);

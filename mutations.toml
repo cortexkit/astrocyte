@@ -2249,6 +2249,7 @@ expect_red = [
     "refresher::opencode_thalamus_source::tests::outside_entry_is_refused_without_blocking_other_entries",
     "refresher::opencode_thalamus_source::tests::relative_entry_is_refused_without_blocking_other_entries",
     "refresher::opencode_thalamus_source::tests::the_sessions_folder_itself_is_refused",
+    "refresher::opencode_thalamus_source::tests::two_entries_resolving_to_one_folder_read_it_once_and_hold_the_watermark",
 ]
 only = true
 timeout_s = 600
@@ -2288,6 +2289,21 @@ expect_red = [
     "refresher::opencode_thalamus_source::tests::a_done_folder_holds_the_watermark_until_its_full_pass_reaches_high_water",
     "refresher::opencode_thalamus_source::tests::a_row_only_the_full_pass_finds_holds_its_done_folder_until_it_is_recorded",
 ]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "opencode-thalamus-one-folder-per-entry"
+guards = "Two OpenCode session entries resolving to one folder read it once and hold the watermark"
+file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+old = "            if !seen.insert(canonical.clone()) {"
+new = "            if { seen.insert(canonical.clone()); false } { // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::opencode_thalamus_source::tests::two_entries_resolving_to_one_folder_read_it_once_and_hold_the_watermark"]
 only = true
 timeout_s = 600
 build_timeout_s = 1800
