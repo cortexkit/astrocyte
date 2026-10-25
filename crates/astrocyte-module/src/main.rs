@@ -989,7 +989,12 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
     ModuleManifest::builder(module_id.to_string(), env!("CARGO_PKG_VERSION").to_string())
         .trust_tier(Some(TrustTier::FirstParty))
         .provides(vec![ProviderRole::ManagementSurface {
-            concurrency: Concurrency::Serial,
+            // `subc_client_rs::serve` runs each request in its own task, so
+            // calls are already concurrent: writes serialize on the writer
+            // fence and reads share the read connection's lock. Declaring it
+            // lets a held `usage.steps.subscribe` coexist with other calls,
+            // which relays such as callosum require before exposing a watch.
+            concurrency: Concurrency::ModuleManaged,
             operations,
             config_schema: ops::operation_schemas(),
             observability: Vec::new(),
@@ -2704,6 +2709,9 @@ mod tests {
 
     /// The manifest declares `usage.steps.subscribe`, and only it, as a
     /// watch, which is what lets the daemon route a subscription to it.
+    /// The surface is module-managed rather than serial: a held watch on a
+    /// serial surface would block every other call, and callosum refuses to
+    /// relay a watch from a serial module.
     #[test]
     fn manifest_declares_the_step_subscription_as_the_only_watch() {
         let manifest = manifest("astrocyte", &config::intentional_empty().config);
@@ -2712,6 +2720,19 @@ mod tests {
         assert_eq!(
             wire["operation_delivery"],
             json!({"usage.steps.subscribe": "watch"})
+        );
+        let concurrency = manifest
+            .provides
+            .iter()
+            .find_map(|role| match role {
+                ProviderRole::ManagementSurface { concurrency, .. } => Some(concurrency),
+                _ => None,
+            })
+            .expect("the manifest declares a management surface");
+        assert_eq!(
+            *concurrency,
+            Concurrency::ModuleManaged,
+            "a serial surface cannot have its watch relayed to phones"
         );
     }
 
