@@ -688,6 +688,50 @@ mod tests {
         .unwrap();
     }
 
+    /// The most rows one full pass of `layout` reads in one drain.
+    fn page_limit(layout: Layout) -> usize {
+        match layout {
+            Layout::V1 => crate::refresher::opencode_source::PAGE_LIMIT,
+            Layout::V2 => crate::refresher::opencode_v2_source::PAGE_LIMIT,
+        }
+    }
+
+    /// Insert `count` user messages updated one millisecond apart, from
+    /// `first_updated` on. A full pass counts every row towards its page but
+    /// records none of these, so a page limit of them makes the pass need a
+    /// second drain.
+    fn fill(path: &Path, layout: Layout, count: usize, first_updated: i64) {
+        let mut conn = store(path, layout);
+        let tx = conn.transaction().unwrap();
+        let seq: i64 = match layout {
+            Layout::V1 => 0,
+            Layout::V2 => tx
+                .query_row(
+                    "SELECT COALESCE(MAX(seq),0) FROM session_message",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+        };
+        for index in 0..i64::try_from(count).unwrap() {
+            let id = format!("fill-{index}");
+            let updated = first_updated + index;
+            match layout {
+                Layout::V1 => tx.execute(
+                    r#"INSERT INTO message VALUES (?1,'session',?2,?2,'{"role":"user"}')"#,
+                    params![id, updated],
+                ),
+                Layout::V2 => tx.execute(
+                    r#"INSERT INTO session_message
+                       VALUES (?1,'session','user',?3,?2,?2,'{"type":"user"}')"#,
+                    params![id, updated, seq + 1 + index],
+                ),
+            }
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
     /// Rewrite a row in place, keeping its rowid.
     fn rewrite(path: &Path, layout: Layout, id: &str, kind: &str, updated: i64, data: &Value) {
         let conn = store(path, layout);
@@ -976,6 +1020,82 @@ mod tests {
                 "{layout:?}"
             );
             assert_eq!(f.watermark(), Some(T0 + 3 * TICK - WATERMARK_MARGIN_MS));
+        }
+    }
+
+    #[test]
+    fn a_done_folder_holds_the_watermark_until_its_full_pass_reaches_high_water() {
+        for layout in LAYOUTS {
+            let f = Fixture::new();
+            f.call(ONE, layout, "first", true, T0);
+            f.declare(vec![f.entry(ONE, false)]);
+            f.tick(T0);
+            let held = Some(T0 - WATERMARK_MARGIN_MS);
+            assert_eq!(f.watermark(), held, "{layout:?}");
+            // More rows above the durable cursor than one page holds.
+            fill(&f.database(ONE), layout, page_limit(layout), T0 + 1);
+            f.declare(vec![f.entry(ONE, true)]);
+            f.tick(T0 + TICK);
+            assert_eq!(
+                f.watermark(),
+                held,
+                "{layout:?}: one page is not high water"
+            );
+            assert_eq!(f.degraded(), None, "{layout:?}");
+            assert_eq!(f.runtime(), Some((Some(T0 + TICK), true)), "{layout:?}");
+            f.tick(T0 + 2 * TICK);
+            assert_eq!(
+                f.watermark(),
+                Some(T0 + 2 * TICK - WATERMARK_MARGIN_MS),
+                "{layout:?}"
+            );
+            assert_eq!(f.degraded(), None, "{layout:?}");
+            assert_eq!(f.runtime(), Some((Some(T0 + 2 * TICK), false)));
+            assert_eq!(f.refs(), vec!["first"], "{layout:?}");
+        }
+    }
+
+    #[test]
+    fn a_row_only_the_full_pass_finds_holds_its_done_folder_until_it_is_recorded() {
+        for layout in LAYOUTS {
+            let f = Fixture::new();
+            let database = f.database(ONE);
+            f.call(ONE, layout, "first", true, T0);
+            f.declare(vec![f.entry(ONE, false)]);
+            f.tick(T0);
+            // The tail reads this row as a user message and passes its rowid.
+            let mut user = payload(layout, true);
+            user["role"] = json!("user");
+            insert(&database, layout, "late", "user", T0 + 1, &user);
+            f.tick(T0 + TICK);
+            let held = Some(T0 + TICK - WATERMARK_MARGIN_MS);
+            assert_eq!(f.watermark(), held, "{layout:?}");
+            // It becomes a finished call in place, updated after a full page
+            // of other rows, so the settling full pass reaches it only on its
+            // second drain and no tail read ever does.
+            let limit = page_limit(layout);
+            fill(&database, layout, limit, T0 + TICK + 1);
+            let after_page = T0 + TICK + 1 + i64::try_from(limit).unwrap();
+            rewrite(
+                &database,
+                layout,
+                "late",
+                "assistant",
+                after_page,
+                &payload(layout, true),
+            );
+            f.declare(vec![f.entry(ONE, true)]);
+            f.tick(T0 + 2 * TICK);
+            assert_eq!(f.refs(), vec!["first"], "{layout:?}");
+            assert_eq!(f.watermark(), held, "{layout:?}: `late` is not recorded");
+            assert_eq!(f.degraded(), None, "{layout:?}");
+            f.tick(T0 + 3 * TICK);
+            assert_eq!(f.refs(), vec!["first", "late"], "{layout:?}");
+            assert_eq!(
+                f.watermark(),
+                Some(T0 + 3 * TICK - WATERMARK_MARGIN_MS),
+                "{layout:?}"
+            );
         }
     }
 

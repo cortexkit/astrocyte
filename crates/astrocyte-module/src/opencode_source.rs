@@ -22,7 +22,7 @@ use crate::refresher::SourceDrainError;
 use crate::state::SharedState;
 
 pub(crate) const OPENCODE_SOURCE_KEY: &str = "opencode";
-const PAGE_LIMIT: usize = super::harness_drain::PAGE_LIMIT as usize;
+pub(crate) const PAGE_LIMIT: usize = super::harness_drain::PAGE_LIMIT as usize;
 
 /// Where a reader of one OpenCode store keeps its durable cursor and records
 /// its set-aside evidence. Shared by the OpenCode 1 and OpenCode 2 readers.

@@ -2269,3 +2269,21 @@ expect_red = ["refresher::opencode_thalamus_source::tests::a_folder_seen_done_ge
 only = true
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "opencode-thalamus-done-folder-holds-until-settled"
+guards = "A done OpenCode session folder holds the watermark until its settling full pass reaches high water"
+file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+old = "        recorded_all: !done || folder.settled,"
+new = "        recorded_all: true, // NON-VACUITY BREAK"
+test_file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+    "refresher::opencode_thalamus_source::tests::a_done_folder_holds_the_watermark_until_its_full_pass_reaches_high_water",
+    "refresher::opencode_thalamus_source::tests::a_row_only_the_full_pass_finds_holds_its_done_folder_until_it_is_recorded",
+]
+only = true
+timeout_s = 600
+build_timeout_s = 1800

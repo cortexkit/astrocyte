@@ -28,7 +28,7 @@ use crate::state::SharedState;
 pub(crate) const SOURCE_KEY: &str = "opencode-v2";
 const FULL_INTERVAL: i64 = 60 * 60 * 1_000;
 const OPEN_CAP: usize = 4_096;
-const PAGE_LIMIT: usize = 2_000;
+pub(crate) const PAGE_LIMIT: usize = 2_000;
 
 #[derive(Default)]
 struct Cache {
