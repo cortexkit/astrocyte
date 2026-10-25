@@ -149,15 +149,15 @@ Scope rules can filter model prefixes. The multiplier uses public API rates of
 the model an alias points to, and strips `-low`/`-high` after a missing row, never
 `-medium`. Ledger pricing is unchanged.
 
-Ledger pricing and the multiplier share `parse_rate_key` in
-`astrocyte-core/src/catalog_client.rs`: `rate.<role>` or
-`rate.<role>.<selector>.<value>`. `above_context.<threshold>` tests prompt size;
-`mode.<name>` requires a stated non-standard mode. Missing mode rates are unpriced,
-not fallback rates. No event stores a mode yet; multiplier rows disclose
-`mode_unrecorded_tokens` beside `base_rate_tier_untested_tokens`.
-Both paths honor `reasoning_billed_as_output`; unlisted reasoning needs its own
-rate. Ledger coverage and whole-event `rate_tiered` refusals precede selection;
-priced charges record the selected `fact_key` in `catalog_entry`.
+Pricing and the multiplier share `parse_rate_key`. Keys are `rate.<role>`
+or `rate.<role>.<selector>.<value>`. The roles are `input`, `output`, `cache_read`,
+`cache_write`, `reasoning`, and `input_audio`; any other role is refused.
+`above_context.<threshold>` tests prompt size; `mode.<name>` requires a stated
+non-standard mode and never falls back. With no stored mode, multiplier rows count
+`mode_unrecorded_tokens` and `base_rate_tier_untested_tokens`.
+Both honor `reasoning_billed_as_output`; unlisted reasoning needs its own rate.
+Ledger coverage and whole-event `rate_tiered` refusals precede selection.
+Charges record `fact_key` in `catalog_entry`.
 
 A unique index prevents a second original per provider/day. Observations wait until
 the catalog's history boundary is known. `scoped_producer_not_ingested` refuses scopes

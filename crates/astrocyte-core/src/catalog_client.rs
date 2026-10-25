@@ -311,7 +311,14 @@ fn alias_target_from_rates(facts: &BTreeMap<String, Value>) -> Option<CatalogMod
 }
 
 /// The token roles the catalog prices, each at `rate.<role>`.
-pub const RATE_ROLES: [&str; 5] = ["input", "output", "cache_read", "cache_write", "reasoning"];
+pub const RATE_ROLES: [&str; 6] = [
+    "input",
+    "output",
+    "cache_read",
+    "cache_write",
+    "reasoning",
+    "input_audio",
+];
 
 /// Mode names a request record uses for ordinary (non-premium) service. A
 /// request stated in one of these prices at the unconditional `rate.<role>`.

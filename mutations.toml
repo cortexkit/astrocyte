@@ -2590,3 +2590,28 @@ expect_red = ["refresher::multiplier_stage_tests::no_catalog_coverage_still_writ
 only = true
 timeout_s = 300
 build_timeout_s = 600
+
+[[control]]
+id = "catalog-recognizes-input-audio-rate"
+guards = "Audio input rates decode without blocking token valuation, while other unknown roles fail closed"
+file = "crates/astrocyte-core/src/catalog_client.rs"
+old = '''pub const RATE_ROLES: [&str; 6] = [
+    "input",
+    "output",
+    "cache_read",
+    "cache_write",
+    "reasoning",
+    "input_audio",
+];'''
+new = '''pub const RATE_ROLES: [&str; 5] = ["input", "output", "cache_read", "cache_write", "reasoning"]; // NON-VACUITY BREAK'''
+test_file = "crates/astrocyte-core/src/pricing.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = [
+  "multiplier::tests::input_audio_catalog_rate_preserves_token_valuation_and_prices_audio",
+  "pricing::tests::input_audio_catalog_rate_preserves_token_charges_and_prices_audio",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600

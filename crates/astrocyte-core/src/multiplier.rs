@@ -4937,6 +4937,159 @@ mod tests {
         }
     }
 
+    fn token_catalog(extra_role: Option<&str>) -> CatalogClient {
+        struct Catalog(BTreeMap<String, Value>);
+        impl crate::catalog_client::CatalogConnection for Catalog {
+            fn catalog_status(
+                &self,
+                _: fusiform_protocol::StatusRequest,
+            ) -> Result<fusiform_protocol::StatusResponse, CatalogCallError> {
+                unreachable!("the test client already has its history boundary")
+            }
+
+            fn catalog_get(
+                &self,
+                request: fusiform_protocol::CatalogGetRequest,
+            ) -> Result<fusiform_protocol::CatalogGetResponse, CatalogCallError> {
+                Ok(fusiform_protocol::CatalogGetResponse {
+                    source: "models.dev".into(),
+                    resolved_at_ms: request.at_ms.unwrap(),
+                    catalog_version: 1,
+                    models: BTreeMap::from([("google/gemini-3.8-flash".into(), self.0.clone())]),
+                    withheld: vec![],
+                    uncertain: vec![],
+                    overridden: vec![],
+                    retired: vec![],
+                    aliased: vec![],
+                    plane: None,
+                    billing_rules: vec![],
+                })
+            }
+        }
+        let rate = |units| {
+            json!({"state":"priced", "units":units, "exponent":9,
+            "currency":"USD", "unit_provenance":{"kind":"stated"}})
+        };
+        let mut facts = BTreeMap::from([
+            ("rate.input".into(), rate(3_000_000_000_i64)),
+            ("rate.output".into(), rate(15_000_000_000_i64)),
+        ]);
+        if let Some(role) = extra_role {
+            facts.insert(format!("rate.{role}"), rate(6_000_000_000));
+        }
+        CatalogClient::new(std::sync::Arc::new(Catalog(facts)), 0)
+    }
+
+    #[test]
+    fn input_audio_catalog_rate_preserves_token_valuation_and_prices_audio() {
+        let mut stored_rows = Vec::new();
+        for (extra_role, audio_tokens) in [
+            (None, 0),
+            (Some("input_audio"), 0),
+            (Some("input_audio"), 1_000_000),
+        ] {
+            let mut conn = conn();
+            let config = config(vec![rule("opencode", "google", None)]);
+            reading(&conn, "acct", 10, 0.0, None);
+            reading(&conn, "acct", 90, 50.0, None);
+            let mut measurements = vec![
+                ("input", "usage.input", 1_000_000),
+                ("output", "usage.output", 1_000_000),
+            ];
+            if audio_tokens > 0 {
+                measurements.push(("input_audio", "usage.input_audio", audio_tokens));
+            }
+            event(
+                &conn,
+                "tokens",
+                "opencode",
+                "google",
+                "gemini-3.8-flash",
+                "metered_api",
+                20,
+                &measurements,
+            );
+            let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
+            let rates = resolve_rates(
+                &token_catalog(extra_role),
+                &catalog_models(&config, &plan),
+                100,
+            )
+            .unwrap();
+            let observation = super::compute_observation(
+                &conn,
+                &config,
+                &plan,
+                &rates,
+                &priced_plan(),
+                100,
+                &["google".into()],
+            )
+            .unwrap();
+            assert!(observation.unpriced_tokens.is_empty());
+            assert_eq!(observation.api_nanos_by_model.len(), 1);
+            assert_eq!(
+                observation.api_nanos_by_model[0].api_nanos,
+                observation.api_nanos
+            );
+            let tx = conn.transaction().unwrap();
+            insert_observation_in_tx(&tx, &observation).unwrap();
+            tx.commit().unwrap();
+            let stored: (i64, i64, i64, String) = conn.query_row(
+                "SELECT api_nanos,input_tokens,output_tokens,unpriced_tokens FROM multiplier_observation",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            assert_eq!(
+                stored,
+                (
+                    18_000_000_000 + audio_tokens * 6_000,
+                    1_000_000,
+                    1_000_000,
+                    "[]".into()
+                )
+            );
+            stored_rows.push(stored);
+        }
+        assert_eq!(stored_rows[0], stored_rows[1]);
+        assert_eq!(stored_rows[2].0, 24_000_000_000);
+    }
+
+    #[test]
+    fn unknown_input_video_catalog_role_fails_the_day_without_rows() {
+        let conn = conn();
+        let config = config(vec![rule("opencode", "google", None)]);
+        reading(&conn, "acct", 10, 0.0, None);
+        reading(&conn, "acct", 90, 50.0, None);
+        event(
+            &conn,
+            "tokens",
+            "opencode",
+            "google",
+            "gemini-3.8-flash",
+            "metered_api",
+            20,
+            &[
+                ("input", "usage.input", 1_000_000),
+                ("output", "usage.output", 1_000_000),
+            ],
+        );
+        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
+        let error = resolve_rates(
+            &token_catalog(Some("input_video")),
+            &catalog_models(&config, &plan),
+            100,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "rate_fact_unrecognized");
+        assert!(error.message().contains("rate.input_video"));
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM multiplier_observation", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
     /// A rate key the decoder does not know fails the resolution (the day is
     /// not written); a model the catalog has no row for is a reason on a
     /// written row.

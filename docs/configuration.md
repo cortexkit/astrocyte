@@ -148,6 +148,12 @@ Claude and gpt-oss traffic in Antigravity's separate third-party pool. Declare
 an equivalent `opencode` rule to include that producer. Older stored config
 generations hydrate a missing `model_prefix` as `null`; new files must include it.
 
+Ledger pricing and the multiplier accept `rate.<role>` and
+`rate.<role>.<selector>.<value>` keys. The recognized roles are `input`, `output`,
+`cache_read`, `cache_write`, `reasoning`, and `input_audio`; other roles are refused.
+The per-million-token `rate.input_audio` price is unused unless an event records an
+`input_audio` measurement. No usage-event reader currently records that role.
+
 The multiplier uses the public API rates of the model an alias points to as its
 reference list prices. When a historical lookup misses, it first retries names
 ending in `-low` or `-high` without that reasoning-level suffix. It never folds

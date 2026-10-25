@@ -1381,6 +1381,7 @@ fn rate_fact_key(role: &str, unit: &str) -> Option<&'static str> {
         "cache_read" => Some("rate.cache_read"),
         "cache_write" => Some("rate.cache_write"),
         "reasoning" => Some("rate.reasoning"),
+        "input_audio" => Some("rate.input_audio"),
         _ => None,
     }
 }
@@ -2235,6 +2236,90 @@ mod tests {
     }
 
     #[test]
+    fn input_audio_catalog_rate_preserves_token_charges_and_prices_audio() {
+        let mut token_charges = Vec::new();
+        for with_audio in [false, true] {
+            let mut conn = conn();
+            let mut facts = BTreeMap::from([
+                ("rate.input".into(), rate(3_000_000_000)),
+                ("rate.output".into(), rate(15_000_000_000)),
+            ]);
+            if with_audio {
+                facts.insert("rate.input_audio".into(), rate(6_000_000_000));
+            }
+            let catalog = client(FakeCatalog::new(facts));
+            let event_id = record(
+                &mut conn,
+                "tokens",
+                ChargeBasis::MeteredApi,
+                Some(700),
+                vec![
+                    measurement("input", Some(1_000_000)),
+                    measurement("output", Some(1_000_000)),
+                ],
+            );
+            reprice_event(
+                &mut conn,
+                &event_id,
+                &catalog,
+                1_000,
+                PricingOrigin::PricingPass,
+            )
+            .unwrap();
+            let rows = conn
+                .prepare("SELECT role,outcome,charge_nanos FROM priced_charge ORDER BY role")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("input".into(), "priced".into(), 3_000_000_000),
+                    ("output".into(), "priced".into(), 15_000_000_000),
+                ]
+            );
+            token_charges.push(rows);
+
+            if with_audio {
+                let audio_id = record(
+                    &mut conn,
+                    "audio",
+                    ChargeBasis::MeteredApi,
+                    Some(700),
+                    vec![measurement("input_audio", Some(1_000_000))],
+                );
+                let plan = read_reprice(&conn, &audio_id).unwrap();
+                let resolved = resolve_reprice(&plan, &catalog, &["provider".into()]).unwrap();
+                let tx = conn.transaction().unwrap();
+                commit_reprice_in_tx(&tx, &plan, &resolved, 1_000, PricingOrigin::PricingPass)
+                    .unwrap();
+                tx.commit().unwrap();
+                let stored: (String, i64, String) = conn
+                    .query_row(
+                        "SELECT outcome,charge_nanos,json_extract(catalog_entry,'$.fact_key')
+                     FROM priced_charge WHERE role='input_audio'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    stored,
+                    ("priced".into(), 6_000_000_000, "rate.input_audio".into())
+                );
+            }
+        }
+        assert_eq!(token_charges[0], token_charges[1]);
+    }
+
+    #[test]
     fn declared_reasoning_uses_output_rates_and_records_the_resolved_key() {
         for (mode, key, nanos) in [
             (None, "rate.output", 3_000_000),
@@ -2857,6 +2942,11 @@ mod tests {
             "rate.input.future_selector",
             rate(3_000),
         );
+    }
+
+    #[test]
+    fn unknown_input_video_catalog_role_refuses_without_any_stored_state() {
+        assert_catalog_refusal_without_rows("video", "rate.input_video", rate(6_000_000_000));
     }
 
     /// Base `rate.input` at 3 USD/M with `rate.input.mode.fast` at 6 USD/M and
