@@ -1,0 +1,1 @@
+{"result":{"earlier_steps":false,"harness":"pi","session":"ses_ck_phone_undated","steps":[{"cache_read":960,"cursor":5,"input":40,"model":"claude-sonnet-4","occurred_at_ms":1788220801000,"output":120,"prompt":1000,"prompt_dropped":false,"provider":"anthropic","step_ref":"undated-session:1","verdict":"cold_start"}],"undated_steps":2}}

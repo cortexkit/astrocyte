@@ -3,6 +3,8 @@
 //! Shared metering integrations for the daemon and management consumers.
 //! Keeping these modules here gives their unit tests one owning test target.
 
+#[cfg(test)]
+mod cache_steps_vectors;
 mod capacity_map;
 pub mod config;
 mod fusiform_client;

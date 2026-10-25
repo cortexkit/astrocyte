@@ -2612,6 +2612,33 @@ target = "--lib"
 expect_red = [
   "multiplier::tests::input_audio_catalog_rate_preserves_token_valuation_and_prices_audio",
   "pricing::tests::input_audio_catalog_rate_preserves_token_charges_and_prices_audio",
+
+[[control]]
+id = "cache-steps-published-reply-members"
+guards = "The published usage.cache.steps replies are the bytes the handler serves"
+file = "crates/astrocyte-core/src/cache_diagnostics.rs"
+old = """pub struct CacheStep {
+    pub cursor: i64,
+    pub step_ref: String,"""
+new = """pub struct CacheStep {
+    pub cursor: i64,
+    #[serde(rename = "renamed_step_ref")] // NON-VACUITY BREAK
+    pub step_ref: String,"""
+test_file = "crates/astrocyte-module/src/cache_steps_vectors.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = [
+  "cache_steps_vectors::every_frame_pins_the_case_its_name_names",
+  "cache_steps_vectors::published_replies_are_the_served_bytes",
+  "refresher::fast_lane_tests::fresh_steps_are_served_and_unknown_broca_facts_are_set_aside_on_the_next_fast_interval",
+  "refresher::fast_lane_tests::fresh_v2_only_completed_row_is_served_on_the_next_fast_interval",
+  "refresher::fast_lane_tests::sqlite_store_replacement_between_cycles_recovers_on_the_next_full_tick",
+  "refresher::opencode_v2_source::tests::v2_only_calls_reach_served_cache_steps_and_sessions_once",
+  "step_feed::tests::a_verdict_changed_by_a_late_earlier_step_is_sent_again",
+  "step_feed::tests::filtered_reads_page_only_the_sessions_latest_rows",
+  "step_feed::tests::reads_page_through_the_feed_in_commit_order",
+  "step_feed::tests::unfiltered_read_keeps_its_reply_bytes",
 ]
 only = true
 timeout_s = 300

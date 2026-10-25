@@ -376,6 +376,15 @@ The memory window is distinct from storage retention. BROCA diagnostics are
 kept for 30 days after the step finished, with at most 500 expired rows deleted
 per maintenance transaction. Harness ledger steps are kept indefinitely.
 
+Sample replies, published for a client to pin its decoder against, live in
+`crates/astrocyte-module/test-vectors/usage-cache-steps-v1/`, with the request
+that produced each one. The step `cursor` is the cache-step cursor, a
+different cursor space from the live feed's `cN` cursors: it counts harness
+events and BROCA steps together, so two rows with the same number in a cache
+read and a feed read are not the same step. To join a session's history with
+the live feed, an app matches rows by (`harness`, `step_ref`) and replaces, and
+never compares a cache-step cursor with a feed cursor.
+
 `usage.cache.sessions` returns `since_ms` (default: 24 hours ago) and
 `sessions`, the harness sessions with a step at or after `since_ms`, most
 recently active first. There are at most `limit` sessions (default 50, maximum
