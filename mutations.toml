@@ -2265,7 +2265,11 @@ test_file = "crates/astrocyte-module/src/opencode_thalamus_source.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
-expect_red = ["refresher::opencode_thalamus_source::tests::a_folder_seen_done_gets_a_full_pass_before_it_releases_the_watermark"]
+expect_red = [
+    "refresher::opencode_thalamus_source::tests::a_folder_seen_done_gets_a_full_pass_before_it_releases_the_watermark",
+    "refresher::opencode_thalamus_source::tests::a_done_folder_holds_the_watermark_until_its_full_pass_reaches_high_water",
+    "refresher::opencode_thalamus_source::tests::a_row_only_the_full_pass_finds_holds_its_done_folder_until_it_is_recorded",
+]
 only = true
 timeout_s = 600
 build_timeout_s = 1800
