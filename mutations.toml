@@ -2057,6 +2057,7 @@ expect_red = [
   "refresher::opencode_v2_source::tests::v2_quiet_window_crosses_between_drains",
   "refresher::opencode_v2_source::tests::v2_cursor_and_pending_rows_survive_restarts",
   "refresher::opencode_v2_source::tests::v2_completion_at_the_cursor_timestamp_is_ingested",
+  "refresher::opencode_thalamus_source::tests::an_unfinished_call_is_recorded_at_once_in_a_done_folder_and_waits_in_an_active_one",
 ]
 only = true
 timeout_s = 600
