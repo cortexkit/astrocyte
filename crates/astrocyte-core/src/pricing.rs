@@ -3114,6 +3114,7 @@ mod tests {
         );
         let plan = read_reprice(&conn, &event_id).unwrap();
         let snapshot = CatalogSnapshot {
+            alias_target: None,
             source: "models.dev".into(),
             resolved_at_ms: 700,
             model_key: "provider/model".into(),

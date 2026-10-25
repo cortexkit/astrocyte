@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 
 use crate::catalog_client::{
     parse_rate_key, stated_mode_condition, CatalogCallError, CatalogClient, CatalogClientError,
-    CatalogLookup, CatalogSnapshot, RateCondition, RATE_FACT_PREFIX, RATE_ROLES,
+    CatalogLookup, CatalogModel, CatalogSnapshot, RateCondition, RATE_FACT_PREFIX, RATE_ROLES,
 };
 use crate::fact::ChargeBasis;
 use crate::money::{round_nano_num, round_nano_ratio, MoneyError};
@@ -795,6 +795,9 @@ pub struct ModelRates {
     /// it did before mode rates were read.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub modes: BTreeMap<String, BTreeMap<String, RateState>>,
+    /// The target catalog model whose historical rates are used to value this alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_model: Option<CatalogModel>,
 }
 
 // JSON object keys are strings, including inside the tagged rate resolution.
@@ -900,28 +903,36 @@ pub fn resolve_rates(
         // Reasoning levels on the wire are not catalog identities. Prefer an
         // exact row, and only retry a missing row for the two supported levels.
         let lookup = catalog.get(provider, model, at_ms);
-        // Missing selections may be empty responses or coverage refusals.
-        let missing = match &lookup {
-            Ok(CatalogLookup::Resolved(snapshot)) => {
-                snapshot.facts.is_empty()
-                    && snapshot.withheld_facts.is_empty()
-                    && snapshot.uncertain_facts.is_empty()
-                    && snapshot.overridden_facts.is_empty()
-            }
-            Err(CatalogClientError::Call(error)) => {
-                RefusalKind::of(&error.code) == RefusalKind::OutsideCoverage
-            }
-            _ => false,
-        };
-        let lookup = match (
-            missing,
+        let (lookup_model, mut lookup) = match (
+            lookup_missing(&lookup),
             model
                 .strip_suffix("-low")
                 .or_else(|| model.strip_suffix("-high")),
         ) {
-            (true, Some(base)) => catalog.get(provider, base, at_ms),
-            _ => lookup,
+            (true, Some(base)) => (base, catalog.get(provider, base, at_ms)),
+            _ => (model.as_str(), lookup),
         };
+        let mut reference_model = None;
+        if lookup_missing(&lookup) {
+            // Aliases exist only on current reads. Discover the public identity
+            // there, but use its rates at the original valuation instant.
+            match catalog.get_current(provider, lookup_model) {
+                Ok(CatalogLookup::Resolved(snapshot)) => {
+                    if let Some(target) = snapshot.alias_target {
+                        lookup = catalog.get(&target.provider_id, &target.model_id, at_ms);
+                        reference_model = Some(target);
+                    }
+                }
+                Err(CatalogClientError::Call(error))
+                    if RefusalKind::of(&error.code) == RefusalKind::OutsideCoverage => {}
+                Err(error) => {
+                    return Err(MultiplierError::Catalog(format!(
+                        "catalog.get current {provider}/{lookup_model}: {error:?}"
+                    )))
+                }
+                _ => {}
+            }
+        }
         let resolution = match lookup {
             Ok(CatalogLookup::Resolved(snapshot)) => match rates_from_snapshot(&snapshot) {
                 ModelResolution::Unpriceable { reason } if reason == RATE_FACT_UNRECOGNIZED => {
@@ -934,6 +945,10 @@ pub fn resolve_rates(
                     return Err(MultiplierError::RateFactUnrecognized(format!(
                         "catalog.get {provider}/{model}: a rate value this decoder cannot read"
                     )))
+                }
+                ModelResolution::Rates(mut rates) => {
+                    rates.reference_model = reference_model;
+                    ModelResolution::Rates(rates)
                 }
                 resolution => resolution,
             },
@@ -963,6 +978,21 @@ pub fn resolve_rates(
             .insert((provider.clone(), model.clone()), resolution);
     }
     Ok(resolved)
+}
+
+fn lookup_missing(lookup: &Result<CatalogLookup, CatalogClientError>) -> bool {
+    match lookup {
+        Ok(CatalogLookup::Resolved(snapshot)) => {
+            snapshot.facts.is_empty()
+                && snapshot.withheld_facts.is_empty()
+                && snapshot.uncertain_facts.is_empty()
+                && snapshot.overridden_facts.is_empty()
+        }
+        Err(CatalogClientError::Call(error)) => {
+            RefusalKind::of(&error.code) == RefusalKind::OutsideCoverage
+        }
+        _ => false,
+    }
 }
 
 /// Every `rate.*` fact the catalog served for one model, decoded to a rate or
@@ -1036,13 +1066,10 @@ fn rate_state(snapshot: &CatalogSnapshot, key: &str) -> RateState {
         // Billing-plane claims are not API reference rates. This consumer
         // makes ordinary catalog reads and does not resolve plane rules.
         Ok(RateValue::BilledAs { .. }) => unpriced(RATE_UNDECODABLE),
-        // An alias points at the public API card used for list-value
-        // comparison, not the route's billed cost. Other inheritance is still
-        // not a public reference price for this model.
         Ok(RateValue::Priced {
-            inherited_from: Some(origin),
+            inherited_from: Some(_),
             ..
-        }) if origin.basis != "alias" => unpriced("rate_inherited"),
+        }) => unpriced("rate_inherited"),
         Ok(RateValue::Priced { amount, .. }) if amount.exponent != NANO_EXPONENT => {
             unpriced("rate_exponent_unsupported")
         }
@@ -1681,7 +1708,12 @@ pub fn compute_observation(
     )?) {
         account["subscription_nanos"] = json!(amount);
     }
-    let ratio = |denominator: i64| (denominator > 0).then(|| api_nanos as f64 / denominator as f64);
+    // A missing list value is not evidence of free usage. Keep both ratios
+    // unknown when unpriced tokens are the only contribution to a zero value.
+    let unmeasurable = api_nanos == 0 && unpriced.values().any(|(tokens, _)| *tokens > 0);
+    let ratio = |denominator: i64| {
+        (denominator > 0 && !unmeasurable).then(|| api_nanos as f64 / denominator as f64)
+    };
     let low_resolution =
         delta_percent <= 0.0 || segments as f64 / delta_percent > LOW_RESOLUTION_ERROR_SHARE;
     Ok(Observation {
@@ -2737,6 +2769,7 @@ mod tests {
                             base: base.clone(),
                             tiers: tiers.clone(),
                             modes: BTreeMap::new(),
+                            reference_model: None,
                         }),
                     )
                 })
@@ -3887,6 +3920,7 @@ mod tests {
             facts.insert(format!("rate.{role}.mode.fast"), rate(2 * TEN_PER_M));
         }
         let snapshot = CatalogSnapshot {
+            alias_target: None,
             source: "models.dev".into(),
             resolved_at_ms: 42,
             model_key: format!("openai/{model}"),
@@ -4088,6 +4122,7 @@ mod tests {
     fn an_unknown_selector_never_applies_and_the_base_prices() {
         let rate = |units: i64| json!({"state":"priced","units":units,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}});
         let snapshot = CatalogSnapshot {
+            alias_target: None,
             source: "models.dev".into(),
             resolved_at_ms: 42,
             model_key: "openai/m".into(),
@@ -4123,6 +4158,7 @@ mod tests {
     #[test]
     fn an_undecodable_rate_value_fails_the_model() {
         let snapshot = CatalogSnapshot {
+            alias_target: None,
             source: "models.dev".into(),
             resolved_at_ms: 42,
             model_key: "openai/m".into(),
@@ -4149,6 +4185,7 @@ mod tests {
             json!({"state": "unpriced", "reason": "not_established"}),
         ] {
             let snapshot = CatalogSnapshot {
+                alias_target: None,
                 source: "models.dev".into(),
                 resolved_at_ms: 42,
                 model_key: "openai/m".into(),
@@ -4996,6 +5033,8 @@ mod tests {
         rows: BTreeMap<String, Value>,
         aliased: Vec<fusiform_protocol::AliasedModelWire>,
         empty_on_miss: BTreeSet<String>,
+        current_only: BTreeSet<String>,
+        requests: std::sync::Mutex<Vec<(String, Option<i64>)>>,
     }
 
     impl crate::catalog_client::CatalogConnection for ReferenceCatalog {
@@ -5015,6 +5054,24 @@ mod tests {
             request: fusiform_protocol::CatalogGetRequest,
         ) -> Result<fusiform_protocol::CatalogGetResponse, CatalogCallError> {
             let model = request.model_id.unwrap();
+            self.requests
+                .lock()
+                .unwrap()
+                .push((model.clone(), request.at_ms));
+            let is_alias = self
+                .aliased
+                .iter()
+                .any(|alias| alias.model == format!("google/{model}"))
+                || self
+                    .rows
+                    .get(&model)
+                    .is_some_and(|rate| rate["inherited_from"]["basis"] == "alias");
+            if request.at_ms.is_some() && (is_alias || self.current_only.contains(&model)) {
+                return Err(CatalogCallError {
+                    code: "no_coverage".into(),
+                    message: "aliases apply to current reads only".into(),
+                });
+            }
             let models = if let Some(rate) = self.rows.get(&model) {
                 BTreeMap::from([(
                     format!("google/{model}"),
@@ -5050,34 +5107,25 @@ mod tests {
     }
 
     #[test]
-    fn alias_values_the_multiplier_while_the_ledger_refuses_the_same_rate() {
-        let mut conn = conn();
-        let model = "antigravity-gemini-3.8-flash";
-        let mut rate = reference_rate(TEN_PER_M);
-        rate["inherited_from"] = json!({"basis":"alias","provider_id":"google",
-            "family":"gemini","model_id":"gemini-3.8-flash"});
-        let catalog = CatalogClient::new(
-            std::sync::Arc::new(ReferenceCatalog {
-                rows: BTreeMap::from([(model.into(), rate)]),
-                empty_on_miss: BTreeSet::new(),
-                aliased: vec![fusiform_protocol::AliasedModelWire {
-                    model: format!("google/{model}"),
-                    target_provider_id: "google".into(),
-                    target_model_id: "gemini-3.8-flash".into(),
-                    source_ref: "plugin/models.ts@abc123".into(),
-                }],
-            }),
-            0,
-        );
+    fn a_non_alias_current_price_does_not_fill_missing_history() {
+        let conn = conn();
+        let connection = std::sync::Arc::new(ReferenceCatalog {
+            rows: BTreeMap::from([("new-model".into(), reference_rate(TEN_PER_M))]),
+            aliased: vec![],
+            empty_on_miss: BTreeSet::new(),
+            current_only: BTreeSet::from(["new-model".into()]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let catalog = CatalogClient::new(connection.clone(), 0);
         let config = config(vec![rule("opencode", "google", None)]);
         reading(&conn, "acct", 10, 0.0, None);
         reading(&conn, "acct", 90, 50.0, None);
         event(
             &conn,
-            "alias",
+            "missing",
             "opencode",
             "google",
-            model,
+            "new-model",
             "metered_api",
             20,
             &[("input", "usage.input", 1_000)],
@@ -5085,45 +5133,142 @@ mod tests {
         let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
         let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
         let observation = observe(&conn, &config, 0, 100, &rates);
-        assert_eq!(observation.tokens.input, 1_000);
-        assert_eq!(observation.api_nanos, 10_000_000);
-        assert!(observation.unpriced_tokens.is_empty());
-
-        let ledger_plan = crate::subscription::read_reprice(&conn, "alias").unwrap();
-        let ledger_rates =
-            crate::subscription::resolve_reprice(&ledger_plan, &catalog, &[]).unwrap();
-        let tx = conn.transaction().unwrap();
-        crate::subscription::commit_reprice_in_tx(
-            &tx,
-            &ledger_plan,
-            &ledger_rates,
-            100,
-            crate::pricing::PricingOrigin::PricingPass,
-        )
-        .unwrap();
-        tx.commit().unwrap();
-        let (outcome, reason, charge, entry): (String, String, Option<i64>, String) = conn
-            .query_row(
-                "SELECT outcome,unpriced_reason,charge_nanos,catalog_entry FROM priced_charge",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(outcome, "unpriced");
-        assert_eq!(reason, "rate_inherited");
-        assert_eq!(charge, None);
         assert_eq!(
-            serde_json::from_str::<Value>(&entry).unwrap()["inherited_from"]["basis"],
-            "alias"
+            *connection.requests.lock().unwrap(),
+            vec![("new-model".into(), Some(100)), ("new-model".into(), None)]
         );
+        assert_eq!(observation.api_nanos, 0);
+        assert_eq!(observation.tokens.input, 1_000);
+        assert_eq!(observation.unpriced_tokens.len(), 1);
+        assert_eq!(observation.unpriced_tokens[0].reason, "no_catalog_coverage");
+        assert_eq!(observation.unpriced_tokens[0].tokens, 1_000);
+        assert_eq!(observation.multiplier, None);
+        assert_eq!(observation.fee_multiplier, None);
+        let known_zero = rates_for(&[("google", "new-model")], 0, None);
+        let zero = observe(&conn, &config, 0, 100, &known_zero);
+        assert!(zero.unpriced_tokens.is_empty());
+        assert_eq!(zero.multiplier, Some(0.0));
+        assert_eq!(zero.fee_multiplier, Some(0.0));
+    }
+
+    #[test]
+    fn alias_values_the_multiplier_while_the_ledger_refuses_the_alias() {
+        for (metadata, marker) in [(true, false), (true, true), (false, true)] {
+            for suffix in ["", "-low", "-high"] {
+                let mut conn = conn();
+                let model = "antigravity-gemini-3.8-flash";
+                let event_model = format!("{model}{suffix}");
+                let mut rate = reference_rate(TEN_PER_M);
+                if marker {
+                    rate["inherited_from"] = json!({"basis":"alias","provider_id":"google",
+            "family":"gemini","model_id":"gemini-3.8-flash"});
+                }
+                let connection = std::sync::Arc::new(ReferenceCatalog {
+                    rows: BTreeMap::from([
+                        (model.into(), rate),
+                        ("gemini-3.8-flash".into(), reference_rate(3 * TEN_PER_M)),
+                    ]),
+                    empty_on_miss: BTreeSet::new(),
+                    current_only: BTreeSet::new(),
+                    aliased: if metadata {
+                        vec![fusiform_protocol::AliasedModelWire {
+                            model: format!("google/{model}"),
+                            target_provider_id: "google".into(),
+                            target_model_id: "gemini-3.8-flash".into(),
+                            source_ref: "plugin/models.ts@abc123".into(),
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    requests: std::sync::Mutex::new(Vec::new()),
+                });
+                let catalog = CatalogClient::new(connection.clone(), 0);
+                let config = config(vec![rule("opencode", "google", None)]);
+                reading(&conn, "acct", 10, 0.0, None);
+                reading(&conn, "acct", 90, 50.0, None);
+                for id in ["alias", "alias-again"] {
+                    event(
+                        &conn,
+                        id,
+                        "opencode",
+                        "google",
+                        &event_model,
+                        "metered_api",
+                        20,
+                        &[("input", "usage.input", 1_000)],
+                    );
+                }
+                let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
+                let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
+                let observation = observe(&conn, &config, 0, 100, &rates);
+                assert_eq!(observation.tokens.input, 2_000);
+                assert_eq!(observation.api_nanos, 60_000_000);
+                assert!(observation.unpriced_tokens.is_empty());
+                let mut expected_requests = vec![
+                    (model.into(), Some(100)),
+                    (model.into(), None),
+                    ("gemini-3.8-flash".into(), Some(100)),
+                ];
+                if !suffix.is_empty() {
+                    expected_requests.insert(0, (event_model, Some(100)));
+                }
+                assert_eq!(*connection.requests.lock().unwrap(), expected_requests);
+                let stored_rates =
+                    serde_json::to_value(&observation.api_nanos_by_model[0].rates).unwrap();
+                assert_eq!(
+                    stored_rates["reference_model"],
+                    json!({"provider_id":"google", "model_id":"gemini-3.8-flash"})
+                );
+                let tx = conn.transaction().unwrap();
+                insert_observation_in_tx(&tx, &observation).unwrap();
+                tx.commit().unwrap();
+                let report = multiplier_report(
+                    &conn,
+                    &MultiplierReportRequest {
+                        from_ms: 0,
+                        to_ms: 200,
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    report["latest"][0]["api_nanos_by_model"][0]["rates"]["reference_model"],
+                    stored_rates["reference_model"]
+                );
+                let pace = multiplier_pace(
+                    &conn,
+                    Some(&config),
+                    &MultiplierPaceRequest {
+                        quota_provider: "codex".into(),
+                        from_ms: 0,
+                        to_ms: 100,
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    pace["hours"][0]["producers"]["opencode"]["list_nanos"],
+                    60_000_000
+                );
+
+                let ledger_plan = crate::subscription::read_reprice(&conn, "alias").unwrap();
+                let error =
+                    crate::subscription::resolve_reprice(&ledger_plan, &catalog, &[]).unwrap_err();
+                assert!(matches!(error,
+                crate::subscription::SubscriptionError::Pricing(crate::pricing::PricingError::Catalog(
+                    CatalogClientError::Call(error))) if error.code == "no_coverage"));
+                let charges: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM priced_charge", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(charges, 0);
+            }
+        }
     }
 
     #[test]
     fn reasoning_suffixes_fold_only_low_and_high_after_a_missing_exact_row() {
         let conn = conn();
-        let base = "antigravity-gemini-4-argon";
-        let flash = "antigravity-gemini-3.8-flash";
-        let gpt = "antigravity-gpt-oss-120b";
+        let base = "gemini-4-argon";
+        let flash = "gemini-3.8-flash";
+        let gpt = "gpt-oss-120b";
         let catalog = CatalogClient::new(
             std::sync::Arc::new(ReferenceCatalog {
                 rows: BTreeMap::from([
@@ -5134,6 +5279,8 @@ mod tests {
                 ]),
                 aliased: vec![],
                 empty_on_miss: BTreeSet::from([format!("{base}-high"), "missing-high".into()]),
+                current_only: BTreeSet::new(),
+                requests: std::sync::Mutex::new(Vec::new()),
             }),
             0,
         );
@@ -5503,6 +5650,7 @@ mod tests {
     fn catalog_facts_decode_to_rates_tiers_and_reasons() {
         let rate = |units: i64| json!({"state":"priced","units":units,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}});
         let snapshot = CatalogSnapshot {
+            alias_target: None,
             source: "models.dev".into(),
             resolved_at_ms: 1,
             model_key: "openai/m".into(),
@@ -5536,6 +5684,7 @@ mod tests {
             }
         );
         let empty = CatalogSnapshot {
+            alias_target: None,
             facts: BTreeMap::new(),
             withheld_facts: BTreeMap::new(),
             ..snapshot
@@ -5556,6 +5705,7 @@ mod tests {
     fn borrowed_stated_zero_is_refused_like_a_borrowed_price() {
         let origin = json!({"provider_id":"zai","family":"glm","basis":"open_weights"});
         let snapshot = CatalogSnapshot {
+            alias_target: None,
             source: "models.dev".into(),
             resolved_at_ms: 1,
             model_key: "openai/m".into(),

@@ -8,8 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use fusiform_protocol::{
-    CatalogGetRequest, CatalogGetResponse, RefusalKind, StatusRequest, StatusResponse,
+    CatalogGetRequest, CatalogGetResponse, RateValue, RefusalKind, StatusRequest, StatusResponse,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const RATE_FACT_PREFIX: &str = "rate.";
@@ -60,6 +61,13 @@ pub struct CatalogSnapshot {
     pub withheld_facts: BTreeMap<String, Value>,
     pub uncertain_facts: BTreeMap<String, Value>,
     pub overridden_facts: BTreeMap<String, Value>,
+    pub alias_target: Option<CatalogModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogModel {
+    pub provider_id: String,
+    pub model_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,11 +195,29 @@ impl CatalogClient {
                 history_start_ms: self.history_start_ms,
             });
         }
+        self.get_at(provider_id, model_id, Some(at_ms))
+    }
+
+    /// Current reads expose curated aliases that have no historical identity.
+    pub(crate) fn get_current(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<CatalogLookup, CatalogClientError> {
+        self.get_at(provider_id, model_id, None)
+    }
+
+    fn get_at(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        at_ms: Option<i64>,
+    ) -> Result<CatalogLookup, CatalogClientError> {
         let response = self
             .connection
             .catalog_get(CatalogGetRequest {
                 source: None,
-                at_ms: Some(at_ms),
+                at_ms,
                 fact_prefixes: Some(vec![RATE_FACT_PREFIX.to_string()]),
                 include_retired: true,
                 model_id: Some(model_id.to_string()),
@@ -205,7 +231,21 @@ impl CatalogClient {
         // into that same map rather than appending, so there is no duplicate key here to
         // refuse or to choose between.
         let facts = response.models.get(&model_key).cloned().unwrap_or_default();
-        validate_rate_fact_keys(&facts)?;
+        let alias_target = response
+            .aliased
+            .iter()
+            .find(|alias| alias.model == model_key)
+            .map(|alias| CatalogModel {
+                provider_id: alias.target_provider_id.clone(),
+                model_id: alias.target_model_id.clone(),
+            })
+            .or_else(|| alias_target_from_rates(&facts));
+        // Current reads discover identities, not prices. Only historical facts
+        // are decoded for valuation, so unfamiliar current rate keys cannot
+        // prevent an otherwise usable alias target from being discovered.
+        if at_ms.is_some() {
+            validate_rate_fact_keys(&facts)?;
+        }
         let withheld_facts = response
             .withheld
             .iter()
@@ -244,8 +284,30 @@ impl CatalogClient {
             withheld_facts,
             uncertain_facts,
             overridden_facts,
+            alias_target,
         }))
     }
+}
+
+fn alias_target_from_rates(facts: &BTreeMap<String, Value>) -> Option<CatalogModel> {
+    facts.iter().find_map(|(key, value)| {
+        if !key.starts_with(RATE_FACT_PREFIX) {
+            return None;
+        }
+        let origin = match serde_json::from_value::<RateValue>(value.clone()).ok()? {
+            RateValue::Priced { inherited_from, .. }
+            | RateValue::StatedZero { inherited_from }
+            | RateValue::Unpriced { inherited_from, .. } => inherited_from?,
+            RateValue::BilledAs { .. } => return None,
+        };
+        if origin.basis != "alias" {
+            return None;
+        }
+        Some(CatalogModel {
+            provider_id: origin.provider_id,
+            model_id: origin.model_id?,
+        })
+    })
 }
 
 /// The token roles the catalog prices, each at `rate.<role>`.

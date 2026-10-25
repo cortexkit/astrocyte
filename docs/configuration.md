@@ -149,11 +149,22 @@ an equivalent `opencode` rule to include that producer. Older stored config
 generations hydrate a missing `model_prefix` as `null`; new files must include it.
 
 The multiplier uses the public API rates of the model an alias points to as its
-reference list prices.
-When the exact model has no catalog row, it retries names ending in `-low` or
-`-high` without that reasoning-level suffix. It never folds `-medium`, and
-unresolved models still contribute unpriced token counts. These rules apply only
-to the multiplier; ledger pricing still refuses inherited rates, including aliases.
+reference list prices. When a historical lookup misses, it first retries names
+ending in `-low` or `-high` without that reasoning-level suffix. It never folds
+`-medium`. If the lookup still misses, it makes one current read to discover an
+alias, then reads the target's rates at the original valuation instant. It does
+not use the alias's current prices for the historical lookup. Each priced alias
+line in `api_nanos_by_model` records the target's `provider_id` and `model_id` in
+`rates.reference_model`. Unresolved non-alias models still contribute unpriced
+token counts. These rules apply only to the multiplier; ledger pricing still
+refuses inherited rates, including aliases.
+
+When a day's API list value is zero and it has positive unpriced token counts,
+`multiplier` and `fee_multiplier` are `null`, not a measured zero. The report
+still discloses the unpriced tokens. The daily stage records that day as complete,
+and recompute uses the same rule. The pace operation cannot estimate quota points
+from a head whose API list value is zero, so its `per_point_nanos` and point
+estimates remain `null`.
 
 A quota provider whose scope names a source that `harness_ingest` skips
 records no multiplier day; the daily stage logs

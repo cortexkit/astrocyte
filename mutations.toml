@@ -240,7 +240,6 @@ runner = "cargo"
 package = "astrocyte-core"
 target = "--lib"
 expect_red = [
-  "multiplier::tests::alias_values_the_multiplier_while_the_ledger_refuses_the_same_rate",
   "pricing::tests::a_provider_absent_from_the_coverage_gap_list_reaches_the_catalog",
   "pricing::tests::aliased_model_rate_is_unpriced_as_inherited",
   "pricing::tests::already_priced_refuses_without_appending_or_changing_generation",
@@ -2601,22 +2600,25 @@ test_file = "crates/astrocyte-core/src/multiplier.rs"
 runner = "cargo"
 package = "astrocyte-core"
 target = "--lib"
-expect_red = ["multiplier::tests::reasoning_suffixes_fold_only_low_and_high_after_a_missing_exact_row"]
+expect_red = [
+  "multiplier::tests::reasoning_suffixes_fold_only_low_and_high_after_a_missing_exact_row",
+  "multiplier::tests::alias_values_the_multiplier_while_the_ledger_refuses_the_alias",
+]
 only = true
 timeout_s = 300
 build_timeout_s = 600
 
 [[control]]
 id = "multiplier-alias-reference-rate"
-guards = "Alias-target public API prices value the multiplier while the ledger still refuses them"
+guards = "Alias valuation uses the target's historical prices, never the alias's current prices"
 file = "crates/astrocyte-core/src/multiplier.rs"
-old = '}) if origin.basis != "alias" => unpriced("rate_inherited"),'
-new = '}) if origin.basis != "alias-disabled" => unpriced("rate_inherited"),'
+old = 'lookup = catalog.get(&target.provider_id, &target.model_id, at_ms);'
+new = 'lookup = catalog.get_current(provider, lookup_model);'
 test_file = "crates/astrocyte-core/src/multiplier.rs"
 runner = "cargo"
 package = "astrocyte-core"
 target = "--lib"
-expect_red = ["multiplier::tests::alias_values_the_multiplier_while_the_ledger_refuses_the_same_rate"]
+expect_red = ["multiplier::tests::alias_values_the_multiplier_while_the_ledger_refuses_the_alias"]
 only = true
 timeout_s = 300
 build_timeout_s = 600
@@ -2647,6 +2649,39 @@ runner = "cargo"
 package = "astrocyte-core"
 target = "--lib"
 expect_red = ["multiplier::tests::reasoning_suffixes_fold_only_low_and_high_after_a_missing_exact_row"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "multiplier-alias-current-discovery"
+guards = "A missing historical alias is discovered with one current read before target valuation"
+file = "crates/astrocyte-core/src/multiplier.rs"
+old = 'if lookup_missing(&lookup) {'
+new = 'if false && lookup_missing(&lookup) {'
+test_file = "crates/astrocyte-core/src/multiplier.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = [
+  "multiplier::tests::alias_values_the_multiplier_while_the_ledger_refuses_the_alias",
+  "multiplier::tests::a_non_alias_current_price_does_not_fill_missing_history",
+]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "multiplier-unpriced-zero-is-unmeasurable"
+guards = "An all-unpriced day completes with null ratios in daily recording, report and recompute"
+file = "crates/astrocyte-core/src/multiplier.rs"
+old = '(denominator > 0 && !unmeasurable).then(|| api_nanos as f64 / denominator as f64)'
+new = '(denominator > 0).then(|| api_nanos as f64 / denominator as f64)'
+test_file = "crates/astrocyte-module/src/refresher.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::multiplier_stage_tests::no_catalog_coverage_still_writes_the_row_with_unpriced_tokens"]
 only = true
 timeout_s = 300
 build_timeout_s = 600

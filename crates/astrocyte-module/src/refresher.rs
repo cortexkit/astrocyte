@@ -8558,6 +8558,59 @@ mod multiplier_stage_tests {
             unpriced,
             json!([{"reason":"no_catalog_coverage","model":"opencode/openai/m","role":"input","tokens":1000,"measurements":1}])
         );
+        let report = crate::ops::dispatch(
+            &state,
+            crate::ops::OP_MULTIPLIER_REPORT,
+            json!({"from_ms": DAY_START - 1, "to_ms": DAY_START + 1}),
+        )
+        .unwrap();
+        let head = &report["latest"][0];
+        assert!(head["subscription_nanos"].as_i64().unwrap() > 0);
+        assert!(head["fee_paid_nanos"].as_i64().unwrap() > 0);
+        assert_eq!(head["multiplier"], serde_json::Value::Null);
+        assert_eq!(head["fee_multiplier"], serde_json::Value::Null);
+        assert_eq!(head["unpriced_tokens"], unpriced);
+
+        let originals = all_rows(&state);
+        MultiplierStage::new(Some(fusiform.clone())).tick(&state, false, NOW + 60_000);
+        assert_eq!(
+            all_rows(&state),
+            originals,
+            "an unmeasurable day is complete"
+        );
+        let outcome = recompute(&state, &fusiform, DAY, None, NOW + 120_000).unwrap();
+        assert_eq!(
+            outcome["recomputed"][0]["multiplier"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            outcome["recomputed"][0]["fee_multiplier"],
+            serde_json::Value::Null
+        );
+        let corrected = crate::ops::dispatch(
+            &state,
+            crate::ops::OP_MULTIPLIER_REPORT,
+            json!({"from_ms": DAY_START - 1, "to_ms": DAY_START + 1}),
+        )
+        .unwrap();
+        assert_eq!(corrected["series"].as_array().unwrap().len(), 1);
+        assert_eq!(corrected["series"][0]["api_nanos"], 0);
+        assert_eq!(
+            corrected["series"][0]["multiplier"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            corrected["series"][0]["fee_multiplier"],
+            serde_json::Value::Null
+        );
+        assert_eq!(corrected["series"][0]["unpriced_tokens"], unpriced);
+        let pace = crate::ops::dispatch(
+            &state,
+            crate::ops::OP_MULTIPLIER_PACE,
+            json!({"quota_provider":"codex", "from_ms":DAY_START - DAY_MS, "to_ms":DAY_START}),
+        )
+        .unwrap();
+        assert_eq!(pace["per_point_nanos"], serde_json::Value::Null);
     }
 
     fn recompute(
