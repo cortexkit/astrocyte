@@ -2125,7 +2125,10 @@ test_file = "crates/astrocyte-module/src/step_feed.rs"
 runner = "cargo"
 package = "astrocyte-module"
 target = "--lib"
-expect_red = ["step_feed::tests::a_verdict_changed_by_a_late_earlier_step_is_sent_again"]
+expect_red = [
+  "step_feed::tests::a_verdict_changed_by_a_late_earlier_step_is_sent_again",
+  "step_feed::tests::filtered_reads_page_only_the_sessions_latest_rows",
+]
 expect_message = "was not sent again"
 only = true
 timeout_s = 600
@@ -2174,9 +2177,12 @@ new = """
 test_file = "crates/astrocyte-module/src/main.rs"
 runner = "cargo"
 package = "astrocyte-module"
-target = "--bin ck-astrocyte"
-expect_red = ["tests::the_feed_is_refused_to_simulators_computers_and_other_modules"]
-expect_message = "a feed call was served to"
+target = "--lib --bin ck-astrocyte"
+expect_red = [
+  "tests::the_feed_is_refused_to_simulators_computers_and_other_modules",
+  "step_feed::tests::only_local_apps_and_callosum_phones_may_read_the_feed",
+]
+expect_message = "/may_read_feed|a feed call was served to/"
 only = true
 timeout_s = 600
 build_timeout_s = 900

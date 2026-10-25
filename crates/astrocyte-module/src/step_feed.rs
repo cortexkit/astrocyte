@@ -496,6 +496,14 @@ mod tests {
     use super::*;
     use crate::state::{leased_test_state, now_ms, test_state};
     use crate::test_support::HANG_GUARD;
+    use cortexkit_usage_steps::{ReadReply, ReadRequest, SubscribeRequest};
+
+    // Use the pinned package's bytes without depending on a machine's Cargo cache.
+    macro_rules! wire_vector {
+        ($path:literal) => {
+            include_bytes!(concat!("../test-vectors/usage-steps-0.2.1/", $path))
+        };
+    }
 
     /// A sink that hands each notice to the test, waits for a permit before
     /// sending one, and never ends on its own.
@@ -529,6 +537,96 @@ mod tests {
             Ok(page) => json!(page),
             Err(refusal) => panic!("read refused {}: {}", refusal.code, refusal.message),
         }
+    }
+
+    fn wire_params(request: &impl serde::Serialize) -> Value {
+        let bytes = serde_json::to_vec(request).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn check_wire_reply(body: &[u8]) {
+        #[derive(Deserialize)]
+        struct Reply {
+            result: ReadReply,
+        }
+        let reply: Reply = serde_json::from_slice(body).unwrap();
+        for row in &reply.result.rows {
+            row.check_counts().unwrap();
+        }
+    }
+
+    fn read_wire_page(state: &SharedState, request: ReadRequest) -> Value {
+        read_wire_bytes(state, &serde_json::to_vec(&request).unwrap())
+    }
+
+    fn read_wire_bytes(state: &SharedState, bytes: &[u8]) -> Value {
+        let request: ReadRequest = serde_json::from_slice(bytes).unwrap();
+        request.check_pairing().unwrap();
+        let outcome = read_outcome(state, serde_json::from_slice(bytes).unwrap());
+        let HandlerOutcome::Response(body) = outcome else {
+            panic!("shared read request was refused: {outcome:?}");
+        };
+        check_wire_reply(&body);
+        let reply: Value = serde_json::from_slice(&body).unwrap();
+        reply["result"].clone()
+    }
+
+    fn replay_shared_read_vectors() {
+        let state = test_state();
+        state
+            .with_conn(|conn| {
+                for (cursor, bytes) in [
+                    (109, wire_vector!("read/row-every-member.json").as_slice()),
+                    (110, wire_vector!("read/row-required-only.json").as_slice()),
+                ] {
+                    let mut row: Value = serde_json::from_slice(bytes).unwrap();
+                    row.as_object_mut().unwrap().remove("cursor");
+                    conn.execute(
+                        "INSERT INTO step_feed(feed_cursor,harness,step_ref,source,session,committed_at_ms,row_json)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        rusqlite::params![
+                            cursor,
+                            row["harness"].as_str().unwrap(),
+                            row["step_ref"].as_str().unwrap(),
+                            row["source"].as_str().unwrap(),
+                            row["session"].as_str().unwrap(),
+                            now_ms(),
+                            row.to_string(),
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut expected: Value =
+            serde_json::from_slice(wire_vector!("read/reply-last-page.json")).unwrap();
+        // Cursors are opaque: these seeded rows use the provider's spelling,
+        // not the zero-padded spelling used by the client's examples.
+        expected["rows"][0]["cursor"] = json!("c109");
+        expected["rows"][1]["cursor"] = json!("c110");
+        expected["through"] = json!("c110");
+        for bytes in [
+            wire_vector!("read/request-from-oldest.json").as_slice(),
+            wire_vector!("read/request-after.json").as_slice(),
+            wire_vector!("tolerant/read-request-null-members.json").as_slice(),
+        ] {
+            assert_eq!(read_wire_bytes(&state, bytes), expected);
+        }
+        let mut empty: Value =
+            serde_json::from_slice(wire_vector!("read/reply-session-empty.json")).unwrap();
+        empty["through"] = json!("c110");
+        assert_eq!(
+            read_wire_bytes(&state, wire_vector!("read/request-session.json")),
+            empty
+        );
+        let selected = read_wire_page(
+            &state,
+            ReadRequest::new().for_session("example-runner", "ses_ex_f"),
+        );
+        assert_eq!(selected["rows"], json!([expected["rows"][0]]));
+        assert_eq!(selected["next"], Value::Null);
+        assert_eq!(selected["through"], "c110");
     }
 
     fn feed_rows(state: &SharedState) -> i64 {
@@ -619,9 +717,12 @@ mod tests {
         let state = test_state();
         let step = TestStep::now("s", "s:1");
         record_steps_for_test(&state, "pi", &[step], false).unwrap();
-        let HandlerOutcome::Response(body) = read_outcome(&state, json!({})) else {
+        let request = ReadRequest::new();
+        request.check_pairing().unwrap();
+        let HandlerOutcome::Response(body) = read_outcome(&state, wire_params(&request)) else {
             panic!("unfiltered read did not return a response");
         };
+        check_wire_reply(&body);
         let body = String::from_utf8(body).unwrap();
         let time = format!("\"occurred_at_ms\":{}", step.occurred_at_ms);
         assert_eq!(body.matches(&time).count(), 1);
@@ -650,20 +751,23 @@ mod tests {
             )
             .unwrap();
         }
-        let first = read_page(
+        let first = read_wire_page(
             &state,
-            json!({"harness": "pi", "session": "chosen", "limit": 1}),
+            ReadRequest::new().for_session("pi", "chosen").with_limit(1),
         );
-        assert_eq!(first["through"], "c6");
+        assert_eq!(first["through"], "c6", "a changed step was not sent again");
         assert_eq!(
             first["next"], "c4",
             "filtered pagination counted an unrelated row"
         );
         assert_eq!(first["rows"].as_array().unwrap().len(), 1);
         assert_eq!(first["rows"][0]["step_ref"], "earlier");
-        let last = read_page(
+        let last = read_wire_page(
             &state,
-            json!({"harness": "pi", "session": "chosen", "limit": 1, "after": first["next"]}),
+            ReadRequest::new()
+                .for_session("pi", "chosen")
+                .with_limit(1)
+                .after(first["next"].as_str().unwrap()),
         );
         assert_eq!(last["through"], "c6");
         assert_eq!(last["next"], Value::Null);
@@ -675,14 +779,15 @@ mod tests {
             assert_eq!(page["rows"][0]["harness"], "pi");
             assert_eq!(page["rows"][0]["session"], "chosen");
         }
-        for params in [
-            json!({"harness": "pi", "session": "chosen", "after": "c6"}),
-            json!({"harness": "PI", "session": "chosen"}),
-            json!({"harness": "pi", "session": "Chosen"}),
+        for request in [
+            ReadRequest::new().for_session("pi", "chosen").after("c6"),
+            ReadRequest::new().for_session("PI", "chosen"),
+            ReadRequest::new().for_session("pi", "Chosen"),
         ] {
-            let empty = read_page(&state, params);
+            let empty = read_wire_page(&state, request);
             assert_eq!(empty, json!({"rows": [], "next": null, "through": "c6"}));
         }
+        replay_shared_read_vectors();
     }
 
     #[tokio::test]
@@ -703,12 +808,34 @@ mod tests {
             (json!({"harness": null, "session": "s"}), "invalid_request"),
             (json!({"unknown": "s"}), "malformed"),
             (json!({"harness": 1, "session": "s"}), "malformed"),
+            (
+                serde_json::from_slice(wire_vector!("rejected/read-request-harness-alone.json"))
+                    .unwrap(),
+                "invalid_request",
+            ),
+            (
+                serde_json::from_slice(wire_vector!(
+                    "rejected/subscribe-request-session-alone.json"
+                ))
+                .unwrap(),
+                "invalid_request",
+            ),
         ] {
-            let refused = read(&state, params.clone()).err().unwrap();
+            let (read_params, subscribe_params) = if expected == "invalid_request" {
+                let read: ReadRequest = serde_json::from_value(params.clone()).unwrap();
+                let subscription: SubscribeRequest = serde_json::from_value(params).unwrap();
+                assert!(read.check_pairing().is_err());
+                assert!(subscription.check_pairing().is_err());
+                assert!(cortexkit_usage_steps::codes::SUBSCRIBE_REFUSALS.contains(&expected));
+                (wire_params(&read), wire_params(&subscription))
+            } else {
+                (params.clone(), params)
+            };
+            let refused = read(&state, read_params).err().unwrap();
             assert_eq!(refused.code, expected);
             let outcome = tokio::time::timeout(
                 HANG_GUARD,
-                subscribe(&state, params, &sink, stopping.clone()),
+                subscribe(&state, subscribe_params, &sink, stopping.clone()),
             )
             .await
             .expect("an invalid filter opened a subscription instead of being refused");
@@ -825,11 +952,30 @@ mod tests {
         let (stop, stopping) = watch::channel(false);
         let (filtered_tx, mut filtered) = mpsc::unbounded_channel();
         let (all_tx, mut all) = mpsc::unbounded_channel();
+        let (vector_tx, mut vector_filtered) = mpsc::unbounded_channel();
+        let (vector_all_tx, mut vector_all) = mpsc::unbounded_channel();
         let mut serving = Vec::new();
-        for (params, sender) in [
-            (json!({"harness": "pi", "session": "chosen"}), filtered_tx),
-            (json!({}), all_tx),
+        for (bytes, sender) in [
+            (
+                serde_json::to_vec(&SubscribeRequest::new().for_session("pi", "chosen")).unwrap(),
+                filtered_tx,
+            ),
+            (
+                serde_json::to_vec(&SubscribeRequest::new()).unwrap(),
+                all_tx,
+            ),
+            (
+                wire_vector!("subscribe/request-session.json").to_vec(),
+                vector_tx,
+            ),
+            (
+                wire_vector!("subscribe/request.json").to_vec(),
+                vector_all_tx,
+            ),
         ] {
+            let request: SubscribeRequest = serde_json::from_slice(&bytes).unwrap();
+            request.check_pairing().unwrap();
+            let params = serde_json::from_slice(&bytes).unwrap();
             let state = state.clone();
             let stopping = stopping.clone();
             serving.push(tokio::spawn(async move {
@@ -837,7 +983,7 @@ mod tests {
             }));
         }
         tokio::time::timeout(HANG_GUARD, async {
-            while state.step_feed().lock().subscribers.len() != 2 {
+            while state.step_feed().lock().subscribers.len() != 4 {
                 tokio::task::yield_now().await;
             }
         })
@@ -852,25 +998,45 @@ mod tests {
             // Publication is synchronous; an unrelated append must not even
             // occupy a filtered queue slot or cause that subscriber to lag.
             let hub = state.step_feed().lock();
-            let subscriber = hub.subscribers.iter().find(|s| s.filter.is_some()).unwrap();
-            assert_eq!(
-                subscriber.queue.capacity(),
-                SUBSCRIBER_QUEUE,
-                "an unrelated append occupied the filtered queue"
-            );
+            for subscriber in hub.subscribers.iter().filter(|s| s.filter.is_some()) {
+                assert_eq!(
+                    subscriber.queue.capacity(),
+                    SUBSCRIBER_QUEUE,
+                    "an unrelated append occupied the filtered queue"
+                );
+            }
         }
         let unfiltered = tokio::time::timeout(HANG_GUARD, all.recv())
             .await
             .expect("unfiltered subscription was not notified")
             .unwrap();
         assert_eq!(unfiltered, br#"{"through":"c2"}"#);
+        let unfiltered_vector = tokio::time::timeout(HANG_GUARD, vector_all.recv())
+            .await
+            .expect("unfiltered vector subscription was not notified")
+            .unwrap();
+        assert_eq!(unfiltered_vector, br#"{"through":"c2"}"#);
         assert!(filtered.try_recv().is_err());
+        assert!(vector_filtered.try_recv().is_err());
         record_steps_for_test(&state, "pi", &[TestStep::now("chosen", "own")], false).unwrap();
         let own = tokio::time::timeout(HANG_GUARD, filtered.recv())
             .await
             .expect("filtered subscription was not notified")
             .unwrap();
         assert_eq!(own, br#"{"through":"c3"}"#);
+        assert!(vector_filtered.try_recv().is_err());
+        record_steps_for_test(
+            &state,
+            "opencode",
+            &[TestStep::now("ses_demo01", "vector-own")],
+            false,
+        )
+        .unwrap();
+        let vector_notice = tokio::time::timeout(HANG_GUARD, vector_filtered.recv())
+            .await
+            .expect("filtered vector subscription was not notified")
+            .unwrap();
+        assert_eq!(vector_notice, br#"{"through":"c4"}"#);
         stop.send(true).unwrap();
         for task in serving {
             let outcome = tokio::time::timeout(HANG_GUARD, task)

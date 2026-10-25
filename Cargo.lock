@@ -387,9 +387,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-usage-steps"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3aad9a36bcb764ff58b993bb93117d07254f56a1e11452c85da4223c33e5849"
+checksum = "af10d723b92f92221ce2e81d40e34a927b92775ed6fe97ccf63eb52ebc5deaf1"
 dependencies = [
  "serde",
  "serde_json",
