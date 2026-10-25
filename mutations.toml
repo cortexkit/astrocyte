@@ -269,6 +269,7 @@ expect_red = [
   "pricing::tests::inclusive_broca_output_is_priced_without_its_reasoning",
   "pricing::tests::inclusive_source_xai_output_is_priced_as_stored",
   "pricing::tests::inherited_rate_is_unpriced_not_charged",
+  "pricing::tests::input_audio_catalog_rate_preserves_token_charges_and_prices_audio",
   "pricing::tests::mixed_reprice_preserves_priced_head_and_supersedes_only_unpriced_head",
   "pricing::tests::own_stated_zero_still_requires_policy",
   "pricing::tests::pre_history_event_records_catalog_pre_history_without_network_io",
