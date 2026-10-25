@@ -30,7 +30,7 @@ subc-protocol = "=0.33.0"
 subc-transport = "=0.14.0"
 subc-control = "=0.33.0"
 subc-os = "=0.1.19"
-subc-client-rs = "=0.32.3"
+subc-client-rs = "=0.32.4"
 subc-jsonc = "=0.1.2"
 
 cortexkit-log = "=0.3.5"
