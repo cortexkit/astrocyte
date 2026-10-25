@@ -127,16 +127,33 @@ A quota provider declaration has three required members:
 
 - `window`: `{"pool_key": <non-empty>, "window_minutes": 1..43200}`, the one
   quota window the used percentage is read from.
-- `scope`: a non-empty array of `{"producer", "provider", "charge_basis"}`
+- `scope`: a non-empty array of `{"producer", "provider", "charge_basis", "model_prefix"}`
   rules naming the traffic that counts against this quota. `charge_basis` is
   required and is `null` (every basis) or one of `metered_api`,
-  `subscription_included`, `unknown`. A rule may not repeat.
+  `subscription_included`, `unknown`. `model_prefix` is also required and is
+  `null` (every model) or a non-empty, literal, case-sensitive model prefix.
+  A rule may not repeat; rules differing only by prefix are distinct.
 - `accounts`: a non-empty map of account reference to `{"plan": "<provider>/<tier>",
   "price_override": <price or null>}`.
 
 A price is `{"minor_units": >0, "exponent": 0..9, "currency": "USD",
 "period": "month"}`; `20000` at exponent `2` is 200.00. An account's
 `price_override` wins over `plan_price_overrides`, which wins over fusiform.
+
+For Antigravity's Gemini weekly pool, use quota provider `antigravity` with
+`"window": {"pool_key": "extra:13:gemini-weekly", "window_minutes": 10080}`.
+A scope rule such as `{"producer": "broca", "provider": "google",
+"charge_basis": null, "model_prefix": "antigravity-gemini-"}` excludes the
+Claude and gpt-oss traffic in Antigravity's separate third-party pool. Declare
+an equivalent `opencode` rule to include that producer. Older stored config
+generations hydrate a missing `model_prefix` as `null`; new files must include it.
+
+The multiplier uses the public API rates of the model an alias points to as its
+reference list prices.
+When the exact model has no catalog row, it retries names ending in `-low` or
+`-high` without that reasoning-level suffix. It never folds `-medium`, and
+unresolved models still contribute unpriced token counts. These rules apply only
+to the multiplier; ledger pricing still refuses inherited rates, including aliases.
 
 A quota provider whose scope names a source that `harness_ingest` skips
 records no multiplier day; the daily stage logs

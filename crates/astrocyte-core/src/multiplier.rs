@@ -138,6 +138,9 @@ pub struct ScopeRule {
     /// `null` counts every charge basis; a value counts only that basis.
     #[serde(deserialize_with = "required_nullable")]
     pub charge_basis: Option<String>,
+    /// `null` counts every model; a value selects a literal, case-sensitive prefix.
+    #[serde(deserialize_with = "required_nullable")]
+    pub model_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +242,11 @@ impl MultiplierConfig {
                 if rule.producer.is_empty() || rule.provider.is_empty() {
                     return Err(format!("{at}: a scope rule needs producer and provider"));
                 }
+                if rule.model_prefix.as_deref().is_some_and(str::is_empty) {
+                    return Err(format!(
+                        "{at}: scope model_prefix must be non-empty or null"
+                    ));
+                }
                 if let Some(basis) = &rule.charge_basis {
                     if ChargeBasis::parse(basis).is_none() {
                         return Err(format!(
@@ -247,7 +255,12 @@ impl MultiplierConfig {
                         ));
                     }
                 }
-                if !rules.insert((&rule.producer, &rule.provider, &rule.charge_basis)) {
+                if !rules.insert((
+                    &rule.producer,
+                    &rule.provider,
+                    &rule.charge_basis,
+                    &rule.model_prefix,
+                )) {
                     return Err(format!(
                         "{at}: scope rule {}/{} is listed twice",
                         rule.producer, rule.provider
@@ -682,13 +695,17 @@ fn scope_predicate(rules: &[ScopeRule]) -> (String, Vec<SqlValue>) {
     for rule in rules {
         values.push(SqlValue::Text(rule.producer.clone()));
         values.push(SqlValue::Text(rule.provider.clone()));
-        match &rule.charge_basis {
-            Some(basis) => {
-                clauses.push("(e.producer = ? AND e.provider = ? AND e.charge_basis = ?)");
-                values.push(SqlValue::Text(basis.clone()));
-            }
-            None => clauses.push("(e.producer = ? AND e.provider = ?)"),
+        let mut clause = "(e.producer = ? AND e.provider = ?".to_string();
+        if let Some(basis) = &rule.charge_basis {
+            clause.push_str(" AND e.charge_basis = ?");
+            values.push(SqlValue::Text(basis.clone()));
         }
+        if let Some(prefix) = &rule.model_prefix {
+            clause.push_str(" AND instr(e.model, ?) = 1");
+            values.push(SqlValue::Text(prefix.clone()));
+        }
+        clause.push(')');
+        clauses.push(clause);
     }
     (format!("({})", clauses.join(" OR ")), values)
 }
@@ -880,7 +897,32 @@ pub fn resolve_rates(
         models: BTreeMap::new(),
     };
     for (provider, model) in models {
-        let resolution = match catalog.get(provider, model, at_ms) {
+        // Reasoning levels on the wire are not catalog identities. Prefer an
+        // exact row, and only retry a missing row for the two supported levels.
+        let lookup = catalog.get(provider, model, at_ms);
+        // Missing selections may be empty responses or coverage refusals.
+        let missing = match &lookup {
+            Ok(CatalogLookup::Resolved(snapshot)) => {
+                snapshot.facts.is_empty()
+                    && snapshot.withheld_facts.is_empty()
+                    && snapshot.uncertain_facts.is_empty()
+                    && snapshot.overridden_facts.is_empty()
+            }
+            Err(CatalogClientError::Call(error)) => {
+                RefusalKind::of(&error.code) == RefusalKind::OutsideCoverage
+            }
+            _ => false,
+        };
+        let lookup = match (
+            missing,
+            model
+                .strip_suffix("-low")
+                .or_else(|| model.strip_suffix("-high")),
+        ) {
+            (true, Some(base)) => catalog.get(provider, base, at_ms),
+            _ => lookup,
+        };
+        let resolution = match lookup {
             Ok(CatalogLookup::Resolved(snapshot)) => match rates_from_snapshot(&snapshot) {
                 ModelResolution::Unpriceable { reason } if reason == RATE_FACT_UNRECOGNIZED => {
                     return Err(MultiplierError::RateFactUnrecognized(format!(
@@ -994,10 +1036,13 @@ fn rate_state(snapshot: &CatalogSnapshot, key: &str) -> RateState {
         // Billing-plane claims are not API reference rates. This consumer
         // makes ordinary catalog reads and does not resolve plane rules.
         Ok(RateValue::BilledAs { .. }) => unpriced(RATE_UNDECODABLE),
+        // An alias points at the public API card used for list-value
+        // comparison, not the route's billed cost. Other inheritance is still
+        // not a public reference price for this model.
         Ok(RateValue::Priced {
-            inherited_from: Some(_),
+            inherited_from: Some(origin),
             ..
-        }) => unpriced("rate_inherited"),
+        }) if origin.basis != "alias" => unpriced("rate_inherited"),
         Ok(RateValue::Priced { amount, .. }) if amount.exponent != NANO_EXPONENT => {
             unpriced("rate_exponent_unsupported")
         }
@@ -2573,6 +2618,7 @@ mod tests {
             producer: producer.into(),
             provider: provider.into(),
             charge_basis: charge_basis.map(str::to_string),
+            model_prefix: None,
         }
     }
 
@@ -2801,6 +2847,69 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn model_prefix_excludes_third_party_tokens_and_null_keeps_them() {
+        let conn = conn();
+        reading(&conn, "acct", 10, 0.0, None);
+        reading(&conn, "acct", 90, 50.0, None);
+        let gemini = "antigravity-gemini-3.8-flash";
+        let claude = "antigravity-claude-sonnet-5-5";
+        let uppercase = "ANTIGRAVITY-GEMINI-3.8-FLASH";
+        for (id, model, at, tokens) in [
+            ("gemini", gemini, 20, 1_000),
+            ("claude", claude, 20, 2_000),
+            ("uppercase", uppercase, 20, 4_000),
+            ("gemini-before", gemini, 5, 100),
+            ("claude-before", claude, 5, 200),
+        ] {
+            event(
+                &conn,
+                id,
+                "opencode",
+                "google",
+                model,
+                "unknown",
+                at,
+                &[("input", "usage.input", tokens)],
+            );
+        }
+        let rates = rates_for(
+            &[
+                ("google", gemini),
+                ("google", claude),
+                ("google", uppercase),
+            ],
+            TEN_PER_M,
+            None,
+        );
+        let mut config = config(vec![rule("opencode", "google", None)]);
+        let all = observe(&conn, &config, 0, 100, &rates);
+        assert_eq!(all.tokens.input, 7_000);
+        assert_eq!(all.api_nanos, 70_000_000);
+        assert_eq!(all.tokens_outside_quota_coverage, 300);
+        config.quota_providers.get_mut("codex").unwrap().scope[0].model_prefix =
+            Some("antigravity-gemini-".into());
+        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
+        assert_eq!(
+            catalog_models(&config, &plan),
+            BTreeSet::from([("google".into(), gemini.into())])
+        );
+        let filtered = observe(&conn, &config, 0, 100, &rates);
+        assert_eq!(filtered.tokens.input, 1_000);
+        assert_eq!(filtered.api_nanos, 10_000_000);
+        assert_eq!(filtered.tokens_outside_quota_coverage, 100);
+        assert_eq!(filtered.api_nanos_by_model.len(), 1);
+        assert_eq!(
+            filtered.api_nanos_by_model[0].model.as_deref(),
+            Some(gemini)
+        );
+        config.quota_providers.get_mut("codex").unwrap().scope[0].model_prefix =
+            Some("antigravity-gemini-%".into());
+        let literal = observe(&conn, &config, 0, 100, &rates);
+        assert_eq!(literal.tokens.input, 0);
+        assert_eq!(literal.api_nanos, 0);
     }
 
     #[test]
@@ -4883,6 +4992,195 @@ mod tests {
         );
     }
 
+    struct ReferenceCatalog {
+        rows: BTreeMap<String, Value>,
+        aliased: Vec<fusiform_protocol::AliasedModelWire>,
+        empty_on_miss: BTreeSet<String>,
+    }
+
+    impl crate::catalog_client::CatalogConnection for ReferenceCatalog {
+        fn catalog_status(
+            &self,
+            _: fusiform_protocol::StatusRequest,
+        ) -> Result<fusiform_protocol::StatusResponse, CatalogCallError> {
+            Ok(
+                serde_json::from_value(json!({"source": "fake", "catalog_version": 0,
+                "model_count": 0, "era_count": 0, "recent_polls": []}))
+                .unwrap(),
+            )
+        }
+
+        fn catalog_get(
+            &self,
+            request: fusiform_protocol::CatalogGetRequest,
+        ) -> Result<fusiform_protocol::CatalogGetResponse, CatalogCallError> {
+            let model = request.model_id.unwrap();
+            let models = if let Some(rate) = self.rows.get(&model) {
+                BTreeMap::from([(
+                    format!("google/{model}"),
+                    BTreeMap::from([("rate.input".into(), rate.clone())]),
+                )])
+            } else if self.empty_on_miss.contains(&model) {
+                BTreeMap::new()
+            } else {
+                return Err(CatalogCallError {
+                    code: "no_coverage".into(),
+                    message: "no such model".into(),
+                });
+            };
+            Ok(fusiform_protocol::CatalogGetResponse {
+                source: "models.dev".into(),
+                resolved_at_ms: 100,
+                catalog_version: 1,
+                models,
+                withheld: vec![],
+                uncertain: vec![],
+                overridden: vec![],
+                retired: vec![],
+                aliased: self.aliased.clone(),
+                plane: None,
+                billing_rules: vec![],
+            })
+        }
+    }
+
+    fn reference_rate(units: i64) -> Value {
+        json!({"state":"priced","units":units,"exponent":9,"currency":"USD",
+            "unit_provenance":{"kind":"stated"}})
+    }
+
+    #[test]
+    fn alias_values_the_multiplier_while_the_ledger_refuses_the_same_rate() {
+        let mut conn = conn();
+        let model = "antigravity-gemini-3.8-flash";
+        let mut rate = reference_rate(TEN_PER_M);
+        rate["inherited_from"] = json!({"basis":"alias","provider_id":"google",
+            "family":"gemini","model_id":"gemini-3.8-flash"});
+        let catalog = CatalogClient::new(
+            std::sync::Arc::new(ReferenceCatalog {
+                rows: BTreeMap::from([(model.into(), rate)]),
+                empty_on_miss: BTreeSet::new(),
+                aliased: vec![fusiform_protocol::AliasedModelWire {
+                    model: format!("google/{model}"),
+                    target_provider_id: "google".into(),
+                    target_model_id: "gemini-3.8-flash".into(),
+                    source_ref: "plugin/models.ts@abc123".into(),
+                }],
+            }),
+            0,
+        );
+        let config = config(vec![rule("opencode", "google", None)]);
+        reading(&conn, "acct", 10, 0.0, None);
+        reading(&conn, "acct", 90, 50.0, None);
+        event(
+            &conn,
+            "alias",
+            "opencode",
+            "google",
+            model,
+            "metered_api",
+            20,
+            &[("input", "usage.input", 1_000)],
+        );
+        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
+        let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
+        let observation = observe(&conn, &config, 0, 100, &rates);
+        assert_eq!(observation.tokens.input, 1_000);
+        assert_eq!(observation.api_nanos, 10_000_000);
+        assert!(observation.unpriced_tokens.is_empty());
+
+        let ledger_plan = crate::subscription::read_reprice(&conn, "alias").unwrap();
+        let ledger_rates =
+            crate::subscription::resolve_reprice(&ledger_plan, &catalog, &[]).unwrap();
+        let tx = conn.transaction().unwrap();
+        crate::subscription::commit_reprice_in_tx(
+            &tx,
+            &ledger_plan,
+            &ledger_rates,
+            100,
+            crate::pricing::PricingOrigin::PricingPass,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let (outcome, reason, charge, entry): (String, String, Option<i64>, String) = conn
+            .query_row(
+                "SELECT outcome,unpriced_reason,charge_nanos,catalog_entry FROM priced_charge",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(outcome, "unpriced");
+        assert_eq!(reason, "rate_inherited");
+        assert_eq!(charge, None);
+        assert_eq!(
+            serde_json::from_str::<Value>(&entry).unwrap()["inherited_from"]["basis"],
+            "alias"
+        );
+    }
+
+    #[test]
+    fn reasoning_suffixes_fold_only_low_and_high_after_a_missing_exact_row() {
+        let conn = conn();
+        let base = "antigravity-gemini-4-argon";
+        let flash = "antigravity-gemini-3.8-flash";
+        let gpt = "antigravity-gpt-oss-120b";
+        let catalog = CatalogClient::new(
+            std::sync::Arc::new(ReferenceCatalog {
+                rows: BTreeMap::from([
+                    (base.into(), reference_rate(TEN_PER_M)),
+                    (format!("{base}-low"), reference_rate(2 * TEN_PER_M)),
+                    (flash.into(), reference_rate(3 * TEN_PER_M)),
+                    (gpt.into(), reference_rate(4 * TEN_PER_M)),
+                ]),
+                aliased: vec![],
+                empty_on_miss: BTreeSet::from([format!("{base}-high"), "missing-high".into()]),
+            }),
+            0,
+        );
+        let config = config(vec![rule("broca", "google", None)]);
+        reading(&conn, "acct", 10, 0.0, None);
+        reading(&conn, "acct", 90, 50.0, None);
+        for model in [
+            format!("{base}-high"),
+            format!("{base}-low"),
+            format!("{flash}-low"),
+            format!("{gpt}-medium"),
+            "missing-high".into(),
+        ] {
+            event(
+                &conn,
+                &model,
+                "broca",
+                "google",
+                &model,
+                "unknown",
+                20,
+                &[("input", "usage.input", 1_000)],
+            );
+        }
+        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
+        let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
+        let observation = observe(&conn, &config, 0, 100, &rates);
+        assert_eq!(observation.tokens.input, 5_000);
+        assert_eq!(observation.api_nanos, 60_000_000);
+        assert_eq!(observation.unpriced_tokens.len(), 2);
+        for unpriced in &observation.unpriced_tokens {
+            assert_eq!(unpriced.reason, "no_catalog_coverage");
+            assert_eq!(unpriced.tokens, 1_000);
+        }
+        assert!(
+            matches!(&rates.models[&("google".into(), format!("{gpt}-medium"))],
+            ModelResolution::Unpriceable { reason } if reason == "no_catalog_coverage")
+        );
+        assert!(observation
+            .api_nanos_by_model
+            .iter()
+            .any(
+                |line| line.model.as_deref() == Some(&format!("{base}-high"))
+                    && line.api_nanos == 10_000_000
+            ));
+    }
+
     /// A correction supersedes its day's head: the report then serves the
     /// correction in that day's slot, never the original, and a correction
     /// taken after later days does not become "latest" over them. A day with
@@ -5115,9 +5413,9 @@ mod tests {
             "quota_providers": {"codex": {
                 "window": {"pool_key": "primary", "window_minutes": 10080},
                 "scope": [
-                    {"producer": "pi", "provider": "openai-codex", "charge_basis": null},
-                    {"producer": "opencode", "provider": "openai", "charge_basis": null},
-                    {"producer": "broca", "provider": "openai", "charge_basis": "subscription_included"}
+                    {"producer": "pi", "provider": "openai-codex", "charge_basis": null, "model_prefix": null},
+                    {"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null},
+                    {"producer": "broca", "provider": "openai", "charge_basis": "subscription_included", "model_prefix": null}
                 ],
                 "accounts": {
                     "00000000-0000-4000-8000-00000000000a": {"plan": "openai/pro_20x", "price_override": null},

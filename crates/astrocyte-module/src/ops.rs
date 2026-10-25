@@ -1985,7 +1985,7 @@ mod tests {
         let config: multiplier::MultiplierConfig = serde_json::from_value(json!({
             "api_twins": {}, "plan_price_overrides": {},
             "quota_providers": {"claude": {"window": {"pool_key": "primary", "window_minutes": 300},
-                "scope": [{"producer": "opencode", "provider": "anthropic", "charge_basis": null}], "accounts": {}}}
+                "scope": [{"producer": "opencode", "provider": "anthropic", "charge_basis": null, "model_prefix": null}], "accounts": {}}}
         })).unwrap();
         desired.subscription_multiplier =
             crate::config::MultiplierSetting::Recorded(config.clone());

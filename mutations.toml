@@ -240,6 +240,7 @@ runner = "cargo"
 package = "astrocyte-core"
 target = "--lib"
 expect_red = [
+  "multiplier::tests::alias_values_the_multiplier_while_the_ledger_refuses_the_same_rate",
   "pricing::tests::a_provider_absent_from_the_coverage_gap_list_reaches_the_catalog",
   "pricing::tests::aliased_model_rate_is_unpriced_as_inherited",
   "pricing::tests::already_priced_refuses_without_appending_or_changing_generation",
@@ -2571,6 +2572,81 @@ runner = "cargo"
 package = "astrocyte-core"
 target = "--lib"
 expect_red = ["store::tests::broca_step_refuses_replace"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "multiplier-model-prefix"
+guards = "A quota pool's model prefix excludes third-party models from its tokens and list value"
+file = "crates/astrocyte-core/src/multiplier.rs"
+old = 'clause.push_str(" AND instr(e.model, ?) = 1");'
+new = 'clause.push_str(" AND (instr(e.model, ?) = 1 OR 1)");'
+test_file = "crates/astrocyte-core/src/multiplier.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["multiplier::tests::model_prefix_excludes_third_party_tokens_and_null_keeps_them"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "multiplier-reasoning-suffix"
+guards = "A missing low or high reasoning-level row uses its base model's public card"
+file = "crates/astrocyte-core/src/multiplier.rs"
+old = 'catalog.get(provider, base, at_ms)'
+new = 'catalog.get(provider, &format!("{base}-missing"), at_ms)'
+test_file = "crates/astrocyte-core/src/multiplier.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["multiplier::tests::reasoning_suffixes_fold_only_low_and_high_after_a_missing_exact_row"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "multiplier-alias-reference-rate"
+guards = "Alias-target public API prices value the multiplier while the ledger still refuses them"
+file = "crates/astrocyte-core/src/multiplier.rs"
+old = '}) if origin.basis != "alias" => unpriced("rate_inherited"),'
+new = '}) if origin.basis != "alias-disabled" => unpriced("rate_inherited"),'
+test_file = "crates/astrocyte-core/src/multiplier.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["multiplier::tests::alias_values_the_multiplier_while_the_ledger_refuses_the_same_rate"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "multiplier-model-prefix-hydration"
+guards = "Old stored generations preserve unfiltered scope rather than silently selecting a prefix"
+file = "crates/astrocyte-module/src/config.rs"
+old = '.or_insert(serde_json::Value::Null);'
+new = '.or_insert(serde_json::Value::String("wrong-prefix".into()));'
+test_file = "crates/astrocyte-module/src/refresher.rs"
+runner = "cargo"
+package = "astrocyte-module"
+target = "--lib"
+expect_red = ["refresher::multiplier_stage_tests::stored_generations_without_model_prefix_hydrate_as_null"]
+only = true
+timeout_s = 300
+build_timeout_s = 600
+
+[[control]]
+id = "multiplier-medium-is-not-a-reasoning-alias"
+guards = "An unresolved medium model stays unpriced even when a suffixless public card exists"
+file = "crates/astrocyte-core/src/multiplier.rs"
+old = 'model.strip_suffix("-high")'
+new = 'model.strip_suffix("-high").or_else(|| model.strip_suffix("-medium"))'
+test_file = "crates/astrocyte-core/src/multiplier.rs"
+runner = "cargo"
+package = "astrocyte-core"
+target = "--lib"
+expect_red = ["multiplier::tests::reasoning_suffixes_fold_only_low_and_high_after_a_missing_exact_row"]
 only = true
 timeout_s = 300
 build_timeout_s = 600

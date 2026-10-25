@@ -2274,14 +2274,30 @@ mod tests {
     fn check_config_accepts_the_closed_live_document() {
         let path =
             std::env::temp_dir().join(format!("astrocyte-check-{}.jsonc", std::process::id()));
-        std::fs::write(
-            &path,
-            br#"{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
-        )
-        .unwrap();
+        let mut document = json!({"poll_interval_secs":60,"qta_connection_file":null,
+            "fusiform_connection_file":null,"reasoning_billed_as_output":[],
+            "subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},
+                "quota_providers":{"antigravity":{
+                    "window":{"pool_key":"extra:13:gemini-weekly","window_minutes":10080},
+                    "scope":[{"producer":"broca","provider":"google","charge_basis":null,"model_prefix":null}],
+                    "accounts":{"acct":{"plan":"google/ai_pro","price_override":null}}
+                }}}, "harness_ingest":{"enabled":true,"exclude":[]}});
         let mut output = Vec::new();
+        std::fs::write(&path, document.to_string()).unwrap();
         check_config(&path, &mut output).unwrap();
         assert!(output.is_empty());
+        let scope =
+            &mut document["subscription_multiplier"]["quota_providers"]["antigravity"]["scope"][0];
+        scope["model_prefix"] = json!("antigravity-gemini-");
+        std::fs::write(&path, document.to_string()).unwrap();
+        check_config(&path, &mut output).unwrap();
+        document["subscription_multiplier"]["quota_providers"]["antigravity"]["scope"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("model_prefix");
+        std::fs::write(&path, document.to_string()).unwrap();
+        let error = check_config(&path, &mut output).unwrap_err();
+        assert!(error.to_string().contains("model_prefix"), "{error}");
         std::fs::remove_file(path).unwrap();
     }
 

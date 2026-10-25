@@ -138,14 +138,16 @@ The ckbus route shares HELLO's single nonce handoff. Daemon validation of
 The refresher drains account writes between ticks (250 ms idle wait) and joins
 the bus reader on its stop flag. Mode changes are logged, not added to health schemas.
 
-After each tick, `astrocyte-core/src/multiplier.rs` attempts missing observations
-for the seven most recent completed UTC days, oldest first; each covers seven days
-ending at 00:00Z. It waits for source reads past the boundary, or two hours, then
-discloses stale sources in `error_deflating`. Absent/skipped sources do not block.
-It reads `window_sample` and scoped models, calls fusiform `plan.prices` and
-`catalog.get` outside transactions, and appends in its own write. Failures retry
-without rows, logged once per day/reason. `rate_fact_unrecognized` fails the day;
-`no_catalog_coverage` counts unpriced tokens. Older days need operator recompute.
+After each tick, the multiplier retries missing observations for the seven latest
+completed UTC days, oldest first; each covers seven days ending at 00:00Z.
+Source reads must pass the boundary, unless absent/skipped or two hours late;
+stale sources appear in `error_deflating`. Fusiform reads precede writes.
+Failures log once per day/reason without rows.
+`rate_fact_unrecognized` fails the day; `no_catalog_coverage` counts unpriced
+tokens. Recompute older days.
+Scope rules can filter model prefixes. The multiplier uses public API rates of
+the model an alias points to, and strips `-low`/`-high` after a missing row, never
+`-medium`. Ledger pricing is unchanged.
 
 Ledger pricing and the multiplier share `parse_rate_key` in
 `astrocyte-core/src/catalog_client.rs`: `rate.<role>` or

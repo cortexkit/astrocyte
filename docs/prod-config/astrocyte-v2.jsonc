@@ -48,9 +48,9 @@
         "window": { "pool_key": "primary", "window_minutes": 10080 },
         // Example scope for OpenCode and BROCA traffic that uses the codex pool.
         "scope": [
-          { "producer": "pi", "provider": "openai-codex", "charge_basis": null },
-          { "producer": "opencode", "provider": "openai", "charge_basis": null },
-          { "producer": "broca", "provider": "openai", "charge_basis": "subscription_included" }
+          { "producer": "pi", "provider": "openai-codex", "charge_basis": null, "model_prefix": null },
+          { "producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null },
+          { "producer": "broca", "provider": "openai", "charge_basis": "subscription_included", "model_prefix": null }
         ],
         // These sample references both use the same example plan.
         "accounts": {
@@ -64,9 +64,9 @@
         "window": { "pool_key": "secondary", "window_minutes": 10080 },
         // Example scope for OpenCode, Claude Code, and BROCA traffic using the pool.
         "scope": [
-          { "producer": "opencode", "provider": "anthropic", "charge_basis": null },
-          { "producer": "claude-code", "provider": "anthropic", "charge_basis": null },
-          { "producer": "broca", "provider": "anthropic", "charge_basis": "subscription_included" }
+          { "producer": "opencode", "provider": "anthropic", "charge_basis": null, "model_prefix": null },
+          { "producer": "claude-code", "provider": "anthropic", "charge_basis": null, "model_prefix": null },
+          { "producer": "broca", "provider": "anthropic", "charge_basis": "subscription_included", "model_prefix": null }
         ],
         // These sample account references are illustrative, not real account IDs.
         "accounts": {

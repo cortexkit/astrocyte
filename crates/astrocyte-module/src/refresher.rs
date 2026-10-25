@@ -7677,7 +7677,7 @@ mod multiplier_stage_tests {
             "plan_price_overrides": {},
             "quota_providers": {"codex": {
                 "window": {"pool_key": "primary", "window_minutes": 10080},
-                "scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null}],
+                "scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null}],
                 "accounts": {"acct": {"plan": "openai/pro_20x", "price_override": null}}
             }}
         },
@@ -7778,8 +7778,8 @@ mod multiplier_stage_tests {
     fn a_scope_naming_broca_is_refused_only_when_broca_is_excluded() {
         let with_broca_scope = |document: &str| {
             document.replace(
-                r#""scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null}]"#,
-                r#""scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null}, {"producer": "broca", "provider": "openai", "charge_basis": "subscription_included"}]"#,
+                r#""scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null}]"#,
+                r#""scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null}, {"producer": "broca", "provider": "openai", "charge_basis": "subscription_included", "model_prefix": null}]"#,
             )
         };
         let directory = tempfile::tempdir().unwrap();
@@ -8263,6 +8263,55 @@ mod multiplier_stage_tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn stored_generations_without_model_prefix_hydrate_as_null() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut old: serde_json::Value = serde_json::from_str(DESIRED).unwrap();
+        old["subscription_multiplier"]["quota_providers"]["codex"]["scope"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("model_prefix");
+        {
+            let state = state::leased_test_state(&directory);
+            state.ordered_write(|tx| {
+                tx.execute("UPDATE desired_config SET generation=3,canonical_bytes=?1,subscription_multiplier=?2 WHERE id=1",
+                    rusqlite::params![old.to_string().as_bytes(), old["subscription_multiplier"].to_string()])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("UPDATE source_runtime SET desired_generation=3", []).map_err(|error| error.to_string())?;
+                Ok(((), true))
+            }).unwrap();
+        }
+        let state = Arc::new(state::leased_test_state(&directory));
+        let config::MultiplierSetting::Recorded(multiplier) =
+            state.desired_config().subscription_multiplier
+        else {
+            panic!("multiplier expected")
+        };
+        assert_eq!(
+            multiplier.quota_providers["codex"].scope[0].model_prefix,
+            None
+        );
+        assert_eq!(state.desired_generation(), 3);
+        publish_desired(&state, &directory);
+        state
+            .with_conn(|conn| {
+                let stored: String = conn
+                    .query_row(
+                        "SELECT subscription_multiplier FROM desired_config",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+                assert_eq!(
+                    stored["quota_providers"]["codex"]["scope"][0].get("model_prefix"),
+                    Some(&serde_json::Value::Null)
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// A day whose inputs cannot be read writes nothing and is retried on

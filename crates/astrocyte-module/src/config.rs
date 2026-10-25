@@ -206,8 +206,8 @@ pub(crate) fn multiplier_column(config: &AstrocyteConfig) -> Result<Option<Strin
 }
 
 /// Reads the column back. NULL is the pre-migration state, never an empty
-/// declaration; a present value goes through the same closed decode and
-/// validation as the desired document.
+/// declaration. Older stored shapes are lifted before closed decoding and
+/// validation; desired documents do not use these compatibility lifts.
 pub(crate) fn decode_multiplier_column(
     column: Option<&str>,
 ) -> Result<MultiplierSetting, ConfigError> {
@@ -220,6 +220,25 @@ pub(crate) fn decode_multiplier_column(
         .map_err(|error| ConfigError::Decode(format!("subscription_multiplier: {error}")))?;
     if let Some(object) = value.as_object_mut() {
         object.remove("reasoning_billed_as_output");
+    }
+    // Generations written before model filtering counted every model.
+    if let Some(providers) = value
+        .get_mut("quota_providers")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for provider in providers.values_mut() {
+            if let Some(scope) = provider
+                .get_mut("scope")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for rule in scope {
+                    if let Some(rule) = rule.as_object_mut() {
+                        rule.entry("model_prefix")
+                            .or_insert(serde_json::Value::Null);
+                    }
+                }
+            }
+        }
     }
     let config: MultiplierConfig = serde_json::from_value(value)
         .map_err(|error| ConfigError::Decode(format!("subscription_multiplier: {error}")))?;
@@ -447,7 +466,7 @@ mod tests {
         "plan_price_overrides": {},
         "quota_providers": {"codex": {
             "window": {"pool_key": "primary", "window_minutes": 10080},
-            "scope": [{"producer": "pi", "provider": "openai-codex", "charge_basis": null}],
+            "scope": [{"producer": "pi", "provider": "openai-codex", "charge_basis": null, "model_prefix": null}],
             "accounts": {"acct": {"plan": "openai/pro_20x", "price_override": null}}
         }}
     }"#;
@@ -600,6 +619,14 @@ mod tests {
         let missing = CODEX.replace(r#", "charge_basis": null"#, "");
         let error = decode(&with_multiplier(&missing)).unwrap_err();
         assert!(error.to_string().contains("charge_basis"), "{error}");
+        let missing = CODEX.replace(r#", "model_prefix": null"#, "");
+        let error = decode(&with_multiplier(&missing)).unwrap_err();
+        assert!(error.to_string().contains("model_prefix"), "{error}");
+        let prefixed = CODEX.replace(
+            r#""model_prefix": null"#,
+            r#""model_prefix": "antigravity-gemini-""#,
+        );
+        assert!(decode(&with_multiplier(&prefixed)).is_ok());
         let missing = CODEX.replace(r#", "price_override": null"#, "");
         let error = decode(&with_multiplier(&missing)).unwrap_err();
         assert!(error.to_string().contains("price_override"), "{error}");
@@ -625,6 +652,11 @@ mod tests {
                 "charge_basis",
             ),
             ("10080", "0", "window_minutes"),
+            (
+                r#""model_prefix": null"#,
+                r#""model_prefix": """#,
+                "model_prefix",
+            ),
             (
                 r#""price_override": null"#,
                 r#""price_override": {"minor_units": 20000, "exponent": 2, "currency": "EUR", "period": "month"}"#,
@@ -663,6 +695,24 @@ mod tests {
             decode_multiplier_column(None).unwrap(),
             MultiplierSetting::NotRecorded
         );
+    }
+
+    #[test]
+    fn scope_rules_can_differ_only_by_model_prefix() {
+        let mut value: serde_json::Value = serde_json::from_str(CODEX).unwrap();
+        let scope = value["quota_providers"]["codex"]["scope"]
+            .as_array_mut()
+            .unwrap();
+        let mut other = scope[0].clone();
+        other["model_prefix"] = serde_json::json!("antigravity-gemini-");
+        scope.push(other.clone());
+        assert!(decode(&with_multiplier(&value.to_string())).is_ok());
+        value["quota_providers"]["codex"]["scope"]
+            .as_array_mut()
+            .unwrap()
+            .push(other);
+        let error = decode(&with_multiplier(&value.to_string())).unwrap_err();
+        assert!(error.to_string().contains("listed twice"), "{error}");
     }
 
     #[test]
