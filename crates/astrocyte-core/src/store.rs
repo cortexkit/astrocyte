@@ -3909,7 +3909,7 @@ mod tests {
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (31, 31, 31)
+            (32, 32, 32)
         );
         assert_eq!(
             store
@@ -3922,7 +3922,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 31, 31)
+            (0, 32, 32)
         );
         assert!(!second.store_ahead());
         store
@@ -3932,7 +3932,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',32,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',33,1)",
                     [],
                 )?;
                 Ok(())
@@ -3941,7 +3941,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 32, 31)
+            (0, 33, 32)
         );
         assert!(ahead.store_ahead());
     }
@@ -4130,8 +4130,14 @@ mod tests {
             INSERT INTO step_feed VALUES (1,'broca','step','runner','session',1,'{}');").unwrap();
         insert_multiplier_row(&conn, "provider", "2026-01-02", Some(None)).unwrap();
         let before = all_rows(&conn);
-        conn.execute_batch(MIGRATIONS.last().unwrap().statements)
-            .unwrap();
+        conn.execute_batch(
+            MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == 31)
+                .unwrap()
+                .statements,
+        )
+        .unwrap();
         assert_eq!(all_rows(&conn), before, "migration must not rewrite rows");
         // An external writer may leave foreign_keys and recursive_triggers off.
         // Clear cache_step_sequence so its unique event/step indexes cannot hide
