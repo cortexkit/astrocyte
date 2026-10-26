@@ -409,7 +409,7 @@ fn quota_reader_shutdown_cancels_mid_session_and_joins_within_the_drain_guard() 
         "fixture-handoff".into(),
     );
     let stop = Arc::new(AtomicBool::new(false));
-    let reader = Reader::start(state.clone(), peer.path.clone(), stop.clone()).unwrap();
+    let reader = Reader::start(state.clone(), Some(peer.path.clone()), stop.clone()).unwrap();
     let stopped = stop.clone();
     let (ended, joined) = std::sync::mpsc::channel();
     let joining = std::thread::spawn(move || {
@@ -628,7 +628,7 @@ fn quota_real_reader_credentials_attach_and_shutdown_mid_pull() {
         "fixture-handoff".into(),
     );
     let stop = Arc::new(AtomicBool::new(false));
-    let reader = Reader::start(state.clone(), peer.path.clone(), stop.clone()).unwrap();
+    let reader = Reader::start(state.clone(), Some(peer.path.clone()), stop.clone()).unwrap();
     let stopping = stop.clone();
     let (ended, joined) = std::sync::mpsc::channel();
     let joining = Background::new(
@@ -655,6 +655,89 @@ fn quota_real_reader_credentials_attach_and_shutdown_mid_pull() {
         .unwrap()
         .iter()
         .any(|request| request["method"] == "ckbus.credential"));
+}
+
+/// Without insula the bus reader still authenticates once and follows the
+/// runners' live subjects: a step event published on a real server becomes a
+/// `runner` feed row through the whole reader path.
+#[test]
+fn bus_reader_without_insula_serves_runner_step_events() {
+    let Some(server) = NatsServer::start() else {
+        return;
+    };
+    let names = AccountNames::derive("box_runner_reader").unwrap();
+    let url = server.url.clone();
+    let peer = Peer::start(Arc::new(move |request| {
+        let value = match request["method"].as_str().unwrap() {
+            "ckbus.credential" => {
+                json!({"result": {"jwt":"fixture", "exp":chrono::Utc::now().timestamp() + 900,
+                "acct":"box_runner_reader", "inbox_prefix":"_INBOX.runner_fixture", "server_url":url,
+                "credential_public":"runner_fixture", "spawn_generation":1, "credential_epoch":1}})
+            }
+            "ckbus.nonce_sign" => {
+                json!({"result":{"signature_b64":base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8;64])}})
+            }
+            _ => panic!("unexpected management operation"),
+        };
+        Some((
+            subc_protocol::FrameType::Response,
+            serde_json::to_vec(&value).unwrap(),
+        ))
+    }));
+    let state = Arc::new(crate::state::test_state());
+    state.install_quota_bus_access(
+        peer.path.clone(),
+        "astrocyte".into(),
+        "fixture-handoff".into(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = Reader::start(state.clone(), None, stop.clone()).unwrap();
+    let (subject, body) = crate::runner_steps::test_event(&names, "minimal", "thalamus", |_| {});
+    runtime().block_on(async {
+        let publisher = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(client) = async_nats::connect(&server.url).await {
+                    break client;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("nats-server did not become ready");
+        // A live publish is not stored, so publish until the reader has
+        // subscribed and served it.
+        tokio::time::timeout(crate::test_support::HANG_GUARD, async {
+            while state.step_feed().runner_counts().appended == 0 {
+                publisher
+                    .publish(subject.clone(), body.clone().into())
+                    .await
+                    .unwrap();
+                publisher.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the reader never served the runner step event");
+    });
+    stop.store(true, Ordering::Relaxed);
+    reader.join();
+    let page = crate::step_feed::read(
+        &state,
+        json!({"harness": "thalamus", "session": "session_a"}),
+    )
+    .unwrap_or_else(|refusal| panic!("steps read refused: {}", refusal.message));
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0]["source"], "runner");
+    assert_eq!(page.rows[0]["step_ref"], "attempt_invented_b");
+    // One module credential: the reader never asks ckbus for a second one.
+    let fresh = peer
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["method"] == "ckbus.credential")
+        .count();
+    assert_eq!(fresh, 1);
 }
 
 #[test]

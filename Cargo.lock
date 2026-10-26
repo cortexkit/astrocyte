@@ -275,9 +275,9 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.2.4"
+version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49ee447dce988b5c1852831643cff3dcf4c0605409c9e3d97c2b87b60f47c757"
+checksum = "605fac4517c19ac6ef700dfdcee3eaa9dfb071c7e3e9b635aa918ce2440a393f"
 
 [[package]]
 name = "cortexkit-bus-nats"
@@ -354,9 +354,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.7.1"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ca1635f0065077496d1b509f976b0c4301f3145f3ff12a52c7d9d22bd8f961e"
+checksum = "02254ed94b6054f68a374119f109d1ba9f598a3810c40e7c261bc47cf49950b5"
 dependencies = [
  "cortexkit-rich-ui-syntax",
  "serde",

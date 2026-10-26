@@ -40,15 +40,18 @@ tracing = "0.1"
 cortexkit-store = { version = "=0.2.4", features = ["sqlite"] }
 cortexkit-store-types = "=0.2.2"
 cortexkit-provider-usage = "=0.10.0"
-cortexkit-bus-naming = "=0.2.4"
+# 0.2.8 adds `live_subject`, the plain-publish `live` root runners announce
+# finished steps on.
+cortexkit-bus-naming = "=0.2.8"
 cortexkit-bus-nats = "=0.3.0"
 cortexkit-bus-trait = "=0.3.0"
 async-nats = { version = "=0.50.0", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
 base64 = "=0.22.1"
 futures-util = "0.3"
 fusiform-protocol = "=0.30.0"
-# The `log-read-watermark/v1` wire types (`watermark` module).
-cortexkit-role-llm-runner = "=0.7.1"
+# The `log-read-watermark/v1` wire types (`watermark` module) and the
+# `step.finished.v1` live step event (`step_events`, added in 0.7.5).
+cortexkit-role-llm-runner = "=0.7.5"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

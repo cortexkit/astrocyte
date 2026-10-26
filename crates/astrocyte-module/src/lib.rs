@@ -17,6 +17,7 @@ mod quota_bus_client;
 mod quota_events;
 mod recent_steps;
 mod refresher;
+mod runner_steps;
 pub mod state;
 pub mod step_feed;
 mod wire_map;

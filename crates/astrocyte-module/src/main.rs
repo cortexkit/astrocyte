@@ -1020,25 +1020,22 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
         .build()
 }
 
-/// The modules astrocyte calls under `desired`, and no others. Quota ingestion
-/// also uses ckbus through an attested route on the daemon connection file.
+/// The modules astrocyte calls under `desired`, and no others. ckbus is
+/// always called, through an attested route on the daemon connection file:
+/// the bus reader authenticates with it to follow runners' step events in
+/// every configuration, and to read quota notices when insula is configured.
 /// BROCA never is: its usage is read from its store, not over subc.
-/// No configured peer means no consumer role at all.
 fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
     let of: Vec<String> = [
         ("fusiform", desired.fusiform_connection_file.is_some()),
         ("insula", desired.qta_connection_file.is_some()),
-        ("ckbus", desired.qta_connection_file.is_some()),
+        ("ckbus", true),
     ]
     .into_iter()
     .filter(|(_, configured)| *configured)
     .map(|(module, _)| module.to_string())
     .collect();
-    if of.is_empty() {
-        Vec::new()
-    } else {
-        vec![ConsumerRole::ServiceClient { of }]
-    }
+    vec![ConsumerRole::ServiceClient { of }]
 }
 
 /// Every call astrocyte makes against another module's surface under
@@ -1082,16 +1079,18 @@ fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignal
                 "events_get fetches the immutable body of an in-sequence quota notice.".to_string(),
             ),
         });
-        declarations.push(SelfSignalDeclaration {
-            name: "astrocyte-ckbus-credentials".to_string(),
-            kind: SelfSignalKind::Poller,
-            effect: SelfSignalEffect::Mutate,
-            anchored_to: SignalAnchor::Event { event: "quota_bus_session".to_string() },
-            cadence: None,
-            domain: Some("ckbus".to_string()),
-            note: Some("ckbus.credential, ckbus.credential_renew and ckbus.nonce_sign authenticate the quota reader; failures retry with bounded backoff.".to_string()),
-        });
     }
+    // The bus reader runs in every configuration: it follows runners' step
+    // events, and quota notices too when insula is configured.
+    declarations.push(SelfSignalDeclaration {
+        name: "astrocyte-ckbus-credentials".to_string(),
+        kind: SelfSignalKind::Poller,
+        effect: SelfSignalEffect::Mutate,
+        anchored_to: SignalAnchor::Event { event: "quota_bus_session".to_string() },
+        cadence: None,
+        domain: Some("ckbus".to_string()),
+        note: Some("ckbus.credential, ckbus.credential_renew and ckbus.nonce_sign authenticate the bus reader (runner step events, and quota notices when insula is configured); failures retry with bounded backoff.".to_string()),
+    });
     if desired.fusiform_connection_file.is_some() {
         // Rate lookups are reads (Observe) driven by events, not by a clock,
         // so the anchor is the event and there is no cadence to declare.
@@ -2162,6 +2161,7 @@ mod tests {
         assert_eq!(
             self_signal_names(&manifest),
             [
+                "astrocyte-ckbus-credentials",
                 "astrocyte-fusiform-catalog-lookup",
                 "astrocyte-fusiform-history-status",
                 "astrocyte-fusiform-history-probe",
@@ -2186,17 +2186,21 @@ mod tests {
         assert_eq!(plan_prices["domain"], "fusiform");
     }
 
-    /// With no peer configured astrocyte calls nobody: the list is present and
-    /// empty (an affirmative "none", not an un-adopted block), and no consumer
-    /// role is declared.
+    /// With no peer configured astrocyte still calls ckbus, whose credential
+    /// lets the bus reader follow runners' step events, and nobody else.
     #[test]
-    fn manifest_declares_no_peer_calls_when_no_peer_is_configured() {
+    fn manifest_declares_only_the_bus_reader_when_no_peer_is_configured() {
         let manifest = manifest("astrocyte", &desired(false, false));
-        assert!(self_signal_names(&manifest).is_empty());
-        assert!(consumed_modules(&manifest).is_empty());
+        assert_eq!(
+            self_signal_names(&manifest),
+            ["astrocyte-ckbus-credentials"]
+        );
+        assert_eq!(consumed_modules(&manifest), ["ckbus"]);
         let wire = serde_json::to_value(&manifest).unwrap();
-        assert_eq!(wire["self_signals"], json!([]));
-        assert!(wire.get("consumes").is_none(), "{wire}");
+        assert_eq!(
+            wire["consumes"],
+            json!([{"role": "service_client", "of": ["ckbus"]}])
+        );
     }
 
     /// BROCA is read from its store, never called over subc, so no ingest

@@ -502,6 +502,87 @@ fn lead_before(
     })
 }
 
+/// The newest time of a dated step before `(?3 time, ?4 key)`, or NULL.
+const LATEST_BEFORE_SQL: &str = "SELECT MAX(e.occurred_at_ms) FROM usage_event e
+     JOIN cache_step_sequence s ON s.event_key=e.event_key
+     WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL
+        AND (e.occurred_at_ms,s.cursor)<(?3,?4)";
+
+/// A step of a session that the ledger does not hold (one a runner
+/// announced on the bus), with what the verdict rules read from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnrecordedStep {
+    pub occurred_at_ms: i64,
+    pub counts: StepCounts,
+    pub request_body_len: Option<u64>,
+}
+
+/// The served values of `row`, a step the ledger does not hold, computed by
+/// the same rules as a recorded step of its session: its lead folds the
+/// session's recorded steps and the `unrecorded` ones that happened before
+/// it, and the session reads its cache when any of them, or `row`, did.
+/// A recorded step at the same time as `row` counts as earlier.
+pub fn unrecorded_step(
+    conn: &Connection,
+    producer: &str,
+    session: &str,
+    row: StepRow,
+    unrecorded: &[UnrecordedStep],
+) -> rusqlite::Result<CacheStep> {
+    let at = row.occurred_at_ms;
+    let recorded_latest: Option<i64> = conn
+        .prepare_cached(LATEST_BEFORE_SQL)?
+        .query_row(params![session, producer, at, i64::MAX], |row| row.get(0))?;
+    let recorded_baseline = match recorded_latest {
+        Some(_) => conn
+            .prepare_cached(BASELINE_SQL)?
+            .query_row(params![session, producer, at, i64::MAX], step_row)
+            .optional()?,
+        None => None,
+    };
+    let earlier: Vec<&UnrecordedStep> = unrecorded
+        .iter()
+        .filter(|step| step.occurred_at_ms < at)
+        .collect();
+    let latest_unrecorded = earlier.iter().max_by_key(|step| step.occurred_at_ms);
+    let unrecorded_baseline = earlier
+        .iter()
+        .filter(|step| step.counts.reports_cache())
+        .max_by_key(|step| step.occurred_at_ms);
+    // The later of the two baselines is the session's last cache report; on
+    // equal times the recorded one is kept, as recorded steps sort first.
+    let baseline = match (recorded_baseline, unrecorded_baseline) {
+        (Some(recorded), Some(other)) if other.occurred_at_ms > recorded.occurred_at_ms => {
+            Some(other.counts)
+        }
+        (Some(recorded), _) => Some(recorded.counts()),
+        (None, other) => other.map(|other| other.counts),
+    };
+    // The ledger stores no request body lengths, so the previous step's
+    // length is known only when that step is an unrecorded one.
+    let request_body_len = latest_unrecorded
+        .filter(|other| recorded_latest.is_none_or(|recorded| other.occurred_at_ms > recorded))
+        .and_then(|other| other.request_body_len);
+    let lead = Lead {
+        earlier_steps: recorded_latest.is_some() || !earlier.is_empty(),
+        baseline,
+        request_body_len,
+    };
+    let reads_cache = row.cache_read.is_some_and(|read| read > 0)
+        || unrecorded
+            .iter()
+            .any(|step| step.counts.cache_read.is_some_and(|read| read > 0))
+        || session_reads_cache(conn, producer, session)?;
+    let query = StepsQuery {
+        producer: producer.to_string(),
+        session: session.to_string(),
+        limit: 1,
+        after_cursor: None,
+    };
+    let mut steps = steps_reply(&query, vec![row], lead, reads_cache, 0).steps;
+    Ok(steps.pop().expect("one step in, one step out"))
+}
+
 /// Whether any dated step of the session read a positive number of cached
 /// tokens.
 pub(crate) fn session_reads_cache(

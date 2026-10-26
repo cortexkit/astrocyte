@@ -53,7 +53,8 @@ Shared library; three binaries.
   queue reconciliation, the daily multiplier stage and its operator recompute).
 - `broca_source.rs`, `wire_map.rs`: BROCA `run-index.db` reader and fact mapping.
 - `qta_client.rs`, `capacity_map.rs`: insula `usage.get`/`events_get` client and capacity mapping.
-- `quota_events.rs`, `quota_bus_client.rs`: quota events and attested authentication;
+- `quota_events.rs`, `quota_bus_client.rs`, `runner_steps.rs`: the bus reader (quota
+  and runner step events) and attested authentication;
   `quota_events_tests.rs` tests delivery, failover and shutdown.
 - `fusiform_client.rs`: fusiform `catalog.get` and `plan.prices` client.
 - `claude_code_source.rs`, `codex_source.rs`, `opencode_source.rs`, `opencode_v2_source.rs`,

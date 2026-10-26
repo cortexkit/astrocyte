@@ -857,6 +857,26 @@ impl SharedState {
         &self.0.step_feed
     }
 
+    /// Append a step a runner announced on the bus to the live step feed,
+    /// under the writer fence on the writer's connection, then tell
+    /// subscribers. Feed rows only: nothing is written to the ledger.
+    pub(crate) fn publish_runner_step(
+        &self,
+        step: &astrocyte_core::step_feed::RunnerStep,
+    ) -> Result<astrocyte_core::step_feed::RunnerAppend, String> {
+        let _crash_guard = WriteCrashGuard(self);
+        let _writer = self.0.writer.lock().map_err(|_| {
+            self.report_crash("store writer fence poisoned".into());
+            "store writer fence poisoned".to_string()
+        })?;
+        self.with_conn(|conn| {
+            self.0
+                .step_feed
+                .publish_runner(conn, now_ms(), step)
+                .map_err(|error| describe_sqlite_error(&error))
+        })
+    }
+
     /// Fill the recent-steps memory from the store: the sessions active in
     /// the last 24 hours, their newest steps each. Bounded by the memory's
     /// own limits, and run on the reader connection in one snapshot. Called

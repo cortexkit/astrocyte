@@ -30,7 +30,7 @@ skips the table-creating probe and copies that timeout.
 The [data model](docs/data-model.md#tables) describes every table and its write rules.
 
 Schema 23 uses local integer `event_key` and `charge_key` references, never served
-IDs. Event digests remain the dedup/served identity; charge digests are retired.
+IDs. Event digests stay the dedup/served identity.
 The scalar predecessor FK and `priced_charge_supersedes_same_measurement` trigger
 require an existing same-measurement predecessor, even with deferred FKs. Operators
 run VACUUM after commit and start a full backup baseline. `spend.charge.explain`
@@ -54,7 +54,7 @@ The audit compares summaries against base rows, requeues discrepancies and start
 its next pass a day after the previous pass completes. Charge writers must
 update the event header before inserting heads; the existing generation-and-basis
 guard checks agreement, not transaction identity. The [data model](docs/data-model.md#hourly-summaries)
-explains the grain, arithmetic, invalidation rules and maintenance budgets.
+explains the details.
 
 ## Write ordering
 
@@ -114,10 +114,8 @@ maintenance, and stop requests interrupt both lanes. One full tick:
 2. Drain harness stores and BROCA, except sources disabled by `harness_ingest`.
    Skipped sources are not read and lose their `source_runtime` row, as for absent
    stores.
-3. Consume insula quota events when `qta_connection_file` is set. A stoppable bus
-   thread binds astrocyte's durable for insula quota events (names from
-   `cortexkit-bus-naming`). It verifies digests
-   and acknowledges only after an account commit or a durable request to fetch
+3. Consume insula quota events when `qta_connection_file` is set. The bus thread
+   binds astrocyte's durable for them, verifies digests and acknowledges only after an account commit or a durable request to fetch
    a snapshot next tick. Duplicates do not write. First notices, epochs, gaps and
    invalid bodies require `usage.get` next tick.
    Healthy readers poll at ten minutes or one cadence before freshness expires,
@@ -137,6 +135,8 @@ The ckbus route shares HELLO's single nonce handoff. Daemon validation of
 `consumer_identity` stamps its principal; nonces stay out of diagnostics.
 The refresher drains account writes between ticks (250 ms idle wait) and joins
 the bus reader on its stop flag. Mode changes are logged, not added to health schemas.
+On the module's one credential and connection, that reader always follows runners'
+live `step.finished.v1` events into the step feed, never the ledger.
 
 After each tick, the multiplier retries missing observations for the seven latest
 completed UTC days, oldest first; each covers seven days ending at 00:00Z.

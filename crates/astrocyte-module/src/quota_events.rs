@@ -394,9 +394,14 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
+    /// Start the module's one bus reader. It holds the module's one ckbus
+    /// credential and NATS connection, because a fresh credential revokes the
+    /// module's previous one. It always follows runners' live step events,
+    /// and also pulls quota notices when `insula_path` yields a usable
+    /// insula client.
     pub fn start(
         state: Arc<SharedState>,
-        insula_path: PathBuf,
+        insula_path: Option<PathBuf>,
         stop: Arc<AtomicBool>,
     ) -> Option<Self> {
         let thread_stop = stop.clone();
@@ -412,9 +417,9 @@ impl Reader {
                 let _stopped = Stopped(state.clone());
                 // QtaClient's polling runtime is never entered here; event requests run on this reader.
                 // Both runtimes are dropped on the OS thread, outside an async context.
-                let Ok(insula) = crate::qta_client::QtaClient::new(insula_path) else {
-                    return;
-                };
+                // Without a usable insula client only runner step events are read.
+                let insula =
+                    insula_path.and_then(|path| crate::qta_client::QtaClient::new(path).ok());
                 let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -424,7 +429,7 @@ impl Reader {
                 runtime.block_on(async {
                     tokio::select! {
                         () = stopped(&thread_stop) => {},
-                        () = reader_loop(&state, &insula) => {},
+                        () = reader_loop(&state, insula.as_ref()) => {},
                     }
                 });
             });
@@ -470,7 +475,7 @@ async fn stopped(stop: &AtomicBool) {
     }
 }
 
-async fn reader_loop(state: &SharedState, insula: &crate::qta_client::QtaClient) {
+async fn reader_loop(state: &SharedState, insula: Option<&crate::qta_client::QtaClient>) {
     let control = state.quota_bus();
     let access = loop {
         if let Some(access) = control.access() {
@@ -496,27 +501,47 @@ async fn reader_loop(state: &SharedState, insula: &crate::qta_client::QtaClient)
             let connection = quota_bus_client::connect(client.clone(), &credential).await?;
             let names =
                 AccountNames::derive(&credential.acct).map_err(|_| "invalid bus account")?;
-            let consumer = bind(&connection, &names.streams().event).await?;
-            let subject = names
-                .event_subject("insula", "quota_sampled", 1)
-                .map_err(|_| "invalid quota subject")?;
+            let quota = match insula {
+                Some(insula) => {
+                    let consumer = bind(&connection, &names.streams().event).await?;
+                    let subject = names
+                        .event_subject("insula", "quota_sampled", 1)
+                        .map_err(|_| "invalid quota subject")?;
+                    Some((insula, consumer, subject))
+                }
+                None => None,
+            };
             delay = Duration::from_millis(250);
             let remaining = credential
                 .exp
                 .saturating_sub(60)
                 .saturating_sub(chrono::Utc::now().timestamp());
             let remaining = Duration::from_secs(u64::try_from(remaining).unwrap_or(0));
-            tokio::time::timeout(
-                remaining,
-                run_session(
-                    control,
-                    insula,
-                    &credential,
-                    &consumer,
-                    &subject,
-                    &mut cursors,
-                ),
-            )
+            let quota_session = async {
+                match &quota {
+                    Some((insula, consumer, subject)) => {
+                        run_session(
+                            control,
+                            insula,
+                            &credential,
+                            consumer,
+                            subject,
+                            &mut cursors,
+                        )
+                        .await
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            // Runner step events share the connection but never end the
+            // session: `follow` retries its own failures, so they cannot
+            // interrupt quota delivery.
+            tokio::time::timeout(remaining, async {
+                tokio::select! {
+                    result = quota_session => result,
+                    () = crate::runner_steps::follow(state, &connection, &names) => Ok(()),
+                }
+            })
             .await
             .unwrap_or(Ok(()))
         }

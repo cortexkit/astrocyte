@@ -1734,13 +1734,13 @@ fn spawn_refresher(
                     plan_prices,
                     poll_interval_secs,
                 ) = startup?;
-                let bus_reader = state.desired_config().qta_connection_file.and_then(|path| {
-                    crate::quota_events::Reader::start(
-                        Arc::clone(&state),
-                        path.into(),
-                        Arc::clone(&stop),
-                    )
-                });
+                // The bus reader always runs: runner step events need only the
+                // bus, and quota notices are read too when insula is configured.
+                let bus_reader = crate::quota_events::Reader::start(
+                    Arc::clone(&state),
+                    state.desired_config().qta_connection_file.map(Into::into),
+                    Arc::clone(&stop),
+                );
                 run_loop_full(
                     Arc::clone(&state),
                     producers,

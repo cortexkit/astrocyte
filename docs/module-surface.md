@@ -515,10 +515,8 @@ Reply:
   arrived late), the whole row is sent again at a new cursor. The last row for
   an identity wins: apps replace, never append.
 
-Runner rows are not served yet: the feed carries only rows from astrocyte's own
-reads (`source: "file"`) until it consumes runners' step events. When it does,
-a row from a runner's `step.finished.v1` event takes its identity from the
-event. When the event carries `harness_step_ref` (runner contract 14.3,
+Runner rows are served: a row from a runner's `step.finished.v1` event takes
+its identity from the event. When the event carries `harness_step_ref` (runner contract 14.3,
 present for runners whose history is the host harness's own record),
 `harness` is the event's `harness` (the hosting program, such as
 `claude-code` or `opencode`) and `step_ref` is `harness_step_ref`, so
@@ -574,10 +572,29 @@ detail `{"through": "<newest cursor>"}`: reload per-session history with
   it. Rows become eligible for deletion 24 hours after they were committed;
   each feed append deletes up to 1,000 of them, so a cursor stays readable
   until the deletion reaches it.
-- In this version every row has `source: "file"`. Runner rows join once
-  astrocyte consumes the `step.finished.v1` events runners publish on the
-  bus. `cache_write_5m`, `cache_write_1h`
-  and `run_id` are not sent yet.
+- Runner rows come from the `step.finished.v1` events that `broca`,
+  `thalamus-harness` and `thalamus` publish on the bus. Astrocyte follows each
+  runner's own subject, `ck.<account>.live.<runner>.step.finished.v1`, with a
+  plain subscription and no durable. The runners are the ones the bus naming
+  table grants astrocyte. The subscriptions share the quota reader's single
+  ckbus credential and NATS connection, and they run whether or not insula is
+  configured. A row is appended as soon as the event arrives, and subscribers
+  are told once it is committed. Runner rows are display data only: nothing
+  from an event reaches the spend ledger.
+- A runner row's `prompt`, `retention`, `verdict`, `prompt_dropped` and
+  `request_size` are computed by the same rules as a file row's, over the
+  session's recorded steps and its other runner rows. `run_id`, and
+  `cache_write_5m` and `cache_write_1h` when the event split them, are sent
+  only on runner rows. `output` includes `reasoning` unless the event says
+  reasoning is outside it.
+- When the feed's newest row for the identity is a file row, astrocyte drops
+  the runner event, because the durable read is the step's record. When it is
+  the same runner row, the event is a duplicate and is also dropped. A later
+  file row for the same identity replaces a runner row. An event that does not
+  decode, or whose subject names a different runner than its body, is counted
+  and dropped. So is a step that finished more than 24 hours ago. If the bus is
+  unavailable or refuses the subscription, astrocyte logs it once and retries,
+  and the feed carries file rows only. Quota events are not affected.
 - The phone's device label is the route's bind identity `harness`
   (`fed-phone:<fingerprint>`), as Callosum stamps it; the principal must be
   `reserved:callosum` as well.
@@ -594,7 +611,14 @@ Tests: `a_notice_is_sent_only_after_its_steps_commit`,
 `the_feed_is_refused_to_simulators_computers_and_other_modules`,
 `a_subscriber_that_falls_behind_its_queue_ends_lagged`,
 `a_drain_ends_every_step_subscription_before_goodbye`,
-`two_subscribers_both_receive_a_notice`.
+`two_subscribers_both_receive_a_notice`,
+`each_runners_event_is_served_as_a_runner_row`,
+`a_file_row_for_the_step_supersedes_the_runner_row`,
+`a_runner_event_after_the_file_row_leaves_the_file_row_newest`,
+`an_undecodable_event_is_counted_and_dropped`,
+`a_runner_rows_verdict_matches_the_file_row_that_replaces_it`,
+`a_runner_row_wakes_its_sessions_filtered_subscription`,
+`bus_reader_without_insula_serves_runner_step_events`.
 
 ### 4.3 Read watermark (`log-read-watermark/v1`)
 

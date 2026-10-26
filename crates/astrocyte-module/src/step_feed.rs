@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use astrocyte_core::step_feed::{self as feed, FeedError, FeedFilter, FeedPage, FeedReadRequest};
+use astrocyte_core::step_feed::{
+    self as feed, FeedError, FeedFilter, FeedPage, FeedReadRequest, RunnerAppend, RunnerStep,
+};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -83,6 +85,7 @@ struct HubState {
 pub struct FeedHub {
     state: Mutex<HubState>,
     slots: Arc<Semaphore>,
+    runner: Mutex<RunnerCounts>,
 }
 
 impl Default for FeedHub {
@@ -90,8 +93,28 @@ impl Default for FeedHub {
         Self {
             state: Mutex::new(HubState::default()),
             slots: Arc::new(Semaphore::new(MAX_FEED_SUBSCRIPTIONS)),
+            runner: Mutex::new(RunnerCounts::default()),
         }
     }
+}
+
+/// What became of the `step.finished.v1` events astrocyte received since it
+/// started. Every event lands in exactly one count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunnerCounts {
+    /// Appended to the feed as a `runner` row.
+    pub appended: u64,
+    /// The feed's newest row for the step was already this runner row.
+    pub unchanged: u64,
+    /// The feed already serves the step from a durable read.
+    pub superseded: u64,
+    /// The step finished before the feed's 24-hour window.
+    pub outside_window: u64,
+    /// The subject or body did not decode, or its counts or times could not
+    /// be served.
+    pub dropped: u64,
+    /// Decoded, but the feed write failed.
+    pub failed: u64,
 }
 
 /// Where a subscription's notices go. The production sink is the request's
@@ -115,6 +138,15 @@ impl NoticeSink for RequestCtx {
     async fn ended(&self) {
         self.cancelled().await;
     }
+}
+
+/// Why a received `step.finished.v1` event added nothing to the feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunnerFailure {
+    /// The event could not be decoded or served.
+    Dropped,
+    /// The feed write failed.
+    Failed,
 }
 
 /// How a subscription's stream ended on its own account.
@@ -188,6 +220,67 @@ impl FeedHub {
         };
         self.notify(through, &changed);
         Ok(())
+    }
+
+    /// Append one runner-announced step to the feed and tell subscribers.
+    /// Called on the writer's connection under the writer fence (see
+    /// `SharedState::publish_runner_step`); the append runs in a savepoint
+    /// of its own, and subscribers are told only once it is released.
+    pub(crate) fn publish_runner(
+        &self,
+        conn: &Connection,
+        now_ms: i64,
+        step: &RunnerStep,
+    ) -> rusqlite::Result<RunnerAppend> {
+        conn.execute_batch("SAVEPOINT step_feed_runner")?;
+        let appended = (|| {
+            let outcome = feed::append_runner_step(conn, now_ms, step)?;
+            Ok::<_, rusqlite::Error>((outcome, feed::through(conn)?))
+        })();
+        let (outcome, through) = match appended {
+            Ok(appended) => {
+                conn.execute_batch("RELEASE step_feed_runner")?;
+                appended
+            }
+            Err(error) => {
+                let _ =
+                    conn.execute_batch("ROLLBACK TO step_feed_runner; RELEASE step_feed_runner");
+                return Err(error);
+            }
+        };
+        if outcome == RunnerAppend::Appended {
+            let changed = FeedFilter {
+                harness: step.harness.clone(),
+                session: step.session.clone(),
+            };
+            self.notify(through, std::slice::from_ref(&changed));
+        }
+        Ok(outcome)
+    }
+
+    /// Count one received `step.finished.v1` event.
+    pub(crate) fn count_runner(&self, outcome: Result<RunnerAppend, RunnerFailure>) {
+        let mut counts = self
+            .runner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let count = match outcome {
+            Ok(RunnerAppend::Appended) => &mut counts.appended,
+            Ok(RunnerAppend::Unchanged) => &mut counts.unchanged,
+            Ok(RunnerAppend::Superseded) => &mut counts.superseded,
+            Ok(RunnerAppend::OutsideWindow) => &mut counts.outside_window,
+            Err(RunnerFailure::Dropped) => &mut counts.dropped,
+            Err(RunnerFailure::Failed) => &mut counts.failed,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    /// The `step.finished.v1` events received since startup, by outcome.
+    pub fn runner_counts(&self) -> RunnerCounts {
+        *self
+            .runner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Queue a newer `through` for unfiltered subscribers and for subscribers
@@ -1048,6 +1141,55 @@ mod tests {
             assert!(matches!(outcome, HandlerOutcome::Streamed));
         }
         assert_eq!(state.step_feed().open_subscriptions(), 0);
+    }
+
+    /// A runner row wakes the subscription filtered to its own harness and
+    /// session, and only that one.
+    #[tokio::test]
+    async fn a_runner_row_wakes_its_sessions_filtered_subscription() {
+        let state = test_state();
+        let (stop, stopping) = watch::channel(false);
+        let (own_tx, mut own) = mpsc::unbounded_channel();
+        let (other_tx, mut other) = mpsc::unbounded_channel();
+        let mut serving = Vec::new();
+        for (session, sender) in [("session_a", own_tx), ("session_b", other_tx)] {
+            let state = state.clone();
+            let stopping = stopping.clone();
+            let params = json!({"harness": "broca", "session": session});
+            serving.push(tokio::spawn(async move {
+                subscribe(&state, params, &ByteSink(sender), stopping).await
+            }));
+        }
+        tokio::time::timeout(HANG_GUARD, async {
+            while state.step_feed().lock().subscribers.len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscriptions never registered");
+        let names = cortexkit_bus_naming::AccountNames::derive("box_feed").unwrap();
+        let (subject, body) = crate::runner_steps::test_event(&names, "minimal", "broca", |_| {});
+        crate::runner_steps::admit(&state, &subject, &body);
+        // Publication is synchronous: only the matching session's queue
+        // receives a notice.
+        for subscriber in state.step_feed().lock().subscribers.iter() {
+            if subscriber.filter.as_ref().unwrap().session == "session_b" {
+                assert_eq!(subscriber.queue.capacity(), SUBSCRIBER_QUEUE);
+            }
+        }
+        let notice = tokio::time::timeout(HANG_GUARD, own.recv())
+            .await
+            .expect("the session's subscription was not notified of its runner row")
+            .unwrap();
+        assert_eq!(notice, br#"{"through":"c1"}"#);
+        assert!(other.try_recv().is_err());
+        stop.send(true).unwrap();
+        for task in serving {
+            tokio::time::timeout(HANG_GUARD, task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     /// Served rows report `output` with reasoning inside it, on the feed and

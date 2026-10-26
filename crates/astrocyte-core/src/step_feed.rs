@@ -32,23 +32,56 @@ const PRUNE_BATCH: i64 = 1_000;
 
 /// Where a feed row's step came from.
 ///
-/// Every row today is `File`: a step read from a harness store or a runner's
-/// durable log. Once astrocyte consumes the `step.finished.v1` events runners
-/// publish on the bus, those steps enter as `runner` rows; the
-/// durable read of the same step then appends its `file` row, which wins as
-/// the newer row for the identity. The table's `source` column already
-/// accepts both values.
+/// `File` is a step read from a harness store or a runner's durable log.
+/// `Runner` is a step known so far only from the `step.finished.v1` event a
+/// runner published on the bus (see [`append_runner_step`]); the durable
+/// read of the same step later appends its `file` row, which wins as the
+/// newer row for the identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeedSource {
     File,
+    Runner,
 }
 
 impl FeedSource {
     fn wire_name(self) -> &'static str {
         match self {
             Self::File => "file",
+            Self::Runner => "runner",
         }
     }
+}
+
+/// A step a runner announced on the bus, already mapped to the feed's
+/// identity and the ledger's count conventions. Display data only: it is
+/// never written to the ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunnerStep {
+    /// The identity's `harness`: the hosting harness when the event names the
+    /// host's record, otherwise the runner's module id.
+    pub harness: String,
+    pub session: String,
+    pub run_id: String,
+    /// `step_ref` is the identity's step id and `cursor` is unused. `output`
+    /// excludes `reasoning`, as the ledger stores it; the served row adds
+    /// them back together.
+    pub step: cache::StepRow,
+    pub cache_write_5m: Option<u64>,
+    pub cache_write_1h: Option<u64>,
+}
+
+/// What [`append_runner_step`] did with a runner step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunnerAppend {
+    /// A new row was appended.
+    Appended,
+    /// The newest row for the identity is already this runner row.
+    Unchanged,
+    /// The newest row for the identity came from a durable read, which is
+    /// the step's record; the runner's hint is dropped.
+    Superseded,
+    /// The step happened before the feed window.
+    OutsideWindow,
 }
 
 /// `usage.steps.read` params.
@@ -175,6 +208,130 @@ fn row_body(
     row.insert("source".into(), Value::from(source.wire_name()));
     row.insert("session".into(), Value::from(session));
     serde_json::to_string(&Value::Object(row))
+}
+
+/// The `file` or `runner` source of the newest stored row for an identity,
+/// with its body, if any.
+fn newest_row(
+    conn: &Connection,
+    harness: &str,
+    step_ref: &str,
+) -> rusqlite::Result<Option<(String, String)>> {
+    conn.prepare_cached(
+        "SELECT source,row_json FROM step_feed WHERE harness=?1 AND step_ref=?2
+         ORDER BY feed_cursor DESC LIMIT 1",
+    )?
+    .query_row(params![harness, step_ref], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })
+    .optional()
+}
+
+/// The session's steps known only from runner rows the feed still serves
+/// (rows no later row for their identity has replaced), other than
+/// `step_ref`'s own.
+fn runner_only_steps(
+    conn: &Connection,
+    harness: &str,
+    session: &str,
+    step_ref: &str,
+) -> rusqlite::Result<Vec<cache::UnrecordedStep>> {
+    let bodies = conn
+        .prepare_cached(
+            "SELECT f.row_json FROM step_feed f
+             WHERE f.harness=?1 AND f.session=?2 AND f.source='runner' AND f.step_ref<>?3
+               AND NOT EXISTS (SELECT 1 FROM step_feed n WHERE n.harness=f.harness
+                   AND n.step_ref=f.step_ref AND n.feed_cursor>f.feed_cursor)",
+        )?
+        .query_map(params![harness, session, step_ref], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let count = |row: &Value, name: &str| row.get(name).and_then(Value::as_u64);
+    bodies
+        .iter()
+        .map(|body| {
+            let row: Value = serde_json::from_str(body).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(cache::UnrecordedStep {
+                occurred_at_ms: row
+                    .get("occurred_at_ms")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                counts: cache::StepCounts {
+                    input: count(&row, "input"),
+                    cache_read: count(&row, "cache_read"),
+                    cache_write: count(&row, "cache_write"),
+                },
+                request_body_len: count(&row, "request_body_len"),
+            })
+        })
+        .collect()
+}
+
+/// Add a step a runner announced to the feed as a `runner` row, unless the
+/// feed already serves a row for it from a durable read, or the same runner
+/// row. The served values are computed as for a recorded step of its session
+/// (see `cache_diagnostics::unrecorded_step`). Must run on the writer's
+/// connection inside a transaction or savepoint of its own; it also deletes
+/// expired rows, as [`append_changes`] does.
+pub fn append_runner_step(
+    conn: &Connection,
+    now_ms: i64,
+    step: &RunnerStep,
+) -> rusqlite::Result<RunnerAppend> {
+    let window_start = now_ms.saturating_sub(FEED_WINDOW_MS);
+    if step.step.occurred_at_ms < window_start {
+        return Ok(RunnerAppend::OutsideWindow);
+    }
+    let (harness, session) = (step.harness.as_str(), step.session.as_str());
+    let step_ref = step.step.step_ref.as_str();
+    let newest = newest_row(conn, harness, step_ref)?;
+    if newest
+        .as_ref()
+        .is_some_and(|(source, _)| source != FeedSource::Runner.wire_name())
+    {
+        return Ok(RunnerAppend::Superseded);
+    }
+    let unrecorded = runner_only_steps(conn, harness, session, step_ref)?;
+    let served = cache::unrecorded_step(conn, harness, session, step.step.clone(), &unrecorded)?;
+    let to_sql = |error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
+    let body = row_body(harness, session, FeedSource::Runner, &served).map_err(to_sql)?;
+    let Value::Object(mut row) = serde_json::from_str::<Value>(&body).map_err(to_sql)? else {
+        unreachable!("a row body is an object");
+    };
+    row.insert("run_id".into(), Value::from(step.run_id.as_str()));
+    for (name, value) in [
+        ("cache_write_5m", step.cache_write_5m),
+        ("cache_write_1h", step.cache_write_1h),
+    ] {
+        if let Some(value) = value {
+            row.insert(name.into(), Value::from(value));
+        }
+    }
+    let body = serde_json::to_string(&Value::Object(row)).map_err(to_sql)?;
+    if newest.is_some_and(|(_, newest)| newest == body) {
+        return Ok(RunnerAppend::Unchanged);
+    }
+    conn.prepare_cached(
+        "INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+    )?
+    .execute(params![
+        harness,
+        step_ref,
+        FeedSource::Runner.wire_name(),
+        session,
+        now_ms,
+        body
+    ])?;
+    prune(conn, window_start)?;
+    Ok(RunnerAppend::Appended)
 }
 
 /// The newest stored row body for an identity, if any.
