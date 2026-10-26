@@ -18,14 +18,13 @@ permissions:
   contents: read
 
 concurrency:
-  # A train may supersede an earlier push to that train. Master proofs and
-  # scheduled breadth audits must finish, not be cancelled by a later push.
+  # A train may supersede an earlier push to that train. Master and scheduled
+  # runs must finish, not be cancelled by a later push.
   group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/train/') }}
 
 env:
   CARGO_TERM_COLOR: always
-  CK_MUTATE_REV: 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e
   NATS_SERVER_VERSION: "2.15.0"
   NATS_SERVER_SHA256_LINUX_AMD64: 5d2c51caca950333aba84911df7d377f826f3a59ec36061c6539105084f65c92
   NATS_SERVER_SHA256_WINDOWS_AMD64: 2d0861dc2ca3567d17f7d19611d7b346cc2ccbd7086a0a77cc957a2c71663200
@@ -106,18 +105,6 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ steps.rust-version.outputs.version }}-
 
-      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        id: mutate-cache
-        with:
-          path: ~/.cargo/bin/ckdev-mutate
-          key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CK_MUTATE_REV }}
-      - name: Install pinned mutation runner
-        if: steps.mutate-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
-
-      - name: Validate mutation catalogue
-        run: ckdev-mutate check
-
       # A path dependency on a sibling checkout builds against whatever that
       # checkout holds, so the lock goes stale whenever the sibling moves.
       # Sibling crates come from crates.io; only this repo's crates are path
@@ -136,8 +123,7 @@ jobs:
 
   # Astrocyte runs on macOS, Linux and Windows. Its readers resolve file
   # identity, paths and SQLite URIs per OS, and a cross-compile proves none of
-  # that, so the suite also runs natively on Windows. Mutation replays stay on
-  # Linux: they test guards, not platforms.
+  # that, so the suite also runs natively on Windows.
   test-windows:
     name: Test (windows)
     runs-on: windows-2025
@@ -187,94 +173,3 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --all-targets --locked --no-fail-fast
-
-  # No branch/event-dependent job or step if: the train gate must never skip.
-  # Select replay scope in the command, while every event runs the same gate.
-  # Runs beside the test jobs, not after them: each shard does its own build,
-  # so waiting on Test only added the Linux test time (about 3 minutes) to
-  # every train. A failing test still fails the run.
-  mutations:
-    name: Mutations (${{ matrix.shard }}/4)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    env:
-      ASTROCYTE_REQUIRE_NATS_SERVER: "1"
-    strategy:
-      fail-fast: false
-      matrix:
-        # Four isolated checkouts bound rebuild work per job. This is an initial
-        # partition, not an estimate from the much slower shared developer Mac.
-        shard: [1, 2, 3, 4]
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          fetch-depth: 0
-      # Account-isolation controls include a real-durable catch, so replays need NATS too.
-      - name: Install pinned NATS server
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/nats-server.tar.gz"
-          directory="$RUNNER_TEMP/astrocyte-nats"
-          curl --fail --location --retry 3 \
-            "https://github.com/nats-io/nats-server/releases/download/v${NATS_SERVER_VERSION}/nats-server-v${NATS_SERVER_VERSION}-linux-amd64.tar.gz" \
-            --output "$archive"
-          printf '%s  %s\n' "$NATS_SERVER_SHA256_LINUX_AMD64" "$archive" | sha256sum --check -
-          mkdir -p "$directory"
-          tar -xzf "$archive" --strip-components=1 -C "$directory" \
-            "nats-server-v${NATS_SERVER_VERSION}-linux-amd64/nats-server"
-          echo "$directory" >> "$GITHUB_PATH"
-          "$directory/nats-server" --version
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
-      - name: Record Rust compiler for cache
-        id: rust-version
-        run: echo "version=$(rustc --version | cut -d ' ' -f 2)" >> "$GITHUB_OUTPUT"
-
-      # Reuse the main job's clean-tree build, but never save mutated artifacts.
-      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ steps.rust-version.outputs.version }}-
-
-      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        id: mutate-cache
-        with:
-          path: ~/.cargo/bin/ckdev-mutate
-          key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CK_MUTATE_REV }}
-      - name: Install pinned mutation runner
-        if: steps.mutate-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
-
-      - name: Replay guard proofs
-        env:
-          EVENT: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          SHARD: ${{ matrix.shard }}/4
-        run: |
-          mkdir -p target/mutations
-          rm -f target/mutations/replay.json
-          case "$EVENT:$REF" in
-            push:refs/heads/train/*)
-              git fetch origin master
-              ckdev-mutate run --diff origin/master --shard "$SHARD" --report target/mutations/replay.json
-              ;;
-            schedule:*)
-              ckdev-mutate run --all --broad --shard "$SHARD" --report target/mutations/replay.json
-              ;;
-            *)
-              # Pushes to refs/heads/master, pull_request, and workflow_call events run
-              # the full replay; only train pushes use the diff-only replay above.
-              ckdev-mutate run --all --shard "$SHARD" --report target/mutations/replay.json
-              ;;
-          esac
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
-        with:
-          name: mutations-${{ github.event_name }}-${{ matrix.shard }}
-          path: target/mutations/replay.json

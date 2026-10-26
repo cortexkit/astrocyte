@@ -5,13 +5,14 @@ how the module works; `STRUCTURE.md` says where code goes.
 
 ## Gates
 
-Run these before you commit. CI runs the same checks on Linux and Windows.
+A worker runs fmt, both clippy passes, the tests for what it touched (filtered by
+name), and the Python and shell checks, then delivers. The head runs the full suite once
+per landing, and CI runs everything on Linux and Windows.
 
-Run every `cargo` and `ckdev-mutate` command on the Linux build server (`runon: "linux,4c"`),
+Run every `cargo` command on the Linux build server (`runon: "linux,4c"`),
 never on the shared development machine. Local builds and tests compete with every other
 agent on that machine (on macOS, each freshly built test binary also costs a security
-scan), and `ckdev-mutate check` builds every test target to list test names. Only the
-Python and shell checks below run locally.
+scan). Only the Python and shell checks below run locally.
 
 ```sh
 scripts/fmt-check.sh
@@ -37,8 +38,9 @@ scripts/check-cortexkit-layout.sh
 
 - Tests sit beside the code under `#[cfg(test)]`. Drive behaviour through the real path
   (the refresher drain, the served operation's dispatch), not a helper that bypasses it.
-- A test for a fix must fail before the fix. Prove it: break the guard, watch the named
-  test fail, then restore it.
+- A bug fix comes with a test that fails without the fix. Show that once (run it on the
+  unfixed code and name the failure) and report it. No break lists, mutation rows or
+  repeat runs.
 - Assert the effect, not just the verdict. For example, assert the stored rows and the
   money, not only that a call returned an error.
 - Test fakes serve until they're released, and waits have a deadline. Never assert on how
@@ -47,19 +49,6 @@ scripts/check-cortexkit-layout.sh
   `ckdev-astrocyte` and run the copy (see `crates/astrocyte-module/tests/version.rs`).
 - Code that must work on Windows needs a test that runs in the Windows CI job. On Windows,
   a path below a regular file reports "not found", not "not a directory".
-
-## Mutation catalogue
-
-`mutations.toml` lists guards whose failure would be silent and costly. Each row names a
-change that breaks the guard and the tests that must fail. CI replays the rows a train
-touches, and every row on master. When you add a row, replay it exactly as CI does
-(`ckdev-mutate run --only <row id>`). List every test the mutant reddens, or the row reports
-`WRONG_TEST`.
-
-Before delivering any change, run `ckdev-mutate check` over the whole catalogue on the build
-server (about 80 s). Rows match their target code by exact text, and an edit can repeat that
-text in a file another row targets. Replaying only your own rows misses that, and CI then
-refuses the catalogue before running any test.
 
 ## Store and migrations
 

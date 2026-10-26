@@ -38,14 +38,7 @@ operations it serves.
 
 The full gate that CI runs is in [CONTRIBUTING.md](CONTRIBUTING.md). The
 Windows clippy pass needs the `x86_64-pc-windows-gnu` target
-(`rustup target add x86_64-pc-windows-gnu`). Replaying the mutation catalogue
-needs `ckdev-mutate`, installed from the revision pinned as `CK_MUTATE_REV` in
-`.github/workflows/ci.yml`:
-
-```sh
-cargo install --locked --git https://github.com/cortexkit/commons --rev <CK_MUTATE_REV> cortexkit-mutate
-ckdev-mutate check
-```
+(`rustup target add x86_64-pc-windows-gnu`).
 
 ## Documentation
 

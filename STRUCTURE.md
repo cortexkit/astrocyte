@@ -5,7 +5,7 @@
 ## Repository map
 
 Crates live in `crates/`, public docs in `docs/`, and gates in `scripts/`.
-`mutations.toml` tests guards by breaking them; `.github/workflows/ci.yml` runs CI.
+`.github/workflows/ci.yml` runs CI.
 
 ## `astrocyte-core`
 

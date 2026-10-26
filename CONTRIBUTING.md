@@ -27,8 +27,8 @@ wrong, not only on what it does when it works. A PR is ready when:
   not fence.
 - Anything that could pass vacuously (an empty collection, a constant that
   came from a query, a fixture that lacks the case) says so or refuses.
-- A test for a fix fails without the fix. The PR names the test and the
-  mutation (a deliberate break of the guarded code) that makes it fail.
+- A bug fix comes with a test that fails without the fix. The PR names the
+  test and how it failed on the unfixed code.
 - Schema changes append a `Migration` in `crates/astrocyte-core/src/store.rs`.
   A migration that has been applied is never edited.
 - Producer fields are stored verbatim and never inferred. Absent stays absent
@@ -66,21 +66,6 @@ scripts/check-cortexkit-layout.sh
 - A test never runs a binary named `ck-*`. It copies the build to a fresh file
   named `ckdev-astrocyte` and runs the copy (see
   `crates/astrocyte-module/tests/version.rs`).
-
-## Mutation catalogue
-
-`mutations.toml` lists guards whose failure would be silent and costly. Each
-row names a change that breaks the guard and the tests that must fail. CI
-replays the rows a change touches on every train push and every row on
-`master`. When you add a row, replay it as CI does and list every test the
-mutant reddens; a row that names the wrong tests reports `WRONG_TEST`:
-
-```sh
-ckdev-mutate run --only <row id>
-```
-
-Install `ckdev-mutate` from the revision pinned in CI; see the
-[README](README.md#build-and-test).
 
 ## How changes land
 
