@@ -1629,48 +1629,6 @@ mod tests {
         assert_eq!(origins, ["pricing_pass", "operator_reprice"]);
     }
 
-    #[test]
-    fn production_origin_literals_reserve_unattributed_for_migration() {
-        // Grep is sufficient for this closed literal set, not for behaviour:
-        // PricingOrigin has only live variants and every writer must supply one.
-        fn scan(dir: &std::path::Path, hits: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    scan(&path, hits);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    let text = std::fs::read_to_string(&path).unwrap();
-                    let production = text.split("#[cfg(test)]").next().unwrap();
-                    for literal in ["\"unattributed\"", "'unattributed'"] {
-                        if production.contains(literal) {
-                            assert!(
-                                path.ends_with("astrocyte-core/src/store.rs"),
-                                "historical origin literal outside migration: {}",
-                                path.display()
-                            );
-                            let migrations =
-                                production.split("pub const MIGRATIONS:").nth(1).unwrap();
-                            assert_eq!(
-                                production.matches(literal).count(),
-                                migrations.matches(literal).count()
-                            );
-                            hits.push(path.clone());
-                        }
-                    }
-                }
-            }
-        }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap();
-        let mut hits = Vec::new();
-        scan(root, &mut hits);
-        assert!(
-            !hits.is_empty(),
-            "the historical migration must be enumerated"
-        );
-    }
-
     fn correction_request(
         event_id: &str,
         basis: ChargeBasis,

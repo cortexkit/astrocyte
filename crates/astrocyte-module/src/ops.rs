@@ -1300,7 +1300,12 @@ mod tests {
 
         let state = test_state();
         for (name, marker) in ROUTES {
-            let (code, message) = dispatch(&state, name, json!({"astrocyte_probe": true}))
+            let probe = if name == OP_EVENT_INGEST {
+                json!({"bad": true})
+            } else {
+                json!({"astrocyte_probe": true})
+            };
+            let (code, message) = dispatch(&state, name, probe)
                 .expect_err("an unknown field is refused by every request type on this surface");
             assert_eq!(code, decode_refusal_code(name), "{name}");
             assert!(
@@ -1309,6 +1314,15 @@ mod tests {
                  which is not {marker:?}"
             );
         }
+        let rows = state
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM usage_event", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(rows, 0, "malformed dispatches must not store events");
     }
 
     /// Each operation is paired with the literal its handler prefixes to a

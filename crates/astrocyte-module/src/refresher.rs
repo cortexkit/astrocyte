@@ -2751,12 +2751,13 @@ fn resolve_event<'a>(
     catalog: Option<&CatalogClient>,
     event_id: &'a str,
     deadline: Option<std::time::Instant>,
+    now: &dyn Fn() -> std::time::Instant,
 ) -> Result<Option<ResolvedEvent<'a>>, String> {
     let plan = state.with_conn(|conn| {
         astrocyte_core::subscription::read_reprice(conn, event_id)
             .map_err(|error| format!("{}: {}", error.code(), error.message()))
     })?;
-    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+    if deadline.is_some_and(|deadline| now() >= deadline) {
         return Ok(None);
     }
     // Plan reading committed above; catalog resolution therefore never
@@ -2845,6 +2846,7 @@ fn price_event_group(
     recorded_at_ms: i64,
     stop: &AtomicBool,
     deadline: Option<std::time::Instant>,
+    now: &dyn Fn() -> std::time::Instant,
 ) -> Option<PricedGroup> {
     let mut outcomes = Vec::with_capacity(event_ids.len());
     let mut resolved = Vec::with_capacity(event_ids.len());
@@ -2852,10 +2854,10 @@ fn price_event_group(
         if stop.load(Ordering::Relaxed) {
             return None;
         }
-        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        if deadline.is_some_and(|deadline| now() >= deadline) {
             break;
         }
-        match resolve_event(state, catalog, event_id, deadline) {
+        match resolve_event(state, catalog, event_id, deadline, now) {
             Ok(Some(event)) => resolved.push(event),
             Ok(None) => break,
             Err(error) => outcomes.push((event_id.clone(), Err(error))),
@@ -2945,6 +2947,16 @@ pub(crate) fn run_pricing_walk(
     stop: &AtomicBool,
     walk: &mut PricingWalk,
 ) -> Result<PricingPass, String> {
+    run_pricing_walk_with_clock(state, recorded_at_ms, stop, walk, &std::time::Instant::now)
+}
+
+fn run_pricing_walk_with_clock(
+    state: &SharedState,
+    recorded_at_ms: i64,
+    stop: &AtomicBool,
+    walk: &mut PricingWalk,
+    now: &dyn Fn() -> std::time::Instant,
+) -> Result<PricingPass, String> {
     let catalog = state.catalog_client();
     let budget = walk.budget;
     let group_events = budget.group_events.max(1);
@@ -2956,7 +2968,7 @@ pub(crate) fn run_pricing_walk(
     // Keyset pagination: each group starts after the last id of the one
     // before, so an event that stays queued because it failed is not read
     // again in this pass and cannot hold the pass on one group.
-    let tick_started = std::time::Instant::now();
+    let tick_started = now();
     let deadline = tick_started.checked_add(budget.tick_time);
     let mut slowest_group = Duration::ZERO;
     let mut taken = 0_usize;
@@ -2980,7 +2992,7 @@ pub(crate) fn run_pricing_walk(
         };
         pass.queue_selection_steps += steps;
         let complete = group.len() < wanted;
-        let group_started = std::time::Instant::now();
+        let group_started = now();
         let Some(PricedGroup {
             attempted: processed,
             outcomes,
@@ -2991,6 +3003,7 @@ pub(crate) fn run_pricing_walk(
             recorded_at_ms,
             stop,
             deadline,
+            now,
         )
         else {
             // The cursor stays before this group, so the next pass starts
@@ -3024,10 +3037,14 @@ pub(crate) fn run_pricing_walk(
         }
         walk.after = group.last().cloned();
         attempted.extend(group);
-        slowest_group = slowest_group.max(group_started.elapsed());
+        slowest_group = slowest_group.max(now().duration_since(group_started));
         // Start another group only if one as slow as the slowest seen this
         // tick would still finish inside the budget.
-        if tick_started.elapsed().saturating_add(slowest_group) > budget.tick_time {
+        if now()
+            .duration_since(tick_started)
+            .saturating_add(slowest_group)
+            > budget.tick_time
+        {
             pass.paused = true;
             break;
         }
@@ -3041,9 +3058,7 @@ pub(crate) fn run_pricing_walk(
     // tick whose queue walk paused on the event cap too, but shares its
     // wall-time budget. Each tick's batch resumes where the last one ended;
     // see `BackfillSweep`.
-    if stop.load(Ordering::Relaxed)
-        || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-    {
+    if stop.load(Ordering::Relaxed) || deadline.is_some_and(|deadline| now() >= deadline) {
         return finish_pricing_pass(pass, failures);
     }
     let due = match state.with_conn(|conn| {
@@ -3112,6 +3127,7 @@ pub(crate) fn run_pricing_walk(
                 recorded_at_ms,
                 stop,
                 deadline,
+                now,
             )
             else {
                 // Nothing in this group was written, so the sweep resumes
@@ -5756,8 +5772,13 @@ mod tests {
                 "claude",
             );
         }
-        let peer =
-            ActsDuringLookup::new(instant, || std::thread::sleep(Duration::from_millis(300)));
+        let elapsed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let lookup_elapsed = elapsed.clone();
+        let peer = ActsDuringLookup::new(instant, move || {
+            lookup_elapsed.store(200, Ordering::SeqCst);
+        });
+        let origin = std::time::Instant::now();
+        let now = || origin + Duration::from_millis(elapsed.load(Ordering::SeqCst));
         state
             .install_catalog(Some(CatalogClient::connect(Arc::new(peer)).unwrap()))
             .unwrap();
@@ -5768,7 +5789,8 @@ mod tests {
             backfill_events: COVERAGE_BACKFILL_PER_PASS,
         });
 
-        let pass = run_pricing_walk(&state, 1, &NEVER_STOP, &mut walk).unwrap();
+        let pass = run_pricing_walk_with_clock(&state, 1, &NEVER_STOP, &mut walk, &now).unwrap();
+        assert_eq!(now().duration_since(origin), walk.budget.tick_time);
         assert_eq!(
             pass.priced, 1,
             "no catalog call may start after the budget expires"
@@ -5783,7 +5805,7 @@ mod tests {
 
         walk.budget.tick_time = Duration::MAX;
         assert_eq!(
-            run_pricing_walk(&state, 2, &NEVER_STOP, &mut walk)
+            run_pricing_walk_with_clock(&state, 2, &NEVER_STOP, &mut walk, &now)
                 .unwrap()
                 .priced,
             2
@@ -5818,9 +5840,13 @@ mod tests {
         assert_eq!(price_unpriced_events(&state, 1, &NEVER_STOP).unwrap(), 3);
         declare_plan(&state, 1_700_000_000_000);
         seed_account_event(&state, "ev-0", instant - 1, "metered_api", "claude");
-        let peer = ActsDuringLookup::new(instant - 1, || {
-            std::thread::sleep(Duration::from_millis(300))
+        let elapsed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let lookup_elapsed = elapsed.clone();
+        let peer = ActsDuringLookup::new(instant - 1, move || {
+            lookup_elapsed.store(200, Ordering::SeqCst);
         });
+        let origin = std::time::Instant::now();
+        let now = || origin + Duration::from_millis(elapsed.load(Ordering::SeqCst));
         state
             .install_catalog(Some(CatalogClient::connect(Arc::new(peer)).unwrap()))
             .unwrap();
@@ -5830,8 +5856,10 @@ mod tests {
             tick_time: Duration::from_millis(200),
             backfill_events: COVERAGE_BACKFILL_PER_PASS,
         });
-        let pass = run_pricing_walk(&state, 2, &NEVER_STOP, &mut walk).unwrap();
+        let pass = run_pricing_walk_with_clock(&state, 2, &NEVER_STOP, &mut walk, &now).unwrap();
+        assert_eq!(now().duration_since(origin), walk.budget.tick_time);
         assert_eq!(pass.priced, 1);
+        assert!(queued_event_ids(&state).is_empty());
         assert!(!pass.backfill_queried);
         assert_eq!(charge_rows_by_origin(&state, "ev-a").len(), 1);
         assert_eq!(charge_rows_by_origin(&state, "ev-b").len(), 1);
@@ -5844,7 +5872,7 @@ mod tests {
             .is_some());
         walk.budget.tick_time = Duration::MAX;
         assert_eq!(
-            run_pricing_walk(&state, 3, &NEVER_STOP, &mut walk)
+            run_pricing_walk_with_clock(&state, 3, &NEVER_STOP, &mut walk, &now)
                 .unwrap()
                 .priced,
             3
@@ -5856,6 +5884,19 @@ mod tests {
             )
             .unwrap()
             .is_none());
+        for event_id in ["ev-a", "ev-b", "ev-c"] {
+            assert_eq!(
+                charge_rows_by_origin(&state, event_id),
+                vec![
+                    ("pricing_pass".to_string(), 1),
+                    ("pricing_pass".to_string(), 2)
+                ]
+            );
+        }
+        assert_eq!(
+            charge_rows_by_origin(&state, "ev-0"),
+            vec![("pricing_pass".to_string(), 1)]
+        );
     }
 
     /// What a SQLite write-ahead log holds: every frame, and the commit

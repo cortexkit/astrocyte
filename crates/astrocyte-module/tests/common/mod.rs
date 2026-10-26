@@ -49,38 +49,13 @@ pub fn ckdev_binary() -> PathBuf {
 /// /var/folders (compared after resolving symlinks, since /var is a link to
 /// /private/var), else /tmp.
 #[cfg(target_os = "macos")]
-fn macos_copy_root(tmpdir: Option<std::ffi::OsString>) -> PathBuf {
+pub(super) fn macos_copy_root(tmpdir: Option<std::ffi::OsString>) -> PathBuf {
     let usable = tmpdir.map(PathBuf::from).filter(|dir| {
         dir.is_absolute()
             && std::fs::canonicalize(dir)
                 .is_ok_and(|real| !real.starts_with("/private/var/folders"))
     });
     usable.unwrap_or_else(|| PathBuf::from("/tmp"))
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::macos_copy_root;
-    use std::path::PathBuf;
-
-    #[test]
-    fn copy_root_follows_tmpdir_except_under_var_folders() {
-        let worker = tempfile::tempdir_in("/tmp").unwrap();
-        let real = std::fs::canonicalize(worker.path()).unwrap();
-        assert_eq!(
-            std::fs::canonicalize(macos_copy_root(Some(worker.path().into()))).unwrap(),
-            real
-        );
-        assert_eq!(macos_copy_root(None), PathBuf::from("/tmp"));
-        assert_eq!(
-            macos_copy_root(Some("relative/dir".into())),
-            PathBuf::from("/tmp")
-        );
-        assert_eq!(
-            macos_copy_root(Some("/var/folders".into())),
-            PathBuf::from("/tmp")
-        );
-    }
 }
 
 /// Every file and directory below `dir`, recursively.

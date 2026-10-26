@@ -890,42 +890,38 @@ pub(super) fn readonly_uri(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    #[ignore = "realistic-size page-query measurement"]
-    fn set_aside_page_query_cost_before_and_after() {
-        use std::time::Instant;
-        let mut conn = Connection::open_in_memory().unwrap();
+    fn page_selects_final_token_rows_and_retains_malformed_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let conn = Connection::open(&path).unwrap();
         conn.execute_batch("CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,time_created INTEGER NOT NULL,time_updated INTEGER NOT NULL,data TEXT NOT NULL); CREATE INDEX message_session_time_created_id_idx ON message(session_id,time_created,id);").unwrap();
-        let tx = conn.transaction().unwrap();
-        {
-            let mut insert = tx
-                .prepare("INSERT INTO message VALUES (?1,'s',?2,?2,?3)")
-                .unwrap();
-            for i in 0..1_834_282 {
-                let data = if i % 3 == 0 {
-                    r#"{"role":"user"}"#
-                } else {
-                    r#"{"role":"assistant","tokens":{"input":100,"output":20},"finish":"stop","time":{"created":1}}"#
-                };
-                insert
-                    .execute(params![format!("msg-{i:08}"), i, data])
-                    .unwrap();
-            }
+        for (ordinal, (id, data)) in [
+            ("final-finish", r#"{"role":"assistant","providerID":"provider","modelID":"model","tokens":{"input":100,"output":20},"finish":"stop","time":{"created":1}}"#),
+            ("final-completed", r#"{"role":"assistant","providerID":"provider","modelID":"model","tokens":{"input":7,"output":3},"time":{"created":1,"completed":2}}"#),
+            ("in-flight", r#"{"role":"assistant","providerID":"provider","modelID":"model","tokens":{"input":50},"time":{"created":1}}"#),
+            ("no-tokens", r#"{"role":"assistant","providerID":"provider","modelID":"model","finish":"stop","time":{"created":1}}"#),
+            ("bad-json", "{broken"),
+        ].into_iter().enumerate() {
+            let time = i64::try_from(ordinal + 1).unwrap();
+            conn.execute("INSERT INTO message VALUES (?1,'s',?2,?2,?3)", params![id, time, data]).unwrap();
         }
-        tx.commit().unwrap();
-        let old = format!("{ASSISTANT_ROW} AND {HAS_TOKENS} AND {TOKENS_FINAL}");
-        for (name, predicate) in [("before", old), ("after", eligible_row(true))] {
-            let mut stmt = conn.prepare(&format!("SELECT id,session_id,time_updated,data FROM message WHERE time_updated>=?1 AND time_updated<=?2 AND {predicate} ORDER BY time_updated,id")).unwrap();
-            let start = Instant::now();
-            let records = stmt
-                .query_map(params![1_000_000, 1_009_999], |r| r.get::<_, String>(0))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            let mut cost = OpenCodeScanCost::default();
-            cost.add_statement(&stmt);
-            assert_eq!(records.len(), 6667);
-            eprintln!("PAGE COST {name}: rows=1834282 selected={} elapsed_ms={} vm_steps={} fullscan_steps={}", records.len(), start.elapsed().as_millis(), cost.vm_steps, cost.fullscan_steps);
-        }
+        let page = read_page(&path, None, 10, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["final-finish", "final-completed"]
+        );
+        assert_eq!(
+            page.set_aside
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["bad-json"]
+        );
+        assert_eq!(page.high_water_ordinal, 5);
+        assert_eq!(page.consumed_ordinal, 5);
     }
     #[test]
     fn forward_slash_unc_uri_keeps_the_server_in_the_filename() {

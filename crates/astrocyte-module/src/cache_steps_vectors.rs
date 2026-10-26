@@ -356,7 +356,25 @@ fn the_after_cursor_request_serves_the_steps_past_its_cursor() {
 /// changes those bytes and fails here.
 #[test]
 fn published_replies_are_the_served_bytes() {
-    for (file, body) in received() {
+    let received = received();
+    let mut generated = received
+        .iter()
+        .map(|(file, _)| file.to_string())
+        .collect::<Vec<_>>();
+    generated.sort();
+    assert_eq!(
+        generated,
+        published_files(),
+        "published frames need generated cases"
+    );
+    assert_eq!(generated, listed_hashes().into_keys().collect::<Vec<_>>());
+    for group in ["reply-", "request-", "rejected/"] {
+        assert!(
+            generated.iter().any(|file| file.starts_with(group)),
+            "empty vector group: {group}"
+        );
+    }
+    for (file, body) in received {
         let expected = std::fs::read(format!("{DIR}/{file}")).unwrap_or_else(|error| {
             panic!("read test-vectors/usage-cache-steps-v1/{file}: {error}")
         });
@@ -371,14 +389,33 @@ fn published_replies_are_the_served_bytes() {
 /// Renaming a file, editing one or leaving one out fails here.
 #[test]
 fn published_sha256sums_cover_every_file() {
+    let listed = listed_hashes();
+    let published = published_files();
+    let listed_names = listed.keys().cloned().collect::<Vec<_>>();
+    assert_eq!(listed_names, published, "SHA256SUMS lists the wrong files");
+    for path in published {
+        let bytes = std::fs::read(format!("{DIR}/{path}")).unwrap();
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(listed[&path], hash, "{path} does not match SHA256SUMS");
+    }
+}
+
+fn listed_hashes() -> std::collections::BTreeMap<String, String> {
     let manifest = std::fs::read_to_string(format!("{DIR}/SHA256SUMS")).unwrap();
     let mut listed = std::collections::BTreeMap::new();
     for line in manifest.lines().filter(|line| !line.is_empty()) {
         let (hash, path) = line
             .split_once("  ")
             .unwrap_or_else(|| panic!("SHA256SUMS line is not '<hash>  <path>': {line}"));
-        listed.insert(path.to_string(), hash.to_string());
+        assert!(
+            listed.insert(path.to_string(), hash.to_string()).is_none(),
+            "duplicate manifest path: {path}"
+        );
     }
+    listed
+}
+
+fn published_files() -> Vec<String> {
     let mut published = Vec::new();
     let mut directories = vec![std::path::PathBuf::from(DIR)];
     while let Some(directory) = directories.pop() {
@@ -402,13 +439,7 @@ fn published_sha256sums_cover_every_file() {
         }
     }
     published.sort();
-    let listed_names = listed.keys().cloned().collect::<Vec<_>>();
-    assert_eq!(listed_names, published, "SHA256SUMS lists the wrong files");
-    for path in published {
-        let bytes = std::fs::read(format!("{DIR}/{path}")).unwrap();
-        let hash = format!("{:x}", Sha256::digest(&bytes));
-        assert_eq!(listed[&path], hash, "{path} does not match SHA256SUMS");
-    }
+    published
 }
 
 /// What each published reply or refusal asks of a decoder, read from the

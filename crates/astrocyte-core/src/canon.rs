@@ -191,7 +191,10 @@ mod tests {
         let a = json!({"b": 1, "a": 2, "c": {"z": 1, "y": 2}});
         let s = jcs_serialize(&a).unwrap();
         assert_eq!(s, r#"{"a":2,"b":1,"c":{"y":2,"z":1}}"#);
-        assert_eq!(canonical_hash(&a).unwrap(), canonical_hash(&a).unwrap());
+        assert_eq!(
+            canonical_hash(&a).unwrap(),
+            "c0f8bd0ab5119fda84f6a24ed2eff88949e145d20f0a1eddbb51e14ef1eae3cb"
+        );
     }
 
     #[test]
@@ -207,11 +210,10 @@ mod tests {
             jcs_serialize(&v).unwrap(),
             "{\"s\":\"a\\\"b\\\\c\\nd\\u0001\"}"
         );
-        let h = canonical_hash(&v).unwrap();
-        assert_eq!(h.len(), 64);
-        assert!(h
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(
+            canonical_hash(&v).unwrap(),
+            "45708bf1130c59d36aa9778c4a85caa874f014d32ad51b2405f7aa9759da8a11"
+        );
     }
 
     #[test]

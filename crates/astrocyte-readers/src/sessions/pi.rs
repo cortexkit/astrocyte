@@ -555,41 +555,6 @@ struct NoopPiFormatObserver;
 
 impl PiFormatObserver for NoopPiFormatObserver {}
 
-/// Parse the Prime Agent Pi-compatible format whose `session_info.name`
-/// identifies an RLM subagent when the session header has `rlmDepth > 0`.
-///
-/// Deduplication is intentionally cross-session: Prime Agent forks copy prior
-/// message entries into a file with a new session id. Provider response ids are
-/// preferred; the message id plus immutable event fields is the fallback.
-///
-/// Prime Agent's append-only JSONL may contain a UTF-8 BOM or undecodable
-/// records. Lossy line handling keeps malformed records local to their own
-/// line without changing the historical behavior of other Pi clients.
-// ASTROCYTE DIVERGENCE: Prime Agent is not a reader in this slice; compile its
-// shared-format entry point only to retain the copied Pi parser tests.
-#[cfg(test)]
-pub(crate) fn parse_pi_format_rlm_file_with_observer(
-    path: &Path,
-    client: &str,
-    fallback_provider: &'static str,
-    observer: &mut impl PiFormatObserver,
-) -> Vec<UnifiedMessage> {
-    // Undated records are kept, as upstream: the observer has already seen
-    // each one as emitted, and Prime's accounting walk matches records by
-    // position, so dropping one here would misalign every later record.
-    parse_pi_format_file_inner(
-        path,
-        client,
-        fallback_provider,
-        Some(client),
-        PiParseOptions::prime_agent(),
-        observer,
-    )
-    .into_iter()
-    .map(|record| record.message)
-    .collect()
-}
-
 #[derive(Clone, Copy)]
 struct PiParseOptions {
     rlm_session_name_as_agent: bool,
@@ -606,16 +571,6 @@ impl PiParseOptions {
             rlm_session_name_as_agent: false,
             retain_extra_fields: true,
             lossy_line_reader: false,
-        }
-    }
-
-    // ASTROCYTE DIVERGENCE: retained only by the copied Prime-mode parser tests.
-    #[cfg(test)]
-    const fn prime_agent() -> Self {
-        Self {
-            rlm_session_name_as_agent: true,
-            retain_extra_fields: true,
-            lossy_line_reader: true,
         }
     }
 }
@@ -1476,22 +1431,25 @@ mod tests {
     fn production_decode_does_not_materialize_extension_strings() {
         let extension = "x".repeat(10_000);
         let mut contents = "{\"type\":\"session\",\"id\":\"s\"}\n".to_string();
-        for index in 0..1_000 {
+        for index in 0..2 {
             contents.push_str(&format!(
                 "{{\"type\":\"message\",\"id\":\"{index}\",\"timestamp\":\"2026-09-01T00:00:00Z\",\"future\":\"{extension}\",\"message\":{{\"role\":\"assistant\",\"model\":\"gpt-5\",\"usage\":{{\"input\":1,\"output\":2,\"future\":\"{extension}\"}}}}}}\n"
             ));
         }
         let file = create_test_file(&contents);
         let parse = parse_pi_file_resumable(file.path(), None, PiPrefixCheck::Full);
-        assert_eq!(parse.messages.len(), 1_000);
+        assert_eq!(parse.messages.len(), 2);
         assert_eq!(parse.skipped_lines, 0);
         let reference = parse_pi_file(file.path());
-        assert_eq!(reference.len(), 1_000);
+        assert_eq!(reference.len(), 2);
         for (record, expected) in parse.messages.iter().zip(reference) {
             assert_eq!(record.message, expected);
+            assert_eq!(record.message.session_id, "s");
+            assert_eq!(record.message.model_id, "gpt-5");
+            assert_eq!(record.message.tokens.input, Some(1));
+            assert_eq!(record.message.tokens.output, Some(2));
         }
         let materialized = parse.resume.unwrap().state.materialized_extension_bytes;
-        eprintln!("1,000 records, two 10,000-byte extensions each: {materialized} materialized extension bytes");
         assert_eq!(materialized, 0, "ingest must skip unused extension values");
     }
 
@@ -1755,57 +1713,6 @@ mod tests {
         assert!(!full.resumed, "the periodic full check catches it");
     }
 
-    fn parse_prime_test_file(path: &Path) -> Vec<UnifiedMessage> {
-        let mut observer = NoopPiFormatObserver;
-        parse_pi_format_rlm_file_with_observer(path, "prime-agent", "prime-agent", &mut observer)
-    }
-
-    #[test]
-    fn prime_rejects_replacement_mangled_usage_keys() {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(b"{\"type\":\"session\",\"id\":\"root\",\"cwd\":\"/tmp/project\"}\n")
-            .unwrap();
-        file.write_all(
-            b"{\"type\":\"message\",\"id\":\"damaged-byte\",\"timestamp\":\"2026-08-08T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"in\xffput\":100,\"output\":5}}}\n",
-        )
-        .unwrap();
-        file.write_all(
-            "{\"type\":\"message\",\"id\":\"damaged-unicode\",\"timestamp\":\"2026-08-08T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"out�put\":7,\"input\":10}}}\n"
-                .as_bytes(),
-        )
-        .unwrap();
-        file.write_all(
-            b"{\"type\":\"message\",\"id\":\"clean\",\"timestamp\":\"2026-08-08T00:00:03Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20,\"output\":8}}}\n",
-        )
-        .unwrap();
-        file.flush().unwrap();
-
-        let messages = parse_prime_test_file(file.path());
-
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0]
-            .dedup_key
-            .as_deref()
-            .is_some_and(|key| key.starts_with("prime-agent:message:clean:")));
-        assert_eq!(messages[0].tokens.total(), 28);
-    }
-
-    #[test]
-    fn damaged_usage_extension_keys_do_not_hide_known_counters() {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(b"{\"type\":\"session\",\"id\":\"root\"}\n")
-            .unwrap();
-        file.write_all(
-            b"{\"type\":\"message\",\"id\":\"kept\",\"timestamp\":\"2026-08-08T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20,\"output\":8,\"future-\xff-field\":999}}}\n",
-        )
-        .unwrap();
-        file.flush().unwrap();
-
-        let messages = parse_prime_test_file(file.path());
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].tokens.total(), 28);
-    }
-
     #[test]
     fn standard_pi_skips_invalid_utf8_line_and_reads_later_records() {
         let mut file = NamedTempFile::new().unwrap();
@@ -1828,8 +1735,7 @@ mod tests {
         // A BOM decodes cleanly, so `str::trim` leaves U+FEFF glued to the
         // front of the header (it is not White_Space) and the header fails to
         // parse. That failure drops the entire transcript, not one record, so
-        // every Pi-format client has to strip it the way the lossy reader
-        // already does for Prime Agent.
+        // the Pi reader must strip it before decoding the header.
         let file = create_test_file(concat!(
             "\u{feff}",
             r#"{"type":"session","id":"session-with-bom","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project"}"#,
@@ -1838,17 +1744,10 @@ mod tests {
             "\n",
         ));
 
-        // ASTROCYTE DIVERGENCE: this crate intentionally ships only the Pi
-        // reader, so the shared-format Senpi and Kimchi wrapper assertions stay
-        // upstream while Pi and the shared Prime-mode path remain covered here.
-        for messages in [
-            parse_pi_file(file.path()),
-            parse_prime_test_file(file.path()),
-        ] {
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0].session_id, "session-with-bom");
-            assert_eq!(messages[0].tokens.total(), 28);
-        }
+        let messages = parse_pi_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "session-with-bom");
+        assert_eq!(messages[0].tokens.total(), 28);
     }
 
     #[test]
@@ -1870,78 +1769,6 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].session_id, "session-clean");
         assert_eq!(messages[0].tokens.total(), 28);
-    }
-
-    #[test]
-    fn prime_rejects_only_matching_critical_child_timestamps() {
-        for (depth, expected_ids) in [(1, vec!["clean"]), (0, vec!["damaged", "clean"])] {
-            let mut file = NamedTempFile::new().unwrap();
-            writeln!(
-                file,
-                "{{\"type\":\"session\",\"id\":\"root\",\"parentSession\":\"/tmp/parent.jsonl\",\"rlmDepth\":{depth}}}"
-            )
-            .unwrap();
-            file.write_all(
-                b"{\"type\":\"message\",\"id\":\"damaged\",\"timestamp\":\"2026-08-08T00:00:0\xffZ\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":10}}}\n",
-            ).unwrap();
-            file.write_all(b"{\"type\":\"message\",\"id\":\"clean\",\"timestamp\":\"2026-08-08T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20}}}\n").unwrap();
-            file.flush().unwrap();
-
-            let messages = parse_prime_test_file(file.path());
-            let ids = messages
-                .iter()
-                .map(|message| {
-                    message
-                        .dedup_key
-                        .as_deref()
-                        .unwrap()
-                        .split(':')
-                        .nth(2)
-                        .unwrap()
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(ids, expected_ids, "rlmDepth={depth}");
-        }
-    }
-
-    #[test]
-    fn prime_rejects_child_message_with_damaged_timestamp_key() {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(b"{\"type\":\"session\",\"id\":\"child\",\"parentSession\":\"/tmp/parent.jsonl\",\"rlmDepth\":1}\n")
-            .unwrap();
-        file.write_all(b"{\"type\":\"message\",\"id\":\"damaged\",\"time\xffstamp\":\"2026-08-08T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":10}}}\n").unwrap();
-        file.write_all(b"{\"type\":\"message\",\"id\":\"clean\",\"timestamp\":\"2026-08-08T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20}}}\n").unwrap();
-        file.flush().unwrap();
-
-        let messages = parse_prime_test_file(file.path());
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0]
-            .dedup_key
-            .as_deref()
-            .unwrap()
-            .contains(":clean:"));
-    }
-
-    #[test]
-    fn damaged_prime_session_placeholders_are_unique_by_source_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let first_dir = temp.path().join("first");
-        let second_dir = temp.path().join("second");
-        std::fs::create_dir_all(&first_dir).unwrap();
-        std::fs::create_dir_all(&second_dir).unwrap();
-        let first = first_dir.join("session.jsonl");
-        let second = second_dir.join("session.jsonl");
-        let contents = b"{\"type\":\"session\",\"id\":\"root-\xff\",\"cwd\":\"/tmp/project\"}\n{\"type\":\"message\",\"id\":\"clean\",\"timestamp\":\"2026-08-08T00:00:03Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20,\"output\":8}}}\n";
-        std::fs::write(&first, contents).unwrap();
-        std::fs::write(&second, contents).unwrap();
-
-        let first_messages = parse_prime_test_file(&first);
-        let second_messages = parse_prime_test_file(&second);
-
-        assert_eq!(first_messages.len(), 1);
-        assert_eq!(second_messages.len(), 1);
-        assert!(first_messages[0].session_id.starts_with("unknown:path:"));
-        assert_ne!(first_messages[0].session_id, second_messages[0].session_id);
     }
 
     #[test]

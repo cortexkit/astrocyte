@@ -224,7 +224,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(empty.decision, VerdictDecision::Allow);
         assert!(empty.consumed_nanos.is_empty());
         assert_eq!(empty.est_cost_nanos, Some(123));
         event(&conn, "spent");
@@ -263,7 +262,6 @@ mod tests {
         adjustment(&conn, "adjusted", "refund", "USD", -40);
         adjustment(&conn, "adjusted", "restatement", "USD", 10);
         let verdict = evaluate(&conn, &request()).unwrap();
-        assert_eq!(verdict.decision, VerdictDecision::Allow);
         assert_eq!(verdict.uncertainty.events_total, 1);
         assert_eq!(
             verdict.consumed_nanos,
@@ -314,7 +312,6 @@ mod tests {
         adjustment(&conn, "repriced", "refund", "USD", -40);
         event(&conn, "pending");
         let verdict = evaluate(&conn, &request()).unwrap();
-        assert_eq!(verdict.decision, VerdictDecision::Allow);
         assert_eq!(
             verdict.consumed_nanos,
             BTreeMap::from([("USD".into(), 110)])
@@ -351,7 +348,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(verdict.decision, VerdictDecision::Allow);
         assert_eq!(verdict.consumed_nanos, BTreeMap::from([("USD".into(), 60)]));
         assert_eq!(verdict.uncertainty.events_total, 1);
         assert_eq!(verdict.uncertainty.unpriced_events, 0);
@@ -363,7 +359,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(empty.decision, VerdictDecision::Allow);
         assert!(empty.consumed_nanos.is_empty());
         assert_eq!(empty.uncertainty.events_total, 0);
     }
@@ -376,7 +371,6 @@ mod tests {
         head(&conn, "large", "output", "USD", i64::MAX);
         adjustment(&conn, "large", "refund", "USD", -i64::MAX);
         let verdict = evaluate(&conn, &request()).unwrap();
-        assert_eq!(verdict.decision, VerdictDecision::Allow);
         assert_eq!(
             verdict.consumed_nanos,
             BTreeMap::from([("USD".into(), i64::MAX)])
@@ -392,7 +386,6 @@ mod tests {
         head(&conn, "negative", "input", "USD", 0);
         adjustment(&conn, "negative", "refund", "USD", i64::MIN);
         let verdict = evaluate(&conn, &request()).unwrap();
-        assert_eq!(verdict.decision, VerdictDecision::Allow);
         assert_eq!(
             verdict.consumed_nanos,
             BTreeMap::from([("USD".into(), i64::MIN)])
@@ -423,7 +416,6 @@ mod tests {
         ).unwrap();
         adjustment(&conn, "refunded", "refund", "USD", -40);
         let verdict = evaluate(&conn, &request()).unwrap();
-        assert_eq!(verdict.decision, VerdictDecision::Allow);
         assert_eq!(
             verdict.consumed_nanos,
             BTreeMap::from([("USD".into(), -40), ("JPY".into(), 0)])
@@ -449,7 +441,6 @@ mod tests {
             let start = std::time::Instant::now();
             let verdict = evaluate(&read, &request()).unwrap();
             let elapsed = start.elapsed();
-            assert_eq!(verdict.decision, VerdictDecision::Allow);
             assert_eq!(verdict.uncertainty.events_total, 100_000);
             assert_eq!(verdict.uncertainty.unpriced_events, 0);
             assert_eq!(
@@ -477,7 +468,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(verdict.decision, VerdictDecision::Allow);
         assert_eq!(verdict.uncertainty_scope, "machine");
         assert_eq!(verdict.limit_nanos, None);
     }

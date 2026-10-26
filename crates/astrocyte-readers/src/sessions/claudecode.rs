@@ -240,6 +240,11 @@ struct CallAggregate {
     emitted: bool,
 }
 
+#[cfg(not(test))]
+type CallHistory = HashMap<String, CallAggregate>;
+#[cfg(test)]
+use tests::CallHistory;
+
 /// Call aggregates for one file, carried across resumed reads.
 ///
 /// Every call seen in the file is kept, emitted or not, so a late copy of an
@@ -249,7 +254,7 @@ struct CallAggregate {
 #[derive(Debug, Clone, Default)]
 struct ClaudeParseState {
     lines: u64,
-    calls: HashMap<String, CallAggregate>,
+    calls: CallHistory,
     /// Keys of calls with new or changed usage since last handed to ingest.
     /// Every aggregate stays in `calls` so later copies of a request can still
     /// be compared against the usage already read for that request.
@@ -262,8 +267,6 @@ struct ClaudeParseState {
     /// Request ids seen in this file only as compaction replays (see
     /// [`UsageRecord::is_compaction_replay`]). They are never emitted.
     replay_only: HashSet<String>,
-    #[cfg(test)]
-    aggregate_visits: std::cell::Cell<usize>,
 }
 
 impl ClaudeParseState {
@@ -361,8 +364,6 @@ impl ClaudeParseState {
             .dirty
             .iter()
             .filter(|key| {
-                #[cfg(test)]
-                self.aggregate_visits.set(self.aggregate_visits.get() + 1);
                 let aggregate = &self.calls[*key];
                 // A complete call is ready immediately. An incomplete call
                 // waits for quiet unless it was emitted before: later changes
@@ -742,6 +743,57 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Count accesses to the retained history itself, not just the dirty set.
+    /// No Deref exposes the underlying map: new traversal APIs must count their
+    /// visits here before the parser can use them in a test build.
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct CallHistory {
+        rows: HashMap<String, CallAggregate>,
+        visits: std::cell::Cell<usize>,
+    }
+
+    impl CallHistory {
+        fn visit(&self) {
+            self.visits.set(self.visits.get() + 1);
+        }
+
+        pub(super) fn get(&self, key: &String) -> Option<&CallAggregate> {
+            self.visit();
+            self.rows.get(key)
+        }
+
+        pub(super) fn get_mut(&mut self, key: &String) -> Option<&mut CallAggregate> {
+            self.visit();
+            self.rows.get_mut(key)
+        }
+
+        pub(super) fn insert(&mut self, key: String, value: CallAggregate) {
+            self.rows.insert(key, value);
+        }
+
+        pub(super) fn remove(&mut self, key: &String) {
+            self.visit();
+            self.rows.remove(key);
+        }
+
+        fn iter(&self) -> impl Iterator<Item = (&String, &CallAggregate)> {
+            self.rows.iter().inspect(|_| self.visit())
+        }
+
+        fn len(&self) -> usize {
+            self.rows.len()
+        }
+    }
+
+    impl std::ops::Index<&String> for CallHistory {
+        type Output = CallAggregate;
+
+        fn index(&self, key: &String) -> &Self::Output {
+            self.visit();
+            &self.rows[key]
+        }
+    }
+
     const WINDOW: i64 = CLAUDE_CODE_QUIET_WINDOW_MS;
 
     #[test]
@@ -749,7 +801,7 @@ mod tests {
         let mut state = ClaudeParseState::default();
         let mut counts = ClaudeParseCounts::default();
         let mut buffer = Vec::new();
-        for index in 0..10_000 {
+        for index in 0..32 {
             parse_line(
                 record(&format!("r{index}"), 1, Some("end_turn")).as_bytes(),
                 &mut buffer,
@@ -757,25 +809,26 @@ mod tests {
                 &mut counts,
             );
         }
-        assert_eq!(state.take_emissions(false).len(), 10_000);
+        assert_eq!(state.take_emissions(false).len(), 32);
         assert_eq!(state.pending_calls(), 0);
-        state.aggregate_visits.set(0);
-        let started = std::time::Instant::now();
-        for _ in 0..100 {
+        state.calls.visits.set(0);
+        assert_eq!(state.calls.iter().count(), 32);
+        assert_eq!(state.calls.visits.get(), 32, "history walks are observed");
+        state.calls.visits.set(0);
+        for _ in 0..3 {
             assert!(state.take_emissions(true).is_empty());
             assert_eq!(state.pending_calls(), 0);
         }
-        let visits = state.aggregate_visits.get();
-        eprintln!(
-            "10,000 emitted calls, 100 quiet polls: {visits} aggregate visits, {:?}",
-            started.elapsed()
-        );
         assert_eq!(
             state.calls.len(),
-            10_000,
+            32,
             "late-copy comparisons keep their history"
         );
-        assert_eq!(visits, 0, "quiet polls must not visit emitted aggregates");
+        assert_eq!(
+            state.calls.visits.get(),
+            0,
+            "quiet polls must not visit emitted aggregates"
+        );
     }
 
     #[test]

@@ -406,7 +406,14 @@ fn matrix(path: &Path, half_dirty: bool) {
         .unwrap_or(usize::MAX);
     let mut cases = 0_u64;
     let mut accelerated = 0_u64;
-    for (index, request) in requests().into_iter().enumerate().skip(offset).take(limit) {
+    let requests = requests();
+    let expected_spend_cases = requests.len().saturating_sub(offset).min(limit);
+    assert!(
+        expected_spend_cases > 0,
+        "the selected matrix must compare spend reports"
+    );
+    let mut spend_cases = 0;
+    for (index, request) in requests.into_iter().enumerate().skip(offset).take(limit) {
         let started = Instant::now();
         let expected = spend_report_from_ledger(
             &tx,
@@ -435,8 +442,10 @@ fn matrix(path: &Path, half_dirty: bool) {
             fast,
         );
         cases += 1;
+        spend_cases += 1;
         accelerated += u64::from(fast);
     }
+    assert_eq!(spend_cases, expected_spend_cases);
     let start = Instant::now();
     let expected = subscription_report_base(&tx, &SubscriptionReportRequest {}, None).unwrap();
     let actual = subscription(&tx, &SubscriptionReportRequest {})

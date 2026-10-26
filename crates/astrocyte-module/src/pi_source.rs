@@ -1059,35 +1059,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "mechanism timing for request comparison"]
-    fn same_call_comparison_timing() {
-        let directory = TempDir::new().unwrap();
-        let path = write_fixture(
-            directory.path(),
-            "project",
-            &fixture("s", "/project", Some("response")),
-        );
-        let parsed = parse_pi_file_resumable(&path, None, PiPrefixCheck::Full);
-        let request = map_message(parsed.messages.into_iter().next().unwrap()).unwrap();
-        let mut copy = request.clone();
-        copy.session = Some("fork".into());
-        copy.project_root = Some("/copy".into());
-        let start = std::time::Instant::now();
-        for _ in 0..100_000 {
-            assert!(std::hint::black_box(same_call(
-                std::hint::black_box(&request),
-                std::hint::black_box(&copy)
-            )));
-        }
-        eprintln!(
-            "same_call: 100000 comparisons, {} us",
-            start.elapsed().as_micros()
-        );
-        copy.measurements[0].quantity_units = Some(999_999);
-        assert!(!same_call(&request, &copy));
-    }
-
-    #[test]
     fn set_aside_pi_bad_record_keeps_good_calls_and_resume() {
         for conflict in [false, true] {
             let temp = TempDir::new().unwrap();
@@ -2302,6 +2273,15 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 1, "file path and read time are not event identity");
+
+        let parsed = parse_pi_file_resumable(&original, None, PiPrefixCheck::Full);
+        let request = map_message(parsed.messages.into_iter().next().unwrap()).unwrap();
+        let mut copy = request.clone();
+        copy.session = Some("fork".into());
+        copy.project_root = Some("/copy".into());
+        assert!(same_call(&request, &copy));
+        copy.measurements[0].quantity_units = Some(999_999);
+        assert!(!same_call(&request, &copy));
     }
 
     /// A stop that arrives partway through recording a Pi drain rolls back

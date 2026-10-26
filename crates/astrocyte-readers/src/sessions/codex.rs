@@ -1002,27 +1002,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "UUID decoder wall-time measurement"]
-    fn uuid_v7_decode_cost_before_and_after() {
-        let id = "019f48b9-8c8f-7351-8841-9387ce1e709f";
-        for (name, decode) in [
-            (
-                "allocating reference",
-                allocating_uuid_reference as fn(&str) -> Option<u64>,
-            ),
-            ("byte decoder", uuid_v7_millis),
-        ] {
-            let started = std::time::Instant::now();
-            for _ in 0..100_000 {
-                assert_eq!(
-                    std::hint::black_box(decode(std::hint::black_box(id))),
-                    Some(0x019f_48b9_8c8f)
-                );
-            }
-            eprintln!("{name}, 100,000 UUIDs: {:?}", started.elapsed());
-        }
-    }
     use std::io::Write;
 
     const THREAD: &str = "019f48b9-8c8f-7351-8841-9387ce1e709f";

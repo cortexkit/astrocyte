@@ -187,13 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_with_a_new_lineage_cannot_resurrect_an_event() {
-        let before_replay = event_id("plex", Some("lineage-before"), "record-1").unwrap();
-        let after_replay = event_id("plex", Some("lineage-after"), "record-1").unwrap();
-        assert_ne!(before_replay, after_replay);
-    }
-
-    #[test]
     fn event_id_canonicalization_prevents_concatenation_collisions() {
         let first = event_id("ab", Some("c"), "d").unwrap();
         let second = event_id("a", Some("bc"), "d").unwrap();

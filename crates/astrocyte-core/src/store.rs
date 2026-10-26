@@ -4034,17 +4034,13 @@ mod tests {
         )
         .unwrap();
         seed_integer_chains(&conn);
-        // Enough events that the migration's cost is visible if it ever
-        // started rewriting rows; the time is printed, never asserted.
         conn.execute_batch(
-            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<20000)
-             INSERT INTO usage_event (event_id,producer,producer_ref,run_ref,charge_basis,
+            "INSERT INTO usage_event (event_id,producer,producer_ref,run_ref,charge_basis,
                                       recorded_at_ms,occurred_at_ms)
-             SELECT 'bulk-'||i,'fixture','bulk-'||i,'run-'||i,'metered_api',1,i FROM n;",
+             VALUES ('legacy-run','fixture','legacy-run','run-1','metered_api',1,1);",
         )
         .unwrap();
         let before = all_rows(&conn);
-        let started = std::time::Instant::now();
         conn.execute_batch(
             MIGRATIONS
                 .iter()
@@ -4053,11 +4049,6 @@ mod tests {
                 .statements,
         )
         .unwrap();
-        println!(
-            "schema v26 on {} events took {:?}",
-            table_rows(&conn, "usage_event").len(),
-            started.elapsed()
-        );
         // Every table keeps its rows; usage_event rows gain one trailing
         // NULL, the new flow_ref.
         let after = all_rows(&conn);
@@ -5510,7 +5501,7 @@ mod tests {
     fn schema_v23_query_plans_bound_backfill_and_multiplier_history() {
         use rusqlite::types::Value::{Integer, Text};
         let mut conn = pre19();
-        seed_query_history(&conn, 20_000, 100_000);
+        seed_query_history(&conn, 3_000, 15_000);
         conn.execute_batch("UPDATE usage_event SET currency='USD';
             INSERT INTO adjustment (adjustment_id,event_id,currency,amount_nanos,reason,occurred_at_ms,recorded_at_ms,origin)
                 SELECT event_id,event_id,'USD',-1,'refund',1,1,'operator' FROM usage_event").unwrap();
@@ -5553,11 +5544,7 @@ mod tests {
                 include_str!("statement.rs"),
                 "SELECT event.event_id,event.currency,",
             ),
-            vec![
-                Text("openai".into()),
-                Text("a".into()),
-                Text("20000".into()),
-            ],
+            vec![Text("openai".into()), Text("a".into()), Text("3000".into())],
             "usage_event_statement_match",
         ));
         cases.push((
@@ -5566,7 +5553,7 @@ mod tests {
                 include_str!("statement.rs"),
                 "SELECT amount_nanos FROM adjustment WHERE event_key=",
             ),
-            vec![Text("e0020000".into())],
+            vec![Text("e0003000".into())],
             "adjustment_event_lookup",
         ));
         for (name, query) in [("scope_models", models), ("time_tokens", tokens)] {
@@ -5576,8 +5563,8 @@ mod tests {
                 vec![
                     Text("codex".into()),
                     Text("openai".into()),
-                    Text("19991".into()),
-                    Text("20001".into()),
+                    Text("2991".into()),
+                    Text("3001".into()),
                 ],
                 "usage_event_multiplier_scope_time",
             ));
@@ -5593,8 +5580,8 @@ mod tests {
                 Text("subscription_included".into()),
                 Text("pi".into()),
                 Text("openai".into()),
-                Text("19991".into()),
-                Text("20001".into()),
+                Text("2991".into()),
+                Text("3001".into()),
             ],
             "usage_event_multiplier_scope_time",
         ));

@@ -40,29 +40,7 @@ fn contains_versioned_family(haystack: &str, family: &str) -> bool {
     false
 }
 
-fn contains_family(haystack: &str, family: &str, delimiter_aware: bool) -> bool {
-    if delimiter_aware {
-        contains_versioned_family(haystack, family)
-    } else {
-        haystack.contains(family)
-    }
-}
-
 pub fn inferred_provider_from_model(model: &str) -> Option<&'static str> {
-    inferred_provider_from_model_inner(model, false)
-}
-
-// ASTROCYTE DIVERGENCE: only copied inference tests use boundary-delimited
-// family matching; production inference keeps upstream's normal matching mode.
-#[cfg(test)]
-fn inferred_provider_from_model_delimited(model: &str) -> Option<&'static str> {
-    inferred_provider_from_model_inner(model, true)
-}
-
-fn inferred_provider_from_model_inner(
-    model: &str,
-    delimit_family_names: bool,
-) -> Option<&'static str> {
     let lower = model.to_lowercase();
 
     // Ollama is a routing prefix, not part of the upstream model family. In
@@ -70,11 +48,11 @@ fn inferred_provider_from_model_inner(
     // otherwise-unknown Ollama model as Meta. Re-run inference on the routed
     // model so known families retain their actual providers.
     if let Some(routed_model) = lower.strip_prefix("ollama/") {
-        return inferred_provider_from_model_inner(routed_model, delimit_family_names);
+        return inferred_provider_from_model(routed_model);
     }
 
-    if contains_family(&lower, "claude", delimit_family_names)
-        || contains_family(&lower, "anthropic", delimit_family_names)
+    if lower.contains("claude")
+        || lower.contains("anthropic")
         || contains_versioned_family(&lower, "opus")
         || contains_versioned_family(&lower, "sonnet")
         || contains_versioned_family(&lower, "haiku")
@@ -83,8 +61,8 @@ fn inferred_provider_from_model_inner(
         return Some("anthropic");
     }
 
-    if contains_family(&lower, "gpt", delimit_family_names)
-        || contains_family(&lower, "openai", delimit_family_names)
+    if lower.contains("gpt")
+        || lower.contains("openai")
         || contains_delimited(&lower, "o1")
         || contains_delimited(&lower, "o3")
         || contains_delimited(&lower, "o4")
@@ -92,40 +70,36 @@ fn inferred_provider_from_model_inner(
         return Some("openai");
     }
 
-    if contains_family(&lower, "gemini", delimit_family_names)
-        || contains_family(&lower, "google", delimit_family_names)
-    {
+    if lower.contains("gemini") || lower.contains("google") {
         return Some("google");
     }
-    if contains_family(&lower, "grok", delimit_family_names) {
+    if lower.contains("grok") {
         return Some("xai");
     }
-    if contains_family(&lower, "deepseek", delimit_family_names) {
+    if lower.contains("deepseek") {
         return Some("deepseek");
     }
-    if contains_family(&lower, "minimax", delimit_family_names) {
+    if lower.contains("minimax") {
         return Some("minimax");
     }
-    if contains_family(&lower, "mistral", delimit_family_names)
-        || contains_family(&lower, "mixtral", delimit_family_names)
-        || contains_family(&lower, "codestral", delimit_family_names)
-        || contains_family(&lower, "devstral", delimit_family_names)
+    if lower.contains("mistral")
+        || lower.contains("mixtral")
+        || lower.contains("codestral")
+        || lower.contains("devstral")
     {
         return Some("mistral");
     }
-    if contains_family(&lower, "llama", delimit_family_names)
-        || contains_versioned_family(&lower, "meta")
-    {
+    if lower.contains("llama") || contains_versioned_family(&lower, "meta") {
         return Some("meta");
     }
-    if contains_family(&lower, "qwen", delimit_family_names) {
+    if lower.contains("qwen") {
         return Some("qwen");
     }
 
     // Sakana's `fugu` / `fugu-ultra` model line. Bare `fugu` is intentionally
     // still mapped to the sakana provider here (provider identity is independent
     // of whether tokscale can price the model).
-    if contains_family(&lower, "fugu", delimit_family_names) {
+    if lower.contains("fugu") {
         return Some("sakana");
     }
 
@@ -255,56 +229,6 @@ mod tests {
                 inferred_provider_from_model(model),
                 Some("mistral"),
                 "{model}"
-            );
-        }
-    }
-
-    #[test]
-    fn delimiter_aware_inference_accepts_family_versions_not_word_substrings() {
-        let genuine = [
-            ("gpt4-turbo", "openai"),
-            ("claude3-opus", "anthropic"),
-            ("opus4", "anthropic"),
-            ("gemini2-pro", "google"),
-            ("grok3", "xai"),
-            ("deepseek3", "deepseek"),
-            ("minimax2", "minimax"),
-            ("mistral4", "mistral"),
-            ("llama3", "meta"),
-            ("qwen3-coder", "qwen"),
-            ("fugu2", "sakana"),
-            ("kimi2", "moonshotai"),
-            ("mimo2", "xiaomi"),
-            ("glm5", "zai"),
-        ];
-        for (model, provider) in genuine {
-            assert_eq!(
-                inferred_provider_from_model_delimited(model),
-                Some(provider),
-                "{model}"
-            );
-        }
-
-        for model in [
-            "agpt-model",
-            "declaude-x",
-            "pregeminified",
-            "engroked",
-            "deepseeking",
-            "minimaximal",
-            "demistralized",
-            "remixtralized",
-            "collamated",
-            "unqwened-model",
-            "defugued",
-            "skimimoed",
-            "glimmer",
-            "unkimied",
-        ] {
-            assert_eq!(
-                inferred_provider_from_model_delimited(model),
-                None,
-                "{model} is not a genuine family token"
             );
         }
     }

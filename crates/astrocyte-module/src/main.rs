@@ -2384,20 +2384,6 @@ mod tests {
         assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn dispatch_wires_a_public_operation_to_the_writer_fence() {
-        let state = test_state();
-        let result = ops::dispatch(&state, ops::OP_EVENT_INGEST, json!({"bad":true}));
-        assert!(result.is_err());
-        let count: i64 = state
-            .with_conn(|conn| {
-                conn.query_row("SELECT COUNT(*) FROM usage_event", [], |row| row.get(0))
-                    .map_err(|error| error.to_string())
-            })
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn event_reprice_is_callable_from_a_management_surface_frame() {
         let state = Arc::new(test_state());

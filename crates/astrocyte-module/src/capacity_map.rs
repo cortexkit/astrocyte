@@ -691,18 +691,10 @@ mod tests {
         );
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0].level, "WARN");
-        assert!(events[0]
-            .fields
-            .get("account_ref")
-            .is_some_and(|value| value.contains("account-bad")));
-        assert!(events[0]
-            .fields
-            .get("pool_key")
-            .is_some_and(|value| value.contains("extra:1:N")));
-        assert!(events[0]
-            .fields
-            .get("count")
-            .is_some_and(|count| count == "2" || count.contains("2")));
+        assert_eq!(events[0].fields["provider"], "codex");
+        assert_eq!(events[0].fields["account_ref"], "account-bad");
+        assert_eq!(events[0].fields["pool_key"], "extra:1:N");
+        assert_eq!(events[0].fields["count"], "2");
     }
 
     #[test]
@@ -784,27 +776,27 @@ mod tests {
             event
                 .fields
                 .get("pool_key")
-                .is_some_and(|pool_key| pool_key.contains("primary"))
+                .is_some_and(|pool_key| pool_key == "primary")
         }));
         assert!(events.iter().any(|event| {
             event
                 .fields
                 .get("account_ref")
-                .is_some_and(|account| account.contains("account-replaced"))
+                .is_some_and(|account| account == "account-replaced")
                 && event
                     .fields
                     .get("previous_windows")
-                    .is_some_and(|status| status.contains("replaced"))
+                    .is_some_and(|status| status == "replaced by the remaining usable windows")
         }));
         assert!(events.iter().any(|event| {
             event
                 .fields
                 .get("account_ref")
-                .is_some_and(|account| account.contains("account-retained"))
+                .is_some_and(|account| account == "account-retained")
                 && event
                     .fields
                     .get("previous_windows")
-                    .is_some_and(|status| status.contains("preserved"))
+                    .is_some_and(|status| status == "preserved because no usable window remains")
         }));
     }
 

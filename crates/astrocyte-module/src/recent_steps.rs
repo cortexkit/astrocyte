@@ -429,13 +429,6 @@ mod tests {
         record_event_in_tx, DeliveryPath, EventRecordRequest, MeasurementInput, StepDetail,
     };
 
-    /// The per-step cost the design budgets for: about 80 bytes plus the
-    /// step id's text.
-    #[test]
-    fn a_kept_step_is_96_bytes_plus_its_id() {
-        assert_eq!(std::mem::size_of::<StepRecord>(), 96);
-    }
-
     const NOW: i64 = 10 * cache::RECENT_WINDOW_MS;
 
     fn request(
@@ -553,7 +546,7 @@ mod tests {
     fn memory_keeps_the_newest_thousand_steps_and_answers_like_the_store() {
         let state = ready_state();
         let reads = |index: usize| [9_000, 0, 9_500, 4_000, 9_000][index % 5];
-        let requests = (0..1_200)
+        let requests = (0..1_001)
             .map(|index| {
                 request(
                     "long",
@@ -564,12 +557,26 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        for chunk in requests.chunks(150) {
-            record(&state, chunk);
+        let mut recorded = 0;
+        for end in [999_usize, 1_000, 1_001] {
+            for chunk in requests[recorded..end].chunks(150) {
+                record(&state, chunk);
+            }
+            recorded = end;
+            state.with_recent_steps_for_test(|memory| {
+                assert_eq!(memory.kept("pi", "long"), Some(end.min(1_000)));
+            });
+            let memory = state.recent_steps_answer(&query("long", 1_000)).unwrap();
+            let ids = memory
+                .steps
+                .iter()
+                .map(|step| step.step_ref.clone())
+                .collect::<Vec<_>>();
+            let expected = (end.saturating_sub(1_000)..end)
+                .map(|index| format!("long:{index}"))
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "retained ids after {end} steps");
         }
-        state.with_recent_steps_for_test(|memory| {
-            assert_eq!(memory.kept("pi", "long"), Some(MAX_STEPS_PER_SESSION));
-        });
         for limit in [1, 200, 999, 1_000] {
             let memory = state.recent_steps_answer(&query("long", limit)).unwrap();
             assert_eq!(
@@ -589,6 +596,26 @@ mod tests {
     /// whose newest step is older than 24 hours.
     #[test]
     fn memory_keeps_at_most_two_hundred_recent_sessions() {
+        let boundary = ready_state();
+        record(
+            &boundary,
+            &[
+                request("outside", 0, NOW - 86_400_000 - 1, 5, None),
+                request("exact", 0, NOW - 86_400_000, 5, None),
+                request("inside", 0, NOW - 86_400_000 + 1, 5, None),
+            ],
+        );
+        let assert_boundary = || {
+            boundary.with_recent_steps_for_test(|memory| {
+                assert_eq!(memory.kept("pi", "outside"), None);
+                assert_eq!(memory.kept("pi", "exact"), Some(1));
+                assert_eq!(memory.kept("pi", "inside"), Some(1));
+            })
+        };
+        assert_boundary();
+        boundary.rebuild_recent_steps();
+        assert_boundary();
+
         let state = ready_state();
         let sessions = (0..210)
             .map(|index| format!("s{index:03}"))

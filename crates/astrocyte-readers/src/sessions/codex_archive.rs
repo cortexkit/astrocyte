@@ -145,11 +145,11 @@ mod tests {
         let mut frames = frame(&data.as_bytes()[..900]);
         frames.extend(frame(&data.as_bytes()[900..]));
         std::fs::write(&path, frames).unwrap();
-        assert!(read_archive(&path, 1000, 128)
-            .unwrap_err()
-            .to_string()
-            .contains("decoded size"));
-        let parsed = read_archive(&path, 4096, 128).unwrap();
+        let limit = u64::try_from(data.len()).unwrap();
+        let error = read_archive(&path, limit - 1, 128).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "decoded size exceeds limit");
+        let parsed = read_archive(&path, limit, 128).unwrap();
         assert_eq!(parsed.counts.lines, 100);
         assert_eq!(
             parsed.decompressed_bytes,
@@ -185,8 +185,10 @@ mod tests {
         assert!(parsed.io_error.is_none());
         assert!(parsed.calls.is_empty());
         assert_eq!(parsed.set_aside.len(), 1);
-        assert!(parsed.set_aside[0]
-            .1
-            .contains("activity but no supported usage"));
+        assert_eq!(parsed.set_aside[0].0, 0);
+        assert_eq!(
+            parsed.set_aside[0].1,
+            "Codex archive has activity but no supported usage; token quantities are unknown"
+        );
     }
 }
