@@ -847,9 +847,15 @@ pub struct ChangedSession {
 
 /// `(producer, session, occurred_at_ms)` of every dated step whose cache
 /// cursor is in `(?1, ?2]`.
+/// Dated steps whose cache cursor is in `(?1, ?2]`.
+///
+/// `CROSS JOIN` makes SQLite drive from the cursor range, a short rowid range
+/// read on every fast-lane commit. Left to choose, the planner drove from
+/// `usage_event`'s producer index and probed each event's cursor, reading the
+/// whole ledger (about 1.3 s per call on a 2.3M-event store).
 const DATED_STEPS_BETWEEN_SQL: &str = concat!(
     "SELECT e.producer,e.session,e.occurred_at_ms FROM cache_step_sequence s",
-    " JOIN usage_event e ON e.event_key=s.event_key",
+    " CROSS JOIN usage_event e ON e.event_key=s.event_key",
     " WHERE s.cursor>?1 AND s.cursor<=?2 AND e.session IS NOT NULL",
     " AND e.occurred_at_ms IS NOT NULL AND e.producer IN ",
     harnesses_sql!()
@@ -1106,6 +1112,30 @@ mod tests {
     };
     use crate::store::{initialize_connection, MIGRATIONS};
     use crate::test_support::conn;
+
+    /// The changed-session read runs after every commit, so it must read only
+    /// the new cursor range, never the ledger.
+    #[test]
+    fn changed_sessions_reads_only_the_new_cursor_range() {
+        let conn = conn();
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {DATED_STEPS_BETWEEN_SQL}"))
+            .unwrap()
+            .query_map(params![0, 10], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.first()
+                .is_some_and(|line| line.starts_with("SEARCH s USING INTEGER PRIMARY KEY")),
+            "the cursor range must drive the read: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|line| !line.contains("SCAN") && !line.contains("USING INDEX usage_event")),
+            "the read must not walk usage_event: {plan:?}"
+        );
+    }
 
     fn counts(input: Option<u64>, read: Option<u64>, write: Option<u64>) -> StepCounts {
         StepCounts {
