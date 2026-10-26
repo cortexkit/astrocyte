@@ -90,9 +90,9 @@ pub struct MeasurementInput {
 pub struct EventRecordRequest {
     pub producer: String,
     /// `None` when the producer has no restarting reference space to
-    /// disambiguate for this event — see `fact::UsageEventIdentity` for the two
-    /// producer shapes that share this arm. Absence is representable and is not the empty string: the two
-    /// hash to different key shapes and can never share an identity.
+    /// disambiguate for this event — see [`fact::event_id`] for the producer
+    /// shapes that omit lineage. Absence and the empty string hash to different
+    /// key shapes and can never share an identity.
     #[serde(default)]
     pub producer_lineage: Option<String>,
     pub producer_ref: String,
@@ -1278,26 +1278,7 @@ fn merge_pair_effects(total: &mut PairEffects, next: PairEffects) {
 mod tests {
     use super::*;
     use crate::store::{initialize_connection, MIGRATIONS};
-
-    fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_connection(&conn).unwrap();
-        for migration in MIGRATIONS {
-            conn.execute_batch(migration.statements).unwrap();
-        }
-        conn
-    }
-
-    fn measurement(role: &str, units: Option<i64>) -> MeasurementInput {
-        MeasurementInput {
-            role: role.into(),
-            unit: "token".into(),
-            kind: "billed".into(),
-            source: format!("usage.{role}"),
-            quantity_units: units,
-            quantity_exponent: units.map(|_| 0),
-        }
-    }
+    use crate::test_support::{conn, measurement};
 
     fn request(
         producer_ref: &str,

@@ -70,27 +70,6 @@ const fn default_message_count() -> i32 {
 }
 
 impl UnifiedMessage {
-    pub fn new(
-        client: impl Into<String>,
-        model_id: impl Into<String>,
-        provider_id: impl Into<String>,
-        session_id: impl Into<String>,
-        timestamp: i64,
-        tokens: TokenBreakdown,
-        cost: f64,
-    ) -> Self {
-        Self::new_full(
-            client,
-            model_id,
-            provider_id,
-            session_id,
-            timestamp,
-            tokens,
-            cost,
-            None,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_agent(
         client: impl Into<String>,
@@ -237,7 +216,7 @@ mod tests {
             reasoning: Some(0),
         };
 
-        let msg = UnifiedMessage::new(
+        let msg = UnifiedMessage::new_with_agent(
             "opencode",
             "claude-3-5-sonnet",
             "anthropic",
@@ -245,6 +224,7 @@ mod tests {
             1733011200000,
             tokens,
             0.05,
+            None,
         );
 
         assert_eq!(msg.client, "opencode");

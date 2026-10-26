@@ -22,4 +22,7 @@ pub mod store;
 pub mod subscription;
 pub mod verdict;
 
-pub use fact::{event_id, Measurement, UsageEvent, UsageEventIdentity};
+#[cfg(test)]
+mod test_support;
+
+pub use fact::{event_id, Measurement, UsageEvent};

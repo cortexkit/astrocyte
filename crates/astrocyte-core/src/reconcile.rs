@@ -318,16 +318,7 @@ mod tests {
 
     use super::*;
     use crate::statement_import::{import_statement_in_tx, StatementImportRequest};
-    use crate::store::{initialize_connection, MIGRATIONS};
-
-    fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_connection(&conn).unwrap();
-        for migration in MIGRATIONS {
-            conn.execute_batch(migration.statements).unwrap();
-        }
-        conn
-    }
+    use crate::test_support::conn;
 
     fn stored_state(conn: &Connection) -> (i64, i64, i64, i64, i64) {
         let count = |table: &str| {

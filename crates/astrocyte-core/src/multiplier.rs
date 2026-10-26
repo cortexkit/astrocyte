@@ -2621,22 +2621,13 @@ fn observation_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{initialize_connection, MIGRATIONS};
+    use crate::test_support::conn;
 
     const DAY: i64 = 86_400_000;
     /// $200.00 a month, in nanos.
     const PLAN_200: i64 = 200_000_000_000;
     /// $10 per million tokens, in nano-USD per million.
     const TEN_PER_M: i64 = 10_000_000_000;
-
-    fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_connection(&conn).unwrap();
-        for migration in MIGRATIONS {
-            conn.execute_batch(migration.statements).unwrap();
-        }
-        conn
-    }
 
     fn window() -> WindowSelector {
         WindowSelector {

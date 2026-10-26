@@ -40,54 +40,14 @@ impl ChargeBasis {
     }
 }
 
-/// The natural key from which Astrocyte derives its local event identifier.
-///
-/// `producer_lineage` is `None` when the producer has no restarting reference
-/// space to disambiguate. That covers two producers that look opposite and are
-/// the same at the key: one that could not observe its own generation, and one
-/// whose references are already stable across restarts (a content hash) and
-/// must NOT supply a generation, because stamping an instance id onto a stable
-/// reference would mint a new identity for the same charge after every restart.
-/// Absence is recorded as absent rather than replaced by a stand-in value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct UsageEventIdentity {
-    pub producer: String,
-    pub producer_lineage: Option<String>,
-    pub producer_ref: String,
-}
-
-impl UsageEventIdentity {
-    pub fn new(
-        producer: impl Into<String>,
-        producer_lineage: impl Into<Option<String>>,
-        producer_ref: impl Into<String>,
-    ) -> Self {
-        Self {
-            producer: producer.into(),
-            producer_lineage: producer_lineage.into(),
-            producer_ref: producer_ref.into(),
-        }
-    }
-
-    /// Derives Astrocyte's identifier from a typed, canonical natural key.
-    ///
-    /// The hash discriminates on the SHAPE of the key, not on a value: a
-    /// lineage-present key carries the lineage as a string field, a
-    /// lineage-absent key omits the field entirely. The two structures can
-    /// never collide, including against a producer that legitimately sends
-    /// the empty string. Mapping the absence onto any string — even `""` —
-    /// would fuse those two cases into one identity.
-    pub fn event_id(&self) -> Result<String, CanonError> {
-        event_id(
-            &self.producer,
-            self.producer_lineage.as_deref(),
-            &self.producer_ref,
-        )
-    }
-}
-
 /// Derives a local event identifier without adopting the producer reference as
 /// Astrocyte's primary key.
+///
+/// `producer_lineage` is `None` when the producer cannot observe its generation
+/// or its references are already stable across restarts (for example, a content
+/// hash). Adding a generation to a stable reference would mint a new identity
+/// for the same charge after every restart. An absent lineage omits the field
+/// from the canonical key; even an empty string is a distinct, present lineage.
 pub fn event_id(
     producer: &str,
     producer_lineage: Option<&str>,
@@ -111,7 +71,7 @@ pub struct UsageEvent {
     pub event_id: String,
     pub producer: String,
     /// `None` when the producer has no restarting reference space to
-    /// disambiguate (see `UsageEventIdentity`); the stored row keeps the
+    /// disambiguate (see [`event_id`]); the stored row keeps the
     /// absence visible so a reader can see which key shape minted the identity.
     pub producer_lineage: Option<String>,
     pub producer_ref: String,
@@ -187,12 +147,6 @@ mod tests {
             ),
         ] {
             assert_eq!(event_id(producer, lineage, reference).unwrap(), expected);
-            assert_eq!(
-                UsageEventIdentity::new(producer, lineage.map(str::to_string), reference)
-                    .event_id()
-                    .unwrap(),
-                expected
-            );
         }
     }
 
@@ -213,12 +167,6 @@ mod tests {
             allocations <= 650_000,
             "identity hashing must not own temporary strings and JSON: {allocations}"
         );
-    }
-
-    #[test]
-    fn event_id_is_stable_for_the_same_natural_key() {
-        let identity = UsageEventIdentity::new("plex", "lineage-a".to_string(), "record-17");
-        assert_eq!(identity.event_id().unwrap(), identity.event_id().unwrap());
     }
 
     #[test]

@@ -582,7 +582,7 @@ mod tests {
 
     use super::*;
     use crate::statement::MatchOutcome;
-    use crate::store::{initialize_connection, MIGRATIONS};
+    use crate::test_support::conn;
 
     /// Imports a statement the way the served import operation does: through
     /// `import_statement_in_tx` inside one transaction that commits on success.
@@ -597,15 +597,6 @@ mod tests {
         let outcome = import_statement_in_tx(&tx, request, file_bytes, operator, imported_at_ms)?;
         tx.commit()?;
         Ok(outcome)
-    }
-
-    fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_connection(&conn).unwrap();
-        for migration in MIGRATIONS {
-            conn.execute_batch(migration.statements).unwrap();
-        }
-        conn
     }
 
     fn request() -> StatementImportRequest {

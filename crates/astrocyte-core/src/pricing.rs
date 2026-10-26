@@ -1998,6 +1998,7 @@ mod tests {
     use crate::catalog_client::{CatalogCallError, CatalogConnection};
     use crate::ingest::{record_event, EventRecordRequest, MeasurementInput};
     use crate::store::{initialize_connection, MIGRATIONS};
+    use crate::test_support::{conn, measurement};
 
     /// An event's pricing state as its current charge heads describe it; the
     /// tests read it through `event_pricing_outcome` to check what repricing left.
@@ -2190,15 +2191,6 @@ mod tests {
         }
     }
 
-    fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_connection(&conn).unwrap();
-        for migration in MIGRATIONS {
-            conn.execute_batch(migration.statements).unwrap();
-        }
-        conn
-    }
-
     /// A chunk of `n` ends at the `n`th event after the cursor, so a chunk of
     /// one ends at the very next event; a chunk longer than what remains has
     /// no end and is the walk's last.
@@ -2222,17 +2214,6 @@ mod tests {
         assert_eq!(end(None, 3).as_deref(), Some("ev-c"));
         assert_eq!(end(None, 4), None);
         assert_eq!(end(Some("ev-b"), 2), None);
-    }
-
-    fn measurement(role: &str, quantity_units: Option<i64>) -> MeasurementInput {
-        MeasurementInput {
-            role: role.into(),
-            unit: "token".into(),
-            kind: "billed".into(),
-            source: format!("usage.{role}"),
-            quantity_units,
-            quantity_exponent: quantity_units.map(|_| 0),
-        }
     }
 
     #[test]

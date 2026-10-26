@@ -770,7 +770,7 @@ mod tests {
 
     use super::*;
     use crate::catalog_client::{CatalogCallError, CatalogConnection};
-    use crate::store::{initialize_connection, MIGRATIONS};
+    use crate::test_support::conn;
 
     /// Declares a plan the way the served subscription-set operation does:
     /// through `set_subscription_in_tx` inside one transaction that commits on
@@ -858,15 +858,6 @@ mod tests {
         });
         let client = CatalogClient::connect(connection.clone()).unwrap();
         (client, connection)
-    }
-
-    fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_connection(&conn).unwrap();
-        for migration in MIGRATIONS {
-            conn.execute_batch(migration.statements).unwrap();
-        }
-        conn
     }
 
     fn request(

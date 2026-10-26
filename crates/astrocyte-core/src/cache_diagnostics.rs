@@ -1105,6 +1105,7 @@ mod tests {
         record_event_in_tx, DeliveryPath, EventRecordRequest, MeasurementInput, StepDetail,
     };
     use crate::store::{initialize_connection, MIGRATIONS};
+    use crate::test_support::conn;
 
     fn counts(input: Option<u64>, read: Option<u64>, write: Option<u64>) -> StepCounts {
         StepCounts {
@@ -1352,15 +1353,6 @@ mod tests {
         assert!(!CACHE_HARNESSES.contains(&"broca"));
         let listed = format!("('{}')", CACHE_HARNESSES.join("','"));
         assert_eq!(listed, harnesses_sql!());
-    }
-
-    fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_connection(&conn).unwrap();
-        for migration in MIGRATIONS {
-            conn.execute_batch(migration.statements).unwrap();
-        }
-        conn
     }
 
     #[test]

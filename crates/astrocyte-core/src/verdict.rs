@@ -158,15 +158,7 @@ pub(crate) fn evaluate_base(
 mod tests {
     use super::*;
     use crate::store::{initialize_connection, MIGRATIONS};
-
-    fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_connection(&conn).unwrap();
-        for migration in MIGRATIONS {
-            conn.execute_batch(migration.statements).unwrap();
-        }
-        conn
-    }
+    use crate::test_support::conn;
 
     fn request() -> VerdictRequest {
         VerdictRequest {

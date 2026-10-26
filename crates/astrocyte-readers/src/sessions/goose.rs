@@ -111,15 +111,9 @@ pub struct GooseSession {
 /// Counts for one read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GooseReadCounts {
-    /// `sessions` rows read.
-    pub rows: u64,
     /// Rows with a counter that is not a non-negative integer (a real, a
     /// text, a negative). Not read further and not ingested.
     pub unreadable_rows: u64,
-    /// Rows where every accumulated counter is NULL: no usage recorded.
-    pub rows_without_usage: u64,
-    /// Rows whose `input` is [`DerivedRole::Underivable`].
-    pub underivable_roles: u64,
 }
 
 /// Result of one [`read_goose_sessions`] call.
@@ -182,7 +176,6 @@ pub fn read_goose_sessions(db_path: &Path) -> Result<GooseRead, String> {
 }
 
 fn read_row(row: &Row<'_>, read: &mut GooseRead) -> rusqlite::Result<()> {
-    read.counts.rows += 1;
     let counters = [
         "accumulated_input_tokens",
         "accumulated_output_tokens",
@@ -202,7 +195,6 @@ fn read_row(row: &Row<'_>, read: &mut GooseRead) -> rusqlite::Result<()> {
     }
     let [input, output, cache_read, cache_write] = values;
     if values.iter().all(Option::is_none) {
-        read.counts.rows_without_usage += 1;
         return Ok(());
     }
     let text = |column: &str| -> rusqlite::Result<Option<String>> {
@@ -223,7 +215,6 @@ fn read_row(row: &Row<'_>, read: &mut GooseRead) -> rusqlite::Result<()> {
         cache_write,
         output,
     };
-    read.counts.underivable_roles += u64::from(usage.input == DerivedRole::Underivable);
     read.sessions.push(GooseSession {
         session_id,
         project_root: text("working_dir")?
@@ -304,7 +295,7 @@ mod tests {
     }
 
     /// A NULL counter is omitted, never zero; a session with no counters at
-    /// all is counted, not emitted; an unusable model config leaves the
+    /// all is not emitted; an unusable model config leaves the
     /// model absent.
     #[test]
     fn absent_counters_are_omitted_not_zero() {
@@ -314,7 +305,6 @@ mod tests {
         ]);
         let read = read_goose_sessions(&path).unwrap();
         assert_eq!(read.sessions.len(), 1);
-        assert_eq!(read.counts.rows_without_usage, 1);
         let session = &read.sessions[0];
         assert_eq!(session.model, None);
         assert_eq!(session.provider, None);
@@ -352,7 +342,6 @@ mod tests {
         let usage = read.sessions[0].usage;
         assert_eq!(usage.input, DerivedRole::Underivable);
         assert_eq!(usage.cache_read, Some(43520));
-        assert_eq!(read.counts.underivable_roles, 1);
     }
 
     /// Reading leaves the store byte-for-byte unchanged, and a timestamp in

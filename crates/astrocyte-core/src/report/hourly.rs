@@ -1613,16 +1613,9 @@ pub(super) fn verdict(
 mod tests {
     use super::*;
     use crate::fact::ChargeBasis;
-    use crate::{ingest, pricing, store, subscription, verdict};
+    use crate::test_support::conn;
+    use crate::{ingest, pricing, subscription, verdict};
 
-    fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        store::initialize_connection(&conn).unwrap();
-        for migration in store::MIGRATIONS {
-            conn.execute_batch(migration.statements).unwrap();
-        }
-        conn
-    }
     fn record(
         conn: &mut Connection,
         id: &str,
