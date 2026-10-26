@@ -572,11 +572,11 @@ detail `{"through": "<newest cursor>"}`: reload per-session history with
   it. Rows become eligible for deletion 24 hours after they were committed;
   each feed append deletes up to 1,000 of them, so a cursor stays readable
   until the deletion reaches it.
-- Runner rows come from the `step.finished.v1` events that `broca`,
-  `thalamus-harness` and `thalamus` publish on the bus. Astrocyte follows each
-  runner's own subject, `ck.<account>.live.<runner>.step.finished.v1`, with a
-  plain subscription and no durable. The runners are the ones the bus naming
-  table grants astrocyte. The subscriptions share the quota reader's single
+- Runner rows come from the `step.finished.v1` events of the runners the bus
+  naming table grants astrocyte; today those are `broca`, `thalamus-harness`
+  and `thalamus`. Astrocyte follows each runner's own subject,
+  `ck.<account>.live.<runner>.step.finished.v1`, with a plain subscription and
+  no durable. The subscriptions share the quota reader's single
   ckbus credential and NATS connection, and they run whether or not insula is
   configured. A row is appended as soon as the event arrives, and subscribers
   are told once it is committed. Runner rows are display data only: nothing
@@ -594,7 +594,8 @@ detail `{"through": "<newest cursor>"}`: reload per-session history with
   decode, or whose subject names a different runner than its body, is counted
   and dropped. So is a step that finished more than 24 hours ago. If the bus is
   unavailable or refuses the subscription, astrocyte logs it once and retries,
-  and the feed carries file rows only. Quota events are not affected.
+  and no new runner rows arrive; runner rows already appended stay served
+  until a feed append prunes them. Quota events are not affected.
 - The phone's device label is the route's bind identity `harness`
   (`fed-phone:<fingerprint>`), as Callosum stamps it; the principal must be
   `reserved:callosum` as well.

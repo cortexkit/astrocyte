@@ -6,8 +6,8 @@
 //! dashboard see a step before astrocyte's own read of a durable store does;
 //! that read later replaces the row. The events are display data only and
 //! never reach the ledger. An event that does not decode is counted and
-//! dropped. While the bus is unavailable no runner rows arrive, and the feed
-//! carries the rows of astrocyte's own reads.
+//! dropped. While the bus is unavailable no new runner rows arrive; runner
+//! rows already appended stay served until a feed append prunes them.
 //!
 //! The subscriptions share the quota reader's NATS connection and credential
 //! (see `quota_events::Reader`), because a fresh ckbus credential revokes the
@@ -181,8 +181,9 @@ async fn subscribe(
     Ok(subscribers)
 }
 
-/// One of the runner crate's `step-events.json` events, published by
-/// `runner` just now on its live subject, with `edit` applied to its body.
+/// A `step-events.json` fixture from the runner crate, made into a
+/// just-finished event on `runner`'s live subject, with `edit` applied to its
+/// body. Nothing is published.
 #[cfg(test)]
 pub(crate) fn test_event(
     names: &AccountNames,
