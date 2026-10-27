@@ -72,8 +72,16 @@ pub struct CatalogModel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogLookup {
-    PreHistory { history_start_ms: i64 },
+    PreHistory {
+        history_start_ms: i64,
+    },
     Resolved(CatalogSnapshot),
+    /// A historical read the catalog refused as outside its coverage. The
+    /// request was fine and the catalog has no row for the model, so there
+    /// is nothing to retry: ledger pricing records the event unpriced with
+    /// `no_catalog_coverage` and the multiplier treats it as a miss that may
+    /// still resolve through a current-read alias.
+    NoCoverage,
 }
 
 #[derive(Clone)]
@@ -213,18 +221,28 @@ impl CatalogClient {
         model_id: &str,
         at_ms: Option<i64>,
     ) -> Result<CatalogLookup, CatalogClientError> {
-        let response = self
-            .connection
-            .catalog_get(CatalogGetRequest {
-                source: None,
-                at_ms,
-                fact_prefixes: Some(vec![RATE_FACT_PREFIX.to_string()]),
-                include_retired: true,
-                model_id: Some(model_id.to_string()),
-                provider_id: Some(provider_id.to_string()),
-                auth_method: None,
-            })
-            .map_err(CatalogClientError::Call)?;
+        let response = match self.connection.catalog_get(CatalogGetRequest {
+            source: None,
+            at_ms,
+            fact_prefixes: Some(vec![RATE_FACT_PREFIX.to_string()]),
+            include_retired: true,
+            model_id: Some(model_id.to_string()),
+            provider_id: Some(provider_id.to_string()),
+            auth_method: None,
+        }) {
+            Ok(response) => response,
+            // A historical read refused as outside coverage is an answer, not
+            // a failure: the request was fine and the catalog has no row for
+            // the model. Current reads keep the refusal as an error, as today,
+            // so alias discovery sees the same refusal it always has.
+            Err(error)
+                if at_ms.is_some()
+                    && RefusalKind::of(&error.code) == RefusalKind::OutsideCoverage =>
+            {
+                return Ok(CatalogLookup::NoCoverage);
+            }
+            Err(error) => return Err(CatalogClientError::Call(error)),
+        };
         let model_key = format!("{provider_id}/{model_id}");
         // Each fact key appears at most once per model. Fusiform builds `models` as a
         // map keyed by fact key, and aliases, plane views and inherited rates all write

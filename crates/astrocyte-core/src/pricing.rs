@@ -640,6 +640,15 @@ fn resolve_reprice_with_catalog(
             None,
             None,
         )),
+        // The catalog looked and has no row for the model. Nothing was served,
+        // so no source, instant or entry is recorded, as for pre-history.
+        CatalogLookup::NoCoverage => Ok(unpriced_all(
+            plan,
+            UnpricedReason::NoCatalogCoverage,
+            None,
+            None,
+            None,
+        )),
         CatalogLookup::Resolved(snapshot) => {
             resolve_catalog_snapshot(plan, &snapshot, reasoning_billed_as_output)
         }
@@ -4375,5 +4384,162 @@ mod tests {
                 charge_nanos: (42 * OUTPUT_RATE + 40 * REASONING_RATE) / 1_000_000,
             }
         );
+    }
+
+    /// A historical read the catalog refuses as outside its coverage is an
+    /// answer, not a failure: the event's measurements are recorded unpriced
+    /// with `no_catalog_coverage`, each gets a head, and the event leaves the
+    /// queue so a later reprice can price it once the catalog covers it.
+    struct RefusingCatalog {
+        code: String,
+        calls: AtomicUsize,
+    }
+
+    impl RefusingCatalog {
+        fn refusing(code: &str) -> Arc<Self> {
+            Arc::new(Self {
+                code: code.into(),
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl CatalogConnection for RefusingCatalog {
+        fn catalog_status(
+            &self,
+            _: fusiform_protocol::StatusRequest,
+        ) -> Result<fusiform_protocol::StatusResponse, CatalogCallError> {
+            Ok(
+                serde_json::from_value(json!({"source": "fake", "catalog_version": 0,
+                "model_count": 0, "era_count": 0, "recent_polls": []}))
+                .unwrap(),
+            )
+        }
+
+        fn catalog_get(
+            &self,
+            _: CatalogGetRequest,
+        ) -> Result<CatalogGetResponse, CatalogCallError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(CatalogCallError {
+                code: self.code.clone(),
+                message: "refused for the test".into(),
+            })
+        }
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn historical_outside_coverage_records_unpriced_and_dequeues() {
+        let mut conn = conn();
+        let event_id = record(
+            &mut conn,
+            "uncovered",
+            ChargeBasis::MeteredApi,
+            Some(700),
+            vec![
+                measurement("input", Some(1_000)),
+                measurement("output", Some(2_000)),
+            ],
+        );
+        assert_eq!(queued(&conn), vec![event_id.clone()]);
+        let fake = RefusingCatalog::refusing("no_coverage");
+        let catalog = CatalogClient::new(fake.clone(), 500);
+        reprice_event(
+            &mut conn,
+            &event_id,
+            &catalog,
+            1_000,
+            PricingOrigin::PricingPass,
+        )
+        .unwrap();
+        assert!(
+            fake.calls.load(Ordering::SeqCst) > 0,
+            "the catalog was consulted"
+        );
+        let rows: Vec<(String, String, Option<String>, Option<i64>, Option<String>, Option<i64>, Option<String>)> = conn
+            .prepare(
+                "SELECT role,outcome,unpriced_reason,charge_nanos,catalog_source,resolved_at_ms,catalog_entry
+                 FROM priced_charge WHERE event_key=(SELECT event_key FROM usage_event WHERE event_id=?1) ORDER BY role",
+            )
+            .unwrap()
+            .query_map([&event_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "input".into(),
+                    "unpriced".into(),
+                    Some("no_catalog_coverage".into()),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                (
+                    "output".into(),
+                    "unpriced".into(),
+                    Some("no_catalog_coverage".into()),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+            ]
+        );
+        assert!(queued(&conn).is_empty(), "an unpriced head is a head");
+        let generation: i64 = conn
+            .query_row(
+                "SELECT pricing_generation FROM usage_event WHERE event_id=?1",
+                [&event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 1);
+    }
+
+    /// Any other refusal kind stays an error and leaves the event queued, so
+    /// a transient catalog outage is retried instead of recorded as uncovered.
+    #[test]
+    fn retryable_refusal_leaves_event_queued() {
+        let mut conn = conn();
+        let event_id = record(
+            &mut conn,
+            "retryable",
+            ChargeBasis::MeteredApi,
+            Some(700),
+            vec![measurement("input", Some(1_000))],
+        );
+        let fake = RefusingCatalog::refusing("unavailable");
+        let catalog = CatalogClient::new(fake.clone(), 500);
+        assert!(matches!(
+            reprice_event(
+                &mut conn,
+                &event_id,
+                &catalog,
+                1_000,
+                PricingOrigin::PricingPass
+            ),
+            Err(PricingError::Catalog(_))
+        ));
+        assert!(
+            fake.calls.load(Ordering::SeqCst) > 0,
+            "the catalog was consulted"
+        );
+        assert_eq!(count(&conn, &event_id), 0);
+        assert_eq!(queued(&conn), vec![event_id.clone()]);
+        let generation: i64 = conn
+            .query_row(
+                "SELECT pricing_generation FROM usage_event WHERE event_id=?1",
+                [&event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 0);
     }
 }

@@ -955,6 +955,13 @@ pub fn resolve_rates(
             Ok(CatalogLookup::PreHistory { .. }) => ModelResolution::Unpriceable {
                 reason: "catalog_pre_history".into(),
             },
+            // A historical miss the catalog answered as outside coverage stays
+            // a written unpriceable reason, whether it arrived as the new
+            // definite outcome or, for a current read, as the refused call it
+            // always was.
+            Ok(CatalogLookup::NoCoverage) => ModelResolution::Unpriceable {
+                reason: "no_catalog_coverage".into(),
+            },
             Err(CatalogClientError::Call(error))
                 if RefusalKind::of(&error.code) == RefusalKind::OutsideCoverage =>
             {
@@ -988,6 +995,10 @@ fn lookup_missing(lookup: &Result<CatalogLookup, CatalogClientError>) -> bool {
                 && snapshot.uncertain_facts.is_empty()
                 && snapshot.overridden_facts.is_empty()
         }
+        // A historical refusal classified as outside coverage arrives as a
+        // definite no-coverage outcome now; the error arm stays for a current
+        // read, which keeps its refusal as an error.
+        Ok(CatalogLookup::NoCoverage) => true,
         Err(CatalogClientError::Call(error)) => {
             RefusalKind::of(&error.code) == RefusalKind::OutsideCoverage
         }
@@ -5296,7 +5307,7 @@ mod tests {
     }
 
     #[test]
-    fn alias_values_the_multiplier_while_the_ledger_refuses_the_alias() {
+    fn alias_values_the_multiplier_while_the_ledger_leaves_the_alias_unpriced() {
         for (metadata, marker) in [(true, false), (true, true), (false, true)] {
             for suffix in ["", "-low", "-high"] {
                 let mut conn = conn();
@@ -5394,15 +5405,30 @@ mod tests {
                 );
 
                 let ledger_plan = crate::subscription::read_reprice(&conn, "alias").unwrap();
-                let error =
-                    crate::subscription::resolve_reprice(&ledger_plan, &catalog, &[]).unwrap_err();
-                assert!(matches!(error,
-                crate::subscription::SubscriptionError::Pricing(crate::pricing::PricingError::Catalog(
-                    CatalogClientError::Call(error))) if error.code == "no_coverage"));
-                let charges: i64 = conn
-                    .query_row("SELECT COUNT(*) FROM priced_charge", [], |row| row.get(0))
+                let resolved =
+                    crate::subscription::resolve_reprice(&ledger_plan, &catalog, &[]).unwrap();
+                let tx = conn.transaction().unwrap();
+                crate::subscription::commit_reprice_in_tx(
+                    &tx,
+                    &ledger_plan,
+                    &resolved,
+                    100,
+                    crate::pricing::PricingOrigin::PricingPass,
+                )
+                .unwrap();
+                tx.commit().unwrap();
+                let stored: (String, Option<String>) = conn
+                    .query_row(
+                        "SELECT outcome,unpriced_reason FROM priced_charge WHERE event_key=(SELECT event_key FROM usage_event WHERE event_id='alias')",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
                     .unwrap();
-                assert_eq!(charges, 0);
+                assert_eq!(
+                    stored,
+                    ("unpriced".into(), Some("no_catalog_coverage".into())),
+                    "a historical alias miss is an answer, not a failure"
+                );
             }
         }
     }

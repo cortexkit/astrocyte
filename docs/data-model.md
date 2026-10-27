@@ -231,7 +231,7 @@ zero. Token roles are disjoint: `input`, `cache_read`, `cache_write`,
 
 Every harness reader records `unknown`, because no transcript says how the
 call was paid for. An event with no `occurred_at_ms` is `unpriced` with
-`undated_event` whatever its basis. BROCA states a basis per fact, and pushing peers state it
+`undated_event` whatever its basis. A metered event whose model the catalog does not cover is stored `unpriced` with `no_catalog_coverage`, including when the catalog refuses the historical read as outside its coverage. BROCA states a basis per fact, and pushing peers state it
 in `spend.event.ingest`. An operator changes an event's basis with
 `spend.basis.correct`; see [operations](operations.md).
 
