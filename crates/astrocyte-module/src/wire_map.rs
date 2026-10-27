@@ -425,7 +425,7 @@ pub(crate) fn system_one_fixture() -> serde_json::Value {
     serde_json::json!({
         "kind": "system_one", "fact_id": "system-one-hash", "batch_id": "batch-1",
         "item_index": 0, "run_id": "run-1", "provider": "typesafe",
-        "model": "typesafe/jev-1.13.0", "account_ref": "primary",
+        "model": "jev-1.13.0", "account_ref": "primary",
         "auth_selection": "apikey:typesafe", "charge_basis": "metered_api",
         "occurred_at_ms": 1_792_772_000_000_u64, "usage": {"input_tokens": 100}
     })
@@ -724,7 +724,7 @@ mod tests {
             );
             // $3 per million input tokens (3e9 nanodollars per million), so
             // the fixture's 100 input tokens cost 300,000 nanodollars.
-            let models = if key == "typesafe/typesafe/jev-1.13.0" {
+            let models = if key == "typesafe/jev-1.13.0" {
                 serde_json::json!({ key: {
                     "rate.input": {"state":"priced","units":3_000_000_000_u64,"exponent":9,
                         "currency":"USD","unit_provenance":{"kind":"stated"}},
