@@ -1190,4 +1190,84 @@ mod tests {
         assert!(cache.open.is_empty());
         assert_eq!(count(&state, "usage_event"), 1);
     }
+
+    /// OpenCode deletes sessions. When the deleted session held every row at or
+    /// above the cursor, the store maximum falls below the cursor while the
+    /// front row (and so the lineage) is unchanged. The next full pass must
+    /// succeed with no new rows and keep the cursor; a later row stamped above
+    /// the old cursor is then recorded exactly once.
+    ///
+    /// No row with `time_updated` between the remaining maximum and the old
+    /// cursor is inserted here. OpenCode stamps `time_updated` at write time,
+    /// and the cursor is at most the snapshot maximum, no later than the wall
+    /// clock at read time, so a genuine later write lands at or above the
+    /// cursor. A backdated row in that gap would only arise from a backwards
+    /// clock step or a write that computed its timestamp before waiting on
+    /// another process's write lock (the limits the v1 reader documents on its
+    /// page cutoff), not from an ordinary OpenCode write, so fabricating one
+    /// would not represent the producer.
+    #[test]
+    fn v2_deleted_session_below_the_cursor_keeps_the_cursor_and_reads_later_rows_once() {
+        let (_temp, path, conn) = database();
+        let insert_in = |id: &str, session: &str, updated: i64, data: &Value| {
+            conn.execute(
+                "INSERT INTO session_message VALUES (?1,?2,'assistant',
+                (SELECT COALESCE(MAX(seq),0)+1 FROM session_message),?3,?3,?4)",
+                params![id, session, updated, data.to_string()],
+            )
+            .unwrap();
+        };
+        insert_in("keep-oldest", "keep", 10, &payload(10, true));
+        insert_in("keep-mid", "keep", 20, &payload(20, true));
+        insert_in("gone-newest", "gone", 40, &payload(40, true));
+        let state = test_state();
+        let source = OpenCodeV2Source::at(&path);
+
+        let first = source.drain(&state, 100, &STOP).unwrap();
+        assert_eq!(first.recorded, 3);
+        assert_eq!(runtime(&state), ("keep-oldest".into(), 40, 40));
+        assert_eq!(quantity(&state, "output"), 39);
+
+        conn.execute("DELETE FROM session_message WHERE session_id='gone'", [])
+            .unwrap();
+        // The cursor-versus-maximum check under test lives in the full page
+        // read; force full passes so the tail's rowid fallback cannot stand in
+        // for it.
+        source.require_full_pass();
+        let second = source.drain(&state, 200, &STOP).unwrap();
+        assert_eq!(second.recorded, 0);
+        assert_eq!(second.skipped_recorded, 0);
+        assert_eq!(
+            runtime(&state),
+            ("keep-oldest".into(), 40, 40),
+            "the cursor is unchanged"
+        );
+        assert_eq!(count(&state, "usage_event"), 3);
+        assert_eq!(quantity(&state, "output"), 39);
+
+        insert_in("new", "new-session", 50, &payload(50, true));
+        source.require_full_pass();
+        let third = source.drain(&state, 300, &STOP).unwrap();
+        assert_eq!(third.recorded, 1);
+        source.require_full_pass();
+        let fourth = source.drain(&state, 400, &STOP).unwrap();
+        assert_eq!(fourth.recorded, 0);
+        assert_eq!(fourth.skipped_recorded, 1);
+        let new_rows: i64 = state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM usage_event WHERE producer_ref='new'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(
+            new_rows, 1,
+            "the row above the old cursor is recorded exactly once"
+        );
+        assert_eq!(count(&state, "usage_event"), 4);
+        assert_eq!(quantity(&state, "output"), 52);
+    }
 }

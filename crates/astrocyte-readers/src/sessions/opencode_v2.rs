@@ -143,9 +143,18 @@ pub fn read_page(
         let represented = cursor.filter(|cursor| cursor.lineage == page.lineage);
         let lower = represented.map_or(0, |cursor| cursor.ordinal);
         if lower > page.high_water {
-            return Err("OpenCode 2 high water regressed within lineage"
-                .to_string()
-                .into());
+            // OpenCode deletes sessions. When the deleted sessions held every
+            // row at or above the cursor, the maximum falls below the cursor
+            // while the front row (and so the lineage) is unchanged. The store
+            // then holds no row newer than the cursor, so this is an empty page
+            // that keeps the cursor instead of a failure. Both ordinals stay at
+            // the cursor: the stored cursor row requires high water to cover the
+            // cursor, and the cursor itself never moves backwards, so rows
+            // already read are not re-read. A later write stamps a fresh
+            // wall-clock time at or above the cursor and is read normally.
+            page.consumed = lower;
+            page.high_water = lower;
+            return Ok(Some(page));
         }
         let offset = i64::try_from(
             limit

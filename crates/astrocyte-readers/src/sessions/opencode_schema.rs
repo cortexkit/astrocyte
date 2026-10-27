@@ -448,14 +448,32 @@ fn read_snapshot(
     .map_err(|error| sqlite_error(stop, "read OpenCode high water", error))?;
 
     let represented = since.filter(|cursor| cursor.lineage == lineage);
-    if represented.is_some_and(|cursor| cursor.ordinal > high_water_ordinal) {
-        return Err(format!(
-            "OpenCode high water regressed within lineage {lineage}: stored {}, offered {high_water_ordinal}",
-            represented.expect("checked above").ordinal
-        )
-        .into());
-    }
     let lower_bound = represented.map_or(0, |cursor| cursor.ordinal);
+    if represented.is_some_and(|cursor| cursor.ordinal > high_water_ordinal) {
+        // OpenCode deletes sessions. When the deleted sessions held every row
+        // at or above the cursor, the maximum falls below the cursor while the
+        // front row (and so the lineage) is unchanged. The store then holds no
+        // row newer than the cursor, so this is an empty page that keeps the
+        // cursor instead of a failure. Both ordinals stay at the cursor: the
+        // stored cursor row requires high water to cover the cursor, and the
+        // cursor itself never moves backwards, so rows already read are not
+        // re-read. A later write stamps a fresh wall-clock time at or above
+        // the cursor and is read normally.
+        let front_row_id = read_front_row_id(connection, &mut cost, stop)?;
+        return Ok(OpenCodePage {
+            set_aside: Vec::new(),
+            lineage,
+            consumed_ordinal: lower_bound,
+            high_water_ordinal: lower_bound,
+            raw: OpenCodeTotals::default(),
+            raw_after_cursor: OpenCodeTotals::default(),
+            emitted: OpenCodeTotals::default(),
+            emitted_after_cursor: OpenCodeTotals::default(),
+            messages: Vec::new(),
+            front_row_id,
+            cost,
+        });
+    }
     // The two lower bounds below must use the same comparison. `time_updated`
     // is not unique: on 2026-09-20 the live store had 1,241,262 messages but
     // only 1,235,249 distinct update timestamps, so 6,013 rows shared an

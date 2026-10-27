@@ -1629,6 +1629,101 @@ mod tests {
         assert_eq!(replacement_rows, 1, "replacement rows must not be skipped");
     }
 
+    /// OpenCode deletes sessions. When the deleted session held every row at or
+    /// above the cursor, the store maximum falls below the cursor while the
+    /// oldest row (and so the lineage) is unchanged. The next full pass must
+    /// succeed with no new rows and keep the cursor; a later row stamped above
+    /// the old cursor is then recorded exactly once.
+    ///
+    /// No row with `time_updated` between the remaining maximum and the old
+    /// cursor is inserted here. OpenCode stamps `time_updated` with `Date.now()`
+    /// on every insert and upsert (see the page-cutoff comment in
+    /// `opencode_schema`), and the cursor is at most the snapshot maximum, no
+    /// later than the wall clock at read time, so a genuine later write lands
+    /// at or above the cursor. A backdated row in that gap would only arise
+    /// from the documented clock-step or write-lock races, not from an
+    /// ordinary OpenCode write, so fabricating one would not represent the
+    /// producer.
+    #[test]
+    fn deleted_session_below_the_cursor_keeps_the_cursor_and_reads_later_rows_once() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = create_database(&path);
+        insert_message(&connection, "msg-keep-oldest", "session-keep", 10, 10);
+        insert_message(&connection, "msg-keep-mid", "session-keep", 20, 20);
+        insert_message(&connection, "msg-gone-newest", "session-gone", 30, 40);
+        let state = test_state();
+        // Every drain here is a full pass: the cursor-versus-maximum check
+        // under test lives in the full page read, and the tail would only
+        // reach it indirectly through its stale-rowid fallback.
+        let source = OpenCodeSource::full_pass_every_tick(&path);
+
+        let first = source.drain(&state, 100, &NEVER_STOP).unwrap();
+        assert_eq!(first.rows_recorded, 3);
+        assert_eq!(
+            runtime_cursor(&state),
+            ("msg-keep-oldest".to_string(), 40, 40)
+        );
+        assert_eq!(
+            ledger_count(
+                &state,
+                "SELECT SUM(quantity_units) FROM measurement WHERE role='output'"
+            ),
+            39
+        );
+
+        connection
+            .execute("DELETE FROM message WHERE session_id='session-gone'", [])
+            .unwrap();
+        let second = source.drain(&state, 200, &NEVER_STOP).unwrap();
+        assert_eq!(second.rows_recorded, 0);
+        assert_eq!(second.exact_redeliveries, 0);
+        assert_eq!(
+            runtime_cursor(&state),
+            ("msg-keep-oldest".to_string(), 40, 40),
+            "the cursor is unchanged"
+        );
+        assert_eq!(ledger_count(&state, "SELECT COUNT(*) FROM usage_event"), 3);
+        assert_eq!(
+            ledger_count(
+                &state,
+                "SELECT SUM(quantity_units) FROM measurement WHERE role='output'"
+            ),
+            39
+        );
+
+        insert_message(&connection, "msg-new", "session-new", 45, 50);
+        drop(connection);
+        let third = source.drain(&state, 300, &NEVER_STOP).unwrap();
+        assert_eq!(third.rows_recorded, 1);
+        let fourth = source.drain(&state, 400, &NEVER_STOP).unwrap();
+        assert_eq!(fourth.rows_recorded, 0);
+        assert_eq!(fourth.exact_redeliveries, 1);
+        let new_rows: i64 = state
+            .with_conn(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM usage_event WHERE producer_ref='msg-new'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(
+            new_rows, 1,
+            "the row above the old cursor is recorded exactly once"
+        );
+        assert_eq!(ledger_count(&state, "SELECT COUNT(*) FROM usage_event"), 4);
+        assert_eq!(
+            ledger_count(
+                &state,
+                "SELECT SUM(quantity_units) FROM measurement WHERE role='output'"
+            ),
+            52
+        );
+    }
+
     /// Lifecycle states of one assistant message, following OpenCode's
     /// processor: created with zero tokens, then `finish` and the final tokens
     /// at finish-step, then `time.completed` at cleanup. A process that dies
