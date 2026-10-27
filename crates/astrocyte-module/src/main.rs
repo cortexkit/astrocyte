@@ -807,16 +807,29 @@ fn health_report(public_projection: &PublicProjection) -> HealthReport {
         astrocyte_module::state::SpendHealth::Ok => HealthStatus::Ok,
         astrocyte_module::state::SpendHealth::Degraded => HealthStatus::Degraded,
     };
-    let metrics = json!({
-        "degradedReason": health.degraded_reason,
-        "capacityRuntime": health.capacity_runtime,
-        "spendLastAttemptMs": health.spend_last_attempt_ms,
-    });
+    let metrics = health_metrics(&health);
     HealthReport {
         status,
         detail: health.degraded_reason,
         metrics: Some(metrics),
     }
+}
+
+/// The health metrics object. `degradedReason` is present only when there is
+/// a reason. Readers such as `ck health` show a null metric as "unknown"
+/// (not measured), so a healthy module must omit the member rather than send
+/// null.
+fn health_metrics(health: &astrocyte_module::state::Health) -> Value {
+    let mut metrics = serde_json::Map::new();
+    if let Some(reason) = &health.degraded_reason {
+        metrics.insert("degradedReason".into(), json!(reason));
+    }
+    metrics.insert("capacityRuntime".into(), health.capacity_runtime.clone());
+    metrics.insert(
+        "spendLastAttemptMs".into(),
+        json!(health.spend_last_attempt_ms),
+    );
+    Value::Object(metrics)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1267,6 +1280,29 @@ impl Error for ModuleError {}
 mod tests {
     use super::*;
     use crate::test_support::{self as refresher, test_state, HANG_GUARD};
+
+    #[test]
+    fn healthy_metrics_omit_degraded_reason_and_degraded_metrics_carry_it() {
+        use astrocyte_module::state::{Health, SpendHealth};
+        let healthy = health_metrics(&Health {
+            status: SpendHealth::Ok,
+            degraded_reason: None,
+            capacity_runtime: Value::Null,
+            spend_last_attempt_ms: Some(1),
+        });
+        assert!(
+            healthy.get("degradedReason").is_none(),
+            "a healthy report must omit degradedReason, not send null: {healthy}"
+        );
+        assert_eq!(healthy["spendLastAttemptMs"], 1);
+        let degraded = health_metrics(&Health {
+            status: SpendHealth::Degraded,
+            degraded_reason: Some("ingest_freshness_unavailable".into()),
+            capacity_runtime: Value::Null,
+            spend_last_attempt_ms: None,
+        });
+        assert_eq!(degraded["degradedReason"], "ingest_freshness_unavailable");
+    }
     use cortexkit_role_llm_runner::watermark::{WatermarkReply, NOT_A_READ_SOURCE};
     use subc_protocol::{
         session::{ModuleControlRequest, ModuleControlResponse},
