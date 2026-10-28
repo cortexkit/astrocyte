@@ -2329,6 +2329,11 @@ pub struct MultiplierPaceRequest {
 }
 
 const HOUR_MS: i64 = 3_600_000;
+// A weekly calibration may describe the current workload for daily routing,
+// but a head older than two days needs a refreshed estimate or fallback.
+const PACE_MAX_HEAD_AGE_MS: i64 = 2 * 24 * HOUR_MS;
+// Bound the read work while allowing a trailing week plus UTC alignment tails.
+const PACE_MAX_RANGE_HOURS: i64 = 192;
 
 #[derive(Deserialize)]
 struct PaceRateLine {
@@ -2410,10 +2415,10 @@ pub fn multiplier_pace(
     let from = i128::from(request.from_ms).div_euclid(i128::from(HOUR_MS)) * i128::from(HOUR_MS);
     let to = (i128::from(request.to_ms) + i128::from(HOUR_MS) - 1).div_euclid(i128::from(HOUR_MS))
         * i128::from(HOUR_MS);
-    if to - from > 192 * i128::from(HOUR_MS) {
+    if to - from > i128::from(PACE_MAX_RANGE_HOURS) * i128::from(HOUR_MS) {
         return Err(refuse(
             "range_too_large",
-            "aligned range must not exceed 192 hours".into(),
+            format!("aligned range must not exceed {PACE_MAX_RANGE_HOURS} hours"),
         ));
     }
     let from = i64::try_from(from)
@@ -2426,11 +2431,16 @@ pub fn multiplier_pace(
                 o.api_nanos_by_model, o.api_twins, o.reasoning_billed_as_output
          FROM multiplier_observation o WHERE o.quota_provider = ?1 AND o.routing_eligible=1
             AND (?2 IS NULL OR o.plan=?2)
-            AND o.interval_end_ms >= ?3 - 172800000
+            AND o.interval_end_ms >= ?3 - ?4
            AND NOT EXISTS (SELECT 1 FROM multiplier_observation child
                            WHERE child.supersedes = o.observation_id)
          ORDER BY o.observation_day DESC, o.observation_id DESC LIMIT 1",
-            params![request.quota_provider, selected_plan, request.to_ms],
+            params![
+                request.quota_provider,
+                selected_plan,
+                request.to_ms,
+                PACE_MAX_HEAD_AGE_MS
+            ],
             |row| {
                 Ok(PaceHead {
                     observation_id: row.get(0)?,

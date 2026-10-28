@@ -3567,6 +3567,9 @@ fn log_unqueued_events(enqueued: usize, complete: bool) {
 const DAY_MS: i64 = 86_400_000;
 /// Each observation covers the seven UTC days that end at the day boundary.
 const MULTIPLIER_INTERVAL_MS: i64 = 7 * DAY_MS;
+// Preserve a bounded two-hour drain wait after midnight; later diagnostic rows
+// may be recorded but stay ineligible until their source backlog is resolved.
+const MULTIPLIER_SOURCE_WAIT_MS: i64 = 2 * 3_600_000;
 
 /// Records one subscription multiplier observation per quota provider per UTC
 /// day, over the trailing seven days. Missing rows are retried for the seven
@@ -3879,7 +3882,7 @@ fn multiplier_stale_sources(
         .into_iter()
         .filter(|source| multiplier::source_in_scope(provider, source))
         .collect();
-    if !sources.is_empty() && snapshot_at_ms < interval_end_ms + 2 * 3_600_000 {
+    if !sources.is_empty() && snapshot_at_ms < interval_end_ms + MULTIPLIER_SOURCE_WAIT_MS {
         return Err(DayError {
             code: "source_reads_pending".into(),
             message: format!(

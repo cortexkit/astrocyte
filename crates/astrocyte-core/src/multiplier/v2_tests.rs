@@ -279,13 +279,19 @@ fn v2_missing_quantity_is_unknown_not_zero() {
             None,
         );
     }
-    let over_budget = calculate(&conn);
-    assert!((over_budget.unpriced_share - 39.0 / 144.0).abs() < 1e-12);
-    assert!(!over_budget.routing_eligible);
-    assert_eq!(over_budget.eligibility_reasons, vec!["unpriced_usage"]);
-    assert!(over_budget.multiplier.is_some_and(|value| value > 0.0));
-    assert_eq!(over_budget.api_nanos, 300);
-    assert!((over_budget.delta_percent - 105.0).abs() < 1e-9);
+    let high_unknown_share = calculate(&conn);
+    assert!((high_unknown_share.unpriced_share - 39.0 / 144.0).abs() < 1e-12);
+    assert!(
+        high_unknown_share.routing_eligible,
+        "{:?}",
+        high_unknown_share.eligibility_reasons
+    );
+    assert!(high_unknown_share.eligibility_reasons.is_empty());
+    assert!(high_unknown_share
+        .multiplier
+        .is_some_and(|value| value > 0.0));
+    assert_eq!(high_unknown_share.api_nanos, 300);
+    assert!((high_unknown_share.delta_percent - 105.0).abs() < 1e-9);
 }
 
 #[test]
@@ -450,10 +456,13 @@ fn v2_eligibility_explains_every_quality_exclusion() {
         event.occurred_at_ms = hour * HOUR_MS;
         unknown.events.push(event);
     }
-    assert!(calculate(&unknown, &priced_plan())
-        .eligibility_reasons
-        .iter()
-        .any(|reason| reason == "unpriced_usage"));
+    let sample = calculate(&unknown, &priced_plan());
+    assert!(sample.unpriced_share > 0.25);
+    assert!(!sample.routing_eligible);
+    assert_eq!(
+        sample.eligibility_reasons,
+        vec!["insufficient_stability_days"]
+    );
 }
 
 #[test]
@@ -633,13 +642,19 @@ fn v2_zero_measurement_events_are_unknown_not_free_usage() {
     }) {
         conn.execute("INSERT INTO usage_event(event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis) VALUES (?1,'pi','lineage',?1,?2,?2,'openai','m','unknown')", params![format!("empty-hour-{hour}"), hour * HOUR_MS]).unwrap();
     }
-    let over_budget = calculate(&conn);
-    assert!((over_budget.unpriced_share - 21.0 / 72.0).abs() < 1e-12);
-    assert!(!over_budget.routing_eligible);
-    assert_eq!(over_budget.eligibility_reasons, vec!["unpriced_usage"]);
-    assert!(over_budget.multiplier.is_some_and(|value| value > 0.0));
-    assert_eq!(over_budget.api_nanos, 300);
-    assert!((over_budget.delta_percent - 102.0).abs() < 1e-9);
+    let high_unknown_share = calculate(&conn);
+    assert!((high_unknown_share.unpriced_share - 21.0 / 72.0).abs() < 1e-12);
+    assert!(
+        high_unknown_share.routing_eligible,
+        "{:?}",
+        high_unknown_share.eligibility_reasons
+    );
+    assert!(high_unknown_share.eligibility_reasons.is_empty());
+    assert!(high_unknown_share
+        .multiplier
+        .is_some_and(|value| value > 0.0));
+    assert_eq!(high_unknown_share.api_nanos, 300);
+    assert!((high_unknown_share.delta_percent - 102.0).abs() < 1e-9);
 }
 
 #[test]
@@ -1009,4 +1024,73 @@ fn v2_day_blocks_keep_account_value_and_points_paired() {
     assert!(summary["bootstrap_relative_width"].as_f64().unwrap() < 1e-9);
     assert!(summary["held_out_ratio_rmse_points"].as_f64().unwrap() < 1e-9);
     assert!((summary["held_out_ratio_r2"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn v2_unpriced_share_does_not_veto_an_adequate_stable_sample() {
+    let mut conn = conn();
+    let config = stable_fixture(&conn);
+    for hour in (0..72).filter(|hour| hour % 6 < 3) {
+        v2_event(
+            &conn,
+            &format!("unpriced-{hour}"),
+            Some("acct"),
+            "premium",
+            hour * HOUR_MS,
+            Some(1),
+        );
+    }
+    let plan = plan_observation(&conn, &config, "codex", 0, 72 * HOUR_MS).unwrap();
+    let row = compute_plan_observations(
+        &conn,
+        &config,
+        &plan,
+        &rates_for(&[("openai", "m")], 100, None),
+        &priced_plan(),
+        72 * HOUR_MS,
+        &[],
+    )
+    .unwrap()
+    .remove(0);
+    assert!(row.routing_eligible, "{:?}", row.eligibility_reasons);
+    assert!((row.unpriced_share - 0.5).abs() < 1e-12);
+    assert!((row.clean_hours_share - 0.5).abs() < 1e-12);
+    assert!((row.delta_percent - 36.0).abs() < 1e-9);
+    assert_eq!(row.api_nanos, 300);
+    assert_eq!(row.tokens.input, 3_000_000);
+    assert!(row
+        .api_nanos_by_model
+        .iter()
+        .all(|model| model.model.as_deref() == Some("m")));
+    assert!(row
+        .unpriced_tokens
+        .iter()
+        .any(|item| item.model.ends_with("/premium") && item.tokens == 36));
+    let tx = conn.transaction().unwrap();
+    insert_observation_in_tx(&tx, &row).unwrap();
+    tx.commit().unwrap();
+    let report = multiplier_report(
+        &conn,
+        &MultiplierReportRequest {
+            from_ms: 0,
+            to_ms: 73 * HOUR_MS,
+        },
+    )
+    .unwrap();
+    let served = &report["series"][0];
+    assert_eq!(served["routing_eligible"], true);
+    assert!((served["unpriced_share"].as_f64().unwrap() - 0.5).abs() < 1e-12);
+    assert_eq!(served["stability_diagnostics"]["active_days"], 3);
+    assert!(
+        served["stability_diagnostics"]["bootstrap_relative_width"]
+            .as_f64()
+            .unwrap()
+            < 1e-9
+    );
+    assert!(
+        served["stability_diagnostics"]["held_out_ratio_rmse_points"]
+            .as_f64()
+            .unwrap()
+            < 1e-9
+    );
 }

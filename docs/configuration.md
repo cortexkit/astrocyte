@@ -176,8 +176,10 @@ Only clean account-hours contribute to the quota multiplier. Saturated hours,
 changed-counter gaps over 15 minutes and hours containing unknown usage are
 excluded from both sides. An unchanged reading and known reset period can
 bridge a longer quiet gap. Unknown usage includes positive unknown-price quantities, missing
-measurement quantities and events with no measurements; those hours count
-toward the 25% unpriced/unknown share budget, not a separate row-level veto.
+measurement quantities and events with no measurements. Their share is a
+diagnostic, not a row-level veto: retained exposure and stability decide whether
+the remaining estimate is usable. Saturation keeps its separate 25% veto,
+because capped hours select the heaviest-use traffic.
 Unattributed events require every configured
 account to be clean; when plans differ they are omitted rather than arbitrarily
 allocated to a plan. The report retains diagnostics for excluded unpriced usage.
@@ -186,7 +188,7 @@ Use `routing_eligible`, not the presence of a numeric `multiplier`, as the routi
 gate. This is an estimated average for the observed model/request mixture, not a
 provider tariff. Sample adequacy requires 24 clean account-hours, 20 points,
 three active UTC days and a day-block 95% interval no wider than 50% of the
-pooled USD/point estimate; there is no clean-share floor or gap-share veto.
+pooled USD/point estimate; there is no clean-, gap- or unknown-share veto.
 Pace only reads eligible heads and requires `plan` when a
 provider has multiple plans. Thresholds, reset handling, the fixed Antigravity
 historical exclusion, fee conventions and limitations are documented in

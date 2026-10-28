@@ -73,8 +73,7 @@ premium-model quota burn need not be proportional to token count. Unknown
 measurement quantities and events with no measurements are unknown usage, not
 zero tokens. They exclude the matching account-hour, or every account's hour
 when unattributed, just like unpriced-model usage. Each excluded account-hour
-counts once toward the shared 25% unpriced/unknown-hour budget. Unknown usage
-does not independently veto the row: the retained clean exposure can still
+counts once in the diagnostic `unpriced_share`, not a share-based veto. The retained clean exposure can still
 produce an eligible estimate. No value is fabricated for the excluded usage.
 
 Attributed events count only in their own configured account's clean hours.
@@ -119,7 +118,6 @@ need not sum to one.
 |---|---|---|
 | At least 24 clean account-hours total | `insufficient_clean_hours` | Require a minimum matched sample, not a fixed coverage share. |
 | At most 25% saturated account-hours | `saturation` | Codex's observed 19% can pass; Claude's 40.9% cannot. Saturated exposure is censored, not free. |
-| At most 25% unpriced/unknown account-hours | `unpriced_usage` | Exclude hours with unpriced models, unknown quantities or no-measurement events together. Separate clean hours remain useful; none of the excluded usage is priced as zero. |
 | Reset metadata present throughout observed exposure | `unknown_reset` | A percentage drop alone cannot identify a period. |
 | No unconfigured observed account | `unconfigured_accounts` | Numerator/denominator membership must agree. |
 | Every included plan price resolved | `unpriced_plan` | No subscription-cost denominator can be fabricated. |
@@ -130,12 +128,13 @@ need not sum to one.
 | Positive finite multiplier | `nonpositive_ratio` | Missing value or zero burn is not a free routing price. |
 | In-scope sources fresh and drained | `source_backlog` | A successful bounded page can leave older usage pending. |
 
-There is no clean-share floor or gap-share veto. Excluding hours from both
+There is no clean-, gap- or unknown-share veto. Excluding hours from both
 value and points reduces sample size but does not itself prove bias. The
 minimum sample and measured stability now govern adequacy. `clean_hours_share`
-and `gap_share` remain diagnostics. Saturation and unpriced-hour budgets remain:
-heavy-use censorship and unsupported model/usage mixtures can cause selection
-bias even when a selected clean estimate is numerically stable.
+and `gap_share` remain diagnostics, as does `unpriced_share`. Unpriced models
+still exclude their hours and are never valued at zero. Saturation keeps its
+25% veto: capped periods select the heaviest-use traffic, so their exclusion
+can bias the retained estimate even when it is numerically stable.
 
 ### Stability and held-out-day validation
 
@@ -182,8 +181,8 @@ several missing measurements in one event count separately there. Event and
 measurement counts include excluded hours and apply to the plan's attributed
 events plus provider-wide unattributed events. They distinguish an absent
 quantity from an event with no measurements. Nonzero counts are compatible with
-an eligible row when its unknown-hour share stays within the budget; counts
-alone are not vetoes. No schema change is needed for the derived report count.
+an eligible row when its retained sample is adequate and stable; neither counts
+nor unknown-hour share are vetoes. No schema change is needed for the derived report count.
 
 `spend.multiplier.report` serves all diagnostics additively. A numeric ratio
 alone is not authorization: consumers must use `routing_eligible` and match the

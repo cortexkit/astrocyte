@@ -292,14 +292,15 @@ Reads never write. A refusal on a read is one of the codes below.
   and `source_backlog`, plus `unattributed_event_share`,
   `zero_measurement_events`, `missing_quantity_events` and the derived
   `unknown_quantity_measurements` count. Missing-quantity and no-measurement
-  usage exclude account-hours within the shared 25% unpriced/unknown-hour
-  budget; their counts do not independently veto a row. Quality shares are fractions of all configured account-hours in
+  usage exclude account-hours; neither their counts nor their share independently
+  veto a row. Retained sample adequacy and stability govern eligibility.
+  Saturation keeps its separate veto. Quality shares are fractions of all configured account-hours in
   the row's plan; unpriced diagnostics also include excluded hours. Legacy rows
   retain their old values with null plan and ineligible legacy defaults.
   `stability_diagnostics` adds the recorded day-block bootstrap interval/width,
   active-day count, held-out-day six-hour RMSE/R² and resampling parameters;
   older rows without calibration inputs return null there. Adequacy uses clean
-  hours/points, active days and interval width, not a clean- or gap-share floor.
+  hours/points, active days and interval width, not a clean-, gap- or unknown-share floor.
 - `spend.multiplier.pace`: hourly usage by producer and work class, valued at
   the latest **eligible**, unsuperseded head's recorded rates without a catalog
   call. Accepts optional `plan`; it is required when configured plans differ.

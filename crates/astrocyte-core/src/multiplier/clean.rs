@@ -14,10 +14,10 @@ const RESET_TOLERANCE_MS: i64 = 10 * 60_000;
 // A full day of matched account-hours and twenty points are the minimum sample;
 // excluded exposure is reported, not used as an unsupported share floor.
 const MIN_CLEAN_HOURS: usize = 24;
-// Codex loses 19% to saturation; Claude loses 40.9%. Permit the former, not
-// the latter. Unpriced hours keep the same budget; excluded gaps instead use
-// the remaining sample's adequacy and measured stability, not a share veto.
-const MAX_EXCLUDED_SHARE: f64 = 0.25;
+// Codex loses 19% to saturation; Claude loses 40.9%. Capped hours are selected
+// heavy-use exposure, unlike excluded unknown or gapped hours. Retain their
+// 25% veto; other excluded exposure uses sample adequacy and stability.
+const MAX_SATURATED_SHARE: f64 = 0.25;
 // A one-point endpoint error is at most 5% of twenty accumulated points.
 const MIN_POINTS: f64 = 20.0;
 // A positive quantity with unknown pricing may represent premium burn even
@@ -529,8 +529,7 @@ pub fn compute_plan_observations(
             ),
             (unresolved_price, "unpriced_plan"),
             (clean_count < MIN_CLEAN_HOURS, "insufficient_clean_hours"),
-            (row.saturated_share > MAX_EXCLUDED_SHARE, "saturation"),
-            (row.unpriced_share > MAX_EXCLUDED_SHARE, "unpriced_usage"),
+            (row.saturated_share > MAX_SATURATED_SHARE, "saturation"),
             (unknown_reset, "unknown_reset"),
             (
                 plans.len() > 1
