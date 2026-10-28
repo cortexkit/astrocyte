@@ -640,17 +640,16 @@ impl ModuleHandler for AstrocyteHandler {
             Err(refusal) => return refusal,
         };
         let route = self.routes.of(ctx.route_handle());
-        if request.method == ops::OP_STEPS_SUBSCRIBE || request.method == ops::OP_STEPS_READ {
-            if !route.may_read_feed {
-                return refusal(
-                    "not_permitted",
-                    format!(
-                        "{} is served only to local apps and Callosum's phone routes",
-                        request.method
-                    ),
-                );
+        if matches!(
+            request.method.as_str(),
+            ops::OP_STEPS_SUBSCRIBE | ops::OP_STEPS_READ | ops::OP_RUNS_LIST | ops::OP_RUNS_DETAIL
+        ) {
+            if let Err((code, message)) =
+                step_feed::require_read_permission(&request.method, route.may_read_feed)
+            {
+                return refusal(&code, message);
             }
-            // Both only read, so a flow's route may use them too.
+            // All four are reads, so a flow's route may use them too.
             if request.method == ops::OP_STEPS_SUBSCRIBE {
                 return step_feed::subscribe(
                     &self.state,
@@ -660,9 +659,11 @@ impl ModuleHandler for AstrocyteHandler {
                 )
                 .await;
             }
-            return tokio::task::block_in_place(|| {
-                step_feed::read_outcome(&self.state, request.params)
-            });
+            if request.method == ops::OP_STEPS_READ {
+                return tokio::task::block_in_place(|| {
+                    step_feed::read_outcome(&self.state, request.params)
+                });
+            }
         }
         if request.method == ops::OP_WATERMARK_GET {
             // A read on the reader connection, answered for the principal
@@ -2084,6 +2085,8 @@ mod tests {
                 "spend.workclass.report",
                 "usage.cache.sessions",
                 "usage.cache.steps",
+                "usage.runs.list",
+                "usage.runs.detail",
                 "usage.steps.read",
                 "usage.steps.subscribe",
                 "watermark.get",
@@ -2682,6 +2685,16 @@ mod tests {
         )
     }
 
+    fn request_frame(channel: u16, corr: u64, method: &str, params: Value) -> Frame {
+        route_frame(
+            FrameType::Request,
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&json!({"method":method,"params":params})).unwrap(),
+        )
+    }
+
     /// Bind channel `channel` as `principal` with identity harness `harness`.
     async fn bind_as(
         stream: &mut TcpStream,
@@ -2870,6 +2883,18 @@ mod tests {
             for request in [
                 read_request(*channel, corr),
                 subscribe_request(*channel, corr + 1),
+                request_frame(
+                    *channel,
+                    corr + 2,
+                    ops::OP_RUNS_LIST,
+                    json!({"from_ms":0,"to_ms":1}),
+                ),
+                request_frame(
+                    *channel,
+                    corr + 3,
+                    ops::OP_RUNS_DETAIL,
+                    json!({"key":{"kind":"session","harness":"opencode","session":"ses_synthetic"}}),
+                ),
             ] {
                 let corr = request.header.corr;
                 send(&mut stream, request).await;
@@ -2888,6 +2913,47 @@ mod tests {
             }
         }
         assert_eq!(state.step_feed().open_subscriptions(), 0);
+        drop(stream);
+        let _ = served(serving, "serving did not end at EOF").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runs_reads_are_served_to_direct_and_callosum_phone_routes() {
+        let state = Arc::new(test_state());
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        for (channel, principal, harness) in [
+            (8, subc_protocol::Principal::Direct, "desktop"),
+            (
+                9,
+                subc_protocol::Principal::Reserved {
+                    module_id: "callosum".into(),
+                },
+                "fed-phone:synthetic",
+            ),
+        ] {
+            bind_as(&mut stream, channel, u64::from(channel), principal, harness).await;
+            send(
+                &mut stream,
+                request_frame(
+                    channel,
+                    100,
+                    ops::OP_RUNS_LIST,
+                    json!({"from_ms":0,"to_ms":1}),
+                ),
+            )
+            .await;
+            let reply = frame_for(&mut stream, channel, 100).await;
+            assert_eq!(reply.header.ty, FrameType::Response);
+            let value: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(value["result"]["totals"]["rows"], 0);
+            send(&mut stream,request_frame(channel,101,ops::OP_RUNS_DETAIL,json!({"key":{"kind":"session","harness":"opencode","session":"ses_missing_synthetic"}}))).await;
+            let reply = frame_for(&mut stream, channel, 101).await;
+            let body: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(body.code, "not_found");
+        }
         drop(stream);
         let _ = served(serving, "serving did not end at EOF").await;
     }

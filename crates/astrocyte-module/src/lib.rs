@@ -18,6 +18,8 @@ mod quota_events;
 mod recent_steps;
 mod refresher;
 mod runner_steps;
+#[cfg(test)]
+mod runs_vectors;
 pub mod state;
 pub mod step_feed;
 mod wire_map;

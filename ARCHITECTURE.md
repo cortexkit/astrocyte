@@ -22,7 +22,7 @@ The workspace has three crates:
 
 ## Durable state
 
-`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS`, currently at schema version 33.
+`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS`, currently at schema version 34.
 `initialize_connection` enables and verifies foreign keys, probes SQLite JSON, triggers and
 partial indexes, and sets a 5000 ms busy timeout. The read-only report connection
 skips the table-creating probe and copies that timeout.
@@ -186,8 +186,8 @@ committed generation and degrades health. See [configuration](docs/configuration
 
 ## Served operations
 
-`PUBLIC_OPERATION_NAMES` in `crates/astrocyte-module/src/ops.rs` is the closed
-surface; dispatch and the manifest both use it.
+Dispatch and the manifest share `PUBLIC_OPERATION_NAMES` in
+`crates/astrocyte-module/src/ops.rs`.
 
 | Operation | Kind |
 |---|---|
@@ -197,7 +197,7 @@ surface; dispatch and the manifest both use it.
 | `spend.workclass.report` | read |
 | `spend.ledger.coverage` | read |
 | `spend.charge.explain` | read |
-| `spend.reconcile` | read, statement reconciliation |
+| `spend.reconcile` | read |
 | `spend.event.ingest` | write |
 | `spend.correction.ingest` | write |
 | `spend.chargeability.settle` | write |
@@ -206,11 +206,13 @@ surface; dispatch and the manifest both use it.
 | `spend.subscription.close` | write |
 | `spend.event.reprice` | write, operator repricing |
 | `spend.basis.correct` | write, charge-basis correction |
-| `spend.multiplier.report` | read, multiplier heads by day |
-| `spend.multiplier.pace` | read, hourly usage at the latest head's rates |
+| `spend.multiplier.report` | read |
+| `spend.multiplier.pace` | read |
 | `spend.multiplier.recompute` | write, operator recompute |
-| `usage.cache.sessions` | read, harness sessions with hit ratio and busts |
-| `usage.cache.steps` | read, one session's steps with cache verdicts |
+| `usage.cache.sessions` | read |
+| `usage.cache.steps` | read |
+| `usage.runs.list` | read, range session/run/flow totals |
+| `usage.runs.detail` | read, whole-key charges and paged items |
 | `usage.steps.subscribe` | read, watch |
 | `usage.steps.read` | read, live step feed |
 | `watermark.get` | read, log-read watermark |

@@ -42,7 +42,19 @@ pub const SUBSCRIBER_QUEUE: usize = 64;
 /// second, as the contract says.
 const NOTICE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The route principals that may read the feed: local apps (`Direct`) and
+/// Turn the shared bind-time admission decision into one consistent refusal.
+pub fn require_read_permission(method: &str, allowed: bool) -> Result<(), (String, String)> {
+    if allowed {
+        Ok(())
+    } else {
+        Err((
+            "not_permitted".into(),
+            format!("{method} is served only to local apps and Callosum's phone routes"),
+        ))
+    }
+}
+
+/// The principals that may read the feed and Runs: local apps (`Direct`) and
 /// Callosum's phone routes, whose bind names the phone in the harness field
 /// (`fed-phone:<fingerprint>`). Simulators (`fed-sim:`), other computers
 /// (`fed-computer:`) and every other principal are refused `not_permitted`.

@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 33. A schema change appends a migration; an applied
+currently version 34. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -47,6 +47,7 @@ ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 | `summary_quantity` | Each row holds exact quantities for a cell, role, unit and exponent, including the covered population and presence counts. | Rebuilds replace these rows. |
 | `summary_money` | Each row holds current-head or adjustment contributions in their actual currency, together with a presence count. | Rebuilds replace these rows. |
 | `summary_cost_frequency` | Each row counts an exact current-head value in the dated, complete, currency-known work-class sample. | Rebuilds replace these rows. |
+| `summary_run_cell` | Each row holds key/model/hour steps, token presence and current-charge cost maps for Runs reads. | The existing hourly rebuild and audit replace these rows. |
 | `summary_audit_state` | The row records the independent audit's cursor, next start time and progress statistics. | The audit updates this row. |
 
 ## Immutability
@@ -311,6 +312,19 @@ The primary key on `event_id` makes the transition happen at most once.
 
 
 ## Hourly summaries
+
+Migration 34 adds `summary_run_cell` at `(kind, hour_number, run_key, provider,
+model)`, with typed step/token/count columns and exact currency/reason maps.
+It shares the existing hour revisions, dirty triggers, reducer, publication row
+budget and audit; summary format 2 requires rebuilding old hours before reuse.
+The key/time index supports whole-key totals and batched fallback maxima; the
+activity index supports newest-first list candidates. Run and flow detail also
+have partial `(run_ref, occurred_at_ms)` and `(flow_ref, occurred_at_ms)` base
+indexes. The relation is disposable, including its undated partition. Runs costs
+exclude adjustments and covered/unpriced/pending money; output tokens include
+reasoning on each event only when output was reported. See the Runs subsection
+of [module surface](module-surface.md#44-runs-cost-reads-usage-runs-v1).
+
 
 Migration 24 adds derived summary tables beside the ledger; it does not delete
 usage events, measurements, charge history or adjustments. It creates empty

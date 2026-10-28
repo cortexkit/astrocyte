@@ -35,6 +35,8 @@ pub const OP_MULTIPLIER_PACE: &str = "spend.multiplier.pace";
 pub const OP_MULTIPLIER_RECOMPUTE: &str = "spend.multiplier.recompute";
 pub const OP_CACHE_SESSIONS: &str = "usage.cache.sessions";
 pub const OP_CACHE_STEPS: &str = "usage.cache.steps";
+pub const OP_RUNS_LIST: &str = "usage.runs.list";
+pub const OP_RUNS_DETAIL: &str = "usage.runs.detail";
 /// The live step feed (`step_feed`). The subscription is a watch, served as a
 /// stream of notices by the serving handler, not through `dispatch`. Both
 /// are served only to the principals `step_feed::may_read_feed` admits; the
@@ -68,7 +70,7 @@ const fn same_str(left: &str, right: &str) -> bool {
 
 /// The closed public surface consumed by dispatch, the manifest, and the schema
 /// artifact. Exact name-set parity prevents a same-sized but incorrect surface.
-pub const PUBLIC_OPERATION_NAMES: [&str; 23] = [
+pub const PUBLIC_OPERATION_NAMES: [&str; 25] = [
     OP_VERDICT,
     OP_REPORT,
     OP_EVENT_INGEST,
@@ -89,6 +91,8 @@ pub const PUBLIC_OPERATION_NAMES: [&str; 23] = [
     OP_MULTIPLIER_RECOMPUTE,
     OP_CACHE_SESSIONS,
     OP_CACHE_STEPS,
+    OP_RUNS_LIST,
+    OP_RUNS_DETAIL,
     OP_STEPS_SUBSCRIBE,
     OP_STEPS_READ,
     OP_WATERMARK_GET,
@@ -318,6 +322,18 @@ fn operation_params_schema(name: &str) -> Value {
                 "harness": optional_string, "session": optional_string,
             }),
         ),
+        OP_RUNS_LIST => closed_object(
+            &["from_ms", "to_ms"],
+            json!({"from_ms":i64_value,"to_ms":i64_value,"harness":optional_string,"limit":optional_u32,"after":optional_string}),
+        ),
+        OP_RUNS_DETAIL => closed_object(
+            &["key"],
+            json!({"key":{"oneOf":[
+            closed_object(&["kind","harness","session"],json!({"kind":{"enum":["session"]},"harness":string,"session":string})),
+            closed_object(&["kind","harness","run_id"],json!({"kind":{"enum":["run"]},"harness":string,"run_id":string})),
+            closed_object(&["kind","harness","flow_id"],json!({"kind":{"enum":["flow"]},"harness":string,"flow_id":string}))
+        ]},"limit":optional_u32,"after":optional_string}),
+        ),
         OP_WATERMARK_GET => closed_object(&[], json!({})),
         other => unreachable!("operation {other} is served without a params schema"),
     }
@@ -353,6 +369,33 @@ fn correction_ingest_schema() -> Value {
 
 pub type OpResult = Result<Value, (String, String)>;
 
+fn map_runs_error(error: astrocyte_core::runs::Error) -> (String, String) {
+    match error {
+        astrocyte_core::runs::Error::Refusal(code) => {
+            (code.into(), format!("runs request refused: {code}"))
+        }
+        astrocyte_core::runs::Error::Store(error) => map_report_error(error),
+    }
+}
+fn op_runs_list(state: &SharedState, params: Value) -> OpResult {
+    let request = serde_json::from_value(params)
+        .map_err(|e| ("malformed".into(), format!("runs list params: {e}")))?;
+    read_value(state, |conn| {
+        astrocyte_core::runs::list(conn, &request)
+            .map(|reply| json!(reply))
+            .map_err(map_runs_error)
+    })
+}
+fn op_runs_detail(state: &SharedState, params: Value) -> OpResult {
+    let request = serde_json::from_value(params)
+        .map_err(|e| ("malformed".into(), format!("runs detail params: {e}")))?;
+    read_value(state, |conn| {
+        astrocyte_core::runs::detail(conn, &request)
+            .map(|reply| json!(reply))
+            .map_err(map_runs_error)
+    })
+}
+
 pub fn dispatch(state: &SharedState, method: &str, params: Value) -> OpResult {
     match method {
         OP_VERDICT => op_verdict(state, params),
@@ -375,6 +418,8 @@ pub fn dispatch(state: &SharedState, method: &str, params: Value) -> OpResult {
         OP_MULTIPLIER_RECOMPUTE => op_multiplier_recompute(state, params),
         OP_CACHE_SESSIONS => op_cache_sessions(state, params),
         OP_CACHE_STEPS => op_cache_steps(state, params),
+        OP_RUNS_LIST => op_runs_list(state, params),
+        OP_RUNS_DETAIL => op_runs_detail(state, params),
         OP_STEPS_SUBSCRIBE => op_steps_subscribe(params),
         OP_STEPS_READ => crate::step_feed::read(state, params)
             .map(|page| json!(page))
@@ -1238,6 +1283,8 @@ mod tests {
             "spend.workclass.report",
             "usage.cache.sessions",
             "usage.cache.steps",
+            "usage.runs.list",
+            "usage.runs.detail",
             "usage.steps.read",
             "usage.steps.subscribe",
             "watermark.get",
@@ -1266,7 +1313,7 @@ mod tests {
     #[test]
     fn every_operation_name_reaches_its_own_handler() {
         // Each operation is paired with the marker its own handler writes.
-        const ROUTES: [(&str, &str); 23] = HANDLER_MARKERS;
+        const ROUTES: [(&str, &str); 25] = HANDLER_MARKERS;
 
         // The markers only discriminate while none of them is a prefix of
         // another: three of these begin with the word "subscription", and if
@@ -1329,7 +1376,7 @@ mod tests {
     /// request-decoding error. A refusal with code `malformed` and a message
     /// starting with that literal came from the decoder; any other answer
     /// means the decoder accepted the params.
-    const HANDLER_MARKERS: [(&str, &str); 23] = [
+    const HANDLER_MARKERS: [(&str, &str); 25] = [
         (OP_VERDICT, "verdict params: "),
         (OP_REPORT, "report params: "),
         (OP_EVENT_INGEST, "event params: "),
@@ -1350,6 +1397,8 @@ mod tests {
         (OP_MULTIPLIER_RECOMPUTE, "multiplier recompute params: "),
         (OP_CACHE_SESSIONS, "cache sessions params: "),
         (OP_CACHE_STEPS, "cache steps params: "),
+        (OP_RUNS_LIST, "runs list params: "),
+        (OP_RUNS_DETAIL, "runs detail params: "),
         (OP_STEPS_SUBSCRIBE, "steps subscribe params: "),
         (OP_STEPS_READ, "steps read params: "),
         (OP_WATERMARK_GET, "watermark params: "),
@@ -1579,8 +1628,25 @@ mod tests {
                 ],
                 json!({"limit": -1}),
             ),
-            // The request has no members, so the refused sample is an
-            // unknown member, as the capability's vectors refuse.
+            sample(
+                OP_RUNS_LIST,
+                vec![
+                    json!({"from_ms":0,"to_ms":1}),
+                    json!({"from_ms":0,"to_ms":1,"harness":null,"limit":50,"after":null}),
+                ],
+                json!({"from_ms":"bad","to_ms":1}),
+            ),
+            sample(
+                OP_RUNS_DETAIL,
+                vec![
+                    json!({"key":{"kind":"session","harness":"opencode","session":"ses_synthetic"}}),
+                    json!({"key":{"kind":"run","harness":"broca","run_id":"run-sid-Synthetic"},"limit":200,"after":null}),
+                    json!({"key":{"kind":"flow","harness":"broca","flow_id":"flow-synthetic"}}),
+                ],
+                json!({"key":{"kind":"run","harness":"broca","session":"wrong"}}),
+            ),
+            // Watermark has no request members, so an unknown member is the
+            // refusal sample, matching the capability's vectors.
             sample(
                 OP_WATERMARK_GET,
                 vec![json!({})],
@@ -1608,10 +1674,23 @@ mod tests {
                     "additionalProperties",
                     "items",
                     "description",
+                    "oneOf",
                 ]
                 .contains(&keyword.as_str()),
                 "the schema checker does not understand {keyword:?}"
             );
+        }
+        if let Some(choices) = schema.get("oneOf") {
+            if choices
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|s| schema_accepts(s, value).is_ok())
+                .count()
+                != 1
+            {
+                return Err("expected one matching alternative".into());
+            }
         }
         if let Some(types) = schema.get("type") {
             let types: Vec<&str> = match types {

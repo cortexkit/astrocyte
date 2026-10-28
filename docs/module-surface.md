@@ -62,6 +62,8 @@ Test: `every_operation_name_reaches_its_own_handler`.
 | `spend.multiplier.pace` | read | `quota_provider`, `from_ms`, `to_ms` |
 | `usage.cache.sessions` | read | `since_ms?`, `harness?`, `limit?` |
 | `usage.cache.steps` | read | `harness`, `session`, `limit?`, `after_cursor?` |
+| `usage.runs.list` | read | `from_ms`, `to_ms`, `harness?`, `limit?`, `after?` |
+| `usage.runs.detail` | read | `key`, `limit?`, `after?` |
 | `usage.steps.subscribe` | read, watch | `harness?`, `session?` |
 | `usage.steps.read` | read | `after?`, `limit?`, `harness?`, `session?` |
 | `watermark.get` | read | none |
@@ -648,6 +650,96 @@ Tests: `watermark_get_answers_thalamus_harness_as_the_crate_vectors_pin`,
 `watermark_get_refuses_thalamus_while_its_source_is_excluded`,
 `the_bind_principal_is_forgotten_when_the_route_or_connection_goes`,
 `manifest_provides_the_log_read_watermark_capability`.
+
+### 4.4 Runs cost reads (`usage-runs-v1`)
+
+These reads serve machine-wide session, BROCA run and BROCA flow costs from the
+ledger, never from client-side pricing. They share the live feed's admission
+check: `Principal::Direct` and reserved `callosum` routes with a `fed-phone:`
+identity harness. Every other caller is refused `not_permitted` before operation-specific parameters are decoded.
+Each reply is the response frame's `result`, read from one SQLite snapshot.
+
+**Keys** are closed tagged objects:
+
+- `{"kind":"session","harness":h,"session":s}`: `(producer, session)`, not
+  the ledger's optional hosting-harness attribution. Harnesses are `opencode`
+  (both versions), `claude-code`, `codex`, `pi`, `gemini`, `goose`, `omp`, `kimi`.
+- `{"kind":"run","harness":"broca","run_id":r}`: BROCA `run_ref`, verbatim.
+- `{"kind":"flow","harness":"broca","flow_id":f}`: BROCA batch `flow_ref`.
+
+Run rows also carry `session` when any fact of the run records its label, even
+if that fact is outside the requested range. It is absent for unlabelled runs;
+no label is fabricated and no run is dropped. Flow rows carry `work_class` when
+recorded; no additional flow-launcher identity is inferred.
+
+**`usage.runs.list` request:** `{from_ms, to_ms, harness?, limit?, after?}`.
+The half-open range must satisfy `from_ms < to_ms` and span at most 31 days.
+`limit` defaults to 50 and must be 1–200. `harness` filters the key's harness.
+`after` is the opaque `next` from a previous page with the same range/filter.
+
+Reply: `{rows, totals:{rows, steps, tokens, cost}, next?}`. Range totals are on
+**every** page and cover the entire filtered range. Each row is
+`{key, first_at_ms, last_at_ms, steps, tokens, cost, pricing_unit, models}`;
+models are `{provider, model, steps, tokens, cost}` splits of exactly the same
+figures. Missing provider/model identity is `null`. Every figure counts only
+facts with `occurred_at_ms` in the range. Undated facts are not listed.
+Rows sort by newest `last_at_ms`, then canonical key; the cursor resumes after
+that pair. `next` is absent on the last page. A concurrently active key may move
+to the first page: restart paging on a feed notice rather than merging snapshots.
+
+**`usage.runs.detail` request:** `{key, limit?, after?}`. `limit` defaults to 200
+and must be 1–1000. Reply: `{key, pricing_unit, items, totals:{tokens,cost}, next?}`.
+Totals cover the entire key, not just the page or the list's time range. Items
+sort oldest first, with undated (`occurred_at_ms: null`) items first and stable
+ledger order for ties. Harness items are
+`{step_ref, occurred_at_ms, provider, model, measurements}`: `step_ref` is the
+verbatim producer reference also used by the feed for step-based harnesses.
+Goose's reference identifies its accumulated session event, not a feed call. BROCA items instead carry
+`segment_ref`, the fact id; it is not a feed step id.
+
+Pricing units are `step` for ordinary harnesses, `run_segment` for BROCA, and
+`session_total` for Goose. Goose's detail has one item for its accumulated
+session event. Segment/session-total costs belong to the run/session as a whole;
+clients must not divide them over feed calls.
+
+**Tokens** have optional `input`, `output`, `reasoning`, `cache_read`, and
+`cache_write` integer members. Missing is not zero: a role is absent when no
+included event reports an exact whole-token quantity. Exact decimal encodings
+are normalized (100 × 10^-1 contributes 10). Genuinely fractional quantities
+are omitted from integer totals without rounding and preserved exactly in detail. `output` includes reasoning, as on the feed;
+`reasoning` is its breakdown. Stored detail roles remain disjoint.
+
+**Cost** is `{priced, covered_measurements, unpriced_measurements,
+unpriced_by_reason, pending_measurements}`. `priced` maps currency to signed
+integer nanos and includes only current `priced` charges; it is `{}` if none.
+Covered/unpriced/pending counts are never folded into money. Reasons are the
+ledger's closed set, including `no_rate`, `no_catalog_coverage`, `rate_tiered`,
+`rate_inherited`, and `stated_zero_requires_policy`. A measurement with no charge
+head is pending. All-zero counts plus empty `priced` means no measurements.
+
+Each detail measurement is `{role, unit, quantity, state, amount_nanos?,
+currency?, reason?}`. `quantity` is `{units, exponent}` (decimal ledger quantity),
+or `null` when unreported. State is `priced`, `covered`, `unpriced`, or `pending`.
+Only priced measurements carry amount/currency, and only unpriced measurements
+carry reason. Current means no charge row supersedes it, so repricing replaces
+figures rather than adding historical charges. List money excludes adjustments.
+
+List refusals: `malformed`, `invalid_range`, `range_too_large`, `invalid_request`
+(bad limit, harness or cursor/request mismatch), `not_permitted`. Detail refusals:
+`malformed`, `invalid_request`, `not_found` (no fact has that key), `not_permitted`.
+Pricing can trail ingest by a pass; pending counts expose that lag. No new watch
+is added: reread on existing step-feed notices. Repricing alone does not produce
+a feed notice; clients needing to observe resolved prices must reread separately.
+
+List totals use rebuildable key/model/hour cells maintained by the existing
+hourly dirty triggers, revision fence, bounded reducer, atomic publication and
+audit. Clean complete hours use cells; dirty/missing/partial hours use indexed
+base ranges in the same snapshot. Detail pages use key/time indexes with LIMIT;
+whole-key totals combine clean cells and dirty-hour base reductions.
+
+Synthetic vectors and SHA-256 checksums are published under
+`crates/astrocyte-module/test-vectors/usage-runs-v1/`. Tests regenerate frame bodies
+through the real dispatch and the serving path's shared permission refusal.
 
 ## 5. Calls astrocyte makes
 

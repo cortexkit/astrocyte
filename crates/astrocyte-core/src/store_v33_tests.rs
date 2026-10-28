@@ -47,7 +47,7 @@ fn schema_v33_preserves_cursor_bytes_and_other_table_rows() {
             .collect::<Vec<_>>()
     };
     let others = store.with_conn(|conn| Ok(other_rows(conn))).unwrap();
-    let outcome = migrate_store(&store).unwrap();
+    let outcome = store.migrate("astrocyte", &MIGRATIONS[..33]).unwrap();
     assert_eq!((outcome.applied, outcome.recorded), (1, 33));
     store
         .with_conn(|conn| {

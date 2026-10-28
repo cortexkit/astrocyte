@@ -1,6 +1,6 @@
 # Codebase Structure
 
-`ARCHITECTURE.md` covers runtime; this maps code.
+`ARCHITECTURE.md` covers runtime.
 
 ## Repository map
 
@@ -11,7 +11,7 @@ Crates live in `crates/`, public docs in `docs/`, and gates in `scripts/`.
 
 Domain logic and storage.
 
-- `store.rs`: `MIGRATIONS` (1 to 33), `initialize_connection` and `migrate_store`.
+- `store.rs`: `MIGRATIONS` (1 to 34), `initialize_connection` and `migrate_store`.
   Migration 23 rebuilds integer keys without charge digests, checking FKs before
   commit; startup restores enforcement. VACUUM is a separate offline step.
 - `fact.rs`: event and measurement identity, minted locally.
@@ -32,6 +32,7 @@ Domain logic and storage.
 - `verdict.rs`: the machine-scoped `budget.verdict` read.
 - `store_v33_tests.rs`: cursor preservation and refusal tests for the event-only rebuild.
 - `cache_diagnostics.rs`: harness steps per session and their cache verdicts.
+- `runs.rs`: session/run/flow cost reads.
 - `step_feed.rs`: the live step feed: table, change detection, paged read.
 - `capacity.rs`: QTA capacity windows, observations, runtime and freshness.
 - `money.rs`: signed nanodollar arithmetic with one rounding site.

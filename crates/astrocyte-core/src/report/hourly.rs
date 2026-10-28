@@ -6,7 +6,7 @@ use rusqlite::Transaction;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-const FORMAT: i64 = 1;
+const FORMAT: i64 = crate::runs::FORMAT;
 const CHUNK: usize = 5_000;
 const MAX_PUBLICATION_ROWS: usize = 50_000;
 const HOUR_MS: i64 = 3_600_000;
@@ -106,6 +106,7 @@ struct Money {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Data {
+    runs: crate::runs::Cells,
     cells: BTreeMap<Key, Cell>,
     quantities: BTreeMap<(Key, QuantityKey), Quantity>,
     money: BTreeMap<(Key, i64, String), Money>,
@@ -294,6 +295,7 @@ impl Data {
             sum(&mut money.nanos, i128::from(row.get::<_, i64>(2)?))?;
             add_count(&mut money.contributions, 1)?;
         }
+        crate::runs::observe(conn, filter, &mut self.runs)?;
         Ok(ledger.events.len())
     }
 }
@@ -410,6 +412,7 @@ fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
             row.get(4)?,
         );
     }
+    data.runs = crate::runs::stored(conn, hour.kind, hour.number)?;
     Ok(data)
 }
 fn replace(
@@ -490,6 +493,7 @@ fn replace(
             ],
         )?;
     }
+    crate::runs::replace(tx, hour.kind, hour.number, &data.runs)?;
     tx.execute("UPDATE summary_hour SET built_revision=?3,format_version=?4,events_total=?5,first_ms=?6,last_ms=?7 WHERE kind=?1 AND hour_number=?2",params![hour.kind,hour.number,revision,FORMAT,data.events,data.first,data.last])?;
     tx.execute(
         "DELETE FROM summary_dirty_hour WHERE kind=?1 AND hour_number=?2",
@@ -663,6 +667,7 @@ impl SummaryMaintenance {
                 + build.data.quantities.len()
                 + build.data.money.len()
                 + build.data.frequencies.len()
+                + build.data.runs.len()
                 > MAX_PUBLICATION_ROWS);
         build.ready = count < CHUNK || build.deferred;
         let spent =

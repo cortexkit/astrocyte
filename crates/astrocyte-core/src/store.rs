@@ -3890,6 +3890,44 @@ DROP TABLE astrocyte_v33_guard;
 DROP TABLE astrocyte_v33_sequence;
 "#,
     },
+    Migration {
+        version: 34,
+        statements: r#"
+-- Runs share the hourly summary revision, dirty queue, and audit. A currency
+-- map in each model cell avoids duplicating step and token counts by currency.
+CREATE TABLE summary_run_cell (
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    run_key TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    first_ms INTEGER NOT NULL,
+    last_ms INTEGER NOT NULL,
+    steps INTEGER NOT NULL,
+    input INTEGER,
+    output INTEGER,
+    reasoning INTEGER,
+    cache_read INTEGER,
+    cache_write INTEGER,
+    priced TEXT NOT NULL,
+    covered INTEGER NOT NULL,
+    unpriced INTEGER NOT NULL,
+    pending INTEGER NOT NULL,
+    reasons TEXT NOT NULL,
+    session TEXT,
+    work_class TEXT,
+    PRIMARY KEY(kind,hour_number,run_key,provider,model),
+    FOREIGN KEY(kind,hour_number) REFERENCES summary_hour(kind,hour_number)
+) WITHOUT ROWID;
+CREATE INDEX summary_run_key_time ON summary_run_cell(run_key,kind,hour_number);
+CREATE INDEX summary_run_activity ON summary_run_cell(kind,last_ms DESC,run_key);
+CREATE INDEX usage_event_run_time ON usage_event(run_ref,occurred_at_ms)
+    WHERE run_ref IS NOT NULL;
+CREATE INDEX usage_event_flow_time ON usage_event(flow_ref,occurred_at_ms)
+    WHERE flow_ref IS NOT NULL;
+INSERT OR IGNORE INTO summary_dirty_hour SELECT kind,hour_number FROM summary_hour;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -3954,7 +3992,7 @@ mod tests {
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (33, 33, 33)
+            (34, 34, 34)
         );
         assert_eq!(
             store
@@ -3967,7 +4005,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 33, 33)
+            (0, 34, 34)
         );
         assert!(!second.store_ahead());
         store
@@ -3977,7 +4015,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',34,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',35,1)",
                     [],
                 )?;
                 Ok(())
@@ -3986,7 +4024,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 34, 33)
+            (0, 35, 34)
         );
         assert!(ahead.store_ahead());
     }
