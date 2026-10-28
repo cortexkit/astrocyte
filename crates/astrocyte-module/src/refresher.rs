@@ -3727,8 +3727,9 @@ impl MultiplierStage {
                 // on every later tick; `log_failure` logs it once per day and reason
                 // so a failure that lasts all day is not repeated every minute.
                 match outcome {
-                    Ok(observation) => {
+                    Ok(observations) => {
                         self.recorded.insert(recorded_key);
+                        for observation in observations {
                         tracing::info!(
                             target: "multiplier",
                             quota_provider,
@@ -3740,6 +3741,7 @@ impl MultiplierStage {
                             subscription_nanos = observation.subscription_nanos,
                             "multiplier observation recorded"
                         );
+                        }
                     }
                     Err(failure) => {
                         self.log_failure(quota_provider, &day, failure);
@@ -3835,13 +3837,15 @@ fn multiplier_stale_sources(
     state: &SharedState,
     interval_end_ms: i64,
     snapshot_at_ms: i64,
+    provider: &multiplier::QuotaProviderConfig,
 ) -> Result<Vec<String>, DayError> {
     let sources = state
         .with_read_op(|conn| {
             let mut statement = conn
                 .prepare(
-                    "SELECT source_key FROM source_runtime
-                     WHERE last_success_ms IS NULL OR last_success_ms < ?1
+                     "SELECT source_key FROM source_runtime
+                      WHERE last_success_ms IS NULL OR last_success_ms < ?1
+                         OR pending_known > 0 OR pending_unknown != 0
                      ORDER BY source_key",
                 )
                 .map_err(|error| ("internal".to_string(), error.to_string()))?;
@@ -3856,6 +3860,7 @@ fn multiplier_stale_sources(
             message,
             needs_config: false,
         })?;
+    let sources: Vec<_> = sources.into_iter().filter(|source| provider.scope.iter().any(|rule| source == &rule.producer || source.starts_with(&format!("{}:", rule.producer)))).collect();
     if !sources.is_empty() && snapshot_at_ms < interval_end_ms + 2 * 3_600_000 {
         return Err(DayError {
             code: "source_reads_pending".into(),
@@ -3871,8 +3876,11 @@ fn multiplier_stale_sources(
 
 fn disclose_stale_sources(observation: &mut multiplier::Observation, sources: &[String]) {
     if !sources.is_empty() {
+        observation.source_backlog = sources.to_vec();
+        observation.routing_eligible = false;
+        observation.eligibility_reasons.push("source_backlog".into());
         observation.error_deflating.push_str(&format!(
-            " stale_sources: {}; no successful read after the interval ended, so late usage may be missing.",
+            " stale_sources: {}; source read is stale or backlog remains, so late usage may be missing.",
             sources.join(", ")
         ));
     }
@@ -3887,9 +3895,9 @@ fn record_multiplier_day(
     quota_provider: &str,
     interval_end_ms: i64,
     snapshot_at_ms: i64,
-) -> Result<multiplier::Observation, DayFailure> {
-    let stale_sources = multiplier_stale_sources(state, interval_end_ms, snapshot_at_ms)?;
-    let mut observation = compute_multiplier_day(
+) -> Result<Vec<multiplier::Observation>, DayFailure> {
+    let stale_sources = multiplier_stale_sources(state, interval_end_ms, snapshot_at_ms, &config.quota_providers[quota_provider])?;
+    let mut observations = compute_multiplier_day(
         state,
         catalog,
         plan_prices,
@@ -3898,18 +3906,19 @@ fn record_multiplier_day(
         interval_end_ms,
         snapshot_at_ms,
     )?;
-    disclose_stale_sources(&mut observation, &stale_sources);
+    for observation in &mut observations { disclose_stale_sources(observation, &stale_sources); }
     state
         .ordered_write(|tx| {
-            multiplier::insert_observation_in_tx(tx, &observation)
+            for observation in &observations { multiplier::insert_observation_in_tx(tx, observation)
                 .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
+            }
             Ok(((), true))
         })
         .map_err(|reason| DayFailure {
             reason,
             needs_config: false,
         })?;
-    Ok(observation)
+    Ok(observations)
 }
 
 /// Resolve plan prices, read, resolve rates, then compute; nothing is written.
@@ -3925,7 +3934,7 @@ fn compute_multiplier_day(
     quota_provider: &str,
     interval_end_ms: i64,
     snapshot_at_ms: i64,
-) -> Result<multiplier::Observation, DayError> {
+) -> Result<Vec<multiplier::Observation>, DayError> {
     let failed = |error: multiplier::MultiplierError| DayError {
         code: error.code().to_string(),
         message: error.message(),
@@ -3967,7 +3976,7 @@ fn compute_multiplier_day(
     let rates = multiplier::resolve_rates(catalog, &models, snapshot_at_ms).map_err(failed)?;
     let observation = state
         .with_read_op(|conn| {
-            multiplier::compute_observation(
+            multiplier::compute_plan_observations(
                 conn,
                 config,
                 &plan,
@@ -4062,17 +4071,9 @@ pub(crate) fn recompute_multiplier_day(
     })?;
     let mut observations = Vec::new();
     for quota_provider in &quota_providers {
-        let exists = state.with_read_op(|conn| {
-            multiplier::observation_exists(conn, quota_provider, day)
-                .map_err(|error| ("internal".to_string(), error.to_string()))
-        })?;
-        let stale_sources = if exists {
-            Vec::new()
-        } else {
-            multiplier_stale_sources(state, interval_end_ms, now_ms)
-                .map_err(|error| (error.code, error.message))?
-        };
-        let mut observation = compute_multiplier_day(
+        let stale_sources = multiplier_stale_sources(state, interval_end_ms, now_ms, &multiplier_config.quota_providers[quota_provider])
+            .map_err(|error| (error.code, error.message))?;
+        let mut rows = compute_multiplier_day(
             state,
             &catalog,
             plan_prices,
@@ -4082,18 +4083,19 @@ pub(crate) fn recompute_multiplier_day(
             now_ms,
         )
         .map_err(|error| (error.code, error.message))?;
-        disclose_stale_sources(&mut observation, &stale_sources);
-        observations.push(observation);
+        for observation in &mut rows { disclose_stale_sources(observation, &stale_sources); }
+        observations.extend(rows);
     }
     state.ordered_op_write(|tx| {
         let mut recomputed = Vec::new();
         for observation in &observations {
             // Recheck inside the writer transaction: another writer may have
             // created this day while its catalog calls were in flight.
-            let (observation_id, supersedes) = match multiplier::observation_head(
+            let (observation_id, supersedes) = match multiplier::observation_plan_head(
                 tx,
                 &observation.quota_provider,
                 &observation.observation_day,
+                observation.plan.as_deref(),
             )
             .map_err(|error| ("internal".to_string(), error.to_string()))?
             {

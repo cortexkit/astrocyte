@@ -3928,6 +3928,28 @@ CREATE INDEX usage_event_flow_time ON usage_event(flow_ref,occurred_at_ms)
 INSERT OR IGNORE INTO summary_dirty_hour SELECT kind,hour_number FROM summary_hour;
 "#,
     },
+    Migration {
+        version: 35,
+        statements: r#"
+ALTER TABLE multiplier_observation ADD COLUMN plan TEXT;
+ALTER TABLE multiplier_observation ADD COLUMN routing_eligible INTEGER NOT NULL DEFAULT 0 CHECK(routing_eligible IN (0,1));
+ALTER TABLE multiplier_observation ADD COLUMN eligibility_reasons TEXT NOT NULL DEFAULT '["legacy_estimator"]';
+ALTER TABLE multiplier_observation ADD COLUMN clean_hours_share REAL NOT NULL DEFAULT 0;
+ALTER TABLE multiplier_observation ADD COLUMN saturated_share REAL NOT NULL DEFAULT 0;
+ALTER TABLE multiplier_observation ADD COLUMN gap_share REAL NOT NULL DEFAULT 0;
+ALTER TABLE multiplier_observation ADD COLUMN unpriced_share REAL NOT NULL DEFAULT 0;
+ALTER TABLE multiplier_observation ADD COLUMN unconfigured_accounts TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE multiplier_observation ADD COLUMN source_backlog TEXT NOT NULL DEFAULT '[]';
+DROP INDEX multiplier_observation_one_original_per_day;
+CREATE UNIQUE INDEX multiplier_observation_one_original_per_day
+ON multiplier_observation(quota_provider, observation_day, COALESCE(plan,'')) WHERE supersedes IS NULL;
+CREATE TRIGGER multiplier_observation_same_plan BEFORE INSERT ON multiplier_observation
+WHEN NEW.supersedes IS NOT NULL AND EXISTS (
+ SELECT 1 FROM multiplier_observation parent WHERE parent.observation_id=NEW.supersedes
+ AND parent.plan IS NOT NEW.plan)
+BEGIN SELECT RAISE(ABORT, 'multiplier_observation_same_plan'); END;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.

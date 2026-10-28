@@ -42,6 +42,9 @@ use crate::fact::ChargeBasis;
 use crate::money::{round_nano_num, round_nano_ratio, MoneyError};
 use crate::pricing::{effective_output, prompt_size, EffectiveOutput};
 
+mod clean;
+pub use clean::compute_plan_observations;
+
 /// Producers whose usage event is exactly one model call, so a tiered rate
 /// (`.above_context.<size>`) can be decided from the event's own prompt. Every
 /// other producer (BROCA) may bundle many calls into one event -- BROCA events
@@ -457,6 +460,8 @@ pub(crate) struct AccountDelta {
     /// The part of the interval this account's readings cover, `[start, end)`
     /// in milliseconds, or `None` with no reading inside the interval.
     pub coverage_ms: Option<(i64, i64)>,
+    #[serde(skip)]
+    hours: BTreeMap<i64, clean::CounterHour>,
 }
 
 impl AccountDelta {
@@ -470,16 +475,7 @@ impl AccountDelta {
     }
 }
 
-/// The sum of positive increments between consecutive readings of one
-/// account's window, in arrival order.
-///
-/// The percent read is `COALESCE(raw_used_percent, used_percent)`: insula's
-/// read-time relaxation moves the real value into `raw_used_percent` and zeroes
-/// `used_percent` on 39-55% of Codex readings, so pairing a relaxed reading's
-/// zero with its neighbour would invent 60-100 point increments. Any decrease
-/// is a reset boundary and contributes nothing. The anchor is the last reading
-/// before the interval (looked for one window length back), so the first
-/// increment inside the interval is measured from it.
+/// Measures a reset-aware high-water series and its bounded hourly coverage.
 fn account_delta(
     conn: &Connection,
     quota_provider: &str,
@@ -488,95 +484,7 @@ fn account_delta(
     start_ms: i64,
     end_ms: i64,
 ) -> rusqlite::Result<AccountDelta> {
-    let start_ns = millis_to_nanos(start_ms);
-    let end_ns = millis_to_nanos(end_ms);
-    let lookback_ns =
-        start_ns - i128::from(window.window_minutes) * 60_000 * i128::from(NANOS_PER_MS);
-    let mut statement = conn.prepare_cached(
-        "SELECT fetched_at_instant, COALESCE(raw_used_percent, used_percent)
-         FROM window_sample
-         WHERE provider = ?1 AND account_ref = ?2 AND pool_key = ?3 AND window_minutes = ?4
-           AND fetched_at_instant >= ?5 AND fetched_at_instant < ?6
-         ORDER BY rowid",
-    )?;
-    let rows = statement.query_map(
-        params![
-            quota_provider,
-            account_ref,
-            window.pool_key,
-            window.window_minutes,
-            clamp_nanos(lookback_ns),
-            clamp_nanos(end_ns)
-        ],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
-    )?;
-    let start_ns = clamp_nanos(start_ns);
-    let mut delta = AccountDelta {
-        account_ref: account_ref.to_string(),
-        delta_percent: 0.0,
-        readings: 0,
-        decrease_boundaries: 0,
-        fetched_at_backwards: 0,
-        coverage_ms: None,
-    };
-    let mut previous: Option<(i64, f64)> = None;
-    let mut anchored = false;
-    let mut first_inside = None;
-    let mut last_inside = None;
-    for row in rows {
-        let (fetched_at, percent) = row?;
-        if let Some((previous_at, previous_percent)) = previous {
-            if fetched_at < previous_at {
-                if fetched_at >= start_ns {
-                    delta.fetched_at_backwards += 1;
-                }
-                continue;
-            }
-            if fetched_at >= start_ns {
-                if percent > previous_percent {
-                    delta.delta_percent += percent - previous_percent;
-                } else if percent < previous_percent {
-                    delta.decrease_boundaries += 1;
-                }
-            }
-        }
-        if fetched_at >= start_ns {
-            delta.readings += 1;
-            first_inside.get_or_insert(fetched_at);
-            last_inside = Some(fetched_at);
-        } else {
-            anchored = true;
-        }
-        previous = Some((fetched_at, percent));
-    }
-    drop(statement);
-    if let (Some(first), Some(last)) = (first_inside, last_inside) {
-        let reading_after_end: bool = conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM window_sample
-              WHERE provider = ?1 AND account_ref = ?2 AND pool_key = ?3 AND window_minutes = ?4
-                AND fetched_at_instant >= ?5)",
-            params![
-                quota_provider,
-                account_ref,
-                window.pool_key,
-                window.window_minutes,
-                clamp_nanos(end_ns)
-            ],
-            |row| row.get(0),
-        )?;
-        let covered_from = if anchored {
-            start_ms
-        } else {
-            first / NANOS_PER_MS
-        };
-        let covered_to = if reading_after_end {
-            end_ms
-        } else {
-            (last / NANOS_PER_MS).saturating_add(1).min(end_ms)
-        };
-        delta.coverage_ms = Some((covered_from, covered_to));
-    }
-    Ok(delta)
+    clean::account_delta(conn, quota_provider, account_ref, window, start_ms, end_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +509,7 @@ pub struct ObservationPlan {
     pub token_interval_ms: Option<(i64, i64)>,
     /// `(event provider, model)` pairs in scope inside the token interval.
     pub(crate) models: BTreeSet<(String, Option<String>)>,
+    events: Vec<ScopedEvent>,
 }
 
 pub fn plan_observation(
@@ -658,23 +567,28 @@ pub fn plan_observation(
         .iter()
         .filter(|account| !provider.accounts.contains_key(*account))
     {
-        unconfigured_accounts.push(account_delta(
+        let measured = account_delta(
             conn,
             quota_provider,
             account,
             &provider.window,
             interval_start_ms,
             interval_end_ms,
-        )?);
+        )?;
+        if measured.readings > 0 { unconfigured_accounts.push(measured); }
     }
     let token_interval_ms = accounts
         .iter()
         .filter_map(|account| account.coverage_ms)
         .reduce(|(start_a, end_a), (start_b, end_b)| (start_a.min(start_b), end_a.max(end_b)));
-    let models = match token_interval_ms {
-        Some((from, to)) => scope_models(conn, &provider.scope, from, to)?,
-        None => BTreeSet::new(),
-    };
+    // Own both sides before catalog I/O: a concurrent ingest must not change
+    // the usage being valued after model discovery has finished.
+    let mut events = Vec::new();
+    for_scoped_events(conn, &provider.scope, interval_start_ms, interval_end_ms, |event| {
+        events.push(event);
+        Ok(())
+    })?;
+    let models = events.iter().map(|event| (event.tokens.provider.clone(), event.tokens.model.clone())).collect();
     Ok(ObservationPlan {
         quota_provider: quota_provider.to_string(),
         provider,
@@ -684,6 +598,7 @@ pub fn plan_observation(
         unconfigured_accounts,
         token_interval_ms,
         models,
+        events,
     })
 }
 
@@ -716,24 +631,6 @@ fn scope_interval(rules: &[ScopeRule], from_ms: i64, to_ms: i64) -> (String, Vec
     (predicate, values)
 }
 
-fn scope_models(
-    conn: &Connection,
-    rules: &[ScopeRule],
-    from_ms: i64,
-    to_ms: i64,
-) -> rusqlite::Result<BTreeSet<(String, Option<String>)>> {
-    let (predicate, values) = scope_interval(rules, from_ms, to_ms);
-    let sql = format!(
-        "SELECT DISTINCT e.provider, e.model FROM usage_event e
-         WHERE {predicate} AND e.occurred_at_ms >= CAST(? AS INTEGER)
-           AND e.occurred_at_ms < CAST(? AS INTEGER)"
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let rows = statement.query_map(params_from_iter(values.iter()), |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    })?;
-    rows.collect()
-}
 
 /// The API provider an event's tokens are valued under.
 fn catalog_provider<'a>(config: &'a MultiplierConfig, event_provider: &'a str) -> &'a str {
@@ -1301,6 +1198,15 @@ pub struct UnpricedTokens {
 /// One row of `multiplier_observation`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Observation {
+    pub plan: Option<String>,
+    pub routing_eligible: bool,
+    pub eligibility_reasons: Vec<String>,
+    pub clean_hours_share: f64,
+    pub saturated_share: f64,
+    pub gap_share: f64,
+    pub unpriced_share: f64,
+    pub unconfigured_accounts: Vec<String>,
+    pub source_backlog: Vec<String>,
     pub quota_provider: String,
     pub observation_day: String,
     pub snapshot_at_ms: i64,
@@ -1369,6 +1275,7 @@ pub fn utc_day(ms: i64) -> Result<String, MultiplierError> {
 /// `(role, unit, source, quantity units, quantity exponent)` of one measurement.
 type MeasuredRole = (String, String, String, Option<i64>, Option<i32>);
 
+#[derive(Debug, Clone, PartialEq)]
 struct EventTokens {
     producer: String,
     provider: String,
@@ -1380,11 +1287,13 @@ struct EventTokens {
     roles: Vec<MeasuredRole>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 struct ScopedEvent {
     id: i64,
     tokens: EventTokens,
     occurred_at_ms: i64,
     work_class: Option<String>,
+    account_ref: Option<String>,
 }
 
 fn decode_role(row: &Row<'_>) -> rusqlite::Result<MeasuredRole> {
@@ -1410,8 +1319,8 @@ fn for_scoped_events(
     let (predicate, values) = scope_interval(scope, from, to);
     let sql = format!(
         "SELECT e.event_key, e.producer, e.provider, e.model, m.role, m.unit, m.source,
-                m.quantity_units,m.quantity_exponent,e.occurred_at_ms,e.work_class
-         FROM usage_event e JOIN measurement m ON m.event_key=e.event_key
+                m.quantity_units,m.quantity_exponent,e.occurred_at_ms,e.work_class,e.account_ref
+         FROM usage_event e LEFT JOIN measurement m ON m.event_key=e.event_key
          WHERE {predicate} AND e.occurred_at_ms >= CAST(? AS INTEGER)
            AND e.occurred_at_ms < CAST(? AS INTEGER) ORDER BY e.event_key"
     );
@@ -1435,10 +1344,13 @@ fn for_scoped_events(
                 },
                 occurred_at_ms: row.get(9)?,
                 work_class: row.get(10)?,
+                account_ref: row.get(11)?,
             });
         }
         if let Some(event) = current.as_mut() {
-            event.tokens.roles.push(decode_role(row)?);
+            if row.get::<_, Option<String>>(4)?.is_some() {
+                event.tokens.roles.push(decode_role(row)?);
+            }
         }
     }
     if let Some(event) = current {
@@ -1598,7 +1510,7 @@ fn allocate_subscription(
 
 /// Prices the token side of `plan` and assembles the observation.
 pub fn compute_observation(
-    conn: &Connection,
+    _conn: &Connection,
     config: &MultiplierConfig,
     plan: &ObservationPlan,
     rates: &ResolvedRates,
@@ -1612,8 +1524,8 @@ pub fn compute_observation(
     let lookup = ModelLookup::new(rates);
     let rules = ValuationRules::from_config(config, reasoning_billed_as_output);
     if let Some((from, to)) = plan.token_interval_ms {
-        for_scoped_events(conn, &plan.provider.scope, from, to, |event| {
-            let event = event.tokens;
+        for scoped in plan.events.iter().filter(|event| event.occurred_at_ms >= from && event.occurred_at_ms < to) {
+            let event = &scoped.tokens;
             let resolution = event
                 .model
                 .as_deref()
@@ -1621,22 +1533,30 @@ pub fn compute_observation(
             value_event(
                 &rules,
                 resolution,
-                &event,
+                event,
                 &mut lines,
                 &mut unpriced,
                 &mut tokens,
-            )
-        })?;
+            )?;
+        }
     }
-    let tokens_outside_quota_coverage = outside_coverage_tokens(conn, plan)?;
+    let mut tokens_outside_quota_coverage = 0_i64;
+    for event in &plan.events {
+        if plan.token_interval_ms.is_none_or(|(from, to)| event.occurred_at_ms < from || event.occurred_at_ms >= to) {
+            let roles = event_quantities(&event.tokens, &mut RoleTokens::default(), &mut 0, &mut |_, _, _| Ok(()))?;
+            for quantity in roles.values() {
+                tokens_outside_quota_coverage = tokens_outside_quota_coverage.checked_add(*quantity).ok_or(MoneyError::OutOfRange)?;
+            }
+        }
+    }
 
-    let mut api_nanos: i64 = 0;
+    let mut api_numerator = 0_i128;
     let mut base_rate_tier_untested_tokens = 0_i64;
     let mut api_nanos_by_model = Vec::new();
     for (_, mut line) in lines {
         line.api_nanos = round_nano_num(line.numerator)?;
-        api_nanos = api_nanos
-            .checked_add(line.api_nanos)
+        api_numerator = api_numerator
+            .checked_add(line.numerator)
             .ok_or(MoneyError::OutOfRange)?;
         base_rate_tier_untested_tokens = base_rate_tier_untested_tokens
             .checked_add(line.base_rate_tier_untested_tokens)
@@ -1648,6 +1568,7 @@ pub fn compute_observation(
             .cloned();
         api_nanos_by_model.push(line);
     }
+    let api_nanos = round_nano_num(api_numerator)?;
 
     // The denominator: accounts whose plan has a price.
     let token_span_ms = plan
@@ -1721,13 +1642,24 @@ pub fn compute_observation(
     }
     // A missing list value is not evidence of free usage. Keep both ratios
     // unknown when unpriced tokens are the only contribution to a zero value.
-    let unmeasurable = api_nanos == 0 && unpriced.values().any(|(tokens, _)| *tokens > 0);
+    let unmeasurable = !plan.unconfigured_accounts.is_empty()
+        || unpriced.keys().any(|(reason, _, _)| reason == "missing_quantity")
+        || (api_nanos == 0 && unpriced.values().any(|(tokens, _)| *tokens > 0));
     let ratio = |denominator: i64| {
         (denominator > 0 && !unmeasurable).then(|| api_nanos as f64 / denominator as f64)
     };
     let low_resolution =
         delta_percent <= 0.0 || segments as f64 / delta_percent > LOW_RESOLUTION_ERROR_SHARE;
     Ok(Observation {
+        plan: None,
+        routing_eligible: false,
+        eligibility_reasons: vec!["legacy_estimator".into()],
+        clean_hours_share: 0.0,
+        saturated_share: 0.0,
+        gap_share: 0.0,
+        unpriced_share: 0.0,
+        unconfigured_accounts: plan.unconfigured_accounts.iter().map(|account| account.account_ref.clone()).collect(),
+        source_backlog: Vec::new(),
         quota_provider: plan.quota_provider.clone(),
         observation_day: utc_day(plan.interval_end_ms)?,
         snapshot_at_ms,
@@ -2027,34 +1959,6 @@ fn value_event(
     Ok(())
 }
 
-fn outside_coverage_tokens(
-    conn: &Connection,
-    plan: &ObservationPlan,
-) -> Result<i64, MultiplierError> {
-    let ranges = match plan.token_interval_ms {
-        Some((from, to)) => vec![(plan.interval_start_ms, from), (to, plan.interval_end_ms)],
-        None => vec![(plan.interval_start_ms, plan.interval_end_ms)],
-    };
-    let mut total = 0_i64;
-    let mut count = |event: EventTokens| -> Result<(), MultiplierError> {
-        let quantities = event_quantities(
-            &event,
-            &mut RoleTokens::default(),
-            &mut 0,
-            &mut |_, _, _| Ok(()),
-        )?;
-        for quantity in quantities.values() {
-            total = total.checked_add(*quantity).ok_or(MoneyError::OutOfRange)?;
-        }
-        Ok(())
-    };
-    for (from, to) in ranges.into_iter().filter(|(from, to)| from < to) {
-        for_scoped_events(conn, &plan.provider.scope, from, to, |event| {
-            count(event.tokens)
-        })?;
-    }
-    Ok(total)
-}
 
 // ---------------------------------------------------------------------------
 // Store
@@ -2101,6 +2005,13 @@ pub fn observation_head(
     .optional()
 }
 
+pub fn observation_plan_head(conn: &Connection, quota_provider: &str, day: &str, plan: Option<&str>) -> rusqlite::Result<Option<i64>> {
+    conn.query_row("SELECT o.observation_id FROM multiplier_observation o
+        WHERE o.quota_provider=?1 AND o.observation_day=?2 AND o.plan IS ?3
+        AND NOT EXISTS (SELECT 1 FROM multiplier_observation child WHERE child.supersedes=o.observation_id)",
+        params![quota_provider, day, plan], |row| row.get(0)).optional()
+}
+
 /// Appends a day's original observation. A second row for the same provider
 /// and day is refused before the insert (the table's partial unique index
 /// refuses a second original too).
@@ -2108,11 +2019,12 @@ pub fn insert_observation_in_tx(
     tx: &Transaction<'_>,
     observation: &Observation,
 ) -> Result<(), MultiplierError> {
-    if observation_exists(
+    if observation_plan_head(
         tx,
         &observation.quota_provider,
         &observation.observation_day,
-    )? {
+        observation.plan.as_deref(),
+    )?.is_some() {
         return Err(MultiplierError::AlreadyRecorded {
             quota_provider: observation.quota_provider.clone(),
             day: observation.observation_day.clone(),
@@ -2139,10 +2051,11 @@ pub fn insert_superseding_observation_in_tx(
     tx: &Transaction<'_>,
     observation: &Observation,
 ) -> Result<Superseded, MultiplierError> {
-    let head = observation_head(
+    let head = observation_plan_head(
         tx,
         &observation.quota_provider,
         &observation.observation_day,
+        observation.plan.as_deref(),
     )?
     .ok_or_else(|| MultiplierError::NothingToSupersede {
         quota_provider: observation.quota_provider.clone(),
@@ -2234,9 +2147,10 @@ fn insert_row(
             accounts_included_count, accounts_included, accounts_excluded, excluded_pairs,
             low_resolution, scope_rules, plan_prices, catalog_resolved_at_ms, api_twins,
             reasoning_billed_as_output, error_deflating, error_inflating, multiplier,
-            fee_multiplier, supersedes
+            fee_multiplier, supersedes, plan, routing_eligible, eligibility_reasons,
+            clean_hours_share, saturated_share, gap_share, unpriced_share, unconfigured_accounts, source_backlog
         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
-                  ?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37)",
+                  ?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46)",
         params![
             observation.quota_provider,
             observation.observation_day,
@@ -2275,6 +2189,15 @@ fn insert_row(
             observation.multiplier,
             observation.fee_multiplier,
             supersedes,
+            observation.plan,
+            observation.routing_eligible,
+            to_json(&observation.eligibility_reasons)?,
+            observation.clean_hours_share,
+            observation.saturated_share,
+            observation.gap_share,
+            observation.unpriced_share,
+            to_json(&observation.unconfigured_accounts)?,
+            to_json(&observation.source_backlog)?,
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -2317,6 +2240,8 @@ pub struct MultiplierRecomputeRequest {
 #[serde(deny_unknown_fields)]
 pub struct MultiplierPaceRequest {
     pub quota_provider: String,
+    #[serde(default)]
+    pub plan: Option<String>,
     pub from_ms: i64,
     pub to_ms: i64,
 }
@@ -2380,6 +2305,12 @@ pub fn multiplier_pace(
                 format!("unknown quota provider '{}'", request.quota_provider),
             )
         })?;
+    let provider = &config.quota_providers[&request.quota_provider];
+    let plans: BTreeSet<_> = provider.accounts.values().map(|account| account.plan.as_str()).collect();
+    if request.plan.is_none() && plans.len() > 1 {
+        return Err(refuse("plan_required", "pace requires a plan when provider accounts use different plans".into()));
+    }
+    let selected_plan = request.plan.as_deref().or_else(|| plans.first().copied());
     if request.from_ms >= request.to_ms {
         return Err(refuse(
             "invalid_range",
@@ -2404,11 +2335,13 @@ pub fn multiplier_pace(
         .query_row(
             "SELECT o.observation_id, o.observation_day, o.api_nanos, o.delta_percent,
                 o.api_nanos_by_model, o.api_twins, o.reasoning_billed_as_output
-         FROM multiplier_observation o WHERE o.quota_provider = ?1
+         FROM multiplier_observation o WHERE o.quota_provider = ?1 AND o.routing_eligible=1
+            AND (?2 IS NULL OR o.plan=?2)
+            AND o.interval_end_ms >= ?3 - 172800000
            AND NOT EXISTS (SELECT 1 FROM multiplier_observation child
                            WHERE child.supersedes = o.observation_id)
          ORDER BY o.observation_day DESC, o.observation_id DESC LIMIT 1",
-            [&request.quota_provider],
+            params![request.quota_provider, selected_plan, request.to_ms],
             |row| {
                 Ok(PaceHead {
                     observation_id: row.get(0)?,
@@ -2472,6 +2405,9 @@ pub fn multiplier_pace(
         from,
         to,
         |scoped| {
+            if let Some(account) = scoped.account_ref.as_ref().and_then(|account| provider.accounts.get(account)) {
+                if Some(account.plan.as_str()) != selected_plan { return Ok(()); }
+            } else if plans.len() > 1 { return Ok(()); }
             let event = scoped.tokens;
             let hour = scoped.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS;
             let work_class = scoped.work_class.unwrap_or_else(|| "unlabelled".into());
@@ -2522,12 +2458,13 @@ pub fn multiplier_pace(
     }).collect::<Result<_, _>>()?;
     Ok(
         json!({"quota_provider": request.quota_provider, "from_ms": from, "to_ms": to,
-        "basis": "pro_rata_list_value", "per_point_nanos": per_point_nanos,
+        "basis": "pro_rata_list_value", "routing_eligible": true, "plan": selected_plan, "per_point_nanos": per_point_nanos,
         "observation_id": head.observation_id, "observation_day": head.observation_day, "undated_events": undated_events, "hours": hours}),
     )
 }
 
-const JSON_COLUMNS: [&str; 9] = [
+const JSON_COLUMNS: [&str; 12] = [
+    "eligibility_reasons", "unconfigured_accounts", "source_backlog",
     "api_nanos_by_model",
     "unpriced_tokens",
     "accounts_included",
@@ -2566,7 +2503,8 @@ pub fn multiplier_report(
              SELECT * FROM head h
              WHERE h.observation_id = (
                  SELECT l.observation_id FROM head l
-                 WHERE l.quota_provider = h.quota_provider
+                  WHERE l.quota_provider = h.quota_provider
+                    AND l.plan IS h.plan
                  ORDER BY l.observation_day DESC, l.observation_id DESC LIMIT 1)
              ORDER BY h.quota_provider"
         ),
@@ -2604,7 +2542,7 @@ fn observation_rows(
             use rusqlite::types::ValueRef;
             let value = match row.get_ref(index)? {
                 ValueRef::Null => Value::Null,
-                ValueRef::Integer(value) if name == "low_resolution" => json!(value != 0),
+                ValueRef::Integer(value) if name == "low_resolution" || name == "routing_eligible" => json!(value != 0),
                 ValueRef::Integer(value) => json!(value),
                 ValueRef::Real(value) => json!(value),
                 ValueRef::Text(text) => {
@@ -2631,6 +2569,7 @@ fn observation_rows(
 
 #[cfg(test)]
 mod tests {
+    include!("multiplier/v2_tests.rs");
     use super::*;
     use crate::test_support::conn;
 
@@ -2815,7 +2754,17 @@ mod tests {
         prices: &BTreeMap<String, PlanPriceUsed>,
         at_ms: i64,
     ) -> Result<Observation, MultiplierError> {
-        super::compute_observation(conn, config, plan, rates, prices, at_ms, &["openai".into()])
+        // Valuation fixtures often append events after constructing quota
+        // inputs. Capture those fixtures here; production never refreshes a plan.
+        let mut plan = plan.clone();
+        plan.events.clear();
+        for_scoped_events(conn, &plan.provider.scope, plan.interval_start_ms, plan.interval_end_ms, |event| { plan.events.push(event); Ok(()) })?;
+        let mut row = super::compute_observation(conn, config, &plan, rates, prices, at_ms, &["openai".into()])?;
+        // These fixtures test pace arithmetic, not the calibration gate.
+        row.plan = Some("openai/pro_20x".into());
+        row.routing_eligible = true;
+        row.eligibility_reasons.clear();
+        Ok(row)
     }
 
     fn delta(conn: &Connection, start: i64, end: i64) -> AccountDelta {
@@ -3461,6 +3410,7 @@ mod tests {
             &conn,
             Some(&config),
             &MultiplierPaceRequest {
+                plan: None,
                 quota_provider: "codex".into(),
                 from_ms: 0,
                 to_ms: HOUR_MS,
@@ -4506,6 +4456,7 @@ mod tests {
             &conn,
             Some(&config),
             &MultiplierPaceRequest {
+                plan: None,
                 quota_provider: "codex".into(),
                 from_ms: 1,
                 to_ms: 3 * HOUR_MS + 2,
@@ -4595,6 +4546,7 @@ mod tests {
         let recompute = insert_superseding_observation_in_tx(&tx, &head).unwrap();
         tx.commit().unwrap();
         let request = MultiplierPaceRequest {
+            plan: None,
             quota_provider: "codex".into(),
             from_ms: 0,
             to_ms: HOUR_MS,
@@ -4640,6 +4592,7 @@ mod tests {
                 &conn,
                 Some(&config),
                 &MultiplierPaceRequest {
+                plan: None,
                     quota_provider: provider.into(),
                     from_ms,
                     to_ms,
@@ -4676,6 +4629,7 @@ mod tests {
             &conn,
             Some(&config),
             &MultiplierPaceRequest {
+                plan: None,
                 quota_provider: "codex".into(),
                 from_ms: -1,
                 to_ms: 1,
@@ -5393,6 +5347,7 @@ mod tests {
                     &conn,
                     Some(&config),
                     &MultiplierPaceRequest {
+                plan: None,
                         quota_provider: "codex".into(),
                         from_ms: 0,
                         to_ms: 100,
