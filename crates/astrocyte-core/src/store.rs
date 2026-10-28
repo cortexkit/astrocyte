@@ -4025,7 +4025,7 @@ mod tests {
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (34, 34, 34)
+            (35, 35, 35)
         );
         assert_eq!(
             store
@@ -4038,7 +4038,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 34, 34)
+            (0, 35, 35)
         );
         assert!(!second.store_ahead());
         store
@@ -4048,7 +4048,7 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',35,1)",
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',36,1)",
                     [],
                 )?;
                 Ok(())
@@ -4057,7 +4057,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 35, 34)
+            (0, 36, 35)
         );
         assert!(ahead.store_ahead());
     }
