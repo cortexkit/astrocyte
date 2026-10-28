@@ -283,8 +283,11 @@ Reads never write. A refusal on a read is one of the codes below.
   local keys are served. Refusals: `malformed` (empty `event_id`), `not_found`.
 - `spend.reconcile`: `statement`, `lines`, `summary`. Refusals: `malformed`,
   `statement_not_found`; a store failure is `store_error`.
-- `spend.multiplier.report`: `latest` (each provider/plan's newest head) and
-  `series` (heads by day in range). Refusal: `invalid_range` (`from_ms`
+- `spend.multiplier.report`: `latest` contains each provider/plan's newest head,
+  ordered by `(quota_provider, plan)`. A legacy pooled row (`plan: null`) appears
+  there only when its provider has no plan-specific observation at all.
+  `series` keeps every head in the requested day range, including both legacy
+  pooled and plan-specific heads. Refusal: `invalid_range` (`from_ms`
   negative or not before `to_ms`). Test:
   `multiplier_report_refuses_a_malformed_range`. Rows add `plan`,
   `routing_eligible`, `eligibility_reasons`, `clean_hours_share`,

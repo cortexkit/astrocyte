@@ -20,14 +20,12 @@ The spend ledger is not changed.
 Use `COALESCE(raw_used_percent, used_percent)` and sort by fetched timestamp, not
 arrival order. A period ends only when `resets_at` advances by **more than ten
 minutes**, capped at half the configured window length for short pools.
-Codex recomputes its horizon on each read: within-period consecutive changes
-reach 61 seconds and the observed horizon range reaches 312 seconds, while the
-nearest separate period is over 85,000 seconds away. A one-second tolerance
-incorrectly called jitter a rollover and rejected the subsequent normal
-horizon as stale. The ten-minute tolerance fixes that mechanism without
-merging genuine weekly rollovers. Within a period count only rises above its high-water mark: rounding
-dips, drops to zero and rebounds below that mark add nothing. A new period's
-first observed value counts from zero, including a first reading greater than
+Codex recomputes its horizon on each read, so small timestamp changes do not
+necessarily mean a new allowance. The tolerance prevents jitter from inventing
+a rollover or making normal readings appear stale, while preserving genuine
+weekly rollovers. Within a period count only rises above its high-water mark:
+rounding dips, drops to zero and rebounds below that mark add nothing. A new
+period's first observed value counts from zero, including a first reading greater than
 the old period's last reading. A missing/unparseable reset horizon is not proof
 of a reset and excludes the hour from calibration.
 An older reset horizon arriving after a newer one (outside that same
@@ -56,11 +54,12 @@ must not be mistaken for missing consumption just because the history is sparse.
 
 Antigravity `vault` readings before **2026-10-20T19:08Z** are excluded. This is a
 fixed historical correction: that frozen set queried Google's wrong production
-quota pool, not an adjustable source preference. QTA confirms later `vault` and
-`oauth` readings refer to the same counter (possibly one hour cached). Merge
-those readings using the same reset/high-water rules. Claude readings have no
-provenance tag; source splitting cannot recover it. An unchanged-reset drop is
-always noise, including the observed zero/61 flap, never a new allowance.
+quota pool, not an adjustable source preference. Later `vault` and `oauth`
+readings sample the same counter, although readings can be cached for about
+one hour. Merge those readings using the same reset/high-water rules. Claude
+readings have no provenance tag; source splitting cannot recover it. An unchanged-reset drop is
+treated as noise, never a new allowance. This includes a reading that briefly
+drops to 0 and returns to its previous percentage with an unchanged reset time.
 Do not choose a source solely by history length: Antigravity's `vault` readings
 before the fixed cutoff queried the wrong production quota pool.
 
@@ -92,11 +91,15 @@ without a resolved monthly price likewise have null ratios and cannot be eligibl
 unknown account reference are treated as unattributed, not silently assigned to
 another configured account.
 
-New rows are per **(quota provider, plan)**. There is no new pooled provider row:
-Codex's pro_100 and pro_200 empirical fits differ even after price normalization.
+New rows are per **(quota provider, plan)**. There is no new pooled provider row.
+Plans can differ in capacity and usage behavior; normalizing their fees does
+not make their quota points interchangeable.
 Historical provider rows remain unchanged; their new fields default to null
 plan, false eligibility and `legacy_estimator`. Schema 35 preserves their
 append-only history and gives each plan an independent supersession chain.
+In the report, `latest` is ordered by quota provider and plan. A legacy pooled
+head appears there only while its provider has no plan-specific observation;
+`series` retains both legacy and plan-specific heads in the requested range.
 
 Money uses checked integer arithmetic. API list numerators are summed before
 one half-even rounding of the row total. Independently displayed model lines
@@ -117,14 +120,14 @@ need not sum to one.
 | Requirement | Reason code when rejected | Rationale |
 |---|---|---|
 | At least 24 clean account-hours total | `insufficient_clean_hours` | Require a minimum matched sample, not a fixed coverage share. |
-| At most 25% saturated account-hours | `saturation` | Codex's observed 19% can pass; Claude's 40.9% cannot. Saturated exposure is censored, not free. |
+| At most 25% saturated account-hours | `saturation` | Capped periods select heavy-use traffic, so excluding too much can bias the estimate. Saturated exposure is censored, not free. |
 | Reset metadata present throughout observed exposure | `unknown_reset` | A percentage drop alone cannot identify a period. |
 | No unconfigured observed account | `unconfigured_accounts` | Numerator/denominator membership must agree. |
 | Every included plan price resolved | `unpriced_plan` | No subscription-cost denominator can be fabricated. |
-| At most 5% unattributed events when plans differ | `unattributed_plan_usage` | Codex has about 2.2% unmatched events; do not assign their value to a random plan. This is an event-share budget, not a money bound. |
+| At most 5% unattributed events when plans differ | `unattributed_plan_usage` | Do not assign unattributed events to a guessed plan. This is an event-share budget, not a money bound. |
 | At least 20 clean points | `insufficient_points` | One point of endpoint quantization is 5% of twenty points. |
 | At least 3 active UTC days | `insufficient_stability_days` | Leave-one-day-out evaluation must retain at least two training days. |
-| Conditional day-block 95% interval width at most 50% of pooled USD/point | `unstable_estimate` | Matched October 2026 pro_200 spans are about 10–15%, versus about 62–100% for the latest pro_100/Claude/Muse samples. |
+| Conditional day-block 95% interval width at most 50% of pooled USD/point | `unstable_estimate` | Limit uncertainty in the retained estimate rather than requiring a fixed coverage share. |
 | Positive finite multiplier | `nonpositive_ratio` | Missing value or zero burn is not a free routing price. |
 | In-scope sources fresh and drained | `source_backlog` | A successful bounded page can leave older usage pending. |
 
@@ -135,6 +138,28 @@ and `gap_share` remain diagnostics, as does `unpriced_share`. Unpriced models
 still exclude their hours and are never valued at zero. Saturation keeps its
 25% veto: capped periods select the heaviest-use traffic, so their exclusion
 can bias the retained estimate even when it is numerically stable.
+
+### How the thresholds were chosen
+
+On one development store in October 2026:
+
+- Reset times within one quota period ranged by up to 312 seconds; consecutive
+  changes reached 61 seconds, while separate periods were at least 85,737
+  seconds apart. Ten minutes accommodates that jitter without merging those
+  periods; the half-window cap preserves short-window rollovers.
+- Saturation occupied 19% of Codex account-time and 40.9% of Claude account-time,
+  motivating a 25% limit on heavy-use censoring.
+- About 2.2% of Codex events lacked a matched account, supporting a 5% omission
+  budget without inventing a plan allocation.
+- Conditional interval widths were about 10–15% for pro_200 measurements and
+  about 62–100% for pro_100, Claude and Muse measurements. A 50% width budget
+  separated those stable and variable estimates on that store.
+
+These are dated observations, not universal provider guarantees. To compare
+another store, use seven-day UTC windows and inspect `window_sample` reset
+times, event/account matches, and the shares and stability diagnostics from
+`spend.multiplier.report`. Validation holds out each UTC day and fits on the
+remaining days, as described below.
 
 ### Stability and held-out-day validation
 
@@ -154,9 +179,8 @@ mixture. The fixed seed and resampling method are recorded with the inputs.
 
 For validation, each UTC day is held out; the ratio of training points to list
 value predicts that day's six-hour bins. RMSE, centered R² and an OLS cross-check
-are reported. No held-out value trains its own coefficient. These match the
-proportionality study's day-held-out method, not validation on the seven highly
-overlapping rolling-week ratios.
+are reported. No held-out value trains its own coefficient. Validation uses
+held-out UTC days, not the seven highly overlapping rolling-week ratios.
 
 `stability_diagnostics` serves the recorded summary. Its immutable inputs and
 summary are retained as `plan_calibration` alongside each included account's

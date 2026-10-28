@@ -2,15 +2,15 @@
 //! not individual hours or accounts, are the resampling units.
 use super::*;
 
-// The proportionality study used 300 UTC-day cluster resamples. Keep the seed
-// fixed so historical recomputes and Windows/Linux reports are reproducible.
+// Three hundred UTC-day resamples provide about seven draws in each 2.5% tail.
+// Keep the seed fixed for reproducible historical and cross-platform results.
 const BOOTSTRAP_RESAMPLES: usize = 300;
 const BOOTSTRAP_SEED: u64 = 20_261_028;
 // At least two training days must remain when one UTC day is held out.
 pub(super) const MIN_ACTIVE_DAYS: usize = 3;
-// The October 2026 matched pro_200 cohort has about 10–15% conditional interval
-// widths, versus about 62–100% for the latest pro_100/Claude/Muse cohorts. A 50% span is an
-// explicit uncertainty budget, not a fitted provider tariff or a share floor.
+// On one development store in October 2026, pro_200 conditional interval widths
+// were about 10–15%, versus 62–100% for pro_100, Claude and Muse measurements.
+// A 50% span is an uncertainty budget, not a provider tariff or a share floor.
 pub(super) const MAX_RELATIVE_WIDTH: f64 = 0.5;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const NUMERATOR_PER_DOLLAR: f64 = 1_000_000_000_000_000.0;

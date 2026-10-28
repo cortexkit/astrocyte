@@ -520,63 +520,11 @@ fn v2_measure_store_clone() {
     let conn =
         Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     conn.execute_batch("PRAGMA query_only=ON; BEGIN;").unwrap();
-    let mut rates = ResolvedRates {
-        resolved_at_ms: utc_day_start_ms("2026-10-28").unwrap(),
-        models: BTreeMap::new(),
-    };
-    let mut statement = conn.prepare("SELECT api_nanos_by_model FROM multiplier_observation ORDER BY snapshot_at_ms,observation_id").unwrap();
-    for json in statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-    {
-        for line in serde_json::from_str::<Vec<PaceRateLine>>(&json.unwrap()).unwrap() {
-            if let (Some(model), Some(resolution)) = (line.model, line.rates) {
-                rates.models.insert(
-                    (catalog_provider(&config, &line.provider).to_string(), model),
-                    resolution,
-                );
-            }
-        }
-    }
-    for day in 22..=28 {
-        let day = format!("2026-10-{day}");
-        let end = utc_day_start_ms(&day).unwrap();
-        for (provider, declaration) in &config.quota_providers {
-            let plan = plan_observation(&conn, &config, provider, end - 7 * DAY, end).unwrap();
-            let prices = resolve_plans(None, &config, declaration, rates.resolved_at_ms).unwrap();
-            let rows = compute_plan_observations(
-                &conn,
-                &config,
-                &plan,
-                &rates,
-                &prices,
-                rates.resolved_at_ms,
-                &[
-                    "openai".into(),
-                    "anthropic".into(),
-                    "meta".into(),
-                    "google".into(),
-                ],
-            )
-            .unwrap();
-            for mut row in rows {
-                let mut sources = conn.prepare("SELECT source_key FROM source_runtime WHERE last_success_ms IS NULL OR last_success_ms<?1 OR pending_known>0 OR pending_unknown!=0").unwrap();
-                row.source_backlog = sources
-                    .query_map([end], |row| row.get::<_, String>(0))
-                    .unwrap()
-                    .map(Result::unwrap)
-                    .filter(|source| source_in_scope(declaration, source))
-                    .collect();
-                if !row.source_backlog.is_empty() {
-                    row.routing_eligible = false;
-                    row.eligibility_reasons.push("source_backlog".into());
-                }
-                println!(
-                    "MEASURE {}",
-                    json!({"day": day, "provider": provider, "plan": row.plan, "multiplier": row.multiplier, "dollars_per_point": (row.delta_percent>0.0).then(|| row.api_nanos as f64 / 1e9 / row.delta_percent), "points": row.delta_percent, "list_dollars": row.api_nanos as f64 / 1e9, "routing_eligible": row.routing_eligible, "reasons": row.eligibility_reasons, "clean_share": row.clean_hours_share, "saturated_share": row.saturated_share, "gap_share": row.gap_share, "unpriced_share": row.unpriced_share, "unconfigured_count": row.unconfigured_accounts.len(), "source_backlog": row.source_backlog, "zero_measurement_events": row.zero_measurement_events, "missing_quantity_events": row.missing_quantity_events, "unattributed_event_share": row.unattributed_event_share, "unpriced_tokens": row.unpriced_tokens, "plan_calibration": row.accounts_included.first().and_then(|account| account.get("plan_calibration")), "diagnostic_multiplier": (row.subscription_nanos > 0).then(|| row.api_nanos as f64 / row.subscription_nanos as f64)})
-                );
-            }
-        }
+    for row in observations_on_clone(&conn, &config) {
+        println!(
+            "MEASURE {}",
+            json!({"day": row.observation_day, "provider": row.quota_provider, "plan": row.plan, "multiplier": row.multiplier, "dollars_per_point": (row.delta_percent>0.0).then(|| row.api_nanos as f64 / 1e9 / row.delta_percent), "points": row.delta_percent, "list_dollars": row.api_nanos as f64 / 1e9, "routing_eligible": row.routing_eligible, "reasons": row.eligibility_reasons, "clean_share": row.clean_hours_share, "saturated_share": row.saturated_share, "gap_share": row.gap_share, "unpriced_share": row.unpriced_share, "unconfigured_count": row.unconfigured_accounts.len(), "source_backlog": row.source_backlog, "zero_measurement_events": row.zero_measurement_events, "missing_quantity_events": row.missing_quantity_events, "unattributed_event_share": row.unattributed_event_share, "unpriced_tokens": row.unpriced_tokens, "plan_calibration": row.accounts_included.first().and_then(|account| account.get("plan_calibration")), "diagnostic_multiplier": (row.subscription_nanos > 0).then(|| row.api_nanos as f64 / row.subscription_nanos as f64)})
+        );
     }
     conn.execute_batch("ROLLBACK;").unwrap();
 }
@@ -1093,4 +1041,197 @@ fn v2_unpriced_share_does_not_veto_an_adequate_stable_sample() {
             .unwrap()
             < 1e-9
     );
+}
+
+#[test]
+fn v2_latest_uses_ordered_plan_heads_instead_of_legacy_pool() {
+    let mut conn = conn();
+    let mut legacy = sample_observation(&conn);
+    legacy.plan = None;
+    legacy.routing_eligible = false;
+    legacy.eligibility_reasons = vec!["legacy_estimator".into()];
+    let request = MultiplierReportRequest {
+        from_ms: 0,
+        to_ms: legacy.interval_end_ms + 1,
+    };
+    let tx = conn.transaction().unwrap();
+    insert_observation_in_tx(&tx, &legacy).unwrap();
+    tx.commit().unwrap();
+    let fallback = multiplier_report(&conn, &request).unwrap();
+    assert_eq!(fallback["latest"].as_array().unwrap().len(), 1);
+    assert!(fallback["latest"][0]["plan"].is_null());
+    let tx = conn.transaction().unwrap();
+    for plan in ["openai/pro_200", "openai/pro_100"] {
+        let mut row = legacy.clone();
+        row.plan = Some(plan.into());
+        row.eligibility_reasons = vec!["insufficient_stability_days".into()];
+        insert_observation_in_tx(&tx, &row).unwrap();
+    }
+    tx.commit().unwrap();
+    let report = multiplier_report(&conn, &request).unwrap();
+    let latest = report["latest"].as_array().unwrap();
+    assert_eq!(latest.len(), 2);
+    assert_eq!(latest[0]["plan"], "openai/pro_100");
+    assert_eq!(latest[1]["plan"], "openai/pro_200");
+    let series = report["series"].as_array().unwrap();
+    assert_eq!(series.len(), 3);
+    assert_eq!(series.iter().filter(|row| row["plan"].is_null()).count(), 1);
+}
+
+fn observations_on_clone(conn: &Connection, config: &MultiplierConfig) -> Vec<Observation> {
+    let mut rates = ResolvedRates {
+        resolved_at_ms: utc_day_start_ms("2026-10-28").unwrap(),
+        models: BTreeMap::new(),
+    };
+    let mut statement = conn.prepare("SELECT api_nanos_by_model FROM multiplier_observation ORDER BY snapshot_at_ms,observation_id").unwrap();
+    for json in statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+    {
+        for line in serde_json::from_str::<Vec<PaceRateLine>>(&json.unwrap()).unwrap() {
+            if let (Some(model), Some(resolution)) = (line.model, line.rates) {
+                rates.models.insert(
+                    (catalog_provider(config, &line.provider).to_string(), model),
+                    resolution,
+                );
+            }
+        }
+    }
+    let mut observations = Vec::new();
+    for day in 22..=28 {
+        let end = utc_day_start_ms(&format!("2026-10-{day}")).unwrap();
+        for (provider, declaration) in &config.quota_providers {
+            let plan = plan_observation(conn, config, provider, end - 7 * DAY, end).unwrap();
+            let prices = resolve_plans(None, config, declaration, rates.resolved_at_ms).unwrap();
+            let rows = compute_plan_observations(
+                conn,
+                config,
+                &plan,
+                &rates,
+                &prices,
+                rates.resolved_at_ms,
+                &[
+                    "openai".into(),
+                    "anthropic".into(),
+                    "meta".into(),
+                    "google".into(),
+                ],
+            )
+            .unwrap();
+            for mut row in rows {
+                let mut sources = conn.prepare("SELECT source_key FROM source_runtime WHERE last_success_ms IS NULL OR last_success_ms<?1 OR pending_known>0 OR pending_unknown!=0").unwrap();
+                row.source_backlog = sources
+                    .query_map([end], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|source| source_in_scope(declaration, source))
+                    .collect();
+                if !row.source_backlog.is_empty() {
+                    row.routing_eligible = false;
+                    row.eligibility_reasons.push("source_backlog".into());
+                }
+                observations.push(row);
+            }
+        }
+    }
+    observations
+}
+
+fn sorted_json(value: Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let sorted: BTreeMap<_, _> = object
+                .into_iter()
+                .map(|(key, value)| (key, sorted_json(value)))
+                .collect();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(values) => Value::Array(values.into_iter().map(sorted_json).collect()),
+        value => value,
+    }
+}
+
+/// Manual capture migrates and appends only to an explicitly supplied disposable
+/// clone. It preserves real row data and calls the same report function as serving.
+#[test]
+#[ignore = "manual local-only report capture on a disposable store clone"]
+fn v2_capture_store_clone_report() {
+    use cortexkit_store::{open_sqlite, Isolation, StorageBackend, StorageDescriptor};
+    let path = std::path::PathBuf::from(
+        std::env::var_os("ASTROCYTE_MULTIPLIER_CAPTURE_CLONE").expect("disposable clone path"),
+    );
+    let path = path.canonicalize().unwrap();
+    assert!(
+        path.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("clone"),
+        "capture requires an explicitly named clone"
+    );
+    assert_eq!(
+        std::env::var("ASTROCYTE_MULTIPLIER_ALLOW_CLONE_WRITE").unwrap(),
+        "capture"
+    );
+    let output = std::env::var_os("ASTROCYTE_MULTIPLIER_CAPTURE_OUTPUT").expect("output file path");
+    let config_path =
+        std::env::var_os("ASTROCYTE_MULTIPLIER_MEASURE_CONFIG").expect("scope file path");
+    let config: MultiplierConfig =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    let store = open_sqlite(&StorageDescriptor {
+        module_id: "astrocyte".into(),
+        storage_namespace: "astrocyte".into(),
+        isolation: Isolation::Module,
+        backend: StorageBackend::Sqlite {
+            path: path.to_string_lossy().into_owned(),
+        },
+    })
+    .unwrap();
+    assert_eq!(crate::store::migrate_store(&store).unwrap().recorded, 35);
+    let expected_rows = 7 * config
+        .quota_providers
+        .values()
+        .map(|provider| {
+            provider
+                .accounts
+                .values()
+                .map(|account| &account.plan)
+                .collect::<BTreeSet<_>>()
+                .len()
+        })
+        .sum::<usize>();
+    let report = store
+        .with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let observations = observations_on_clone(&tx, &config);
+            assert_eq!(observations.len(), expected_rows);
+            for row in &observations {
+                if observation_plan_head(
+                    &tx,
+                    &row.quota_provider,
+                    &row.observation_day,
+                    row.plan.as_deref(),
+                )
+                .unwrap()
+                .is_some()
+                {
+                    insert_superseding_observation_in_tx(&tx, row).unwrap();
+                } else {
+                    insert_observation_in_tx(&tx, row).unwrap();
+                }
+            }
+            tx.commit()?;
+            Ok(multiplier_report(
+                conn,
+                &MultiplierReportRequest {
+                    from_ms: utc_day_start_ms("2026-10-22").unwrap(),
+                    to_ms: utc_day_start_ms("2026-10-29").unwrap(),
+                },
+            )
+            .unwrap())
+        })
+        .unwrap();
+    let bytes = serde_json::to_vec(&sorted_json(json!({"result": report}))).unwrap();
+    assert_ne!(bytes.last(), Some(&b'\n'));
+    std::fs::write(output, &bytes).unwrap();
+    println!("CAPTURE schema=35 bytes={}", bytes.len());
 }

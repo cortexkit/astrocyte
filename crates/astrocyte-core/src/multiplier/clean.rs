@@ -3,28 +3,29 @@
 use super::calibration::{CalibrationBin, MIN_ACTIVE_DAYS};
 use super::*;
 
-// Changed-counter pairs need the 15-minute bound used by the proportionality
-// study. Equal values in the same known period can bridge event-mode silence.
+// The ten-minute backstop leaves five minutes of margin for changed-counter
+// pairs. Equal values in the same known period can bridge longer quiet gaps.
 const MAX_GAP_MS: i64 = 15 * 60_000;
 pub(super) const ANTIGRAVITY_WRONG_VAULT_CUTOFF_NS: i64 = 1_792_523_280_000_000_000;
-// Codex recomputes its horizon: observed within-period ranges reach 312 seconds,
-// while the nearest separate period is over 85,000 seconds away. Ten minutes
-// admits that jitter without mistaking it for a new allowance or stale cache.
+// On one development store in October 2026, within-period reset times varied
+// by up to 312 seconds; separate periods were at least 85,737 seconds apart.
+// Ten minutes admits that jitter without inventing a rollover or stale cache.
 const RESET_TOLERANCE_MS: i64 = 10 * 60_000;
 // A full day of matched account-hours and twenty points are the minimum sample;
 // excluded exposure is reported, not used as an unsupported share floor.
 const MIN_CLEAN_HOURS: usize = 24;
-// Codex loses 19% to saturation; Claude loses 40.9%. Capped hours are selected
-// heavy-use exposure, unlike excluded unknown or gapped hours. Retain their
-// 25% veto; other excluded exposure uses sample adequacy and stability.
+// On one development store in October 2026, saturation occupied 19% of Codex
+// account-time and 40.9% of Claude account-time. The 25% veto limits selected
+// heavy-use exposure; other exclusions use sample adequacy and stability.
 const MAX_SATURATED_SHARE: f64 = 0.25;
 // A one-point endpoint error is at most 5% of twenty accumulated points.
 const MIN_POINTS: f64 = 20.0;
 // A positive quantity with unknown pricing may represent premium burn even
 // with few tokens. No positive quantity is assumed free.
 const MATERIAL_TOKENS: i64 = 1;
-// Codex has 2.2% unmatched events. Do not invent a cross-plan allocation; allow
-// at most 5% omitted events and disclose the omission even below the budget.
+// On one development store in October 2026, 2.2% of Codex events were unmatched.
+// Allow at most 5% omitted events rather than inventing a plan allocation, and
+// disclose the omission even below the budget; this is not a value bound.
 const MAX_UNATTRIBUTED_SHARE: f64 = 0.05;
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -53,8 +54,8 @@ fn reset_tolerance(window: &WindowSelector) -> i64 {
     RESET_TOLERANCE_MS.min(window.window_minutes.saturating_mul(60_000) / 2)
 }
 
-// Six-hour bins match the validated coarse-bin cohort; hourly fits are more
-// sensitive to integer-point rounding and completed-run timestamp boundaries.
+// Six-hour bins reduce sensitivity to integer-point rounding and the mismatch
+// between quota-consumption times and completed-run timestamps in hourly bins.
 const CALIBRATION_BIN_MS: i64 = 6 * HOUR_MS;
 
 fn calibration_bin(bins: &mut BTreeMap<i64, CalibrationBin>, at_ms: i64) -> &mut CalibrationBin {
@@ -124,7 +125,7 @@ pub(super) fn account_delta(
         let (at_ns, used, reset, source) = row?;
         // Fixed historical exclusion, not a tuning knob: before 2026-10-20
         // 19:08Z Antigravity vault queried Google's wrong production pool.
-        // QTA confirms that later vault and oauth readings share one counter.
+        // Later vault and oauth readings sample the same counter.
         if provider == "antigravity"
             && source.as_deref() == Some("vault")
             && at_ns < ANTIGRAVITY_WRONG_VAULT_CUTOFF_NS

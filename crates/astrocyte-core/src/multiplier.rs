@@ -2605,6 +2605,8 @@ pub fn multiplier_report(
         SELECT o.* FROM multiplier_observation o
         WHERE NOT EXISTS (SELECT 1 FROM multiplier_observation child
                            WHERE child.supersedes = o.observation_id))";
+    // A pooled legacy head is only a fallback until that provider has any
+    // plan-specific observation. The history below still retains every head.
     let latest = observation_rows(
         conn,
         &format!(
@@ -2615,7 +2617,10 @@ pub fn multiplier_report(
                   WHERE l.quota_provider = h.quota_provider
                     AND l.plan IS h.plan
                  ORDER BY l.observation_day DESC, l.observation_id DESC LIMIT 1)
-             ORDER BY h.quota_provider"
+               AND (h.plan IS NOT NULL OR NOT EXISTS (
+                   SELECT 1 FROM multiplier_observation p
+                   WHERE p.quota_provider = h.quota_provider AND p.plan IS NOT NULL))
+             ORDER BY h.quota_provider, h.plan"
         ),
         &[],
     )?;
