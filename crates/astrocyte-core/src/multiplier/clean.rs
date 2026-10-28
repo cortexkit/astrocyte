@@ -373,7 +373,6 @@ pub fn compute_plan_observations(
                 &mut RoleTokens::default(),
             )?;
         }
-        let unknown_quantity = missing_quantities > 0 || zero_measurements > 0;
         row.unpriced_tokens = diagnostics
             .into_iter()
             .filter(|((reason, _, _), (tokens, _))| *tokens > 0 || reason == "missing_quantity")
@@ -414,8 +413,6 @@ pub fn compute_plan_observations(
             (row.saturated_share > MAX_EXCLUDED_SHARE, "saturation"),
             (row.gap_share > MAX_EXCLUDED_SHARE, "gaps"),
             (row.unpriced_share > MAX_EXCLUDED_SHARE, "unpriced_usage"),
-            (missing_quantities > 0, "missing_quantity"),
-            (zero_measurements > 0, "missing_measurements"),
             (unknown_reset, "unknown_reset"),
             (
                 plans.len() > 1
@@ -433,14 +430,13 @@ pub fn compute_plan_observations(
                 row.eligibility_reasons.push(reason.into());
             }
         }
-        if unknown_quantity
-            || unresolved_price
+        if unresolved_price
             || !row.unconfigured_accounts.is_empty()
             || (row.api_nanos == 0
                 && row
                     .unpriced_tokens
                     .iter()
-                    .any(|unpriced| unpriced.tokens > 0))
+                    .any(|unpriced| unpriced.tokens > 0 && unpriced.reason != "missing_quantity"))
         {
             row.multiplier = None;
             row.fee_multiplier = None;

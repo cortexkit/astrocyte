@@ -1766,6 +1766,12 @@ fn event_quantities<'a>(
     let mut quantities: BTreeMap<&str, i64> = BTreeMap::new();
     let mut output_source = None;
     for (role, unit, source, units, exponent) in &event.roles {
+        // Missing quantities exclude the hour even for an unsupported unit;
+        // absence is unknown usage, not evidence of a zero-sized measurement.
+        if units.is_none() || exponent.is_none() {
+            count_unpriced("missing_quantity", role, units.unwrap_or(0))?;
+            continue;
+        }
         // The catalog's rate.cache_write cannot distinguish token_cache_5m
         // from token_cache_1h. Keep these units in the unpriced breakdown, not
         // the unit=token totals on either side of quota coverage.
@@ -2195,9 +2201,7 @@ fn validate_observation(observation: &Observation) -> Result<(), MultiplierError
     if observation.routing_eligible
         && (!observation.eligibility_reasons.is_empty()
             || !observation.source_backlog.is_empty()
-            || !observation.unconfigured_accounts.is_empty()
-            || observation.zero_measurement_events > 0
-            || observation.missing_quantity_events > 0)
+            || !observation.unconfigured_accounts.is_empty())
     {
         return invalid("an eligible row cannot carry a completeness refusal".into());
     }
@@ -2660,6 +2664,22 @@ fn observation_rows(
             };
             object.insert(name.clone(), value);
         }
+        let unknown_quantity_measurements = object
+            .get("unpriced_tokens")
+            .and_then(Value::as_array)
+            .ok_or_else(|| MultiplierError::Encode("unpriced_tokens must be an array".into()))?
+            .iter()
+            .filter(|entry| entry["reason"] == "missing_quantity")
+            .try_fold(0_u64, |sum, entry| -> Result<u64, MultiplierError> {
+                let count = entry["measurements"].as_u64().ok_or_else(|| {
+                    MultiplierError::Encode("unpriced measurement count must be nonnegative".into())
+                })?;
+                Ok(sum.checked_add(count).ok_or(MoneyError::OutOfRange)?)
+            })?;
+        object.insert(
+            "unknown_quantity_measurements".into(),
+            json!(unknown_quantity_measurements),
+        );
         out.push(Value::Object(object));
     }
     Ok(out)

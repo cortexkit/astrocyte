@@ -181,15 +181,75 @@ fn v2_snapshot_does_not_value_late_ingest() {
 
 #[test]
 fn v2_missing_quantity_is_unknown_not_zero() {
-    let conn = conn();
-    let config = fixture_quantity(&conn, None);
-    let row = rows(&conn, &config).remove(0);
-    assert!(row.multiplier.is_none() && row.fee_multiplier.is_none());
-    assert!(!row.routing_eligible);
-    assert!(row
-        .eligibility_reasons
-        .iter()
-        .any(|reason| reason == "missing_quantity"));
+    let mut conn = conn();
+    let mut config = fixture(&conn);
+    let account = config.quota_providers["codex"].accounts["acct"].clone();
+    config
+        .quota_providers
+        .get_mut("codex")
+        .unwrap()
+        .accounts
+        .insert("second".into(), account);
+    conn.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at) SELECT provider,'second',pool_key,fetched_at_instant,used_percent,window_minutes,resets_at FROM window_sample WHERE account_ref='acct'", []).unwrap();
+    let mut prices = priced_plan();
+    let mut second_price = prices["acct"].clone();
+    second_price.account_ref = "second".into();
+    prices.insert("second".into(), second_price);
+    v2_event(&conn, "unknown", Some("acct"), "m", HOUR_MS, None);
+    conn.execute("INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent) VALUES ((SELECT event_key FROM usage_event WHERE event_id='unknown'),'output','token','billed','output',NULL,NULL)", []).unwrap();
+    let calculate = |conn: &Connection| {
+        let plan = plan_observation(conn, &config, "codex", 0, 48 * HOUR_MS).unwrap();
+        compute_plan_observations(
+            conn,
+            &config,
+            &plan,
+            &rates_for(&[("openai", "m")], 100, None),
+            &prices,
+            48 * HOUR_MS,
+            &["openai".into()],
+        )
+        .unwrap()
+        .remove(0)
+    };
+    let row = calculate(&conn);
+    assert!(row.routing_eligible);
+    assert!(row.multiplier.is_some_and(|value| value > 0.0));
+    assert!(row.fee_multiplier.is_some_and(|value| value > 0.0));
+    assert!((row.clean_hours_share - 95.0 / 96.0).abs() < 1e-12);
+    assert!((row.unpriced_share - 1.0 / 96.0).abs() < 1e-12);
+    assert!((row.delta_percent - 95.0).abs() < 1e-9);
+    assert_eq!(row.api_nanos, 100);
+    assert_eq!(row.missing_quantity_events, 1);
+    let tx = conn.transaction().unwrap();
+    insert_observation_in_tx(&tx, &row).unwrap();
+    tx.commit().unwrap();
+    let report = multiplier_report(
+        &conn,
+        &MultiplierReportRequest {
+            from_ms: 0,
+            to_ms: 49 * HOUR_MS,
+        },
+    )
+    .unwrap();
+    assert_eq!(report["series"][0]["unknown_quantity_measurements"], 2);
+    assert_eq!(report["series"][0]["routing_eligible"], true);
+    for hour in (0..=25).filter(|hour| *hour != 10) {
+        v2_event(
+            &conn,
+            &format!("unknown-hour-{hour}"),
+            Some("acct"),
+            "m",
+            hour * HOUR_MS,
+            None,
+        );
+    }
+    let over_budget = calculate(&conn);
+    assert!((over_budget.unpriced_share - 25.0 / 96.0).abs() < 1e-12);
+    assert!(!over_budget.routing_eligible);
+    assert_eq!(over_budget.eligibility_reasons, vec!["unpriced_usage"]);
+    assert!(over_budget.multiplier.is_some_and(|value| value > 0.0));
+    assert_eq!(over_budget.api_nanos, 100);
+    assert!((over_budget.delta_percent - 71.0).abs() < 1e-9);
 }
 
 #[test]
@@ -478,16 +538,67 @@ fn v2_measure_store_clone() {
 
 #[test]
 fn v2_zero_measurement_events_are_unknown_not_free_usage() {
-    let conn = conn();
-    let config = fixture(&conn);
+    let mut conn = conn();
+    let mut config = fixture(&conn);
+    let account = config.quota_providers["codex"].accounts["acct"].clone();
+    config
+        .quota_providers
+        .get_mut("codex")
+        .unwrap()
+        .accounts
+        .insert("second".into(), account);
+    conn.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at) SELECT provider,'second',pool_key,fetched_at_instant,used_percent,window_minutes,resets_at FROM window_sample WHERE account_ref='acct'", []).unwrap();
+    let mut prices = priced_plan();
+    let mut second_price = prices["acct"].clone();
+    second_price.account_ref = "second".into();
+    prices.insert("second".into(), second_price);
     conn.execute("INSERT INTO usage_event(event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis) VALUES ('empty','pi','lineage','empty',?1,?1,'openai','m','unknown')", [HOUR_MS]).unwrap();
-    let row = rows(&conn, &config).remove(0);
-    assert!(row.multiplier.is_none());
+    let calculate = |conn: &Connection| {
+        let plan = plan_observation(conn, &config, "codex", 0, 48 * HOUR_MS).unwrap();
+        compute_plan_observations(
+            conn,
+            &config,
+            &plan,
+            &rates_for(&[("openai", "m")], 100, None),
+            &prices,
+            48 * HOUR_MS,
+            &["openai".into()],
+        )
+        .unwrap()
+        .remove(0)
+    };
+    let row = calculate(&conn);
+    assert!(row.routing_eligible);
+    assert!(row.multiplier.is_some_and(|value| value > 0.0));
+    assert!((row.clean_hours_share - 47.0 / 48.0).abs() < 1e-12);
+    assert!((row.unpriced_share - 1.0 / 48.0).abs() < 1e-12);
+    assert!((row.delta_percent - 94.0).abs() < 1e-9);
+    assert_eq!(row.api_nanos, 100);
     assert_eq!(row.zero_measurement_events, 1);
-    assert!(row
-        .eligibility_reasons
-        .iter()
-        .any(|reason| reason == "missing_measurements"));
+    let tx = conn.transaction().unwrap();
+    insert_observation_in_tx(&tx, &row).unwrap();
+    tx.commit().unwrap();
+    let report = multiplier_report(
+        &conn,
+        &MultiplierReportRequest {
+            from_ms: 0,
+            to_ms: 49 * HOUR_MS,
+        },
+    )
+    .unwrap();
+    assert_eq!(report["series"][0]["zero_measurement_events"], 1);
+    assert_eq!(report["series"][0]["unknown_quantity_measurements"], 0);
+    assert_eq!(report["series"][0]["routing_eligible"], true);
+    for hour in (0..=13).filter(|hour| *hour != 10) {
+        conn.execute("INSERT INTO usage_event(event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis) VALUES (?1,'pi','lineage',?1,?2,?2,'openai','m','unknown')", params![format!("empty-hour-{hour}"), hour * HOUR_MS]).unwrap();
+    }
+    let over_budget = calculate(&conn);
+    assert!((over_budget.unpriced_share - 13.0 / 48.0).abs() < 1e-12);
+    assert!(!over_budget.routing_eligible);
+    assert_eq!(over_budget.eligibility_reasons, vec!["unpriced_usage"]);
+    assert!(over_budget.multiplier.is_some_and(|value| value > 0.0));
+    assert_eq!(over_budget.api_nanos, 100);
+    assert!((over_budget.delta_percent - 70.0).abs() < 1e-9);
 }
 
 #[test]

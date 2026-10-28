@@ -290,7 +290,10 @@ Reads never write. A refusal on a read is one of the codes below.
   `routing_eligible`, `eligibility_reasons`, `clean_hours_share`,
   `saturated_share`, `gap_share`, `unpriced_share`, `unconfigured_accounts`
   and `source_backlog`, plus `unattributed_event_share`,
-  `zero_measurement_events` and `missing_quantity_events`. Quality shares are fractions of all configured account-hours in
+  `zero_measurement_events`, `missing_quantity_events` and the derived
+  `unknown_quantity_measurements` count. Missing-quantity and no-measurement
+  usage exclude account-hours within the shared 25% unpriced/unknown-hour
+  budget; their counts do not independently veto a row. Quality shares are fractions of all configured account-hours in
   the row's plan; unpriced diagnostics also include excluded hours. Legacy rows
   retain their old values with null plan and ineligible legacy defaults.
 - `spend.multiplier.pace`: hourly usage by producer and work class, valued at

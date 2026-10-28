@@ -168,13 +168,16 @@ refuses inherited rates, including aliases.
 The estimator records a separate row per quota provider and configured plan;
 different plans never pool their points. Every account with readings in the
 selected pool/window must have a configured plan. An unconfigured account or
-missing measurement quantity makes the ratios `null`, not zero or free usage.
+unresolved plan price makes the ratios `null`, not zero or free usage.
 The report names unconfigured accounts. Add their plan declarations before
 recomputing; omitting an account is not a way to exclude its traffic safely.
 
 Only clean account-hours contribute to the quota multiplier. Saturated hours,
-unbounded reading gaps and hours containing positive unknown-price quantities
-are excluded from both sides. Unattributed events require every configured
+unbounded reading gaps and hours containing unknown usage are excluded from
+both sides. Unknown usage includes positive unknown-price quantities, missing
+measurement quantities and events with no measurements; those hours count
+toward the 25% unpriced/unknown share budget, not a separate row-level veto.
+Unattributed events require every configured
 account to be clean; when plans differ they are omitted rather than arbitrarily
 allocated to a plan. The report retains diagnostics for excluded unpriced usage.
 

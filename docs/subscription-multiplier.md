@@ -56,7 +56,11 @@ bound, all bracketing readings are below 100%, reset metadata is usable, and it
 has no positive unpriced quantity. One positive unknown-price token is material:
 premium-model quota burn need not be proportional to token count. Unknown
 measurement quantities and events with no measurements are unknown usage, not
-zero tokens; either makes the whole row unmeasurable.
+zero tokens. They exclude the matching account-hour, or every account's hour
+when unattributed, just like unpriced-model usage. Each excluded account-hour
+counts once toward the shared 25% unpriced/unknown-hour budget. Unknown usage
+does not independently veto the row: the retained clean exposure can still
+produce an eligible estimate. No value is fabricated for the excluded usage.
 
 Attributed events count only in their own configured account's clean hours.
 Unattributed events count only when **every configured account**, across plans,
@@ -100,9 +104,7 @@ need not sum to one.
 | At least 50% clean account-hours and 24 clean account-hours total | `insufficient_clean_hours` | Avoid fitting a week from a tiny selected subset; Claude had only one jointly clean active hour. |
 | At most 25% saturated account-hours | `saturation` | Codex's observed 19% can pass; Claude's 40.9% cannot. Saturated exposure is censored, not free. |
 | At most 25% gapped account-hours | `gaps` | Same conservative exclusion budget as saturation; clean-hour status uses the 15-minute gap bound above. |
-| At most 25% unknown-price account-hours | `unpriced_usage` | Separate Spark-only hours may be useful; an unknown premium model used 43 of 73 Muse points on one day and must never be valued at zero. |
-| No unknown measurement quantities | `missing_quantity` | Their size has no defensible upper bound. |
-| No events without measurement rows | `missing_measurements` | Their size is unknown even when no quantity field exists to report. |
+| At most 25% unpriced/unknown account-hours | `unpriced_usage` | Exclude hours with unpriced models, unknown quantities or no-measurement events together. Separate clean hours remain useful; none of the excluded usage is priced as zero. |
 | Reset metadata present throughout observed exposure | `unknown_reset` | A percentage drop alone cannot identify a period. |
 | No unconfigured observed account | `unconfigured_accounts` | Numerator/denominator membership must agree. |
 | Every included plan price resolved | `unpriced_plan` | No subscription-cost denominator can be fabricated. |
@@ -120,12 +122,14 @@ Sources absent from `source_runtime` are not independently certified; neither
 this gate nor configuration proves that traffic outside ingestion is visible.
 
 Rows also expose `unattributed_event_share`, `zero_measurement_events` and
-`missing_quantity_events`; the event counts include excluded hours and apply
-to the plan's attributed events plus provider-wide unattributed events. They
-distinguish an absent quantity on a measurement from an event with no
-measurements. Both null the ratios, even if the remaining clean subset has a
-positive list value. The hourly quality shares alone cannot disclose that
-unknown quantity population.
+`missing_quantity_events`. The report additionally derives
+`unknown_quantity_measurements` from the persisted missing-quantity diagnostics;
+several missing measurements in one event count separately there. Event and
+measurement counts include excluded hours and apply to the plan's attributed
+events plus provider-wide unattributed events. They distinguish an absent
+quantity from an event with no measurements. Nonzero counts are compatible with
+an eligible row when its unknown-hour share stays within the budget; counts
+alone are not vetoes. No schema change is needed for the derived report count.
 
 `spend.multiplier.report` serves all diagnostics additively. A numeric ratio
 alone is not authorization: consumers must use `routing_eligible` and match the
