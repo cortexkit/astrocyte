@@ -330,6 +330,12 @@ fn v2_eligibility_explains_every_quality_exclusion() {
             "{reason}: {:?}",
             row.eligibility_reasons
         );
+        if change == 3 {
+            assert!(row
+                .eligibility_reasons
+                .iter()
+                .any(|reason| reason == "nonpositive_ratio"));
+        }
         if change < 3 {
             assert!(row
                 .eligibility_reasons
