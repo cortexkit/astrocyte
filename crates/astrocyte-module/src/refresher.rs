@@ -3667,8 +3667,23 @@ impl MultiplierStage {
                     continue;
                 }
                 match state.with_read_op(|conn| {
-                    multiplier::observation_exists(conn, quota_provider, &day)
-                        .map_err(|error| ("internal".to_string(), error.to_string()))
+                    for account in multiplier_config.quota_providers[quota_provider]
+                        .accounts
+                        .values()
+                    {
+                        if multiplier::observation_plan_head(
+                            conn,
+                            quota_provider,
+                            &day,
+                            Some(&account.plan),
+                        )
+                        .map_err(|error| ("internal".to_string(), error.to_string()))?
+                        .is_none()
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
                 }) {
                     Ok(true) => {
                         self.recorded.insert(recorded_key);
@@ -3730,17 +3745,17 @@ impl MultiplierStage {
                     Ok(observations) => {
                         self.recorded.insert(recorded_key);
                         for observation in observations {
-                        tracing::info!(
-                            target: "multiplier",
-                            quota_provider,
-                            %day,
-                            multiplier = ?observation.multiplier,
-                            fee_multiplier = ?observation.fee_multiplier,
-                            delta_percent = observation.delta_percent,
-                            api_nanos = observation.api_nanos,
-                            subscription_nanos = observation.subscription_nanos,
-                            "multiplier observation recorded"
-                        );
+                            tracing::info!(
+                                target: "multiplier",
+                                quota_provider,
+                                %day,
+                                multiplier = ?observation.multiplier,
+                                fee_multiplier = ?observation.fee_multiplier,
+                                delta_percent = observation.delta_percent,
+                                api_nanos = observation.api_nanos,
+                                subscription_nanos = observation.subscription_nanos,
+                                "multiplier observation recorded"
+                            );
                         }
                     }
                     Err(failure) => {
@@ -3843,7 +3858,7 @@ fn multiplier_stale_sources(
         .with_read_op(|conn| {
             let mut statement = conn
                 .prepare(
-                     "SELECT source_key FROM source_runtime
+                    "SELECT source_key FROM source_runtime
                       WHERE last_success_ms IS NULL OR last_success_ms < ?1
                          OR pending_known > 0 OR pending_unknown != 0
                      ORDER BY source_key",
@@ -3860,7 +3875,10 @@ fn multiplier_stale_sources(
             message,
             needs_config: false,
         })?;
-    let sources: Vec<_> = sources.into_iter().filter(|source| provider.scope.iter().any(|rule| source == &rule.producer || source.starts_with(&format!("{}:", rule.producer)))).collect();
+    let sources: Vec<_> = sources
+        .into_iter()
+        .filter(|source| multiplier::source_in_scope(provider, source))
+        .collect();
     if !sources.is_empty() && snapshot_at_ms < interval_end_ms + 2 * 3_600_000 {
         return Err(DayError {
             code: "source_reads_pending".into(),
@@ -3878,7 +3896,9 @@ fn disclose_stale_sources(observation: &mut multiplier::Observation, sources: &[
     if !sources.is_empty() {
         observation.source_backlog = sources.to_vec();
         observation.routing_eligible = false;
-        observation.eligibility_reasons.push("source_backlog".into());
+        observation
+            .eligibility_reasons
+            .push("source_backlog".into());
         observation.error_deflating.push_str(&format!(
             " stale_sources: {}; source read is stale or backlog remains, so late usage may be missing.",
             sources.join(", ")
@@ -3896,7 +3916,12 @@ fn record_multiplier_day(
     interval_end_ms: i64,
     snapshot_at_ms: i64,
 ) -> Result<Vec<multiplier::Observation>, DayFailure> {
-    let stale_sources = multiplier_stale_sources(state, interval_end_ms, snapshot_at_ms, &config.quota_providers[quota_provider])?;
+    let stale_sources = multiplier_stale_sources(
+        state,
+        interval_end_ms,
+        snapshot_at_ms,
+        &config.quota_providers[quota_provider],
+    )?;
     let mut observations = compute_multiplier_day(
         state,
         catalog,
@@ -3906,11 +3931,24 @@ fn record_multiplier_day(
         interval_end_ms,
         snapshot_at_ms,
     )?;
-    for observation in &mut observations { disclose_stale_sources(observation, &stale_sources); }
+    for observation in &mut observations {
+        disclose_stale_sources(observation, &stale_sources);
+    }
     state
         .ordered_write(|tx| {
-            for observation in &observations { multiplier::insert_observation_in_tx(tx, observation)
-                .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
+            for observation in &observations {
+                if multiplier::observation_plan_head(
+                    tx,
+                    &observation.quota_provider,
+                    &observation.observation_day,
+                    observation.plan.as_deref(),
+                )
+                .map_err(|error| error.to_string())?
+                .is_none()
+                {
+                    multiplier::insert_observation_in_tx(tx, observation)
+                        .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
+                }
             }
             Ok(((), true))
         })
@@ -4071,8 +4109,13 @@ pub(crate) fn recompute_multiplier_day(
     })?;
     let mut observations = Vec::new();
     for quota_provider in &quota_providers {
-        let stale_sources = multiplier_stale_sources(state, interval_end_ms, now_ms, &multiplier_config.quota_providers[quota_provider])
-            .map_err(|error| (error.code, error.message))?;
+        let stale_sources = multiplier_stale_sources(
+            state,
+            interval_end_ms,
+            now_ms,
+            &multiplier_config.quota_providers[quota_provider],
+        )
+        .map_err(|error| (error.code, error.message))?;
         let mut rows = compute_multiplier_day(
             state,
             &catalog,
@@ -4083,7 +4126,9 @@ pub(crate) fn recompute_multiplier_day(
             now_ms,
         )
         .map_err(|error| (error.code, error.message))?;
-        for observation in &mut rows { disclose_stale_sources(observation, &stale_sources); }
+        for observation in &mut rows {
+            disclose_stale_sources(observation, &stale_sources);
+        }
         observations.extend(rows);
     }
     state.ordered_op_write(|tx| {
@@ -4113,6 +4158,7 @@ pub(crate) fn recompute_multiplier_day(
             };
             recomputed.push(serde_json::json!({
                 "quota_provider": observation.quota_provider,
+                "plan": observation.plan,
                 "observation_day": observation.observation_day,
                 "observation_id": observation_id,
                 "supersedes": supersedes,
@@ -7530,6 +7576,7 @@ pub fn log_pricing_failed(error: &str) {
 
 #[cfg(test)]
 mod multiplier_stage_tests {
+    include!("refresher_multiplier_v2_tests.rs");
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicUsize;
 
@@ -7817,8 +7864,8 @@ mod multiplier_stage_tests {
             .unwrap();
     }
 
-    /// Ten points of quota and 1,000 opencode/openai tokens inside the seven
-    /// days before `DAY_START`, with no active reader runtime rows.
+    /// Dense, unsaturated quota history and 1,000 opencode/openai tokens inside
+    /// the seven days before `DAY_START`, with no active reader runtime rows.
     fn seed_usage(state: &SharedState) {
         state
             .ordered_write(|tx| {
@@ -7826,10 +7873,12 @@ mod multiplier_stage_tests {
                 // has no active store reader unless a test adds one explicitly.
                 tx.execute("DELETE FROM source_runtime", [])
                     .map_err(|error| error.to_string())?;
-                for (at_ms, used) in [(DAY_START - 8 * DAY_MS, 0.0), (DAY_START - DAY_MS, 10.0)] {
+                for minute in (0..=7 * 24 * 60).step_by(5) {
+                    let at_ms = DAY_START - 7 * DAY_MS + minute * 60_000;
+                    let used = minute as f64 / 240.0;
                     tx.execute(
-                        "INSERT INTO window_sample (provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes)
-                         VALUES ('codex','acct','primary',?1,?2,10080)",
+                        "INSERT INTO window_sample (provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at)
+                         VALUES ('codex','acct','primary',?1,?2,10080,'2024-10-10T00:00:00Z')",
                         params![at_ms * 1_000_000, used],
                     )
                     .map_err(|error| error.to_string())?;
@@ -7896,7 +7945,7 @@ mod multiplier_stage_tests {
                 [(
                     "codex".into(),
                     DAY.into(),
-                    if declared { 20_000_000 } else { 10_000_000 }
+                    if declared { 20_000_000 } else { 0 }
                 )]
             );
             let recorded: String = state.with_conn(|conn| conn.query_row(
@@ -7927,8 +7976,8 @@ mod multiplier_stage_tests {
                 tx.execute(
                     "INSERT OR REPLACE INTO source_runtime
                      (source_key,source_module,desired_generation,last_success_ms,pending_known,pending_unknown)
-                     VALUES (?1,?1,(SELECT generation FROM desired_config WHERE id = 1),?2,0,1)",
-                    params![source, last_success_ms],
+                      VALUES (?1,?1,(SELECT generation FROM desired_config WHERE id = 1),?2,0,?3)",
+                    params![source, last_success_ms, i64::from(last_success_ms.is_none())],
                 )
                 .map_err(|error| error.to_string())?;
                 Ok(((), true))
@@ -8004,7 +8053,7 @@ mod multiplier_stage_tests {
     }
 
     #[test]
-    fn the_day_waits_for_every_source_and_includes_its_late_usage() {
+    fn the_day_waits_for_every_in_scope_source_and_includes_its_late_usage() {
         let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(state::leased_test_state(&directory));
         publish_desired(&state, &directory);
@@ -8012,7 +8061,7 @@ mod multiplier_stage_tests {
         install_catalog(&state, &fusiform);
         seed_usage(&state);
         source_success(&state, "opencode", Some(DAY_START + 1));
-        source_success(&state, "pi", Some(DAY_START - 1));
+        source_success(&state, "opencode-v2", Some(DAY_START - 1));
         let mut stage = MultiplierStage::new(Some(fusiform.clone()));
         stage.tick(&state, false, NOW);
         assert!(!observation_days(&state).contains(&DAY.to_string()));
@@ -8028,7 +8077,7 @@ mod multiplier_stage_tests {
             ).map_err(|error| error.to_string())?;
             Ok(((), true))
         }).unwrap();
-        source_success(&state, "pi", Some(NOW + 60_000));
+        source_success(&state, "opencode-v2", Some(NOW + 60_000));
         stage.tick(&state, false, NOW + 60_000);
         let day_rows: Vec<_> = current_day_observations(&state)
             .into_iter()
@@ -8054,7 +8103,7 @@ mod multiplier_stage_tests {
         install_catalog(&state, &fusiform);
         seed_usage(&state);
         source_success(&state, "opencode", None);
-        source_success(&state, "pi", Some(DAY_START - 1));
+        source_success(&state, "opencode-v2", Some(DAY_START - 1));
         source_success(&state, "codex", Some(DAY_START + 1));
         let mut stage = MultiplierStage::new(Some(fusiform.clone()));
         stage.tick(&state, false, DAY_START + 7_200_000 - 1);
@@ -8070,8 +8119,25 @@ mod multiplier_stage_tests {
                 .map_err(|error| ("internal".into(), error.to_string()))
             })
             .unwrap();
-        assert!(text.contains("stale_sources: opencode, pi"), "{text}");
+        assert!(
+            text.contains("stale_sources: opencode, opencode-v2"),
+            "{text}"
+        );
         assert!(!text.contains("codex"), "{text}");
+        let report = crate::ops::dispatch(
+            &state,
+            crate::ops::OP_MULTIPLIER_REPORT,
+            json!({"from_ms": DAY_START - 1, "to_ms": DAY_START + 1}),
+        )
+        .unwrap();
+        let row = &report["series"][0];
+        assert_eq!(row["routing_eligible"], false);
+        assert_eq!(row["source_backlog"], json!(["opencode", "opencode-v2"]));
+        assert!(row["eligibility_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "source_backlog"));
     }
 
     #[test]
@@ -8104,7 +8170,7 @@ mod multiplier_stage_tests {
     }
 
     #[test]
-    fn recompute_waits_only_for_a_missing_days_sources() {
+    fn recompute_rechecks_even_an_existing_days_sources() {
         let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(state::leased_test_state(&directory));
         publish_desired(&state, &directory);
@@ -8133,7 +8199,14 @@ mod multiplier_stage_tests {
             })
             .unwrap();
         assert!(text.contains("stale_sources: opencode"), "{text}");
-        let corrected = recompute(&state, &fusiform, DAY, Some("codex"), NOW).unwrap();
+        assert_eq!(
+            recompute(&state, &fusiform, DAY, Some("codex"), NOW)
+                .unwrap_err()
+                .0,
+            "source_reads_pending"
+        );
+        let corrected =
+            recompute(&state, &fusiform, DAY, Some("codex"), DAY_START + 7_200_001).unwrap();
         assert_eq!(
             corrected["recomputed"][0]["supersedes"],
             created["recomputed"][0]["observation_id"]
@@ -8566,6 +8639,10 @@ mod multiplier_stage_tests {
         .unwrap();
         let head = &report["latest"][0];
         assert!(head["subscription_nanos"].as_i64().unwrap() > 0);
+        assert!(
+            head["delta_percent"].as_f64().unwrap() < 42.0,
+            "the unknown-price hour is excluded, not the other clean hours"
+        );
         assert!(head["fee_paid_nanos"].as_i64().unwrap() > 0);
         assert_eq!(head["multiplier"], serde_json::Value::Null);
         assert_eq!(head["fee_multiplier"], serde_json::Value::Null);
@@ -8609,8 +8686,11 @@ mod multiplier_stage_tests {
             crate::ops::OP_MULTIPLIER_PACE,
             json!({"quota_provider":"codex", "from_ms":DAY_START - DAY_MS, "to_ms":DAY_START}),
         )
-        .unwrap();
-        assert_eq!(pace["per_point_nanos"], serde_json::Value::Null);
+        .unwrap_err();
+        assert_eq!(
+            pace.0, "no_multiplier_observation",
+            "pace never uses an ineligible calibration"
+        );
     }
 
     fn recompute(

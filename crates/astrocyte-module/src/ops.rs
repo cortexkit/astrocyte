@@ -283,6 +283,7 @@ fn operation_params_schema(name: &str) -> Value {
             &["quota_provider", "from_ms", "to_ms"],
             json!({
                 "quota_provider": string,
+                "plan": optional_string,
                 "from_ms": i64_value,
                 "to_ms": i64_value,
             }),
@@ -1576,7 +1577,11 @@ mod tests {
             ),
             sample(
                 OP_MULTIPLIER_PACE,
-                vec![json!({"quota_provider": "claude", "from_ms": 1, "to_ms": 2})],
+                vec![
+                    json!({"quota_provider": "claude", "from_ms": 1, "to_ms": 2}),
+                    json!({"quota_provider": "claude", "plan": "anthropic/max_20x", "from_ms": 1, "to_ms": 2}),
+                    json!({"quota_provider": "claude", "plan": null, "from_ms": 1, "to_ms": 2}),
+                ],
                 json!({"quota_provider": "claude", "from_ms": 1.5, "to_ms": 2}),
             ),
             sample(
@@ -2078,7 +2083,7 @@ mod tests {
         let config: multiplier::MultiplierConfig = serde_json::from_value(json!({
             "api_twins": {}, "plan_price_overrides": {},
             "quota_providers": {"claude": {"window": {"pool_key": "primary", "window_minutes": 300},
-                "scope": [{"producer": "opencode", "provider": "anthropic", "charge_basis": null, "model_prefix": null}], "accounts": {}}}
+                "scope": [{"producer": "opencode", "provider": "anthropic", "charge_basis": null, "model_prefix": null}], "accounts": {"acct": {"plan": "anthropic/max_20x", "price_override": null}}}}
         })).unwrap();
         desired.subscription_multiplier =
             crate::config::MultiplierSetting::Recorded(config.clone());
@@ -2098,6 +2103,11 @@ mod tests {
             let mut observation = multiplier::compute_observation(tx, &config, &plan, &rates, &Default::default(), 86400000, &[]).map_err(|error| error.message())?;
             observation.api_nanos = 10_000_000;
             observation.delta_percent = 2.0;
+            // A manual eligible calibration isolates stored-rate serving from
+            // the separate tests of the calibration quality gate.
+            observation.plan = Some("anthropic/max_20x".into());
+            observation.routing_eligible = true;
+            observation.eligibility_reasons.clear();
             multiplier::insert_observation_in_tx(tx, &observation).map_err(|error| error.message())?;
             Ok(((), true))
         }).unwrap();
@@ -2110,7 +2120,7 @@ mod tests {
         assert_eq!(
             response,
             json!({"quota_provider": "claude", "from_ms": 0, "to_ms": 3600000,
-            "basis": "pro_rata_list_value", "per_point_nanos": 5000000,
+            "basis": "pro_rata_list_value", "routing_eligible": true, "plan": "anthropic/max_20x", "per_point_nanos": 5000000,
             "observation_day": "1970-01-02", "observation_id": 1, "undated_events": 0,
             "hours": [{"hour_start_ms": 0, "producers": {"opencode": {"events": 1, "list_nanos": 1000000, "estimated_points": 0.2, "unpriced_tokens": 0,
                 "by_work_class": {"head": {"events": 1, "list_nanos": 1000000, "estimated_points": 0.2}}}}}]})

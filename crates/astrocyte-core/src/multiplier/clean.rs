@@ -5,6 +5,7 @@ use super::*;
 // Hourly coverage permits no sample gap above 15 minutes; longer gaps can hide
 // resets. The October 2026 proportionality study used the same coverage bound.
 const MAX_GAP_MS: i64 = 15 * 60_000;
+pub(super) const ANTIGRAVITY_WRONG_VAULT_CUTOFF_NS: i64 = 1_792_523_280_000_000_000;
 // Insula reset horizons jitter by less than a second (e.g. .7 versus .0).
 const RESET_TOLERANCE_MS: i64 = 1_000;
 // At least half of all account-hour buckets must be clean, with at least 24
@@ -51,30 +52,73 @@ pub(super) fn account_delta(
          AND window_minutes=?4 AND fetched_at_instant>=?5 AND fetched_at_instant<=?6
          ORDER BY fetched_at_instant, rowid",
     )?;
-    let rows = statement.query_map(params![provider, account, window.pool_key, window.window_minutes,
-        clamp_nanos(millis_to_nanos(start.saturating_sub(window.window_minutes.saturating_mul(60_000)))),
-        clamp_nanos(millis_to_nanos(end.saturating_add(MAX_GAP_MS)))], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?))
-    })?;
+    let rows = statement.query_map(
+        params![
+            provider,
+            account,
+            window.pool_key,
+            window.window_minutes,
+            clamp_nanos(millis_to_nanos(
+                start.saturating_sub(window.window_minutes.saturating_mul(60_000))
+            )),
+            clamp_nanos(millis_to_nanos(end.saturating_add(MAX_GAP_MS)))
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        },
+    )?;
     let mut samples = Vec::new();
+    let mut latest_reset: Option<i64> = None;
+    let mut stale_reset_readings = 0_u64;
     for row in rows {
         let (at_ns, used, reset, source) = row?;
         // Fixed historical exclusion, not a tuning knob: before 2026-10-20
         // 19:08Z Antigravity vault queried Google's wrong production pool.
         // QTA confirms that later vault and oauth readings share one counter.
-        if provider == "antigravity" && source.as_deref() == Some("vault")
-            && at_ns < 1_792_523_280_000_000_000 {
+        if provider == "antigravity"
+            && source.as_deref() == Some("vault")
+            && at_ns < ANTIGRAVITY_WRONG_VAULT_CUTOFF_NS
+        {
             continue;
+        }
+        let reset = reset
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(&text).ok())
+            .map(|at| at.timestamp_millis());
+        if let (Some(latest), Some(reset)) = (latest_reset, reset) {
+            // A cached reading from the previous allowance cannot raise the
+            // current period's high-water mark or certify current coverage.
+            if latest.saturating_sub(reset) > RESET_TOLERANCE_MS {
+                if at_ns >= clamp_nanos(millis_to_nanos(start))
+                    && at_ns < clamp_nanos(millis_to_nanos(end))
+                {
+                    stale_reset_readings += 1;
+                }
+                continue;
+            }
+        }
+        if let Some(reset) = reset {
+            latest_reset = Some(latest_reset.map_or(reset, |latest| latest.max(reset)));
         }
         samples.push(Sample {
             at: at_ns / NANOS_PER_MS,
             used,
-            reset: reset.and_then(|text| chrono::DateTime::parse_from_rfc3339(&text).ok()).map(|at| at.timestamp_millis()),
+            reset,
         });
     }
     let mut result = AccountDelta {
-        account_ref: account.into(), delta_percent: 0.0, readings: 0,
-        decrease_boundaries: 0, fetched_at_backwards: 0, coverage_ms: None,
+        account_ref: account.into(),
+        delta_percent: 0.0,
+        readings: 0,
+        decrease_boundaries: 0,
+        fetched_at_backwards: 0,
+        stale_reset_readings,
+        reset_boundaries: 0,
+        coverage_ms: None,
         hours: BTreeMap::new(),
     };
     let mut high = samples.first().map_or(0.0, |sample| sample.used);
@@ -86,13 +130,20 @@ pub(super) fn account_delta(
     }
     for pair in samples.windows(2) {
         let (previous, current) = (&pair[0], &pair[1]);
-        if current.at <= previous.at { continue; }
+        if current.at <= previous.at {
+            continue;
+        }
         let reset = match (horizon, current.reset) {
             (Some(old), Some(new)) => new.saturating_sub(old) > RESET_TOLERANCE_MS,
             _ => false,
         };
-        if reset { high = 0.0; horizon = current.reset; }
-        if horizon.is_none() { horizon = current.reset; }
+        if reset {
+            high = 0.0;
+            horizon = current.reset;
+        }
+        if horizon.is_none() {
+            horizon = current.reset;
+        }
         let rise = (current.used - high).max(0.0);
         high = high.max(current.used);
         if current.at >= start && current.at < end && current.used < previous.used {
@@ -104,10 +155,17 @@ pub(super) fn account_delta(
         let from = previous.at.max(start);
         let to = current.at.min(end);
         if reset && current.at >= start && current.at < end {
-            result.hours.entry(current.at.div_euclid(HOUR_MS) * HOUR_MS).or_default().points += rise;
+            result.reset_boundaries += 1;
+            result
+                .hours
+                .entry(current.at.div_euclid(HOUR_MS) * HOUR_MS)
+                .or_default()
+                .points += rise;
             result.delta_percent += rise;
         }
-        if from >= to { continue; }
+        if from >= to {
+            continue;
+        }
         let gap = current.at - previous.at;
         let mut at = from;
         while at < to {
@@ -119,7 +177,9 @@ pub(super) fn account_delta(
                 bucket.saturated |= previous.used >= 100.0 || current.used >= 100.0;
                 bucket.reset_unknown |= previous.reset.is_none() || current.reset.is_none();
             }
-            let points = if reset { 0.0 } else {
+            let points = if reset {
+                0.0
+            } else {
                 rise * (until - at) as f64 / gap as f64
             };
             bucket.points += points;
@@ -130,7 +190,9 @@ pub(super) fn account_delta(
     if let (Some(first), Some(last)) = (samples.first(), samples.last()) {
         let from = first.at.max(start);
         let to = last.at.saturating_add(1).min(end);
-        if from < to { result.coverage_ms = Some((from, to)); }
+        if from < to {
+            result.coverage_ms = Some((from, to));
+        }
     }
     Ok(result)
 }
@@ -147,38 +209,86 @@ pub fn compute_plan_observations(
     snapshot_at_ms: i64,
     reasoning_billed_as_output: &[String],
 ) -> Result<Vec<Observation>, MultiplierError> {
-    let plans: BTreeSet<_> = plan.provider.accounts.values().map(|account| account.plan.clone()).collect();
+    let plans: BTreeSet<_> = plan
+        .provider
+        .accounts
+        .values()
+        .map(|account| account.plan.clone())
+        .collect();
     let lookup = ModelLookup::new(rates);
     let rules = ValuationRules::from_config(config, reasoning_billed_as_output);
     let mut bad_hours = BTreeSet::new();
-    let mut unknown_quantity = false;
     for event in &plan.events {
         let mut unpriced = BTreeMap::new();
-        let resolution = event.tokens.model.as_deref().and_then(|model| lookup.get(rules.catalog_provider(&event.tokens.provider), model));
-        value_event(&rules, resolution, &event.tokens, &mut BTreeMap::new(), &mut unpriced, &mut RoleTokens::default())?;
-        let unknown = event.tokens.roles.is_empty() || unpriced.keys().any(|(reason, _, _)| reason == "missing_quantity");
-        unknown_quantity |= unknown;
-        if unknown || unpriced.values().any(|(tokens, _)| *tokens >= MATERIAL_TOKENS) {
+        let resolution =
+            event.tokens.model.as_deref().and_then(|model| {
+                lookup.get(rules.catalog_provider(&event.tokens.provider), model)
+            });
+        value_event(
+            &rules,
+            resolution,
+            &event.tokens,
+            &mut BTreeMap::new(),
+            &mut unpriced,
+            &mut RoleTokens::default(),
+        )?;
+        let missing = unpriced
+            .keys()
+            .any(|(reason, _, _)| reason == "missing_quantity");
+        let unknown = event.tokens.roles.is_empty() || missing;
+        if unknown
+            || unpriced
+                .values()
+                .any(|(tokens, _)| *tokens >= MATERIAL_TOKENS)
+        {
             let hour = event.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS;
-            match event.account_ref.as_ref().filter(|account| plan.provider.accounts.contains_key(*account)) {
-                Some(account) => { bad_hours.insert((account.clone(), hour)); }
-                None => { for account in plan.provider.accounts.keys() { bad_hours.insert((account.clone(), hour)); } }
+            match event
+                .account_ref
+                .as_ref()
+                .filter(|account| plan.provider.accounts.contains_key(*account))
+            {
+                Some(account) => {
+                    bad_hours.insert((account.clone(), hour));
+                }
+                None => {
+                    for account in plan.provider.accounts.keys() {
+                        bad_hours.insert((account.clone(), hour));
+                    }
+                }
             }
         }
     }
     let first_hour = plan.interval_start_ms.div_euclid(HOUR_MS) * HOUR_MS;
-    let hours: Vec<_> = (first_hour..plan.interval_end_ms).step_by(usize::try_from(HOUR_MS).expect("hour fits usize")).collect();
+    let hours: Vec<_> = (first_hour..plan.interval_end_ms)
+        .step_by(usize::try_from(HOUR_MS).expect("hour fits usize"))
+        .collect();
     let clean = |account: &str, hour: i64| {
-        plan.accounts.iter().find(|row| row.account_ref == account).and_then(|row| row.hours.get(&hour))
-            .is_some_and(|counter| counter.covered_ms == HOUR_MS && !counter.saturated && !counter.reset_unknown)
+        plan.accounts
+            .iter()
+            .find(|row| row.account_ref == account)
+            .and_then(|row| row.hours.get(&hour))
+            .is_some_and(|counter| {
+                counter.covered_ms == HOUR_MS && !counter.saturated && !counter.reset_unknown
+            })
             && !bad_hours.contains(&(account.to_string(), hour))
     };
     let mut output = Vec::new();
     for name in &plans {
-        let members: BTreeSet<_> = plan.provider.accounts.iter().filter(|(_, account)| &account.plan == name).map(|(account, _)| account.clone()).collect();
+        let members: BTreeSet<_> = plan
+            .provider
+            .accounts
+            .iter()
+            .filter(|(_, account)| &account.plan == name)
+            .map(|(account, _)| account.clone())
+            .collect();
         let mut filtered = plan.clone();
-        filtered.accounts.retain(|account| members.contains(&account.account_ref));
-        filtered.provider.accounts.retain(|account, _| members.contains(account));
+        filtered
+            .accounts
+            .retain(|account| members.contains(&account.account_ref));
+        filtered
+            .provider
+            .accounts
+            .retain(|account, _| members.contains(account));
         let mut clean_count = 0_usize;
         let mut saturated = 0_usize;
         let mut gaps = 0_usize;
@@ -201,39 +311,137 @@ pub fn compute_plan_observations(
         let mut unmatched = 0_usize;
         filtered.events.retain(|event| {
             let hour = event.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS;
-            match event.account_ref.as_ref().filter(|account| plan.provider.accounts.contains_key(*account)) {
+            match event
+                .account_ref
+                .as_ref()
+                .filter(|account| plan.provider.accounts.contains_key(*account))
+            {
                 Some(account) => members.contains(account) && clean(account, hour),
                 None => {
                     unmatched += 1;
-                    plans.len() == 1 && plan.provider.accounts.keys().all(|account| clean(account, hour))
+                    plans.len() == 1
+                        && plan
+                            .provider
+                            .accounts
+                            .keys()
+                            .all(|account| clean(account, hour))
                 }
             }
         });
         filtered.token_interval_ms = Some((plan.interval_start_ms, plan.interval_end_ms));
-        let mut row = compute_observation(conn, config, &filtered, rates, prices, snapshot_at_ms, reasoning_billed_as_output)?;
+        let plan_prices: BTreeMap<_, _> = prices
+            .iter()
+            .filter(|(account, _)| members.contains(*account))
+            .map(|(account, price)| (account.clone(), price.clone()))
+            .collect();
+        let mut row = compute_observation(
+            conn,
+            config,
+            &filtered,
+            rates,
+            &plan_prices,
+            snapshot_at_ms,
+            reasoning_billed_as_output,
+        )?;
+        // Preserve diagnostics for excluded hours too. A clean Spark estimate
+        // must not make an unpriced premium model disappear from the report.
+        let mut diagnostics = BTreeMap::new();
+        let mut zero_measurements = 0_u64;
+        let mut missing_quantities = 0_u64;
+        for event in plan.events.iter().filter(|event| {
+            event.account_ref.as_ref().is_none_or(|account| {
+                !plan.provider.accounts.contains_key(account) || members.contains(account)
+            })
+        }) {
+            zero_measurements += u64::from(event.tokens.roles.is_empty());
+            missing_quantities += u64::from(
+                event
+                    .tokens
+                    .roles
+                    .iter()
+                    .any(|(_, _, _, quantity, exponent)| quantity.is_none() || exponent.is_none()),
+            );
+            let resolution = event.tokens.model.as_deref().and_then(|model| {
+                lookup.get(rules.catalog_provider(&event.tokens.provider), model)
+            });
+            value_event(
+                &rules,
+                resolution,
+                &event.tokens,
+                &mut BTreeMap::new(),
+                &mut diagnostics,
+                &mut RoleTokens::default(),
+            )?;
+        }
+        let unknown_quantity = missing_quantities > 0 || zero_measurements > 0;
+        row.unpriced_tokens = diagnostics
+            .into_iter()
+            .filter(|((reason, _, _), (tokens, _))| *tokens > 0 || reason == "missing_quantity")
+            .map(
+                |((reason, model, role), (tokens, measurements))| UnpricedTokens {
+                    reason,
+                    model,
+                    role,
+                    tokens,
+                    measurements,
+                },
+            )
+            .collect();
         row.plan = Some(name.clone());
+        row.zero_measurement_events = zero_measurements;
+        row.missing_quantity_events = missing_quantities;
+        row.unattributed_event_share = unmatched as f64 / plan.events.len().max(1) as f64;
         let total = (members.len() * hours.len()).max(1) as f64;
         row.clean_hours_share = clean_count as f64 / total;
         row.saturated_share = saturated as f64 / total;
         row.gap_share = gaps as f64 / total;
         row.unpriced_share = unpriced as f64 / total;
         row.eligibility_reasons.clear();
+        let unresolved_price = row
+            .accounts_excluded
+            .iter()
+            .any(|account| account["reason"] != "account_not_configured");
         for (bad, reason) in [
-            (!row.unconfigured_accounts.is_empty(), "unconfigured_accounts"),
-            (!row.accounts_excluded.is_empty(), "unpriced_plan"),
-            (row.clean_hours_share < MIN_CLEAN_SHARE || clean_count < MIN_CLEAN_HOURS, "insufficient_clean_hours"),
+            (
+                !row.unconfigured_accounts.is_empty(),
+                "unconfigured_accounts",
+            ),
+            (unresolved_price, "unpriced_plan"),
+            (
+                row.clean_hours_share < MIN_CLEAN_SHARE || clean_count < MIN_CLEAN_HOURS,
+                "insufficient_clean_hours",
+            ),
             (row.saturated_share > MAX_EXCLUDED_SHARE, "saturation"),
             (row.gap_share > MAX_EXCLUDED_SHARE, "gaps"),
             (row.unpriced_share > MAX_EXCLUDED_SHARE, "unpriced_usage"),
-            (unknown_quantity, "missing_quantity"),
+            (missing_quantities > 0, "missing_quantity"),
+            (zero_measurements > 0, "missing_measurements"),
             (unknown_reset, "unknown_reset"),
-            (plans.len() > 1 && unmatched as f64 / plan.events.len().max(1) as f64 > MAX_UNATTRIBUTED_SHARE, "unattributed_plan_usage"),
+            (
+                plans.len() > 1
+                    && unmatched as f64 / plan.events.len().max(1) as f64 > MAX_UNATTRIBUTED_SHARE,
+                "unattributed_plan_usage",
+            ),
             (row.delta_percent < MIN_POINTS, "insufficient_points"),
-            (row.multiplier.is_none_or(|ratio| !ratio.is_finite() || ratio <= 0.0), "nonpositive_ratio"),
+            (
+                row.multiplier
+                    .is_none_or(|ratio| !ratio.is_finite() || ratio <= 0.0),
+                "nonpositive_ratio",
+            ),
         ] {
-            if bad { row.eligibility_reasons.push(reason.into()); }
+            if bad {
+                row.eligibility_reasons.push(reason.into());
+            }
         }
-        if unknown_quantity || !row.unconfigured_accounts.is_empty() {
+        if unknown_quantity
+            || unresolved_price
+            || !row.unconfigured_accounts.is_empty()
+            || (row.api_nanos == 0
+                && row
+                    .unpriced_tokens
+                    .iter()
+                    .any(|unpriced| unpriced.tokens > 0))
+        {
             row.multiplier = None;
             row.fee_multiplier = None;
         }

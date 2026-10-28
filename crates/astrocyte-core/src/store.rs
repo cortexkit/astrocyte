@@ -3934,12 +3934,23 @@ INSERT OR IGNORE INTO summary_dirty_hour SELECT kind,hour_number FROM summary_ho
 ALTER TABLE multiplier_observation ADD COLUMN plan TEXT;
 ALTER TABLE multiplier_observation ADD COLUMN routing_eligible INTEGER NOT NULL DEFAULT 0 CHECK(routing_eligible IN (0,1));
 ALTER TABLE multiplier_observation ADD COLUMN eligibility_reasons TEXT NOT NULL DEFAULT '["legacy_estimator"]';
-ALTER TABLE multiplier_observation ADD COLUMN clean_hours_share REAL NOT NULL DEFAULT 0;
-ALTER TABLE multiplier_observation ADD COLUMN saturated_share REAL NOT NULL DEFAULT 0;
-ALTER TABLE multiplier_observation ADD COLUMN gap_share REAL NOT NULL DEFAULT 0;
-ALTER TABLE multiplier_observation ADD COLUMN unpriced_share REAL NOT NULL DEFAULT 0;
+ALTER TABLE multiplier_observation ADD COLUMN clean_hours_share REAL NOT NULL DEFAULT 0 CHECK(clean_hours_share BETWEEN 0 AND 1);
+ALTER TABLE multiplier_observation ADD COLUMN saturated_share REAL NOT NULL DEFAULT 0 CHECK(saturated_share BETWEEN 0 AND 1);
+ALTER TABLE multiplier_observation ADD COLUMN gap_share REAL NOT NULL DEFAULT 0 CHECK(gap_share BETWEEN 0 AND 1);
+ALTER TABLE multiplier_observation ADD COLUMN unpriced_share REAL NOT NULL DEFAULT 0 CHECK(unpriced_share BETWEEN 0 AND 1);
 ALTER TABLE multiplier_observation ADD COLUMN unconfigured_accounts TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE multiplier_observation ADD COLUMN source_backlog TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE multiplier_observation ADD COLUMN unattributed_event_share REAL NOT NULL DEFAULT 0 CHECK(unattributed_event_share BETWEEN 0 AND 1);
+ALTER TABLE multiplier_observation ADD COLUMN zero_measurement_events INTEGER NOT NULL DEFAULT 0 CHECK(zero_measurement_events>=0);
+ALTER TABLE multiplier_observation ADD COLUMN missing_quantity_events INTEGER NOT NULL DEFAULT 0 CHECK(missing_quantity_events>=0);
+DROP TRIGGER multiplier_observation_insert_once;
+CREATE TRIGGER multiplier_observation_insert_once BEFORE INSERT ON multiplier_observation
+WHEN EXISTS (SELECT 1 FROM multiplier_observation WHERE observation_id=NEW.observation_id)
+  OR EXISTS (SELECT 1 FROM multiplier_observation WHERE supersedes=NEW.supersedes)
+  OR (NEW.supersedes IS NULL AND EXISTS (SELECT 1 FROM multiplier_observation
+      WHERE quota_provider=NEW.quota_provider AND observation_day=NEW.observation_day
+        AND plan IS NEW.plan AND supersedes IS NULL))
+BEGIN SELECT RAISE(ABORT, 'multiplier_observation_insert_once'); END;
 DROP INDEX multiplier_observation_one_original_per_day;
 CREATE UNIQUE INDEX multiplier_observation_one_original_per_day
 ON multiplier_observation(quota_provider, observation_day, COALESCE(plan,'')) WHERE supersedes IS NULL;
@@ -5584,10 +5595,6 @@ mod tests {
             "SELECT DISTINCT event.event_id",
         )
         .replace("{comparison}", ">=");
-        let models = real_query(
-            include_str!("multiplier.rs"),
-            "SELECT DISTINCT e.provider, e.model FROM usage_event e",
-        );
         let tokens = real_query(
             include_str!("multiplier.rs"),
             "SELECT e.event_key, e.producer, e.provider, e.model, m.role, m.unit, m.source,",
@@ -5616,23 +5623,21 @@ mod tests {
             vec![Text("e0003000".into())],
             "adjustment_event_lookup",
         ));
-        for (name, query) in [("scope_models", models), ("time_tokens", tokens)] {
-            cases.push((
-                name,
-                query.replace("{predicate}", "((e.producer = ? AND e.provider = ?))"),
-                vec![
-                    Text("codex".into()),
-                    Text("openai".into()),
-                    Text("2991".into()),
-                    Text("3001".into()),
-                ],
-                "usage_event_multiplier_scope_time",
-            ));
-        }
-        let multi_scope = real_query(include_str!("multiplier.rs"), "SELECT DISTINCT e.provider, e.model FROM usage_event e")
+        cases.push((
+            "time_tokens",
+            tokens.replace("{predicate}", "((e.producer = ? AND e.provider = ?))"),
+            vec![
+                Text("codex".into()),
+                Text("openai".into()),
+                Text("2991".into()),
+                Text("3001".into()),
+            ],
+            "usage_event_multiplier_scope_time",
+        ));
+        let multi_scope = tokens
             .replace("{predicate}", "((e.producer = ? AND e.provider = ? AND e.charge_basis = ?) OR (e.producer = ? AND e.provider = ?))");
         cases.push((
-            "multi_scope_models",
+            "multi_scope_tokens",
             multi_scope,
             vec![
                 Text("codex".into()),

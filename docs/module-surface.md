@@ -229,9 +229,10 @@ Tests: `op_event_reprice_routes_subscription_included_through_coverage`,
 
 Recomputes one UTC day (`observation_day`, `YYYY-MM-DD`) for one configured
 quota provider, or for all of them when `quota_provider` is absent, over the
-seven days ending at that day's 00:00Z. Each row supersedes the day's head, or
+seven days ending at that day's 00:00Z. One row per configured plan supersedes
+that provider/plan/day's head, or
 is the day's original when none exists. All rows append in one transaction or
-none does. Reply: `{"recomputed": [{quota_provider, observation_day,
+none does. Reply: `{"recomputed": [{quota_provider, plan, observation_day,
 observation_id, supersedes, multiplier, fee_multiplier}]}`.
 
 | Code | Condition |
@@ -243,7 +244,7 @@ observation_id, supersedes, multiplier, fee_multiplier}]}`.
 | `catalog_unavailable` | No fusiform catalog is connected, or a catalog call failed. |
 | `plan_prices_unavailable` | Plan prices were needed and could not be read. |
 | `rate_fact_unrecognized` | The catalog served a rate this build cannot read. |
-| `source_reads_pending` | A missing original's sources have not all been read after the day's boundary, and two hours have not passed. |
+| `source_reads_pending` | An in-scope source is stale or has pending known/unknown backlog, and two hours have not passed. Recompute checks this even for an existing day. After the bound, rows are appended with `source_backlog` and are routing-ineligible. |
 | `arithmetic_out_of_range` | An exact computation overflowed. |
 
 Tests: `a_recompute_supersedes_the_day_and_the_report_serves_it`,
@@ -282,12 +283,22 @@ Reads never write. A refusal on a read is one of the codes below.
   local keys are served. Refusals: `malformed` (empty `event_id`), `not_found`.
 - `spend.reconcile`: `statement`, `lines`, `summary`. Refusals: `malformed`,
   `statement_not_found`; a store failure is `store_error`.
-- `spend.multiplier.report`: `latest` (each provider's newest head) and
+- `spend.multiplier.report`: `latest` (each provider/plan's newest head) and
   `series` (heads by day in range). Refusal: `invalid_range` (`from_ms`
   negative or not before `to_ms`). Test:
-  `multiplier_report_refuses_a_malformed_range`.
+  `multiplier_report_refuses_a_malformed_range`. Rows add `plan`,
+  `routing_eligible`, `eligibility_reasons`, `clean_hours_share`,
+  `saturated_share`, `gap_share`, `unpriced_share`, `unconfigured_accounts`
+  and `source_backlog`, plus `unattributed_event_share`,
+  `zero_measurement_events` and `missing_quantity_events`. Quality shares are fractions of all configured account-hours in
+  the row's plan; unpriced diagnostics also include excluded hours. Legacy rows
+  retain their old values with null plan and ineligible legacy defaults.
 - `spend.multiplier.pace`: hourly usage by producer and work class, valued at
-  the latest head's recorded rates without a catalog call. Refusals:
+  the latest **eligible**, unsuperseded head's recorded rates without a catalog
+  call. Accepts optional `plan`; it is required when configured plans differ.
+  Replies include the selected `plan` and `routing_eligible: true`. Eligible
+  heads must end no more than two days before `to_ms`; an older eligible row
+  does not authorize a stale estimate. Refusals: `plan_required`,
   `unknown_quota_provider`, `invalid_range`, `range_too_large` (over 192
   aligned hours), `no_multiplier_observation`. Test:
   `pace_refuses_unknown_provider_invalid_or_excessive_range_and_missing_head`.
