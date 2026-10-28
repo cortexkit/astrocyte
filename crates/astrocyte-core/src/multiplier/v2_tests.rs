@@ -41,6 +41,37 @@ fn fixture_quantity(conn: &Connection, quantity: Option<i64>) -> MultiplierConfi
     config
 }
 
+fn stable_fixture(conn: &Connection) -> MultiplierConfig {
+    stability_fixture(conn, [1, 1, 1])
+}
+
+fn stability_fixture(conn: &Connection, daily_scale: [i64; 3]) -> MultiplierConfig {
+    let config = config(vec![rule("pi", "openai", None)]);
+    for minute in (0..=3 * 24 * 60).step_by(5) {
+        reset_reading(
+            conn,
+            "acct",
+            minute * 60_000,
+            minute as f64 / 60.0,
+            14 * 24 * HOUR_MS,
+        );
+    }
+    // Distinct UTC days and six-hour bins carry matched value and points,
+    // rather than making a one-call arithmetic fixture certify stability.
+    for hour in (0..72).step_by(6) {
+        let day = usize::try_from(hour / 24).unwrap();
+        v2_event(
+            conn,
+            &format!("stable-{hour}"),
+            None,
+            "m",
+            (hour + 3) * HOUR_MS,
+            Some(250_000 * daily_scale[day]),
+        );
+    }
+    config
+}
+
 fn rows(conn: &Connection, config: &MultiplierConfig) -> Vec<Observation> {
     let plan = plan_observation(conn, config, "codex", 0, 48 * HOUR_MS).unwrap();
     compute_plan_observations(
@@ -182,7 +213,7 @@ fn v2_snapshot_does_not_value_late_ingest() {
 #[test]
 fn v2_missing_quantity_is_unknown_not_zero() {
     let mut conn = conn();
-    let mut config = fixture(&conn);
+    let mut config = stable_fixture(&conn);
     let account = config.quota_providers["codex"].accounts["acct"].clone();
     config
         .quota_providers
@@ -198,14 +229,14 @@ fn v2_missing_quantity_is_unknown_not_zero() {
     v2_event(&conn, "unknown", Some("acct"), "m", HOUR_MS, None);
     conn.execute("INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent) VALUES ((SELECT event_key FROM usage_event WHERE event_id='unknown'),'output','token','billed','output',NULL,NULL)", []).unwrap();
     let calculate = |conn: &Connection| {
-        let plan = plan_observation(conn, &config, "codex", 0, 48 * HOUR_MS).unwrap();
+        let plan = plan_observation(conn, &config, "codex", 0, 72 * HOUR_MS).unwrap();
         compute_plan_observations(
             conn,
             &config,
             &plan,
             &rates_for(&[("openai", "m")], 100, None),
             &prices,
-            48 * HOUR_MS,
+            72 * HOUR_MS,
             &["openai".into()],
         )
         .unwrap()
@@ -215,10 +246,10 @@ fn v2_missing_quantity_is_unknown_not_zero() {
     assert!(row.routing_eligible);
     assert!(row.multiplier.is_some_and(|value| value > 0.0));
     assert!(row.fee_multiplier.is_some_and(|value| value > 0.0));
-    assert!((row.clean_hours_share - 95.0 / 96.0).abs() < 1e-12);
-    assert!((row.unpriced_share - 1.0 / 96.0).abs() < 1e-12);
-    assert!((row.delta_percent - 95.0).abs() < 1e-9);
-    assert_eq!(row.api_nanos, 100);
+    assert!((row.clean_hours_share - 143.0 / 144.0).abs() < 1e-12);
+    assert!((row.unpriced_share - 1.0 / 144.0).abs() < 1e-12);
+    assert!((row.delta_percent - 143.0).abs() < 1e-9);
+    assert_eq!(row.api_nanos, 300);
     assert_eq!(row.missing_quantity_events, 1);
     let tx = conn.transaction().unwrap();
     insert_observation_in_tx(&tx, &row).unwrap();
@@ -227,13 +258,18 @@ fn v2_missing_quantity_is_unknown_not_zero() {
         &conn,
         &MultiplierReportRequest {
             from_ms: 0,
-            to_ms: 49 * HOUR_MS,
+            to_ms: 73 * HOUR_MS,
         },
     )
     .unwrap();
     assert_eq!(report["series"][0]["unknown_quantity_measurements"], 2);
     assert_eq!(report["series"][0]["routing_eligible"], true);
-    for hour in (0..=25).filter(|hour| *hour != 10) {
+    for hour in (0..3).flat_map(|day| {
+        (0..24)
+            .filter(|hour| hour % 6 != 3)
+            .take(13)
+            .map(move |hour| day * 24 + hour)
+    }) {
         v2_event(
             &conn,
             &format!("unknown-hour-{hour}"),
@@ -244,12 +280,12 @@ fn v2_missing_quantity_is_unknown_not_zero() {
         );
     }
     let over_budget = calculate(&conn);
-    assert!((over_budget.unpriced_share - 25.0 / 96.0).abs() < 1e-12);
+    assert!((over_budget.unpriced_share - 39.0 / 144.0).abs() < 1e-12);
     assert!(!over_budget.routing_eligible);
     assert_eq!(over_budget.eligibility_reasons, vec!["unpriced_usage"]);
     assert!(over_budget.multiplier.is_some_and(|value| value > 0.0));
-    assert_eq!(over_budget.api_nanos, 100);
-    assert!((over_budget.delta_percent - 71.0).abs() < 1e-9);
+    assert_eq!(over_budget.api_nanos, 300);
+    assert!((over_budget.delta_percent - 105.0).abs() < 1e-9);
 }
 
 #[test]
@@ -357,18 +393,18 @@ fn v2_attribution_uses_own_clean_hours_and_never_pools_plans() {
 #[test]
 fn v2_eligibility_explains_every_quality_exclusion() {
     let conn = conn();
-    let config = fixture(&conn);
+    let config = stable_fixture(&conn);
     let rates = rates_for(&[("openai", "m")], 100, None);
-    let plan = plan_observation(&conn, &config, "codex", 0, 48 * HOUR_MS).unwrap();
+    let plan = plan_observation(&conn, &config, "codex", 0, 72 * HOUR_MS).unwrap();
     let calculate = |plan: &ObservationPlan, prices: &BTreeMap<String, PlanPriceUsed>| {
-        compute_plan_observations(&conn, &config, plan, &rates, prices, 48 * HOUR_MS, &[])
+        compute_plan_observations(&conn, &config, plan, &rates, prices, 72 * HOUR_MS, &[])
             .unwrap()
             .remove(0)
     };
     assert!(calculate(&plan, &priced_plan()).routing_eligible);
     for (reason, change) in [
         ("saturation", 0),
-        ("gaps", 1),
+        ("insufficient_clean_hours", 1),
         ("unknown_reset", 2),
         ("insufficient_points", 3),
     ] {
@@ -528,7 +564,7 @@ fn v2_measure_store_clone() {
                 }
                 println!(
                     "MEASURE {}",
-                    json!({"day": day, "provider": provider, "plan": row.plan, "multiplier": row.multiplier, "dollars_per_point": (row.delta_percent>0.0).then(|| row.api_nanos as f64 / 1e9 / row.delta_percent), "points": row.delta_percent, "list_dollars": row.api_nanos as f64 / 1e9, "routing_eligible": row.routing_eligible, "reasons": row.eligibility_reasons, "clean_share": row.clean_hours_share, "saturated_share": row.saturated_share, "gap_share": row.gap_share, "unpriced_share": row.unpriced_share, "unconfigured_count": row.unconfigured_accounts.len(), "source_backlog": row.source_backlog, "zero_measurement_events": row.zero_measurement_events, "missing_quantity_events": row.missing_quantity_events, "unattributed_event_share": row.unattributed_event_share, "unpriced_tokens": row.unpriced_tokens, "diagnostic_multiplier": (row.subscription_nanos > 0).then(|| row.api_nanos as f64 / row.subscription_nanos as f64)})
+                    json!({"day": day, "provider": provider, "plan": row.plan, "multiplier": row.multiplier, "dollars_per_point": (row.delta_percent>0.0).then(|| row.api_nanos as f64 / 1e9 / row.delta_percent), "points": row.delta_percent, "list_dollars": row.api_nanos as f64 / 1e9, "routing_eligible": row.routing_eligible, "reasons": row.eligibility_reasons, "clean_share": row.clean_hours_share, "saturated_share": row.saturated_share, "gap_share": row.gap_share, "unpriced_share": row.unpriced_share, "unconfigured_count": row.unconfigured_accounts.len(), "source_backlog": row.source_backlog, "zero_measurement_events": row.zero_measurement_events, "missing_quantity_events": row.missing_quantity_events, "unattributed_event_share": row.unattributed_event_share, "unpriced_tokens": row.unpriced_tokens, "plan_calibration": row.accounts_included.first().and_then(|account| account.get("plan_calibration")), "diagnostic_multiplier": (row.subscription_nanos > 0).then(|| row.api_nanos as f64 / row.subscription_nanos as f64)})
                 );
             }
         }
@@ -539,7 +575,7 @@ fn v2_measure_store_clone() {
 #[test]
 fn v2_zero_measurement_events_are_unknown_not_free_usage() {
     let mut conn = conn();
-    let mut config = fixture(&conn);
+    let mut config = stable_fixture(&conn);
     let account = config.quota_providers["codex"].accounts["acct"].clone();
     config
         .quota_providers
@@ -554,14 +590,14 @@ fn v2_zero_measurement_events_are_unknown_not_free_usage() {
     prices.insert("second".into(), second_price);
     conn.execute("INSERT INTO usage_event(event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis) VALUES ('empty','pi','lineage','empty',?1,?1,'openai','m','unknown')", [HOUR_MS]).unwrap();
     let calculate = |conn: &Connection| {
-        let plan = plan_observation(conn, &config, "codex", 0, 48 * HOUR_MS).unwrap();
+        let plan = plan_observation(conn, &config, "codex", 0, 72 * HOUR_MS).unwrap();
         compute_plan_observations(
             conn,
             &config,
             &plan,
             &rates_for(&[("openai", "m")], 100, None),
             &prices,
-            48 * HOUR_MS,
+            72 * HOUR_MS,
             &["openai".into()],
         )
         .unwrap()
@@ -570,10 +606,10 @@ fn v2_zero_measurement_events_are_unknown_not_free_usage() {
     let row = calculate(&conn);
     assert!(row.routing_eligible);
     assert!(row.multiplier.is_some_and(|value| value > 0.0));
-    assert!((row.clean_hours_share - 47.0 / 48.0).abs() < 1e-12);
-    assert!((row.unpriced_share - 1.0 / 48.0).abs() < 1e-12);
-    assert!((row.delta_percent - 94.0).abs() < 1e-9);
-    assert_eq!(row.api_nanos, 100);
+    assert!((row.clean_hours_share - 71.0 / 72.0).abs() < 1e-12);
+    assert!((row.unpriced_share - 1.0 / 72.0).abs() < 1e-12);
+    assert!((row.delta_percent - 142.0).abs() < 1e-9);
+    assert_eq!(row.api_nanos, 300);
     assert_eq!(row.zero_measurement_events, 1);
     let tx = conn.transaction().unwrap();
     insert_observation_in_tx(&tx, &row).unwrap();
@@ -582,23 +618,28 @@ fn v2_zero_measurement_events_are_unknown_not_free_usage() {
         &conn,
         &MultiplierReportRequest {
             from_ms: 0,
-            to_ms: 49 * HOUR_MS,
+            to_ms: 73 * HOUR_MS,
         },
     )
     .unwrap();
     assert_eq!(report["series"][0]["zero_measurement_events"], 1);
     assert_eq!(report["series"][0]["unknown_quantity_measurements"], 0);
     assert_eq!(report["series"][0]["routing_eligible"], true);
-    for hour in (0..=13).filter(|hour| *hour != 10) {
+    for hour in (0..3).flat_map(|day| {
+        (0..24)
+            .filter(|hour| hour % 6 != 3)
+            .take(7)
+            .map(move |hour| day * 24 + hour)
+    }) {
         conn.execute("INSERT INTO usage_event(event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis) VALUES (?1,'pi','lineage',?1,?2,?2,'openai','m','unknown')", params![format!("empty-hour-{hour}"), hour * HOUR_MS]).unwrap();
     }
     let over_budget = calculate(&conn);
-    assert!((over_budget.unpriced_share - 13.0 / 48.0).abs() < 1e-12);
+    assert!((over_budget.unpriced_share - 21.0 / 72.0).abs() < 1e-12);
     assert!(!over_budget.routing_eligible);
     assert_eq!(over_budget.eligibility_reasons, vec!["unpriced_usage"]);
     assert!(over_budget.multiplier.is_some_and(|value| value > 0.0));
-    assert_eq!(over_budget.api_nanos, 100);
-    assert!((over_budget.delta_percent - 70.0).abs() < 1e-9);
+    assert_eq!(over_budget.api_nanos, 300);
+    assert!((over_budget.delta_percent - 102.0).abs() < 1e-9);
 }
 
 #[test]
@@ -664,4 +705,308 @@ fn v2_unresolved_plan_price_is_not_a_partial_multiplier() {
         .any(|reason| reason == "unpriced_plan"));
     assert_eq!(row.api_nanos, 100);
     assert!(row.subscription_nanos > 0);
+}
+
+#[test]
+fn v2_quiet_gaps_are_covered_but_changed_gaps_are_unknown() {
+    let conn = conn();
+    let horizon = 7 * 24 * HOUR_MS;
+    for (account, before, after, reset) in [
+        ("quiet", 10.0, 10.0, horizon + 700),
+        ("changed", 10.0, 20.0, horizon),
+        ("reset", 10.0, 10.0, horizon + 7 * 24 * HOUR_MS),
+        ("capped", 100.0, 100.0, horizon),
+    ] {
+        reset_reading(&conn, account, 0, before, horizon);
+        reset_reading(&conn, account, 4 * HOUR_MS, after, reset);
+    }
+    let quiet = account_delta(&conn, "codex", "quiet", &window(), HOUR_MS, 3 * HOUR_MS).unwrap();
+    assert_eq!(quiet.coverage_ms, Some((HOUR_MS, 3 * HOUR_MS)));
+    assert!((quiet.delta_percent).abs() < 1e-12);
+    assert_eq!(quiet.hours[&HOUR_MS].covered_ms, HOUR_MS);
+    assert_eq!(quiet.hours[&(2 * HOUR_MS)].covered_ms, HOUR_MS);
+    for account in ["changed", "reset"] {
+        let unknown =
+            account_delta(&conn, "codex", account, &window(), HOUR_MS, 3 * HOUR_MS).unwrap();
+        assert!(unknown.coverage_ms.is_none());
+        assert!(unknown.hours.values().all(|hour| hour.covered_ms == 0));
+        assert!(unknown.delta_percent.abs() < 1e-12);
+    }
+    let capped = account_delta(&conn, "codex", "capped", &window(), HOUR_MS, 3 * HOUR_MS).unwrap();
+    assert_eq!(capped.hours[&HOUR_MS].covered_ms, HOUR_MS);
+    assert!(capped.hours[&HOUR_MS].saturated);
+}
+
+#[test]
+fn v2_reset_jitter_is_not_rollover_or_stale_previous_period() {
+    let conn = conn();
+    let old = 14 * 24 * HOUR_MS;
+    let new = old + 7 * 24 * HOUR_MS;
+    for (minute, used, horizon) in [
+        (0, 10.0, old),
+        (1, 15.0, old + 2_000),
+        (2, 16.0, old + 312_000),
+        (3, 17.0, old + 1_000),
+        (4, 20.0, old),
+        (5, 45.0, new),
+        (6, 50.0, new + 4_000),
+        (7, 100.0, old),
+        (8, 55.0, new),
+    ] {
+        reset_reading(&conn, "acct", minute * 60_000, used, horizon);
+    }
+    let measured = account_delta(&conn, "codex", "acct", &window(), 0, HOUR_MS).unwrap();
+    assert!((measured.delta_percent - 65.0).abs() < 1e-9);
+    assert_eq!(measured.reset_boundaries, 1);
+    assert_eq!(measured.stale_reset_readings, 1);
+    assert_eq!(measured.readings, 8);
+}
+
+#[test]
+fn v2_jitter_tolerance_does_not_merge_short_window_rollovers() {
+    let conn = conn();
+    reset_reading(&conn, "acct", 0, 80.0, 60_000);
+    reset_reading(&conn, "acct", 60_000, 20.0, 120_000);
+    conn.execute("UPDATE window_sample SET window_minutes=1", [])
+        .unwrap();
+    let window = WindowSelector {
+        pool_key: "primary".into(),
+        window_minutes: 1,
+    };
+    let measured = account_delta(&conn, "codex", "acct", &window, 0, 120_000).unwrap();
+    assert!((measured.delta_percent - 20.0).abs() < 1e-9);
+    assert_eq!(measured.reset_boundaries, 1);
+}
+
+#[test]
+fn v2_adequate_stable_sample_does_not_need_half_the_week() {
+    let mut conn = conn();
+    let config = config(vec![rule("pi", "openai", None)]);
+    let day_ms = 24 * HOUR_MS;
+    let horizon = 21 * day_ms;
+    for day in 0..7 {
+        for minute in (0..24 * 60).step_by(5) {
+            if minute > 14 * 60 && minute < 19 * 60 {
+                continue;
+            }
+            let (used, reset) = if minute < 14 * 60 {
+                (
+                    if minute < 9 * 60 {
+                        minute as f64 / 60.0
+                    } else {
+                        100.0
+                    },
+                    horizon + 2 * day * day_ms,
+                )
+            } else {
+                (
+                    (minute - 14 * 60) as f64 / 60.0,
+                    horizon + (2 * day + 1) * day_ms,
+                )
+            };
+            reset_reading(&conn, "acct", day * day_ms + minute * 60_000, used, reset);
+        }
+        for hour in 0..8 {
+            v2_event(
+                &conn,
+                &format!("valued-{day}-{hour}"),
+                Some("acct"),
+                "m",
+                day * day_ms + hour * HOUR_MS + HOUR_MS / 2,
+                Some(125_000),
+            );
+        }
+        for hour in 19..24 {
+            v2_event(
+                &conn,
+                &format!("unpriced-{day}-{hour}"),
+                Some("acct"),
+                "premium",
+                day * day_ms + hour * HOUR_MS + HOUR_MS / 2,
+                Some(1),
+            );
+        }
+    }
+    reset_reading(&conn, "acct", 7 * day_ms, 0.0, horizon + 14 * day_ms);
+    let plan = plan_observation(&conn, &config, "codex", 0, 7 * day_ms).unwrap();
+    let row = compute_plan_observations(
+        &conn,
+        &config,
+        &plan,
+        &rates_for(&[("openai", "m")], 100, None),
+        &priced_plan(),
+        7 * day_ms,
+        &[],
+    )
+    .unwrap()
+    .remove(0);
+    assert!(row.routing_eligible, "{:?}", row.eligibility_reasons);
+    assert!((row.clean_hours_share - 1.0 / 3.0).abs() < 1e-12);
+    assert!(row.gap_share < 0.25);
+    assert_eq!(row.api_nanos, 700);
+    assert!((row.delta_percent - 56.0).abs() < 1e-9);
+    let tx = conn.transaction().unwrap();
+    insert_observation_in_tx(&tx, &row).unwrap();
+    tx.commit().unwrap();
+    let report = multiplier_report(
+        &conn,
+        &MultiplierReportRequest {
+            from_ms: 0,
+            to_ms: 8 * day_ms,
+        },
+    )
+    .unwrap();
+    let stability = &report["series"][0]["stability_diagnostics"];
+    assert_eq!(stability["active_days"], 7);
+    assert!(stability["bootstrap_relative_width"].as_f64().unwrap() < 1e-9);
+}
+
+#[test]
+fn v2_changed_gaps_do_not_veto_an_adequate_stable_sample() {
+    let conn = conn();
+    let config = config(vec![rule("pi", "openai", None)]);
+    let day_ms = 24 * HOUR_MS;
+    for day in 0..7 {
+        for minute in (0..=4 * 60).step_by(5) {
+            reset_reading(
+                &conn,
+                "acct",
+                day * day_ms + minute * 60_000,
+                day as f64 * 10.0 + minute as f64 / 60.0,
+                21 * day_ms,
+            );
+        }
+        v2_event(
+            &conn,
+            &format!("priced-{day}"),
+            Some("acct"),
+            "m",
+            day * day_ms + 2 * HOUR_MS,
+            Some(1_000_000),
+        );
+    }
+    reset_reading(&conn, "acct", 7 * day_ms, 70.0, 21 * day_ms);
+    let plan = plan_observation(&conn, &config, "codex", 0, 7 * day_ms).unwrap();
+    let row = compute_plan_observations(
+        &conn,
+        &config,
+        &plan,
+        &rates_for(&[("openai", "m")], 100, None),
+        &priced_plan(),
+        7 * day_ms,
+        &[],
+    )
+    .unwrap()
+    .remove(0);
+    assert!(row.routing_eligible, "{:?}", row.eligibility_reasons);
+    assert!((row.gap_share - 5.0 / 6.0).abs() < 1e-12);
+    assert!((row.clean_hours_share - 1.0 / 6.0).abs() < 1e-12);
+    assert!((row.delta_percent - 28.0).abs() < 1e-9);
+    assert_eq!(row.api_nanos, 700);
+}
+
+#[test]
+fn v2_variable_day_calibration_is_not_routing_eligible() {
+    let mut conn = conn();
+    let config = stability_fixture(&conn, [1, 10, 1]);
+    let plan = plan_observation(&conn, &config, "codex", 0, 72 * HOUR_MS).unwrap();
+    let row = compute_plan_observations(
+        &conn,
+        &config,
+        &plan,
+        &rates_for(&[("openai", "m")], 100, None),
+        &priced_plan(),
+        72 * HOUR_MS,
+        &[],
+    )
+    .unwrap()
+    .remove(0);
+    assert!(!row.routing_eligible);
+    assert_eq!(row.eligibility_reasons, vec!["unstable_estimate"]);
+    assert_eq!(row.api_nanos, 1200);
+    assert!((row.delta_percent - 72.0).abs() < 1e-9);
+    let tx = conn.transaction().unwrap();
+    insert_observation_in_tx(&tx, &row).unwrap();
+    tx.commit().unwrap();
+    let report = multiplier_report(
+        &conn,
+        &MultiplierReportRequest {
+            from_ms: 0,
+            to_ms: 73 * HOUR_MS,
+        },
+    )
+    .unwrap();
+    let stability = &report["series"][0]["stability_diagnostics"];
+    assert_eq!(stability["active_days"], 3);
+    assert_eq!(stability["held_out_test_bins"], 12);
+    assert!(stability["bootstrap_relative_width"].as_f64().unwrap() > 0.5);
+    assert!((stability["bootstrap_95_low"].as_f64().unwrap() - 100.0e-9 / 24.0).abs() < 1e-20);
+    assert!((stability["bootstrap_95_high"].as_f64().unwrap() - 1000.0e-9 / 24.0).abs() < 1e-20);
+    // Held out: four high-value bins err by 54 points each; each of eight
+    // low-value bins errs by 54/11. Their mean squared error is 119556/121.
+    let expected_rmse = (119_556.0_f64 / 121.0).sqrt();
+    assert!(
+        (stability["held_out_ratio_rmse_points"].as_f64().unwrap() - expected_rmse).abs() < 1e-9
+    );
+}
+
+#[test]
+fn v2_two_days_do_not_establish_day_block_stability() {
+    let conn = conn();
+    let config = stable_fixture(&conn);
+    let row = rows(&conn, &config).remove(0);
+    assert!(!row.routing_eligible);
+    assert_eq!(row.eligibility_reasons, vec!["insufficient_stability_days"]);
+    assert_eq!(row.api_nanos, 200);
+    assert!((row.delta_percent - 48.0).abs() < 1e-9);
+}
+
+#[test]
+fn v2_day_blocks_keep_account_value_and_points_paired() {
+    let conn = conn();
+    let config = config(vec![rule("pi", "openai", None)]);
+    let mut base = 0.0;
+    for (day, scale) in [1_i64, 2, 4].into_iter().enumerate() {
+        let day = i64::try_from(day).unwrap();
+        for minute in (0..24 * 60).step_by(5) {
+            reset_reading(
+                &conn,
+                "acct",
+                day * 24 * HOUR_MS + minute * 60_000,
+                base + minute as f64 / 240.0 * scale as f64,
+                14 * 24 * HOUR_MS,
+            );
+        }
+        for hour in (0..24).step_by(6) {
+            v2_event(
+                &conn,
+                &format!("paired-{day}-{hour}"),
+                Some("acct"),
+                "m",
+                (day * 24 + hour + 3) * HOUR_MS,
+                Some(250_000 * scale),
+            );
+        }
+        base += 6.0 * scale as f64;
+    }
+    reset_reading(&conn, "acct", 72 * HOUR_MS, base, 14 * 24 * HOUR_MS);
+    let plan = plan_observation(&conn, &config, "codex", 0, 72 * HOUR_MS).unwrap();
+    let row = compute_plan_observations(
+        &conn,
+        &config,
+        &plan,
+        &rates_for(&[("openai", "m")], 100, None),
+        &priced_plan(),
+        72 * HOUR_MS,
+        &[],
+    )
+    .unwrap()
+    .remove(0);
+    assert!(row.routing_eligible, "{:?}", row.eligibility_reasons);
+    assert_eq!(row.api_nanos, 700);
+    assert!((row.delta_percent - 42.0).abs() < 1e-9);
+    let summary = &row.accounts_included[0]["plan_calibration"]["summary"];
+    assert!(summary["bootstrap_relative_width"].as_f64().unwrap() < 1e-9);
+    assert!(summary["held_out_ratio_rmse_points"].as_f64().unwrap() < 1e-9);
+    assert!((summary["held_out_ratio_r2"].as_f64().unwrap() - 1.0).abs() < 1e-9);
 }

@@ -96,7 +96,7 @@ fn v2_served_plan_rows_keep_independent_eligible_heads_on_recompute() {
         for (prefix, account) in [("a", "acct"), ("b", "acct2")] {
           for index in 0..40 {
             let id = format!("{prefix}-{index}");
-            tx.execute("INSERT INTO usage_event(event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis,account_ref) VALUES (?1,'opencode','lineage',?1,?2,?2,'openai','m','unknown',?3)", params![id, DAY_START - 2 * DAY_MS, account]).map_err(|error| error.to_string())?;
+            tx.execute("INSERT INTO usage_event(event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis,account_ref) VALUES (?1,'opencode','lineage',?1,?2,?2,'openai','m','unknown',?3)", params![id, DAY_START - (index % 7 + 1) * DAY_MS + ((index / 7) % 4 * 6 + 3) * 3_600_000, account]).map_err(|error| error.to_string())?;
             tx.execute("INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent) VALUES ((SELECT event_key FROM usage_event WHERE event_id=?1),'input','token','billed','usage.input',1000,0)", [id]).map_err(|error| error.to_string())?;
           }
         }

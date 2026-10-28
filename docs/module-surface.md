@@ -296,6 +296,10 @@ Reads never write. A refusal on a read is one of the codes below.
   budget; their counts do not independently veto a row. Quality shares are fractions of all configured account-hours in
   the row's plan; unpriced diagnostics also include excluded hours. Legacy rows
   retain their old values with null plan and ineligible legacy defaults.
+  `stability_diagnostics` adds the recorded day-block bootstrap interval/width,
+  active-day count, held-out-day six-hour RMSE/R² and resampling parameters;
+  older rows without calibration inputs return null there. Adequacy uses clean
+  hours/points, active days and interval width, not a clean- or gap-share floor.
 - `spend.multiplier.pace`: hourly usage by producer and work class, valued at
   the latest **eligible**, unsuperseded head's recorded rates without a catalog
   call. Accepts optional `plan`; it is required when configured plans differ.

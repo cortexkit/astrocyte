@@ -18,14 +18,19 @@ The spend ledger is not changed.
 ## Counter periods and boundaries
 
 Use `COALESCE(raw_used_percent, used_percent)` and sort by fetched timestamp, not
-arrival order. A period ends only when `resets_at` advances by **more than one
-second**. Insula horizons jitter by less than a second (17:59:59.7 versus
-18:00:00). Within a period count only rises above its high-water mark: rounding
+arrival order. A period ends only when `resets_at` advances by **more than ten
+minutes**, capped at half the configured window length for short pools.
+Codex recomputes its horizon on each read: within-period consecutive changes
+reach 61 seconds and the observed horizon range reaches 312 seconds, while the
+nearest separate period is over 85,000 seconds away. A one-second tolerance
+incorrectly called jitter a rollover and rejected the subsequent normal
+horizon as stale. The ten-minute tolerance fixes that mechanism without
+merging genuine weekly rollovers. Within a period count only rises above its high-water mark: rounding
 dips, drops to zero and rebounds below that mark add nothing. A new period's
 first observed value counts from zero, including a first reading greater than
 the old period's last reading. A missing/unparseable reset horizon is not proof
 of a reset and excludes the hour from calibration.
-An older reset horizon arriving after a newer one (outside the same one-second
+An older reset horizon arriving after a newer one (outside that same
 jitter tolerance) is stale cache data: exclude that sample rather than letting
 an old allowance raise the current period's high-water mark. Account diagnostics
 count these as `stale_reset_readings`.
@@ -33,11 +38,21 @@ count these as `stale_reset_readings`.
 Adjacent reading increases are divided across UTC hour buckets in proportion
 to elapsed time, clipping both interval boundaries. This is an explicit
 constant-burn approximation between samples, not exact event attribution. The
-new period's first value is located at its first reading instead. No far-future
-sample certifies an interval's tail: only the **15 minutes** after the end are
-queried. A clean hour requires bracketing readings and no gap over 15 minutes,
-including at its two boundaries. A gap never becomes clean just because there
-are readings on both sides of the week.
+new period's first value is located at its first reading instead. A changed
+pair more than **15 minutes** apart is unknown: its hours and interpolated
+points are excluded. Equal percentage endpoints in the same known period,
+within reset tolerance, instead certify quiet time even across a longer gap.
+Saturated quiet time remains unclean; missing reset metadata cannot certify
+quiet time. The scan reads through 15 minutes after the end plus one later
+candidate. A later changed value/reset cannot certify the tail; an unchanged
+quiet pair can. Both boundaries are clipped to the requested interval.
+
+This reflects event-driven ingestion: insula publishes on change, and the
+backstop reads at most ten minutes apart (or earlier for freshness). History
+deduplicates repeated **fetched instants**, not equal percentages. A backstop
+returning the same cached source instant therefore creates no new sample.
+Equal values at distinct fetched instants remain separate rows. Quiet periods
+must not be mistaken for missing consumption just because the history is sparse.
 
 Antigravity `vault` readings before **2026-10-20T19:08Z** are excluded. This is a
 fixed historical correction: that frozen set queried Google's wrong production
@@ -51,8 +66,8 @@ before the fixed cutoff queried the wrong production quota pool.
 
 ## Matching numerator and denominator
 
-A configured account-hour is clean only when fully bracketed within the gap
-bound, all bracketing readings are below 100%, reset metadata is usable, and it
+A configured account-hour is clean only when fully bracketed by short or
+unchanged-period quiet pairs, all bracketing readings are below 100%, reset metadata is usable, and it
 has no positive unpriced quantity. One positive unknown-price token is material:
 premium-model quota burn need not be proportional to token count. Unknown
 measurement quantities and events with no measurements are unknown usage, not
@@ -94,24 +109,63 @@ interval** for priced accounts of the plan, not the price of clean exposure;
 
 ## Eligibility policy
 
-All policies are named constants in `multiplier/clean.rs`; they are deliberately
+All policies are named constants in `multiplier/clean.rs` and
+`multiplier/calibration.rs`; they are deliberately
 not tunable configuration. Shares use all configured account-hours in the plan
 as denominator, including unobserved hours. Exclusions may overlap, so shares
 need not sum to one.
 
 | Requirement | Reason code when rejected | Rationale |
 |---|---|---|
-| At least 50% clean account-hours and 24 clean account-hours total | `insufficient_clean_hours` | Avoid fitting a week from a tiny selected subset; Claude had only one jointly clean active hour. |
+| At least 24 clean account-hours total | `insufficient_clean_hours` | Require a minimum matched sample, not a fixed coverage share. |
 | At most 25% saturated account-hours | `saturation` | Codex's observed 19% can pass; Claude's 40.9% cannot. Saturated exposure is censored, not free. |
-| At most 25% gapped account-hours | `gaps` | Same conservative exclusion budget as saturation; clean-hour status uses the 15-minute gap bound above. |
 | At most 25% unpriced/unknown account-hours | `unpriced_usage` | Exclude hours with unpriced models, unknown quantities or no-measurement events together. Separate clean hours remain useful; none of the excluded usage is priced as zero. |
 | Reset metadata present throughout observed exposure | `unknown_reset` | A percentage drop alone cannot identify a period. |
 | No unconfigured observed account | `unconfigured_accounts` | Numerator/denominator membership must agree. |
 | Every included plan price resolved | `unpriced_plan` | No subscription-cost denominator can be fabricated. |
 | At most 5% unattributed events when plans differ | `unattributed_plan_usage` | Codex has about 2.2% unmatched events; do not assign their value to a random plan. This is an event-share budget, not a money bound. |
 | At least 20 clean points | `insufficient_points` | One point of endpoint quantization is 5% of twenty points. |
+| At least 3 active UTC days | `insufficient_stability_days` | Leave-one-day-out evaluation must retain at least two training days. |
+| Conditional day-block 95% interval width at most 50% of pooled USD/point | `unstable_estimate` | Matched October 2026 pro_200 spans are about 10–15%, versus about 62–100% for the latest pro_100/Claude/Muse samples. |
 | Positive finite multiplier | `nonpositive_ratio` | Missing value or zero burn is not a free routing price. |
 | In-scope sources fresh and drained | `source_backlog` | A successful bounded page can leave older usage pending. |
+
+There is no clean-share floor or gap-share veto. Excluding hours from both
+value and points reduces sample size but does not itself prove bias. The
+minimum sample and measured stability now govern adequacy. `clean_hours_share`
+and `gap_share` remain diagnostics. Saturation and unpriced-hour budgets remain:
+heavy-use censorship and unsupported model/usage mixtures can cause selection
+bias even when a selected clean estimate is numerically stable.
+
+### Stability and held-out-day validation
+
+The calculation retains exact rate-times-token numerators, points and clean
+hours in six-hour bins from the same owned snapshot as the observation. Codex
+plan validation is account-matched; a single configured account uses its
+provider scope conditionally, and unattributed multi-account single-plan usage
+uses provider/plan bins without inventing account assignment. Empty zero/zero
+bins do not inflate fit metrics; zero-point bins with list value remain.
+
+Three hundred deterministic resamples draw whole UTC-day blocks, preserving
+all accounts and bins of a day together. Each draw uses a ratio of sums, not an
+average of per-bin ratios. The 2.5th–97.5th percentile span divided by pooled
+USD/point is the width gate. This is conditional sample uncertainty, not a
+confidence guarantee covering invisible clients, selection bias or a new task
+mixture. The fixed seed and resampling method are recorded with the inputs.
+
+For validation, each UTC day is held out; the ratio of training points to list
+value predicts that day's six-hour bins. RMSE, centered R² and an OLS cross-check
+are reported. No held-out value trains its own coefficient. These match the
+proportionality study's day-held-out method, not validation on the seven highly
+overlapping rolling-week ratios.
+
+`stability_diagnostics` serves the recorded summary. Its immutable inputs and
+summary are retained as `plan_calibration` alongside each included account's
+JSON diagnostics, explicitly shared at plan level; no table migration or guessed
+allocation of provider-wide value is needed. `account_slot` identifies matched
+bins in sorted configured plan-member order. Exact numerators are decimal
+strings so JSON integer limits and per-bin rounding cannot alter row money.
+Legacy observations without those inputs report null stability diagnostics.
 
 Readiness requires `last_success_ms` at/after the interval end **and** no
 `pending_known` or `pending_unknown`. Before two hours after the boundary the

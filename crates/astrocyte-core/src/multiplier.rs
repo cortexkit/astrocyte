@@ -42,6 +42,7 @@ use crate::fact::ChargeBasis;
 use crate::money::{round_nano_num, round_nano_ratio, MoneyError};
 use crate::pricing::{effective_output, prompt_size, EffectiveOutput};
 
+mod calibration;
 mod clean;
 pub use clean::compute_plan_observations;
 
@@ -2680,6 +2681,15 @@ fn observation_rows(
             "unknown_quantity_measurements".into(),
             json!(unknown_quantity_measurements),
         );
+        let stability = object
+            .get("accounts_included")
+            .and_then(Value::as_array)
+            .and_then(|accounts| accounts.first())
+            .and_then(|account| account.get("plan_calibration"))
+            .and_then(|calibration| calibration.get("summary"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        object.insert("stability_diagnostics".into(), stability);
         out.push(Value::Object(object));
     }
     Ok(out)
@@ -4293,7 +4303,7 @@ mod tests {
         let conn = conn();
         let config = config(vec![rule("opencode", "openai", None)]);
         reading(&conn, "acct", 0, 50.0, None);
-        reading(&conn, "acct", DAY, 60.0, None);
+        reading(&conn, "acct", 10, 60.0, None);
         reading(&conn, "acct", 7 * DAY, 60.0, None);
         event(
             &conn,

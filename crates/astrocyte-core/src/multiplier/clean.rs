@@ -1,19 +1,22 @@
 //! Reset-aware, matched account-hour calibration. Do not pool readings across
 //! plans: a point on one plan is not interchangeable with a point on another.
+use super::calibration::{CalibrationBin, MIN_ACTIVE_DAYS};
 use super::*;
 
-// Hourly coverage permits no sample gap above 15 minutes; longer gaps can hide
-// resets. The October 2026 proportionality study used the same coverage bound.
+// Changed-counter pairs need the 15-minute bound used by the proportionality
+// study. Equal values in the same known period can bridge event-mode silence.
 const MAX_GAP_MS: i64 = 15 * 60_000;
 pub(super) const ANTIGRAVITY_WRONG_VAULT_CUTOFF_NS: i64 = 1_792_523_280_000_000_000;
-// Insula reset horizons jitter by less than a second (e.g. .7 versus .0).
-const RESET_TOLERANCE_MS: i64 = 1_000;
-// At least half of all account-hour buckets must be clean, with at least 24
-// clean buckets total. One jointly clean hour is insufficient for calibration.
-const MIN_CLEAN_SHARE: f64 = 0.5;
+// Codex recomputes its horizon: observed within-period ranges reach 312 seconds,
+// while the nearest separate period is over 85,000 seconds away. Ten minutes
+// admits that jitter without mistaking it for a new allowance or stale cache.
+const RESET_TOLERANCE_MS: i64 = 10 * 60_000;
+// A full day of matched account-hours and twenty points are the minimum sample;
+// excluded exposure is reported, not used as an unsupported share floor.
 const MIN_CLEAN_HOURS: usize = 24;
 // Codex loses 19% to saturation; Claude loses 40.9%. Permit the former, not
-// the latter. Apply the same conservative budget to gaps and unpriced hours.
+// the latter. Unpriced hours keep the same budget; excluded gaps instead use
+// the remaining sample's adequacy and measured stability, not a share veto.
 const MAX_EXCLUDED_SHARE: f64 = 0.25;
 // A one-point endpoint error is at most 5% of twenty accumulated points.
 const MIN_POINTS: f64 = 20.0;
@@ -38,6 +41,43 @@ struct Sample {
     reset: Option<i64>,
 }
 
+fn quiet_pair(previous: &Sample, current: &Sample, tolerance: i64) -> bool {
+    previous.used.total_cmp(&current.used).is_eq()
+        && matches!((previous.reset, current.reset), (Some(old), Some(new))
+            if (i128::from(new) - i128::from(old)).abs() <= i128::from(tolerance))
+}
+
+fn reset_tolerance(window: &WindowSelector) -> i64 {
+    // A genuinely short window still needs distinct periods: the tolerance
+    // cannot merge a rollover of a one-minute pool, for example.
+    RESET_TOLERANCE_MS.min(window.window_minutes.saturating_mul(60_000) / 2)
+}
+
+// Six-hour bins match the validated coarse-bin cohort; hourly fits are more
+// sensitive to integer-point rounding and completed-run timestamp boundaries.
+const CALIBRATION_BIN_MS: i64 = 6 * HOUR_MS;
+
+fn calibration_bin(bins: &mut BTreeMap<i64, CalibrationBin>, at_ms: i64) -> &mut CalibrationBin {
+    let start_ms = at_ms.div_euclid(CALIBRATION_BIN_MS) * CALIBRATION_BIN_MS;
+    bins.entry(start_ms).or_insert(CalibrationBin {
+        start_ms,
+        ..CalibrationBin::default()
+    })
+}
+
+fn account_calibration_bin(
+    bins: &mut BTreeMap<(usize, i64), CalibrationBin>,
+    slot: usize,
+    at_ms: i64,
+) -> &mut CalibrationBin {
+    let start_ms = at_ms.div_euclid(CALIBRATION_BIN_MS) * CALIBRATION_BIN_MS;
+    bins.entry((slot, start_ms)).or_insert(CalibrationBin {
+        start_ms,
+        account_slot: Some(slot),
+        ..CalibrationBin::default()
+    })
+}
+
 pub(super) fn account_delta(
     conn: &Connection,
     provider: &str,
@@ -46,10 +86,15 @@ pub(super) fn account_delta(
     start: i64,
     end: i64,
 ) -> rusqlite::Result<AccountDelta> {
+    let tolerance = reset_tolerance(window);
     let mut statement = conn.prepare_cached(
         "SELECT fetched_at_instant, COALESCE(raw_used_percent, used_percent), resets_at, source
          FROM window_sample WHERE provider=?1 AND account_ref=?2 AND pool_key=?3
-         AND window_minutes=?4 AND fetched_at_instant>=?5 AND fetched_at_instant<=?6
+         AND window_minutes=?4 AND fetched_at_instant>=?5
+         AND (fetched_at_instant<=?6 OR fetched_at_instant=(
+             SELECT MIN(tail.fetched_at_instant) FROM window_sample tail
+             WHERE tail.provider=?1 AND tail.account_ref=?2 AND tail.pool_key=?3
+               AND tail.window_minutes=?4 AND tail.fetched_at_instant>?6))
          ORDER BY fetched_at_instant, rowid",
     )?;
     let rows = statement.query_map(
@@ -92,7 +137,7 @@ pub(super) fn account_delta(
         if let (Some(latest), Some(reset)) = (latest_reset, reset) {
             // A cached reading from the previous allowance cannot raise the
             // current period's high-water mark or certify current coverage.
-            if latest.saturating_sub(reset) > RESET_TOLERANCE_MS {
+            if latest.saturating_sub(reset) > tolerance {
                 if at_ns >= clamp_nanos(millis_to_nanos(start))
                     && at_ns < clamp_nanos(millis_to_nanos(end))
                 {
@@ -126,6 +171,13 @@ pub(super) fn account_delta(
     for sample in &samples {
         if sample.at >= start && sample.at < end {
             result.readings += 1;
+            result.coverage_ms = Some(match result.coverage_ms {
+                Some((from, to)) => (
+                    from.min(sample.at),
+                    to.max(sample.at.saturating_add(1).min(end)),
+                ),
+                None => (sample.at, sample.at.saturating_add(1).min(end)),
+            });
         }
     }
     for pair in samples.windows(2) {
@@ -134,7 +186,7 @@ pub(super) fn account_delta(
             continue;
         }
         let reset = match (horizon, current.reset) {
-            (Some(old), Some(new)) => new.saturating_sub(old) > RESET_TOLERANCE_MS,
+            (Some(old), Some(new)) => new.saturating_sub(old) > tolerance,
             _ => false,
         };
         if reset {
@@ -167,17 +219,24 @@ pub(super) fn account_delta(
             continue;
         }
         let gap = current.at - previous.at;
+        let covered = gap <= MAX_GAP_MS || (!reset && quiet_pair(previous, current, tolerance));
+        if covered {
+            result.coverage_ms = Some(match result.coverage_ms {
+                Some((old_from, old_to)) => (old_from.min(from), old_to.max(to)),
+                None => (from, to),
+            });
+        }
         let mut at = from;
         while at < to {
             let hour = at.div_euclid(HOUR_MS) * HOUR_MS;
             let until = to.min(hour.saturating_add(HOUR_MS));
             let bucket = result.hours.entry(hour).or_default();
-            if gap <= MAX_GAP_MS {
+            if covered {
                 bucket.covered_ms += until - at;
                 bucket.saturated |= previous.used >= 100.0 || current.used >= 100.0;
                 bucket.reset_unknown |= previous.reset.is_none() || current.reset.is_none();
             }
-            let points = if reset {
+            let points = if reset || !covered {
                 0.0
             } else {
                 rise * (until - at) as f64 / gap as f64
@@ -185,13 +244,6 @@ pub(super) fn account_delta(
             bucket.points += points;
             result.delta_percent += points;
             at = until;
-        }
-    }
-    if let (Some(first), Some(last)) = (samples.first(), samples.last()) {
-        let from = first.at.max(start);
-        let to = last.at.saturating_add(1).min(end);
-        if from < to {
-            result.coverage_ms = Some((from, to));
         }
     }
     Ok(result)
@@ -218,20 +270,27 @@ pub fn compute_plan_observations(
     let lookup = ModelLookup::new(rates);
     let rules = ValuationRules::from_config(config, reasoning_billed_as_output);
     let mut bad_hours = BTreeSet::new();
+    let mut event_numerators = BTreeMap::new();
     for event in &plan.events {
         let mut unpriced = BTreeMap::new();
         let resolution =
             event.tokens.model.as_deref().and_then(|model| {
                 lookup.get(rules.catalog_provider(&event.tokens.provider), model)
             });
+        let mut event_lines = BTreeMap::new();
         value_event(
             &rules,
             resolution,
             &event.tokens,
-            &mut BTreeMap::new(),
+            &mut event_lines,
             &mut unpriced,
             &mut RoleTokens::default(),
         )?;
+        let numerator = event_lines.values().try_fold(0_i128, |sum, line| {
+            sum.checked_add(line.numerator)
+                .ok_or(MoneyError::OutOfRange)
+        })?;
+        event_numerators.insert(event.id, numerator);
         let missing = unpriced
             .keys()
             .any(|(reason, _, _)| reason == "missing_quantity");
@@ -282,6 +341,11 @@ pub fn compute_plan_observations(
             .map(|(account, _)| account.clone())
             .collect();
         let mut filtered = plan.clone();
+        let member_slots: BTreeMap<_, _> = members
+            .iter()
+            .enumerate()
+            .map(|(slot, account)| (account.clone(), slot))
+            .collect();
         filtered
             .accounts
             .retain(|account| members.contains(&account.account_ref));
@@ -294,6 +358,8 @@ pub fn compute_plan_observations(
         let mut gaps = 0_usize;
         let mut unpriced = 0_usize;
         let mut unknown_reset = false;
+        let mut calibration_bins = BTreeMap::new();
+        let mut account_bins = BTreeMap::new();
         for account in &mut filtered.accounts {
             account.delta_percent = 0.0;
             for hour in &hours {
@@ -305,6 +371,21 @@ pub fn compute_plan_observations(
                 if clean(&account.account_ref, *hour) {
                     clean_count += 1;
                     account.delta_percent += counter.map_or(0.0, |counter| counter.points);
+                    if prices
+                        .get(&account.account_ref)
+                        .is_some_and(|price| price.monthly_nanos.is_some())
+                    {
+                        let bin = calibration_bin(&mut calibration_bins, *hour);
+                        bin.clean_account_hours += 1;
+                        bin.points += counter.map_or(0.0, |counter| counter.points);
+                        let bin = account_calibration_bin(
+                            &mut account_bins,
+                            member_slots[&account.account_ref],
+                            *hour,
+                        );
+                        bin.clean_account_hours += 1;
+                        bin.points += counter.map_or(0.0, |counter| counter.points);
+                    }
                 }
             }
         }
@@ -329,6 +410,26 @@ pub fn compute_plan_observations(
             }
         });
         filtered.token_interval_ms = Some((plan.interval_start_ms, plan.interval_end_ms));
+        for event in &filtered.events {
+            let bin = calibration_bin(&mut calibration_bins, event.occurred_at_ms);
+            bin.api_numerator = bin
+                .api_numerator
+                .checked_add(event_numerators[&event.id])
+                .ok_or(MoneyError::OutOfRange)?;
+            let slot = event
+                .account_ref
+                .as_ref()
+                .and_then(|account| member_slots.get(account))
+                .copied()
+                .or_else(|| (members.len() == 1).then_some(0));
+            if let Some(slot) = slot {
+                let bin = account_calibration_bin(&mut account_bins, slot, event.occurred_at_ms);
+                bin.api_numerator = bin
+                    .api_numerator
+                    .checked_add(event_numerators[&event.id])
+                    .ok_or(MoneyError::OutOfRange)?;
+            }
+        }
         let plan_prices: BTreeMap<_, _> = prices
             .iter()
             .filter(|(account, _)| members.contains(*account))
@@ -343,6 +444,27 @@ pub fn compute_plan_observations(
             snapshot_at_ms,
             reasoning_billed_as_output,
         )?;
+        let use_account_bins = plans.len() > 1 || members.len() == 1;
+        let validation_bins: Vec<_> = if use_account_bins {
+            account_bins.into_values().collect()
+        } else {
+            calibration_bins.into_values().collect()
+        };
+        let grain = if plans.len() > 1 {
+            "account_matched_six_hour"
+        } else if members.len() == 1 {
+            "single_account_scope_six_hour"
+        } else {
+            "provider_plan_six_hour"
+        };
+        let stability = super::calibration::assess(&validation_bins, grain);
+        // Each included account shares this plan-level calibration. Repeating
+        // its immutable inputs and summary avoids inventing account attribution
+        // for provider-wide usage or changing an applied table migration.
+        let calibration = json!({"summary": &stability, "bins": &validation_bins});
+        for account in &mut row.accounts_included {
+            account["plan_calibration"] = calibration.clone();
+        }
         // Preserve diagnostics for excluded hours too. A clean Spark estimate
         // must not make an unpriced premium model disappear from the report.
         let mut diagnostics = BTreeMap::new();
@@ -406,12 +528,8 @@ pub fn compute_plan_observations(
                 "unconfigured_accounts",
             ),
             (unresolved_price, "unpriced_plan"),
-            (
-                row.clean_hours_share < MIN_CLEAN_SHARE || clean_count < MIN_CLEAN_HOURS,
-                "insufficient_clean_hours",
-            ),
+            (clean_count < MIN_CLEAN_HOURS, "insufficient_clean_hours"),
             (row.saturated_share > MAX_EXCLUDED_SHARE, "saturation"),
-            (row.gap_share > MAX_EXCLUDED_SHARE, "gaps"),
             (row.unpriced_share > MAX_EXCLUDED_SHARE, "unpriced_usage"),
             (unknown_reset, "unknown_reset"),
             (
@@ -420,6 +538,14 @@ pub fn compute_plan_observations(
                 "unattributed_plan_usage",
             ),
             (row.delta_percent < MIN_POINTS, "insufficient_points"),
+            (
+                stability.active_days < MIN_ACTIVE_DAYS,
+                "insufficient_stability_days",
+            ),
+            (
+                stability.active_days >= MIN_ACTIVE_DAYS && !stability.passes_width_gate(),
+                "unstable_estimate",
+            ),
             (
                 row.multiplier
                     .is_none_or(|ratio| !ratio.is_finite() || ratio <= 0.0),
