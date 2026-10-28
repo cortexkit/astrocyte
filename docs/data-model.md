@@ -47,7 +47,7 @@ ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 | `summary_quantity` | Each row holds exact quantities for a cell, role, unit and exponent, including the covered population and presence counts. | Rebuilds replace these rows. |
 | `summary_money` | Each row holds current-head or adjustment contributions in their actual currency, together with a presence count. | Rebuilds replace these rows. |
 | `summary_cost_frequency` | Each row counts an exact current-head value in the dated, complete, currency-known work-class sample. | Rebuilds replace these rows. |
-| `summary_run_cell` | Each row holds key/model/hour steps, token presence and current-charge cost maps for Runs reads. | The existing hourly rebuild and audit replace these rows. |
+| `summary_run_cell` | Each row stores step counts, token totals and presence, and current-charge cost maps for one run key, provider and model, and hour. | The existing hourly rebuild and audit replace these rows. |
 | `summary_audit_state` | The row records the independent audit's cursor, next start time and progress statistics. | The audit updates this row. |
 
 ## Immutability

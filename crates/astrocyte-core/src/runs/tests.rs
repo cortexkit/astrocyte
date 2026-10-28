@@ -100,7 +100,7 @@ fn fill(c: &mut Connection) {
 }
 
 // Independent oracle: query each event's raw role sums and current charge rows,
-// then add ordinary integers. It never reads a summary or calls the Runs reducer.
+// then add ordinary integers. It never reads stored summaries or calls the Runs list or detail code.
 #[derive(Default)]
 struct Figures {
     steps: u64,

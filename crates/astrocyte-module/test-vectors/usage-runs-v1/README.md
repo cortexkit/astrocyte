@@ -27,7 +27,7 @@ formats with synthetic values.
 real dispatch from invented ledger facts and checks every byte and checksum.
 Permission vectors use the same refusal helper as the serving handler; the fake
 daemon integration tests separately verify bind-time authorization on the wire.
-For regeneration, run on the build server:
+To regenerate these vectors, run:
 
 ```sh
 ASTROCYTE_EXPORT_RUNS_VECTORS=1 cargo test --workspace runs_vectors -- --nocapture

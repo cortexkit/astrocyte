@@ -6844,7 +6844,7 @@ mod tests {
     /// version exactly once even when run twice. Derived from MIGRATIONS so a
     /// new migration cannot silently drop this test's coverage (the typed
     /// count it used to carry would have needed editing on every migration,
-    /// which is the hand-maintained-literal shape issue #5 named).
+    /// a hand-written count to maintain whenever a migration is added).
     #[test]
     fn migration_chain_restarts_at_v1_and_runner_records_it_once() {
         assert!(!MIGRATIONS.is_empty());
@@ -7681,7 +7681,7 @@ mod tests {
     #[test]
     fn usage_event_required_fields_reject_null_without_effect() {
         let conn = open_memory();
-        // Ruling 142 makes producer_lineage nullable: a producer that could
+        // producer_lineage is nullable: a producer that could
         // not observe its own generation stores no lineage rather than a
         // stand-in value, so that field no longer sits in the required list.
         // Acceptance is covered by usage_event_accepts_absent_lineage below.
@@ -7727,7 +7727,7 @@ mod tests {
     #[test]
     fn usage_event_accepts_absent_lineage_and_keeps_the_natural_key_unique() {
         let conn = open_memory();
-        // Ruling 142: a lineage-absent event is storable, and its natural key
+        // A lineage-absent event is storable, and its natural key
         // stays unique even though the table-level UNIQUE constraint treats
         // NULLs as distinct — the partial index is the backstop.
         conn.execute(
