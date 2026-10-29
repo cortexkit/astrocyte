@@ -15,6 +15,43 @@ prices. Recompute can change historical values when prices or scope change.
 Quota readings and scoped events are captured together before catalog calls.
 The spend ledger is not changed.
 
+## Account and credential identities
+
+An account-bearing quota reading always joins by `account_ref`, even when it
+also carries a vault credential reference. A reading without an account can
+instead use its exact `credential_ref`. Credential history is keyed by quota
+provider, credential, pool and source instant; two keys for one provider never
+share a counter. Readings with neither identity remain latest-only and cannot
+produce a multiplier. Earlier latest-only readings cannot be reconstructed as
+credential history.
+
+Declare account plans in `accounts` or credential plans in `credentials`, not
+both for one quota provider. Credential counters use the same reset, high-water,
+clean-hour, saturation and stability rules described below. The report's
+historically named `accounts_included` and `accounts_excluded` lists contain
+`credential_ref` instead of `account_ref` for credential rows; `plan_prices`
+also shows the identity actually priced. Account rows keep their existing shape.
+Unconfigured credential readings are listed in the legacy-named
+`unconfigured_accounts` array and reject the row with `unconfigured_credentials`.
+Their exclusion diagnostics use `credential_ref` and `credential_not_configured`.
+
+With exactly one configured credential, all in-scope provider tokens are
+conditionally attributed to that credential. Ledger credential labels are not
+used as a quota identity: some producers omit them and their names need not
+match vault references. More than one configured credential makes every plan
+row ineligible with `multiple_credentials_without_token_attribution`, even when
+the credentials hold the same plan. Those rows have null ratios and no tokens
+assigned to an individual key or plan. Unpriced diagnostics remain visible.
+
+OpenCode Go uses quota provider `opencodego`, its `tertiary` 43,200-minute pool,
+and plan `opencode-go/go` ($10/month). Kimi for Coding uses quota provider
+`kimi-for-coding`, its `primary` 10,080-minute pool, and plan
+`kimi-code-plan-global/allegro` ($99/month). Plan prices are resolved from the
+catalog, not hard-coded. Their token scopes use ledger providers `opencode-go`
+and `kimi-code-plan-global`, with both `broca` and `opencode` producers. Go's
+paid extra usage cannot be distinguished from included traffic here and would
+distort its ratio; the estimate is not evidence that extra usage is included.
+
 ## Counter periods and boundaries
 
 Use `COALESCE(raw_used_percent, used_percent)` and sort by fetched timestamp, not

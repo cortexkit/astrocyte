@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 35. A schema change appends a migration; an applied
+currently version 36. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -40,6 +40,7 @@ ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 | `capacity_provider_reading` | Each row records the latest capacity reading for a provider without account attribution. | upsert |
 | `window_sample` | Each row preserves a capacity-window observation and its breakdown in the append-only history. | insert |
 | `multiplier_observation` | Each row records a daily subscription multiplier observation or an operator recompute that supersedes an earlier observation. | insert only |
+| `credential_window_sample` | Source-instant quota history for readings without an account, identified by provider, vault credential and pool. | insert only |
 | `summary_value` | Each row assigns an exact stored string an integer identifier, with identifier zero reserved for null. | Builders insert new values. |
 | `summary_hour` | Each row records an hour's persistent revision, published revision, format, event count and time extrema. | Triggers advance revisions, and publication records a completed build. |
 | `summary_dirty_hour` | Each row identifies an hour that needs a fresh reduction from base rows. | Triggers insert dirty keys, and successful publication removes them. |

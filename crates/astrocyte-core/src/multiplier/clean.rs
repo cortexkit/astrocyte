@@ -79,16 +79,19 @@ fn account_calibration_bin(
     })
 }
 
-pub(super) fn account_delta(
+pub(super) fn counter_delta(
     conn: &Connection,
     provider: &str,
-    account: &str,
+    identity: (&str, bool),
     window: &WindowSelector,
     start: i64,
     end: i64,
 ) -> rusqlite::Result<AccountDelta> {
+    let (account, credential) = identity;
     let tolerance = reset_tolerance(window);
-    let mut statement = conn.prepare_cached(
+    // Only the identity column and table differ; reset and coverage rules are
+    // shared so a credential counter cannot receive a more permissive estimate.
+    let sql =
         "SELECT fetched_at_instant, COALESCE(raw_used_percent, used_percent), resets_at, source
          FROM window_sample WHERE provider=?1 AND account_ref=?2 AND pool_key=?3
          AND window_minutes=?4 AND fetched_at_instant>=?5
@@ -96,8 +99,14 @@ pub(super) fn account_delta(
              SELECT MIN(tail.fetched_at_instant) FROM window_sample tail
              WHERE tail.provider=?1 AND tail.account_ref=?2 AND tail.pool_key=?3
                AND tail.window_minutes=?4 AND tail.fetched_at_instant>?6))
-         ORDER BY fetched_at_instant, rowid",
-    )?;
+         ORDER BY fetched_at_instant, rowid";
+    let sql = if credential {
+        sql.replace("window_sample", "credential_window_sample")
+            .replace("account_ref", "credential_ref")
+    } else {
+        sql.to_string()
+    };
+    let mut statement = conn.prepare_cached(&sql)?;
     let rows = statement.query_map(
         params![
             provider,
@@ -264,7 +273,7 @@ pub fn compute_plan_observations(
 ) -> Result<Vec<Observation>, MultiplierError> {
     let plans: BTreeSet<_> = plan
         .provider
-        .accounts
+        .members()
         .values()
         .map(|account| account.plan.clone())
         .collect();
@@ -302,16 +311,15 @@ pub fn compute_plan_observations(
                 .any(|(tokens, _)| *tokens >= MATERIAL_TOKENS)
         {
             let hour = event.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS;
-            match event
-                .account_ref
-                .as_ref()
-                .filter(|account| plan.provider.accounts.contains_key(*account))
-            {
+            match event.account_ref.as_ref().filter(|account| {
+                plan.provider.credentials.is_empty()
+                    && plan.provider.accounts.contains_key(*account)
+            }) {
                 Some(account) => {
                     bad_hours.insert((account.clone(), hour));
                 }
                 None => {
-                    for account in plan.provider.accounts.keys() {
+                    for account in plan.provider.members().keys() {
                         bad_hours.insert((account.clone(), hour));
                     }
                 }
@@ -336,7 +344,7 @@ pub fn compute_plan_observations(
     for name in &plans {
         let members: BTreeSet<_> = plan
             .provider
-            .accounts
+            .members()
             .iter()
             .filter(|(_, account)| &account.plan == name)
             .map(|(account, _)| account.clone())
@@ -352,7 +360,7 @@ pub fn compute_plan_observations(
             .retain(|account| members.contains(&account.account_ref));
         filtered
             .provider
-            .accounts
+            .members_mut()
             .retain(|account, _| members.contains(account));
         let mut clean_count = 0_usize;
         let mut saturated = 0_usize;
@@ -391,20 +399,23 @@ pub fn compute_plan_observations(
             }
         }
         let mut unmatched = 0_usize;
+        let ambiguous_credentials = plan.provider.credentials.len() > 1;
         filtered.events.retain(|event| {
+            if ambiguous_credentials {
+                return false;
+            }
             let hour = event.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS;
-            match event
-                .account_ref
-                .as_ref()
-                .filter(|account| plan.provider.accounts.contains_key(*account))
-            {
+            match event.account_ref.as_ref().filter(|account| {
+                plan.provider.credentials.is_empty()
+                    && plan.provider.accounts.contains_key(*account)
+            }) {
                 Some(account) => members.contains(account) && clean(account, hour),
                 None => {
                     unmatched += 1;
                     plans.len() == 1
                         && plan
                             .provider
-                            .accounts
+                            .members()
                             .keys()
                             .all(|account| clean(account, hour))
                 }
@@ -420,6 +431,7 @@ pub fn compute_plan_observations(
             let slot = event
                 .account_ref
                 .as_ref()
+                .filter(|_| plan.provider.credentials.is_empty())
                 .and_then(|account| member_slots.get(account))
                 .copied()
                 .or_else(|| (members.len() == 1).then_some(0));
@@ -473,7 +485,9 @@ pub fn compute_plan_observations(
         let mut missing_quantities = 0_u64;
         for event in plan.events.iter().filter(|event| {
             event.account_ref.as_ref().is_none_or(|account| {
-                !plan.provider.accounts.contains_key(account) || members.contains(account)
+                !plan.provider.credentials.is_empty()
+                    || !plan.provider.accounts.contains_key(account)
+                    || members.contains(account)
             })
         }) {
             zero_measurements += u64::from(event.tokens.roles.is_empty());
@@ -519,14 +533,22 @@ pub fn compute_plan_observations(
         row.gap_share = gaps as f64 / total;
         row.unpriced_share = unpriced as f64 / total;
         row.eligibility_reasons.clear();
-        let unresolved_price = row
-            .accounts_excluded
-            .iter()
-            .any(|account| account["reason"] != "account_not_configured");
+        let unresolved_price = row.accounts_excluded.iter().any(|account| {
+            account["reason"] != "account_not_configured"
+                && account["reason"] != "credential_not_configured"
+        });
         for (bad, reason) in [
             (
+                ambiguous_credentials,
+                "multiple_credentials_without_token_attribution",
+            ),
+            (
                 !row.unconfigured_accounts.is_empty(),
-                "unconfigured_accounts",
+                if plan.provider.credentials.is_empty() {
+                    "unconfigured_accounts"
+                } else {
+                    "unconfigured_credentials"
+                },
             ),
             (unresolved_price, "unpriced_plan"),
             (clean_count < MIN_CLEAN_HOURS, "insufficient_clean_hours"),
@@ -556,7 +578,8 @@ pub fn compute_plan_observations(
                 row.eligibility_reasons.push(reason.into());
             }
         }
-        if unresolved_price
+        if ambiguous_credentials
+            || unresolved_price
             || !row.unconfigured_accounts.is_empty()
             || (row.api_nanos == 0
                 && row

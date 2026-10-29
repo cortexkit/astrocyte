@@ -125,6 +125,38 @@ pub struct QuotaProviderConfig {
     /// Account ref → the plan it holds.
     #[serde(deserialize_with = "unique_map")]
     pub accounts: BTreeMap<String, AccountPlan>,
+    /// Vault credential ref → plan, for providers whose counters have no account.
+    /// Never combined with accounts.
+    #[serde(deserialize_with = "unique_map")]
+    pub credentials: BTreeMap<String, AccountPlan>,
+}
+
+impl QuotaProviderConfig {
+    /// A provider uses one identity namespace, so equal account and credential
+    /// strings can never alias in the estimator's counter maps.
+    pub fn members(&self) -> &BTreeMap<String, AccountPlan> {
+        if self.credentials.is_empty() {
+            &self.accounts
+        } else {
+            &self.credentials
+        }
+    }
+
+    fn members_mut(&mut self) -> &mut BTreeMap<String, AccountPlan> {
+        if self.credentials.is_empty() {
+            &mut self.accounts
+        } else {
+            &mut self.credentials
+        }
+    }
+
+    fn identity_field(&self) -> &'static str {
+        if self.credentials.is_empty() {
+            "account_ref"
+        } else {
+            "credential_ref"
+        }
+    }
 }
 
 /// Reader keys can differ from their ledger producer names.
@@ -281,12 +313,17 @@ impl MultiplierConfig {
                     ));
                 }
             }
-            if provider.accounts.is_empty() {
-                return Err(format!("{at}: accounts must name at least one account"));
+            if provider.accounts.is_empty() == provider.credentials.is_empty() {
+                return Err(format!(
+                    "{at}: name either non-empty accounts or non-empty credentials, never both"
+                ));
             }
-            for (account, plan) in &provider.accounts {
+            for (account, plan) in provider.members() {
                 if account.is_empty() {
-                    return Err(format!("{at}: account refs must be non-empty"));
+                    return Err(format!(
+                        "{at}: {} must be non-empty",
+                        provider.identity_field()
+                    ));
                 }
                 validate_plan_key(&plan.plan)
                     .map_err(|error| format!("{at} account '{account}': {error}"))?;
@@ -487,6 +524,7 @@ impl AccountDelta {
 }
 
 /// Measures a reset-aware high-water series and its bounded hourly coverage.
+#[cfg(test)]
 fn account_delta(
     conn: &Connection,
     quota_provider: &str,
@@ -495,7 +533,14 @@ fn account_delta(
     start_ms: i64,
     end_ms: i64,
 ) -> rusqlite::Result<AccountDelta> {
-    clean::account_delta(conn, quota_provider, account_ref, window, start_ms, end_ms)
+    clean::counter_delta(
+        conn,
+        quota_provider,
+        (account_ref, false),
+        window,
+        start_ms,
+        end_ms,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -544,24 +589,31 @@ pub fn plan_observation(
         });
     }
     let mut accounts = Vec::new();
-    for account in provider.accounts.keys() {
-        accounts.push(account_delta(
+    for account in provider.members().keys() {
+        accounts.push(clean::counter_delta(
             conn,
             quota_provider,
-            account,
+            (account, !provider.credentials.is_empty()),
             &provider.window,
             interval_start_ms,
             interval_end_ms,
         )?);
     }
-    let seen: Vec<String> = conn
-        .prepare(
-            "SELECT DISTINCT account_ref FROM window_sample
+    let seen_sql = if provider.credentials.is_empty() {
+        "SELECT DISTINCT account_ref FROM window_sample
               WHERE provider = ?1 AND pool_key = ?2 AND window_minutes = ?3
                 AND fetched_at_instant >= ?4 AND fetched_at_instant < ?5
                 AND NOT(provider='antigravity' AND source IS 'vault' AND fetched_at_instant < ?6)
-             ORDER BY account_ref",
-        )?
+             ORDER BY account_ref"
+    } else {
+        "SELECT DISTINCT credential_ref FROM credential_window_sample
+              WHERE provider = ?1 AND pool_key = ?2 AND window_minutes = ?3
+                AND fetched_at_instant >= ?4 AND fetched_at_instant < ?5
+                AND NOT(provider='antigravity' AND source IS 'vault' AND fetched_at_instant < ?6)
+             ORDER BY credential_ref"
+    };
+    let seen: Vec<String> = conn
+        .prepare(seen_sql)?
         .query_map(
             params![
                 quota_provider,
@@ -577,12 +629,12 @@ pub fn plan_observation(
     let mut unconfigured_accounts = Vec::new();
     for account in seen
         .iter()
-        .filter(|account| !provider.accounts.contains_key(*account))
+        .filter(|account| !provider.members().contains_key(*account))
     {
-        let measured = account_delta(
+        let measured = clean::counter_delta(
             conn,
             quota_provider,
-            account,
+            (account, !provider.credentials.is_empty()),
             &provider.window,
             interval_start_ms,
             interval_end_ms,
@@ -1036,7 +1088,10 @@ pub trait PlanPriceSource: Send + Sync {
 /// The monthly price one account is valued at, with where it came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanPriceUsed {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub account_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
     pub plan: String,
     /// `account_override`, `plan_override`, or `fusiform`; `null` when unpriced.
     pub source: Option<String>,
@@ -1057,7 +1112,7 @@ pub fn resolve_plans(
     provider: &QuotaProviderConfig,
     at_ms: i64,
 ) -> Result<BTreeMap<String, PlanPriceUsed>, MultiplierError> {
-    let needs_fusiform = provider.accounts.values().any(|account| {
+    let needs_fusiform = provider.members().values().any(|account| {
         account.price_override.is_none() && !config.plan_price_overrides.contains_key(&account.plan)
     });
     let served = if needs_fusiform {
@@ -1080,9 +1135,14 @@ pub fn resolve_plans(
         None
     };
     let mut plans = BTreeMap::new();
-    for (account_ref, account) in &provider.accounts {
+    for (account_ref, account) in provider.members() {
         let mut used = PlanPriceUsed {
-            account_ref: account_ref.clone(),
+            account_ref: if provider.credentials.is_empty() {
+                account_ref.clone()
+            } else {
+                String::new()
+            },
+            credential_ref: (!provider.credentials.is_empty()).then(|| account_ref.clone()),
             plan: account.plan.clone(),
             source: None,
             monthly_nanos: None,
@@ -1607,7 +1667,7 @@ pub fn compute_observation(
     }
     let api_nanos = round_nano_num(api_numerator)?;
 
-    // The denominator: accounts whose plan has a price.
+    // The denominator uses only identified counters whose plan has a price.
     let token_span_ms = plan
         .token_interval_ms
         .map(|(from, to)| to.checked_sub(from).ok_or(MoneyError::OutOfRange))
@@ -1642,7 +1702,7 @@ pub fn compute_observation(
                 delta_percent += account.delta_percent;
                 segments += account.segments();
                 accounts_included.push(json!({
-                    "account_ref": account.account_ref,
+                    (plan.provider.identity_field()): account.account_ref,
                     "delta_percent": account.delta_percent,
                     "subscription_nanos": 0,
                     "readings": account.readings,
@@ -1654,7 +1714,7 @@ pub fn compute_observation(
                 }));
             }
             None => accounts_excluded.push(json!({
-                "account_ref": account.account_ref,
+                (plan.provider.identity_field()): account.account_ref,
                 "reason": price
                     .and_then(|price| price.unpriceable_reason.clone())
                     .unwrap_or_else(|| "plan_price_unresolved".into()),
@@ -1665,8 +1725,8 @@ pub fn compute_observation(
     }
     for account in &plan.unconfigured_accounts {
         accounts_excluded.push(json!({
-            "account_ref": account.account_ref,
-            "reason": "account_not_configured",
+            (plan.provider.identity_field()): account.account_ref,
+            "reason": if plan.provider.credentials.is_empty() { "account_not_configured" } else { "credential_not_configured" },
             "delta_percent": account.delta_percent,
             "readings": account.readings,
         }));
@@ -2394,7 +2454,7 @@ pub fn multiplier_pace(
         })?;
     let provider = &config.quota_providers[&request.quota_provider];
     let plans: BTreeSet<_> = provider
-        .accounts
+        .members()
         .values()
         .map(|account| account.plan.as_str())
         .collect();
@@ -2745,6 +2805,7 @@ mod tests {
             quota_providers: BTreeMap::from([(
                 "codex".to_string(),
                 QuotaProviderConfig {
+                    credentials: BTreeMap::new(),
                     window: window(),
                     scope,
                     accounts: BTreeMap::from([(
@@ -2866,6 +2927,7 @@ mod tests {
             "acct".to_string(),
             PlanPriceUsed {
                 account_ref: "acct".into(),
+                credential_ref: None,
                 plan: "openai/pro_20x".into(),
                 source: Some("fusiform".into()),
                 monthly_nanos: Some(PLAN_200),
@@ -5844,6 +5906,7 @@ mod tests {
                     {"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null},
                     {"producer": "broca", "provider": "openai", "charge_basis": "subscription_included", "model_prefix": null}
                 ],
+                "credentials": {},
                 "accounts": {
                     "00000000-0000-4000-8000-00000000000a": {"plan": "openai/pro_20x", "price_override": null},
                     "00000000-0000-4000-8000-00000000000b": {"plan": "openai/pro_20x", "price_override": null}

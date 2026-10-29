@@ -53,6 +53,7 @@
           { "producer": "broca", "provider": "openai", "charge_basis": "subscription_included", "model_prefix": null }
         ],
         // These sample references both use the same example plan.
+        "credentials": {},
         "accounts": {
           "sample-codex-account-1": { "plan": "openai/pro_20x", "price_override": null },
           "sample-codex-account-2": { "plan": "openai/pro_20x", "price_override": null }
@@ -69,6 +70,7 @@
           { "producer": "broca", "provider": "anthropic", "charge_basis": "subscription_included", "model_prefix": null }
         ],
         // These sample account references are illustrative, not real account IDs.
+        "credentials": {},
         "accounts": {
           "sample-claude-account-1": { "plan": "anthropic/max_20x", "price_override": null },
           "sample-claude-account-2": { "plan": "anthropic/max_20x", "price_override": null },

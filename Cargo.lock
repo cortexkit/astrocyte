@@ -336,9 +336,9 @@ checksum = "57e7ea934b88f1cd195c79fdeb56bda1a4595252a444eba543689fda561ea7a4"
 
 [[package]]
 name = "cortexkit-provider-usage"
-version = "0.10.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b25ab5046feed63c6c5fbf8fd300e83b46640a578879635c745b437ac82d4cc"
+checksum = "5fbb4e0942770cee9a2755519f76a94136071fd68ec8b8314f684ae8be5a5676"
 dependencies = [
  "serde",
 ]

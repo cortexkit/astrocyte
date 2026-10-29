@@ -107,6 +107,13 @@ pub fn map_usage_array(
         if account_ref.is_some_and(str::is_empty) {
             return Err("capacity entry has empty account identity".into());
         }
+        let credential_ref = entry
+            .credential_ref
+            .as_deref()
+            .filter(|_| account_ref.is_none());
+        if credential_ref.is_some_and(str::is_empty) {
+            return Err("capacity entry has empty credential identity".into());
+        }
         let entry_window_start = windows.len();
 
         let mut push = |pool_key: String,
@@ -170,6 +177,7 @@ pub fn map_usage_array(
                 provider_readings.push(CapacityProviderReading {
                     provider: entry.provider.clone(),
                     api_provider: entry.api_provider.clone(),
+                    credential_ref: credential_ref.map(str::to_owned),
                     pool_key,
                     slot_kind: slot_kind.to_string(),
                     external_id,
@@ -390,6 +398,116 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    fn credential_entry(credential: &str, minute: u32, used: f64) -> ProviderUsage {
+        let mut entry = ProviderUsage::healthy(
+            "opencodego",
+            None,
+            "vault",
+            Usage {
+                primary: Some(window(used)),
+                ..Usage::default()
+            },
+        );
+        entry.credential_ref = Some(credential.into());
+        entry.fetched_at = Some(format!("2026-10-28T00:{minute:02}:00Z"));
+        entry
+    }
+
+    fn persist_entries(conn: &mut rusqlite::Connection, entries: &[ProviderUsage]) {
+        let snapshot = map_usage_array(entries, None).unwrap();
+        let tx = conn.transaction().unwrap();
+        astrocyte_core::capacity::apply_snapshot_in_tx(&tx, &snapshot, 1).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn credential_history_preserves_distinct_source_instants() {
+        let mut conn = capacity_conn();
+        for (minute, used) in [(0, 10.0), (5, 15.0), (5, 15.0)] {
+            persist_entries(&mut conn, &[credential_entry("apikey:one", minute, used)]);
+        }
+        let samples: Vec<f64> = conn
+            .prepare(
+                "SELECT used_percent FROM credential_window_sample ORDER BY fetched_at_instant",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(samples, vec![10.0, 15.0]);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM capacity_provider_reading", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM window_sample", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn credential_history_never_merges_keys_for_the_same_provider() {
+        let mut conn = capacity_conn();
+        persist_entries(
+            &mut conn,
+            &[
+                credential_entry("apikey:one", 0, 10.0),
+                credential_entry("apikey:two", 0, 80.0),
+            ],
+        );
+        persist_entries(
+            &mut conn,
+            &[
+                credential_entry("apikey:one", 5, 15.0),
+                credential_entry("apikey:two", 5, 82.0),
+            ],
+        );
+        let samples: Vec<(String, f64)> = conn.prepare("SELECT credential_ref,used_percent FROM credential_window_sample ORDER BY credential_ref,fetched_at_instant")
+            .unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            samples,
+            vec![
+                ("apikey:one".into(), 10.0),
+                ("apikey:one".into(), 15.0),
+                ("apikey:two".into(), 80.0),
+                ("apikey:two".into(), 82.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn credential_history_account_identity_wins_even_when_vault_ref_changes() {
+        let mut conn = capacity_conn();
+        let mut entry = credential_entry("apikey:one", 0, 10.0);
+        entry.account = Some("account-one".into());
+        persist_entries(&mut conn, &[entry.clone()]);
+        entry.credential_ref = None;
+        entry.fetched_at = Some("2026-10-28T00:05:00Z".into());
+        persist_entries(&mut conn, &[entry]);
+        let samples: Vec<String> = conn
+            .prepare("SELECT account_ref FROM window_sample ORDER BY fetched_at_instant")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(samples, vec!["account-one", "account-one"]);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM credential_window_sample", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
     }
 
     #[derive(Debug)]

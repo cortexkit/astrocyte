@@ -22,7 +22,7 @@ The workspace has three crates:
 
 ## Durable state
 
-`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS`, currently at schema version 35.
+`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS`, currently at schema version 36.
 `initialize_connection` enables and verifies foreign keys, probes SQLite JSON, triggers and
 partial indexes, and sets a 5000 ms busy timeout. The read-only report connection
 skips the table-creating probe and copies that timeout.

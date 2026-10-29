@@ -2322,6 +2322,7 @@ mod tests {
                 "quota_providers":{"antigravity":{
                     "window":{"pool_key":"extra:13:gemini-weekly","window_minutes":10080},
                     "scope":[{"producer":"broca","provider":"google","charge_basis":null,"model_prefix":null}],
+                    "credentials":{},
                     "accounts":{"acct":{"plan":"google/ai_pro","price_override":null}}
                 }}}, "harness_ingest":{"enabled":true,"exclude":[]}});
         let mut output = Vec::new();

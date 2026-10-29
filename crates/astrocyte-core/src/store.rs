@@ -3961,6 +3961,28 @@ WHEN NEW.supersedes IS NOT NULL AND EXISTS (
 BEGIN SELECT RAISE(ABORT, 'multiplier_observation_same_plan'); END;
 "#,
     },
+    Migration {
+        version: 36,
+        statements: r#"
+CREATE TABLE credential_window_sample (
+    provider           TEXT NOT NULL CHECK(length(provider)>0),
+    credential_ref     TEXT NOT NULL CHECK(length(credential_ref)>0),
+    api_provider       TEXT,
+    pool_key           TEXT NOT NULL,
+    fetched_at_instant INTEGER NOT NULL,
+    used_percent       REAL NOT NULL CHECK(used_percent BETWEEN 0 AND 100),
+    raw_used_percent   REAL,
+    resets_at          TEXT,
+    window_minutes     INTEGER,
+    source             TEXT,
+    PRIMARY KEY(provider,credential_ref,pool_key,fetched_at_instant)
+);
+CREATE TRIGGER credential_window_sample_no_update BEFORE UPDATE ON credential_window_sample
+BEGIN SELECT RAISE(ABORT, 'credential_window_sample is append-only'); END;
+CREATE TRIGGER credential_window_sample_no_delete BEFORE DELETE ON credential_window_sample
+BEGIN SELECT RAISE(ABORT, 'credential_window_sample is append-only'); END;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.

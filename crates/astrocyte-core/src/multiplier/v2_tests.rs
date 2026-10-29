@@ -86,6 +86,92 @@ fn rows(conn: &Connection, config: &MultiplierConfig) -> Vec<Observation> {
     .unwrap()
 }
 
+fn credential_fixture(conn: &Connection, refs: &[&str]) -> MultiplierConfig {
+    let mut config = stable_fixture(conn);
+    let provider = config.quota_providers.get_mut("codex").unwrap();
+    let declaration = provider.accounts.remove("acct").unwrap();
+    for credential in refs {
+        provider.credentials.insert((*credential).into(), declaration.clone());
+        conn.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes,resets_at,source)
+            SELECT provider,?1,pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes,resets_at,source FROM window_sample WHERE account_ref='acct'", [credential]).unwrap();
+    }
+    config.validate().unwrap();
+    config
+}
+
+fn credential_rows(conn: &Connection, config: &MultiplierConfig) -> Vec<Observation> {
+    let plan = plan_observation(conn, config, "codex", 0, 72 * HOUR_MS).unwrap();
+    let source = Served(PlanPricesResponse { prices: vec![served_price("pro_20x", Some(20_000), None)], resolved_at_ms: 0, tier_vocabulary: "vendor".into(), unit_policy: "list".into() });
+    let prices = resolve_plans(Some(&source), config, &config.quota_providers["codex"], 0).unwrap();
+    compute_plan_observations(conn, config, &plan, &rates_for(&[("openai", "m")], 100, None), &prices, 72 * HOUR_MS, &[]).unwrap()
+}
+
+#[test]
+fn v2_credential_counter_produces_eligible_plan_and_truthful_report_identity() {
+    let mut conn = conn();
+    let config = credential_fixture(&conn, &["apikey:one"]);
+    let row = credential_rows(&conn, &config).remove(0);
+    assert!(row.routing_eligible, "{:?}", row.eligibility_reasons);
+    assert!((row.delta_percent - 72.0).abs() < 1e-9);
+    assert_eq!(row.tokens.input, 3_000_000);
+    assert_eq!(row.api_nanos, 300);
+    assert_eq!(row.accounts_included[0]["credential_ref"], "apikey:one");
+    assert!(row.accounts_included[0].get("account_ref").is_none());
+    let tx = conn.transaction().unwrap();
+    insert_observation_in_tx(&tx, &row).unwrap();
+    tx.commit().unwrap();
+    let report = multiplier_report(&conn, &MultiplierReportRequest { from_ms: 0, to_ms: 73 * HOUR_MS }).unwrap();
+    assert_eq!(report["latest"][0]["accounts_included"][0]["credential_ref"], "apikey:one");
+    assert_eq!(report["latest"][0]["plan_prices"][0]["credential_ref"], "apikey:one");
+    assert!(report["latest"][0]["plan_prices"][0].get("account_ref").is_none());
+}
+
+#[test]
+fn v2_credential_counters_never_guess_token_shares_for_multiple_keys() {
+    let conn = conn();
+    let config = credential_fixture(&conn, &["apikey:one", "apikey:two"]);
+    let row = credential_rows(&conn, &config).remove(0);
+    assert!(!row.routing_eligible);
+    assert!(row.eligibility_reasons.iter().any(|reason| reason == "multiple_credentials_without_token_attribution"));
+    assert!(row.multiplier.is_none() && row.fee_multiplier.is_none());
+    assert_eq!(row.tokens.input, 0);
+    assert_eq!(row.api_nanos, 0);
+    assert_eq!(row.accounts_included.len(), 2);
+}
+
+#[test]
+fn v2_credential_scopes_and_plan_prices_use_their_own_provider_names() {
+    let conn = conn();
+    for (quota, ledger, tier, slot, minutes, monthly) in [
+        ("opencodego", "opencode-go", "go", "tertiary", 43200, 1000),
+        ("kimi-for-coding", "kimi-code-plan-global", "allegro", "primary", 10080, 9900),
+    ] {
+        let mut config = config(vec![rule("broca", ledger, None), rule("opencode", ledger, None)]);
+        let mut provider = config.quota_providers.remove("codex").unwrap();
+        provider.window = WindowSelector { pool_key: slot.into(), window_minutes: minutes };
+        provider.accounts.clear();
+        provider.credentials.insert(format!("apikey:{quota}"), AccountPlan { plan: format!("{ledger}/{tier}"), price_override: None });
+        config.quota_providers.insert(quota.into(), provider);
+        config.validate().unwrap();
+        for producer in ["broca", "opencode"] {
+            event(&conn, &format!("{quota}-{producer}"), producer, ledger, "m", "unknown", HOUR_MS, &[("input", "input", 123)]);
+        }
+        event(&conn, &format!("{quota}-not-ledger"), "broca", quota, "wrong", "unknown", HOUR_MS, &[("input", "input", 999)]);
+        let plan = plan_observation(&conn, &config, quota, 0, 72 * HOUR_MS).unwrap();
+        assert_eq!(plan.events.len(), 2);
+        assert!(plan.events.iter().all(|event| event.tokens.provider == ledger));
+        let source = Served(PlanPricesResponse {
+            prices: vec![fusiform_protocol::PlanPriceWire { provider_id: ledger.into(), ..served_price(tier, Some(monthly), None) }],
+            resolved_at_ms: 0, tier_vocabulary: "vendor".into(), unit_policy: "list".into(),
+        });
+        let prices = resolve_plans(Some(&source), &config, &config.quota_providers[quota], 0).unwrap();
+        let price = prices.values().next().unwrap();
+        assert_eq!(price.monthly_nanos, Some(monthly * 10_000_000));
+        assert_eq!(price.source.as_deref(), Some("fusiform"));
+        assert!(price.credential_ref.is_some() && price.account_ref.is_empty());
+    }
+}
+
 #[test]
 fn v2_reset_periods_ignore_rounding_flaps_and_jitter_but_count_new_first_reading() {
     let conn = conn();

@@ -123,7 +123,7 @@ ledger. All three members are required; use `{}` to declare nothing.
 | `plan_price_overrides` | map of plan key to price | A monthly price used instead of fusiform's for that plan key. |
 | `quota_providers` | map of quota provider to declaration | One entry per quota provider, keyed by the provider name the quota module reports. |
 
-A quota provider declaration has three required members:
+A quota provider declaration has four required members:
 
 - `window`: `{"pool_key": <non-empty>, "window_minutes": 1..43200}`, the one
   quota window the used percentage is read from.
@@ -133,11 +133,16 @@ A quota provider declaration has three required members:
   `subscription_included`, `unknown`. `model_prefix` is also required and is
   `null` (every model) or a non-empty, literal, case-sensitive model prefix.
   A rule may not repeat; rules differing only by prefix are distinct.
-- `accounts`: a non-empty map of account reference to `{"plan": "<provider>/<tier>",
+- `accounts`: a map of account reference to `{"plan": "<provider>/<tier>",
   "price_override": <price or null>}`.
+- `credentials`: the same plan map, keyed by the exact vault `credential_ref`.
+  Use it only for quota readings that have no account. Exactly one of `accounts`
+  and `credentials` must be non-empty; write `{}` for the other. Empty references,
+  duplicate keys and unknown members are refused in both maps. Older stored
+  generations decode with an empty credential map; new files must include it.
 
 A price is `{"minor_units": >0, "exponent": 0..9, "currency": "USD",
-"period": "month"}`; `20000` at exponent `2` is 200.00. An account's
+"period": "month"}`; `20000` at exponent `2` is 200.00. An identity's
 `price_override` wins over `plan_price_overrides`, which wins over fusiform.
 
 For Antigravity's Gemini weekly pool, use quota provider `antigravity` with
@@ -147,6 +152,27 @@ A scope rule such as `{"producer": "broca", "provider": "google",
 Claude and gpt-oss traffic in Antigravity's separate third-party pool. Declare
 an equivalent `opencode` rule to include that producer. Older stored config
 generations hydrate a missing `model_prefix` as `null`; new files must include it.
+
+For OpenCode Go, use quota provider `opencodego`, window
+`{"pool_key": "tertiary", "window_minutes": 43200}`, and credential plan
+`"apikey:opencode-go": {"plan": "opencode-go/go", "price_override": null}`.
+For Kimi for Coding, use quota provider `kimi-for-coding`, window
+`{"pool_key": "primary", "window_minutes": 10080}`, and credential plan
+`"apikey:kimi-for-coding": {"plan": "kimi-code-plan-global/allegro", "price_override": null}`.
+Use the actual vault reference if it differs from these examples. Leave
+`accounts` empty. Monthly prices come from `plan.prices`: $10 for Go and $99
+for Allegro, unless explicitly overridden.
+
+Their ledger names differ from the quota names. Declare both `broca` and
+`opencode` producer rules with ledger provider `opencode-go` or
+`kimi-code-plan-global`, respectively, and `charge_basis: null` and
+`model_prefix: null`. A subscription-only charge-basis filter would omit
+OpenCode Go usage whose basis is recorded as unknown. Provider-wide scope is
+usable only with one configured credential. Multiple credentials make every
+plan row ineligible with `multiple_credentials_without_token_attribution`;
+tokens are not divided between keys. Paid extra usage on Go cannot be separated
+from included traffic by this scope and would distort the ratio. Do not treat
+that ratio as an included-quota calibration when extra usage is enabled.
 
 Ledger pricing and the multiplier accept `rate.<role>` and
 `rate.<role>.<selector>.<value>` keys. The recognized roles are `input`, `output`,

@@ -39,7 +39,7 @@ tracing = "0.1"
 
 cortexkit-store = { version = "=0.2.4", features = ["sqlite"] }
 cortexkit-store-types = "=0.2.2"
-cortexkit-provider-usage = "=0.10.0"
+cortexkit-provider-usage = "=0.14.0"
 # 0.2.8 adds `live_subject`, the plain-publish `live` root runners announce
 # finished steps on.
 cortexkit-bus-naming = "=0.2.8"

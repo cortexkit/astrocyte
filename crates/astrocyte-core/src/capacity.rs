@@ -78,6 +78,8 @@ pub struct CapacityObservation {
 pub struct CapacityProviderReading {
     pub provider: String,
     pub api_provider: Option<String>,
+    /// Present only when the source has no account identity.
+    pub credential_ref: Option<String>,
     pub pool_key: String,
     pub slot_kind: String,
     pub external_id: Option<String>,
@@ -362,6 +364,22 @@ fn apply_readings_in_tx(
                observed_at_ms=excluded.observed_at_ms",
         )?;
         for reading in &snapshot.provider_readings {
+            if let Some(credential_ref) = &reading.credential_ref {
+                if let Some(instant) = fetched_at_instant(reading.fetched_at.as_deref()) {
+                    tx.execute(
+                        "INSERT INTO credential_window_sample
+                         (provider,credential_ref,api_provider,pool_key,fetched_at_instant,
+                          used_percent,raw_used_percent,resets_at,window_minutes,source)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                         ON CONFLICT(provider,credential_ref,pool_key,fetched_at_instant) DO NOTHING",
+                        params![reading.provider, credential_ref, reading.api_provider,
+                            reading.pool_key, instant, reading.used_percent,
+                            reading.raw_used_percent, reading.resets_at,
+                            reading.window_minutes, reading.source],
+                    )?;
+                }
+                continue;
+            }
             insert.execute(params![
                 reading.provider,
                 reading.api_provider,
@@ -527,6 +545,49 @@ pub fn windows(conn: &Connection) -> rusqlite::Result<Vec<CapacityWindow>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn credential_history_migration_preserves_accounts_and_enforces_identity() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for migration in crate::store::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 36)
+        {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        conn.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent) VALUES ('p','account','primary',1,10)", []).unwrap();
+        conn.execute_batch(
+            crate::store::MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == 36)
+                .unwrap()
+                .statements,
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT account_ref FROM window_sample", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "account"
+        );
+        assert!(conn.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent) VALUES ('p','','primary',1,20)", []).is_err());
+        conn.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent) VALUES ('p','credential','primary',1,20)", []).unwrap();
+        assert!(conn
+            .execute("UPDATE credential_window_sample SET used_percent=30", [])
+            .is_err());
+        assert!(conn
+            .execute("DELETE FROM credential_window_sample", [])
+            .is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT used_percent FROM credential_window_sample",
+                [],
+                |r| r.get::<_, f64>(0)
+            )
+            .unwrap()
+            .to_bits(),
+            20.0_f64.to_bits()
+        );
+    }
     use super::*;
     use crate::store::{initialize_connection, MIGRATIONS};
     use std::collections::BTreeSet;
@@ -873,6 +934,7 @@ mod tests {
     fn complete_provider_retirement_is_labeled_only() {
         let mut conn = conn();
         let reading = CapacityProviderReading {
+            credential_ref: None,
             provider: "codex".into(),
             api_provider: Some("openai".into()),
             pool_key: "primary".into(),
@@ -1177,6 +1239,7 @@ mod tests {
     fn window_sample_unlabeled_entry_creates_no_row() {
         let mut conn = conn();
         let reading = CapacityProviderReading {
+            credential_ref: None,
             provider: "codex".into(),
             api_provider: None,
             pool_key: "primary".into(),

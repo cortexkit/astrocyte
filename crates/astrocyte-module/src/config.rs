@@ -227,6 +227,12 @@ pub(crate) fn decode_multiplier_column(
         .and_then(serde_json::Value::as_object_mut)
     {
         for provider in providers.values_mut() {
+            // Older stored generations could declare account plans only.
+            if let Some(provider) = provider.as_object_mut() {
+                provider
+                    .entry("credentials")
+                    .or_insert_with(|| serde_json::json!({}));
+            }
             if let Some(scope) = provider
                 .get_mut("scope")
                 .and_then(serde_json::Value::as_array_mut)
@@ -467,6 +473,7 @@ mod tests {
         "quota_providers": {"codex": {
             "window": {"pool_key": "primary", "window_minutes": 10080},
             "scope": [{"producer": "pi", "provider": "openai-codex", "charge_basis": null, "model_prefix": null}],
+            "credentials": {},
             "accounts": {"acct": {"plan": "openai/pro_20x", "price_override": null}}
         }}
     }"#;
@@ -608,6 +615,9 @@ mod tests {
     #[test]
     fn the_multiplier_member_is_closed_at_every_level() {
         assert!(decode(&with_multiplier(CODEX)).is_ok());
+        let missing_credentials = CODEX.replace("\"credentials\": {},", "");
+        let error = decode(&with_multiplier(&missing_credentials)).unwrap_err();
+        assert!(error.to_string().contains("credentials"), "{error}");
         // An unknown member inside a nested object.
         let unknown = CODEX.replace(
             r#""window_minutes": 10080"#,
@@ -666,6 +676,36 @@ mod tests {
             let error = decode(&with_multiplier(&CODEX.replace(from, to))).unwrap_err();
             assert!(error.to_string().contains(needle), "{needle}: {error}");
         }
+    }
+
+    #[test]
+    fn credential_plan_config_is_closed_validated_and_old_columns_still_decode() {
+        let credential = CODEX
+            .replace(
+                "\"accounts\": {\"acct\"",
+                "\"accounts\": {}, \"credentials\": {\"apikey:one\"",
+            )
+            .replace("\"credentials\": {},", "");
+        assert!(decode(&with_multiplier(&credential)).is_ok());
+        for (text, needle) in [
+            (credential.replace("apikey:one", ""), "credential_ref"),
+            (credential.replace("openai/pro_20x", "no-slash"), "plan key"),
+            (credential.replace("\"plan\":", "\"unknown\": true, \"plan\":"), "unknown"),
+            (credential.replace("\"accounts\": {}", "\"accounts\": {\"acct\": {\"plan\": \"openai/pro_20x\", \"price_override\": null}}"), "never both"),
+            (credential.replace("\"apikey:one\":", "\"apikey:one\": {\"plan\": \"openai/pro_20x\", \"price_override\": null}, \"apikey:one\":"), "duplicate member"),
+        ] {
+            let error = decode(&with_multiplier(&text)).unwrap_err();
+            assert!(error.to_string().contains(needle), "{needle}: {error}");
+        }
+        let old = CODEX.replace("\"credentials\": {},", "");
+        let stored = decode_multiplier_column(Some(&old)).unwrap();
+        let MultiplierSetting::Recorded(stored) = stored else {
+            panic!("missing stored config")
+        };
+        assert!(stored.quota_providers["codex"].credentials.is_empty());
+        assert!(stored.quota_providers["codex"]
+            .accounts
+            .contains_key("acct"));
     }
 
     /// The production document shipped with the binary must decode under this

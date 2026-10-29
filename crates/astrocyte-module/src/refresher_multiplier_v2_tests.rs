@@ -129,3 +129,34 @@ fn v2_served_plan_rows_keep_independent_eligible_heads_on_recompute() {
         assert!(row["eligibility_reasons"].as_array().unwrap().is_empty());
     }
 }
+
+#[test]
+fn v2_credential_daily_stage_records_and_serves_the_plan_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(state::leased_test_state(&directory));
+    let mut document: serde_json::Value = serde_json::from_str(DESIRED).unwrap();
+    let provider = &mut document["subscription_multiplier"]["quota_providers"]["codex"];
+    provider["credentials"] = json!({"apikey:one": provider["accounts"]["acct"].clone()});
+    provider["accounts"] = json!({});
+    publish_document(&state, &directory, &document.to_string());
+    let fusiform = FakeFusiform::new(false);
+    install_catalog(&state, &fusiform);
+    seed_usage(&state);
+    state.ordered_write(|tx| {
+        tx.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at) SELECT provider,'apikey:one',pool_key,fetched_at_instant,used_percent,window_minutes,resets_at FROM window_sample", []).map_err(|error| error.to_string())?;
+        Ok(((), true))
+    }).unwrap();
+    MultiplierStage::new(Some(fusiform.clone())).tick(&state, false, NOW);
+    assert_eq!(current_day_observations(&state).len(), 1);
+    MultiplierStage::new(Some(fusiform)).tick(&state, false, NOW + 60_000);
+    assert_eq!(current_day_observations(&state).len(), 1);
+    let report = crate::ops::dispatch(&state, crate::ops::OP_MULTIPLIER_REPORT,
+        json!({"from_ms": DAY_START - 1, "to_ms": DAY_START + 1})).unwrap();
+    assert_eq!(report["series"].as_array().unwrap().len(), 1);
+    let row = &report["series"][0];
+    assert_eq!(row["plan"], "openai/pro_20x");
+    assert_eq!(row["input_tokens"], 1000);
+    assert!(row["api_nanos"].as_i64().unwrap() > 0);
+    assert_eq!(row["accounts_included"][0]["credential_ref"], "apikey:one");
+    assert!(row["accounts_included"][0].get("account_ref").is_none());
+}

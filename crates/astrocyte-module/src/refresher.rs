@@ -3671,7 +3671,7 @@ impl MultiplierStage {
                 }
                 match state.with_read_op(|conn| {
                     for account in multiplier_config.quota_providers[quota_provider]
-                        .accounts
+                        .members()
                         .values()
                     {
                         if multiplier::observation_plan_head(
@@ -7728,6 +7728,7 @@ mod multiplier_stage_tests {
             "quota_providers": {"codex": {
                 "window": {"pool_key": "primary", "window_minutes": 10080},
                 "scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null}],
+                "credentials": {},
                 "accounts": {"acct": {"plan": "openai/pro_20x", "price_override": null}}
             }}
         },
