@@ -5,25 +5,57 @@ how the module works; `STRUCTURE.md` says where code goes.
 
 ## Gates
 
-A worker runs fmt, both clippy passes, the tests for what it touched (filtered by
-name), and the Python and shell checks, then delivers. The head runs the full suite once
-per landing, and CI runs everything on Linux and Windows.
+`scripts/gate.sh` runs CI's checks. Its local checks take about 4 seconds:
+the train preconditions, the doc references, the `.cortexkit` layout, the path
+dependencies and the format. It then runs the full Linux and Windows suites in parallel
+on the build servers, and prints `ASTROCYTE_GATE_OK <commit>` only when everything
+passed. Run it before every push. A delivery must report a passing full gate, not
+filtered tests.
 
-Run every `cargo` command on the Linux build server (`runon: "linux,4c"`),
-never on the shared development machine. Local builds and tests compete with every other
-agent on that machine (on macOS, each freshly built test binary also costs a security
-scan). Only the Python and shell checks below run locally.
+Never run `cargo` on the shared development machine. Local builds compete with all other
+work there, and on macOS each freshly built test binary also costs a security scan. If
+`ck motor run` is unavailable from your shell, run the same cargo lanes on the Linux and
+Windows build servers another way (for example the shell tool's `runon` setting):
 
 ```sh
-scripts/fmt-check.sh
-cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
-cargo test --workspace
-python3 scripts/check_doc_references.py
-python3 scripts/check_train_preconditions.py
-python3 scripts/check-path-deps.py
-scripts/check-cortexkit-layout.sh
+scripts/gate.sh --fast                                   # local, seconds
+# runon: "linux,16c"
+ASTROCYTE_REQUIRE_NATS_SERVER=1 cargo clippy --workspace --all-targets --locked -- -D warnings
+ASTROCYTE_REQUIRE_NATS_SERVER=1 cargo test --workspace --all-targets --locked
+# runon: "windows"
+ASTROCYTE_REQUIRE_NATS_SERVER=1 cargo clippy --workspace --all-targets --locked -- -D warnings
+ASTROCYTE_REQUIRE_NATS_SERVER=1 cargo test --workspace --all-targets --locked --no-fail-fast
 ```
+
+`ASTROCYTE_REQUIRE_NATS_SERVER=1` makes the real-bus tests fail rather than skip when
+nats-server is missing, as in CI. CI installs a pinned server; the gate relies on the
+build servers' images having one.
+
+## Standing approvals
+
+Do these without asking, and say in your report that you did:
+
+- Build and test on the remote build servers, at whatever vCPU count the job needs.
+- Regenerate a test vector or golden file when its regenerating test shows the only
+  difference is the change you were asked to make. Update its `SHA256SUMS` and README
+  table in the same commit. A published, tagged vector set is never edited; a new
+  schema version gets a new folder and tag.
+- Add a test-only seam behind `#[cfg(test)]` or the `test-support` feature.
+- Make a fake peer serve until it is released, or give a wait a deadline.
+- Keep `ARCHITECTURE.md` and `STRUCTURE.md` under their size cap by moving detail into
+  the matching page under `docs/`, in plain full sentences. Never compress them into
+  fragments.
+- Add `.gitattributes` rules that keep test-vector bytes identical on Windows.
+- Rebase onto `origin/master` and resolve conflicts keeping both sides' intent.
+
+Ask first, because these are contracts or money:
+
+- A served operation's request or reply shape, a refusal code, or a health rule.
+- A config member, or decoding of stored config generations.
+- A migration that rewrites or deletes existing rows (adding tables, columns or
+  indexes is fine).
+- Event identity, pricing, charge basis, or any recorded money.
+- What `docs/module-surface.md` or a contract under `docs/` promises.
 
 - Run the whole workspace (`--workspace`), not one crate with `-p`: the build cache is
   shared across workspace-wide builds, and a single-crate build misses it.
