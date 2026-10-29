@@ -4043,11 +4043,14 @@ mod tests {
     #[test]
     fn schema_v23_runner_applies_once_and_returns_the_final_store_ahead_outcome() {
         let (_directory, store) = migration_store();
+        // Versions run 1..=latest without gaps, so a fresh store applies all of them.
+        // Reading the latest from the chain keeps this test valid for new migrations.
+        let latest = MIGRATIONS.last().unwrap().version;
         let first = migrate_store(&store).unwrap();
         // The rebuild runner must return the outcome after later migrations too.
         assert_eq!(
             (first.applied, first.recorded, first.chain_max),
-            (35, 35, 35)
+            (latest, latest, latest)
         );
         assert_eq!(
             store
@@ -4060,7 +4063,7 @@ mod tests {
         let second = migrate_store(&store).unwrap();
         assert_eq!(
             (second.applied, second.recorded, second.chain_max),
-            (0, 35, 35)
+            (0, latest, latest)
         );
         assert!(!second.store_ahead());
         store
@@ -4070,8 +4073,8 @@ mod tests {
                     1
                 );
                 conn.execute(
-                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',36,1)",
-                    [],
+                    "INSERT INTO cortexkit_schema_version VALUES ('astrocyte',?1,1)",
+                    [latest + 1],
                 )?;
                 Ok(())
             })
@@ -4079,7 +4082,7 @@ mod tests {
         let ahead = migrate_store(&store).unwrap();
         assert_eq!(
             (ahead.applied, ahead.recorded, ahead.chain_max),
-            (0, 36, 35)
+            (0, latest + 1, latest)
         );
         assert!(ahead.store_ahead());
     }
