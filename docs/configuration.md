@@ -160,8 +160,8 @@ For Kimi for Coding, use quota provider `kimi-for-coding`, window
 `{"pool_key": "primary", "window_minutes": 10080}`, and credential plan
 `"apikey:kimi-for-coding": {"plan": "kimi-code-plan-global/allegro", "price_override": null}`.
 Use the actual vault reference if it differs from these examples. Leave
-`accounts` empty. Monthly prices come from `plan.prices`: $10 for Go and $99
-for Allegro, unless explicitly overridden.
+`accounts` empty. Monthly prices come from fusiform's `plan.prices` unless
+explicitly overridden.
 
 Their ledger names differ from the quota names. Declare both `broca` and
 `opencode` producer rules with ledger provider `opencode-go` or

@@ -35,8 +35,9 @@ Unconfigured credential readings are listed in the legacy-named
 `unconfigured_accounts` array and reject the row with `unconfigured_credentials`.
 Their exclusion diagnostics use `credential_ref` and `credential_not_configured`.
 
-With exactly one configured credential, all in-scope provider tokens are
-conditionally attributed to that credential. Ledger credential labels are not
+With exactly one configured credential, in-scope provider tokens are
+attributed to that credential, in the clean hours only, under the same
+clean-hour rules as account counters. Ledger credential labels are not
 used as a quota identity: some producers omit them and their names need not
 match vault references. More than one configured credential makes every plan
 row ineligible with `multiple_credentials_without_token_attribution`, even when
