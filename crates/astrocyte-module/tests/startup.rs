@@ -44,9 +44,13 @@ fn startup_without_a_home_refuses_before_writing_anything() {
         !output.status.success(),
         "startup without a home must fail: {stderr}"
     );
+    // The status is in the message because a process that never started (on
+    // Windows, a loader failure under load) also exits non-zero with empty
+    // stderr, and only its exit code tells that apart from the guard.
     assert!(
         stderr.contains("data home resolved to the relative"),
-        "the refusal must say why: {stderr}"
+        "the refusal must say why (exit {:?}): {stderr}",
+        output.status
     );
 }
 
