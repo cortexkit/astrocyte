@@ -69,7 +69,10 @@ pub(crate) fn feed_step(event: StepFinished) -> Option<RunnerStep> {
         event.harness_step_ref.as_deref(),
         event.attempt_id.as_deref(),
     )?;
-    let occurred_at_ms = i64::try_from(event.finished_at_ms).ok()?;
+    // A step's time is when it started, as for a recorded step (OpenCode's
+    // message creation time, for example). The file row that later replaces
+    // this one then sorts at the same place in the feed.
+    let occurred_at_ms = i64::try_from(event.started_at_ms).ok()?;
     // The ledger stores output without reasoning and the served row adds
     // reasoning back (`served_output`). An event that does not say reasoning
     // is outside output is read as including it, the feed's own convention;
@@ -280,7 +283,8 @@ mod tests {
         for runner in RUNNERS {
             admit_event(&state, &event("minimal", runner, |_| {}));
         }
-        admit_event(&state, &event("full", "broca", |_| {}));
+        let full_event = event("full", "broca", |_| {});
+        admit_event(&state, &full_event);
         let rows = rows(&state, json!({}));
         let identities: Vec<_> = rows
             .iter()
@@ -308,7 +312,15 @@ mod tests {
         }
         let mut full = rows[3].clone();
         full.as_object_mut().unwrap().remove("cursor");
-        full.as_object_mut().unwrap().remove("occurred_at_ms");
+        let occurred = full
+            .as_object_mut()
+            .unwrap()
+            .remove("occurred_at_ms")
+            .unwrap();
+        let sent: Value = serde_json::from_slice(&full_event.1).unwrap();
+        // The row's time is the event's start, not its finish a second later.
+        assert_eq!(occurred, sent["started_at_ms"]);
+        assert_ne!(occurred, sent["finished_at_ms"]);
         assert_eq!(
             full,
             json!({
@@ -470,7 +482,8 @@ mod tests {
         admit_event(
             &state,
             &event("minimal", "broca", |body| {
-                body["finished_at_ms"] = json!(old)
+                body["started_at_ms"] = json!(old);
+                body["finished_at_ms"] = json!(old + 1_000);
             }),
         );
         assert_eq!(feed_rows(&state), 0);
