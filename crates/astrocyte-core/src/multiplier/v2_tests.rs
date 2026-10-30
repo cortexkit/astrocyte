@@ -140,6 +140,27 @@ fn v2_credential_counters_never_guess_token_shares_for_multiple_keys() {
 }
 
 #[test]
+fn v2_a_day_without_clean_hours_is_unmeasured_not_unused() {
+    // Calls happened, but the plan has no counter readings yet, so no hour is
+    // clean. A 0.0 fee ratio would claim the plan was unused that day.
+    let conn = conn();
+    let config = config(vec![rule("pi", "openai", None)]);
+    v2_event(&conn, "used", None, "m", 10 * HOUR_MS, Some(1_000_000));
+    let row = rows(&conn, &config).remove(0);
+    assert_eq!(row.clean_hours_share, 0.0);
+    assert!(
+        row.multiplier.is_none() && row.fee_multiplier.is_none(),
+        "multiplier {:?}, fee {:?}",
+        row.multiplier,
+        row.fee_multiplier
+    );
+    assert!(row
+        .eligibility_reasons
+        .iter()
+        .any(|reason| reason == "insufficient_clean_hours"));
+}
+
+#[test]
 fn v2_credential_scopes_and_plan_prices_use_their_own_provider_names() {
     let conn = conn();
     for (quota, ledger, tier, slot, minutes, monthly) in [

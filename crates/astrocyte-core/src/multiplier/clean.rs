@@ -578,9 +578,13 @@ pub fn compute_plan_observations(
                 row.eligibility_reasons.push(reason.into());
             }
         }
+        // Both ratios count only clean hours. With none, the plan was not
+        // measured that day, which is not the same as unused, so a 0.0 fee
+        // ratio would claim usage the counter never showed was absent.
         if ambiguous_credentials
             || unresolved_price
             || !row.unconfigured_accounts.is_empty()
+            || clean_count == 0
             || (row.api_nanos == 0
                 && row
                     .unpriced_tokens
