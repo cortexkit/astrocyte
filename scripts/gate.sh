@@ -49,7 +49,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked --no-fail-fast'
 
 step "Linux and Windows suites (remote, in parallel)"
-ck motor run --vcpus 16 -- "set -euo pipefail
+ck motor run --vcpus 8 -- "set -euo pipefail
 $linux_cmd" >"$logs/linux.log" 2>&1 &
 linux_pid=$!
 ck motor run --platform windows -- "set -euo pipefail

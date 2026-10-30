@@ -22,7 +22,7 @@ that also fails on unchanged master is reported by name, never fixed in passing:
 
 ```sh
 scripts/gate.sh --fast                                   # local, seconds
-# runon: "linux,16c"
+# runon: "linux,8c"
 ASTROCYTE_REQUIRE_NATS_SERVER=1 cargo clippy --workspace --all-targets --locked -- -D warnings
 ASTROCYTE_REQUIRE_NATS_SERVER=1 cargo test --workspace --all-targets --locked
 # runon: "windows"
