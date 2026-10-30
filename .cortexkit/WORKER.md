@@ -13,9 +13,12 @@ passed. Run it before every push. A delivery must report a passing full gate, no
 filtered tests.
 
 Never run `cargo` on the shared development machine. Local builds compete with all other
-work there, and on macOS each freshly built test binary also costs a security scan. If
-`ck motor run` is unavailable from your shell, run the same cargo lanes on the Linux and
-Windows build servers another way (for example the shell tool's `runon` setting):
+work there, and on macOS each freshly built test binary also costs a security scan.
+Worker sandboxes can't reach the build servers through `ck motor run`, so a worker runs
+`scripts/gate.sh --fast` locally and the two cargo lanes below on the Linux and Windows
+build servers another way (for example the shell tool's `runon` setting). If a lane is
+refused for capacity, retry it later, or with fewer vCPUs. Never skip a lane. A failure
+that also fails on unchanged master is reported by name, never fixed in passing:
 
 ```sh
 scripts/gate.sh --fast                                   # local, seconds
