@@ -178,11 +178,7 @@ impl OpenCodeThalamusSource {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            let canonical = match declared_roots::contain(
-                Some(&folder),
-                &entry.path,
-                "OpenCode session folder",
-            ) {
+            let canonical = match declared_roots::contain_opencode_session(&folder, &entry.path) {
                 Ok(Contained::Inside(path)) => path,
                 Ok(Contained::Refused(reason)) => {
                     warn_once(&mut cache.warned, reason);
@@ -833,6 +829,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runner_head_calls_are_recorded_with_the_declared_owner() {
+        for layout in LAYOUTS {
+            let f = Fixture::new();
+            let head = f
+                .folder
+                .parent()
+                .unwrap()
+                .join("launch-head-runner/data/opencode");
+            insert(
+                &head.join("opencode.db"),
+                layout,
+                "head-call",
+                "assistant",
+                CREATED,
+                &payload(layout, true),
+            );
+            let mut entry = f.entry(ONE, false);
+            entry["path"] = json!(head);
+            f.declare(vec![entry]);
+            f.tick(T0);
+            assert_eq!(
+                f.events(),
+                vec![("head-call".into(), "opencode".into(), Some(OWNER.into()))],
+                "{layout:?}"
+            );
+            assert_eq!(f.runtime(), Some((Some(T0), false)), "{layout:?}");
+            assert_eq!(f.watermark(), Some(T0 - WATERMARK_MARGIN_MS), "{layout:?}");
+            assert_eq!(f.degraded(), None, "{layout:?}");
+
+            insert(
+                &head.join("opencode.db"),
+                layout,
+                "head-next",
+                "assistant",
+                CREATED + TICK,
+                &payload(layout, true),
+            );
+            f.tick(T0 + TICK);
+            assert_eq!(
+                f.events(),
+                vec![
+                    ("head-call".into(), "opencode".into(), Some(OWNER.into())),
+                    ("head-next".into(), "opencode".into(), Some(OWNER.into())),
+                ],
+                "{layout:?}"
+            );
+            assert_eq!(
+                f.watermark(),
+                Some(T0 + TICK - WATERMARK_MARGIN_MS),
+                "{layout:?}"
+            );
+        }
+    }
+
     fn refuses_path(f: Fixture, path: impl FnOnce(&Fixture) -> PathBuf) {
         f.call(ONE, Layout::V2, "good", true, CREATED);
         f.call(TWO, Layout::V2, "bad", true, CREATED);
@@ -880,6 +931,29 @@ mod tests {
         });
     }
 
+    #[test]
+    fn non_head_harness_paths_are_refused_without_blocking_other_entries() {
+        for relative in [
+            "",
+            "launch-worker/data/opencode",
+            "launch-head-x",
+            "launch-head-x/data",
+            "launch-head-x/opencode",
+            "launch-head-x/data/opencode/deeper",
+            "launch-head-/data/opencode",
+            "other/launch-head-x/data/opencode",
+            "launch-head-x/extra/data/opencode",
+            "launch-head-x/data/other",
+        ] {
+            refuses_path(Fixture::new(), |f| {
+                let path = f.folder.parent().unwrap().join(relative);
+                fs::create_dir_all(&path).unwrap();
+                fs::copy(f.database(TWO), path.join("opencode.db")).unwrap();
+                path
+            });
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn escaping_symlink_is_refused_without_blocking_other_entries() {
@@ -889,6 +963,19 @@ mod tests {
             let link = f.folder.join("escape");
             std::os::unix::fs::symlink(outside, &link).unwrap();
             link
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaping_head_symlink_is_refused_without_blocking_other_entries() {
+        refuses_path(Fixture::new(), |f| {
+            let outside = f.temp.path().join("outside/launch-head-runner");
+            fs::create_dir_all(outside.join("data")).unwrap();
+            fs::rename(f.folder.join(TWO), outside.join("data/opencode")).unwrap();
+            let link = f.folder.parent().unwrap().join("launch-head-runner");
+            std::os::unix::fs::symlink(outside, &link).unwrap();
+            link.join("data/opencode")
         });
     }
 
@@ -982,6 +1069,52 @@ mod tests {
                     .is_some_and(|reason| reason.contains("resolve to one folder")),
                 "{layout:?}"
             );
+            assert_eq!(f.watermark(), None, "{layout:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_head_and_its_in_sessions_symlink_read_once_and_hold_the_watermark() {
+        for layout in LAYOUTS {
+            let f = Fixture::new();
+            f.call(ONE, layout, "head-call", true, CREATED);
+            let head = f
+                .folder
+                .parent()
+                .unwrap()
+                .join("launch-head-x/data/opencode");
+            fs::create_dir_all(head.parent().unwrap()).unwrap();
+            fs::rename(f.folder.join(ONE), &head).unwrap();
+            std::os::unix::fs::symlink(&head, f.folder.join(ONE)).unwrap();
+            let mut entry = f.entry(ONE, false);
+            entry["path"] = json!(head);
+            let mut alias = f.entry(ONE, false);
+            alias["owner_principal"] = json!("magic-context");
+            f.declare(vec![entry, alias]);
+            f.tick(T0);
+            f.tick(T0 + TICK);
+            assert_eq!(
+                f.events(),
+                vec![("head-call".into(), "opencode".into(), Some(OWNER.into()))],
+                "{layout:?}"
+            );
+            let rejected: i64 = f
+                .state
+                .with_conn(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM rejected_delivery", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|e| e.to_string())
+                })
+                .unwrap();
+            assert_eq!(rejected, 0, "{layout:?}: the head was read a second time");
+            assert!(
+                f.degraded()
+                    .is_some_and(|reason| reason.contains("resolve to one folder")),
+                "{layout:?}"
+            );
+            assert_eq!(f.runtime(), Some((Some(T0 + TICK), true)), "{layout:?}");
             assert_eq!(f.watermark(), None, "{layout:?}");
         }
     }

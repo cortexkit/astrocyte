@@ -153,7 +153,8 @@ Each source resolves its store path by these rules, implemented in
   binding rules are the [Claude workers contract](claude-workers-contract.md).
 - The OpenCode session folders come from
   `<data home>/cortexkit/thalamus-harness/opencode-sessions/roots.json`. The
-  binding rules are the
+  folders may be inside `opencode-sessions/` or at the sibling
+  `launch-head-<name>/data/opencode` runner-head paths. The binding rules are the
   [OpenCode sessions contract](thalamus-opencode-sessions-contract.md).
 - broca's store is read only at the default data-home path. A
   `BROCA_STATE_ROOT` elsewhere puts it where astrocyte does not look, and it
@@ -256,11 +257,14 @@ Rules that affect what is recorded:
   `worker_events_stamp_declared_class_without_changing_identity`.
 - Declared OpenCode sessions are read from each folder in thalamus-harness's
   `roots.json`, which astrocyte re-reads on every full tick. A folder's path
-  must be absolute and, after symlinks are resolved, strictly inside the
-  `opencode-sessions/` folder that holds the roots file; any other entry is
-  logged and skipped while the other entries still read. The roots file and
-  the containment rule share their code with the Claude workers
-  (`declared_roots.rs`). A missing roots file means no sessions: there is no
+  must be absolute and, after symlinks are resolved, either strictly inside
+  the canonical `opencode-sessions/` folder that holds the roots file or
+  exactly `<H>/launch-head-<name>/data/opencode`, where `<H>` is that folder's
+  canonical parent and `<name>` is one non-empty path component. Any other
+  entry is logged once and skipped while the other entries still read.
+  Roots-file decoding and path resolution share code with the Claude workers
+  (`declared_roots.rs`), but only OpenCode sessions accept runner-head paths.
+  A missing roots file means no sessions: there is no
   runtime row and no folder cursor. An unknown `version` reads nothing and
   degrades the source. An unreadable or malformed file, including one that
   names a folder twice, keeps the last good entry list and degrades the source.

@@ -24,8 +24,8 @@ Path: `<cortexkit data home>/thalamus-harness/opencode-sessions/roots.json`,
 where the cortexkit data home is `$XDG_DATA_HOME/cortexkit`, falling back to
 `~/.local/share/cortexkit` on Linux and macOS and to the platform data folder
 on Windows. The session folders sit inside the same `opencode-sessions/`
-folder. The harness module writes the file atomically (a temporary file, then
-rename).
+folder or at the runner-head paths defined below. The harness module writes
+the file atomically (a temporary file, then rename).
 
 ```json
 {
@@ -49,9 +49,15 @@ rename).
   when the session's server restarts after a module restart or an idle stop,
   it reuses the same folder and the same entry. A new session always gets a
   new folder. The path must be absolute and, after symlinks are resolved,
-  inside the `opencode-sessions/` folder that holds `roots.json`. Astrocyte
-  refuses any other path, logs it and skips that entry; the other entries
-  still read.
+  either strictly inside the canonical `opencode-sessions/` folder that
+  holds `roots.json`, or exactly `<H>/launch-head-<name>/data/opencode`.
+  Here `<H>` is the canonical parent of that `opencode-sessions/` folder,
+  and `<name>` is one non-empty path component: the `launch-head-` component
+  must have at least one character after the prefix. The second shape
+  supports long-lived runner heads whose folders OpenCode and other modules
+  already reference, so those folders cannot move. Astrocyte refuses any
+  other resolved path, logs it once and skips that entry; the other entries
+  still read. A symlink does not exempt its target from these rules.
 - `session_ref`: the harness module's reference for the session. Astrocyte
   uses it only in log lines in v1.
 - `owner_principal`: the module that started the session, as the bare
@@ -67,6 +73,11 @@ rename).
   server's exit time: astrocyte only applies the done-folder rules to a folder
   once a read sees it marked `done`, so a `done_at_ms` from before that write
   could fall behind a watermark that never covered the folder as done.
+
+The roots file remains `version: 1`; the additional accepted path shape does
+not change its schema. Older astrocyte builds simply skip runner-head entries.
+No usage is lost, because a head folder is never erased while it is unread;
+an upgraded build can read it later.
 
 Unknown fields, at the top level or in an entry, are ignored, so either side
 can add fields without a coordinated release. A changed meaning bumps

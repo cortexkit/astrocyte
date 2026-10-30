@@ -1,10 +1,10 @@
 //! Roots files that thalamus-harness writes to declare its private harness
-//! folders, and the containment rule astrocyte applies to every declared path.
+//! folders, and the containment checks astrocyte applies to every declared path.
 //! The Claude workers contract (`docs/claude-workers-contract.md`) and the
 //! OpenCode sessions contract (`docs/thalamus-opencode-sessions-contract.md`)
-//! share both.
+//! share file decoding and path resolution, but allow different folder shapes.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -54,8 +54,7 @@ pub(crate) fn read<T: DeserializeOwned>(path: &Path, label: &str) -> RootsFile<T
 
 /// Where a declared path leads.
 pub(crate) enum Contained {
-    /// The path resolves strictly inside the declaring folder. Holds the
-    /// resolved path.
+    /// The path is accepted. Holds the resolved path.
     Inside(PathBuf),
     /// The path is refused, for the reason given. Other entries still read.
     Refused(String),
@@ -76,6 +75,50 @@ pub(crate) fn contain(
     declared: &Path,
     label: &str,
 ) -> Result<Contained, String> {
+    contain_with(folder, declared, label, |folder, canonical| {
+        canonical != folder && canonical.starts_with(folder)
+    })
+}
+
+/// OpenCode also reads runner heads in the harness data folder. Their data
+/// folders cannot move because OpenCode and other modules already refer to them.
+pub(crate) fn contain_opencode_session(
+    folder: &Path,
+    declared: &Path,
+) -> Result<Contained, String> {
+    contain_with(
+        Some(folder),
+        declared,
+        "OpenCode session folder",
+        |folder, canonical| {
+            if canonical != folder && canonical.starts_with(folder) {
+                return true;
+            }
+            let Some(relative) = folder
+                .parent()
+                .and_then(|harness| canonical.strip_prefix(harness).ok())
+            else {
+                return false;
+            };
+            let mut parts = relative.components();
+            matches!(
+                (parts.next(), parts.next(), parts.next(), parts.next()),
+                (Some(Component::Normal(head)), Some(Component::Normal(data)),
+                    Some(Component::Normal(opencode)), None)
+                    if head.as_encoded_bytes().strip_prefix(b"launch-head-")
+                        .is_some_and(|name| !name.is_empty())
+                        && data == "data" && opencode == "opencode"
+            )
+        },
+    )
+}
+
+fn contain_with(
+    folder: Option<&Path>,
+    declared: &Path,
+    label: &str,
+    accepts: impl FnOnce(&Path, &Path) -> bool,
+) -> Result<Contained, String> {
     if !declared.is_absolute() {
         return Ok(Contained::Refused(format!(
             "refuse relative {label} {}",
@@ -90,7 +133,7 @@ pub(crate) fn contain(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Contained::Gone),
         Err(error) => return Err(format!("resolve {label} {}: {error}", declared.display())),
     };
-    if canonical == folder || !canonical.starts_with(folder) {
+    if !accepts(folder, &canonical) {
         return Ok(Contained::Refused(format!(
             "refuse {label} outside declared folder: {}",
             declared.display()
