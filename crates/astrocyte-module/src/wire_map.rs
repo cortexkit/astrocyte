@@ -81,7 +81,11 @@ pub struct WireSpendSegmentFact {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WireBindIdentity {
-    pub project_root: String,
+    /// Absent for a session with no project (for example one opened without a
+    /// scope folder); the call is then recorded with no project, never a
+    /// placeholder.
+    #[serde(default)]
+    pub project_root: Option<String>,
     pub harness: String,
     pub session: String,
 }
@@ -237,7 +241,7 @@ pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String
         producer_ref: wire.fact_id,
         prior_event_ref: None,
         harness: Some(wire.session.harness),
-        project_root: Some(wire.session.project_root),
+        project_root: wire.session.project_root,
         session: Some(wire.session.session),
         run_ref: Some(wire.run_id),
         flow_ref: None,
@@ -440,6 +444,20 @@ mod tests {
     /// type change: an absent field must OMIT its measurement, and a reported
     /// zero must still produce one. A mechanical rewrite that mapped absence to
     /// `Some(0)` would compile, pass the fixture test above, and change nothing.
+    #[test]
+    fn a_session_without_a_project_is_recorded_with_none() {
+        let mut fact = wire_fixture();
+        fact["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("project_root");
+        let request = map_fact(serde_json::from_value(fact).unwrap()).unwrap();
+        assert_eq!(request.project_root, None);
+        assert_eq!(request.session.as_deref(), Some("session-1"));
+        let request = map_fact(serde_json::from_value(wire_fixture()).unwrap()).unwrap();
+        assert_eq!(request.project_root.as_deref(), Some("/project"));
+    }
+
     #[test]
     fn an_absent_count_omits_its_measurement_while_a_reported_zero_keeps_one() {
         let mut absent = wire_fixture();
