@@ -125,7 +125,6 @@ impl QtaClient {
             "op": "route.open",
             "target": { "kind": "management_surface", "module_id": QTA_MODULE_ID },
             "identity": {
-                "project_root": "/",
                 "harness": "ck-astrocyte",
                 "session": self.session,
             },

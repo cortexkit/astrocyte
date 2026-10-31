@@ -1022,10 +1022,16 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
         )]))
         .consumes(declared_consumers(desired))
         // `watermark.get` is the one operation of `log-read-watermark/v1`.
-        // subc-protocol keeps capability claims in this block's `provides`,
-        // apart from the role declarations in the manifest's own `provides`.
+        // `bind-no-project/v1` says no route's project is read at bind (only
+        // the principal, the harness and the scope's flow id), so the daemon
+        // sends none. subc-protocol keeps capability claims in this block's
+        // `provides`, apart from the role declarations in the manifest's own
+        // `provides`.
         .capabilities(Some(CapabilityDeclarations {
-            provides: vec![LOG_READ_WATERMARK_V1.to_string()],
+            provides: vec![
+                LOG_READ_WATERMARK_V1.to_string(),
+                subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
+            ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))
@@ -1521,7 +1527,7 @@ mod tests {
             target: RouteTarget::ManagementSurface {
                 module_id: DEFAULT_MODULE_ID.to_string(),
             },
-            identity: BindIdentity::new("/tmp/p", harness, "s"),
+            identity: BindIdentity::new(harness, "s"),
             principal: Some(principal),
             consumer_capabilities: None,
             role_versions: None,
@@ -2791,8 +2797,8 @@ mod tests {
     }
 
     /// The manifest claims `log-read-watermark/v1`, the capability
-    /// `watermark.get` serves, in the capability block, which the daemon
-    /// validates at HELLO.
+    /// `watermark.get` serves, and `bind-no-project/v1`, in the capability
+    /// block, which the daemon validates at HELLO.
     #[test]
     fn manifest_provides_the_log_read_watermark_capability() {
         let manifest = manifest("astrocyte", &config::intentional_empty().config);
@@ -2800,7 +2806,7 @@ mod tests {
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire["capabilities"]["provides"],
-            json!(["log-read-watermark/v1"])
+            json!(["log-read-watermark/v1", "bind-no-project/v1"])
         );
         subc_protocol::manifest::validate_manifest_capability_grammar(&wire).unwrap();
         assert!(ops::PUBLIC_OPERATION_NAMES.contains(&ops::OP_WATERMARK_GET));
@@ -3200,7 +3206,7 @@ mod tests {
             RouteTarget::ManagementSurface {
                 module_id: DEFAULT_MODULE_ID.to_string(),
             },
-            BindIdentity::new("/tmp/p", "h", "s"),
+            BindIdentity::new("h", "s"),
         )
         .with_principal(thalamus_harness());
 

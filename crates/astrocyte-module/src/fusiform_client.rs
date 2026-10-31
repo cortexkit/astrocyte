@@ -114,7 +114,6 @@ impl FusiformClient {
             "op": "route.open",
             "target": { "kind": "tool_provider", "module_id": FUSIFORM_MODULE_ID },
             "identity": {
-                "project_root": "/",
                 "harness": "ck-astrocyte",
                 "session": "catalog-pricing",
             },

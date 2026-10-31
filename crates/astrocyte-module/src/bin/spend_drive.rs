@@ -91,7 +91,7 @@ async fn call<S: AsyncRead + AsyncWrite + Unpin>(
     let route = exchange(stream, 0, 0, 1, json!({
         "op": "route.open",
         "target": {"kind": "management_surface", "module_id": DEFAULT_MODULE_ID},
-        "identity": {"project_root": "/", "harness": "ck-astrocyte", "session": format!("astro-spend-drive-{}", std::process::id())}
+        "identity": {"harness": "ck-astrocyte", "session": format!("astro-spend-drive-{}", std::process::id())}
     })).await?;
     let route = match decode(route)? {
         Ok(route) => route,

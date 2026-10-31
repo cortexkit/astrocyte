@@ -88,7 +88,7 @@ impl Client {
         let body = serde_json::to_vec(&json!({
             "op": "route.open",
             "target": {"kind": "management_surface", "module_id": "ckbus"},
-            "identity": {"project_root": "/", "harness": "ck-astrocyte", "session": "quota-events"},
+            "identity": {"harness": "ck-astrocyte", "session": "quota-events"},
             "consumer_identity": {"module_id": self.access.module_id, "launch_nonce": self.access.nonce},
         })).map_err(|_| "ckbus route encoding failed")?;
         let value = exchange(&mut route, body).await?;
