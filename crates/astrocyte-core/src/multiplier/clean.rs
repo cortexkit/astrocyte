@@ -362,6 +362,32 @@ pub fn compute_plan_observations(
             .provider
             .members_mut()
             .retain(|account, _| members.contains(account));
+        // A call with no account can be valued only in an hour where every
+        // counter of a single-plan provider is clean; otherwise it is dropped.
+        // A clean account's points from such an hour would then be counted
+        // without the value that burned them, which drags the ratio down as
+        // other accounts saturate, so those hours count on neither side.
+        let attributed = |account: Option<&String>| {
+            account.is_some_and(|account| {
+                plan.provider.credentials.is_empty() && plan.provider.accounts.contains_key(account)
+            })
+        };
+        let pooled_hours: BTreeSet<i64> = plan
+            .events
+            .iter()
+            .filter(|event| !attributed(event.account_ref.as_ref()))
+            .map(|event| event.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS)
+            .filter(|hour| {
+                plans.len() > 1
+                    || !plan
+                        .provider
+                        .members()
+                        .keys()
+                        .all(|account| clean(account, *hour))
+            })
+            .collect();
+        let paired =
+            |account: &str, hour: i64| clean(account, hour) && !pooled_hours.contains(&hour);
         let mut clean_count = 0_usize;
         let mut saturated = 0_usize;
         let mut gaps = 0_usize;
@@ -377,7 +403,7 @@ pub fn compute_plan_observations(
                 gaps += usize::from(counter.is_none_or(|counter| counter.covered_ms != HOUR_MS));
                 unknown_reset |= counter.is_some_and(|counter| counter.reset_unknown);
                 unpriced += usize::from(bad_hours.contains(&(account.account_ref.clone(), *hour)));
-                if clean(&account.account_ref, *hour) {
+                if paired(&account.account_ref, *hour) {
                     clean_count += 1;
                     account.delta_percent += counter.map_or(0.0, |counter| counter.points);
                     if prices
@@ -400,6 +426,32 @@ pub fn compute_plan_observations(
         }
         let mut unmatched = 0_usize;
         let ambiguous_credentials = plan.provider.credentials.len() > 1;
+        // The fee ratio compares the plan's whole list value with its fee, so
+        // it counts every call the plan can be credited with, in any hour.
+        // Only the quota ratio needs clean counter hours. A call whose usage
+        // is unknown is left out, so the ratio is a known-value lower bound;
+        // such calls are counted in `zero_measurement_events` and
+        // `missing_quantity_events`.
+        let mut fee_view = filtered.clone();
+        fee_view.events.retain(|event| {
+            let known = !event.tokens.roles.is_empty()
+                && event
+                    .tokens
+                    .roles
+                    .iter()
+                    .all(|(_, _, _, quantity, exponent)| quantity.is_some() && exponent.is_some());
+            known
+                && !ambiguous_credentials
+                && match event
+                    .account_ref
+                    .as_ref()
+                    .filter(|account| attributed(Some(*account)))
+                {
+                    Some(account) => members.contains(account),
+                    None => plans.len() == 1,
+                }
+        });
+        fee_view.token_interval_ms = Some((plan.interval_start_ms, plan.interval_end_ms));
         filtered.events.retain(|event| {
             if ambiguous_credentials {
                 return false;
@@ -409,7 +461,7 @@ pub fn compute_plan_observations(
                 plan.provider.credentials.is_empty()
                     && plan.provider.accounts.contains_key(*account)
             }) {
-                Some(account) => members.contains(account) && clean(account, hour),
+                Some(account) => members.contains(account) && paired(account, hour),
                 None => {
                     unmatched += 1;
                     plans.len() == 1
@@ -457,6 +509,16 @@ pub fn compute_plan_observations(
             snapshot_at_ms,
             reasoning_billed_as_output,
         )?;
+        row.fee_multiplier = compute_observation(
+            conn,
+            config,
+            &fee_view,
+            rates,
+            &plan_prices,
+            snapshot_at_ms,
+            reasoning_billed_as_output,
+        )?
+        .fee_multiplier;
         let use_account_bins = plans.len() > 1 || members.len() == 1;
         let validation_bins: Vec<_> = if use_account_bins {
             account_bins.into_values().collect()
@@ -578,13 +640,13 @@ pub fn compute_plan_observations(
                 row.eligibility_reasons.push(reason.into());
             }
         }
-        // Both ratios count only clean hours. With none, the plan was not
-        // measured that day, which is not the same as unused, so a 0.0 fee
-        // ratio would claim usage the counter never showed was absent.
-        if ambiguous_credentials
-            || unresolved_price
-            || !row.unconfigured_accounts.is_empty()
-            || clean_count == 0
+        if ambiguous_credentials || unresolved_price || !row.unconfigured_accounts.is_empty() {
+            row.multiplier = None;
+            row.fee_multiplier = None;
+        }
+        // The quota ratio counts only clean hours. With none, the plan's quota
+        // was not measured that day, which is not the same as unused.
+        if clean_count == 0
             || (row.api_nanos == 0
                 && row
                     .unpriced_tokens
@@ -592,7 +654,6 @@ pub fn compute_plan_observations(
                     .any(|unpriced| unpriced.tokens > 0 && unpriced.reason != "missing_quantity"))
         {
             row.multiplier = None;
-            row.fee_multiplier = None;
         }
         row.routing_eligible = row.eligibility_reasons.is_empty();
         row.error_inflating = "Estimate, not a marginal tariff. Bounded boundary pairs are time-interpolated; unseen pre-reset burn and unrecorded traffic remain unknown. Unattributed usage is omitted when plans differ.".into();

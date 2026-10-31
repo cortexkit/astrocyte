@@ -140,24 +140,76 @@ fn v2_credential_counters_never_guess_token_shares_for_multiple_keys() {
 }
 
 #[test]
-fn v2_a_day_without_clean_hours_is_unmeasured_not_unused() {
+fn v2_a_day_without_clean_hours_has_no_quota_ratio() {
     // Calls happened, but the plan has no counter readings yet, so no hour is
-    // clean. A 0.0 fee ratio would claim the plan was unused that day.
+    // clean. A 0.0 quota ratio would claim the plan's quota went unused.
     let conn = conn();
     let config = config(vec![rule("pi", "openai", None)]);
     v2_event(&conn, "used", None, "m", 10 * HOUR_MS, Some(1_000_000));
     let row = rows(&conn, &config).remove(0);
     assert_eq!(row.clean_hours_share, 0.0);
-    assert!(
-        row.multiplier.is_none() && row.fee_multiplier.is_none(),
-        "multiplier {:?}, fee {:?}",
-        row.multiplier,
-        row.fee_multiplier
-    );
+    assert!(row.multiplier.is_none(), "multiplier {:?}", row.multiplier);
     assert!(row
         .eligibility_reasons
         .iter()
         .any(|reason| reason == "insufficient_clean_hours"));
+}
+
+#[test]
+fn v2_fee_ratio_counts_calls_in_every_hour_but_quota_ratio_only_clean_ones() {
+    let conn = conn();
+    let config = fixture(&conn);
+    // Hours 20 to 22 lose their readings while usage rises, so they are not
+    // clean. A call in hour 21 is the plan's value all the same.
+    conn.execute(
+        "DELETE FROM window_sample WHERE fetched_at_instant > ?1 AND fetched_at_instant < ?2",
+        params![20 * HOUR_MS * NANOS_PER_MS, 23 * HOUR_MS * NANOS_PER_MS],
+    )
+    .unwrap();
+    v2_event(&conn, "unclean", None, "m", 21 * HOUR_MS, Some(1_000_000));
+    let row = rows(&conn, &config).remove(0);
+    assert_eq!(row.api_nanos, 100, "the quota side counts only the clean call");
+    let fee = row.fee_multiplier.expect("fee ratio");
+    assert!(
+        (fee - 200.0 / row.fee_paid_nanos as f64).abs() < 1e-12,
+        "fee ratio {fee} must count both calls against {} nanos",
+        row.fee_paid_nanos
+    );
+}
+
+#[test]
+fn v2_points_and_value_pair_in_hours_with_unattributed_usage() {
+    // Two accounts on one plan; `second` is at its cap in hour 0. A call with
+    // no account in hour 0 cannot be valued, so `acct`'s hour-0 points must
+    // go too, or they are counted without the value that burned them.
+    let measure = |with_unmatched: bool| {
+        let conn = conn();
+        let mut config = fixture(&conn);
+        let second = config.quota_providers["codex"].accounts["acct"].clone();
+        config
+            .quota_providers
+            .get_mut("codex")
+            .unwrap()
+            .accounts
+            .insert("second".into(), second);
+        for minute in (0..=48 * 60).step_by(5) {
+            let used = if minute <= 60 { 100.0 } else { 10.0 };
+            reset_reading(&conn, "second", minute * 60_000, used, 7 * 24 * HOUR_MS);
+        }
+        if with_unmatched {
+            v2_event(&conn, "unmatched", None, "m", HOUR_MS / 2, Some(999));
+        }
+        rows(&conn, &config).remove(0)
+    };
+    let (without, with) = (measure(false), measure(true));
+    // `acct` rises one point an hour, so hour 0 is worth exactly one point.
+    assert!(
+        (without.delta_percent - with.delta_percent - 1.0).abs() < 1e-9,
+        "points without {} with {}",
+        without.delta_percent,
+        with.delta_percent
+    );
+    assert_eq!(with.tokens.input, without.tokens.input);
 }
 
 #[test]
@@ -478,10 +530,13 @@ fn v2_attribution_uses_own_clean_hours_and_never_pools_plans() {
         );
     }
     v2_event(&conn, "matched", Some("acct"), "m", HOUR_MS / 2, Some(7));
-    v2_event(&conn, "unmatched", None, "m", HOUR_MS / 2, Some(999));
+    v2_event(&conn, "unmatched", None, "m", 3 * HOUR_MS + HOUR_MS / 2, Some(999));
     v2_event(&conn, "other", Some("second"), "m", 10 * HOUR_MS, Some(11));
     let same_plan = rows(&conn, &config).remove(0);
-    assert_eq!(same_plan.tokens.input, 1_000_018);
+    // "matched" counts in hour 0 on its own clean account even with `second`
+    // at its cap, and the unmatched call counts because hour 3 is clean for
+    // both accounts.
+    assert_eq!(same_plan.tokens.input, 1_001_017);
     second.plan = "openai/pro_100".into();
     config
         .quota_providers
