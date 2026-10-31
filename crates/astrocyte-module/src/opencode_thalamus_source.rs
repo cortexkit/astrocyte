@@ -884,6 +884,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_moved_sessions_recorded_history_is_skipped_not_quarantined() {
+        for layout in LAYOUTS {
+            let f = Fixture::new();
+            let heads = f.folder.parent().unwrap().to_path_buf();
+            let first = heads.join("launch-head-first/data/opencode");
+            let moved = heads.join("launch-head-moved/data/opencode");
+            insert(
+                &first.join("opencode.db"),
+                layout,
+                "history",
+                "assistant",
+                CREATED,
+                &payload(layout, true),
+            );
+            let mut entry = f.entry(ONE, false);
+            entry["path"] = json!(first);
+            f.declare(vec![entry.clone()]);
+            f.tick(T0);
+
+            // The session moves to another head under another owner, and its
+            // new store carries the old call as well as a new one.
+            fs::create_dir_all(&moved).unwrap();
+            fs::copy(first.join("opencode.db"), moved.join("opencode.db")).unwrap();
+            insert(
+                &moved.join("opencode.db"),
+                layout,
+                "after-move",
+                "assistant",
+                CREATED + TICK,
+                &payload(layout, true),
+            );
+            let mut moved_entry = f.entry(TWO, false);
+            moved_entry["path"] = json!(moved);
+            moved_entry["owner_principal"] = json!("other-owner");
+            f.declare(vec![entry, moved_entry]);
+            f.tick(T0 + TICK);
+
+            assert_eq!(
+                f.events(),
+                vec![
+                    (
+                        "after-move".into(),
+                        "opencode".into(),
+                        Some("other-owner".into())
+                    ),
+                    ("history".into(), "opencode".into(), Some(OWNER.into())),
+                ],
+                "{layout:?}"
+            );
+            assert_eq!(f.degraded(), None, "{layout:?}");
+            let rejected: i64 = f
+                .state
+                .with_conn(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM rejected_delivery", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|e| e.to_string())
+                })
+                .unwrap();
+            assert_eq!(rejected, 0, "{layout:?}");
+        }
+    }
+
     fn refuses_path(f: Fixture, path: impl FnOnce(&Fixture) -> PathBuf) {
         f.call(ONE, Layout::V2, "good", true, CREATED);
         f.call(TWO, Layout::V2, "bad", true, CREATED);

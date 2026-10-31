@@ -1049,6 +1049,31 @@ fn commit_page_in_lane(
                 // Returning an error drops the transaction uncommitted.
                 return Err("OpenCode ingest stopped".to_string());
             }
+            // A store another module declared can hold calls already recorded
+            // from another store: a session moved into a runner head keeps its
+            // history, recorded earlier from its original store with that
+            // store's labels. The first record of a call stands, so the copy
+            // counts as already recorded instead of being quarantined again on
+            // every pass.
+            if matches!(home, CursorHome::Declared { .. }) {
+                let id = astrocyte_core::fact::event_id(
+                    &request.producer,
+                    request.producer_lineage.as_deref(),
+                    &request.producer_ref,
+                )
+                .map_err(|error| format!("derive OpenCode identity: {error:?}"))?;
+                let recorded: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM usage_event WHERE event_id=?1)",
+                        [&id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if recorded {
+                    dispositions.push(RecordDisposition::ExactRedelivery);
+                    continue;
+                }
+            }
             let result = astrocyte_core::ingest::record_event_in_tx(
                 tx,
                 request,
