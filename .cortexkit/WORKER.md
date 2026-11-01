@@ -3,36 +3,39 @@
 Build and test guidance for anyone changing this repository. `ARCHITECTURE.md` explains
 how the module works; `STRUCTURE.md` says where code goes.
 
-## Gates
+## Before delivering
 
-`scripts/gate.sh` runs CI's checks. Its local checks take about 4 seconds:
-the train preconditions, the doc references, the `.cortexkit` layout, the path
-dependencies and the format. It then runs the full Linux and Windows suites in parallel
-on the build servers, and prints `ASTROCYTE_GATE_OK <commit>` only when everything
-passed. Run it before every push. A delivery must report a passing full gate, not
-filtered tests.
-
-Never run `cargo` on the shared development machine. Local builds compete with all other
-work there, and on macOS each freshly built test binary also costs a security scan.
-Worker sandboxes can't reach the build servers through `ck motor run`, so a worker runs
-`scripts/gate.sh --fast` locally and the two cargo lanes below on the Linux and Windows
-build servers another way (for example the shell tool's `runon` setting). If a lane is
-refused for capacity, retry it later, or with fewer vCPUs. Never skip a lane. A failure
-that also fails on unchanged master is reported by name, never fixed in passing:
+Run only what checks your change, and keep it to minutes:
 
 ```sh
-scripts/gate.sh --fast                                   # local, seconds
-# runon: "linux,8c"
-ASTROCYTE_REQUIRE_NATS_SERVER=1 cargo clippy --workspace --all-targets --locked -- -D warnings
-ASTROCYTE_REQUIRE_NATS_SERVER=1 cargo test --workspace --all-targets --locked
-# runon: "windows"
-ASTROCYTE_REQUIRE_NATS_SERVER=1 cargo clippy --workspace --all-targets --locked -- -D warnings
-ASTROCYTE_REQUIRE_NATS_SERVER=1 cargo test --workspace --all-targets --locked --no-fail-fast
+scripts/gate.sh --fast                                    # local, seconds
+# runon: "linux,4c"
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked <filter>                  # tests for what you changed
 ```
 
-`ASTROCYTE_REQUIRE_NATS_SERVER=1` makes the real-bus tests fail rather than skip when
-nats-server is missing, as in CI. CI installs a pinned server; the gate relies on the
-build servers' images having one.
+- The filter names the tests for the files and behaviour you changed, plus the test
+  that fails without your fix. If that run takes more than about 15 minutes, the filter
+  is too broad.
+- Run clippy on Windows too (`runon: "windows"`) when you touched code that differs
+  by platform (paths, files, processes, sockets).
+- Never run the whole test suite or `scripts/gate.sh` without `--fast`. The head runs
+  the full gate once, over merged deliveries.
+- A failure that looks unrelated: rerun that one test by name on unchanged master, and
+  report it by name if it fails there too. Never fix it in passing.
+- Keep the normal build directory. A separate `CARGO_TARGET_DIR` forces a cold build.
+- Never run `cargo` on the shared development machine. Local builds compete with all
+  other work there, and on macOS each freshly built test binary also costs a security
+  scan. If a remote job is refused for capacity, retry it later or with fewer vCPUs.
+
+## The full gate (head only)
+
+`scripts/gate.sh` runs CI's checks. Its local checks take about 4 seconds: the train
+preconditions, the doc references, the `.cortexkit` layout, the path dependencies and
+the format. It then runs the full Linux and Windows suites in parallel on the build
+servers, and prints `ASTROCYTE_GATE_OK <commit>` only when everything passed. The head
+runs it before each push. It sets `ASTROCYTE_REQUIRE_NATS_SERVER=1`, so the real-bus
+tests fail rather than skip when nats-server is missing, as in CI.
 
 ## Standing approvals
 
@@ -60,8 +63,8 @@ Ask first, because these are contracts or money:
 - Event identity, pricing, charge basis, or any recorded money.
 - What `docs/module-surface.md` or a contract under `docs/` promises.
 
-- Run the whole workspace (`--workspace`), not one crate with `-p`: the build cache is
-  shared across workspace-wide builds, and a single-crate build misses it.
+- Build with `--workspace` and narrow with a test filter, not one crate with `-p`: the
+  build cache is shared across workspace-wide builds, and a single-crate build misses it.
 - The workspace denies lossy numeric casts (`cast_possible_truncation`, `cast_possible_wrap`,
   `cast_sign_loss`), `float_cmp` and `large_stack_arrays`. Convert with `try_from` and
   map the error. Where a cast is provably safe, put an `#[allow]` on the smallest item, with
