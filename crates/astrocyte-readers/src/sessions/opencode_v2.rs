@@ -185,6 +185,23 @@ pub fn read_page_with_settled_sessions(
         .optional()
         .map_err(|e| sqlite_error(stop, "select OpenCode 2 boundary", e))?
         .unwrap_or(page.high_water);
+        if page.consumed == lower && lower < page.high_water {
+            // A whole page of rows shares the cursor's own update time, so the
+            // boundary above lands on the cursor again and would never move.
+            // That happens when OpenCode writes many rows in one millisecond,
+            // as when it imports a long session. Move the boundary to the next
+            // update time instead: the page then reads every tied row plus the
+            // rows at that next time, and the cursor passes the tie.
+            page.consumed = counted_query_row(
+                connection,
+                &mut page.cost,
+                "SELECT MIN(time_updated) FROM session_message WHERE time_updated>?1",
+                params![lower],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| sqlite_error(stop, "select OpenCode 2 boundary past a tie", e))?
+            .unwrap_or(page.high_water);
+        }
         let legacy = table_exists(connection, &mut page.cost, "message")
             .map_err(|e| sqlite_error(stop, "detect OpenCode 1 table", e))?;
         let mut statement = connection

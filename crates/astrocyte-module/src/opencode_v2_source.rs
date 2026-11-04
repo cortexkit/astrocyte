@@ -705,6 +705,40 @@ mod tests {
         }).unwrap();
     }
 
+    /// OpenCode can write more rows than a page in one millisecond, as when it
+    /// imports a long session. The cursor must still pass that tie, or every
+    /// later call stays unrecorded.
+    #[test]
+    fn a_tie_larger_than_a_page_does_not_stall_the_cursor() {
+        let (_temp, path, conn) = database();
+        for index in 0..PAGE_LIMIT + 5 {
+            insert(&conn, &format!("tied-{index:05}"), 10, &payload(10, true));
+        }
+        insert(&conn, "later", 20, &payload(20, true));
+        let state = test_state();
+        let source = OpenCodeV2Source::at(&path);
+        for now in [100, 130, 160] {
+            source.drain(&state, now, &STOP).unwrap();
+        }
+        let later: i64 = state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM usage_event WHERE producer_ref='later'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(later, 1, "the call after the tie must be recorded");
+        assert_eq!(
+            count(&state, "usage_event"),
+            i64::try_from(PAGE_LIMIT + 6).unwrap()
+        );
+        assert_eq!(runtime(&state).1, 20);
+        assert_eq!(count(&state, "quarantine_evidence"), 0);
+    }
+
     #[test]
     fn streamed_or_finish_is_not_v2_completion() {
         let (_temp, path, conn) = database();

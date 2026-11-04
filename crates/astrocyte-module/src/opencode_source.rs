@@ -1623,13 +1623,17 @@ mod tests {
         assert_eq!(first.consumed_ordinal, Some(20));
         assert_eq!(first.rows_recorded, 3);
 
+        // The two tied rows fill the whole page at the cursor's own time, so
+        // the cutoff moves to the next update time: both tied rows are read
+        // again (free exact redeliveries) together with the later row, and
+        // the cursor passes the tie instead of staying on it for good.
         let second = source
             .drain_with_limit(&state, 200, 2, &NEVER_STOP)
             .unwrap();
-        assert_eq!(second.consumed_ordinal, Some(20));
-        assert_eq!(second.raw.records, 2);
+        assert_eq!(second.consumed_ordinal, Some(30));
+        assert_eq!(second.raw.records, 3);
         assert_eq!(second.exact_redeliveries, 2);
-        assert_eq!(second.rows_recorded, 0);
+        assert_eq!(second.rows_recorded, 1);
 
         let (tied_b, later): (i64, i64) = state
             .with_conn(|connection| {
@@ -1645,7 +1649,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(tied_b, 1, "the second tied message must be ingested");
-        assert_eq!(later, 0, "the tied boundary must not advance early");
+        assert_eq!(later, 1, "the cursor must pass a tie that fills a page");
     }
 
     #[test]

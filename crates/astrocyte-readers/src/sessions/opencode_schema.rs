@@ -527,6 +527,23 @@ fn read_snapshot(
         other => Err(other),
     })
     .map_err(|error| sqlite_error(stop, "select OpenCode page boundary", error))?;
+    // A whole page of rows sharing the cursor's own update time puts the
+    // cutoff back on the cursor, which would then never move. Take the next
+    // update time as the cutoff instead, so the page reads every tied row plus
+    // the rows at that next time, and the cursor passes the tie.
+    let cutoff = if cutoff == lower_bound && lower_bound < high_water_ordinal {
+        counted_query_row(
+            connection,
+            &mut cost,
+            "SELECT MIN(time_updated) FROM message WHERE time_updated>?1",
+            params![lower_bound],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(|error| sqlite_error(stop, "select OpenCode page boundary past a tie", error))?
+        .unwrap_or(high_water_ordinal)
+    } else {
+        cutoff
+    };
 
     // The ledger stores measurements write-once, so a message is selected
     // only once its token figure is final. While a turn streams, OpenCode
@@ -940,6 +957,48 @@ mod tests {
         );
         assert_eq!(page.high_water_ordinal, 5);
         assert_eq!(page.consumed_ordinal, 5);
+    }
+
+    /// More rows than a page share the cursor's update time. The cursor must
+    /// still pass them, or every later message stays unread for good.
+    #[test]
+    fn a_tie_larger_than_a_page_at_the_cursor_does_not_stall_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,time_created INTEGER NOT NULL,time_updated INTEGER NOT NULL,data TEXT NOT NULL);").unwrap();
+        let data = r#"{"role":"assistant","providerID":"provider","modelID":"model","tokens":{"input":1,"output":1},"finish":"stop","time":{"created":1}}"#;
+        for index in 0..12 {
+            conn.execute(
+                "INSERT INTO message VALUES (?1,'s',10,10,?2)",
+                params![format!("tied-{index:02}"), data],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO message VALUES ('later','s',20,20,?1)",
+            params![data],
+        )
+        .unwrap();
+        let stop = AtomicBool::new(false);
+        let first = read_page(&path, None, 4, &stop).unwrap();
+        assert_eq!(first.consumed_ordinal, 10);
+        let cursor = OpenCodeCursor {
+            lineage: first.lineage.clone(),
+            ordinal: first.consumed_ordinal,
+        };
+        let second = read_page(&path, Some(&cursor), 4, &stop).unwrap();
+        assert_eq!(second.consumed_ordinal, 20, "the cursor must pass the tie");
+        assert!(second.messages.iter().any(|row| row.id == "later"));
+        assert_eq!(
+            second
+                .messages
+                .iter()
+                .filter(|row| row.id.starts_with("tied-"))
+                .count(),
+            12,
+            "every tied row is read again with the next update time"
+        );
     }
     #[test]
     fn forward_slash_unc_uri_keeps_the_server_in_the_filename() {
