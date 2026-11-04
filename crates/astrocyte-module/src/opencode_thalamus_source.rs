@@ -1,13 +1,13 @@
-//! OpenCode sessions that thalamus-harness runs in private OpenCode servers,
-//! and the read watermark that tells it when a finished session's folder has
-//! been recorded and may be erased. The binding contract is
+//! OpenCode sessions that thalamus-harness runs in private or shared servers,
+//! and the read watermark that tells it when a finished session's folder or
+//! rows have been recorded and may be erased. The binding contract is
 //! `docs/thalamus-opencode-sessions-contract.md`.
 //!
 //! Each declared folder's `opencode.db` is read with the same OpenCode 1 and
 //! OpenCode 2 readers as the user's own store, each with its own durable
 //! cursor per folder. The folders are read on full refresher ticks only, never
 //! in the fast lane. Calls keep producer `opencode` and OpenCode's message id,
-//! and carry the declaring module as `work_class`.
+//! and carry the listed session's declaring module as `work_class`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use super::declared_roots::{self, Contained, RootsFile};
 use super::harness_drain::{self, HarnessSource};
-use super::opencode_source::{CursorHome, OpenCodeSource, ReadOptions};
+use super::opencode_source::{CursorHome, OpenCodeSource, ReadOptions, SessionOptions};
 use super::opencode_v2_source::OpenCodeV2Source;
 use super::SourceDrainError;
 use crate::state::SharedState;
@@ -39,9 +39,56 @@ const LAYOUT_V2: &str = "opencode-2";
 #[derive(Clone, Deserialize)]
 struct Entry {
     path: PathBuf,
+    #[serde(flatten)]
+    store: Store,
+}
+
+#[derive(Clone)]
+enum Store {
+    Folder(Session),
+    Shared { sessions: Vec<SharedSession> },
+    MissingSharedKind,
+}
+
+impl<'de> Deserialize<'de> for Store {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value.get("kind") {
+            None => match serde_json::from_value(value.clone()) {
+                Ok(session) => Ok(Self::Folder(session)),
+                // A shared declaration without its discriminator is refused
+                // locally, rather than preventing other stores from reading.
+                Err(_) if value.get("sessions").is_some() => Ok(Self::MissingSharedKind),
+                Err(error) => Err(serde::de::Error::custom(error)),
+            },
+            Some(kind) if kind == "shared" => {
+                #[derive(Deserialize)]
+                struct Shared {
+                    sessions: Vec<SharedSession>,
+                }
+                serde_json::from_value::<Shared>(value)
+                    .map(|shared| Self::Shared {
+                        sessions: shared.sessions,
+                    })
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Err(serde::de::Error::custom("unknown OpenCode store kind")),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+struct Session {
     session_ref: String,
     owner_principal: String,
     state: SessionState,
+}
+
+#[derive(Clone, Deserialize)]
+struct SharedSession {
+    session: String,
+    #[serde(flatten)]
+    metadata: Session,
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -58,9 +105,12 @@ enum SessionState {
 struct Folder {
     v1: OpenCodeSource,
     v2: OpenCodeV2Source,
-    /// The folder is `done` and, since it was seen done, a full pass of each
-    /// layout has reached its high water, so every call in it is recorded.
+    /// Since the folder or its latest done session was seen done, a full pass
+    /// of each layout has reached its high water and recorded its final calls.
     settled: bool,
+    /// Sessions already seen done. A newly done session requires a full pass
+    /// even while the shared server continues writing other sessions.
+    done_sessions: HashSet<String>,
 }
 
 impl Folder {
@@ -76,6 +126,7 @@ impl Folder {
             v1: OpenCodeSource::declared(database.clone(), home(LAYOUT_V1)),
             v2: OpenCodeV2Source::declared(database, home(LAYOUT_V2)),
             settled: false,
+            done_sessions: HashSet::new(),
         }
     }
 }
@@ -86,9 +137,8 @@ enum FolderRead {
     Gone,
     /// Read and committed.
     Read {
-        /// Whether the folder lets the watermark move: an `active` folder
-        /// always does, since the watermark promises nothing about calls in a
-        /// folder that is not done yet; a `done` one only once it is settled.
+        /// Whether the store lets the watermark move: a done folder or newly
+        /// done shared session must finish its settling pass first.
         recorded_all: bool,
         quarantined: usize,
     },
@@ -178,7 +228,23 @@ impl OpenCodeThalamusSource {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            let canonical = match declared_roots::contain_opencode_session(&folder, &entry.path) {
+            let contained = match &entry.store {
+                Store::Folder(_) => declared_roots::contain_opencode_session(&folder, &entry.path),
+                Store::Shared { .. } => {
+                    declared_roots::contain_opencode_shared(&folder, &entry.path)
+                }
+                Store::MissingSharedKind => {
+                    warn_once(
+                        &mut cache.warned,
+                        format!(
+                            "refuse shared OpenCode store without kind: {}",
+                            entry.path.display()
+                        ),
+                    );
+                    continue;
+                }
+            };
+            let canonical = match contained {
                 Ok(Contained::Inside(path)) => path,
                 Ok(Contained::Refused(reason)) => {
                     warn_once(&mut cache.warned, reason);
@@ -226,7 +292,10 @@ impl OpenCodeThalamusSource {
                     complete = false;
                     let reason = format!(
                         "read OpenCode session {} at {}: {reason}",
-                        entry.session_ref,
+                        match &entry.store {
+                            Store::Folder(session) => session.session_ref.as_str(),
+                            Store::Shared { .. } | Store::MissingSharedKind => "shared store",
+                        },
                         database.display()
                     );
                     warn_once(&mut cache.warned, reason.clone());
@@ -287,20 +356,44 @@ fn read_folder(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(FolderRead::Gone),
         Err(error) => return Err(format!("inspect {}: {error}", database.display()).into()),
     }
-    let done = entry.state == SessionState::Done;
-    if !done {
+    let mut sessions = HashMap::new();
+    if let Store::Shared { sessions: listed } = &entry.store {
+        for session in listed {
+            sessions
+                .entry(session.session.clone())
+                .or_insert(SessionOptions {
+                    work_class: &session.metadata.owner_principal,
+                    settled: session.metadata.state == SessionState::Done,
+                });
+        }
+    }
+    let done_sessions = sessions
+        .iter()
+        .filter(|(_, options)| options.settled)
+        .map(|(session, _)| session.clone())
+        .collect::<HashSet<_>>();
+    let done =
+        matches!(&entry.store, Store::Folder(session) if session.state == SessionState::Done);
+    if matches!(&entry.store, Store::Folder(_)) && !done
+        || !done_sessions.is_subset(&folder.done_sessions)
+    {
         folder.settled = false;
     }
-    // Once a folder is done, one full pass of each layout from its durable
-    // cursor finds every call the tail reads could have missed.
-    let settling = done && !folder.settled;
+    folder.done_sessions = done_sessions;
+    // A final full pass finds calls the tail could have missed, including
+    // incomplete rows below the cursor in a newly done shared session.
+    let settling = (done || !folder.done_sessions.is_empty()) && !folder.settled;
     if settling {
         folder.v1.require_full_pass();
         folder.v2.require_full_pass();
     }
     let options = ReadOptions {
-        work_class: Some(entry.owner_principal.as_str()),
+        work_class: match &entry.store {
+            Store::Folder(session) => Some(session.owner_principal.as_str()),
+            Store::Shared { .. } | Store::MissingSharedKind => None,
+        },
         settled: done,
+        sessions: matches!(&entry.store, Store::Shared { .. }).then_some(&sessions),
     };
     let has_v1 = opencode_v2::has_v1_message_table(database, stop).map_err(read_error)?;
     let mut quarantined = 0;
@@ -317,7 +410,7 @@ fn read_folder(
             && folder.v2.full_pass_reached_high_water();
     }
     Ok(FolderRead::Read {
-        recorded_all: !done || folder.settled,
+        recorded_all: !settling || folder.settled,
         quarantined,
     })
 }
@@ -461,7 +554,9 @@ mod tests {
     use crate::refresher::opencode_source::OpenCodeSource;
     use crate::refresher::run_iteration_with_harness;
     use crate::state::test_state;
+    use astrocyte_core::catalog_client::{CatalogCallError, CatalogClient, CatalogConnection};
     use astrocyte_readers::sessions::opencode_v2::QUIET_WINDOW;
+    use fusiform_protocol::{CatalogGetRequest, CatalogGetResponse, StatusRequest, StatusResponse};
     use rusqlite::Connection;
     use serde_json::{json, Value};
     use std::fs;
@@ -475,6 +570,43 @@ mod tests {
     const CREATED: i64 = 1_700_000_000_000;
     const T0: i64 = 1_800_000_000_000;
     const TICK: i64 = 30_000;
+
+    /// A fixed dollar per million tokens makes every billed token worth 1,000
+    /// nanodollars, independently of the provider's live catalog.
+    struct DollarCatalog;
+
+    impl CatalogConnection for DollarCatalog {
+        fn catalog_status(&self, _: StatusRequest) -> Result<StatusResponse, CatalogCallError> {
+            Ok(
+                serde_json::from_value(json!({"source":"fixed", "catalog_version":1,
+                "model_count":1, "era_count":1, "recent_polls":[]}))
+                .unwrap(),
+            )
+        }
+
+        fn catalog_get(
+            &self,
+            request: CatalogGetRequest,
+        ) -> Result<CatalogGetResponse, CatalogCallError> {
+            if request.at_ms == Some(0) {
+                return Err(CatalogCallError {
+                    code: "no_coverage".into(),
+                    message: format!("no record at 0: fusiform's history begins at {CREATED}. An empty answer would claim the catalog was empty; it was unobserved."),
+                });
+            }
+            let rate = json!({"state":"priced", "units":1_000_000_000_i64,
+                "exponent":9, "currency":"USD", "unit_provenance":{"kind":"stated"}});
+            Ok(
+                serde_json::from_value(json!({"source":"fixed", "catalog_version":1,
+                "resolved_at_ms": request.at_ms,
+                "models":{"anthropic/claude-sonnet-4":{
+                    "rate.input":rate, "rate.output":rate, "rate.reasoning":rate,
+                    "rate.cache_read":rate, "rate.cache_write":rate}},
+                "withheld":[], "uncertain":[], "overridden":[]}))
+                .unwrap(),
+            )
+        }
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Layout {
@@ -524,6 +656,42 @@ mod tests {
             json!({"path": self.folder.join(session), "session_ref": session,
                 "owner_principal": OWNER, "state": if done {"done"} else {"active"},
                 "done_at_ms": if done {Some(T0)} else {None}, "future": true})
+        }
+
+        fn shared_path(&self) -> PathBuf {
+            self.folder
+                .parent()
+                .unwrap()
+                .join("opencode2-server/data/opencode")
+        }
+
+        fn shared_entry(&self, sessions: Vec<Value>) -> Value {
+            json!({"path": self.shared_path(), "kind": "shared", "sessions": sessions})
+        }
+
+        fn shared_session(session: &str, done: bool) -> Value {
+            json!({"session": session, "session_ref": format!("ref-{session}"),
+                "owner_principal": OWNER, "state": if done {"done"} else {"active"},
+                "done_at_ms": if done {Some(T0)} else {None}, "work_class": "ignored"})
+        }
+
+        fn shared_call(&self, session: &str, id: &str, complete: bool, updated: i64) {
+            let database = self.shared_path().join("opencode.db");
+            insert(
+                &database,
+                Layout::V2,
+                id,
+                "assistant",
+                updated,
+                &payload(Layout::V2, complete),
+            );
+            Connection::open(database)
+                .unwrap()
+                .execute(
+                    "UPDATE session_message SET session_id=?1 WHERE id=?2",
+                    params![session, id],
+                )
+                .unwrap();
         }
 
         fn declare(&self, entries: Vec<Value>) {
@@ -750,6 +918,360 @@ mod tests {
             ),
         }
         .unwrap();
+    }
+
+    #[test]
+    fn shared_calls_record_listed_owners_and_unlisted_usage() {
+        let f = Fixture::new();
+        f.state
+            .install_catalog(Some(
+                CatalogClient::connect(Arc::new(DollarCatalog)).unwrap(),
+            ))
+            .unwrap();
+        f.shared_call("listed", "listed-call", true, CREATED);
+        f.shared_call("unlisted", "unlisted-call", true, CREATED);
+        f.declare(vec![
+            f.shared_entry(vec![Fixture::shared_session("listed", false)])
+        ]);
+        f.tick(T0);
+        assert_eq!(
+            f.events(),
+            vec![
+                ("listed-call".into(), "opencode".into(), Some(OWNER.into())),
+                ("unlisted-call".into(), "opencode".into(), None),
+            ],
+            "every shared-store call must be recorded, even without a session item"
+        );
+        assert_eq!(f.runtime(), Some((Some(T0), false)));
+        assert_eq!(f.watermark(), Some(T0 - WATERMARK_MARGIN_MS));
+        assert_eq!(f.degraded(), None);
+
+        for reference in ["listed-call", "unlisted-call"] {
+            f.state.with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT m.role,m.source,m.quantity_units,m.quantity_exponent,m.unit
+                    FROM measurement m JOIN usage_event e USING(event_key)
+                    WHERE e.producer_ref=?1 ORDER BY m.role").unwrap();
+                let measurements = stmt.query_map([reference], |r| Ok((
+                    r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?,
+                    r.get::<_,i64>(3)?, r.get::<_,String>(4)?
+                ))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                assert_eq!(measurements, vec![
+                    ("cache_read".into(), "usage.cacheRead".into(), 7, 0, "token".into()),
+                    ("cache_write".into(), "usage.cacheWrite".into(), 11, 0, "token".into()),
+                    ("input".into(), "usage.input".into(), 3, 0, "token".into()),
+                    ("output".into(), "usage.output".into(), 5, 0, "token".into()),
+                    ("reasoning".into(), "usage.reasoning".into(), 2, 0, "token".into()),
+                ]);
+                let unpriced: i64 = conn.query_row("SELECT COUNT(*) FROM priced_charge p
+                    JOIN usage_event e USING(event_key) WHERE e.producer_ref=?1
+                    AND p.outcome='unpriced' AND p.unpriced_reason='charge_basis_unknown'
+                    AND NOT EXISTS(SELECT 1 FROM priced_charge child WHERE child.supersedes=p.charge_key)",
+                    [reference], |r| r.get(0)).unwrap();
+                assert_eq!(unpriced, 5);
+                Ok(())
+            }).unwrap();
+
+            // OpenCode does not attest who paid. Explicit API-key evidence is
+            // required to price these otherwise unpriced, unknown-basis calls.
+            let id = astrocyte_core::fact::event_id("opencode", None, reference).unwrap();
+            crate::ops::dispatch(
+                &f.state,
+                crate::ops::OP_BASIS_CORRECT,
+                json!({
+                    "event_id":id, "corrected_basis":"metered_api", "reason":"API-key evidence"
+                }),
+            )
+            .unwrap();
+            f.state.with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT p.role,p.outcome,p.charge_nanos FROM priced_charge p
+                    JOIN usage_event e USING(event_key) WHERE e.producer_ref=?1
+                    AND NOT EXISTS(SELECT 1 FROM priced_charge child WHERE child.supersedes=p.charge_key)
+                    ORDER BY p.role").unwrap();
+                let money = stmt.query_map([reference], |r| Ok((
+                    r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?
+                ))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                assert_eq!(money, vec![
+                    ("cache_read".into(), "priced".into(), 7_000),
+                    ("cache_write".into(), "priced".into(), 11_000),
+                    ("input".into(), "priced".into(), 3_000),
+                    ("output".into(), "priced".into(), 5_000),
+                    ("reasoning".into(), "priced".into(), 2_000),
+                ]);
+                Ok(())
+            }).unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_paths_require_the_shared_kind_and_exact_resolved_location() {
+        for relative in [
+            "opencode2-server/data/opencode",
+            "opencode2-server/data",
+            "opencode2-server/data/opencode/x",
+            "other/opencode2-server/data/opencode",
+            "launch-head-runner/data/opencode",
+            "opencode-sessions/private",
+        ] {
+            for shared in [false, true] {
+                let accepted = if shared {
+                    relative == "opencode2-server/data/opencode"
+                } else {
+                    relative.starts_with("launch-head-")
+                        || relative.starts_with("opencode-sessions/")
+                };
+                let f = Fixture::new();
+                f.call(ONE, Layout::V2, "good", true, CREATED);
+                let path = f.folder.parent().unwrap().join(relative);
+                insert(
+                    &path.join("opencode.db"),
+                    Layout::V2,
+                    "candidate",
+                    "assistant",
+                    CREATED,
+                    &payload(Layout::V2, true),
+                );
+                let mut entry = if shared {
+                    f.shared_entry(vec![Fixture::shared_session("session", false)])
+                } else {
+                    f.entry(TWO, false)
+                };
+                entry["path"] = json!(path);
+                f.declare(vec![entry, f.entry(ONE, false)]);
+                f.tick(T0);
+                let expected = if accepted {
+                    vec!["candidate", "good"]
+                } else {
+                    vec!["good"]
+                };
+                assert_eq!(f.refs(), expected, "{relative}, shared={shared}");
+                assert_eq!(f.degraded(), None);
+                assert_eq!(f.watermark(), Some(T0 - WATERMARK_MARGIN_MS));
+                assert_eq!(
+                    f.source.cache.lock().unwrap().warned.len(),
+                    usize::from(!accepted)
+                );
+                f.tick(T0 + TICK);
+                assert_eq!(
+                    f.source.cache.lock().unwrap().warned.len(),
+                    usize::from(!accepted)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_declaration_without_kind_is_skipped_not_a_malformed_roots_file() {
+        let f = Fixture::new();
+        f.call(ONE, Layout::V2, "good", true, CREATED);
+        f.shared_call("session", "unmarked", true, CREATED);
+        let mut shared = f.shared_entry(vec![]);
+        shared.as_object_mut().unwrap().remove("kind");
+        f.declare(vec![shared, f.entry(ONE, false)]);
+        f.tick(T0);
+        assert_eq!(f.refs(), vec!["good"]);
+        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 1);
+        f.tick(T0 + TICK);
+        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 1);
+        assert_eq!(f.degraded(), None);
+        assert_eq!(f.watermark(), Some(T0 + TICK - WATERMARK_MARGIN_MS));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_path_uses_the_resolved_location_even_for_an_in_sessions_alias() {
+        let f = Fixture::new();
+        f.shared_call("session", "shared", true, CREATED);
+        let alias = f.folder.join("alias");
+        std::os::unix::fs::symlink(f.shared_path(), &alias).unwrap();
+        let mut shared = f.shared_entry(vec![]);
+        shared["path"] = json!(alias);
+        f.declare(vec![shared]);
+        f.tick(T0);
+        assert_eq!(f.refs(), vec!["shared"]);
+        assert_eq!(f.degraded(), None);
+        let mut folder = f.entry(ONE, false);
+        folder["path"] = json!(alias);
+        f.declare(vec![folder]);
+        f.tick(T0 + TICK);
+        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 1);
+        assert_eq!(f.degraded(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_path_symlink_cannot_escape_the_harness_parent() {
+        let f = Fixture::new();
+        f.call(ONE, Layout::V2, "good", true, CREATED);
+        f.shared_call("session", "escaped", true, CREATED);
+        let path = f.shared_path();
+        let outside = f.temp.path().join("outside");
+        fs::rename(&path, &outside).unwrap();
+        std::os::unix::fs::symlink(outside, &path).unwrap();
+        f.declare(vec![f.shared_entry(vec![]), f.entry(ONE, false)]);
+        f.tick(T0);
+        assert_eq!(f.refs(), vec!["good"]);
+        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 1);
+        assert_eq!(f.degraded(), None);
+        assert_eq!(f.watermark(), Some(T0 - WATERMARK_MARGIN_MS));
+    }
+
+    #[test]
+    fn shared_interrupted_calls_settle_per_session_and_unlisted_calls_wait() {
+        let f = Fixture::new();
+        for session in ["active", "done", "unlisted"] {
+            f.shared_call(session, session, false, T0);
+        }
+        f.declare(vec![f.shared_entry(vec![
+            Fixture::shared_session("active", false),
+            Fixture::shared_session("done", false),
+            Fixture::shared_session("deleted", true),
+        ])]);
+        f.tick(T0);
+        assert!(f.refs().is_empty());
+        f.declare(vec![f.shared_entry(vec![
+            Fixture::shared_session("active", false),
+            Fixture::shared_session("done", true),
+            Fixture::shared_session("deleted", true),
+        ])]);
+        f.tick(T0 + TICK);
+        assert_eq!(f.refs(), vec!["done"]);
+        f.tick(T0 + QUIET_WINDOW - 1);
+        assert_eq!(f.refs(), vec!["done"]);
+        f.tick(T0 + QUIET_WINDOW);
+        assert_eq!(f.refs(), vec!["active", "done", "unlisted"]);
+        assert_eq!(f.degraded(), None);
+    }
+
+    #[test]
+    fn unreadable_shared_store_holds_watermark_but_missing_store_does_not() {
+        let f = Fixture::new();
+        f.shared_call("session", "shared", true, CREATED);
+        f.declare(vec![f.shared_entry(vec![]), f.entry(ONE, false)]);
+        f.tick(T0);
+        let released = f.watermark();
+        assert_eq!(released, Some(T0 - WATERMARK_MARGIN_MS));
+        fs::write(f.shared_path().join("opencode.db"), vec![7_u8; 4096]).unwrap();
+        f.call(ONE, Layout::V2, "folder", true, CREATED);
+        f.tick(T0 + TICK);
+        assert_eq!(f.refs(), vec!["folder", "shared"]);
+        assert_eq!(f.watermark(), released);
+        assert!(f.degraded().unwrap().contains("shared store"));
+        assert_eq!(f.runtime(), Some((Some(T0 + TICK), true)));
+        fs::remove_file(f.shared_path().join("opencode.db")).unwrap();
+        f.tick(T0 + 2 * TICK);
+        assert_eq!(f.watermark(), Some(T0 + 2 * TICK - WATERMARK_MARGIN_MS));
+        assert_eq!(f.degraded(), None);
+        fs::remove_dir_all(f.shared_path()).unwrap();
+        f.tick(T0 + 3 * TICK);
+        assert_eq!(f.watermark(), Some(T0 + 3 * TICK - WATERMARK_MARGIN_MS));
+        assert_eq!(f.degraded(), None);
+    }
+
+    #[test]
+    fn shared_done_sessions_hold_watermark_until_their_final_full_pass_finishes() {
+        let f = Fixture::new();
+        f.shared_call("done", "first", true, CREATED);
+        f.declare(vec![
+            f.shared_entry(vec![Fixture::shared_session("done", false)])
+        ]);
+        f.tick(T0);
+        let released = f.watermark();
+        let count = page_limit(Layout::V2) + 2;
+        let database = f.shared_path().join("opencode.db");
+        fill(&database, Layout::V2, count, T0 + 1);
+        f.shared_call(
+            "done",
+            "final",
+            false,
+            T0 + i64::try_from(count).unwrap() + 1,
+        );
+        f.declare(vec![
+            f.shared_entry(vec![Fixture::shared_session("done", true)])
+        ]);
+        f.tick(T0 + TICK);
+        assert_eq!(f.refs(), vec!["first"]);
+        assert_eq!(f.watermark(), released);
+        assert_eq!(f.degraded(), None);
+        f.tick(T0 + 2 * TICK);
+        assert_eq!(f.refs(), vec!["final", "first"]);
+        assert_eq!(f.watermark(), Some(T0 + 2 * TICK - WATERMARK_MARGIN_MS));
+        assert_eq!(f.degraded(), None);
+    }
+
+    #[test]
+    fn shared_session_erasure_below_the_cursor_does_not_block_later_calls() {
+        let mut f = Fixture::new();
+        f.shared_call("keeper", "keeper", true, CREATED);
+        f.shared_call("interrupted", "interrupted", false, T0 - 1);
+        f.shared_call("done", "erased", true, T0);
+        f.declare(vec![
+            f.shared_entry(vec![Fixture::shared_session("done", true)])
+        ]);
+        f.tick(T0);
+        Connection::open(f.shared_path().join("opencode.db"))
+            .unwrap()
+            .execute("DELETE FROM session_message WHERE session_id='done'", [])
+            .unwrap();
+        f.declare(vec![
+            f.shared_entry(vec![Fixture::shared_session("interrupted", true)])
+        ]);
+        f.restart();
+        f.tick(T0 + TICK);
+        assert_eq!(f.watermark(), Some(T0 + TICK - WATERMARK_MARGIN_MS));
+        assert_eq!(f.degraded(), None);
+        f.shared_call("keeper", "later", true, T0 + 2 * TICK);
+        f.tick(T0 + 3 * TICK);
+        assert_eq!(f.refs(), vec!["erased", "interrupted", "keeper", "later"]);
+        assert_eq!(f.degraded(), None);
+    }
+
+    #[test]
+    fn shared_imported_history_keeps_the_first_record_without_quarantine() {
+        let mut f = Fixture::new();
+        f.call(ONE, Layout::V2, "history", true, CREATED);
+        f.declare(vec![f.entry(ONE, false)]);
+        f.tick(T0);
+        f.shared_call("imported", "history", true, CREATED);
+        f.shared_call("imported", "new", true, CREATED + 1);
+        let mut session = Fixture::shared_session("imported", false);
+        session["owner_principal"] = json!("other-owner");
+        f.declare(vec![f.shared_entry(vec![session])]);
+        f.tick(T0 + TICK);
+        f.restart();
+        f.tick(T0 + 2 * TICK);
+        assert_eq!(
+            f.events(),
+            vec![
+                ("history".into(), "opencode".into(), Some(OWNER.into())),
+                ("new".into(), "opencode".into(), Some("other-owner".into())),
+            ]
+        );
+        f.state
+            .with_conn(|conn| {
+                let rejected: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM rejected_delivery", [], |r| r.get(0))
+                    .unwrap();
+                let evidence: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM set_aside_record", [], |r| r.get(0))
+                    .unwrap();
+                let measurements: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM measurement", [], |r| r.get(0))
+                    .unwrap();
+                let original_session: String = conn
+                    .query_row(
+                        "SELECT session FROM usage_event WHERE producer_ref='history'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(rejected, 0);
+                assert_eq!(evidence, 0);
+                assert_eq!(measurements, 10);
+                assert_eq!(original_session, "session");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(f.degraded(), None);
     }
 
     #[test]

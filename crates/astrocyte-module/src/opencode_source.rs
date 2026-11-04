@@ -1,7 +1,7 @@
 //! OpenCode's on-disk SQLite producer and ledger ingest mapping.
 
 use super::harness_drain::DrainMode;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(any(test, feature = "test-support"))]
 use std::ffi::OsString;
 use std::fs;
@@ -177,6 +177,38 @@ pub(crate) struct ReadOptions<'a> {
     /// `finish` (it keeps zeros while the call streams), so its reader, which
     /// waits for `finish` or `time.completed`, has nothing more to settle.
     pub settled: bool,
+    /// A shared store's per-session overrides. Unlisted sessions have no work
+    /// class and retain the normal quiet window, rather than using agent names.
+    pub sessions: Option<&'a HashMap<String, SessionOptions<'a>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SessionOptions<'a> {
+    pub work_class: &'a str,
+    pub settled: bool,
+}
+
+impl ReadOptions<'_> {
+    pub(crate) fn session_settled(self, session: &str) -> bool {
+        self.settled
+            || self
+                .sessions
+                .and_then(|sessions| sessions.get(session))
+                .is_some_and(|options| options.settled)
+    }
+
+    pub(crate) fn stamp(self, mut request: EventRecordRequest) -> EventRecordRequest {
+        if let Some(sessions) = self.sessions {
+            request.work_class = request
+                .session
+                .as_deref()
+                .and_then(|session| sessions.get(session))
+                .map(|options| options.work_class.to_owned());
+            request
+        } else {
+            stamp_work_class(request, self.work_class)
+        }
+    }
 }
 
 /// When each kind of read runs. See `OpenCodeSource` for the design these
@@ -778,7 +810,7 @@ impl OpenCodeSource {
             root,
             std::mem::take(&mut page.messages),
             &mut set_aside,
-            options.work_class,
+            options,
         );
         let committed = commit_page_in_lane(
             state,
@@ -831,7 +863,7 @@ impl OpenCodeSource {
                 reason: record.reason,
             })
             .collect();
-        let requests = map_messages(root, page.messages, &mut set_aside, options.work_class);
+        let requests = map_messages(root, page.messages, &mut set_aside, options);
         let committed = commit_page_with_evidence(
             state,
             &self.home,
@@ -931,13 +963,13 @@ fn map_messages(
     path: &Path,
     messages: Vec<OpenCodeMessage>,
     set_aside: &mut Vec<crate::refresher::SetAsideRecord>,
-    work_class: Option<&str>,
+    options: ReadOptions<'_>,
 ) -> Vec<EventRecordRequest> {
     let mut requests = Vec::new();
     for message in messages {
         let locator = format!("{path:?}:message:{}", message.id);
         match map_message(message) {
-            Ok(request) => requests.push(stamp_work_class(request, work_class)),
+            Ok(request) => requests.push(options.stamp(request)),
             Err(reason) => set_aside.push(crate::refresher::SetAsideRecord { locator, reason }),
         }
     }

@@ -19,7 +19,7 @@ use astrocyte_readers::{
 };
 
 use super::harness_drain::{self, DrainMode, HarnessSource};
-use super::opencode_source::{stamp_work_class, CursorHome, PageCursor, ReadOptions};
+use super::opencode_source::{CursorHome, PageCursor, ReadOptions};
 use super::{SetAsideRecord, SourceDrainError};
 use crate::state::SharedState;
 
@@ -226,13 +226,11 @@ impl OpenCodeV2Source {
                     .is_none_or(|last| now < last || now.saturating_sub(last) >= FULL_INTERVAL));
         let pending = cache.open.keys().copied().collect::<Vec<_>>();
         let mut extra_cost = OpenCodeScanCost::default();
-        // No write can follow a settled store's last one, so each call in it
-        // with tokens but no completion is as final as one whose quiet window
-        // has passed. Reading at the end of time makes the reader treat it so;
-        // the read cadence above still runs on the real clock.
-        let reader_now = if options.settled { i64::MAX } else { now };
+        // Finality belongs to a session in a shared store, not to the server:
+        // another session may still be streaming while a done one is erased.
+        let settled = |session: &str| options.session_settled(session);
         let page = if full {
-            self.full_page(state, path, reader_now, stop)?
+            self.full_page(state, path, now, stop, &settled)?
         } else {
             if cache.reader.is_none() {
                 let Some(reader) = TailReader::open(path, stop).map_err(read_error)? else {
@@ -245,7 +243,7 @@ impl OpenCodeV2Source {
                 .reader
                 .as_ref()
                 .expect("opened v2 tail reader")
-                .read(
+                .read_with_settled_sessions(
                     path,
                     &OpenCodeTailRequest {
                         after_rowid: cache.tail,
@@ -253,9 +251,10 @@ impl OpenCodeV2Source {
                         open_rowids: &pending,
                         limit: PAGE_LIMIT,
                     },
-                    reader_now,
+                    now,
                     stop,
                     mode.is_full(),
+                    &settled,
                 )
                 .map_err(read_error)?;
             if !self.home.retains_connection() {
@@ -283,7 +282,7 @@ impl OpenCodeV2Source {
                         });
                     }
                     full = true;
-                    self.full_page(state, path, reader_now, stop)?
+                    self.full_page(state, path, now, stop, &settled)?
                 }
                 page => page,
             }
@@ -295,16 +294,7 @@ impl OpenCodeV2Source {
         if let Some(key) = self.home.runtime_key() {
             mode.ensure_runtime(state, key)?;
         }
-        let outcome = commit(
-            state,
-            &self.home,
-            &page,
-            full,
-            now,
-            stop,
-            mode,
-            options.work_class,
-        )?;
+        let outcome = commit(state, &self.home, &page, full, now, stop, mode, options)?;
         cache.marker_present = true;
         cache.signature = Some(signature);
         if full {
@@ -353,9 +343,18 @@ impl OpenCodeV2Source {
         path: &std::path::Path,
         now: i64,
         stop: &AtomicBool,
+        settled: &dyn Fn(&str) -> bool,
     ) -> Result<Option<Page>, SourceDrainError> {
         let cursor = self.home.read_cursor(state)?;
-        opencode_v2::read_page(path, cursor.as_ref(), PAGE_LIMIT, now, stop).map_err(read_error)
+        opencode_v2::read_page_with_settled_sessions(
+            path,
+            cursor.as_ref(),
+            PAGE_LIMIT,
+            now,
+            stop,
+            settled,
+        )
+        .map_err(read_error)
     }
 }
 
@@ -409,7 +408,7 @@ fn commit(
     now: i64,
     stop: &AtomicBool,
     mode: DrainMode,
-    work_class: Option<&str>,
+    options: ReadOptions<'_>,
 ) -> Result<Outcome, SourceDrainError> {
     let mut stopped = false;
     let result = mode.write(state, |tx| {
@@ -447,7 +446,7 @@ fn commit(
             }
             match map_message(message.clone()) {
                 Ok(request) => {
-                    let request = stamp_work_class(request, work_class);
+                    let request = options.stamp(request);
                     let result = astrocyte_core::ingest::record_event_in_tx(
                         tx,
                         &request,

@@ -128,6 +128,19 @@ pub fn read_page(
     now_ms: i64,
     stop: &AtomicBool,
 ) -> Result<Option<Page>, OpenCodeReadError> {
+    read_page_with_settled_sessions(path, cursor, limit, now_ms, stop, &|_| false)
+}
+
+/// Read a full page with immediate finality for sessions that can no longer write.
+/// Other sessions retain the ordinary quiet window, including unlisted sessions.
+pub fn read_page_with_settled_sessions(
+    path: &Path,
+    cursor: Option<&OpenCodeCursor>,
+    limit: usize,
+    now_ms: i64,
+    stop: &AtomicBool,
+    settled: &dyn Fn(&str) -> bool,
+) -> Result<Option<Page>, OpenCodeReadError> {
     with_read_snapshot(path, stop, |connection| {
         let Some(mut page) = begin_page(connection, stop, true)? else {
             return Ok(None);
@@ -146,15 +159,12 @@ pub fn read_page(
             // OpenCode deletes sessions. When the deleted sessions held every
             // row at or above the cursor, the maximum falls below the cursor
             // while the front row (and so the lineage) is unchanged. The store
-            // then holds no row newer than the cursor, so this is an empty page
-            // that keeps the cursor instead of a failure. Both ordinals stay at
-            // the cursor: the stored cursor row requires high water to cover the
-            // cursor, and the cursor itself never moves backwards, so rows
-            // already read are not re-read. A later write stamps a fresh
-            // wall-clock time at or above the cursor and is read normally.
-            page.consumed = lower;
+            // then holds no row newer than the cursor. Keep the high water at
+            // the cursor, as its durable row requires, but still check older
+            // incomplete calls: they may now be quiet or their session done.
+            // Completed rows below the cursor are not re-read. A later write
+            // at or above the cursor is read normally.
             page.high_water = lower;
-            return Ok(Some(page));
         }
         let offset = i64::try_from(
             limit
@@ -193,7 +203,7 @@ pub fn read_page(
             .next()
             .map_err(|e| sqlite_error(stop, "step OpenCode 2 page", e))?
         {
-            take_row(connection, row, legacy, now_ms, stop, &mut page)?;
+            take_row(connection, row, legacy, now_ms, stop, &mut page, settled)?;
         }
         drop(rows);
         page.cost.add_statement(&statement);
@@ -220,7 +230,7 @@ pub fn read_tail(
     stop: &AtomicBool,
 ) -> Result<Option<Page>, OpenCodeReadError> {
     with_read_snapshot(path, stop, |connection| {
-        read_tail_snapshot(connection, request, now_ms, stop, true)
+        read_tail_snapshot(connection, request, now_ms, stop, true, &|_| false)
     })
 }
 
@@ -251,8 +261,21 @@ impl TailReader {
         stop: &AtomicBool,
         check_marker: bool,
     ) -> Result<Option<Page>, OpenCodeReadError> {
+        self.read_with_settled_sessions(path, request, now_ms, stop, check_marker, &|_| false)
+    }
+
+    /// Read a tail with the same per-session finality as a full page.
+    pub fn read_with_settled_sessions(
+        &self,
+        path: &Path,
+        request: &OpenCodeTailRequest<'_>,
+        now_ms: i64,
+        stop: &AtomicBool,
+        check_marker: bool,
+        settled: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<Page>, OpenCodeReadError> {
         in_read_snapshot(&self.connection, path, stop, |connection| {
-            read_tail_snapshot(connection, request, now_ms, stop, check_marker)
+            read_tail_snapshot(connection, request, now_ms, stop, check_marker, settled)
         })
     }
 }
@@ -263,6 +286,7 @@ fn read_tail_snapshot(
     now_ms: i64,
     stop: &AtomicBool,
     check_marker: bool,
+    settled: &dyn Fn(&str) -> bool,
 ) -> Result<Option<Page>, OpenCodeReadError> {
     let Some(mut page) = begin_page(connection, stop, check_marker)? else {
         return Ok(None);
@@ -304,7 +328,7 @@ fn read_tail_snapshot(
             .map_err(|e| sqlite_error(stop, "read OpenCode 2 type", e))?
             == "assistant"
         {
-            take_row(connection, row, legacy, now_ms, stop, &mut page)?;
+            take_row(connection, row, legacy, now_ms, stop, &mut page, settled)?;
         }
     }
     drop(rows);
@@ -326,7 +350,7 @@ fn read_tail_snapshot(
                 .next()
                 .map_err(|e| sqlite_error(stop, "step OpenCode 2 pending row", e))?
             {
-                take_row(connection, row, legacy, now_ms, stop, &mut page)?;
+                take_row(connection, row, legacy, now_ms, stop, &mut page, settled)?;
             }
         }
         page.cost.add_statement(&lookup);
@@ -341,6 +365,7 @@ fn take_row(
     now_ms: i64,
     stop: &AtomicBool,
     page: &mut Page,
+    settled: &dyn Fn(&str) -> bool,
 ) -> Result<(), OpenCodeReadError> {
     if stop.load(Ordering::Relaxed) {
         return Err(OpenCodeReadError::Stopped);
@@ -352,7 +377,7 @@ fn take_row(
         .get(1)
         .map_err(|e| sqlite_error(stop, "read OpenCode 2 id", e))?;
     let decoded = (|| -> Result<Option<OpenCodeMessage>, String> {
-        let session_id = row.get(2).map_err(|e| format!("read session: {e}"))?;
+        let session_id: String = row.get(2).map_err(|e| format!("read session: {e}"))?;
         let updated_at_ms = row.get(3).map_err(|e| format!("read update time: {e}"))?;
         let mut bytes = row
             .get::<_, String>(4)
@@ -365,7 +390,7 @@ fn take_row(
             .as_ref()
             .is_some_and(|time| time.completed.is_some());
         let quiet = now_ms.saturating_sub(updated_at_ms) >= QUIET_WINDOW;
-        if !completed && !quiet {
+        if !completed && !quiet && !settled(&session_id) {
             page.open_rows.push(OpenCodeOpenRow {
                 rowid,
                 updated_at_ms,
