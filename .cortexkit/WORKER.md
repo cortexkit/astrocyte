@@ -24,6 +24,11 @@ cargo test --workspace --locked <filter>                  # tests for what you c
 - A failure that looks unrelated: rerun that one test by name on unchanged master, and
   report it by name if it fails there too. Never fix it in passing.
 - Keep the normal build directory. A separate `CARGO_TARGET_DIR` forces a cold build.
+- A remote Linux job can't change a tracked file: the write fails with "Operation not
+  permitted". So make a red-first change in your local checkout without committing it,
+  run the job, then undo the change locally. Never edit or restore a tracked file inside
+  the job: the edit fails, the test runs against the fix, and it reads as a false proof. Regenerate test
+  vectors locally, or name the files in the job's `return_paths`.
 - Never run `cargo` on the shared development machine. Local builds compete with all
   other work there, and on macOS each freshly built test binary also costs a security
   scan. If a remote job is refused for capacity, retry it later or with fewer vCPUs.
