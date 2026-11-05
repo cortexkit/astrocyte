@@ -882,6 +882,7 @@ pub fn resolve_rates(
             _ => (model.as_str(), lookup),
         };
         let mut reference_model = None;
+        let discover_quota_proxy = lookup_without_prices(&lookup);
         if lookup_missing(&lookup) {
             // Aliases exist only on current reads. Discover the public identity
             // there, but use its rates at the original valuation instant.
@@ -897,6 +898,26 @@ pub fn resolve_rates(
                 Err(error) => {
                     return Err(MultiplierError::Catalog(format!(
                         "catalog.get current {provider}/{lookup_model}: {error:?}"
+                    )))
+                }
+                _ => {}
+            }
+        }
+        if discover_quota_proxy && reference_model.is_none() {
+            // An auth-specific lookup is current-only and identifies the public
+            // API model; fetch its rates at the original historical instant.
+            match catalog.get_current_apikey(provider, lookup_model) {
+                Ok(CatalogLookup::Resolved(snapshot)) => {
+                    if let Some(target) = quota_proxy_target(&snapshot) {
+                        lookup = catalog.get(&target.provider_id, &target.model_id, at_ms);
+                        reference_model = Some(target);
+                    }
+                }
+                Err(CatalogClientError::Call(error))
+                    if RefusalKind::of(&error.code) == RefusalKind::OutsideCoverage => {}
+                Err(error) => {
+                    return Err(MultiplierError::Catalog(format!(
+                        "catalog.get current apikey {provider}/{lookup_model}: {error:?}"
                     )))
                 }
                 _ => {}
@@ -954,6 +975,51 @@ pub fn resolve_rates(
             .insert((provider.clone(), model.clone()), resolution);
     }
     Ok(resolved)
+}
+
+fn lookup_without_prices(lookup: &Result<CatalogLookup, CatalogClientError>) -> bool {
+    let Ok(CatalogLookup::Resolved(snapshot)) = lookup else {
+        return false;
+    };
+    // Any priced fact, even priced zero, keeps its existing historical path.
+    // Undecodable facts must still fail the day rather than be hidden by a proxy.
+    snapshot
+        .facts
+        .iter()
+        .filter(|(key, _)| key.starts_with(RATE_FACT_PREFIX))
+        .all(|(_, value)| {
+            matches!(
+                serde_json::from_value::<RateValue>(value.clone()),
+                Ok(RateValue::StatedZero { .. })
+                    | Ok(RateValue::Unpriced {
+                        reason: ProtocolUnpricedReason::MissingRate
+                            | ProtocolUnpricedReason::NoCatalogCoverage
+                            | ProtocolUnpricedReason::UnknownChargeBasis,
+                        ..
+                    })
+            )
+        })
+}
+
+// Keep quota proxies beside, not inside, alias discovery: an alias is a model
+// identity, while a quota proxy is only a list-price reference for valuation.
+// Ledger pricing must not treat a plan's reference prices as amounts billed.
+fn quota_proxy_target(snapshot: &CatalogSnapshot) -> Option<CatalogModel> {
+    snapshot.facts.iter().find_map(|(key, value)| {
+        if !key.starts_with(RATE_FACT_PREFIX) {
+            return None;
+        }
+        let origin = match serde_json::from_value::<RateValue>(value.clone()).ok()? {
+            RateValue::Priced { inherited_from, .. }
+            | RateValue::StatedZero { inherited_from }
+            | RateValue::Unpriced { inherited_from, .. } => inherited_from?,
+            RateValue::BilledAs { .. } => return None,
+        };
+        (origin.basis == "quota_proxy").then_some(CatalogModel {
+            provider_id: origin.provider_id,
+            model_id: origin.model_id?,
+        })
+    })
 }
 
 fn lookup_missing(lookup: &Result<CatalogLookup, CatalogClientError>) -> bool {
@@ -5430,6 +5496,254 @@ mod tests {
     fn reference_rate(units: i64) -> Value {
         json!({"state":"priced","units":units,"exponent":9,"currency":"USD",
             "unit_provenance":{"kind":"stated"}})
+    }
+
+    struct QuotaProxyCatalog {
+        own_rates: BTreeMap<String, Value>,
+        target_history_start_ms: i64,
+        requests: std::sync::Mutex<Vec<fusiform_protocol::CatalogGetRequest>>,
+    }
+
+    impl crate::catalog_client::CatalogConnection for QuotaProxyCatalog {
+        fn catalog_status(
+            &self,
+            _: fusiform_protocol::StatusRequest,
+        ) -> Result<fusiform_protocol::StatusResponse, CatalogCallError> {
+            unreachable!("the test supplies the catalog history boundary")
+        }
+
+        fn catalog_get(
+            &self,
+            request: fusiform_protocol::CatalogGetRequest,
+        ) -> Result<fusiform_protocol::CatalogGetResponse, CatalogCallError> {
+            let provider = request.provider_id.as_deref().unwrap();
+            let model = request.model_id.as_deref().unwrap();
+            let rates = match (
+                provider,
+                model,
+                request.at_ms,
+                request.auth_method.as_deref(),
+            ) {
+                ("kimi-code-plan-global", "k3.1-pro", Some(_), None) => Ok(self.own_rates.clone()),
+                ("kimi-code-plan-global", "k3.1-pro", None, Some("apikey")) => {
+                    // This current response identifies the model to query, but
+                    // its prices must not be used. Make them unlike the history.
+                    let mut rate = reference_rate(100_000_000_000);
+                    rate["inherited_from"] = json!({"basis":"quota_proxy",
+                        "provider_id":"moonshotai", "family":"kimi", "model_id":"kimi-k3.1-pro"});
+                    Ok(BTreeMap::from([("rate.input".into(), rate)]))
+                }
+                ("moonshotai", "kimi-k3.1-pro", Some(at_ms), None)
+                    if at_ms >= self.target_history_start_ms =>
+                {
+                    Ok(BTreeMap::from([
+                        ("rate.input".into(), reference_rate(2_000_000_000)),
+                        ("rate.output".into(), reference_rate(10_000_000_000)),
+                        ("rate.cache_read".into(), reference_rate(200_000_000)),
+                        ("rate.cache_write".into(), reference_rate(2_000_000_000)),
+                    ]))
+                }
+                ("moonshotai", "kimi-k3.1-pro", Some(_), None) => Err(CatalogCallError {
+                    code: "no_coverage".into(),
+                    message: "before the target's first rate era".into(),
+                }),
+                _ => panic!("unexpected catalog request: {request:?}"),
+            };
+            let model_key = format!("{provider}/{model}");
+            self.requests.lock().unwrap().push(request);
+            Ok(fusiform_protocol::CatalogGetResponse {
+                source: "models.dev".into(),
+                resolved_at_ms: 999,
+                catalog_version: 1,
+                models: BTreeMap::from([(model_key, rates?)]),
+                withheld: vec![],
+                uncertain: vec![],
+                overridden: vec![],
+                retired: vec![],
+                aliased: vec![],
+                plane: None,
+                billing_rules: vec![],
+            })
+        }
+    }
+
+    fn quota_proxy_card(state: Value) -> BTreeMap<String, Value> {
+        ["input", "output", "cache_read", "cache_write"]
+            .into_iter()
+            .map(|role| (format!("rate.{role}"), state.clone()))
+            .collect()
+    }
+
+    fn assert_quota_proxy_requests(connection: &QuotaProxyCatalog) {
+        let requests = connection.requests.lock().unwrap();
+        let calls: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.provider_id.as_deref().unwrap(),
+                    request.model_id.as_deref().unwrap(),
+                    request.at_ms,
+                    request.auth_method.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("kimi-code-plan-global", "k3.1-pro", Some(100), None),
+                ("kimi-code-plan-global", "k3.1-pro", None, Some("apikey")),
+                ("moonshotai", "kimi-k3.1-pro", Some(100), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn quota_proxy_values_the_day_at_historical_target_rates() {
+        for own_rates in [
+            quota_proxy_card(json!({"state":"stated_zero"})),
+            quota_proxy_card(json!({"state":"unpriced", "reason":"missing_rate"})),
+            BTreeMap::from([("rate.input".into(), json!({"state":"stated_zero"}))]),
+        ] {
+            let mut conn = conn();
+            let connection = std::sync::Arc::new(QuotaProxyCatalog {
+                own_rates,
+                target_history_start_ms: 100,
+                requests: std::sync::Mutex::new(Vec::new()),
+            });
+            let catalog = CatalogClient::new(connection.clone(), 0);
+            let config = config(vec![rule("broca", "kimi-code-plan-global", None)]);
+            reading(&conn, "acct", 10, 0.0, None);
+            reading(&conn, "acct", 90, 50.0, None);
+            event(
+                &conn,
+                "plan-call",
+                "broca",
+                "kimi-code-plan-global",
+                "k3.1-pro",
+                "subscription_included",
+                20,
+                &[
+                    ("input", "usage.input", 1_000),
+                    ("output", "usage.output", 1_000),
+                    ("cache_read", "usage.cache_read", 1_000),
+                    ("cache_write", "usage.cache_write", 1_000),
+                ],
+            );
+            let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
+            let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
+            let observation = observe(&conn, &config, 0, 100, &rates);
+            assert_eq!(observation.api_nanos, 14_200_000);
+            assert!(observation.unpriced_tokens.is_empty());
+            assert!(observation.multiplier.is_some_and(|ratio| ratio > 0.0));
+            assert_quota_proxy_requests(&connection);
+            let tx = conn.transaction().unwrap();
+            insert_observation_in_tx(&tx, &observation).unwrap();
+            tx.commit().unwrap();
+            let report = multiplier_report(
+                &conn,
+                &MultiplierReportRequest {
+                    from_ms: 0,
+                    to_ms: 200,
+                },
+            )
+            .unwrap();
+            assert_eq!(report["latest"][0]["api_nanos"], 14_200_000);
+            assert_eq!(
+                report["latest"][0]["api_nanos_by_model"][0]["rates"]["reference_model"],
+                json!({"provider_id":"moonshotai", "model_id":"kimi-k3.1-pro"})
+            );
+        }
+    }
+
+    #[test]
+    fn quota_proxy_before_target_history_writes_an_unpriced_day() {
+        let mut conn = conn();
+        let connection = std::sync::Arc::new(QuotaProxyCatalog {
+            own_rates: quota_proxy_card(json!({"state":"stated_zero"})),
+            target_history_start_ms: 101,
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let catalog = CatalogClient::new(connection.clone(), 0);
+        let config = config(vec![rule("broca", "kimi-code-plan-global", None)]);
+        reading(&conn, "acct", 10, 0.0, None);
+        reading(&conn, "acct", 90, 50.0, None);
+        event(
+            &conn,
+            "before-history",
+            "broca",
+            "kimi-code-plan-global",
+            "k3.1-pro",
+            "subscription_included",
+            20,
+            &[("input", "usage.input", 1_000)],
+        );
+        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
+        let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
+        let observation = observe(&conn, &config, 0, 100, &rates);
+        assert_quota_proxy_requests(&connection);
+        assert_eq!(observation.api_nanos, 0);
+        assert_eq!(observation.tokens.input, 1_000);
+        assert_eq!(observation.unpriced_tokens.len(), 1);
+        assert_eq!(observation.unpriced_tokens[0].reason, "no_catalog_coverage");
+        assert_eq!(observation.unpriced_tokens[0].tokens, 1_000);
+        assert_eq!(observation.multiplier, None);
+        let tx = conn.transaction().unwrap();
+        insert_observation_in_tx(&tx, &observation).unwrap();
+        tx.commit().unwrap();
+        let report = multiplier_report(
+            &conn,
+            &MultiplierReportRequest {
+                from_ms: 0,
+                to_ms: 200,
+            },
+        )
+        .unwrap();
+        assert_eq!(report["latest"].as_array().unwrap().len(), 1);
+        assert_eq!(report["latest"][0]["unpriced_tokens"][0]["tokens"], 1_000);
+        assert_eq!(
+            report["latest"][0]["unpriced_tokens"][0]["reason"],
+            "no_catalog_coverage"
+        );
+    }
+
+    #[test]
+    fn priced_historical_rows_do_not_request_quota_proxy() {
+        for units in [0, 2_000_000_000] {
+            let conn = conn();
+            let mut own_rates = quota_proxy_card(json!({"state":"stated_zero"}));
+            own_rates.insert("rate.input".into(), reference_rate(units));
+            let connection = std::sync::Arc::new(QuotaProxyCatalog {
+                own_rates,
+                target_history_start_ms: 100,
+                requests: std::sync::Mutex::new(Vec::new()),
+            });
+            let catalog = CatalogClient::new(connection.clone(), 0);
+            let config = config(vec![rule("broca", "kimi-code-plan-global", None)]);
+            reading(&conn, "acct", 10, 0.0, None);
+            reading(&conn, "acct", 90, 50.0, None);
+            event(
+                &conn,
+                "own-price",
+                "broca",
+                "kimi-code-plan-global",
+                "k3.1-pro",
+                "subscription_included",
+                20,
+                &[("input", "usage.input", 1_000)],
+            );
+            let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
+            let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
+            let observation = observe(&conn, &config, 0, 100, &rates);
+            assert_eq!(observation.api_nanos, units / 1_000);
+            assert!(observation.unpriced_tokens.is_empty());
+            let requests = connection.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].at_ms, Some(100));
+            assert_eq!(requests[0].auth_method, None);
+            let stored_rates =
+                serde_json::to_value(&observation.api_nanos_by_model[0].rates).unwrap();
+            assert!(stored_rates.get("reference_model").is_none());
+        }
     }
 
     #[test]

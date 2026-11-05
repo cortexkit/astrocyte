@@ -203,7 +203,7 @@ impl CatalogClient {
                 history_start_ms: self.history_start_ms,
             });
         }
-        self.get_at(provider_id, model_id, Some(at_ms))
+        self.get_at(provider_id, model_id, Some(at_ms), None)
     }
 
     /// Current reads expose curated aliases that have no historical identity.
@@ -212,7 +212,17 @@ impl CatalogClient {
         provider_id: &str,
         model_id: &str,
     ) -> Result<CatalogLookup, CatalogClientError> {
-        self.get_at(provider_id, model_id, None)
+        self.get_at(provider_id, model_id, None, None)
+    }
+
+    /// A current lookup with `auth_method: apikey` can identify the public API
+    /// model referenced by a plan.
+    pub(crate) fn get_current_apikey(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<CatalogLookup, CatalogClientError> {
+        self.get_at(provider_id, model_id, None, Some("apikey"))
     }
 
     fn get_at(
@@ -220,6 +230,7 @@ impl CatalogClient {
         provider_id: &str,
         model_id: &str,
         at_ms: Option<i64>,
+        auth_method: Option<&str>,
     ) -> Result<CatalogLookup, CatalogClientError> {
         let response = match self.connection.catalog_get(CatalogGetRequest {
             source: None,
@@ -228,7 +239,7 @@ impl CatalogClient {
             include_retired: true,
             model_id: Some(model_id.to_string()),
             provider_id: Some(provider_id.to_string()),
-            auth_method: None,
+            auth_method: auth_method.map(str::to_string),
         }) {
             Ok(response) => response,
             // A historical read refused as outside coverage is an answer, not
