@@ -983,11 +983,16 @@ fn lookup_without_prices(lookup: &Result<CatalogLookup, CatalogClientError>) -> 
     };
     // Any priced fact, even priced zero, keeps its existing historical path.
     // Undecodable facts must still fail the day rather than be hidden by a proxy.
-    snapshot
+    // A row with no rate facts at all is a missing model, not a plan's card: it
+    // keeps the alias path alone, so a provider without an apikey plane never
+    // gets a lookup whose refusal could fail the whole day.
+    let mut rates = snapshot
         .facts
         .iter()
         .filter(|(key, _)| key.starts_with(RATE_FACT_PREFIX))
-        .all(|(_, value)| {
+        .peekable();
+    rates.peek().is_some()
+        && rates.all(|(_, value)| {
             matches!(
                 serde_json::from_value::<RateValue>(value.clone()),
                 Ok(RateValue::StatedZero { .. })
@@ -5525,6 +5530,8 @@ mod tests {
                 request.auth_method.as_deref(),
             ) {
                 ("kimi-code-plan-global", "k3.1-pro", Some(_), None) => Ok(self.own_rates.clone()),
+                // The alias lookup a missing row makes: no alias is served.
+                ("kimi-code-plan-global", "k3.1-pro", None, None) => Ok(BTreeMap::new()),
                 ("kimi-code-plan-global", "k3.1-pro", None, Some("apikey")) => {
                     // This current response identifies the model to query, but
                     // its prices must not be used. Make them unlike the history.
@@ -5703,6 +5710,39 @@ mod tests {
         assert_eq!(
             report["latest"][0]["unpriced_tokens"][0]["reason"],
             "no_catalog_coverage"
+        );
+    }
+
+    /// A row with no rate facts is a missing model, not a plan card. It takes
+    /// the alias lookup only, never the apikey plane read.
+    #[test]
+    fn a_row_without_rate_facts_does_not_request_quota_proxy() {
+        let conn = conn();
+        let connection = std::sync::Arc::new(QuotaProxyCatalog {
+            own_rates: BTreeMap::new(),
+            target_history_start_ms: 100,
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let catalog = CatalogClient::new(connection.clone(), 0);
+        let config = config(vec![rule("broca", "kimi-code-plan-global", None)]);
+        reading(&conn, "acct", 10, 0.0, None);
+        reading(&conn, "acct", 90, 50.0, None);
+        event(
+            &conn,
+            "missing-row",
+            "broca",
+            "kimi-code-plan-global",
+            "k3.1-pro",
+            "subscription_included",
+            20,
+            &[("input", "usage.input", 1_000)],
+        );
+        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
+        resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
+        let requests = connection.requests.lock().unwrap();
+        assert!(
+            requests.iter().all(|request| request.auth_method.is_none()),
+            "a missing row must not make the apikey plane read: {requests:?}"
         );
     }
 
