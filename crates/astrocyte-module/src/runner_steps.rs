@@ -424,6 +424,22 @@ mod tests {
         assert_eq!(feed_rows(&state), 1);
     }
 
+    /// The step event body is closed, so a decoder older than runner contract
+    /// 0.8.7 refuses an event carrying that version's optional timing and
+    /// routing members. They must decode, and the step must reach the feed.
+    #[test]
+    fn an_event_with_contract_0_8_7_members_is_admitted() {
+        let state = test_state();
+        let (subject, body) = event("minimal", "thalamus-harness", |body| {
+            body["sent_to_last_content_ms"] = json!(1_200);
+            body["first_to_last_content_ms"] = json!(900);
+            body["route_decision_id"] = json!("rd_0123456789abcdef");
+        });
+        admit(&state, &subject, &body);
+        assert_eq!(feed_rows(&state), 1);
+        assert_eq!(state.step_feed().runner_counts().dropped, 0);
+    }
+
     /// A runner row's cache fields come from the same rules as a recorded
     /// step's, over the session's recorded steps: the file row that later
     /// replaces it, with the same counts, serves the same values.
