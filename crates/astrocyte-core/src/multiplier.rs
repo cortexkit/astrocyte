@@ -1146,8 +1146,9 @@ fn rate_state(snapshot: &CatalogSnapshot, key: &str) -> RateState {
             inherited_from: _,
         }) => unpriced(match reason {
             ProtocolUnpricedReason::MissingRate => "no_rate",
-            // Without an API card there is no reference price with which to
-            // value subscription tokens, just like missing catalog coverage.
+            // The catalog has no public API price for the model behind this
+            // plan, so its subscription tokens cannot be valued: the same
+            // outcome as missing catalog coverage.
             ProtocolUnpricedReason::NoCatalogCoverage | ProtocolUnpricedReason::NoApiCard => {
                 "no_catalog_coverage"
             }

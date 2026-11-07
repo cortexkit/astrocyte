@@ -1451,8 +1451,9 @@ fn measurement_rate_key(
         return None;
     }
     let mut selectors = measurement.price_selectors.clone();
-    // As for token keys, a record stating a standard mode prices at the base
-    // rate; only a non-standard mode selects a conditional price.
+    // As for token keys, a record stating a standard mode (`STANDARD_MODES`:
+    // "standard" or "default") prices at the base rate; only another mode,
+    // such as "fast", selects a conditional price.
     if let Some(mode) = stated_mode_condition(recorded_mode) {
         selectors.insert("mode".into(), mode.into());
     }
