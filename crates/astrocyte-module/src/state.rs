@@ -579,7 +579,7 @@ impl SharedState {
             .clone()
     }
 
-    /// Share the one launch-nonce handoff with the attested ckbus client, not other peers.
+    /// Stage the cached launch identity for attested consumers, gated by HELLO_ACK.
     pub fn install_quota_bus_access(
         &self,
         path: std::path::PathBuf,
@@ -587,6 +587,11 @@ impl SharedState {
         nonce: String,
     ) {
         self.0.quota_bus.install_access(path, module_id, nonce);
+    }
+
+    /// Release attested consumers only after the daemon accepts this module's HELLO.
+    pub fn acknowledge_module_hello(&self) {
+        self.0.quota_bus.acknowledge_hello();
     }
 
     pub(crate) fn quota_bus(&self) -> &crate::quota_events::Control {

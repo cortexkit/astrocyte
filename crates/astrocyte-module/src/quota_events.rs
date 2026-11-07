@@ -31,6 +31,7 @@ struct Pending {
 
 struct Inner {
     access: Option<Access>,
+    hello_acked: bool,
     attached: bool,
     credential_expires_ms: i64,
     last_pull_ms: Option<i64>,
@@ -51,6 +52,7 @@ impl Default for Control {
     fn default() -> Self {
         Self(Mutex::new(Inner {
             access: None,
+            hello_acked: false,
             attached: false,
             credential_expires_ms: 0,
             last_pull_ms: None,
@@ -73,19 +75,28 @@ pub(crate) struct PollTicket {
 
 impl Control {
     pub fn install_access(&self, path: PathBuf, module_id: String, nonce: String) {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).access = Some(Access {
+        let mut inner = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        inner.hello_acked = false;
+        inner.access = Some(Access {
             path,
             module_id,
             nonce,
         });
     }
 
-    fn access(&self) -> Option<Access> {
-        self.0
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .access
-            .clone()
+    pub(crate) fn acknowledge_hello(&self) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).hello_acked = true;
+    }
+
+    pub(crate) fn hello_acked(&self) -> bool {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).hello_acked
+    }
+
+    pub(crate) fn access(&self) -> Option<Access> {
+        let inner = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        // Both attested consumers wait here, so neither can race the serving
+        // connection's HELLO with an independent route-open connection.
+        inner.hello_acked.then(|| inner.access.clone()).flatten()
     }
 
     fn pulled(&self, exp: i64, now: i64) {

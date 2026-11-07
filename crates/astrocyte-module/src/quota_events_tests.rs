@@ -408,6 +408,7 @@ fn quota_reader_shutdown_cancels_mid_session_and_joins_within_the_drain_guard() 
         "astrocyte".into(),
         "fixture-handoff".into(),
     );
+    state.acknowledge_module_hello();
     let stop = Arc::new(AtomicBool::new(false));
     let reader = Reader::start(state.clone(), Some(peer.path.clone()), stop.clone()).unwrap();
     let stopped = stop.clone();
@@ -435,6 +436,23 @@ fn quota_reader_shutdown_cancels_mid_session_and_joins_within_the_drain_guard() 
     joining.stop_and_join();
     assert!(!state.quota_bus().0.lock().unwrap().attached);
     assert!(state.capacity_poll_ticket(now_ms()).is_some());
+}
+
+#[test]
+fn attested_consumers_wait_for_hello_ack_and_share_the_staged_identity() {
+    let state = crate::state::test_state();
+    state.install_quota_bus_access(
+        "unused-daemon.json".into(),
+        "astrocyte".into(),
+        "fixture-handoff".into(),
+    );
+    assert!(!state.quota_bus().hello_acked());
+    assert!(state.quota_bus().access().is_none());
+    state.acknowledge_module_hello();
+    assert!(state.quota_bus().hello_acked());
+    let access = state.quota_bus().access().unwrap();
+    assert_eq!(access.module_id, "astrocyte");
+    assert!(access.nonce == "fixture-handoff");
 }
 
 #[test]
@@ -627,6 +645,7 @@ fn quota_real_reader_credentials_attach_and_shutdown_mid_pull() {
         "astrocyte".into(),
         "fixture-handoff".into(),
     );
+    state.acknowledge_module_hello();
     let stop = Arc::new(AtomicBool::new(false));
     let reader = Reader::start(state.clone(), Some(peer.path.clone()), stop.clone()).unwrap();
     let stopping = stop.clone();
@@ -690,6 +709,7 @@ fn bus_reader_without_insula_serves_runner_step_events() {
         "astrocyte".into(),
         "fixture-handoff".into(),
     );
+    state.acknowledge_module_hello();
     let stop = Arc::new(AtomicBool::new(false));
     let reader = Reader::start(state.clone(), None, stop.clone()).unwrap();
     let (subject, body) = crate::runner_steps::test_event(&names, "minimal", "thalamus", |_| {});

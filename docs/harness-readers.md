@@ -407,6 +407,13 @@ pages `usage.read` with a limit of 1,000. Each page commits events, set-aside
 evidence and the durable cursor in one ingest transaction before `usage.ack` is
 called. A failed acknowledgement leaves committed facts intact; subsequent drains
 retry acknowledgement and accept identical redelivery without recording spend twice.
+The media feed and event-bus readers share a staged launch identity released only after
+the daemon accepts HELLO. The media route uses the SDK's separate consumer
+connection and implicit identity from the process's cached launch nonce, so the
+daemon attests the caller as astrocyte. A connection file alone never authorizes
+an unattested fallback. The SDK retries route admission for at most ten seconds
+inside a tick and preserves typed refusals when that budget ends. Refusal messages
+and details are not logged because they could echo the launch credential.
 The reader never waits for colliculus during boot. An uninstalled or unregistered
 module has no runtime row and does not degrade health. Daemon warming, reloading
 and stale-route refusals defer the drain without changing health and log once per

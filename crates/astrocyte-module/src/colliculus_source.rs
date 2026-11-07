@@ -1,5 +1,7 @@
 //! Acknowledged media usage, drained only on full refresher ticks.
 
+use std::path::Path;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -11,9 +13,10 @@ use cortexkit_role_media::usage::{
 use rusqlite::{params, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use subc_protocol::{error_codes, FrameType};
-use subc_transport::{authenticate_client, connection_file};
-use tokio::net::TcpStream;
+use subc_client_rs::{
+    CallError, CallOptions, ConsumerOptions, NotSentCause, RouteHandle, SubcConsumer,
+};
+use subc_protocol::{error_codes, RouteTarget, SUBC_MODULE_ID_ENV};
 
 use crate::refresher::{harness_drain, SetAsideRecord, SourceDrainError};
 use crate::state::SharedState;
@@ -43,42 +46,90 @@ fn refusal(code: &str, detail: &Value) -> FeedError {
         | error_codes::MODULE_RELOADING
         | error_codes::UNKNOWN_CHANNEL
         | error_codes::STALE_ROUTE_EPOCH => FeedError::Transient(code.into()),
+        "bad_consumer_identity" => FeedError::Failed("colliculus identity refused".into()),
         _ => FeedError::Failed(format!("colliculus refusal {code}: {detail}")),
     }
 }
 
+fn call_options() -> CallOptions {
+    // The SDK normally waits through long module restarts. Keep its backoff and
+    // implicit launch identity, but bound retries to this reader's tick budget.
+    CallOptions {
+        timeout: BUDGET,
+        route_retry_deadline: BUDGET,
+        ..CallOptions::default()
+    }
+}
+
+fn sdk_error(error: CallError) -> FeedError {
+    let cause = error.not_sent_cause();
+    let code = error
+        .route_open_refusal()
+        .map(|body| body.code.as_str())
+        .or_else(|| error.code())
+        .or(match &cause {
+            Some(
+                NotSentCause::RouteOpenRefused { code }
+                | NotSentCause::DaemonRefusedBeforeForward { code },
+            ) => Some(code.as_str()),
+            _ => None,
+        });
+    // A daemon refusal can echo the route's launch credential. Retain only the
+    // known structural codes, never its message, detail or debug rendering.
+    match code {
+        Some(
+            code @ (error_codes::UNKNOWN_MODULE
+            | error_codes::MODULE_REMOVED
+            | error_codes::MODULE_WARMING
+            | error_codes::MODULE_RELOADING
+            | error_codes::UNKNOWN_CHANNEL
+            | error_codes::STALE_ROUTE_EPOCH
+            | error_codes::TARGET_UNAVAILABLE
+            | "feed_not_admitted"
+            | "bad_consumer_identity"),
+        ) => refusal(code, &Value::Null),
+        _ => FeedError::Failed("colliculus operation unavailable".into()),
+    }
+}
+
 struct Route {
-    stream: TcpStream,
-    channel: u16,
-    epoch: u32,
-    correlation: u64,
+    consumer: SubcConsumer,
+    handle: RouteHandle,
 }
 
 impl Route {
+    async fn open(path: &Path) -> Result<Self, FeedError> {
+        let consumer = tokio::time::timeout(
+            BUDGET,
+            SubcConsumer::connect(path, ConsumerOptions::default()),
+        )
+        .await
+        .map_err(|_| "colliculus connection timeout".to_string())?
+        .map_err(|_| "colliculus daemon connection unavailable".to_string())?;
+        let identity =
+            serde_json::from_value(json!({"harness":"ck-astrocyte","session":"media-usage"}))
+                .map_err(|_| "colliculus route identity invalid".to_string())?;
+        let handle = consumer
+            .open_route(
+                RouteTarget::ManagementSurface {
+                    module_id: SOURCE_KEY.into(),
+                },
+                identity,
+                call_options(),
+            )
+            .await
+            .map_err(sdk_error)?;
+        Ok(Self { consumer, handle })
+    }
+
     async fn exchange(&mut self, body: Value) -> Result<Value, FeedError> {
         let bytes = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
-        let response = crate::peer_exchange::exchange(
-            &mut self.stream,
-            self.channel,
-            self.epoch,
-            self.correlation,
-            bytes,
-            crate::peer_exchange::ExchangeMode::Peer,
-        )
-        .await?;
-        self.correlation += 1;
-        let value: Value =
-            serde_json::from_slice(&response.body).map_err(|error| error.to_string())?;
-        if response.header.ty == FrameType::Error {
-            return Err(refusal(
-                value.get("code").and_then(Value::as_str).unwrap_or(""),
-                &value,
-            ));
-        }
-        if response.header.ty != FrameType::Response {
-            return Err(FeedError::Failed("unexpected colliculus frame type".into()));
-        }
-        Ok(value)
+        let response = self
+            .consumer
+            .request(&self.handle, bytes, call_options())
+            .await
+            .map_err(sdk_error)?;
+        serde_json::from_slice(&response).map_err(|error| error.to_string().into())
     }
 
     async fn request<T: DeserializeOwned>(
@@ -86,12 +137,9 @@ impl Route {
         method: &str,
         params: Value,
     ) -> Result<T, FeedError> {
-        let value = tokio::time::timeout(
-            BUDGET,
-            self.exchange(json!({"method":method,"params":params})),
-        )
-        .await
-        .map_err(|_| "colliculus response timeout".to_string())??;
+        let value = self
+            .exchange(json!({"method":method,"params":params}))
+            .await?;
         serde_json::from_value(
             value
                 .get("result")
@@ -115,55 +163,41 @@ impl Route {
 }
 
 pub(crate) struct ColliculusSource {
-    connection_file: PathBuf,
+    #[cfg(test)]
+    fixture_connection: Option<PathBuf>,
     transient_logged: AtomicBool,
 }
 
 impl ColliculusSource {
-    pub(crate) fn new(connection_file: PathBuf) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            connection_file,
+            #[cfg(test)]
+            fixture_connection: None,
             transient_logged: AtomicBool::new(false),
         }
     }
 
-    async fn open(&self) -> Result<Route, FeedError> {
-        let metadata = connection_file::read(&self.connection_file)
-            .map_err(|error| format!("connection file: {error:?}"))?;
-        let endpoint = metadata
-            .endpoints
-            .first()
-            .ok_or("no daemon endpoint".to_string())?;
-        let mut stream = crate::peer_exchange::connect_endpoint(&endpoint.host, endpoint.port)
-            .await
-            .map_err(|error| format!("daemon connect: {error}"))?;
-        authenticate_client(&mut stream, &metadata, BUDGET)
-            .await
-            .map_err(|error| format!("daemon authentication: {error:?}"))?;
-        let mut route = Route {
-            stream,
-            channel: 0,
-            epoch: 0,
-            correlation: 1,
-        };
-        let opened = route
-            .exchange(json!({
-                "op":"route.open", "target":{"kind":"management_surface","module_id":SOURCE_KEY},
-                "identity":{"harness":"ck-astrocyte","session":"media-usage"}
-            }))
-            .await?;
-        route.channel = opened
-            .get("route_channel")
-            .and_then(Value::as_u64)
-            .and_then(|value| u16::try_from(value).ok())
-            .filter(|value| *value != 0)
-            .ok_or("invalid route channel".to_string())?;
-        route.epoch = opened
-            .get("route_epoch")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or("invalid route epoch".to_string())?;
-        Ok(route)
+    async fn open(&self, state: &SharedState) -> Result<Route, FeedError> {
+        #[cfg(test)]
+        if let Some(path) = &self.fixture_connection {
+            return Route::open(path).await;
+        }
+        let access = state
+            .quota_bus()
+            .access()
+            .ok_or("colliculus attested module identity unavailable".to_string())?;
+        let nonce = subc_os::launch_nonce()
+            .map_err(|_| "colliculus launch identity unavailable".to_string())?;
+        // The SDK derives implicit identity from the same process cache as HELLO.
+        // Refuse before connecting if it cannot attest the identity we staged.
+        if std::env::var(SUBC_MODULE_ID_ENV).ok().as_deref() != Some(access.module_id.as_str())
+            || nonce.as_ref().map(|value| value.value()) != Some(access.nonce.as_str())
+        {
+            return Err(FeedError::Failed(
+                "colliculus attested module identity unavailable".into(),
+            ));
+        }
+        Route::open(&access.path).await
     }
 
     async fn drain(
@@ -189,9 +223,7 @@ impl ColliculusSource {
         if stop.load(Ordering::Relaxed) {
             return Err(FeedError::Stopped);
         }
-        let mut route = tokio::time::timeout(BUDGET, self.open())
-            .await
-            .map_err(|_| "colliculus route timeout".to_string())??;
+        let mut route = self.open(state).await?;
         // A prior acknowledgement can be lost after the page committed. Retrying
         // the durable watermark also releases retained records on a quiet feed.
         if cursor > 0 {
@@ -285,8 +317,15 @@ impl harness_drain::HarnessSource for ColliculusSource {
         now: i64,
         stop: &AtomicBool,
     ) -> Result<Option<String>, SourceDrainError> {
-        // The transport runtime is owned by the blocking refresher thread, and
-        // route admission is attempted only during a tick, never during boot.
+        #[cfg(not(test))]
+        let wait_for_hello = true;
+        #[cfg(test)]
+        let wait_for_hello = self.fixture_connection.is_none();
+        if wait_for_hello && !state.quota_bus().hello_acked() {
+            return Err(SourceDrainError::Deferred);
+        }
+        // The blocking refresher owns this runtime. Consumer tasks and their
+        // connections are dropped with it after the drain ends.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

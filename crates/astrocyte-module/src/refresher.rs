@@ -1670,16 +1670,13 @@ pub fn start_refresher(
     )
 }
 
-/// Adds the media feed using the daemon connection supplied at module launch.
+/// Adds the media feed, which waits for the shared attested launch identity.
 pub fn start_refresher_with_media(
     state: Arc<SharedState>,
     stop: Arc<AtomicBool>,
-    connection_file: std::path::PathBuf,
 ) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
     let mut sources = refresher_harness_sources();
-    sources.push(Arc::new(colliculus_source::ColliculusSource::new(
-        connection_file,
-    )));
+    sources.push(Arc::new(colliculus_source::ColliculusSource::new()));
     spawn_refresher(
         state,
         stop,

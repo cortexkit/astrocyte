@@ -3,6 +3,7 @@ use crate::refresher::harness_drain::HarnessSource;
 use crate::state::test_state;
 use crate::test_support::Background;
 use std::sync::{Arc, Mutex};
+use subc_protocol::FrameType;
 use subc_protocol::{Flags, Frame, Priority};
 
 type Reply = Arc<dyn Fn(&Value) -> (FrameType, Value) + Send + Sync>;
@@ -15,7 +16,10 @@ struct Peer {
 
 impl Peer {
     fn start(reply: Reply) -> Self {
-        let (listener, path, connection) = crate::test_support::fake_daemon("media-feed", 41, 42);
+        let (listener, path, mut connection) =
+            crate::test_support::fake_daemon("media-feed", 41, 42);
+        connection.daemon_ver = "0.39.0".into();
+        subc_transport::connection_file::write_atomic(&path, &connection).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let capture = requests.clone();
         let (release, mut released) = tokio::sync::oneshot::channel();
@@ -35,7 +39,12 @@ impl Peer {
                                 while let Ok(Some(request)) = read_frame(&mut stream).await {
                                     let value: Value = serde_json::from_slice(&request.body).unwrap();
                                     capture.lock().unwrap().push(value.clone());
-                                    let (kind, value) = reply(&value);
+                                    let (kind, mut value) = reply(&value);
+                                    // Error frames require a message even when a
+                                    // fixture cares only about the structural code.
+                                    if kind == FrameType::Error && value.get("message").is_none() {
+                                        value["message"] = json!("fixture refusal");
+                                    }
                                     let response = Frame::build(kind, Flags::new(false, Priority::Passive, false), request.header.channel, request.header.epoch, request.header.corr, serde_json::to_vec(&value).unwrap()).unwrap();
                                     if write_frame(&mut stream, &response).await.is_err() || stream.flush().await.is_err() { return; }
                                 }
@@ -54,7 +63,9 @@ impl Peer {
         }
     }
     fn source(&self) -> ColliculusSource {
-        ColliculusSource::new(self.path.clone())
+        let mut source = ColliculusSource::new();
+        source.fixture_connection = Some(self.path.clone());
+        source
     }
     fn calls(&self, method: &str) -> Vec<Value> {
         self.requests
@@ -77,7 +88,7 @@ impl Drop for Peer {
 fn opened() -> (FrameType, Value) {
     (
         FrameType::Response,
-        json!({"route_channel":7,"route_epoch":1}),
+        json!({"op":"route.open","route_channel":7,"route_epoch":1}),
     )
 }
 fn result(value: Value) -> (FrameType, Value) {
@@ -555,6 +566,149 @@ fn media_exclusion_key_is_known_and_default_on() {
     assert!(peer.requests.lock().unwrap().is_empty());
     assert_eq!(count(&state, "usage_event"), 0);
     assert_eq!(peer.source().source_key(), SOURCE_KEY);
+}
+
+#[test]
+fn media_attestation_requires_launch_identity_without_connection_file_fallback() {
+    let state = test_state();
+    let peer = Peer::start(fixed_page(vec![vendor_entry(1)]));
+    state.install_quota_bus_access(
+        peer.path.clone(),
+        "astrocyte".into(),
+        "fixture-handoff".into(),
+    );
+    let source = ColliculusSource::new();
+    tick(&state, &source);
+    state.acknowledge_module_hello();
+    tick(&state, &source);
+    assert!(
+        peer.requests.lock().unwrap().is_empty(),
+        "a readable connection file must not permit an unattested media route"
+    );
+    assert_eq!(count(&state, "usage_event"), 0);
+    assert_eq!(cursor(&state), None);
+}
+
+#[test]
+fn media_attestation_refusal_never_includes_the_launch_nonce() {
+    let error = refusal(
+        "bad_consumer_identity",
+        &json!({"code":"bad_consumer_identity","message":"fixture-sensitive-nonce"}),
+    );
+    assert_eq!(
+        error,
+        FeedError::Failed("colliculus identity refused".into())
+    );
+}
+
+#[test]
+fn media_sdk_uses_attested_launch_identity() {
+    // The nonce cache is process-wide. A child gives the real SDK a supervised
+    // launch without changing the environment of concurrently running tests.
+    if std::env::var("ASTROCYTE_MEDIA_NONCE_TEST").as_deref() != Ok("child") {
+        subc_os::launch_nonce().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "refresher::colliculus_source::tests::media_sdk_uses_attested_launch_identity",
+                "--nocapture",
+            ])
+            .env("ASTROCYTE_MEDIA_NONCE_TEST", "child")
+            .env(SUBC_MODULE_ID_ENV, "astrocyte")
+            .env("SUBC_LAUNCH_NONCE", "fixture-handoff")
+            .env_remove("SUBC_LAUNCH_NONCE_FD");
+        let output = crate::test_support::output_within(&mut command, "attested media consumer");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    subc_os::launch_nonce().unwrap();
+    let peer = Peer::start(fixed_page(vec![vendor_entry(1)]));
+    let state = test_state();
+    state.install_quota_bus_access(
+        peer.path.clone(),
+        "astrocyte".into(),
+        "fixture-handoff".into(),
+    );
+    let source = ColliculusSource::new();
+    tick(&state, &source);
+    assert!(
+        peer.requests.lock().unwrap().is_empty(),
+        "route opened before HELLO_ACK"
+    );
+    state.acknowledge_module_hello();
+    tick(&state, &source);
+    assert_eq!(count(&state, "usage_event"), 1);
+    assert_eq!(cursor(&state).as_deref(), Some("1"));
+    let requests = peer.requests.lock().unwrap();
+    let opens: Vec<_> = requests
+        .iter()
+        .filter(|value| value["op"] == "route.open")
+        .collect();
+    assert_eq!(opens.len(), 1);
+    assert_eq!(
+        opens[0]["target"],
+        json!({"kind":"management_surface","module_id":"colliculus"})
+    );
+    assert_eq!(opens[0]["consumer_identity"]["module_id"], "astrocyte");
+    assert!(opens[0]["consumer_identity"]["launch_nonce"] == "fixture-handoff");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|value| value["method"] == "usage.ack")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn media_sdk_warming_deadline_keeps_typed_refusal_deferred() {
+    let peer = Peer::start(Arc::new(|_| {
+        (
+            FrameType::Error,
+            json!({"code":error_codes::MODULE_WARMING,"message":"still starting"}),
+        )
+    }));
+    let state = test_state();
+    let prior_runtime_rows = count(&state, "source_runtime");
+    let source = peer.source();
+    let outcome = harness_drain::HarnessSource::drain_for_health(
+        &source,
+        &state,
+        100,
+        &AtomicBool::new(false),
+    );
+    assert!(matches!(outcome, Err(SourceDrainError::Deferred)));
+    assert_eq!(count(&state, "source_runtime"), prior_runtime_rows);
+    assert_eq!(count(&state, "media_feed_cursor"), 0);
+    assert!(state.producer_degraded_reason(SOURCE_KEY).is_none());
+    assert!(
+        peer.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|value| value["op"] == "route.open")
+            .count()
+            > 1
+    );
+    assert!(peer.calls("usage.read").is_empty());
+    assert!(peer.calls("usage.ack").is_empty());
+}
+
+#[test]
+fn media_sdk_error_retains_only_safe_structural_codes() {
+    for code in ["bad_consumer_identity", "fixture-sensitive-nonce"] {
+        let body = serde_json::from_value(json!({"code":code,"message":"fixture-sensitive-nonce","detail":{"launch_nonce":"fixture-sensitive-nonce"}})).unwrap();
+        let error = sdk_error(CallError::Module(body));
+        assert!(
+            matches!(error, FeedError::Failed(ref reason) if !reason.contains("fixture-sensitive-nonce"))
+        );
+    }
 }
 
 #[test]

@@ -321,13 +321,10 @@ async fn run(config: ModuleConfig, state: Arc<SharedState>) -> Result<LoopEnd, M
             // during hydration still has the default disposition: nothing has
             // started that needs stopping.
             let sigterm = sigterm_received()?;
-            let media_connection = config.connection_file_path.clone();
             serve_module(
                 &config,
                 state,
-                move |state, stop| {
-                    astrocyte_module::start_refresher_with_media(state, stop, media_connection)
-                },
+                astrocyte_module::start_refresher_with_media,
                 sigterm,
             )
             .await
@@ -590,7 +587,7 @@ where
     connect().await
 }
 
-/// Share the process's one launch-nonce read with the attested ckbus client.
+/// Stage the process's cached launch identity for attested module consumers.
 ///
 /// `subc_os::launch_nonce` reads the nonce once per process and caches it;
 /// `main` takes it before anything else starts, and the serve helper's HELLO
@@ -643,6 +640,10 @@ struct AstrocyteHandler {
 
 #[async_trait]
 impl ModuleHandler for AstrocyteHandler {
+    async fn on_hello_ack(&self, _ack: &subc_protocol::ModuleHelloAckBody) {
+        self.state.acknowledge_module_hello();
+    }
+
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let request = match decode_route_request(&body) {
             Ok(request) => request,
