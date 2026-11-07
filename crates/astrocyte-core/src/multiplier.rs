@@ -1033,7 +1033,6 @@ fn lookup_missing(lookup: &Result<CatalogLookup, CatalogClientError>) -> bool {
             snapshot.facts.is_empty()
                 && snapshot.withheld_facts.is_empty()
                 && snapshot.uncertain_facts.is_empty()
-                && snapshot.overridden_facts.is_empty()
         }
         // A historical refusal classified as outside coverage arrives as a
         // definite no-coverage outcome now; the error arm stays for a current
@@ -1067,6 +1066,11 @@ fn rates_from_snapshot(snapshot: &CatalogSnapshot) -> ModelResolution {
                 reason: RATE_FACT_UNRECOGNIZED.into(),
             };
         };
+        // Subscription reference value counts only tokens. Duration, image
+        // and request prices must neither replace token rates nor fail a day.
+        if parsed.unit.is_some() {
+            continue;
+        }
         let state = rate_state(snapshot, key);
         // Checked on every key, including conditions that never apply: a
         // value astrocyte cannot read means it cannot read what the catalog
@@ -1114,6 +1118,7 @@ fn rate_state(snapshot: &CatalogSnapshot, key: &str) -> RateState {
     }
     match serde_json::from_value::<RateValue>(entry.clone()) {
         Err(_) => unpriced(RATE_UNDECODABLE),
+        Ok(RateValue::Priced { per: Some(_), .. }) => unpriced(RATE_UNDECODABLE),
         // Billing-plane claims are not API reference rates. This consumer
         // makes ordinary catalog reads and does not resolve plane rules.
         Ok(RateValue::BilledAs { .. }) => unpriced(RATE_UNDECODABLE),
@@ -1141,7 +1146,11 @@ fn rate_state(snapshot: &CatalogSnapshot, key: &str) -> RateState {
             inherited_from: _,
         }) => unpriced(match reason {
             ProtocolUnpricedReason::MissingRate => "no_rate",
-            ProtocolUnpricedReason::NoCatalogCoverage => "no_catalog_coverage",
+            // Without an API card there is no reference price with which to
+            // value subscription tokens, just like missing catalog coverage.
+            ProtocolUnpricedReason::NoCatalogCoverage | ProtocolUnpricedReason::NoApiCard => {
+                "no_catalog_coverage"
+            }
             ProtocolUnpricedReason::UnknownChargeBasis => "catalog_unknown_charge_basis",
             ProtocolUnpricedReason::NotEstablished => RATE_UNDECODABLE,
         }),
@@ -4167,7 +4176,7 @@ mod tests {
             facts,
             withheld_facts: BTreeMap::new(),
             uncertain_facts: BTreeMap::new(),
-            overridden_facts: BTreeMap::new(),
+            fact_overrides: BTreeMap::new(),
         };
         ResolvedRates {
             resolved_at_ms: 42,
@@ -4373,7 +4382,7 @@ mod tests {
             ]),
             withheld_facts: BTreeMap::new(),
             uncertain_facts: BTreeMap::new(),
-            overridden_facts: BTreeMap::new(),
+            fact_overrides: BTreeMap::new(),
         };
         let resolution = rates_from_snapshot(&snapshot);
         assert!(
@@ -4408,7 +4417,7 @@ mod tests {
             )]),
             withheld_facts: BTreeMap::new(),
             uncertain_facts: BTreeMap::new(),
-            overridden_facts: BTreeMap::new(),
+            fact_overrides: BTreeMap::new(),
         };
         assert_eq!(
             rates_from_snapshot(&snapshot),
@@ -4432,7 +4441,7 @@ mod tests {
                 facts: BTreeMap::from([("rate.input".into(), entry)]),
                 withheld_facts: BTreeMap::new(),
                 uncertain_facts: BTreeMap::new(),
-                overridden_facts: BTreeMap::new(),
+                fact_overrides: BTreeMap::new(),
             };
             assert_eq!(
                 rates_from_snapshot(&snapshot),
@@ -4497,6 +4506,7 @@ mod tests {
                 period: "month".into(),
             }),
             quota_value: None,
+            service_tiers: None,
             refusal_reason: refusal.map(str::to_string),
             boundary_at_ms: 0,
             established_by: "fusiform".into(),
@@ -5202,7 +5212,12 @@ mod tests {
                     models: BTreeMap::from([("google/gemini-3.8-flash".into(), self.0.clone())]),
                     withheld: vec![],
                     uncertain: vec![],
-                    overridden: vec![],
+                    next_page_token: None,
+                    curated: vec![],
+                    quality_scores: None,
+                    canonical_links: vec![],
+                    wire_corrections: vec![],
+                    fact_overrides: vec![],
                     retired: vec![],
                     aliased: vec![],
                     plane: None,
@@ -5385,7 +5400,12 @@ mod tests {
                     )]),
                     withheld: vec![],
                     uncertain: vec![],
-                    overridden: vec![],
+                    next_page_token: None,
+                    curated: vec![],
+                    quality_scores: None,
+                    canonical_links: vec![],
+                    wire_corrections: vec![],
+                    fact_overrides: vec![],
                     retired: vec![],
                     aliased: vec![],
                     plane: None,
@@ -5489,7 +5509,12 @@ mod tests {
                 models,
                 withheld: vec![],
                 uncertain: vec![],
-                overridden: vec![],
+                next_page_token: None,
+                curated: vec![],
+                quality_scores: None,
+                canonical_links: vec![],
+                wire_corrections: vec![],
+                fact_overrides: vec![],
                 retired: vec![],
                 aliased: self.aliased.clone(),
                 plane: None,
@@ -5565,7 +5590,12 @@ mod tests {
                 models: BTreeMap::from([(model_key, rates?)]),
                 withheld: vec![],
                 uncertain: vec![],
-                overridden: vec![],
+                next_page_token: None,
+                curated: vec![],
+                quality_scores: None,
+                canonical_links: vec![],
+                wire_corrections: vec![],
+                fact_overrides: vec![],
                 retired: vec![],
                 aliased: vec![],
                 plane: None,
@@ -6237,7 +6267,12 @@ mod tests {
                     models: BTreeMap::from([(format!("{provider}/{model}"), facts)]),
                     withheld: vec![],
                     uncertain: vec![],
-                    overridden: vec![],
+                    next_page_token: None,
+                    curated: vec![],
+                    quality_scores: None,
+                    canonical_links: vec![],
+                    wire_corrections: vec![],
+                    fact_overrides: vec![],
                     retired: vec![],
                     aliased: vec![],
                     plane: None,
@@ -6361,7 +6396,7 @@ mod tests {
             ]),
             withheld_facts: BTreeMap::from([("rate.cache_read".to_string(), json!({}))]),
             uncertain_facts: BTreeMap::new(),
-            overridden_facts: BTreeMap::new(),
+            fact_overrides: BTreeMap::new(),
         };
         let ModelResolution::Rates(rates) = rates_from_snapshot(&snapshot) else {
             panic!("rates expected");
@@ -6422,7 +6457,7 @@ mod tests {
             ]),
             withheld_facts: BTreeMap::new(),
             uncertain_facts: BTreeMap::new(),
-            overridden_facts: BTreeMap::new(),
+            fact_overrides: BTreeMap::new(),
         };
         let ModelResolution::Rates(rates) = rates_from_snapshot(&snapshot) else {
             panic!("rates expected");

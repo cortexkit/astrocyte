@@ -48,7 +48,7 @@ cortexkit-bus-trait = "=0.3.0"
 async-nats = { version = "=0.50.0", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
 base64 = "=0.22.1"
 futures-util = "0.3"
-fusiform-protocol = "=0.30.0"
+fusiform-protocol = "=0.52.0"
 # The `log-read-watermark/v1` wire types (`watermark` module) and the
 # `step.finished.v1` live step event (`step_events`, added in 0.7.5).
 cortexkit-role-llm-runner = "=0.8.15"

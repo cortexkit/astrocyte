@@ -7608,6 +7608,7 @@ mod multiplier_stage_tests {
         plan_prices_fail: std::sync::atomic::AtomicBool,
         input_rate_units: std::sync::atomic::AtomicI64,
         unrecognized_key: std::sync::atomic::AtomicBool,
+        unit_billing: std::sync::atomic::AtomicBool,
         uncovered: std::sync::atomic::AtomicBool,
     }
 
@@ -7619,6 +7620,7 @@ mod multiplier_stage_tests {
                 plan_prices_fail: std::sync::atomic::AtomicBool::new(plan_prices_fail),
                 input_rate_units: std::sync::atomic::AtomicI64::new(10_000_000_000),
                 unrecognized_key: std::sync::atomic::AtomicBool::new(false),
+                unit_billing: std::sync::atomic::AtomicBool::new(false),
                 uncovered: std::sync::atomic::AtomicBool::new(false),
             })
         }
@@ -7664,6 +7666,24 @@ mod multiplier_stage_tests {
             if self.unrecognized_key.load(Ordering::SeqCst) {
                 facts.insert("rate.input.above_context.272k".to_string(), rate);
             }
+            if self.unit_billing.load(Ordering::SeqCst) {
+                let unit_rate = json!({"state":"priced","units":4_500_000,"exponent":9,"currency":"USD",
+                    "unit_provenance":{"kind":"stated"},"per":60,
+                    "increment":{"kind":"unknown"},"minimum_quantity":{"kind":"unknown"}});
+                facts.insert("rate.input_audio.per_second".into(), unit_rate.clone());
+                facts.insert("rate.input.per_character".into(), unit_rate.clone());
+                facts.insert(
+                    "rate.output.per_image.size.large.quality.high".into(),
+                    unit_rate,
+                );
+                for role in ["output_audio", "cached_input_audio"] {
+                    facts.insert(
+                        format!("rate.{role}"),
+                        json!({"state":"priced","units":1,"exponent":9,
+                        "currency":"USD","unit_provenance":{"kind":"stated"}}),
+                    );
+                }
+            }
             Ok(CatalogGetResponse {
                 source: "models.dev".into(),
                 resolved_at_ms: request.at_ms.unwrap(),
@@ -7671,7 +7691,12 @@ mod multiplier_stage_tests {
                 models: BTreeMap::from([(key, facts)]),
                 withheld: vec![],
                 uncertain: vec![],
-                overridden: vec![],
+                next_page_token: None,
+                curated: vec![],
+                quality_scores: None,
+                canonical_links: vec![],
+                wire_corrections: vec![],
+                fact_overrides: vec![],
                 retired: vec![],
                 aliased: vec![],
                 plane: None,
@@ -7703,6 +7728,7 @@ mod multiplier_stage_tests {
                         period: "month".into(),
                     }),
                     quota_value: None,
+                    service_tiers: None,
                     refusal_reason: None,
                     boundary_at_ms: 0,
                     established_by: "fusiform".into(),
@@ -7957,6 +7983,22 @@ mod multiplier_stage_tests {
                 .map_err(|error| error.to_string())).unwrap();
             assert_eq!(recorded, if declared { "[\"openai\"]" } else { "[]" });
         }
+    }
+
+    #[test]
+    fn unit_billing_multiplier_day_ignores_non_token_catalog_rates() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(state::leased_test_state(&directory));
+        publish_desired(&state, &directory);
+        seed_usage(&state);
+        let fusiform = FakeFusiform::new(false);
+        fusiform.unit_billing.store(true, Ordering::SeqCst);
+        install_catalog(&state, &fusiform);
+        MultiplierStage::new(Some(fusiform)).tick(&state, false, NOW);
+        assert_eq!(
+            current_day_observations(&state),
+            [("codex".into(), DAY.into(), 10_000_000)]
+        );
     }
 
     fn observation_days(state: &SharedState) -> Vec<String> {

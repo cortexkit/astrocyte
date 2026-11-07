@@ -149,15 +149,15 @@ Scope rules can filter model prefixes. The multiplier uses public API rates of
 the model an alias points to, and strips `-low`/`-high` after a missing row, never
 `-medium`. Ledger pricing is unchanged.
 
-Pricing and the multiplier share `parse_rate_key`. Keys are `rate.<role>`
-or `rate.<role>.<selector>.<value>`. The roles are `input`, `output`, `cache_read`,
-`cache_write`, `reasoning`, and `input_audio`; any other role is refused.
-`above_context.<threshold>` tests prompt size; `mode.<name>` requires a stated
-non-standard mode and never falls back. With no stored mode, multiplier rows count
-`mode_unrecorded_tokens` and `base_rate_tier_untested_tokens`.
-Both honor `reasoning_billed_as_output`; unlisted reasoning needs its own rate.
-Ledger coverage and whole-event `rate_tiered` refusals precede selection.
-Charges record `fact_key` in `catalog_entry`.
+Pricing and the multiplier share `parse_rate_key`. Token keys retain their
+per-million denominator and single-selector grammar, with `output_audio` and
+`cached_input_audio` added beside `input_audio`. Unit keys put `per_second`,
+`per_character`, `per_image`, or `per_request` immediately after the role and
+require a positive `per`; request billing uses `rate.request.per_request`.
+The multiplier skips unit rates. Token mode, context-tier and reasoning billing
+rules are unchanged. Charges record the selected fact and, for unit rates,
+rounding rules and raw and priced quantities in `catalog_entry`.
+[The data model](docs/data-model.md) describes selectors and exact rounding.
 
 A unique index prevents a second original per provider/day. Observations wait until
 the catalog's history boundary is known. `scoped_producer_not_ingested` refuses scopes

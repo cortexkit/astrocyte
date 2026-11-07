@@ -5,6 +5,9 @@
 //! code can release the store before calling fusiform and can reject a stale
 //! resolution under the event's pricing generation.
 
+use std::collections::BTreeMap;
+
+use fusiform_protocol::money::{Increment, MinimumQuantity};
 use fusiform_protocol::{
     Amount, Floor, RateValue, UnpricedReason as ProtocolUnpricedReason, NANO_EXPONENT,
 };
@@ -14,14 +17,14 @@ use serde_json::{json, Value};
 
 use crate::canon::CanonError;
 use crate::catalog_client::{
-    mode_rate_key, stated_mode_condition, tier_thresholds, CatalogClient, CatalogClientError,
-    CatalogLookup, CatalogSnapshot,
+    mode_rate_key, parse_rate_key, stated_mode_condition, tier_thresholds, CatalogClient,
+    CatalogClientError, CatalogLookup, CatalogSnapshot, RATE_ROLES, RATE_UNITS,
 };
 use crate::fact::ChargeBasis;
 use crate::ingest::INCLUSIVE_OUTPUT_SOURCE;
 use crate::money::{round_nano_num, MoneyError, NUMERATOR_SCALE};
 
-/// Catalog rates quote nanodollars per million (10^6) quantity units. This
+/// Token rates quote nanodollars per million (10^6) tokens. This
 /// exponent is distinct from NUMERATOR_SCALE, the millionths-of-a-nanodollar
 /// scale `money` uses to round stored amounts.
 const RATE_UNIT_EXPONENT: i32 = 6;
@@ -287,6 +290,9 @@ struct MeasurementPlan {
     role: String,
     unit: String,
     source: String,
+    // Media records do not carry price selectors yet. Keeping them internal
+    // lets selection stay exact without adding an unstated input contract.
+    price_selectors: BTreeMap<String, String>,
     quantity_units: Option<i64>,
     quantity_exponent: Option<i32>,
     current_head: Option<CurrentHead>,
@@ -480,6 +486,7 @@ fn read_plan_in_tx(
             };
             Ok(MeasurementPlan {
                 role: row.get(0)?,
+                price_selectors: BTreeMap::new(),
                 unit: row.get(1)?,
                 source: row.get(6)?,
                 quantity_units: row.get(2)?,
@@ -1146,12 +1153,7 @@ fn resolve_measurement(
     // rate; a model that serves none leaves it unpriced (`no_rate`) rather
     // than pricing it at the standard rate. A request recorded as standard,
     // or with no recorded mode, prices at the unconditional rate.
-    let fact_key = rate_fact_key(rate_role, &measurement.unit).map(|base| {
-        match stated_mode_condition(recorded_mode) {
-            Some(mode) => mode_rate_key(rate_role, mode),
-            None => base.to_string(),
-        }
-    });
+    let fact_key = measurement_rate_key(snapshot, measurement, rate_role, recorded_mode);
     let Some(fact_key) = fact_key.as_deref() else {
         return Ok(ChargeDecision::Unpriced {
             reason: UnpricedReason::NoRate,
@@ -1191,14 +1193,38 @@ fn resolve_measurement(
     let mut provenance = json!({
         "fact_key": fact_key,
         "value": entry,
-        "overridden": snapshot.overridden_facts.get(fact_key),
+        "overridden": null,
     });
+    // Ordinary token entries retain their serialized shape; sourced overrides
+    // are recorded separately under fact_override.
+    if let Some(override_entry) = snapshot.fact_overrides.get(fact_key) {
+        provenance["fact_override"] = override_entry.clone();
+    }
     let rate = serde_json::from_value::<RateValue>(entry.clone()).map_err(|error| {
         CatalogClientError::InvalidRate {
             reason: error.to_string(),
             entry: entry.clone(),
         }
     })?;
+    if let RateValue::Priced {
+        per,
+        increment,
+        minimum_quantity,
+        ..
+    } = &rate
+    {
+        let is_token = measurement.unit == "token";
+        if (is_token && per.is_some())
+            || (!is_token && !per.is_some_and(|per| per > 0))
+            || matches!(increment, Increment::Quantum { quantity: 0 })
+            || matches!(minimum_quantity, MinimumQuantity::Minimum { quantity: 0 })
+        {
+            return Err(CatalogClientError::InvalidRate {
+                reason: "token rates must omit per; unit rates require a positive per and positive quantity rules".into(),
+                entry: entry.clone(),
+            }.into());
+        }
+    }
     match rate {
         // Astrocyte reads the ordinary catalog, not a billing plane. Keep
         // refusing plane-only values rather than interpreting them as charges.
@@ -1234,6 +1260,9 @@ fn resolve_measurement(
             amount,
             floor,
             inherited_from: None,
+            per,
+            increment,
+            minimum_quantity,
         } => {
             if amount.exponent != NANO_EXPONENT {
                 return Err(CatalogClientError::InvalidRate {
@@ -1245,7 +1274,26 @@ fn resolve_measurement(
                 }
                 .into());
             }
-            match price_exact(&amount, quantity_units, quantity_exponent) {
+            let price = if let Some(per) = per {
+                provenance["per"] = json!(per);
+                provenance["increment"] = json!(increment);
+                provenance["minimum_quantity"] = json!(minimum_quantity);
+                provenance["raw_quantity"] =
+                    json!({"units":quantity_units,"exponent":quantity_exponent});
+                adjusted_unit_quantity(
+                    quantity_units,
+                    quantity_exponent,
+                    &increment,
+                    &minimum_quantity,
+                )
+                .and_then(|(units, exponent)| {
+                    provenance["priced_quantity"] = json!({"units":units,"exponent":exponent});
+                    price_unit_exact(&amount, units, exponent, per)
+                })
+            } else {
+                price_exact(&amount, quantity_units, quantity_exponent)
+            };
+            match price {
                 Ok(charge_nanos) => Ok(ChargeDecision::Priced {
                     charge_nanos,
                     amount,
@@ -1280,7 +1328,9 @@ fn resolve_measurement(
         } => Ok(ChargeDecision::Unpriced {
             reason: match reason {
                 ProtocolUnpricedReason::MissingRate => UnpricedReason::NoRate,
-                ProtocolUnpricedReason::NoCatalogCoverage => UnpricedReason::NoCatalogCoverage,
+                ProtocolUnpricedReason::NoCatalogCoverage | ProtocolUnpricedReason::NoApiCard => {
+                    UnpricedReason::NoCatalogCoverage
+                }
                 ProtocolUnpricedReason::UnknownChargeBasis => {
                     UnpricedReason::CatalogUnknownChargeBasis
                 }
@@ -1380,6 +1430,137 @@ fn round_rational_nanos(numerator: i128, divisor: i128) -> Result<i64, MoneyErro
     round_nano_num(normalized)
 }
 
+fn measurement_rate_key(
+    snapshot: &CatalogSnapshot,
+    measurement: &MeasurementPlan,
+    role: &str,
+    recorded_mode: Option<&str>,
+) -> Option<String> {
+    if measurement.unit == "token" {
+        return rate_fact_key(role, "token").map(|base| {
+            match stated_mode_condition(recorded_mode) {
+                Some(mode) => mode_rate_key(role, mode),
+                None => base.to_string(),
+            }
+        });
+    }
+    if !RATE_UNITS.contains(&measurement.unit.as_str())
+        || (!RATE_ROLES.contains(&role) && role != "request")
+        || ((role == "request") != (measurement.unit == "request"))
+    {
+        return None;
+    }
+    let mut selectors = measurement.price_selectors.clone();
+    if let Some(mode) = recorded_mode {
+        selectors.insert("mode".into(), mode.into());
+    }
+    let base = format!("rate.{role}.per_{}", measurement.unit);
+    if selectors.is_empty() {
+        return Some(base);
+    }
+    // Selector ordering is not a pricing dimension. Match the complete set,
+    // including withheld facts, and never fall back to a less specific price.
+    let keys: std::collections::BTreeSet<_> = snapshot
+        .facts
+        .keys()
+        .chain(snapshot.withheld_facts.keys())
+        .collect();
+    let mut matches = keys.into_iter().filter(|key| {
+        parse_rate_key(key).is_ok_and(|parsed| {
+            parsed.role == role
+                && parsed.unit == Some(measurement.unit.as_str())
+                && parsed.selectors == selectors
+        })
+    });
+    let first = matches.next();
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first.cloned().unwrap_or_else(|| {
+        let mut absent = base;
+        for (selector, value) in selectors {
+            absent.push_str(&format!(".{selector}.{value}"));
+        }
+        absent
+    }))
+}
+
+/// Keeps decimal quantities exact until money reaches its single rounding site.
+fn quantity_ratio(units: i64, exponent: i32) -> Result<(i128, i128), MoneyError> {
+    if units < 0 {
+        return Err(MoneyError::OutOfRange);
+    }
+    let scale = 10_i128
+        .checked_pow(exponent.unsigned_abs())
+        .ok_or(MoneyError::OutOfRange)?;
+    if exponent >= 0 {
+        Ok((
+            i128::from(units)
+                .checked_mul(scale)
+                .ok_or(MoneyError::OutOfRange)?,
+            1,
+        ))
+    } else {
+        Ok((i128::from(units), scale))
+    }
+}
+
+fn adjusted_unit_quantity(
+    units: i64,
+    exponent: i32,
+    increment: &Increment,
+    minimum: &MinimumQuantity,
+) -> Result<(i64, i32), MoneyError> {
+    let (mut numerator, mut denominator) = quantity_ratio(units, exponent)?;
+    let mut priced = (units, exponent);
+    // A stated minimum is a floor on charged usage, so apply it after quantum
+    // rounding, even when that minimum is not itself a quantum multiple.
+    if let Increment::Quantum { quantity } = increment {
+        let quantum = i128::from(*quantity);
+        let divisor = denominator
+            .checked_mul(quantum)
+            .filter(|value| *value > 0)
+            .ok_or(MoneyError::OutOfRange)?;
+        let quanta = (numerator / divisor)
+            .checked_add(i128::from(numerator % divisor != 0))
+            .ok_or(MoneyError::OutOfRange)?;
+        numerator = quanta.checked_mul(quantum).ok_or(MoneyError::OutOfRange)?;
+        denominator = 1;
+        priced = (
+            i64::try_from(numerator).map_err(|_| MoneyError::OutOfRange)?,
+            0,
+        );
+    }
+    if let MinimumQuantity::Minimum { quantity } = minimum {
+        let floor = i128::from(*quantity)
+            .checked_mul(denominator)
+            .ok_or(MoneyError::OutOfRange)?;
+        if numerator < floor {
+            priced = (
+                i64::try_from(*quantity).map_err(|_| MoneyError::OutOfRange)?,
+                0,
+            );
+        }
+    }
+    Ok(priced)
+}
+
+fn price_unit_exact(
+    amount: &Amount,
+    units: i64,
+    exponent: i32,
+    per: u64,
+) -> Result<i64, MoneyError> {
+    let (quantity, scale) = quantity_ratio(units, exponent)?;
+    let numerator = quantity
+        .checked_mul(i128::from(amount.units))
+        .ok_or(MoneyError::OutOfRange)?;
+    let denominator = scale
+        .checked_mul(i128::from(per))
+        .ok_or(MoneyError::OutOfRange)?;
+    crate::money::round_nano_ratio(numerator, denominator)
+}
+
 fn rate_fact_key(role: &str, unit: &str) -> Option<&'static str> {
     if unit != "token" {
         return None;
@@ -1391,6 +1572,8 @@ fn rate_fact_key(role: &str, unit: &str) -> Option<&'static str> {
         "cache_write" => Some("rate.cache_write"),
         "reasoning" => Some("rate.reasoning"),
         "input_audio" => Some("rate.input_audio"),
+        "output_audio" => Some("rate.output_audio"),
+        "cached_input_audio" => Some("rate.cached_input_audio"),
         _ => None,
     }
 }
@@ -1541,6 +1724,7 @@ fn stored_integrity_error(column: usize, kind: Type, detail: String) -> rusqlite
 
 #[cfg(test)]
 mod tests {
+    include!("pricing_unit_billing_tests.rs");
 
     #[test]
     fn corrupt_head_outcome_names_the_stored_value() {
@@ -2113,7 +2297,12 @@ mod tests {
                     models: BTreeMap::from([("provider/model".into(), facts)]),
                     withheld: vec![],
                     uncertain: vec![],
-                    overridden: vec![],
+                    next_page_token: None,
+                    curated: vec![],
+                    quality_scores: None,
+                    canonical_links: vec![],
+                    wire_corrections: vec![],
+                    fact_overrides: vec![],
                     retired: vec![],
                     aliased: vec![],
                     plane: None,
@@ -3162,7 +3351,7 @@ mod tests {
             ]),
             withheld_facts: BTreeMap::new(),
             uncertain_facts: BTreeMap::new(),
-            overridden_facts: BTreeMap::new(),
+            fact_overrides: BTreeMap::new(),
         };
         let resolved = resolve_catalog_snapshot(&plan, &snapshot, &[]).unwrap();
         let tx = conn.transaction().unwrap();

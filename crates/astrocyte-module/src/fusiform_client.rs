@@ -792,6 +792,8 @@ pub(crate) mod tests {
         for _ in 0..2 {
             let before = connections.lock().unwrap().len();
             let result = client.catalog_get(CatalogGetRequest {
+                paged: false,
+                page_token: None,
                 source: None,
                 at_ms: Some(0),
                 fact_prefixes: Some(vec!["rate.".into()]),
@@ -834,6 +836,8 @@ pub(crate) mod tests {
         );
         let client = FusiformClient::new(&peer.connection_file_path).unwrap();
         let request = || CatalogGetRequest {
+            paged: false,
+            page_token: None,
             source: None,
             at_ms: Some(0),
             fact_prefixes: Some(vec!["rate.".into()]),

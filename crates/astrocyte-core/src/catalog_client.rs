@@ -60,7 +60,7 @@ pub struct CatalogSnapshot {
     pub facts: BTreeMap<String, Value>,
     pub withheld_facts: BTreeMap<String, Value>,
     pub uncertain_facts: BTreeMap<String, Value>,
-    pub overridden_facts: BTreeMap<String, Value>,
+    pub fact_overrides: BTreeMap<String, Value>,
     pub alias_target: Option<CatalogModel>,
 }
 
@@ -146,6 +146,8 @@ impl CatalogClient {
             }
         }
         let request = CatalogGetRequest {
+            paged: false,
+            page_token: None,
             source: None,
             at_ms: Some(0),
             fact_prefixes: Some(vec![RATE_FACT_PREFIX.to_string()]),
@@ -233,6 +235,8 @@ impl CatalogClient {
         auth_method: Option<&str>,
     ) -> Result<CatalogLookup, CatalogClientError> {
         let response = match self.connection.catalog_get(CatalogGetRequest {
+            paged: false,
+            page_token: None,
             source: None,
             at_ms,
             fact_prefixes: Some(vec![RATE_FACT_PREFIX.to_string()]),
@@ -295,10 +299,14 @@ impl CatalogClient {
                     .map_err(|error| CatalogClientError::ProtocolEncoding(error.to_string()))
             })
             .collect::<Result<_, _>>()?;
-        let overridden_facts = response
-            .overridden
+        let fact_overrides = response
+            .fact_overrides
             .iter()
-            .filter(|fact| fact.provider_id == provider_id && fact.model_id == model_id)
+            .filter(|fact| {
+                fact.provider_id == provider_id
+                    && fact.model_id == model_id
+                    && fact.model == model_key
+            })
             .map(|fact| {
                 serde_json::to_value(fact)
                     .map(|value| (fact.fact_key.clone(), value))
@@ -312,7 +320,7 @@ impl CatalogClient {
             facts,
             withheld_facts,
             uncertain_facts,
-            overridden_facts,
+            fact_overrides,
             alias_target,
         }))
     }
@@ -340,14 +348,19 @@ fn alias_target_from_rates(facts: &BTreeMap<String, Value>) -> Option<CatalogMod
 }
 
 /// The token roles the catalog prices, each at `rate.<role>`.
-pub const RATE_ROLES: [&str; 6] = [
+pub const RATE_ROLES: [&str; 8] = [
     "input",
     "output",
     "cache_read",
     "cache_write",
     "reasoning",
     "input_audio",
+    "output_audio",
+    "cached_input_audio",
 ];
+
+/// Non-token units have explicit denominators rather than an implied million.
+pub const RATE_UNITS: [&str; 4] = ["second", "character", "image", "request"];
 
 /// Mode names a request record uses for ordinary (non-premium) service. A
 /// request stated in one of these prices at the unconditional `rate.<role>`.
@@ -372,26 +385,66 @@ pub enum RateCondition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateKey {
     pub role: &'static str,
-    /// `None` for the unconditional `rate.<role>`.
+    /// `None` denotes the existing per-million-token grammar.
+    pub unit: Option<&'static str>,
+    /// Unit-rate selectors are an unordered set; each name appears once.
+    pub selectors: BTreeMap<String, String>,
+    /// Token-only condition; unit keys use `selectors` instead.
     pub condition: Option<RateCondition>,
 }
 
 /// The one rate-key grammar, shared by ledger pricing and the multiplier:
-/// `rate.<role>` (unconditional) or `rate.<role>.<selector>.<value>`
-/// (conditional). A key that fits neither shape, names a role outside
-/// [`RATE_ROLES`], or has an empty segment is an error. So is an
-/// `above_context` threshold that is not a whole number: that selector is one
-/// astrocyte knows, and a threshold it cannot read would otherwise decide
-/// nothing.
+/// Token keys are `rate.<role>` or `rate.<role>.<selector>.<value>`.
+/// Unit keys put `per_<unit>` immediately after the role and may carry
+/// several distinct selector/value pairs. The request role is exclusive to
+/// `rate.request.per_request`. Unknown roles and units, empty segments and
+/// repeated unit selectors are errors. Token `above_context` thresholds must
+/// be whole numbers so an unreadable threshold cannot silently select a base rate.
 pub fn parse_rate_key(key: &str) -> Result<RateKey, String> {
     let rest = key
         .strip_prefix(RATE_FACT_PREFIX)
         .ok_or_else(|| format!("rate key {key:?} does not start with {RATE_FACT_PREFIX:?}"))?;
     let segments: Vec<&str> = rest.split('.').collect();
+    let unit = segments
+        .get(1)
+        .and_then(|segment| segment.strip_prefix("per_"));
     let role = RATE_ROLES
         .into_iter()
+        .chain((unit == Some("request")).then_some("request"))
         .find(|role| *role == segments[0])
         .ok_or_else(|| format!("rate key {key:?}: role {:?} is not priced", segments[0]))?;
+    if let Some(unit) = unit {
+        let unit = RATE_UNITS
+            .into_iter()
+            .find(|known| *known == unit)
+            .ok_or_else(|| format!("rate key {key:?}: unsupported unit {unit:?}"))?;
+        if (role == "request") != (unit == "request") {
+            return Err(format!(
+                "rate key {key:?}: request billing requires rate.request.per_request"
+            ));
+        }
+        let (pairs, trailing) = segments[2..].as_chunks::<2>();
+        if !trailing.is_empty() || pairs.iter().flatten().any(|segment| segment.is_empty()) {
+            return Err(format!(
+                "rate key {key:?}: selectors require nonempty name/value pairs"
+            ));
+        }
+        let mut selectors = BTreeMap::new();
+        for pair in pairs {
+            if selectors
+                .insert(pair[0].to_string(), pair[1].to_string())
+                .is_some()
+            {
+                return Err(format!("rate key {key:?}: repeated selector {:?}", pair[0]));
+            }
+        }
+        return Ok(RateKey {
+            role,
+            unit: Some(unit),
+            selectors,
+            condition: None,
+        });
+    }
     let condition = match segments[1..] {
         [] => None,
         [selector, value] if !selector.is_empty() && !value.is_empty() => Some(match selector {
@@ -417,7 +470,12 @@ pub fn parse_rate_key(key: &str) -> Result<RateKey, String> {
             ))
         }
     };
-    Ok(RateKey { role, condition })
+    Ok(RateKey {
+        role,
+        unit: None,
+        selectors: BTreeMap::new(),
+        condition,
+    })
 }
 
 /// The mode-conditional rate a request prices at, from the mode its own
@@ -446,6 +504,7 @@ pub fn tier_thresholds(facts: &BTreeMap<String, Value>) -> Result<BTreeSet<u64>,
     for key in facts.keys() {
         match parse_rate_key(key) {
             Ok(RateKey {
+                unit: None,
                 condition: Some(RateCondition::AboveContext(threshold)),
                 ..
             }) => {
@@ -512,7 +571,12 @@ mod tests {
                     models: BTreeMap::from([("provider/model".into(), facts)]),
                     withheld: vec![],
                     uncertain: vec![],
-                    overridden: vec![],
+                    next_page_token: None,
+                    curated: vec![],
+                    quality_scores: None,
+                    canonical_links: vec![],
+                    wire_corrections: vec![],
+                    fact_overrides: vec![],
                     retired: vec![],
                     aliased: vec![],
                     plane: None,
@@ -650,6 +714,8 @@ mod tests {
         let wire_control = FakeConnection::new(64, BTreeMap::new());
         let refusal = wire_control
             .catalog_get(CatalogGetRequest {
+                paged: false,
+                page_token: None,
                 source: None,
                 at_ms: Some(0),
                 fact_prefixes: Some(vec![RATE_FACT_PREFIX.into()]),
@@ -786,6 +852,7 @@ mod tests {
             amount,
             floor,
             inherited_from,
+            ..
         } = decoded
         else {
             panic!("served priced rate decoded as another state");
@@ -855,6 +922,38 @@ mod tests {
             "input",
         ] {
             assert!(parse(malformed).is_err(), "{malformed} parsed");
+        }
+    }
+
+    #[test]
+    fn unit_billing_grammar_accepts_units_roles_and_multiple_selectors() {
+        for key in [
+            "rate.output_audio",
+            "rate.cached_input_audio",
+            "rate.input_audio.per_second",
+            "rate.input.per_character",
+            "rate.output.per_image.size.1024x1024.quality.high",
+            "rate.request.per_request",
+        ] {
+            assert!(parse_rate_key(key).is_ok(), "{key}");
+        }
+    }
+
+    #[test]
+    fn unit_billing_grammar_refuses_unknown_units_and_repeated_selectors() {
+        for key in [
+            "rate.input.per_minute",
+            "rate.input.per_token",
+            "rate.request",
+            "rate.request.per_second",
+            "rate.input.per_request",
+            "rate.input.per_second.size.large.size.small",
+            "rate.input.per_second.mode",
+            "rate.input.per_second..large",
+            "rate.input.size.large.per_second",
+            "rate.input.mode.fast.size.large",
+        ] {
+            assert!(parse_rate_key(key).is_err(), "{key}");
         }
     }
 

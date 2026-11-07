@@ -617,9 +617,9 @@ dependencies = [
 
 [[package]]
 name = "fusiform-protocol"
-version = "0.30.0"
+version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b803c5aa7b9bf0514cdb0cc629b9f7fb7fb6747d07428253a7044e771fbc6528"
+checksum = "4d5886af46649df3ad60bc6563fb28647e0441d37bd25cdd63cf85c64b29a209"
 dependencies = [
  "serde",
  "serde_json",

@@ -281,6 +281,45 @@ original per quota provider and day. Test:
 
 ## Money
 
+### Catalog rate units and quantities
+
+Token rates retain the implicit denominator of one million tokens. Their keys are
+`rate.<role>` or `rate.<role>.<selector>.<value>`, with the existing token mode and
+context-threshold rules. Audio token roles include `input_audio`, `output_audio`,
+and `cached_input_audio`. A token rate must not state `per`.
+The token `above_context.<threshold>` selector tests prompt size;
+`mode.<name>` requires a stated non-standard mode and never falls back.
+Without a stored mode, multiplier rows count `mode_unrecorded_tokens` and
+`base_rate_tier_untested_tokens`. Both pricing paths honor
+`reasoning_billed_as_output`; unlisted reasoning needs its own rate. Ledger
+coverage and whole-event `rate_tiered` refusals precede selection.
+
+Unit rates use `rate.<role>.per_<unit>` followed by zero or more selector/value
+pairs. The closed unit list is `second`, `character`, `image`, and `request`.
+Request billing uses only `rate.request.per_request`. Selector names cannot repeat.
+A unit measurement matches both role and unit, and every stated selector must
+match the served selector set regardless of pair order. An unserved selector
+leaves the measurement unpriced; it never selects the base rate. Record-level
+media selectors are not yet part of any served input or stored column.
+
+Every priced unit rate needs a positive `per` denominator. Its `increment` and
+`minimum_quantity` states distinguish `unknown`, established `none`, and a
+`quantum` or `minimum` quantity. A quantum rounds usage up to its next multiple;
+a minimum then raises the resulting quantity if needed. Unknown and none leave
+that quantity unchanged. Quantity rules use exact decimal arithmetic, including
+fractional seconds, before the amount is calculated as quantity times rate divided
+by `per` through the single money rounding site.
+
+The charge's `catalog_entry` retains `fact_key` and the original rate `value`.
+For unit charges it also records `per`, `increment`, `minimum_quantity`,
+`raw_quantity`, and `priced_quantity`. Both quantities have `units` and `exponent`
+members, representing units times ten to the exponent. This preserves the gap
+between measured and billed usage, including uncertainty about rounding rules.
+A sourced catalog fact override is retained under `fact_override`. The subscription multiplier
+values only token measurements and ignores unit-rate facts beside token rates.
+
+### Monetary representation
+
 Money is a signed 64-bit integer count of nanounits (10^-9) of the row's
 currency: nanodollars for USD. Corrections are signed deltas, so a total can
 be negative. Arithmetic is checked in 128 bits. An overflow is a data error:

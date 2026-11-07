@@ -1,0 +1,55 @@
+{
+    "request": {
+      "arguments": {
+        "model_id": "gpt-transcribe",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "curated": [
+        {
+          "auth_methods": [
+            "apikey"
+          ],
+          "model": "openai/gpt-transcribe",
+          "review_by_ms": 1799193600000,
+          "source_ref": "Read 2026-11-07 at https://developers.openai.com/api/docs/models/gpt-transcribe: \"GPT Transcribe\"; \"Input modalities: audio, text\"; \"Output modalities: text\"; the \"Transcription audio duration\" table states \"Price | $0.0045 | minute\". https://developers.openai.com/api/docs/pricing, transcription table: \"gpt-transcribe | Transcription | - | - | $0.0045 / minute\". Served as $0.0045 per 60 seconds, not a per-token price. The token-rate columns are '-' so no token rate is served. Neither page states a rounding rule, a minimum, or a prompt/keyword text billing rule; those omissions do not establish that no rounding, minimum or text charge applies."
+        }
+      ],
+      "models": {
+        "openai/gpt-transcribe": {
+          "capability.input_modalities": [
+            "audio",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "existence": "present",
+          "model.lineage": "gpt",
+          "model.name": "GPT Transcribe",
+          "provider.name": "OpenAI",
+          "rate.input_audio.per_second": {
+            "currency": "USD",
+            "exponent": 9,
+            "increment": {
+              "kind": "unknown"
+            },
+            "minimum_quantity": {
+              "kind": "unknown"
+            },
+            "per": 60,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 4500000
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  }
