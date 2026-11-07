@@ -461,14 +461,14 @@ fn media_usage_vectors_drain_with_invalid_and_unrepresentable_evidence() {
         .collect();
     let peer = Peer::start(fixed_page(entries));
     tick(&state, &peer.source());
-    assert_eq!(cursor(&state).as_deref(), Some("10"));
-    assert_eq!(count(&state, "usage_event"), 4);
-    assert_eq!(count(&state, "measurement"), 3);
+    assert_eq!(cursor(&state).as_deref(), Some("12"));
+    assert_eq!(count(&state, "usage_event"), 5);
+    assert_eq!(count(&state, "measurement"), 4);
     assert_eq!(
         coverage(&state).skipped_local_by_source.get(SOURCE_KEY),
         Some(&1)
     );
-    assert_eq!(coverage(&state).set_aside_by_source[SOURCE_KEY].records, 5);
+    assert_eq!(coverage(&state).set_aside_by_source[SOURCE_KEY].records, 6);
     let evidence = state
         .with_conn(|conn| {
             let mut statement = conn
@@ -485,26 +485,28 @@ fn media_usage_vectors_drain_with_invalid_and_unrepresentable_evidence() {
                 .map_err(|error| error.to_string())
         })
         .unwrap();
-    assert_eq!(evidence[0].0, "usage.read/seq/3");
-    assert!(evidence[0].1.contains("not representable"));
-    for (entry, seq) in evidence[1..].iter().zip(7..=10) {
+    // Every refused vector is caught by the contract's own record check, so
+    // none reaches astrocyte's representability guard.
+    assert_eq!(evidence.len(), 6);
+    for (entry, seq) in evidence.iter().zip(7..=12) {
         assert_eq!(entry.0, format!("usage.read/seq/{seq}"));
         assert!(entry.1.contains("invalid_usage_record"), "{entry:?}");
         assert!(entry.1.contains("quantity"), "{entry:?}");
     }
     let quantities = state.with_conn(|conn| {
-        let mut statement = conn.prepare("SELECT producer_ref,quantity_units,quantity_exponent FROM usage_event JOIN measurement USING(event_key) WHERE producer_ref IN ('r-fraction-edge','r-whole-edge') ORDER BY producer_ref").map_err(|error| error.to_string())?;
+        let mut statement = conn.prepare("SELECT producer_ref,quantity_units,quantity_exponent FROM usage_event JOIN measurement USING(event_key) WHERE producer_ref IN ('r-coefficient-edge','r-fraction-edge','r-whole-edge') ORDER BY producer_ref").map_err(|error| error.to_string())?;
         let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i32>(2)?))).map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
     }).unwrap();
     assert_eq!(
         quantities,
         [
+            ("r-coefficient-edge".into(), i64::MAX, -9),
             ("r-fraction-edge".into(), 123_456_789, -9),
             ("r-whole-edge".into(), i64::MAX, 0),
         ]
     );
-    assert_eq!(peer.calls("usage.ack")[0]["params"]["through_seq"], 10);
+    assert_eq!(peer.calls("usage.ack")[0]["params"]["through_seq"], 12);
     assert_eq!(state.producer_degraded_reason(SOURCE_KEY), None);
 }
 

@@ -52,7 +52,7 @@ fusiform-protocol = "=0.52.0"
 # The `log-read-watermark/v1` wire types (`watermark` module) and the
 # `step.finished.v1` live step event (`step_events`, added in 0.7.5).
 cortexkit-role-llm-runner = "=0.8.15"
-cortexkit-role-media = "=0.1.1"
+cortexkit-role-media = "=0.1.2"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

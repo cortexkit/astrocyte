@@ -113,9 +113,10 @@ fn decimal_quantity(quantity: &str) -> Result<(i64, i32), String> {
         return Err("invalid decimal quantity".into());
     }
     let (whole, fraction) = quantity.split_once('.').unwrap_or((quantity, ""));
-    // Keep the ledger's representability guard for producers on older contracts.
-    // Even a contract-valid decimal can overflow the ledger's i64 coefficient.
-    // Remove only insignificant zeroes, never round or replace a quantity with zero.
+    // The current contract only admits quantities whose coefficient fits the
+    // ledger's i64, but a producer on an older contract version may still send
+    // finer or larger ones, so keep this guard. Remove only insignificant zeroes;
+    // never round a quantity or replace it with zero.
     let fraction = fraction.trim_end_matches('0');
     if fraction.len() > 9 {
         return Err("quantity not representable as i64 units with exponent -9..0".into());
@@ -147,17 +148,14 @@ mod tests {
             let record: UsageRecord = serde_json::from_value(value.clone()).unwrap();
             let mapped = map_record(&record);
             match record.record_id.as_str() {
-                "r-whole-fraction-edge" => {
-                    assert!(mapped.unwrap_err().contains("not representable"));
-                }
-                "r-fraction-edge" | "r-whole-edge" => {
+                "r-fraction-edge" | "r-whole-edge" | "r-coefficient-edge" => {
                     let (event, _) = mapped.unwrap().unwrap();
                     assert_eq!(event.producer_ref, record.record_id);
                     assert_eq!(event.measurements.len(), 1);
-                    let expected = if record.record_id == "r-fraction-edge" {
-                        (123_456_789, -9)
-                    } else {
-                        (i64::MAX, 0)
+                    let expected = match record.record_id.as_str() {
+                        "r-fraction-edge" => (123_456_789, -9),
+                        "r-whole-edge" => (i64::MAX, 0),
+                        _ => (i64::MAX, -9),
                     };
                     assert_eq!(event.measurements[0].quantity_units, Some(expected.0));
                     assert_eq!(event.measurements[0].quantity_exponent, Some(expected.1));

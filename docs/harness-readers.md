@@ -422,7 +422,7 @@ and stale-route refusals defer the drain without changing health and log once pe
 episode. Other failures keep progress and mark the source failed for retry;
 `feed_not_admitted` degrades immediately with that reason.
 
-The reader decodes the published `cortexkit-role-media` 0.1.1 types. Each vendor
+The reader decodes the published `cortexkit-role-media` 0.1.2 types. Each vendor
 record uses its `record_id` as the colliculus producer reference, without an instance
 or epoch qualifier. Its one job, stream or call id is the run reference and its
 principal is the work class. API-key vendor work is metered, OAuth vendor work is subscription-included,
@@ -437,12 +437,13 @@ feed location and reason. Valid records on the same page are still recorded; the
 evidence and cursor commit together before the page is acknowledged. Invalid page
 structure instead fails the page without advancing or acknowledging it.
 
-The published `r-done` and `r-ended` vectors are now invalid records because their
-quantities exceed the contract's nine-fractional-digit bound. The `r-fraction-edge`
-and `r-whole-edge` vectors fit the store exactly and are recorded. The combined
-`r-whole-fraction-edge` is contract-valid but cannot fit the store's integer
-coefficient, so it is still set aside. The ledger keeps its own representability
-guard for producers on older contracts. No rounding or replacement zero is used.
+The contract admits a quantity only when it has at most nine fractional digits and
+its coefficient (the digits without the point) fits a signed 64-bit integer, which
+is exactly what the store can hold. So every published refused vector, including
+`r-whole-fraction-edge`, is set aside as an invalid record, and the valid edges
+(`r-fraction-edge`, `r-whole-edge`, `r-coefficient-edge`) are recorded exactly.
+The ledger keeps its own representability guard for producers on older contract
+versions, which admitted quantities the store cannot hold. No rounding or replacement zero is used.
 Selectors are immutable event facts. A `speed_mode` of `fast` selects a `mode.fast`
 rate suffix, while `standard` and `default` use the base mode. If a record also
 states `mode`, equal values describe one condition. Different values leave every
