@@ -3983,6 +3983,27 @@ CREATE TRIGGER credential_window_sample_no_delete BEFORE DELETE ON credential_wi
 BEGIN SELECT RAISE(ABORT, 'credential_window_sample is append-only'); END;
 "#,
     },
+    Migration {
+        version: 37,
+        statements: r#"
+ALTER TABLE usage_event ADD COLUMN media_facts TEXT
+    CHECK (media_facts IS NULL OR (json_valid(media_facts) AND json_type(media_facts) = 'object'));
+-- The existing guard protects the older columns; this companion guard makes
+-- the added producer facts immutable without changing any previous condition.
+CREATE TRIGGER usage_event_media_facts_update_guard
+BEFORE UPDATE ON usage_event
+WHEN NEW.media_facts IS NOT OLD.media_facts
+BEGIN SELECT RAISE(ABORT, 'usage_event_media_facts_update_guard'); END;
+
+-- Feed sequence numbers are unsigned 64-bit wire values, so text preserves the
+-- full domain rather than narrowing them to SQLite's signed integer range.
+CREATE TABLE media_feed_cursor (
+    source_key TEXT PRIMARY KEY CHECK (source_key = 'colliculus'),
+    through_seq TEXT NOT NULL,
+    skipped_local INTEGER NOT NULL DEFAULT 0 CHECK (skipped_local >= 0)
+);
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.

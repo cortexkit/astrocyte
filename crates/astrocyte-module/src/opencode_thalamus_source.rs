@@ -284,7 +284,9 @@ impl OpenCodeThalamusSource {
                     complete &= recorded_all;
                     quarantined += count;
                 }
-                Err(SourceDrainError::Stopped) => return Err(SourceDrainError::Stopped),
+                Err(error @ (SourceDrainError::Stopped | SourceDrainError::Deferred)) => {
+                    return Err(error)
+                }
                 // The database vanished while it was read: the harness module
                 // erased it, which neither holds the watermark nor degrades.
                 Err(SourceDrainError::Failed(_)) if gone(&database) => {}

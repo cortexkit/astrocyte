@@ -20,9 +20,9 @@ pub struct AstrocyteConfig {
 }
 
 /// Every producer `harness_ingest.exclude` may name, by its `source_runtime`
-/// key: the local harness readers and BROCA's store reader. A producer added
+/// key: the local harness readers, BROCA's store and the media feed. A producer added
 /// later joins this list and is ingested unless the operator excludes it.
-pub(crate) const INGEST_SOURCES: [&str; 11] = [
+pub(crate) const INGEST_SOURCES: [&str; 12] = [
     "claude-code",
     "claude-code-workers",
     "codex",
@@ -34,6 +34,7 @@ pub(crate) const INGEST_SOURCES: [&str; 11] = [
     "omp",
     "kimi",
     "broca",
+    "colliculus",
 ];
 
 /// Which producers the refresher drains. `enabled: false` turns every one

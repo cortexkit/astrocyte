@@ -70,6 +70,7 @@ subc-jsonc = { workspace = true }
 fusiform-protocol = { workspace = true }
 # `watermark.get` uses the `log-read-watermark/v1` wire types from this dependency.
 cortexkit-role-llm-runner = { workspace = true }
+cortexkit-role-media = { workspace = true }
 # The live step feed's row identity for runner-announced steps
 # (`live_row_identity`).
 cortexkit-usage-steps = "=0.2.1"
@@ -84,6 +85,7 @@ libc = "0.2"
 signal-hook = { version = "0.4", default-features = false }
 
 [dev-dependencies]
+cortexkit-role-media = { workspace = true, features = ["test-vectors"] }
 astrocyte-readers = { workspace = true, features = ["test-support"] }
 astrocyte-module = { path = ".", features = ["test-support"] }
 tempfile = "3"

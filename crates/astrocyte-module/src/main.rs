@@ -321,7 +321,16 @@ async fn run(config: ModuleConfig, state: Arc<SharedState>) -> Result<LoopEnd, M
             // during hydration still has the default disposition: nothing has
             // started that needs stopping.
             let sigterm = sigterm_received()?;
-            serve_module(&config, state, astrocyte_module::start_refresher, sigterm).await
+            let media_connection = config.connection_file_path.clone();
+            serve_module(
+                &config,
+                state,
+                move |state, stop| {
+                    astrocyte_module::start_refresher_with_media(state, stop, media_connection)
+                },
+                sigterm,
+            )
+            .await
         },
     )
     .await

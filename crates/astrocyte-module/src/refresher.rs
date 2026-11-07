@@ -13,6 +13,8 @@ mod claude_code_source;
 mod claude_workers_source;
 #[path = "codex_source.rs"]
 mod codex_source;
+#[path = "colliculus_source.rs"]
+mod colliculus_source;
 #[path = "declared_roots.rs"]
 mod declared_roots;
 #[cfg(all(test, target_os = "linux"))]
@@ -162,6 +164,8 @@ pub(crate) enum SourceDrainError {
     /// This is not a failure: it must not degrade the source's health or
     /// write anything into `source_runtime`.
     Stopped,
+    /// A peer is warming or changing routes. Retain health and retry next tick.
+    Deferred,
     /// The drain failed.
     Failed(String),
 }
@@ -176,6 +180,7 @@ impl std::fmt::Display for SourceDrainError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stopped => formatter.write_str("drain stopped"),
+            Self::Deferred => formatter.write_str("drain deferred"),
             Self::Failed(reason) => formatter.write_str(reason),
         }
     }
@@ -1664,6 +1669,27 @@ pub fn start_refresher(
     )
 }
 
+/// Adds the media feed using the daemon connection supplied at module launch.
+pub fn start_refresher_with_media(
+    state: Arc<SharedState>,
+    stop: Arc<AtomicBool>,
+    connection_file: std::path::PathBuf,
+) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
+    let mut sources = refresher_harness_sources();
+    sources.push(Arc::new(colliculus_source::ColliculusSource::new(
+        connection_file,
+    )));
+    spawn_refresher(
+        state,
+        stop,
+        refresher_opencode_source(),
+        refresher_pi_source(),
+        refresher_claude_code_source(),
+        refresher_codex_source(),
+        sources,
+    )
+}
+
 /// The production refresher reading OpenCode from `opencode_database`, so a
 /// test can put a slow OpenCode stage inside the real loop and shut it down.
 #[cfg(any(test, feature = "test-support"))]
@@ -2489,7 +2515,7 @@ fn drain_harness(
     match harness.drain_for_health(state, current_time_ms(), stop) {
         Ok(None) => state.clear_producer_degraded(key),
         // A stopped drain committed nothing and says nothing about health.
-        Err(SourceDrainError::Stopped) => {}
+        Err(SourceDrainError::Stopped | SourceDrainError::Deferred) => {}
         Ok(Some(reason)) | Err(SourceDrainError::Failed(reason)) => {
             harness_drain::mark_drain_failed(state, key, reason)
         }

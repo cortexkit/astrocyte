@@ -24,7 +24,7 @@ pub mod state;
 pub mod step_feed;
 mod wire_map;
 
-pub use refresher::{hydrate_startup, start_refresher};
+pub use refresher::{hydrate_startup, start_refresher, start_refresher_with_media};
 
 #[cfg(test)]
 mod route_death_peer;

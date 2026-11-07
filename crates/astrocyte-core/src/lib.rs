@@ -10,6 +10,7 @@ pub mod capacity;
 pub mod catalog_client;
 pub mod fact;
 pub mod ingest;
+pub mod media;
 pub mod money;
 pub mod multiplier;
 pub mod pricing;

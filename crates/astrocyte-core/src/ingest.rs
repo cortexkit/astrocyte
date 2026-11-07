@@ -324,6 +324,7 @@ pub struct BasisCorrectRequest {
 
 #[derive(Debug)]
 struct EventPayload {
+    media: Option<crate::media::MediaFacts>,
     prior_event_ref: Option<String>,
     harness: Option<String>,
     project_root: Option<String>,
@@ -367,8 +368,13 @@ impl EventPayload {
     /// restated by the same output re-sent with reasoning subtracted, which is
     /// how the current wire mapping represents it. See
     /// [`restates_inclusive_output`] for the exact conditions.
-    fn restated_by(&self, incoming: &EventRecordRequest) -> bool {
-        if self.prior_event_ref != incoming.prior_event_ref
+    fn restated_by(
+        &self,
+        incoming: &EventRecordRequest,
+        media: Option<&crate::media::MediaFacts>,
+    ) -> bool {
+        if self.media.as_ref() != media
+            || self.prior_event_ref != incoming.prior_event_ref
             || self.harness != incoming.harness
             || self.project_root != incoming.project_root
             || self.session != incoming.session
@@ -515,10 +521,31 @@ pub fn record_event_in_tx(
     recorded_at_ms: i64,
     delivery: DeliveryPath,
 ) -> Result<EventRecordOutcome, IngestError> {
+    record_event_with_facts_in_tx(tx, request, recorded_at_ms, delivery, None)
+}
+
+/// Records media price facts with the event. Passing them separately keeps the
+/// `spend.event.ingest` request schema unchanged.
+pub fn record_media_event_in_tx(
+    tx: &Transaction<'_>,
+    request: &EventRecordRequest,
+    media: &crate::media::MediaFacts,
+    recorded_at_ms: i64,
+) -> Result<EventRecordOutcome, IngestError> {
+    record_event_with_facts_in_tx(tx, request, recorded_at_ms, DeliveryPath::Read, Some(media))
+}
+
+fn record_event_with_facts_in_tx(
+    tx: &Transaction<'_>,
+    request: &EventRecordRequest,
+    recorded_at_ms: i64,
+    delivery: DeliveryPath,
+    media: Option<&crate::media::MediaFacts>,
+) -> Result<EventRecordOutcome, IngestError> {
     validate_event_request(request, recorded_at_ms)?;
 
     if let Some((stored_event_id, stored_payload)) = load_event_payload(tx, request)? {
-        if stored_payload.restated_by(request) {
+        if stored_payload.restated_by(request, media) {
             // An exact re-read may give an event recorded before its reader
             // kept this detail the row it lacks. It never changes a row.
             if record_step_detail(tx, &stored_event_id, &request.step_detail)? {
@@ -546,7 +573,7 @@ pub fn record_event_in_tx(
                 waiting_for_target: false,
             });
         }
-        let incoming_payload = canonical_incoming_payload(request)?;
+        let incoming_payload = canonical_incoming_payload(request, media)?;
         tx.execute(
             "INSERT INTO rejected_delivery (
                  producer,producer_lineage,producer_ref,incoming_payload,stored_event_key,detected_at_ms
@@ -569,7 +596,7 @@ pub fn record_event_in_tx(
         });
     }
 
-    let local_event_id = insert_event(tx, request, recorded_at_ms)?;
+    let local_event_id = insert_event(tx, request, recorded_at_ms, media)?;
 
     let mut effects = PairEffects::default();
     let mut waiting_for_target = false;
@@ -872,7 +899,10 @@ fn validate_event_request(
     Ok(())
 }
 
-fn canonical_incoming_payload(request: &EventRecordRequest) -> Result<String, CanonError> {
+fn canonical_incoming_payload(
+    request: &EventRecordRequest,
+    media: Option<&crate::media::MediaFacts>,
+) -> Result<String, CanonError> {
     let mut measurements = request.measurements.iter().collect::<Vec<_>>();
     measurements.sort_by(|left, right| (&left.role, &left.unit).cmp(&(&right.role, &right.unit)));
     let mut payload = json!({
@@ -905,6 +935,9 @@ fn canonical_incoming_payload(request: &EventRecordRequest) -> Result<String, Ca
     if let (Some(flow_ref), Some(object)) = (&request.flow_ref, payload.as_object_mut()) {
         object.insert("flow_ref".into(), json!(flow_ref));
     }
+    if let (Some(media), Some(object)) = (media, payload.as_object_mut()) {
+        object.insert("media_facts".into(), json!(media));
+    }
     jcs_serialize(&payload)
 }
 
@@ -919,7 +952,7 @@ fn load_event_payload(
             "SELECT prior_event_ref,harness,project_root,session,run_ref,work_class,
                 occurred_at_ms,emitted_at_ms,terminal_status,attempt_ordinal,
                 vendor_request_id,provider,model,account_ref,auth_selection,charge_basis,
-                charge_basis_mapping_version,charge_basis_overrides,event_id,flow_ref
+                charge_basis_mapping_version,charge_basis_overrides,event_id,flow_ref,media_facts
          FROM usage_event
          WHERE producer=?1 AND producer_lineage IS ?2 AND producer_ref=?3",
         )?
@@ -935,6 +968,7 @@ fn load_event_payload(
                 Ok((
                     row.get::<_, String>(18)?,
                     EventPayload {
+                        media: crate::media::read_facts(row, 20)?,
                         prior_event_ref: row.get(0)?,
                         harness: row.get(1)?,
                         project_root: row.get(2)?,
@@ -1007,6 +1041,7 @@ fn insert_event(
     tx: &Transaction<'_>,
     request: &EventRecordRequest,
     recorded_at_ms: i64,
+    media: Option<&crate::media::MediaFacts>,
 ) -> Result<String, IngestError> {
     // Identity is {producer, producer_lineage, producer_ref} and must not
     // change: the same charge re-exported with the same pin must dedupe.
@@ -1022,10 +1057,10 @@ fn insert_event(
              harness,project_root,session,run_ref,work_class,
              occurred_at_ms,emitted_at_ms,recorded_at_ms,terminal_status,attempt_ordinal,
              vendor_request_id,provider,model,account_ref,auth_selection,charge_basis,pricing_generation,
-             charge_basis_mapping_version,charge_basis_overrides,flow_ref
+              charge_basis_mapping_version,charge_basis_overrides,flow_ref,media_facts
           ) VALUES (
               ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,
-              ?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,0,?22,?23,?24
+              ?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,0,?22,?23,?24,?25
           )",
         params![
             event_id,
@@ -1052,6 +1087,7 @@ fn insert_event(
             request.charge_basis_mapping_version,
             request.charge_basis_overrides,
             request.flow_ref,
+            media.map(|facts| jcs_serialize(&json!(facts))).transpose()?,
         ],
     )?;
     Ok(event_id)

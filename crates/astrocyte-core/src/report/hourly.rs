@@ -987,6 +987,7 @@ pub(super) fn coverage(
     };
     Ok(Some(LedgerCoverage {
         set_aside_by_source: load_set_aside_coverage(conn)?,
+        skipped_local_by_source: load_skipped_local_coverage(conn)?,
         events_total: total.events,
         events_unpriced: total
             .events
@@ -1620,6 +1621,40 @@ mod tests {
     use crate::fact::ChargeBasis;
     use crate::test_support::conn;
     use crate::{ingest, pricing, subscription, verdict};
+
+    #[test]
+    fn media_skipped_local_coverage_is_live_on_base_and_hourly_paths() {
+        let mut conn = conn();
+        assert!(
+            ledger_coverage_base(&conn, &LedgerCoverageRequest {}, 10_000)
+                .unwrap()
+                .skipped_local_by_source
+                .is_empty()
+        );
+        record(
+            &mut conn,
+            "media-coverage-anchor",
+            Some(1_000),
+            ChargeBasis::MeteredApi,
+            None,
+        );
+        catch_up(&mut conn);
+        let hourly = coverage(&conn, 10_000)
+            .unwrap()
+            .expect("hourly summaries are used");
+        assert!(hourly.skipped_local_by_source.is_empty());
+        conn.execute(
+            "INSERT INTO media_feed_cursor VALUES('colliculus','18446744073709551615',3)",
+            [],
+        )
+        .unwrap();
+        let direct = ledger_coverage_base(&conn, &LedgerCoverageRequest {}, 10_000).unwrap();
+        let hourly = coverage(&conn, 10_000)
+            .unwrap()
+            .expect("hourly summaries are still used");
+        assert_eq!(direct.skipped_local_by_source.get("colliculus"), Some(&3));
+        assert_eq!(hourly.skipped_local_by_source.get("colliculus"), Some(&3));
+    }
 
     fn record(
         conn: &mut Connection,

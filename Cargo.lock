@@ -44,6 +44,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "cortexkit-role-media",
  "cortexkit-store",
  "fusiform-protocol",
  "hex",
@@ -71,6 +72,7 @@ dependencies = [
  "cortexkit-paths",
  "cortexkit-provider-usage",
  "cortexkit-role-llm-runner",
+ "cortexkit-role-media",
  "cortexkit-store",
  "cortexkit-store-types",
  "cortexkit-usage-steps",
@@ -362,6 +364,18 @@ dependencies = [
  "cortexkit-role-tool-provider",
  "serde",
  "serde_jcs",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "cortexkit-role-media"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf764fa40506723c074f032364198a9ae6f15f8ba6ccac2b6a47fe5ddb0cb04"
+dependencies = [
+ "base64",
+ "serde",
  "serde_json",
  "sha2",
 ]

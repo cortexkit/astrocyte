@@ -412,7 +412,7 @@ fn read_plan_in_tx(
     let event = tx
         .query_row(
             "SELECT provider,model,account_ref,occurred_at_ms,charge_basis,currency,
-                    pricing_generation,producer,event_key
+                    pricing_generation,producer,event_key,media_facts
              FROM usage_event WHERE event_id=?1",
             [event_id],
             |row| {
@@ -440,6 +440,7 @@ fn read_plan_in_tx(
                     })?,
                     row.get::<_, String>(7)?,
                     row.get::<_, i64>(8)?,
+                    crate::media::read_facts(row, 9)?,
                 ))
             },
         )
@@ -454,6 +455,20 @@ fn read_plan_in_tx(
         return Err(PricingError::Refused(PricingRefusal::BasisUnchanged));
     }
 
+    let mut selectors = event
+        .9
+        .as_ref()
+        .map(|facts| facts.selectors.clone())
+        .unwrap_or_default();
+    let mode = selectors.remove("speed_mode");
+    // Both names describe one price condition. Equal statements need only one
+    // selector; differing statements remain available to refuse contradictory rates.
+    if mode
+        .as_ref()
+        .is_some_and(|mode| selectors.get("mode") == Some(mode))
+    {
+        selectors.remove("mode");
+    }
     let mut statement = tx.prepare(
         "SELECT m.role,m.unit,m.quantity_units,m.quantity_exponent,
                 pc.charge_key,pc.outcome,m.source
@@ -463,7 +478,7 @@ fn read_plan_in_tx(
           AND NOT EXISTS (
               SELECT 1 FROM priced_charge child WHERE child.supersedes=pc.charge_key
           )
-         WHERE m.event_key=?1
+          WHERE m.event_key=?1 AND m.kind <> 'observed'
          ORDER BY m.role,m.unit",
     )?;
     let all_measurements = statement
@@ -486,7 +501,7 @@ fn read_plan_in_tx(
             };
             Ok(MeasurementPlan {
                 role: row.get(0)?,
-                price_selectors: BTreeMap::new(),
+                price_selectors: selectors.clone(),
                 unit: row.get(1)?,
                 source: row.get(6)?,
                 quantity_units: row.get(2)?,
@@ -525,7 +540,7 @@ fn read_plan_in_tx(
         charge_basis: corrected_basis.unwrap_or(event.4),
         currency: event.5,
         pricing_generation: event.6,
-        mode: None,
+        mode,
         targets,
         all_measurements,
         measurements_preserved,
@@ -1149,6 +1164,22 @@ fn resolve_measurement(
     quantity_units: i64,
     quantity_exponent: i32,
 ) -> Result<ChargeDecision, PricingError> {
+    // Overwriting a stated selector with its contradictory alias could choose
+    // a rate that does not describe the work that was recorded.
+    let mode_conflict = recorded_mode
+        .zip(measurement.price_selectors.get("mode"))
+        .filter(|(speed_mode, mode)| *speed_mode != mode.as_str());
+    if let Some((speed_mode, mode)) = mode_conflict {
+        return Ok(ChargeDecision::Unpriced {
+            reason: UnpricedReason::NoRate,
+            catalog_source: Some(snapshot.source.clone()),
+            resolved_at_ms: Some(snapshot.resolved_at_ms),
+            catalog_entry: Some(json!({
+                "state": "selector_conflict",
+                "selectors": {"mode": mode, "speed_mode": speed_mode},
+            })),
+        });
+    }
     // A request recorded in a non-standard mode prices only at that mode's
     // rate; a model that serves none leaves it unpriced (`no_rate`) rather
     // than pricing it at the standard rate. A request recorded as standard,
@@ -1437,6 +1468,9 @@ fn measurement_rate_key(
     recorded_mode: Option<&str>,
 ) -> Option<String> {
     if measurement.unit == "token" {
+        if !measurement.price_selectors.is_empty() {
+            return None;
+        }
         return rate_fact_key(role, "token").map(|base| {
             match stated_mode_condition(recorded_mode) {
                 Some(mode) => mode_rate_key(role, mode),
@@ -1728,6 +1762,7 @@ fn stored_integrity_error(column: usize, kind: Type, detail: String) -> rusqlite
 #[cfg(test)]
 mod tests {
     include!("pricing_unit_billing_tests.rs");
+    include!("media_pricing_tests.rs");
 
     #[test]
     fn corrupt_head_outcome_names_the_stored_value() {

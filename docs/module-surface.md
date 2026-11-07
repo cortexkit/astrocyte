@@ -270,11 +270,14 @@ Reads never write. A refusal on a read is one of the codes below.
   `invalid_timezone`. Test: `spend_report_refusal_keeps_its_code`.
 - `spend.subscription.report`: `rows`, `coverage`, `ingest_freshness`.
 - `spend.workclass.report`: `rows`, `producers`.
-- `spend.ledger.coverage`: `set_aside_by_source`, `events_total`,
+- `spend.ledger.coverage`: `set_aside_by_source`, `skipped_local_by_source`, `events_total`,
   `events_unpriced`, `events_undated`, `zero_measurement_events`,
   `unpriced_events_by_reason`, `unpriced_measurements_by_reason`,
   `ingest_freshness`, `rate_staleness`, `capacity`. Test:
   `open_coverage_report_does_not_stall_an_ingest_commit`.
+  `skipped_local_by_source` is always a map of producer keys to counts of local
+  work acknowledged without spend events; it is empty when no work was skipped.
+  Test: `media_skipped_local_coverage_is_live_on_base_and_hourly_paths`.
 - `spend.charge.explain`: `event`, `measurements`, `adjustments`,
   `transition`. Each measurement supplies `role` and `unit`; its charges are
   identified by `pricing_generation` within that measurement. There is no

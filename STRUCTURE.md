@@ -11,9 +11,7 @@ Crates live in `crates/`, public docs in `docs/`, and gates in `scripts/`.
 
 Domain logic and storage.
 
-- `store.rs`: `MIGRATIONS` (1 to 34), `initialize_connection` and `migrate_store`.
-  Migration 23 rebuilds integer keys without charge digests, checking FKs before
-  commit; startup restores enforcement. VACUUM is a separate offline step.
+- `store.rs` defines `MIGRATIONS` (1 to 37), initializes connections and migrates stores.
 - `fact.rs`: event and measurement identity, minted locally.
 - `ingest.rs`: transactional event recording, redelivery handling, chargeability
   settlement, adjustments and charge-basis correction.
@@ -53,6 +51,8 @@ Shared library; three binaries.
 - `refresher.rs`: the background loop (drains, capacity poll, pricing pass, pricing
   queue reconciliation, the daily multiplier stage and its operator recompute).
 - `broca_source.rs`, `wire_map.rs`: BROCA `run-index.db` reader and fact mapping.
+- `colliculus_source.rs` drains the acknowledged media usage feed. The core's
+  `media.rs` maps its typed records without rounding quantities or inventing usage.
 - `qta_client.rs`, `capacity_map.rs`: insula `usage.get`/`events_get` client and capacity mapping.
 - `quota_events.rs`, `quota_bus_client.rs`, `runner_steps.rs`: the bus reader (quota
   and runner step events) and attested authentication;

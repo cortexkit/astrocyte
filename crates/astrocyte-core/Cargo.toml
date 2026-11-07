@@ -11,6 +11,7 @@ repository = "https://github.com/cortexkit/astrocyte"
 workspace = true
 
 [dependencies]
+cortexkit-role-media = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -21,3 +22,6 @@ fusiform-protocol = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+
+[dev-dependencies]
+cortexkit-role-media = { workspace = true, features = ["test-vectors"] }

@@ -398,3 +398,38 @@ record none, so it is inferred from the model name by
 `inferred_provider_from_model`; Pi assistant messages do the same when the record
 has no provider. This includes Codestral and Devstral in the Mistral family.
 Pi operations and Kimi CLI keep missing model and provider fields absent.
+
+## Colliculus media usage
+
+The `colliculus` source is enabled by default and can be excluded through
+`harness_ingest.exclude`. Each full refresher tick opens a management route and
+pages `usage.read` with a limit of 1,000. Each page commits events, set-aside
+evidence and the durable cursor in one ingest transaction before `usage.ack` is
+called. A failed acknowledgement leaves committed facts intact; subsequent drains
+retry acknowledgement and accept identical redelivery without recording spend twice.
+The reader never waits for colliculus during boot. An uninstalled or unregistered
+module has no runtime row and does not degrade health. Daemon warming, reloading
+and stale-route refusals defer the drain without changing health and log once per
+episode. Other failures keep progress and mark the source failed for retry;
+`feed_not_admitted` degrades immediately with that reason.
+
+The reader decodes the published `cortexkit-role-media` 0.1.0 types. Each vendor
+record uses its `record_id` as the colliculus producer reference, without an instance
+or epoch qualifier. Its one job, stream or call id is the run reference and its
+principal is the work class. API-key vendor work is metered, OAuth vendor work is subscription-included,
+and an absent authentication method leaves the charge basis unknown. Local work
+is counted as skipped coverage and acknowledged without an event.
+
+Billed quantities are parsed exactly into an integer coefficient and an exponent
+between -9 and 0. Observed measurements are retained but never priced. Records
+whose quantities cannot fit the store, and raw undecodable or oversize entries,
+are set aside as evidence and acknowledged only with committed progress. This
+includes the published usage vector's `r-done` and `r-ended` records: their
+quantities exceed the store's precision. No rounding or replacement zero is used.
+Selectors are immutable event facts. A `speed_mode` of `fast` selects a `mode.fast`
+rate suffix, while `standard` and `default` use the base mode. If a record also
+states `mode`, equal values describe one condition. Different values leave every
+billable measurement unpriced with `no_rate`, and its catalog evidence preserves
+both conflicting values rather than silently choosing either rate. Other selectors
+select exact unit-rate keys. A missing matching rate leaves the
+measurement unpriced, including failed or cancelled attempts with billed work.

@@ -2,9 +2,13 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 36. A schema change appends a migration; an applied
+currently version 37. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
+
+Connection initialization checks JSON, triggers and partial indexes, verifies
+foreign-key enforcement, and sets a 5000 ms busy timeout. The report connection
+copies that timeout without running the table-creating probes.
 
 ## Tables
 
@@ -31,6 +35,7 @@ ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 | `statement_import` | Each row records CSV import provenance and its content digest for idempotency. | insert only |
 | `desired_config` | The row records the committed desired-configuration generation. | one row |
 | `source_runtime` | Each row records a producer's cursor, lineage, last successful drain and pending disclosure. | upsert |
+| `media_feed_cursor` | The row records colliculus's committed unsigned feed sequence and skipped-local count. | upsert with each page |
 | `set_aside_record` | Each row records an unreadable producer record by source and locator, including its reason and observation times. | upsert |
 | `declared_store_cursor` | Each row records the durable read position of one store that another module declared, per source and on-disk layout. | upsert; deleted when the store is no longer declared |
 | `read_watermark` | Each row records a reader source's read watermark, the time before which everything in its declared stores is recorded. | upsert that only moves forward |
@@ -490,3 +495,26 @@ cannot make an earlier stale reply retroactively exact.
 The implementation is in `crates/astrocyte-core/src/report/hourly.rs`, and the
 refresher schedules it from `crates/astrocyte-module/src/refresher.rs`. The
 original reducers remain available for fallback and byte-equivalence tests.
+
+## Schema 37: media facts and acknowledged progress
+
+Migration 37 adds nullable `usage_event.media_facts`, a JSON object containing
+producer-stated `selectors` and optional `failure`. These facts are immutable and
+participate in exact-redelivery comparison. The existing update guard keeps all
+its conditions; a companion guard rejects changes to the new member. Existing
+rows retain NULL and are not rewritten. Pricing copies the stored selectors into
+each measurement plan, removing `speed_mode` into the established mode path so
+`fast` selects `mode.fast` while `standard` and `default` select the base mode.
+
+`media_feed_cursor` stores colliculus's committed `through_seq` and cumulative
+`skipped_local` count. Sequence numbers are decimal text to preserve the feed's
+unsigned 64-bit range. The cursor, local-work count, events and set-aside evidence
+commit together before acknowledgement. Local counters increase only for entries
+beyond the previous watermark. The cursor survives source exclusion or absence;
+removing a source's runtime row never discards committed feed progress.
+
+`spend.ledger.coverage.skipped_local_by_source` is always a map, empty when no local
+work was skipped. Both the direct and hourly coverage paths load these counters
+live; they are not spend events or priced-charge rows. The migration rehearsal
+runs the SQL on an empty store and on a store through schema 36 with an existing
+event, verifies that no rows were rewritten, and checks both immutability guards.

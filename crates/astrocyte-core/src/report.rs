@@ -2036,6 +2036,7 @@ pub struct SetAsideCoverage {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LedgerCoverage {
     pub set_aside_by_source: BTreeMap<String, SetAsideCoverage>,
+    pub skipped_local_by_source: BTreeMap<String, u64>,
     pub events_total: u64,
     pub events_unpriced: u64,
     pub events_undated: u64,
@@ -2088,6 +2089,7 @@ fn ledger_coverage_base(
     let provider_readings = load_provider_capacity_readings(conn)?;
     Ok(LedgerCoverage {
         set_aside_by_source: load_set_aside_coverage(conn)?,
+        skipped_local_by_source: load_skipped_local_coverage(conn)?,
         events_total: population.events_total,
         events_unpriced: population
             .events_total
@@ -2110,6 +2112,12 @@ fn ledger_coverage_base(
             provider_readings,
         },
     })
+}
+
+fn load_skipped_local_coverage(conn: &Connection) -> Result<BTreeMap<String, u64>, ReportError> {
+    let mut statement = conn.prepare("SELECT source_key,skipped_local FROM media_feed_cursor WHERE skipped_local > 0 ORDER BY source_key")?;
+    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 fn load_set_aside_coverage(

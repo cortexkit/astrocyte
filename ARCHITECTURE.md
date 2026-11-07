@@ -22,20 +22,15 @@ The workspace has three crates:
 
 ## Durable state
 
-`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS`, currently at schema version 36.
-`initialize_connection` enables and verifies foreign keys, probes SQLite JSON, triggers and
-partial indexes, and sets a 5000 ms busy timeout. The read-only report connection
-skips the table-creating probe and copies that timeout.
+`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS`, currently at schema version 37.
+`initialize_connection` verifies SQLite features and enables foreign keys and a
+5000 ms busy timeout; the read-only report connection skips creation probes.
 
 The [data model](docs/data-model.md#tables) describes every table and its write rules.
 
-Schema 23 uses local integer `event_key` and `charge_key` references, never served
-IDs. Event digests stay the dedup/served identity.
-The scalar predecessor FK and `priced_charge_supersedes_same_measurement` trigger
-require an existing same-measurement predecessor, even with deferred FKs. Operators
-run VACUUM after commit and start a full backup baseline. `spend.charge.explain`
-identifies charges by role, unit and generation; `supersedes` serves the predecessor
-generation.
+Local integer event and charge keys are never served. Event digests remain the
+identity; charge explanations use role, unit and generation. The
+[data model](docs/data-model.md) explains predecessor constraints and migration maintenance.
 
 Triggers `usage_event_no_delete`, `measurement_no_update` and `priced_charge_no_update`
 abort UPDATE and DELETE. Corrections append rows; see the [data model](docs/data-model.md).
@@ -87,6 +82,9 @@ write, so it needs no lease.
   sessions, with the declared `work_class`. An acknowledgement or read watermark
   lets it erase finished folders; see the [workers](docs/claude-workers-contract.md)
   and [sessions](docs/thalamus-opencode-sessions-contract.md) contracts.
+- **Colliculus feed.** Full ticks drain media usage through a management route,
+  committing each page with its cursor before acknowledging it. An absent module
+  leaves health untouched; see [harness readers](docs/harness-readers.md).
 - **Push.** Peers call `spend.event.ingest`, `spend.correction.ingest` and
   `spend.chargeability.settle`; see [retry rules](docs/money-ingest.md).
 
@@ -94,7 +92,7 @@ Spend facts write `usage_event`, `measurement` and `chargeability_transition`.
 BROCA steps will arrive from its step log, not its exported spend facts.
 `fact.rs` mints identity locally; `producer_ref` values stay verbatim as provenance.
 
-BROCA, Claude Code, Codex, OpenCode and Pi set unreadable records aside as
+BROCA, colliculus, Claude Code, Codex, OpenCode and Pi set unreadable records aside as
 `set_aside_record` evidence, committing evidence, good events and progress together.
 Only new evidence warns; rereads refresh last-seen time. Coverage reports counts
 without degrading health.
@@ -111,7 +109,7 @@ maintenance, and stop requests interrupt both lanes. One full tick:
 1. Connect a pending fusiform catalog and find its history boundary through
    `catalog.status`, falling back to a refused time-zero `catalog.get` for older
    peers. Until then, step 4 waits.
-2. Drain harness stores and BROCA, except sources disabled by `harness_ingest`.
+2. Drain harness stores, BROCA and colliculus, except sources disabled by `harness_ingest`.
    Skipped sources are not read and lose their `source_runtime` row, as for absent
    stores.
 3. Consume insula quota events when `qta_connection_file` is set. The bus thread
@@ -173,7 +171,7 @@ The config is a closed JSONC object with six required members:
 `poll_interval_secs`, `qta_connection_file`, `fusiform_connection_file`,
 `subscription_multiplier`, `harness_ingest`, `reasoning_billed_as_output`.
 Unknown or missing members fail decoding at every level. `harness_ingest.exclude` names source keys from Producers (and
-`broca`); unknown or repeated keys are refused, as is `enabled: false` with a non-empty
+`broca` and `colliculus`); unknown or repeated keys are refused, as is `enabled: false` with a non-empty
 `exclude`. Before migration 15, stored generations have no multiplier declaration;
 the daily stage skips them until a reload. Before migration 17, they have no
 `harness_ingest` and restore as all on. The reasoning list is stored in the
