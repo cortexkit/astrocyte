@@ -410,8 +410,10 @@ retry acknowledgement and accept identical redelivery without recording spend tw
 The media feed and event-bus readers share a staged launch identity released only after
 the daemon accepts HELLO. The media route uses the SDK's separate consumer
 connection and implicit identity from the process's cached launch nonce, so the
-daemon attests the caller as astrocyte. A connection file alone never authorizes
-an unattested fallback. The SDK retries route admission for at most ten seconds
+daemon attests the caller as astrocyte. The reader never falls back to a client
+authenticated by the connection file alone, which would arrive as a plain local
+caller that colliculus refuses: before connecting it checks that the staged module
+id and launch nonce are the ones the SDK will present. The SDK retries route admission for at most ten seconds
 inside a tick and preserves typed refusals when that budget ends. Refusal messages
 and details are not logged because they could echo the launch credential.
 The reader never waits for colliculus during boot. An uninstalled or unregistered
