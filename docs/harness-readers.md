@@ -422,7 +422,7 @@ and stale-route refusals defer the drain without changing health and log once pe
 episode. Other failures keep progress and mark the source failed for retry;
 `feed_not_admitted` degrades immediately with that reason.
 
-The reader decodes the published `cortexkit-role-media` 0.1.0 types. Each vendor
+The reader decodes the published `cortexkit-role-media` 0.1.1 types. Each vendor
 record uses its `record_id` as the colliculus producer reference, without an instance
 or epoch qualifier. Its one job, stream or call id is the run reference and its
 principal is the work class. API-key vendor work is metered, OAuth vendor work is subscription-included,
@@ -430,11 +430,19 @@ and an absent authentication method leaves the charge basis unknown. Local work
 is counted as skipped coverage and acknowledged without an event.
 
 Billed quantities are parsed exactly into an integer coefficient and an exponent
-between -9 and 0. Observed measurements are retained but never priced. Records
-whose quantities cannot fit the store, and raw undecodable or oversize entries,
-are set aside as evidence and acknowledged only with committed progress. This
-includes the published usage vector's `r-done` and `r-ended` records: their
-quantities exceed the store's precision. No rounding or replacement zero is used.
+between -9 and 0. Observed measurements are retained but never priced. Entries
+that fail the contract's entry or record checks, records whose quantities cannot
+fit the store, and raw undecodable or oversize entries are set aside with their
+feed location and reason. Valid records on the same page are still recorded; the
+evidence and cursor commit together before the page is acknowledged. Invalid page
+structure instead fails the page without advancing or acknowledging it.
+
+The published `r-done` and `r-ended` vectors are now invalid records because their
+quantities exceed the contract's nine-fractional-digit bound. The `r-fraction-edge`
+and `r-whole-edge` vectors fit the store exactly and are recorded. The combined
+`r-whole-fraction-edge` is contract-valid but cannot fit the store's integer
+coefficient, so it is still set aside. The ledger keeps its own representability
+guard for producers on older contracts. No rounding or replacement zero is used.
 Selectors are immutable event facts. A `speed_mode` of `fast` selects a `mode.fast`
 rate suffix, while `standard` and `default` use the base mode. If a record also
 states `mode`, equal values describe one condition. Different values leave every

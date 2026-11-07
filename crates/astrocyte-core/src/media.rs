@@ -113,9 +113,9 @@ fn decimal_quantity(quantity: &str) -> Result<(i64, i32), String> {
         return Err("invalid decimal quantity".into());
     }
     let (whole, fraction) = quantity.split_once('.').unwrap_or((quantity, ""));
-    // A 0.1.0 producer may send quantities finer than the ledger stores. Remove
-    // only insignificant zeroes; refusing the whole record preserves its evidence
-    // without rounding a billed quantity or replacing a missing fact with zero.
+    // Keep the ledger's representability guard for producers on older contracts.
+    // Even a contract-valid decimal can overflow the ledger's i64 coefficient.
+    // Remove only insignificant zeroes, never round or replace a quantity with zero.
     let fraction = fraction.trim_end_matches('0');
     if fraction.len() > 9 {
         return Err("quantity not representable as i64 units with exponent -9..0".into());
@@ -147,7 +147,21 @@ mod tests {
             let record: UsageRecord = serde_json::from_value(value.clone()).unwrap();
             let mapped = map_record(&record);
             match record.record_id.as_str() {
-                "r-done" | "r-ended" => assert!(mapped.unwrap_err().contains("not representable")),
+                "r-whole-fraction-edge" => {
+                    assert!(mapped.unwrap_err().contains("not representable"));
+                }
+                "r-fraction-edge" | "r-whole-edge" => {
+                    let (event, _) = mapped.unwrap().unwrap();
+                    assert_eq!(event.producer_ref, record.record_id);
+                    assert_eq!(event.measurements.len(), 1);
+                    let expected = if record.record_id == "r-fraction-edge" {
+                        (123_456_789, -9)
+                    } else {
+                        (i64::MAX, 0)
+                    };
+                    assert_eq!(event.measurements[0].quantity_units, Some(expected.0));
+                    assert_eq!(event.measurements[0].quantity_exponent, Some(expected.1));
+                }
                 "r-local" => assert!(mapped.unwrap().is_none()),
                 "r-failed" | "r-cancelled" => {
                     let (event, facts) = mapped.unwrap().unwrap();
@@ -173,9 +187,16 @@ mod tests {
                 other => panic!("unasserted vector {other}"),
             }
         }
+        for case in vectors["refused_records"].as_array().unwrap() {
+            let record: UsageRecord = serde_json::from_value(case["record"].clone()).unwrap();
+            let reason = map_record(&record).unwrap_err();
+            assert!(reason.contains("invalid media record"), "{reason}");
+            assert!(reason.contains("invalid_usage_record"), "{reason}");
+            assert!(reason.contains("quantity"), "{reason}");
+        }
         for (quantity, expected) in [
             ("90", (90, 0)),
-            ("1.230000000000", (123, -2)),
+            ("1.230000000", (123, -2)),
             ("0.000000001", (1, -9)),
             ("9223372036854775807", (i64::MAX, 0)),
         ] {
@@ -183,6 +204,7 @@ mod tests {
         }
         assert!(decimal_quantity("9223372036854775808").is_err());
         assert!(decimal_quantity("0.0000000001").is_err());
+        assert!(decimal_quantity("1.230000000000").is_err());
     }
 
     #[test]

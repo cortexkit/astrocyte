@@ -92,6 +92,36 @@ fn sdk_error(error: CallError) -> FeedError {
     }
 }
 
+fn check_page_structure(page: &UsageReadAnswer) -> Result<(), FeedError> {
+    // The contract's answer check also validates every record. Check only the
+    // envelope here so one unreadable entry cannot stall the whole feed.
+    if page.entries.len() > usize::try_from(LIMIT).expect("small page limit") {
+        return Err(FeedError::Failed(
+            "media page exceeds requested limit".into(),
+        ));
+    }
+    let mut previous = 0;
+    for entry in &page.entries {
+        if entry.seq <= previous {
+            return Err(FeedError::Failed(
+                "invalid media page: sequence numbers must strictly increase from zero".into(),
+            ));
+        }
+        previous = entry.seq;
+    }
+    if page.last_seq != page.entries.last().map(|entry| entry.seq)
+        || serde_json::to_vec(page)
+            .map_err(|error| format!("invalid media page: {error}"))?
+            .len()
+            > cortexkit_role_media::MESSAGE_MAX
+    {
+        return Err(FeedError::Failed(
+            "invalid media page: last_seq mismatch or message too large".into(),
+        ));
+    }
+    Ok(())
+}
+
 struct Route {
     consumer: SubcConsumer,
     handle: RouteHandle,
@@ -241,13 +271,7 @@ impl ColliculusSource {
                     json!(UsageReadRequest::new(LIMIT).with_after_seq(cursor)),
                 )
                 .await?;
-            usage::check_usage_answer(&page)
-                .map_err(|error| format!("invalid media page: {error}"))?;
-            if page.entries.len() > usize::try_from(LIMIT).expect("small page limit") {
-                return Err(FeedError::Failed(
-                    "media page exceeds requested limit".into(),
-                ));
-            }
+            check_page_structure(&page)?;
             let next = page.last_seq.unwrap_or(cursor).max(cursor);
             if !page.entries.is_empty() && next == cursor {
                 if replayed {
@@ -268,6 +292,10 @@ impl ColliculusSource {
                         return Err("media ingest stopped".into());
                     }
                     let locator = format!("usage.read/seq/{}", entry.seq);
+                    if let Err(error) = usage::check_usage_entry(entry) {
+                        evidence.push(SetAsideRecord { locator, reason: format!("invalid media entry: {error}") });
+                        continue;
+                    }
                     if let Some(record) = &entry.record {
                         match astrocyte_core::media::map_record(record) {
                             Ok(Some((event, facts))) => {

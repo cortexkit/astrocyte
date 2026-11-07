@@ -384,7 +384,64 @@ fn media_raw_feed_vectors_are_set_aside_and_acknowledged() {
 }
 
 #[test]
-fn media_usage_vectors_drain_with_unrepresentable_evidence() {
+fn media_invalid_middle_record_is_set_aside_without_stalling_the_page() {
+    for invalid in [
+        json!({"quantity":"9223372036854775808"}),
+        json!({"quantity":"0.0000000001"}),
+        json!({"stream_id":"also-a-stream"}),
+    ] {
+        let state = Arc::new(test_state());
+        let observer = state.clone();
+        let mut middle = vendor_entry(2);
+        if let Some(quantity) = invalid.get("quantity") {
+            middle["record"]["measurements"][0]["quantity"] = quantity.clone();
+        } else {
+            middle["record"]["stream_id"] = invalid["stream_id"].clone();
+        }
+        let reply = fixed_page(vec![vendor_entry(1), middle, vendor_entry(3)]);
+        let peer = Peer::start(Arc::new(move |value| {
+            if value["method"] == "usage.ack" {
+                assert_eq!(cursor(&observer).as_deref(), Some("3"));
+                assert_eq!(count(&observer, "usage_event"), 2);
+                assert_eq!(count(&observer, "set_aside_record"), 1);
+            }
+            reply(value)
+        }));
+        tick(&state, &peer.source());
+        assert_eq!(cursor(&state).as_deref(), Some("3"), "{invalid}");
+        let (records, evidence) = state
+            .with_conn(|conn| {
+                let mut statement = conn
+                    .prepare("SELECT producer_ref FROM usage_event ORDER BY producer_ref")
+                    .map_err(|error| error.to_string())?;
+                let records = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                let evidence = conn
+                    .query_row("SELECT locator,reason FROM set_aside_record", [], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|error| error.to_string())?;
+                Ok((records, evidence))
+            })
+            .unwrap();
+        assert_eq!(records, ["r-1", "r-3"]);
+        assert_eq!(count(&state, "measurement"), 2);
+        assert_eq!(evidence.0, "usage.read/seq/2");
+        assert!(evidence.1.contains("invalid_usage_record"), "{evidence:?}");
+        if invalid.get("quantity").is_some() {
+            assert!(evidence.1.contains("quantity"), "{evidence:?}");
+        }
+        assert_eq!(peer.calls("usage.ack").len(), 1);
+        assert_eq!(peer.calls("usage.ack")[0]["params"]["through_seq"], 3);
+        assert_eq!(state.producer_degraded_reason(SOURCE_KEY), None);
+    }
+}
+
+#[test]
+fn media_usage_vectors_drain_with_invalid_and_unrepresentable_evidence() {
     let state = test_state();
     let vectors: Value =
         serde_json::from_str(cortexkit_role_media::vectors::file("usage.json").unwrap()).unwrap();
@@ -392,23 +449,32 @@ fn media_usage_vectors_drain_with_unrepresentable_evidence() {
         .as_array()
         .unwrap()
         .iter()
+        .chain(
+            vectors["refused_records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|case| &case["record"]),
+        )
         .enumerate()
         .map(|(index, record)| json!({"seq":index+1,"record":record}))
         .collect();
     let peer = Peer::start(fixed_page(entries));
     tick(&state, &peer.source());
-    assert_eq!(cursor(&state).as_deref(), Some("5"));
-    assert_eq!(count(&state, "usage_event"), 2);
-    assert_eq!(count(&state, "measurement"), 1);
+    assert_eq!(cursor(&state).as_deref(), Some("10"));
+    assert_eq!(count(&state, "usage_event"), 4);
+    assert_eq!(count(&state, "measurement"), 3);
     assert_eq!(
         coverage(&state).skipped_local_by_source.get(SOURCE_KEY),
         Some(&1)
     );
-    assert_eq!(coverage(&state).set_aside_by_source[SOURCE_KEY].records, 2);
+    assert_eq!(coverage(&state).set_aside_by_source[SOURCE_KEY].records, 5);
     let evidence = state
         .with_conn(|conn| {
             let mut statement = conn
-                .prepare("SELECT locator,reason FROM set_aside_record ORDER BY locator")
+                .prepare(
+                    "SELECT locator,reason FROM set_aside_record ORDER BY length(locator),locator",
+                )
                 .map_err(|error| error.to_string())?;
             let rows = statement
                 .query_map([], |row| {
@@ -419,12 +485,26 @@ fn media_usage_vectors_drain_with_unrepresentable_evidence() {
                 .map_err(|error| error.to_string())
         })
         .unwrap();
-    assert_eq!(evidence[0].0, "usage.read/seq/1");
-    assert_eq!(evidence[1].0, "usage.read/seq/4");
-    assert!(evidence
-        .iter()
-        .all(|(_, reason)| reason.contains("not representable")));
-    assert_eq!(peer.calls("usage.ack")[0]["params"]["through_seq"], 5);
+    assert_eq!(evidence[0].0, "usage.read/seq/3");
+    assert!(evidence[0].1.contains("not representable"));
+    for (entry, seq) in evidence[1..].iter().zip(7..=10) {
+        assert_eq!(entry.0, format!("usage.read/seq/{seq}"));
+        assert!(entry.1.contains("invalid_usage_record"), "{entry:?}");
+        assert!(entry.1.contains("quantity"), "{entry:?}");
+    }
+    let quantities = state.with_conn(|conn| {
+        let mut statement = conn.prepare("SELECT producer_ref,quantity_units,quantity_exponent FROM usage_event JOIN measurement USING(event_key) WHERE producer_ref IN ('r-fraction-edge','r-whole-edge') ORDER BY producer_ref").map_err(|error| error.to_string())?;
+        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i32>(2)?))).map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
+    }).unwrap();
+    assert_eq!(
+        quantities,
+        [
+            ("r-fraction-edge".into(), 123_456_789, -9),
+            ("r-whole-edge".into(), i64::MAX, 0),
+        ]
+    );
+    assert_eq!(peer.calls("usage.ack")[0]["params"]["through_seq"], 10);
     assert_eq!(state.producer_degraded_reason(SOURCE_KEY), None);
 }
 
@@ -730,19 +810,31 @@ fn media_unsigned_feed_sequences_survive_the_signed_store_boundary() {
 
 #[test]
 fn media_malformed_feed_page_keeps_cursor_and_acks_nothing() {
-    let state = test_state();
-    let peer = Peer::start(Arc::new(move |value| {
-        if value["op"] == "route.open" {
-            return opened();
-        }
-        result(json!({"entries":[vendor_entry(1)],"last_seq":2}))
-    }));
-    tick(&state, &peer.source());
-    assert!(state
-        .producer_degraded_reason(SOURCE_KEY)
-        .unwrap()
-        .contains("invalid media page"));
-    assert_eq!(cursor(&state), None);
-    assert_eq!(count(&state, "usage_event"), 0);
-    assert!(peer.calls("usage.ack").is_empty());
+    for malformed in [
+        json!({"entries":[vendor_entry(1)],"last_seq":2}),
+        json!({"entries":[vendor_entry(1)]}),
+        json!({"entries":[],"last_seq":1}),
+        page(vec![vendor_entry(0)]),
+        page(vec![vendor_entry(1), vendor_entry(1)]),
+        page(vec![vendor_entry(2), vendor_entry(1)]),
+        page((1..=1_001).map(vendor_entry).collect()),
+    ] {
+        let state = test_state();
+        let peer = Peer::start(Arc::new(move |value| {
+            if value["op"] == "route.open" {
+                return opened();
+            }
+            result(malformed.clone())
+        }));
+        tick(&state, &peer.source());
+        let reason = state.producer_degraded_reason(SOURCE_KEY).unwrap();
+        assert!(
+            reason.contains("invalid media page") || reason.contains("exceeds requested limit"),
+            "{reason}"
+        );
+        assert_eq!(cursor(&state), None);
+        assert_eq!(count(&state, "usage_event"), 0);
+        assert_eq!(count(&state, "set_aside_record"), 0);
+        assert!(peer.calls("usage.ack").is_empty());
+    }
 }
