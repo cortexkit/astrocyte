@@ -650,13 +650,13 @@ fn runs_migration_34_requeues_existing_clean_hours_before_reuse() {
     for migration in &crate::store::MIGRATIONS[..33] {
         c.execute_batch(migration.statements).unwrap();
     }
-    edge(
-        &mut c,
-        "old",
-        "ses_old",
-        Some(1),
-        vec![quantity("input", 12, 0)],
-    );
+    // Seed the dated session and its quantity at schema 33, before the runs migration.
+    c.execute_batch(
+        "INSERT INTO usage_event(event_id,producer,producer_ref,session,occurred_at_ms,recorded_at_ms,charge_basis)
+         VALUES('old','opencode','old','ses_old',1,1,'metered_api');
+         INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent)
+         VALUES((SELECT event_key FROM usage_event WHERE event_id='old'),'input','token','billed','fixture',12,0);",
+    ).unwrap();
     c.execute_batch("UPDATE summary_hour SET built_revision=revision,format_version=1; DELETE FROM summary_dirty_hour;").unwrap();
     c.execute_batch(crate::store::MIGRATIONS[33].statements)
         .unwrap();

@@ -4530,8 +4530,8 @@ mod tests {
         conn
     }
 
-    /// The hourly store migrated to the latest schema, for tests that record
-    /// through ingest, whose event queries include `flow_ref`.
+    /// Tests using current ingest need the latest event schema, even when they
+    /// exercise a constraint introduced in an earlier migration.
     fn latest_hourly_store() -> Connection {
         let conn = hourly_store();
         for migration in MIGRATIONS.iter().filter(|migration| migration.version > 24) {
@@ -5376,17 +5376,13 @@ mod tests {
 
     #[test]
     fn schema_v19_attempt_ordinal_overflow_is_integrity_error() {
-        let mut conn = pre19();
+        let mut conn = latest_hourly_store();
         let mut event = sample_event("overflow");
         event.attempt_ordinal = None;
         insert_event(&conn, &event).unwrap();
         conn.execute_batch("DROP TRIGGER usage_event_update_guard")
             .unwrap();
         conn.execute("UPDATE usage_event SET attempt_ordinal=4294967296", [])
-            .unwrap();
-        // Ingest reads `flow_ref` (added in v26), which this pre-v19 store
-        // lacks; add it so the read reaches the overflowing ordinal.
-        conn.execute_batch("ALTER TABLE usage_event ADD COLUMN flow_ref TEXT")
             .unwrap();
         let before = table_rows(&conn, "usage_event");
         let request = crate::ingest::EventRecordRequest {

@@ -1474,8 +1474,14 @@ mod tests {
             conn.execute_batch(migration.statements).unwrap();
         }
         let tx = conn.transaction().unwrap();
+        // Seed the old schema directly; current ingest requires the latest event columns.
         for id in ["legacy-a", "legacy-b"] {
-            record_event_in_tx(&tx, &cc_request(id), 1, DeliveryPath::Read).unwrap();
+            tx.execute(
+                "INSERT INTO usage_event(event_id,producer,producer_ref,recorded_at_ms,charge_basis)
+                 VALUES(?1,'claude-code',?1,1,'metered_api')",
+                [id],
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
         conn.execute_batch(MIGRATIONS[27].statements).unwrap();

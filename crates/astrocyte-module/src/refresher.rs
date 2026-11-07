@@ -260,18 +260,19 @@ pub(crate) mod harness_drain {
                     let columns: Vec<usize> = (0..stmt.column_count())
                         .filter(|col| stmt.column_name(*col).unwrap() != "event_key")
                         .collect();
-                    // `flow_ref` was added to usage_event after these hashes
-                    // were pinned, and only BROCA batch facts set it. A NULL
-                    // there is left out, so a pinned hash still proves every
-                    // earlier column is stored exactly as before; a set
-                    // flow_ref is hashed like any other value.
-                    let flow_ref = (0..stmt.column_count())
-                        .find(|col| stmt.column_name(*col).unwrap() == "flow_ref");
+                    // `flow_ref` and `media_facts` were added after these hashes
+                    // were pinned. Only BROCA batch facts set flow_ref, and only
+                    // media events set media_facts. NULLs in those columns are
+                    // left out so each pinned hash still proves every earlier
+                    // column is unchanged; non-NULL values are always hashed.
+                    let added_columns: Vec<usize> = (0..stmt.column_count())
+                        .filter(|col| matches!(stmt.column_name(*col).unwrap(), "flow_ref" | "media_facts"))
+                        .collect();
                     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
                     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
                         for col in &columns {
                             let value = row.get_ref(*col).map_err(|e| e.to_string())?;
-                            if Some(*col) == flow_ref
+                            if added_columns.contains(col)
                                 && matches!(value, rusqlite::types::ValueRef::Null)
                             {
                                 continue;
