@@ -440,6 +440,20 @@ mod tests {
         assert_eq!(state.step_feed().runner_counts().dropped, 0);
     }
 
+    /// Runner contract 0.8.19 adds an optional cache report (the lifetime used
+    /// and the warming state) to the closed step event, so an older decoder
+    /// refuses an event carrying it. The step must still reach the feed.
+    #[test]
+    fn an_event_with_a_contract_0_8_19_cache_report_is_admitted() {
+        let state = test_state();
+        let (subject, body) = event("minimal", "thalamus-harness", |body| {
+            body["cache"] = json!({"ttl_ms": 3_600_000});
+        });
+        admit(&state, &subject, &body);
+        assert_eq!(feed_rows(&state), 1);
+        assert_eq!(state.step_feed().runner_counts().dropped, 0);
+    }
+
     /// A runner row's cache fields come from the same rules as a recorded
     /// step's, over the session's recorded steps: the file row that later
     /// replaces it, with the same counts, serves the same values.
