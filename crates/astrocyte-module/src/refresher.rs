@@ -7647,6 +7647,7 @@ mod multiplier_stage_tests {
         input_rate_units: std::sync::atomic::AtomicI64,
         unrecognized_key: std::sync::atomic::AtomicBool,
         unit_billing: std::sync::atomic::AtomicBool,
+        cache_write_ttl: std::sync::atomic::AtomicBool,
         uncovered: std::sync::atomic::AtomicBool,
     }
 
@@ -7659,6 +7660,7 @@ mod multiplier_stage_tests {
                 input_rate_units: std::sync::atomic::AtomicI64::new(10_000_000_000),
                 unrecognized_key: std::sync::atomic::AtomicBool::new(false),
                 unit_billing: std::sync::atomic::AtomicBool::new(false),
+                cache_write_ttl: std::sync::atomic::AtomicBool::new(false),
                 uncovered: std::sync::atomic::AtomicBool::new(false),
             })
         }
@@ -7720,6 +7722,19 @@ mod multiplier_stage_tests {
                         json!({"state":"priced","units":1,"exponent":9,
                         "currency":"USD","unit_provenance":{"kind":"stated"}}),
                     );
+                }
+            }
+            if self.cache_write_ttl.load(Ordering::SeqCst) {
+                for (key, units) in [
+                    ("rate.cache_write", 10_000_000_000_i64),
+                    ("rate.cache_write.ttl.5m", 12_500_000_000),
+                    ("rate.cache_write.ttl.1h", 20_000_000_000),
+                    (
+                        "rate.cache_write.above_context.272000.ttl.12h",
+                        40_000_000_000,
+                    ),
+                ] {
+                    facts.insert(key.into(), json!({"state":"priced","units":units,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}}));
                 }
             }
             Ok(CatalogGetResponse {
@@ -8020,6 +8035,67 @@ mod multiplier_stage_tests {
                 "SELECT reasoning_billed_as_output FROM multiplier_observation WHERE observation_day=?1", [DAY], |row| row.get(0))
                 .map_err(|error| error.to_string())).unwrap();
             assert_eq!(recorded, if declared { "[\"openai\"]" } else { "[]" });
+        }
+    }
+
+    #[test]
+    fn cache_write_ttl_multiplier_day_is_recorded_and_values_split_writes() {
+        for missing_lifetime in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = Arc::new(state::leased_test_state(&directory));
+            publish_desired(&state, &directory);
+            seed_usage(&state);
+            state
+                .ordered_write(|tx| {
+                    let measurements = [
+                        ("token", 100),
+                        ("token_cache_5m", 200),
+                        ("token_cache_1h", 300),
+                    ]
+                    .into_iter()
+                    .chain(missing_lifetime.then_some(("token_cache_12h", 400)));
+                    for (unit, quantity) in measurements {
+                        tx.execute(
+                            "INSERT INTO measurement (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
+                             VALUES ((SELECT event_key FROM usage_event WHERE event_id='e1'),'cache_write',?1,'billed','usage.cache_write',?2,0)",
+                            params![unit, quantity],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                    Ok(((), true))
+                })
+                .unwrap();
+            let fusiform = FakeFusiform::new(false);
+            fusiform.cache_write_ttl.store(true, Ordering::SeqCst);
+            install_catalog(&state, &fusiform);
+            MultiplierStage::new(Some(fusiform)).tick(&state, false, NOW);
+            assert_eq!(
+                current_day_observations(&state),
+                [(
+                    "codex".into(),
+                    DAY.into(),
+                    if missing_lifetime { 0 } else { 19_500_000 }
+                )]
+            );
+            let unpriced: String = state
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT unpriced_tokens FROM multiplier_observation WHERE observation_day=?1",
+                        [DAY],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .unwrap();
+            let unpriced: serde_json::Value = serde_json::from_str(&unpriced).unwrap();
+            if missing_lifetime {
+                // Missing rates exclude their hour from value and quota points,
+                // but do not fail the day or claim the lifetime's price is zero.
+                assert_eq!(unpriced[0]["reason"], "no_rate");
+                assert_eq!(unpriced[0]["tokens"], 400);
+            } else {
+                assert_eq!(unpriced, json!([]));
+            }
         }
     }
 

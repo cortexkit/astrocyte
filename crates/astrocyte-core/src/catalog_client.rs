@@ -366,20 +366,20 @@ pub const RATE_UNITS: [&str; 4] = ["second", "character", "image", "request"];
 /// request stated in one of these prices at the unconditional `rate.<role>`.
 pub const STANDARD_MODES: [&str; 2] = ["standard", "default"];
 
-/// The condition under which a conditional rate `rate.<role>.<selector>.<value>`
-/// replaces the unconditional `rate.<role>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RateCondition {
-    /// `above_context.<threshold>`: the request's prompt exceeds the threshold.
-    AboveContext(u64),
-    /// `mode.<name>`: the request's own record states it ran in that mode
-    /// (for example `fast`).
-    Mode(String),
-    /// A selector family this decoder has no producer for. It applies only
-    /// when a request's record states that condition, and no record states
-    /// one, so it never applies and the unconditional rate prices the request.
-    Unknown { selector: String, value: String },
+/// Cache-write lifetimes are stated by each measurement's unit, not its request.
+pub(crate) fn cache_write_ttl(unit: &str) -> Option<&'static str> {
+    CACHE_WRITE_TTLS
+        .iter()
+        .find_map(|(known, ttl)| (*known == unit).then_some(*ttl))
 }
+
+const CACHE_WRITE_TTLS: [(&str, &str); 5] = [
+    ("token_cache_5m", "5m"),
+    ("token_cache_30m", "30m"),
+    ("token_cache_1h", "1h"),
+    ("token_cache_12h", "12h"),
+    ("token_cache_24h", "24h"),
+];
 
 /// One decoded `rate.*` fact key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,18 +387,27 @@ pub struct RateKey {
     pub role: &'static str,
     /// `None` denotes the existing per-million-token grammar.
     pub unit: Option<&'static str>,
-    /// Unit-rate selectors are an unordered set; each name appears once.
+    /// Token and unit selectors are an unordered set; each name appears once.
     pub selectors: BTreeMap<String, String>,
-    /// Token-only condition; unit keys use `selectors` instead.
-    pub condition: Option<RateCondition>,
+}
+
+impl RateKey {
+    /// Unknown conditions cannot activate either a price or its tier/mode.
+    pub(crate) fn has_only_known_token_selectors(&self) -> bool {
+        self.unit.is_none()
+            && self
+                .selectors
+                .keys()
+                .all(|selector| matches!(selector.as_str(), "above_context" | "mode" | "ttl"))
+    }
 }
 
 /// The one rate-key grammar, shared by ledger pricing and the multiplier:
-/// Token keys are `rate.<role>` or `rate.<role>.<selector>.<value>`.
+/// Token keys are `rate.<role>` followed by distinct selector/value pairs.
 /// Unit keys put `per_<unit>` immediately after the role and may carry
 /// several distinct selector/value pairs. The request role is exclusive to
 /// `rate.request.per_request`. Unknown roles and units, empty segments and
-/// repeated unit selectors are errors. Token `above_context` thresholds must
+/// repeated selectors are errors. Token `above_context` thresholds must
 /// be whole numbers so an unreadable threshold cannot silently select a base rate.
 pub fn parse_rate_key(key: &str) -> Result<RateKey, String> {
     let rest = key
@@ -413,7 +422,7 @@ pub fn parse_rate_key(key: &str) -> Result<RateKey, String> {
         .chain((unit == Some("request")).then_some("request"))
         .find(|role| *role == segments[0])
         .ok_or_else(|| format!("rate key {key:?}: role {:?} is not priced", segments[0]))?;
-    if let Some(unit) = unit {
+    let unit = if let Some(unit) = unit {
         let unit = RATE_UNITS
             .into_iter()
             .find(|known| *known == unit)
@@ -423,59 +432,54 @@ pub fn parse_rate_key(key: &str) -> Result<RateKey, String> {
                 "rate key {key:?}: request billing requires rate.request.per_request"
             ));
         }
-        let (pairs, trailing) = segments[2..].as_chunks::<2>();
-        if !trailing.is_empty() || pairs.iter().flatten().any(|segment| segment.is_empty()) {
-            return Err(format!(
-                "rate key {key:?}: selectors require nonempty name/value pairs"
-            ));
-        }
-        let mut selectors = BTreeMap::new();
-        for pair in pairs {
-            if selectors
-                .insert(pair[0].to_string(), pair[1].to_string())
-                .is_some()
-            {
-                return Err(format!("rate key {key:?}: repeated selector {:?}", pair[0]));
-            }
-        }
-        return Ok(RateKey {
-            role,
-            unit: Some(unit),
-            selectors,
-            condition: None,
-        });
+        Some(unit)
+    } else {
+        None
+    };
+    let (pairs, trailing) = segments[if unit.is_some() { 2 } else { 1 }..].as_chunks::<2>();
+    if !trailing.is_empty() || pairs.iter().flatten().any(|segment| segment.is_empty()) {
+        return Err(format!(
+            "rate key {key:?}: selectors require nonempty name/value pairs"
+        ));
     }
-    let condition = match segments[1..] {
-        [] => None,
-        [selector, value] if !selector.is_empty() && !value.is_empty() => Some(match selector {
-            "above_context" => {
+    let mut selectors = BTreeMap::new();
+    for [selector, value] in pairs {
+        let mut value = value.to_string();
+        if unit.is_none() {
+            if *selector == "above_context" {
                 if !value.bytes().all(|byte| byte.is_ascii_digit()) {
                     return Err(format!(
                         "tier key {key:?}: threshold {value:?} is not a whole number"
                     ));
                 }
-                RateCondition::AboveContext(value.parse::<u64>().map_err(|error| {
-                    format!("tier key {key:?}: threshold {value:?} is not a u64 ({error})")
-                })?)
+                value = value
+                    .parse::<u64>()
+                    .map_err(|error| {
+                        format!("tier key {key:?}: threshold {value:?} is not a u64 ({error})")
+                    })?
+                    .to_string();
             }
-            "mode" => RateCondition::Mode(value.to_string()),
-            _ => RateCondition::Unknown {
-                selector: selector.to_string(),
-                value: value.to_string(),
-            },
-        }),
-        _ => {
-            return Err(format!(
-                "rate key {key:?} is neither rate.<role> nor rate.<role>.<selector>.<value>"
-            ))
+            if *selector == "ttl" && !CACHE_WRITE_TTLS.iter().any(|(_, ttl)| *ttl == value) {
+                return Err(format!("rate key {key:?}: unsupported ttl {value:?}"));
+            }
         }
-    };
+        if selectors.insert(selector.to_string(), value).is_some() {
+            return Err(format!("rate key {key:?}: repeated selector {selector:?}"));
+        }
+    }
     Ok(RateKey {
         role,
-        unit: None,
-        selectors: BTreeMap::new(),
-        condition,
+        unit,
+        selectors,
     })
+}
+
+pub(crate) fn token_rate_key(role: &str, selectors: &BTreeMap<String, String>) -> String {
+    let mut key = format!("rate.{role}");
+    for (selector, value) in selectors {
+        key.push_str(&format!(".{selector}.{value}"));
+    }
+    key
 }
 
 /// The mode-conditional rate a request prices at, from the mode its own
@@ -503,12 +507,14 @@ pub fn tier_thresholds(facts: &BTreeMap<String, Value>) -> Result<BTreeSet<u64>,
     let mut thresholds = BTreeSet::new();
     for key in facts.keys() {
         match parse_rate_key(key) {
-            Ok(RateKey {
-                unit: None,
-                condition: Some(RateCondition::AboveContext(threshold)),
-                ..
-            }) => {
-                thresholds.insert(threshold);
+            Ok(parsed) if parsed.has_only_known_token_selectors() => {
+                if let Some(threshold) = parsed.selectors.get("above_context") {
+                    thresholds.insert(
+                        threshold
+                            .parse::<u64>()
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
             }
             Err(error) if key.contains(".above_context.") => return Err(error),
             _ => {}
@@ -890,26 +896,68 @@ mod tests {
     }
 
     #[test]
-    fn rate_keys_are_unconditional_or_one_selector_and_value() {
-        let parse = |key: &str| parse_rate_key(key).map(|key| (key.role, key.condition));
-        assert_eq!(parse("rate.cache_read"), Ok(("cache_read", None)));
+    fn cache_write_ttl_snapshot_accepts_tiered_lifetime_keys() {
+        let facts = BTreeMap::from([
+            ("rate.cache_write".into(), priced_rate(9)),
+            (
+                "rate.cache_write.above_context.272000.ttl.12h".into(),
+                priced_rate(9),
+            ),
+        ]);
+        let client = CatalogClient::new(Arc::new(FakeConnection::new(100, facts.clone())), 100);
+        let result = client.get("provider", "model", 150);
+        let Ok(CatalogLookup::Resolved(snapshot)) = result else {
+            panic!("tiered lifetime catalog snapshot refused: {result:?}");
+        };
+        assert_eq!(snapshot.facts, facts);
+        assert_eq!(tier_thresholds(&facts).unwrap(), BTreeSet::from([272_000]));
+    }
+
+    #[test]
+    fn cache_write_ttl_conditions_are_an_unordered_set() {
+        assert_eq!(
+            parse_rate_key("rate.cache_write.above_context.272000.ttl.12h.mode.fast").unwrap(),
+            parse_rate_key("rate.cache_write.mode.fast.ttl.12h.above_context.272000").unwrap()
+        );
+        for ttl in ["5m", "30m", "1h", "12h", "24h"] {
+            assert!(parse_rate_key(&format!("rate.cache_write.ttl.{ttl}")).is_ok());
+        }
+        for key in [
+            "rate.cache_write.ttl.1h.ttl.5m",
+            "rate.cache_write.mode.fast.mode.fast",
+            "rate.cache_write.ttl.2h",
+            "rate.cache_write.ttl.",
+            "rate.cache_write..1h",
+            "rate.cache_write.ttl.1h.above_context.272k",
+        ] {
+            assert!(parse_rate_key(key).is_err(), "{key} parsed");
+        }
+    }
+
+    #[test]
+    fn rate_keys_preserve_unconditional_and_single_selector_meanings() {
+        let parse = |key: &str| parse_rate_key(key).map(|key| (key.role, key.selectors));
+        assert_eq!(
+            parse("rate.cache_read"),
+            Ok(("cache_read", BTreeMap::new()))
+        );
         assert_eq!(
             parse("rate.input.above_context.200000"),
-            Ok(("input", Some(RateCondition::AboveContext(200_000))))
+            Ok((
+                "input",
+                BTreeMap::from([("above_context".into(), "200000".into())])
+            ))
         );
         assert_eq!(
             parse("rate.cache_read.mode.fast"),
-            Ok(("cache_read", Some(RateCondition::Mode("fast".into()))))
+            Ok((
+                "cache_read",
+                BTreeMap::from([("mode".into(), "fast".into())])
+            ))
         );
         assert_eq!(
             parse("rate.input.region.eu"),
-            Ok((
-                "input",
-                Some(RateCondition::Unknown {
-                    selector: "region".into(),
-                    value: "eu".into()
-                })
-            ))
+            Ok(("input", BTreeMap::from([("region".into(), "eu".into())])))
         );
         for malformed in [
             "rate.input.above_context.200k",
@@ -951,7 +999,6 @@ mod tests {
             "rate.input.per_second.mode",
             "rate.input.per_second..large",
             "rate.input.size.large.per_second",
-            "rate.input.mode.fast.size.large",
         ] {
             assert!(parse_rate_key(key).is_err(), "{key}");
         }

@@ -114,10 +114,10 @@ every tick while events are not flowing. The same reader follows runners' live
 
 ## Pricing
 
-Each measurement is priced against the catalog entry in force when the call
-happened. `parse_rate_key` in `catalog_client.rs` is the one rate-key grammar,
+Each measurement uses the catalog entry in force at the call.
+`parse_rate_key` in `catalog_client.rs` is the one rate-key grammar,
 shared with the multiplier. Token keys are `rate.<role>` per million tokens,
-optionally conditioned on prompt size (`above_context`) or a stated `mode`. Unit
+optionally conditioned on prompt size (`above_context`), `mode` or `ttl`. Unit
 keys add a denominator after the role, such as `per_second` or `per_image`, and
 may carry selectors such as image size. Unknown roles and units are refused.
 Providers in `reasoning_billed_as_output` price reasoning at the output rate;

@@ -35,8 +35,9 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 use crate::catalog_client::{
-    parse_rate_key, stated_mode_condition, CatalogCallError, CatalogClient, CatalogClientError,
-    CatalogLookup, CatalogModel, CatalogSnapshot, RateCondition, RATE_FACT_PREFIX, RATE_ROLES,
+    cache_write_ttl, parse_rate_key, stated_mode_condition, token_rate_key, CatalogCallError,
+    CatalogClient, CatalogClientError, CatalogLookup, CatalogModel, CatalogSnapshot,
+    RATE_FACT_PREFIX, RATE_ROLES,
 };
 use crate::fact::ChargeBasis;
 use crate::money::{round_nano_num, round_nano_ratio, MoneyError};
@@ -764,6 +765,10 @@ pub struct ModelRates {
     /// it did before mode rates were read.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub modes: BTreeMap<String, BTreeMap<String, RateState>>,
+    /// Complete token condition sets, keyed by the selector-sorted rate key.
+    /// Empty in observations recorded before lifetime rates were supported.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub conditional: BTreeMap<String, RateState>,
     /// The target catalog model whose historical rates are used to value this alias.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_model: Option<CatalogModel>,
@@ -1081,23 +1086,53 @@ fn rates_from_snapshot(snapshot: &CatalogSnapshot) -> ModelResolution {
             };
         }
         let role = parsed.role.to_string();
-        match parsed.condition {
-            None => {
+        let selectors = &parsed.selectors;
+        // Unknown selectors have no measurement producer and never apply.
+        if !parsed.has_only_known_token_selectors() {
+            continue;
+        }
+        if let Some(threshold) = selectors.get("above_context") {
+            // Parsing already checked the threshold; retain it even when the
+            // only tier price is for a particular lifetime or mode.
+            if let Ok(threshold) = threshold.parse::<u64>() {
+                rates.tiers.entry(threshold).or_default();
+            }
+        }
+        if let Some(mode) = selectors.get("mode") {
+            rates.modes.entry(mode.clone()).or_default();
+        }
+        match selectors.len() {
+            0 => {
                 rates.base.insert(role, state);
             }
-            Some(RateCondition::AboveContext(threshold)) => {
+            1 if selectors.contains_key("above_context") => {
+                let threshold = selectors["above_context"]
+                    .parse::<u64>()
+                    .expect("validated threshold");
                 rates
                     .tiers
                     .entry(threshold)
                     .or_default()
                     .insert(role, state);
             }
-            Some(RateCondition::Mode(mode)) => {
-                rates.modes.entry(mode).or_default().insert(role, state);
+            1 if selectors.contains_key("mode") => {
+                rates
+                    .modes
+                    .entry(selectors["mode"].clone())
+                    .or_default()
+                    .insert(role, state);
             }
-            // No request records an unknown condition, so its rate never
-            // applies and is not kept.
-            Some(RateCondition::Unknown { .. }) => {}
+            _ => {
+                let key = token_rate_key(parsed.role, selectors);
+                if rates.conditional.insert(key.clone(), state).is_some() {
+                    rates.conditional.insert(
+                        key,
+                        RateState::Unpriced {
+                            reason: "no_rate".into(),
+                        },
+                    );
+                }
+            }
         }
     }
     ModelResolution::Rates(rates)
@@ -1380,8 +1415,9 @@ pub struct Observation {
     pub token_interval_end_ms: Option<i64>,
     pub window_pool_key: String,
     pub window_minutes: i64,
-    /// Input, cache-read, cache-write, output and reasoning counts from unit
-    /// `token` with exponent 0, priced or not, inside the token interval.
+    /// Input, cache-read, cache-write, output and reasoning counts from plain
+    /// and lifetime-specific token units with exponent 0, priced or not,
+    /// inside the token interval.
     /// Output excludes reasoning when the stored output includes it.
     /// Unsupported units are listed in `unpriced_tokens`.
     pub tokens: RoleTokens,
@@ -1897,15 +1933,18 @@ pub fn compute_observation(
     })
 }
 
+type TokenQuantities<'a> = BTreeMap<(&'a str, Option<&'static str>), i64>;
+
 fn event_quantities<'a>(
     event: &'a EventTokens,
     measured: &mut RoleTokens,
     inclusive_output_adjustment: &mut i64,
     count_unpriced: &mut impl FnMut(&str, &str, i64) -> Result<(), MultiplierError>,
-) -> Result<BTreeMap<&'a str, i64>, MultiplierError> {
-    // Measured quantities by role. A quantity that is not a whole token count
+) -> Result<TokenQuantities<'a>, MultiplierError> {
+    // Quantities retain role and lifetime so split writes cannot overwrite
+    // one another. A quantity that is not a whole token count
     // cannot be valued and is counted by reason.
-    let mut quantities: BTreeMap<&str, i64> = BTreeMap::new();
+    let mut quantities = TokenQuantities::new();
     let mut output_source = None;
     for (role, unit, source, units, exponent) in &event.roles {
         // Missing quantities exclude the hour even for an unsupported unit;
@@ -1914,10 +1953,10 @@ fn event_quantities<'a>(
             count_unpriced("missing_quantity", role, units.unwrap_or(0))?;
             continue;
         }
-        // The catalog's rate.cache_write cannot distinguish token_cache_5m
-        // from token_cache_1h. Keep these units in the unpriced breakdown, not
-        // the unit=token totals on either side of quota coverage.
-        if unit != "token" {
+        let ttl = (role == "cache_write")
+            .then(|| cache_write_ttl(unit))
+            .flatten();
+        if unit != "token" && ttl.is_none() {
             count_unpriced(
                 "unit_not_priced",
                 &format!("{role}/{unit}"),
@@ -1932,7 +1971,7 @@ fn event_quantities<'a>(
                     output_source = Some(source.as_str());
                 }
                 if RATE_ROLES.contains(&role.as_str()) {
-                    quantities.insert(role.as_str(), *units);
+                    quantities.insert((role.as_str(), ttl), *units);
                 } else {
                     count_unpriced("unrecognized_role", role, *units)?;
                 }
@@ -1945,8 +1984,10 @@ fn event_quantities<'a>(
     // Some BROCA output counts include reasoning tokens. Remove that overlap
     // once, using the ledger's rule, for both valuation and token counts on
     // either side of quota coverage.
-    if let (Some(output), Some(source)) = (quantities.get("output").copied(), output_source) {
-        let reasoning = quantities.get("reasoning").copied();
+    if let (Some(output), Some(source)) =
+        (quantities.get(&("output", None)).copied(), output_source)
+    {
+        let reasoning = quantities.get(&("reasoning", None)).copied();
         match effective_output(
             &event.producer,
             Some(&event.provider),
@@ -1956,7 +1997,7 @@ fn event_quantities<'a>(
         ) {
             EffectiveOutput::AsStored => {}
             EffectiveOutput::ReasoningRemoved(effective) => {
-                quantities.insert("output", effective);
+                quantities.insert(("output", None), effective);
                 let removed = output
                     .checked_sub(effective)
                     .ok_or(MoneyError::OutOfRange)?;
@@ -1972,8 +2013,8 @@ fn event_quantities<'a>(
                     "reasoning",
                     reasoning.unwrap_or(0),
                 )?;
-                quantities.remove("output");
-                quantities.remove("reasoning");
+                quantities.remove(&("output", None));
+                quantities.remove(&("reasoning", None));
             }
         }
     }
@@ -2025,7 +2066,7 @@ fn value_event(
         &mut line.inclusive_output_adjustment,
         &mut count_unpriced,
     )?;
-    for (role, quantity) in &quantities {
+    for ((role, _), quantity) in &quantities {
         totals.add(role, *quantity)?;
     }
     let event_total = quantities.values().try_fold(0_i64, |sum, quantity| {
@@ -2033,7 +2074,7 @@ fn value_event(
     })?;
 
     if event.model.is_none() {
-        for (role, quantity) in &quantities {
+        for ((role, _), quantity) in &quantities {
             count_unpriced("missing_model", role, *quantity)?;
         }
         return Ok(());
@@ -2042,13 +2083,13 @@ fn value_event(
     let model_rates = match resolution {
         Some(ModelResolution::Rates(model_rates)) => model_rates,
         Some(ModelResolution::Unpriceable { reason }) => {
-            for (role, quantity) in &quantities {
+            for ((role, _), quantity) in &quantities {
                 count_unpriced(reason, role, *quantity)?;
             }
             return Ok(());
         }
         None => {
-            for (role, quantity) in &quantities {
+            for ((role, _), quantity) in &quantities {
                 count_unpriced("rate_not_resolved", role, *quantity)?;
             }
             return Ok(());
@@ -2058,8 +2099,7 @@ fn value_event(
     // Tier: decided from this event's own prompt, and only where one event is
     // one call. The largest threshold the prompt exceeds applies to every role.
     // The prompt is read from the event's measurements as stored, including
-    // the lifetime-split cache writes that are not priced above, with the
-    // same function ledger pricing decides its tiers with.
+    // lifetime-split cache writes, using the ledger's prompt-size function.
     let per_request = PER_REQUEST_PRODUCERS.contains(&event.producer.as_str());
     let prompt =
         prompt_size(event.roles.iter().map(|(role, unit, _, units, exponent)| {
@@ -2069,7 +2109,7 @@ fn value_event(
         // A prompt measurement with no usable quantity leaves the prompt's
         // size unknown, so neither the base nor a tier rate can be chosen.
         // Ledger pricing refuses the same request as `rate_tiered`.
-        for (role, quantity) in &quantities {
+        for ((role, _), quantity) in &quantities {
             count_unpriced("rate_tiered", role, *quantity)?;
         }
         return Ok(());
@@ -2113,7 +2153,7 @@ fn value_event(
         .reasoning_billed_as_output
         .iter()
         .any(|provider| provider == api_provider);
-    for (role, quantity) in quantities {
+    for ((role, ttl), quantity) in quantities {
         if quantity == 0 {
             continue;
         }
@@ -2122,20 +2162,40 @@ fn value_event(
         } else {
             role
         };
-        let state = match mode_rates {
-            // No catalog key prices a stated mode above a context tier, and
-            // neither the tier rate nor the mode rate alone is that price.
-            Some(_) if tier.is_some() => {
-                count_unpriced("mode_rate_above_tier", role, quantity)?;
-                continue;
+        let mut selectors = BTreeMap::new();
+        if let Some(ttl) = ttl {
+            selectors.insert("ttl".into(), ttl.into());
+        }
+        if let Some(mode) = stated_mode {
+            selectors.insert("mode".into(), mode.into());
+        }
+        if let Some((threshold, _)) = tier {
+            selectors.insert("above_context".into(), threshold.to_string());
+        }
+        let exact = model_rates
+            .conditional
+            .get(&token_rate_key(rate_role, &selectors));
+        let state = if ttl.is_some() {
+            // A lifetime is a measurement dimension, never a hint to use the
+            // vendor's default write price or a less-specific condition set.
+            exact
+        } else {
+            match mode_rates {
+                // Without a complete mode/tier rate, neither condition's
+                // price alone describes the recorded request.
+                Some(_) if tier.is_some() && exact.is_none() => {
+                    count_unpriced("mode_rate_above_tier", role, quantity)?;
+                    continue;
+                }
+                // A stated mode is priced at its own rate or not at all.
+                Some(_) if tier.is_some() => exact,
+                Some(rates) => rates.and_then(|rates| rates.get(rate_role)),
+                // A role whose tier key is absent is valued at its base rate, as
+                // the catalog publishes no separate long-context price for it.
+                None => tier
+                    .and_then(|(_, tier_rates)| tier_rates.get(rate_role))
+                    .or_else(|| model_rates.base.get(rate_role)),
             }
-            // A stated mode is priced at its own rate or not at all.
-            Some(rates) => rates.and_then(|rates| rates.get(rate_role)),
-            // A role whose tier key is absent is valued at its base rate, as
-            // the catalog publishes no separate long-context price for it.
-            None => tier
-                .and_then(|(_, tier_rates)| tier_rates.get(rate_role))
-                .or_else(|| model_rates.base.get(rate_role)),
         };
         match state {
             Some(RateState::Priced { units_per_million }) => {
@@ -2995,6 +3055,7 @@ mod tests {
                             base: base.clone(),
                             tiers: tiers.clone(),
                             modes: BTreeMap::new(),
+                            conditional: BTreeMap::new(),
                             reference_model: None,
                         }),
                     )
@@ -3465,7 +3526,7 @@ mod tests {
     }
 
     #[test]
-    fn money_outside_coverage_counts_the_same_disjoint_plain_tokens() {
+    fn money_outside_coverage_counts_the_same_disjoint_tokens_including_lifetime_writes() {
         let conn = conn();
         let (mut config, mut plan) = arithmetic_fixture(&conn);
         config.quota_providers.get_mut("codex").unwrap().scope =
@@ -3502,12 +3563,13 @@ mod tests {
             observation.tokens,
             RoleTokens {
                 input: 10,
+                cache_write: 5,
                 output: 4,
                 reasoning: 3,
                 ..RoleTokens::default()
             }
         );
-        assert_eq!(observation.tokens_outside_quota_coverage, 17);
+        assert_eq!(observation.tokens_outside_quota_coverage, 22);
     }
 
     #[test]
@@ -3981,9 +4043,97 @@ mod tests {
         assert_eq!(observation.tokens.input, 1_300);
     }
 
+    #[test]
+    fn cache_write_ttl_multiplier_matches_complete_tier_and_mode_sets() {
+        let config = config(vec![]);
+        let rate = |units: i64| json!({"state":"priced","units":units,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}});
+        let mut snapshot = CatalogSnapshot {
+            alias_target: None,
+            source: "models.dev".into(),
+            resolved_at_ms: 42,
+            model_key: "anthropic/m".into(),
+            facts: BTreeMap::from([
+                ("rate.cache_write".into(), rate(TEN_PER_M)),
+                ("rate.cache_write.ttl.1h".into(), rate(2 * TEN_PER_M)),
+                ("rate.cache_write.mode.fast".into(), rate(3 * TEN_PER_M)),
+                (
+                    "rate.cache_write.ttl.1h.above_context.100".into(),
+                    rate(4 * TEN_PER_M),
+                ),
+                (
+                    "rate.cache_write.ttl.1h.mode.fast.above_context.100".into(),
+                    rate(5 * TEN_PER_M),
+                ),
+            ]),
+            withheld_facts: BTreeMap::new(),
+            uncertain_facts: BTreeMap::new(),
+            fact_overrides: BTreeMap::new(),
+        };
+        for (mode, remove_tier, expected) in [
+            (None, false, Some(40_000_000_000_000_i128)),
+            (Some("fast"), false, Some(50_000_000_000_000)),
+            (Some("priority"), false, None),
+            (None, true, None),
+        ] {
+            if remove_tier {
+                snapshot
+                    .facts
+                    .remove("rate.cache_write.ttl.1h.above_context.100");
+            }
+            let resolution = rates_from_snapshot(&snapshot);
+            assert!(matches!(resolution, ModelResolution::Rates(_)));
+            let round_trip: ModelResolution =
+                serde_json::from_value(serde_json::to_value(&resolution).unwrap()).unwrap();
+            assert_eq!(round_trip, resolution);
+            let event = EventTokens {
+                producer: "claude-code".into(),
+                provider: "anthropic".into(),
+                model: Some("m".into()),
+                mode: mode.map(str::to_owned),
+                roles: vec![(
+                    "cache_write".into(),
+                    "token_cache_1h".into(),
+                    "usage.cache_write".into(),
+                    Some(1_000),
+                    Some(0),
+                )],
+            };
+            let mut lines = BTreeMap::new();
+            let mut unpriced = BTreeMap::new();
+            let mut totals = RoleTokens::default();
+            value_event(
+                &ValuationRules::from_config(&config, &[]),
+                Some(&resolution),
+                &event,
+                &mut lines,
+                &mut unpriced,
+                &mut totals,
+            )
+            .unwrap();
+            let line = lines.into_values().next().unwrap();
+            assert_eq!(line.numerator, expected.unwrap_or(0));
+            assert_eq!(totals.cache_write, 1_000);
+            if expected.is_some() {
+                assert!(unpriced.is_empty());
+            } else {
+                assert_eq!(
+                    unpriced,
+                    BTreeMap::from([(
+                        (
+                            "no_rate".into(),
+                            "claude-code/anthropic/m".into(),
+                            "cache_write".into()
+                        ),
+                        (1_000, 1)
+                    )])
+                );
+            }
+        }
+    }
+
     /// Claude Code stores lifetime-split cache writes under the units
-    /// `token_cache_5m` and `token_cache_1h`; the catalog's one cache-write
-    /// rate cannot price them, so they are counted by reason, never dropped.
+    /// `token_cache_5m` and `token_cache_1h`; without a matching lifetime rate
+    /// they are counted as `no_rate`, never dropped or valued at the plain rate.
     #[test]
     fn a_cache_write_split_by_lifetime_is_counted_not_dropped() {
         let conn = conn();
@@ -4023,10 +4173,7 @@ mod tests {
             .iter()
             .map(|entry| (entry.reason.as_str(), entry.role.as_str(), entry.tokens))
             .collect();
-        assert_eq!(
-            unpriced,
-            [("unit_not_priced", "cache_write/token_cache_1h", 4000)]
-        );
+        assert_eq!(unpriced, [("no_rate", "cache_write", 4000)]);
     }
 
     /// A per-request producer's event over the threshold prices every role at
@@ -4144,7 +4291,7 @@ mod tests {
         let observation = observe(&conn, &config, 0, 200, &rates);
         // 400 input at the tier rate; the unknown-prompt event adds nothing.
         assert_eq!(observation.api_nanos, 8_000_000);
-        assert_eq!(observation.api_nanos_by_model[0].tiered_tokens, 400);
+        assert_eq!(observation.api_nanos_by_model[0].tiered_tokens, 1_100);
         let unpriced: Vec<_> = observation
             .unpriced_tokens
             .iter()
@@ -4154,8 +4301,8 @@ mod tests {
             unpriced,
             [
                 ("missing_quantity", "cache_read", 0),
+                ("no_rate", "cache_write", 700),
                 ("rate_tiered", "input", 50),
-                ("unit_not_priced", "cache_write/token_cache_1h", 700),
             ]
         );
     }

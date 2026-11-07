@@ -289,11 +289,18 @@ original per quota provider and day. Test:
 ### Catalog rate units and quantities
 
 Token rates retain the implicit denominator of one million tokens. Their keys are
-`rate.<role>` or `rate.<role>.<selector>.<value>`, with the existing token mode and
-context-threshold rules. Audio token roles include `input_audio`, `output_audio`,
-and `cached_input_audio`. A token rate must not state `per`.
+`rate.<role>` followed by zero or more distinct `<selector>.<value>` pairs, in any
+order. Repeated selectors and empty segments are refused. Audio token roles include
+`input_audio`, `output_audio`, and `cached_input_audio`. A token rate must not state `per`.
 The token `above_context.<threshold>` selector tests prompt size;
-`mode.<name>` requires a stated non-standard mode and never falls back.
+its threshold must be a whole number. `mode.<name>` requires a stated non-standard
+mode and never falls back. `ttl` accepts only `5m`, `30m`, `1h`, `12h`, or `24h`.
+Each `cache_write` measurement with unit `token_cache_<lifetime>` selects its own
+`ttl.<lifetime>` row, combined with any applicable mode or context tier. Selection
+matches the complete condition set regardless of pair order. A missing lifetime
+row is `no_rate`, never a fallback to another lifetime or plain `rate.cache_write`.
+A plain `token` write still uses the plain rate (or its stated mode). Unknown
+token selectors parse but never apply.
 Without a stored mode, multiplier rows count `mode_unrecorded_tokens` and
 `base_rate_tier_untested_tokens`. Both pricing paths honor
 `reasoning_billed_as_output`; unlisted reasoning needs its own rate. Ledger

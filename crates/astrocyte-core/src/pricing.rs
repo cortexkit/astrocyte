@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::canon::CanonError;
 use crate::catalog_client::{
-    mode_rate_key, parse_rate_key, stated_mode_condition, tier_thresholds, CatalogClient,
+    cache_write_ttl, parse_rate_key, stated_mode_condition, tier_thresholds, CatalogClient,
     CatalogClientError, CatalogLookup, CatalogSnapshot, RATE_ROLES, RATE_UNITS,
 };
 use crate::fact::ChargeBasis;
@@ -1244,7 +1244,8 @@ fn resolve_measurement(
         ..
     } = &rate
     {
-        let is_token = measurement.unit == "token";
+        let is_token = measurement.unit == "token"
+            || (rate_role == "cache_write" && cache_write_ttl(&measurement.unit).is_some());
         if (is_token && per.is_some())
             || (!is_token && !per.is_some_and(|per| per > 0))
             || matches!(increment, Increment::Quantum { quantity: 0 })
@@ -1467,31 +1468,34 @@ fn measurement_rate_key(
     role: &str,
     recorded_mode: Option<&str>,
 ) -> Option<String> {
-    if measurement.unit == "token" {
+    let ttl = (role == "cache_write")
+        .then(|| cache_write_ttl(&measurement.unit))
+        .flatten();
+    let token = measurement.unit == "token" || ttl.is_some();
+    let base = if token {
         if !measurement.price_selectors.is_empty() {
             return None;
         }
-        return rate_fact_key(role, "token").map(|base| {
-            match stated_mode_condition(recorded_mode) {
-                Some(mode) => mode_rate_key(role, mode),
-                None => base.to_string(),
-            }
-        });
-    }
-    if !RATE_UNITS.contains(&measurement.unit.as_str())
-        || (!RATE_ROLES.contains(&role) && role != "request")
-        || ((role == "request") != (measurement.unit == "request"))
-    {
-        return None;
-    }
+        rate_fact_key(role, "token")?.to_string()
+    } else {
+        if !RATE_UNITS.contains(&measurement.unit.as_str())
+            || (!RATE_ROLES.contains(&role) && role != "request")
+            || ((role == "request") != (measurement.unit == "request"))
+        {
+            return None;
+        }
+        format!("rate.{role}.per_{}", measurement.unit)
+    };
     let mut selectors = measurement.price_selectors.clone();
+    if let Some(ttl) = ttl {
+        selectors.insert("ttl".into(), ttl.into());
+    }
     // As for token keys, a record stating a standard mode (`STANDARD_MODES`:
     // "standard" or "default") prices at the base rate; only another mode,
     // such as "fast", selects a conditional price.
     if let Some(mode) = stated_mode_condition(recorded_mode) {
         selectors.insert("mode".into(), mode.into());
     }
-    let base = format!("rate.{role}.per_{}", measurement.unit);
     if selectors.is_empty() {
         return Some(base);
     }
@@ -1505,7 +1509,12 @@ fn measurement_rate_key(
     let mut matches = keys.into_iter().filter(|key| {
         parse_rate_key(key).is_ok_and(|parsed| {
             parsed.role == role
-                && parsed.unit == Some(measurement.unit.as_str())
+                && parsed.unit
+                    == if token {
+                        None
+                    } else {
+                        Some(measurement.unit.as_str())
+                    }
                 && parsed.selectors == selectors
         })
     });
@@ -3161,6 +3170,190 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn cache_write_ttl_prices_each_measurement_at_its_own_lifetime() {
+        let mut conn = conn();
+        let measurements = [
+            "token",
+            "token_cache_5m",
+            "token_cache_1h",
+            "token_cache_30m",
+            "token_cache_12h",
+            "token_cache_24h",
+        ]
+        .map(|unit| MeasurementInput {
+            unit: unit.into(),
+            ..measurement("cache_write", Some(1_000))
+        });
+        let event_id = record(
+            &mut conn,
+            "lifetimes",
+            ChargeBasis::MeteredApi,
+            Some(700),
+            measurements.into(),
+        );
+        let fake = FakeCatalog::new(BTreeMap::from([
+            ("rate.cache_write".into(), rate(3_000_000_000)),
+            ("rate.cache_write.ttl.5m".into(), rate(4_000_000_000)),
+            ("rate.cache_write.ttl.1h".into(), rate(6_000_000_000)),
+            ("rate.cache_write.ttl.30m".into(), rate(5_000_000_000)),
+            ("rate.cache_write.ttl.12h".into(), rate(7_000_000_000)),
+            ("rate.cache_write.ttl.24h".into(), rate(8_000_000_000)),
+        ]));
+        reprice_event(
+            &mut conn,
+            &event_id,
+            &client(fake),
+            1_000,
+            PricingOrigin::PricingPass,
+        )
+        .unwrap();
+        let rows: Vec<(String, Option<i64>, Option<String>)> = conn.prepare(
+            "SELECT unit, charge_nanos, unpriced_reason FROM priced_charge WHERE event_key=(SELECT event_key FROM usage_event WHERE event_id=?1) ORDER BY unit"
+        ).unwrap().query_map([&event_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("token".into(), Some(3_000_000), None),
+                ("token_cache_12h".into(), Some(7_000_000), None),
+                ("token_cache_1h".into(), Some(6_000_000), None),
+                ("token_cache_24h".into(), Some(8_000_000), None),
+                ("token_cache_30m".into(), Some(5_000_000), None),
+                ("token_cache_5m".into(), Some(4_000_000), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn cache_write_ttl_missing_lifetime_never_falls_back() {
+        let mut conn = conn();
+        let event_id = record(
+            &mut conn,
+            "missing-lifetime",
+            ChargeBasis::MeteredApi,
+            Some(700),
+            vec![MeasurementInput {
+                unit: "token_cache_1h".into(),
+                ..measurement("cache_write", Some(1_000))
+            }],
+        );
+        let fake = FakeCatalog::new(BTreeMap::from([
+            ("rate.cache_write".into(), rate(3_000_000_000)),
+            ("rate.cache_write.ttl.5m".into(), rate(4_000_000_000)),
+        ]));
+        reprice_event(
+            &mut conn,
+            &event_id,
+            &client(fake),
+            1_000,
+            PricingOrigin::PricingPass,
+        )
+        .unwrap();
+        let rows = tier_rows(&conn, &event_id);
+        assert_eq!(rows[0].0.as_deref(), Some("no_rate"));
+        assert_eq!(rows[0].4, None);
+        let entry: Value = serde_json::from_str(rows[0].1.as_deref().unwrap()).unwrap();
+        assert_eq!(entry["fact_key"], "rate.cache_write.ttl.1h");
+        assert_eq!(entry["state"], "absent");
+    }
+
+    #[test]
+    fn cache_write_ttl_matches_the_complete_mode_condition_set() {
+        let mut conn = conn();
+        let event_id = record(
+            &mut conn,
+            "mode-lifetime",
+            ChargeBasis::MeteredApi,
+            Some(700),
+            vec![MeasurementInput {
+                unit: "token_cache_1h".into(),
+                ..measurement("cache_write", Some(1_000))
+            }],
+        );
+        let fake = FakeCatalog::new(BTreeMap::from([
+            ("rate.cache_write".into(), rate(3_000_000_000)),
+            ("rate.cache_write.mode.fast".into(), rate(4_000_000_000)),
+            ("rate.cache_write.ttl.1h".into(), rate(5_000_000_000)),
+            (
+                "rate.cache_write.ttl.1h.mode.fast".into(),
+                rate(6_000_000_000),
+            ),
+            (
+                "rate.cache_write.region.eu.ttl.1h".into(),
+                rate(9_000_000_000),
+            ),
+            (
+                "rate.cache_write.region.eu.above_context.100.ttl.1h".into(),
+                rate(9_000_000_000),
+            ),
+        ]));
+        let tx = conn.transaction().unwrap();
+        let mut plan = read_reprice_in_tx(&tx, &event_id).unwrap();
+        drop(tx);
+        for (mode, expected) in [
+            (None, Some(5_000_000)),
+            (Some("fast"), Some(6_000_000)),
+            (Some("priority"), None),
+        ] {
+            plan.mode = mode.map(str::to_owned);
+            let resolved = resolve_reprice(&plan, &client(fake.clone()), &[]).unwrap();
+            let decisions: Vec<_> = resolved
+                .measurements
+                .into_iter()
+                .map(|measurement| measurement.decision)
+                .collect();
+            assert_eq!(charge_nanos(&decisions), vec![expected]);
+            if expected.is_none() {
+                assert!(matches!(
+                    decisions[0],
+                    ChargeDecision::Unpriced {
+                        reason: UnpricedReason::NoRate,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn cache_write_ttl_tiered_snapshot_still_refuses_the_whole_event() {
+        let mut conn = conn();
+        let event_id = record(
+            &mut conn,
+            "tiered-lifetime",
+            ChargeBasis::MeteredApi,
+            Some(700),
+            vec![
+                measurement("input", Some(300_000)),
+                MeasurementInput {
+                    unit: "token_cache_12h".into(),
+                    ..measurement("cache_write", Some(1_000))
+                },
+            ],
+        );
+        let fake = FakeCatalog::new(BTreeMap::from([
+            ("rate.input".into(), rate(3_000_000_000)),
+            (
+                "rate.cache_write.above_context.272000.ttl.12h".into(),
+                rate(6_000_000_000),
+            ),
+        ]));
+        reprice_event(
+            &mut conn,
+            &event_id,
+            &client(fake),
+            1_000,
+            PricingOrigin::PricingPass,
+        )
+        .unwrap();
+        let rows = tier_rows(&conn, &event_id);
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row.0.as_deref(), Some("rate_tiered"));
+            assert_eq!(row.4, None);
+        }
     }
 
     /// A request recorded fast prices at `rate.input.mode.fast`; one recorded
