@@ -1,133 +1,135 @@
 # Codebase Structure
 
-`ARCHITECTURE.md` covers runtime.
+A Cargo workspace of three crates. `ARCHITECTURE.md` explains how the parts work
+together; this file says where they live. To find a symbol, search the code.
 
-## Repository map
+## Repository
 
-Crates live in `crates/`, public docs in `docs/`, and gates in `scripts/`.
-`.github/workflows/ci.yml` runs CI.
+```text
+crates/
+  astrocyte-core/     ledger domain logic and the SQLite schema (no subc dependency)
+  astrocyte-module/   the ck-astrocyte binary, peer clients and source mappings
+  astrocyte-readers/  harness session-store parsers
+docs/                 public contracts, data model and operator guides
+scripts/              local and CI gates, train push tooling
+.github/workflows/    CI (ci.yml): checks, lints and tests on Linux and Windows
+```
 
-## `astrocyte-core`
+Internal records live in the ignored `.cortexkit/` folder, which tracks only
+`WORKER.md`, the build and test guide for workers.
 
-Domain logic and storage.
+## `crates/astrocyte-core/src`
 
-- `store.rs` defines `MIGRATIONS` (1 to 37), initializes connections and migrates stores.
-- `fact.rs`: event and measurement identity, minted locally.
-- `ingest.rs`: transactional event recording, redelivery handling, chargeability
-  settlement, adjustments and charge-basis correction.
-- `pricing.rs`: per-measurement pricing and resolve-then-commit repricing.
-- `catalog_client.rs`: typed boundary to the fusiform catalog, and the one rate-key
-  grammar (`parse_rate_key`) that ledger pricing and the multiplier share.
-- `subscription.rs`: effective-dated subscription plans and coverage resolution.
-- `multiplier.rs`: the derived subscription multiplier: config, Δused%, list-price
-  token valuation, the daily observation, operator recompute and report.
-- `statement.rs`, `statement_import.rs`: vendor statements, CSV import, line matching.
-- `reconcile.rs`: statement-line against ledger reconciliation.
-- `report.rs`: the read model behind reports, coverage and explain; explain serves
-  charge generations within a measurement, not local surrogate keys.
-- `report/hourly.rs`: This module builds and audits hourly summaries and combines
-  clean summaries with live base rows for reports.
-- `verdict.rs`: the machine-scoped `budget.verdict` read.
-- `store_v33_tests.rs`: cursor preservation and refusal tests for the event-only rebuild.
+- `store.rs`: `MIGRATIONS` (1 to 37), connection setup and `migrate_store`.
+- `fact.rs`: call and measurement identity.
+- `ingest.rs`: recording calls in one transaction, redelivery and quarantine,
+  chargeability settlement, adjustments and charge-basis correction.
+- `pricing.rs`: pricing one measurement, and resolve-then-commit repricing.
+- `catalog_client.rs`: the typed fusiform catalog boundary and `parse_rate_key`.
+- `media.rs`: maps colliculus usage records into calls without rounding.
+- `subscription.rs`: effective-dated ledger plans and coverage.
+- `multiplier.rs`: the subscription multiplier: config, valuation, the daily
+  observation, recompute and report. `multiplier/clean.rs` finds clean
+  account-hours; `multiplier/calibration.rs` holds the stability checks.
+- `statement.rs`, `statement_import.rs`, `reconcile.rs`: vendor statements, CSV
+  import and statement-to-ledger reconciliation.
+- `report.rs`: the read model behind the spend reports, coverage and explain.
+  `report/hourly.rs` builds, reads and audits the hourly summaries.
+- `runs.rs`: session, run and flow cost reads, with their hourly totals.
 - `cache_diagnostics.rs`: harness steps per session and their cache verdicts.
-- `runs.rs`: session/run/flow cost reads.
-- `step_feed.rs`: the live step feed: table, change detection, paged read.
-- `capacity.rs`: QTA capacity windows, observations, runtime and freshness.
+- `step_feed.rs`: the live step feed table, retention and paged read.
+- `capacity.rs`: insula quota windows, readings and freshness.
+- `verdict.rs`: `budget.verdict`.
 - `money.rs`: signed nanodollar arithmetic with one rounding site.
-- `canon.rs`: internal exact-integer canonical JSON and SHA-256 hashing.
-- `lib.rs`: crate root.
+- `canon.rs`: canonical JSON and SHA-256 hashing for identity.
+- `test_support.rs`: shared test fixtures.
 
-## `astrocyte-module`
+## `crates/astrocyte-module/src`
 
-Shared library; three binaries.
+A library shared by three binaries: `main.rs` (`ck-astrocyte`) and two tools,
+`bin/spend_drive.rs` (calls one operation over a connection file) and
+`bin/corpus_drive.rs` (drives real exported facts through ingest).
 
-- `lib.rs`: shared modules and unit tests, compiled once.
-- `main.rs`: startup, `--version`, `--check-config`, subc serving and the manifest.
-- `ops.rs`: `PUBLIC_OPERATION_NAMES` and `dispatch` for the served operations.
-- `state.rs`: `SharedState`, the writer fence, the public projection and health.
+- `main.rs`: startup, `--version`, `--check-config`, the manifest, serving and
+  route-level refusals.
+- `ops.rs`: `PUBLIC_OPERATION_NAMES` and `dispatch`.
+- `state.rs`: `SharedState`, the writer fence, the projection and health.
+- `config.rs`: closed configuration decoding and `INGEST_SOURCES`.
+- `refresher.rs`: the loop: full ticks, the fast lane, pricing, the queue check,
+  summaries and the multiplier stage. It also holds `harness_drain`, the drain
+  plumbing every file source shares.
+- Harness sources, one per source key: `claude_code_source.rs`, `codex_source.rs`,
+  `opencode_source.rs`, `opencode_v2_source.rs`, `pi_source.rs`,
+  `gemini_source.rs`, `goose_source.rs`, `omp_source.rs`, `kimi_source.rs`.
+  `jsonl_schedule.rs` holds each JSONL file's next read deadlines, such as the
+  staggered daily full re-read.
+- Declared folders: `declared_roots.rs` (roots files and path containment),
+  `claude_workers_source.rs`, `claude_thalamus_source.rs` and
+  `opencode_thalamus_source.rs`. `harness_paths.rs` resolves every harness path.
+- `broca_source.rs`, `wire_map.rs`: BROCA's `run-index.db` reader and fact mapping.
+- `colliculus_source.rs`: the colliculus media usage feed.
+- `fusiform_client.rs`, `qta_client.rs`, `peer_exchange.rs`: the fusiform and
+  insula clients and their shared framing. `capacity_map.rs` maps quota answers.
+- `quota_events.rs`, `quota_bus_client.rs`: the bus reader for insula's quota
+  events, with polling failover, and its attested ckbus calls. `runner_steps.rs`
+  admits live runner step events into the step feed.
 - `recent_steps.rs`: the in-memory recent steps behind `usage.cache.steps`.
-- `step_feed.rs`: serving the live step feed and who may read it.
-- `config.rs`: closed desired-configuration decoding and canonical identity.
-- `refresher.rs`: the background loop (drains, capacity poll, pricing pass, pricing
-  queue reconciliation, the daily multiplier stage and its operator recompute).
-- `broca_source.rs`, `wire_map.rs`: BROCA `run-index.db` reader and fact mapping.
-- `colliculus_source.rs` drains the acknowledged media usage feed. The core's
-  `media.rs` maps its typed records without rounding quantities or inventing usage.
-- `qta_client.rs`, `capacity_map.rs`: insula `usage.get`/`events_get` client and capacity mapping.
-- `quota_events.rs`, `quota_bus_client.rs`, `runner_steps.rs`: the bus reader (quota
-  and runner step events) and attested authentication;
-  `quota_events_tests.rs` tests delivery, failover and shutdown.
-- `fusiform_client.rs`: fusiform `catalog.get` and `plan.prices` client.
-- `claude_code_source.rs`, `codex_source.rs`, `opencode_source.rs`, `opencode_v2_source.rs`,
-  `pi_source.rs`, `gemini_source.rs`, `goose_source.rs`, `omp_source.rs`, `kimi_source.rs`:
-  harness producers sharing `refresher::harness_drain`, each with its own
-  mapping and cursor.
-- `harness_paths.rs`: injectable harness paths.
-- `declared_roots.rs` decodes roots and checks path containment. `claude_workers_source.rs`
-  and `claude_thalamus_source.rs` acknowledge Claude folder reads.
-  `opencode_thalamus_source.rs` publishes OpenCode read watermarks.
-- `build.rs`: stamps source and dependency provenance into the binary.
-- `test_support.rs`: waits and fixtures; gated by tests or the `test-support`
-  dev-dependency feature.
+- `step_feed.rs`: serving the step feed, its subscribers and who may read it.
+- `test_support.rs`: test fixtures, also built under the `test-support` feature.
+  The crate's `build.rs` stamps build provenance into the binary.
 
-Two non-production tools in `src/bin`:
+## `crates/astrocyte-readers/src`
 
-- `spend_drive`: management consumer calling one served operation over a connection file.
-- `corpus_drive`: drives a producer's real exported facts through the ingest path.
+- `sessions/`: one parser per harness: `claudecode.rs`, `codex.rs` (with
+  `codex_archive.rs` for compressed rollouts), `opencode.rs`, `opencode_v2.rs`,
+  `opencode_schema.rs`, `pi.rs`, `gemini.rs`, `goose.rs`, `omp.rs`, `kimi.rs`.
+- Shared reader parts: `sessions/jsonl_resume.rs` (resumable JSONL reads),
+  `sessions/sqlite_read.rs` (read-only snapshot opens), `sessions/roles.rs`
+  (token roles), `sessions/lenient.rs` (diagnostic-only fields),
+  `sessions/utils.rs` and `sessions/mod.rs`.
+- `provider_identity.rs`, `file_identity.rs`, `sqlite_uri.rs`, `read_io.rs`:
+  provider names, opened-file identity, read-only SQLite URIs and read counters.
 
-## `astrocyte-readers`
+Most parsers are adapted from tokscale; see `THIRD-PARTY-NOTICES.md`.
 
-Harness session-store parsers.
+## Tests and vectors
 
-- `sessions/claudecode.rs`: Claude Code JSONL transcripts, folded to one call per
-  request.
-- `sessions/codex.rs`: Codex CLI rollouts, one call per advancing `token_count`.
-- `sessions/gemini.rs`: Gemini CLI chat recordings, one call per message with `tokens`.
-- `sessions/goose.rs`: the Goose SQLite store, one accumulated row per session.
-- `sessions/omp.rs`: Oh My Pi JSONL sessions, one call per assistant message.
-- `sessions/kimi.rs`: Kimi CLI wire logs, one call per `StatusUpdate`.
-- `sessions/jsonl_resume.rs`: the resumable append-only JSONL read the JSONL readers
-  share (Pi keeps its own).
-- `sessions/roles.rs`: `DerivedRole`, a disjoint token role or why there is none.
-- `sessions/opencode.rs`, `sessions/opencode_schema.rs`, `sessions/opencode_v2.rs`: OpenCode.
-- `sessions/pi.rs`: Pi JSONL sessions.
-- Most reader files are adapted from the tokscale project; see `THIRD-PARTY-NOTICES.md`.
-- `sessions/mod.rs`, `sessions/utils.rs`: shared session types and helpers.
-- `provider_identity.rs`: provider name normalization.
-- `file_identity.rs`, `sqlite_uri.rs`: opened-file identity and read-only SQLite URIs.
-- `tests/fixtures/pi_usage.jsonl`: a Pi fixture.
+Unit tests sit beside the code under `#[cfg(test)]`, some in sibling files whose
+names end in _tests. Integration tests are in each crate's `tests/`. Wire vectors
+that apps decode are in `crates/astrocyte-module/test-vectors/`, regenerated by
+tests; samples pinned from peers are in `tests/vectors/`.
 
 ## Scripts
 
-- `scripts/check_train_preconditions.py`: CI precondition check on `ci.yml`.
-- `scripts/fmt-check.sh`: formatting gate.
-- `scripts/train-push.sh`, `scripts/train-push.local.sh`, `scripts/watch-ci.sh`,
-  `scripts/lib/operator-gh.sh`, `scripts/lib/workflow-gates.py`: operator push and
-  CI-watch tooling.
-- `scripts/check_doc_references.py`: validates paths, identifiers, tables and operations
-  in both overview docs.
-- `scripts/check-path-deps.py`: no path dependency outside the repo.
-- `scripts/check-cortexkit-layout.sh`: nothing internal tracked under `.cortexkit/`.
+- `scripts/gate.sh`: CI's checks before a push: local checks, then the Linux and
+  Windows suites on the remote build servers; with --fast, only the local checks.
+- `scripts/check_doc_references.py`: checks every path, identifier, table and
+  operation named in the two overview docs, and their size ceiling.
+- `scripts/fmt-check.sh`, `scripts/check-path-deps.py`,
+  `scripts/check-cortexkit-layout.sh`, `scripts/check_train_preconditions.py`:
+  formatting, no outside path dependencies, nothing internal tracked, CI shape.
+- `scripts/train-push.sh`, `scripts/watch-ci.sh`, `scripts/lib/`: landing on
+  master through CI.
 
 ## Docs
 
-`docs/` is public only; internal records stay in the ignored `.cortexkit/`, which
-tracks only `WORKER.md`, the build and test guide.
+- Contracts: `docs/module-surface.md` (every operation), `docs/money-ingest.md`,
+  `docs/claude-workers-contract.md`,
+  `docs/thalamus-claude-code-sessions-contract.md`,
+  `docs/thalamus-opencode-sessions-contract.md`.
+- How it works: `docs/data-model.md`, `docs/harness-readers.md`,
+  `docs/subscription-multiplier.md`.
+- Operators: `docs/configuration.md`, `docs/operations.md`, and
+  `docs/prod-config/astrocyte-v2.jsonc` as an example configuration.
 
-- Contracts: `docs/module-surface.md` (operations), `docs/money-ingest.md`,
-  `docs/claude-workers-contract.md`, `docs/thalamus-opencode-sessions-contract.md`.
-- Architecture: `docs/data-model.md`, `docs/harness-readers.md`.
-- Operator guides: `docs/configuration.md`, `docs/operations.md`.
-- `docs/prod-config/astrocyte-v2.jsonc`: an example desired configuration.
+## Where new code goes
 
-## Change placement
-
-- Schema: add a new `Migration` in `store.rs`. Never edit one that has already been
-  applied.
-- A new served operation: add it to `PUBLIC_OPERATION_NAMES` and `dispatch` in
-  `ops.rs`. Put its logic in `astrocyte-core`.
-- A new pull producer: add its client and drain in `astrocyte-module`. A new harness:
-  add its reader in `astrocyte-readers` and mapping in `astrocyte-module`. Add either
-  source key to `config::INGEST_SOURCES` for `harness_ingest.exclude`; ingestion
-  defaults on unless excluded.
-- Tests sit beside the code under `#[cfg(test)]`.
+- **Schema:** a new `Migration` at the end of `MIGRATIONS` in `store.rs`. Never
+  edit an applied migration.
+- **A served operation:** its logic in `astrocyte-core`, its name in
+  `PUBLIC_OPERATION_NAMES` and `dispatch`, and its contract in
+  `docs/module-surface.md`.
+- **A harness:** the parser in `astrocyte-readers`, the source in
+  `astrocyte-module` on `harness_drain`, and its key in `config::INGEST_SOURCES`.
+- **A peer client:** in `astrocyte-module`, with every module it calls declared in
+  the manifest.

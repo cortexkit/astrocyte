@@ -1,186 +1,196 @@
 # Architecture
 
-The source is authoritative; `STRUCTURE.md` maps it.
+Astrocyte (`ck-astrocyte`) is the spend ledger for AI usage on one machine. It
+records every model call and media job it can observe, prices each in signed
+nanodollars against the fusiform catalog, and serves spend reports, run costs,
+cache diagnostics, a live step feed and subscription multipliers over subc. It
+reads usage after the fact, never on a call's path, and enforces nothing:
+`budget.verdict` always answers `allow`. `STRUCTURE.md` maps the files; `docs/`
+holds the contracts and details this page summarises.
 
-## System shape
+## Rules the design keeps
 
-Astrocyte (`ck-astrocyte`) records machine-scoped AI usage off the request hot path,
-prices events in signed nanodollars against fusiform, and serves ledger, report and
-reconciliation over subc. `budget.verdict` always returns `allow`, because cap
-enforcement is not built.
+- **Append-only.** Recorded calls, measurements and charges are never deleted or
+  rewritten; a correction appends a new generation.
+- **Absent is not zero.** An unreported count stays unknown, and an unpriced
+  quantity stays unpriced with a reason.
+- **Astrocyte mints identity.** `fact.rs` derives `event_id` from the producer,
+  lineage (usually the session) and the producer's own reference, which is kept
+  verbatim. Re-reading a store records nothing twice.
+- **One pricer.** Producers send usage, never cost, so reports cannot disagree
+  with the ledger.
+- **One bad record never stops a source.** It is set aside as evidence with its
+  location and reason, and reading continues.
+- **No peer blocks startup or ends the process.** Work that needs a peer waits.
+- **Per-tick cost follows new work.** Readers tail what changed; whole-history
+  checks run daily.
 
-The workspace has three crates:
+## Terms
 
-- `astrocyte-core`: producer-neutral identity, ingest, pricing, subscriptions,
-  statements, reconciliation, reports and the SQLite schema. It has no subc
-  dependency.
-- `astrocyte-module`: the `ck-astrocyte` binary, with serving, desired configuration,
-  the refresher loop, the subc clients and the producer mappings.
-- `astrocyte-readers`: parsers for coding-harness session stores (Claude Code,
-  Codex, OpenCode, Pi, Gemini CLI, Goose, Oh My Pi, Kimi CLI) and provider identity
-  normalization.
+- **Call (event):** one model request or media job, a row in `usage_event`.
+- **Measurement:** one quantity of one role on a call, such as input tokens.
+- **Charge:** the price of one measurement. The head is the newest generation;
+  repricing appends a head naming its predecessor.
+- **Charge basis:** `metered_api` prices at list rates; `subscription_included` is
+  covered when a ledger plan is in force; an unknown basis stays unpriced.
+- **Source:** a place usage is read from, with its own key, cursor and health.
+- **Work class:** who the work was for, verbatim from the producer.
+
+## Crates
+
+- `astrocyte-core`: identity, ingest, pricing, subscriptions, statements,
+  reconciliation, reports, runs, cache diagnostics, the multiplier and the SQLite
+  schema. It has no subc dependency.
+- `astrocyte-module`: the `ck-astrocyte` binary: serving, configuration, the
+  refresher loop, peer clients and the mapping from each source into the ledger.
+- `astrocyte-readers`: parsers for harness session stores (Claude Code, Codex,
+  OpenCode 1 and 2, Pi, Gemini CLI, Goose, Oh My Pi, Kimi CLI) and provider name
+  normalisation. Most are adapted from tokscale.
 
 ## Durable state
 
-`crates/astrocyte-core/src/store.rs` defines `MIGRATIONS`, currently at schema version 37.
-`initialize_connection` verifies SQLite features and enables foreign keys and a
-5000 ms busy timeout; the read-only report connection skips creation probes.
+One SQLite store in WAL mode, written by one process under a lease.
+`crates/astrocyte-core/src/store.rs` holds `MIGRATIONS`, at schema version 37; an
+older binary refuses a newer store. `initialize_connection` sets a 5000 ms busy
+timeout and in-memory temporary storage, enables foreign keys and probes needed
+SQLite features; commits use FULL sync. Triggers refuse deleting or rewriting the
+append-only tables, even through `INSERT OR REPLACE`. Integer keys are never
+served. The [data model](docs/data-model.md#tables) lists every table.
 
-The [data model](docs/data-model.md#tables) describes every table and its write rules.
+## Where usage comes from
 
-Local integer event and charge keys are never served. Event digests remain the
-identity; charge explanations use role, unit and generation. The
-[data model](docs/data-model.md) explains predecessor constraints and migration maintenance.
-
-Triggers `usage_event_no_delete`, `measurement_no_update` and `priced_charge_no_update`
-abort UPDATE and DELETE. Corrections append rows; see the [data model](docs/data-model.md).
-
-## Hourly summaries
-
-Per-call rows remain authoritative, and hourly summaries are derived data that can
-be rebuilt. Triggers mark the affected UTC hour or undated partition dirty in the
-same transaction that records an event or changes its pricing, adjustments or
-chargeability. The refresher rebuilds dirty hours from the base tables and
-publishes a replacement only if the hour's revision still matches. Reports read
-clean whole hours from summaries and read dirty, missing or timezone and
-subscription seam hours from base rows in the same snapshot. Work-class
-percentiles come from exact value frequencies rather than approximate buckets.
-The audit compares summaries against base rows, requeues discrepancies and starts
-its next pass a day after the previous pass completes. Charge writers must
-update the event header before inserting heads; the existing generation-and-basis
-guard checks agreement, not transaction identity. The [data model](docs/data-model.md#hourly-summaries)
-explains the details.
-
-## Write ordering
-
-`SharedState` holds one store, a writer fence and two connections. `ordered_write`
-(refresher) and `ordered_op_write` (served operations) run one transaction under the
-fence, then refresh the projection. Network and file I/O precede transactions;
-statement import accepts regular files up to 64 MiB. A failed projection refresh
-leaves the commit intact; health stays stale until a refresh succeeds. A write panic
-rolls back and stops the module non-zero so the supervisor restarts it.
-
-Served reads, including `budget.verdict`, use `with_read_op` on a mutex-guarded
-read-only connection opened after migration. In WAL mode a report neither waits for
-nor blocks ingest, and each read sees one ledger snapshot. Refresher reads and reads before
-`spend.event.reprice` and `spend.basis.correct` use the writer via `with_conn`;
-`spend.multiplier.recompute` reads on the reader before writing. The reader cannot
-write, so it needs no lease.
-
-## Producers
-
-- **BROCA store.** `drain_once` reads one page of `export_facts` from BROCA's
-  `run-index.db` in its data directory (`mode=ro`) past the cursor
-  (`<instance>:<epoch>`, `export_seq`); a new instance or epoch restarts at 0. It
-  refuses a lineage regression and commits facts and cursor in one transaction. An
-  absent store removes the row; any drain failure keeps the cursor, sets `pending_unknown`.
-- **Harness files.** Each tick reads the local harness session stores through
-  `astrocyte-readers`, one isolated drain per source key; see
-  [harness readers](docs/harness-readers.md). Goose emits one total per session.
-- **Declared folders.** `claude-code-workers`, `claude-code-thalamus` and
-  `opencode-thalamus` read THALAMUS's private folders with owner labels and
-  acknowledge finished reads for cleanup. See the [workers](docs/claude-workers-contract.md),
+- **Harness stores.** One reader per harness reads its session files or database
+  read-only; see [harness readers](docs/harness-readers.md).
+- **BROCA.** `drain_once` reads pages of `export_facts` from BROCA's `run-index.db`
+  past a cursor, refuses a cursor that moves backwards, and commits facts and
+  cursor together. BROCA plans to replace this with an acknowledged billing feed.
+- **Declared folders.** THALAMUS lists its private sessions in roots files, read as
+  `claude-code-workers`, `claude-code-thalamus` and `opencode-thalamus`. Each entry
+  must resolve to its exact expected path. After commit astrocyte acknowledges
+  reads (or serves a watermark through `watermark.get`), and only then may
+  THALAMUS delete a folder. See the
+  [workers](docs/claude-workers-contract.md),
   [Claude Code](docs/thalamus-claude-code-sessions-contract.md) and
   [OpenCode](docs/thalamus-opencode-sessions-contract.md) contracts.
-- **Colliculus feed.** Full ticks drain media usage through a management route,
-  committing each page with its cursor before acknowledging it. An absent module
-  leaves health untouched; see [harness readers](docs/harness-readers.md).
+- **Colliculus.** Media usage arrives through colliculus's feed (`usage.read`),
+  each page committed with its cursor before `usage.ack`. A missing colliculus
+  module leaves health untouched.
 - **Push.** Peers call `spend.event.ingest`, `spend.correction.ingest` and
   `spend.chargeability.settle`; see [retry rules](docs/money-ingest.md).
 
-Spend facts write `usage_event`, `measurement` and `chargeability_transition`.
-BROCA steps will arrive from its step log, not its exported spend facts.
-`fact.rs` mints identity locally; `producer_ref` values stay verbatim as provenance.
-
-BROCA, colliculus, Claude Code, Codex, OpenCode and Pi set unreadable records aside as
-`set_aside_record` evidence, committing evidence, good events and progress together.
-Only new evidence warns; rereads refresh last-seen time. Coverage reports counts
-without degrading health.
+Every source writes `usage_event`, `measurement` and `chargeability_transition`.
+A call recorded again with identical content writes nothing; different content
+is quarantined. Set-aside records go to `set_aside_record` in the same
+transaction as the good calls and the cursor, and coverage counts them.
 
 ## Refresher loop
 
-`start_refresher` runs full ticks on one OS thread every `poll_interval_secs`.
-Between ticks, `FAST_LANE_INTERVAL` (two seconds) tails OpenCode 1/2 and BROCA
-and checks JSONL hot paths discovered on full ticks. Idle cycles commit nothing.
-Only full drains advance `last_success_ms`. Both lanes share ingestion and
-post-commit memory refresh under the writer fence. Tails run no full passes or
-maintenance, and stop requests interrupt both lanes. One full tick:
+`start_refresher` runs one OS thread. A full tick, every `poll_interval_secs`:
 
-1. Connect a pending fusiform catalog and find its history boundary through
-   `catalog.status`, falling back to a refused time-zero `catalog.get` for older
-   peers. Until then, step 4 waits.
-2. Drain harness stores, BROCA and colliculus, except sources disabled by `harness_ingest`.
-   Skipped sources are not read and lose their `source_runtime` row, as for absent
-   stores.
-3. Consume insula quota events when `qta_connection_file` is set. The bus thread
-   binds astrocyte's durable for them, verifies digests and acknowledges only after an account commit or a durable request to fetch
-   a snapshot next tick. Duplicates do not write. First notices, epochs, gaps and
-   invalid bodies require `usage.get` next tick.
-   Healthy readers poll at ten minutes or one cadence before freshness expires,
-   whichever is earlier. Only account commits reset freshness. Without a current
-   credential, attachment or recent successful pull, every tick polls. Failed
-   polls retain windows; capacity remains advisory.
-4. Price queued events through `run_pricing_walk`. With no catalog configured,
-   events are stored unpriced with reason `catalog_unconfigured`.
-5. Spend a bounded budget reconciling `pricing_pending` against the full ledger, to
-   catch any write path that failed to enqueue.
+1. Connect a configured fusiform catalog and learn its history boundary from
+   `catalog.status`. Until then, pricing waits and calls stay queued.
+2. Drain every source that `harness_ingest` allows. An excluded source is not read
+   and loses its `source_runtime` row, like an absent one.
+3. Read insula quota: commit queued quota events, and call `usage.get` when the
+   event stream cannot be trusted or the freshness horizon is near (see below).
+4. Price queued calls (`run_pricing_walk`), bounded per tick by time and count.
+5. Spend up to two seconds on the daily check that every unpriced call is queued
+   for pricing (`QUEUE_RECONCILE_INTERVAL`).
 
-The `subc-client-rs` serve helper owns the connection. A refresher end, reset or
-handler panic exits 1, and a panic is answered `internal`. EOF and GOODBYE exit
-0. On Unix, SIGTERM stops cleanly, then re-raises.
+Then the loop rebuilds dirty summary hours for up to 1.5 seconds and runs the
+multiplier stage. Between full ticks it applies quota events every 250 ms and,
+every two seconds (`FAST_LANE_INTERVAL`), a fast lane: the harness readers except
+Goose, the Claude worker folders and BROCA tail only what changed. Other sources
+wait for full ticks. Fast cycles commit nothing when idle and never count as a
+source's successful drain.
 
-The ckbus route shares HELLO's single nonce handoff. Daemon validation of
-`consumer_identity` stamps its principal; nonces stay out of diagnostics.
-The refresher drains account writes between ticks (250 ms idle wait) and joins
-the bus reader on its stop flag. Mode changes are logged, not added to health schemas.
-On the module's one credential and connection, that reader always follows runners'
-live `step.finished.v1` events into the step feed, never the ledger.
+The bus reader thread holds one ckbus credential, opened with the launch secret
+already given to the daemon. It reads insula's per-account quota notices from
+astrocyte's durable, fetches each body through `events_get`, checks its digest
+and acknowledges only after commit. A gap, new epoch, bad digest or missing body
+asks for a full `usage.get`, which also runs at least every ten minutes, and on
+every tick while events are not flowing. The same reader follows runners' live
+`step.finished.v1` events into the step feed, never into the ledger.
 
-After each tick, the multiplier retries missing observations for the seven latest
-completed UTC days, oldest first; each covers seven days ending at 00:00Z.
-Source reads must pass the boundary, unless absent/skipped or two hours late;
-stale sources appear in `error_deflating`. Fusiform reads precede writes.
-Failures log once per day/reason without rows.
-`rate_fact_unrecognized` fails the day; `no_catalog_coverage` counts unpriced
-tokens. Recompute older days.
-Scope rules can filter model prefixes. The multiplier uses public API rates of
-the model an alias points to, and strips `-low`/`-high` after a missing row, never
-`-medium`. Ledger pricing is unchanged.
+## Pricing
 
-Pricing and the multiplier share `parse_rate_key`. Token keys retain their
-per-million denominator and single-selector grammar, with `output_audio` and
-`cached_input_audio` added beside `input_audio`. Unit keys put `per_second`,
-`per_character`, `per_image`, or `per_request` immediately after the role and
-require a positive `per`; request billing uses `rate.request.per_request`.
-The multiplier skips unit rates. Token mode, context-tier and reasoning billing
-rules are unchanged. Charges record the selected fact and, for unit rates,
-rounding rules and raw and priced quantities in `catalog_entry`.
-[The data model](docs/data-model.md) describes selectors and exact rounding.
+Each measurement is priced against the catalog entry in force when the call
+happened. `parse_rate_key` in `catalog_client.rs` is the one rate-key grammar,
+shared with the multiplier. Token keys are `rate.<role>` per million tokens,
+optionally conditioned on prompt size (`above_context`) or a stated `mode`. Unit
+keys add a denominator after the role, such as `per_second` or `per_image`, and
+may carry selectors such as image size. Unknown roles and units are refused.
+Providers in `reasoning_billed_as_output` price reasoning at the output rate;
+otherwise reasoning needs its own rate.
 
-A unique index prevents a second original per provider/day. Observations wait until
-the catalog's history boundary is known. `scoped_producer_not_ingested` refuses scopes
-including excluded producers before calls or writes: their quota counts traffic
-whose tokens ingestion omits. `spend.multiplier.recompute` uses current config and
-catalog, superseding the head or creating an original; only missing originals wait
-for sources. `spend.multiplier.report` serves unsuperseded heads by day. Unknown
-providers and failed computations write nothing.
+A charge records which catalog fact priced it, or why the measurement is unpriced
+(for example `no_catalog_coverage` or `no_subscription_in_force`). Repricing
+(`spend.event.reprice`) and basis correction (`spend.basis.correct`) append new
+heads. The [data model](docs/data-model.md#money) covers units, rounding and the
+charge chain.
 
-## Desired configuration
+## Hourly summaries
+
+Reports read per-hour totals instead of scanning every call. The summaries are
+derived; per-call rows stay authoritative. Triggers mark an hour dirty in the
+transaction that records a call or changes its pricing, adjustments or
+chargeability, and the loop rebuilds dirty hours from base rows, publishing only
+if the hour has not changed since. A report combines clean hours with base rows
+for dirty hours and for hours a timezone or plan boundary splits, in one
+snapshot, so answers equal a full scan. `usage.runs.list` has its own hourly
+table, kept the same way. A daily audit requeues any hour that differs from its
+base rows. Details: [data model](docs/data-model.md#hourly-summaries).
+
+## Subscription multiplier
+
+The multiplier estimates how much list-price API value a subscription delivers per
+unit of its quota. Each UTC day it writes one row per quota provider and plan for
+the seven days before that midnight. It counts only clean account-hours: closely
+bracketed by quota readings, unsaturated, with usable reset times and all calls
+priced. `routing_eligible` and its reasons come from sample-size and stability
+gates. Readings match by account id, or by vault credential for account-less
+plans; plan models without prices are valued at their public API twin. Missed
+days are retried for a week, and `spend.multiplier.recompute` appends a new row
+for a day. The ledger is never changed. The rules and thresholds are in
+[subscription multiplier](docs/subscription-multiplier.md).
+
+## Cache diagnostics and the step feed
+
+`usage.cache.sessions` and `usage.cache.steps` give each harness step a cache
+verdict (cold start, stable, warning, bust, full bust or unknown, plus a
+dropped-prompt flag) in session order, from the ledger and `step_detail`; recent
+sessions come from memory (`recent_steps.rs`). The live step feed keeps a day of
+normalised steps in `step_feed`, merging recorded steps with runner
+announcements; a recorded row always wins. Subscribers get cursor notices and
+page rows themselves. Only local apps and Callosum phones may read it.
+
+## Serving and write ordering
+
+The `subc-client-rs` serve helper owns the daemon connection and runs requests
+concurrently. `SharedState` holds a fenced writer and one read-only connection.
+`ordered_write` (refresher) and `ordered_op_write` (served writes) run one
+transaction under the fence, then refresh the in-memory projection; network and
+file I/O come first. Served reads use `with_read_op`, so a report never blocks
+ingest.
+
+Writes check no caller identity, so a flow's route may read but never write
+(`flow_scopes_unsupported`). Only `thalamus-harness` may call `watermark.get`. A
+write panic, stopped refresher or handler panic exits 1 so the supervisor
+restarts the module; failed requests still get an `internal` reply. EOF and
+GOODBYE exit 0. On Unix, SIGTERM stops cleanly and then re-raises.
+
+## Configuration
 
 The config is a closed JSONC object with six required members:
 `poll_interval_secs`, `qta_connection_file`, `fusiform_connection_file`,
-`subscription_multiplier`, `harness_ingest`, `reasoning_billed_as_output`.
-Unknown or missing members fail decoding at every level. `harness_ingest.exclude` names source keys from Producers (and
-`broca` and `colliculus`); unknown or repeated keys are refused, as is `enabled: false` with a non-empty
-`exclude`. Before migration 15, stored generations have no multiplier declaration;
-the daily stage skips them until a reload. Before migration 17, they have no
-`harness_ingest` and restore as all on. The reasoning list is stored in the
-generation JSON; older generations lift the nested multiplier list or use an empty
-list. New desired documents reject the nested form. `hydrate_startup` reads the file once,
-so every change takes effect at the next start. `ck-astrocyte --check-config <path>`
-validates a file without opening the store or the network. If no generation was ever
-committed, an invalid file at startup stops the module; otherwise it keeps the
-committed generation and degrades health. See [configuration](docs/configuration.md).
+`subscription_multiplier`, `harness_ingest` and `reasoning_billed_as_output`. An
+unknown or missing member fails decoding at every level, so the config file and
+the binary must change together. `harness_ingest.exclude` takes keys from
+`config::INGEST_SOURCES`. `hydrate_startup` reads the file once at startup, and
+each accepted file becomes a stored generation. An invalid file stops the first
+start; later it keeps the stored generation and degrades health.
+`ck-astrocyte --check-config <path>` validates a file offline. See
+[configuration](docs/configuration.md).
 
 ## Served operations
 
@@ -209,18 +219,21 @@ Dispatch and the manifest share `PUBLIC_OPERATION_NAMES` in
 | `spend.multiplier.recompute` | write, operator recompute |
 | `usage.cache.sessions` | read |
 | `usage.cache.steps` | read |
-| `usage.runs.list` | read, range session/run/flow totals |
-| `usage.runs.detail` | read, whole-key charges and paged items |
+| `usage.runs.list` | read, session, run and flow totals |
+| `usage.runs.detail` | read, one run's items |
 | `usage.steps.subscribe` | read, watch |
 | `usage.steps.read` | read, live step feed |
-| `watermark.get` | read, log-read watermark |
+| `watermark.get` | read, THALAMUS read watermark |
 
-Astrocyte calls QTA `usage.get` and fusiform `catalog.status`, `catalog.get` and
-`plan.prices`. The contract is the [module surface](docs/module-surface.md).
+Astrocyte calls fusiform (`catalog.status`, `catalog.get`, `plan.prices`), insula
+(`usage.get`, `events_get`), colliculus (`usage.read`, `usage.ack`) and the ckbus
+credential operations. The [module surface](docs/module-surface.md) is the
+contract.
 
 ## Health
 
-`PublicProjection::health` reads only the in-memory projection. Health degrades when
-the configuration is degraded, a producer's last drain failed, or a source has no
-success within four poll intervals. Capacity freshness is reported separately and
-uses four times the capacity cadence.
+`PublicProjection::health` reads only the in-memory projection, never the store.
+It degrades when the configuration is degraded, the last projection refresh
+failed, a source's last drain failed, or any source has had no successful drain
+within four poll intervals. Quota freshness
+is reported beside it and does not change the status.
