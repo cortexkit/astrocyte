@@ -1,0 +1,281 @@
+{
+    "request": {
+      "arguments": {
+        "model_id": "gpt-6.1-sol",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-6.1-sol": {
+          "capability.attachment": true,
+          "capability.cache_lifetimes": [
+            "30m",
+            "12h"
+          ],
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.structured_output": true,
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1050000,
+          "limit.output": 128000,
+          "model.canonical_id": "openai/gpt-6.1-sol",
+          "model.family": "gpt-sol",
+          "model.lineage": "gpt",
+          "model.name": "GPT-6.1 Sol",
+          "model.open_weights": false,
+          "model.status": null,
+          "provider.name": "OpenAI",
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 100000000
+          },
+          "rate.cache_read.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 200000000
+          },
+          "rate.cache_read.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 200000000
+          },
+          "rate.cache_read.mode.ultrafast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 600000000
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 2500000000
+          },
+          "rate.cache_write.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 5000000000
+          },
+          "rate.cache_write.above_context.272000.ttl.12h": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10000000000
+          },
+          "rate.cache_write.above_context.272000.ttl.30m": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 5000000000
+          },
+          "rate.cache_write.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 5000000000
+          },
+          "rate.cache_write.mode.ultrafast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 15000000000
+          },
+          "rate.cache_write.ttl.12h": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 5000000000
+          },
+          "rate.cache_write.ttl.30m": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 2500000000
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 2000000000
+          },
+          "rate.input.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 4000000000
+          },
+          "rate.input.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 4000000000
+          },
+          "rate.input.mode.ultrafast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 12000000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10000000000
+          },
+          "rate.output.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 15000000000
+          },
+          "rate.output.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 20000000000
+          },
+          "rate.output.mode.ultrafast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 60000000000
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://api.openai.com/v1"
+          },
+          "wire.family": "openai.responses",
+          "wire.npm": {
+            "from": "provider",
+            "value": "@ai-sdk/openai"
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev",
+      "wire_corrections": [
+        {
+          "established_at_ms": 1792713600000,
+          "established_by": "fusiform",
+          "field": "wire.api",
+          "model": "gpt-6.1-sol",
+          "provider": "openai",
+          "review_by_ms": 1797897600000,
+          "source_ref": {
+            "commit": "accessed 2026-10-23",
+            "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+            "repo": "https://platform.openai.com"
+          },
+          "withheld": false
+        }
+      ]
+    }
+  }

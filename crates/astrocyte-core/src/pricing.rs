@@ -1627,13 +1627,15 @@ fn rate_fact_key(role: &str, unit: &str) -> Option<&'static str> {
 /// Roles whose tokens are part of the prompt a request sends.
 const PROMPT_ROLES: [&str; 3] = ["input", "cache_read", "cache_write"];
 
-/// Units a prompt role is stored in. Claude Code records a cache write split
-/// by cache lifetime as `token_cache_5m` and `token_cache_1h` (and a plain
-/// `token` cache write only when the record carries no split, so the three
-/// never repeat each other). A cache write is sent as prompt whatever its
-/// lifetime, so the split units count toward the prompt even though no
-/// catalog rate prices them.
-const PROMPT_UNITS: [&str; 3] = ["token", "token_cache_5m", "token_cache_1h"];
+/// Whether a prompt role's unit counts toward the prompt: plain `token`, or
+/// any cache-write lifetime unit such as `token_cache_1h`. A producer records
+/// a split cache write in lifetime units and a plain `token` write only when
+/// there is no split, so the two never repeat each other. A cache write is
+/// sent as prompt whatever its lifetime, so every lifetime unit counts;
+/// leaving one out would put a long prompt under a context tier's threshold.
+fn is_prompt_unit(unit: &str) -> bool {
+    unit == "token" || cache_write_ttl(unit).is_some()
+}
 
 /// Power of ten a stored token quantity may carry, at the finest.
 const PROMPT_SCALE_EXPONENT: u32 = 9;
@@ -1655,7 +1657,7 @@ impl PromptSize {
 }
 
 /// The prompt of one request: the sum of its `input`, `cache_read` and
-/// `cache_write` token measurements (see [`PROMPT_UNITS`]). A long-context
+/// `cache_write` token measurements (see [`is_prompt_unit`]). A long-context
 /// tier's threshold applies to the whole prompt, not to uncached input alone,
 /// so a request whose input is small but whose cache read is large still
 /// crosses it. Ledger pricing and the multiplier both decide tiers with this,
@@ -1671,7 +1673,7 @@ pub(crate) fn prompt_size<'a>(
 ) -> Option<PromptSize> {
     let mut scaled_tokens: i128 = 0;
     for (role, unit, units, exponent) in measurements {
-        if !PROMPT_ROLES.contains(&role) || !PROMPT_UNITS.contains(&unit) {
+        if !PROMPT_ROLES.contains(&role) || !is_prompt_unit(unit) {
             continue;
         }
         let (units, exponent) = units.zip(exponent)?;

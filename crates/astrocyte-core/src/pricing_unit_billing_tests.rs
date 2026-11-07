@@ -454,3 +454,113 @@ fn unit_billing_fractional_nanos_use_half_even_once() {
         );
     }
 }
+
+/// Fusiform's served reply for a model whose cache writes are priced per
+/// lifetime, checked by digest so the pinned bytes can't drift.
+fn cache_lifetime_vector(name: &str, bytes: &[u8], sha256: &str) -> CatalogGetResponse {
+    use sha2::{Digest, Sha256};
+    assert_eq!(hex::encode(Sha256::digest(bytes)), sha256, "{name}");
+    let fixture: Value = serde_json::from_slice(bytes).unwrap();
+    serde_json::from_value(fixture["response"].clone()).unwrap()
+}
+
+fn record_cache_writes(conn: &mut Connection, provider: &str, model: &str, units: &[&str]) -> String {
+    let measurements: Vec<Value> = units
+        .iter()
+        .map(|unit| {
+            json!({"role":"cache_write", "unit":unit, "kind":"billed", "source":"test",
+                "quantity_units":1_000_000, "quantity_exponent":0})
+        })
+        .collect();
+    let request = serde_json::from_value::<EventRecordRequest>(json!({
+        "producer":"producer", "producer_lineage":"lineage", "producer_ref":model,
+        "provider":provider, "model":model, "charge_basis":"metered_api",
+        "occurred_at_ms":700, "measurements":measurements,
+    }))
+    .unwrap();
+    record_event(conn, &request, 900).unwrap().event_id
+}
+
+fn charges_by_unit(conn: &Connection) -> Vec<(String, Option<i64>, Option<String>)> {
+    conn.prepare("SELECT unit, charge_nanos, unpriced_reason FROM priced_charge ORDER BY unit")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// Claude Opus 5.5 as fusiform serves it: 5-minute writes at $5 and 1-hour
+/// writes at $8 per million tokens. A write without a stated lifetime keeps
+/// the plain rate, and each split write is priced at its own lifetime.
+#[test]
+fn cache_lifetime_golden_prices_each_anthropic_write_at_its_lifetime() {
+    let response = cache_lifetime_vector(
+        "claude-opus-5-5",
+        include_bytes!("../test-vectors/fusiform-protocol-0.54.0/claude-opus-5-5-cache-lifetimes.json"),
+        "1c6d423bc6821633b404e6cdd39f77a864064359a3b4829033c74b0abfb2e61b",
+    );
+    let mut conn = conn();
+    let id = record_cache_writes(
+        &mut conn,
+        "anthropic",
+        "claude-opus-5-5",
+        &["token", "token_cache_5m", "token_cache_1h"],
+    );
+    let fake = FakeCatalog::new(BTreeMap::new());
+    *fake.response.lock().unwrap() = response;
+    reprice_event(&mut conn, &id, &client(fake), 1_000, PricingOrigin::PricingPass).unwrap();
+    assert_eq!(
+        charges_by_unit(&conn),
+        vec![
+            ("token".into(), Some(5_000_000_000), None),
+            ("token_cache_1h".into(), Some(8_000_000_000), None),
+            ("token_cache_5m".into(), Some(5_000_000_000), None),
+        ]
+    );
+}
+
+/// GPT-6.1 Sol as fusiform serves it carries lifetime prices on its
+/// above-272k tier too (`rate.cache_write.above_context.272000.ttl.12h`).
+/// The reply must decode, and the ledger still refuses a tiered model's
+/// event whole rather than choosing a tier.
+#[test]
+fn cache_lifetime_golden_tiered_openai_reply_decodes_and_refuses_as_tiered() {
+    let response = cache_lifetime_vector(
+        "gpt-6.1-sol",
+        include_bytes!("../test-vectors/fusiform-protocol-0.54.0/gpt-6.1-sol-cache-lifetimes.json"),
+        "c302a523f188ac031c84abff027a119845393357d76c5add979564afc7c827a5",
+    );
+    let mut conn = conn();
+    let id = record_cache_writes(
+        &mut conn,
+        "openai",
+        "gpt-6.1-sol",
+        &["token_cache_30m", "token_cache_12h"],
+    );
+    let fake = FakeCatalog::new(BTreeMap::new());
+    *fake.response.lock().unwrap() = response;
+    reprice_event(&mut conn, &id, &client(fake), 1_000, PricingOrigin::PricingPass).unwrap();
+    assert_eq!(
+        charges_by_unit(&conn),
+        vec![
+            ("token_cache_12h".into(), None, Some("rate_tiered".into())),
+            ("token_cache_30m".into(), None, Some("rate_tiered".into())),
+        ]
+    );
+}
+
+/// Every cache-write lifetime is part of the prompt a context tier is tested
+/// against. A request with 200k input tokens and a 100k-token 12-hour cache
+/// write sends a 300k prompt, so it crosses a 272k tier.
+#[test]
+fn every_cache_write_lifetime_counts_toward_the_prompt() {
+    for unit in ["token_cache_5m", "token_cache_30m", "token_cache_1h", "token_cache_12h", "token_cache_24h"] {
+        let prompt = prompt_size([
+            ("input", "token", Some(200_000), Some(0)),
+            ("cache_write", unit, Some(100_000), Some(0)),
+        ])
+        .unwrap();
+        assert!(prompt.exceeds(272_000), "{unit}");
+    }
+}
