@@ -1451,7 +1451,9 @@ fn measurement_rate_key(
         return None;
     }
     let mut selectors = measurement.price_selectors.clone();
-    if let Some(mode) = recorded_mode {
+    // As for token keys, a record stating a standard mode prices at the base
+    // rate; only a non-standard mode selects a conditional price.
+    if let Some(mode) = stated_mode_condition(recorded_mode) {
         selectors.insert("mode".into(), mode.into());
     }
     let base = format!("rate.{role}.per_{}", measurement.unit);

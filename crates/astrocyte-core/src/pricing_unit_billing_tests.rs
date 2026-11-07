@@ -229,6 +229,37 @@ fn unit_billing_selectors_match_exactly_without_base_fallback() {
 }
 
 #[test]
+fn unit_billing_standard_mode_prices_at_the_base_unit_rate() {
+    for (mode, expected_key) in [
+        ("standard", "rate.input_audio.per_second"),
+        ("fast", "rate.input_audio.per_second.mode.fast"),
+    ] {
+        let mut conn = conn();
+        let id = record(
+            &mut conn,
+            "audio",
+            ChargeBasis::MeteredApi,
+            Some(700),
+            vec![unit_billing_measurement("input_audio", "second", 60)],
+        );
+        let value = unit_billing_rate(Some(60), json!({"kind":"none"}), json!({"kind":"none"}));
+        let catalog = client(FakeCatalog::new(BTreeMap::from([
+            ("rate.input_audio.per_second".into(), value.clone()),
+            ("rate.input_audio.per_second.mode.fast".into(), value),
+        ])));
+        let mut plan = read_reprice(&conn, &id).unwrap();
+        plan.mode = Some(mode.into());
+        let resolved = resolve_reprice(&plan, &catalog, &[]).unwrap();
+        let tx = conn.transaction().unwrap();
+        commit_reprice_in_tx(&tx, &plan, &resolved, 1_000, PricingOrigin::PricingPass).unwrap();
+        tx.commit().unwrap();
+        let (charge, entry) = unit_billing_stored(&conn);
+        assert!(charge.is_some(), "{mode}");
+        assert_eq!(entry["fact_key"], expected_key, "{mode}");
+    }
+}
+
+#[test]
 fn unit_billing_transcription_golden_decodes_and_prices_end_to_end() {
     use sha2::{Digest, Sha256};
     let bytes = include_bytes!("../test-vectors/fusiform-protocol-0.52.0/gpt-transcribe.json");
