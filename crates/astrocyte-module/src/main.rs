@@ -1054,11 +1054,13 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
 /// the bus reader authenticates with it to follow runners' step events in
 /// every configuration, and to read quota notices when insula is configured.
 /// BROCA never is: its usage is read from its store, not over subc.
+/// Colliculus is called when its media source is ingested.
 fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
     let of: Vec<String> = [
         ("fusiform", desired.fusiform_connection_file.is_some()),
         ("insula", desired.qta_connection_file.is_some()),
         ("ckbus", true),
+        ("colliculus", desired.harness_ingest.ingests("colliculus")),
     ]
     .into_iter()
     .filter(|(_, configured)| *configured)
@@ -1228,6 +1230,22 @@ fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignal
                 ),
             });
         }
+    }
+    if desired.harness_ingest.ingests("colliculus") {
+        declarations.push(SelfSignalDeclaration {
+            name: "astrocyte-colliculus-usage-read".to_string(),
+            kind: SelfSignalKind::Poller,
+            effect: SelfSignalEffect::Observe,
+            anchored_to: SignalAnchor::FixedInterval,
+            cadence: Some(tick_cadence()),
+            domain: Some("colliculus".to_string()),
+            note: Some(
+                "usage.read on each full refresher tick, paging until empty; usage.ack \
+                 follows each committed page. A retry acknowledges the durable watermark \
+                 before reading."
+                    .to_string(),
+            ),
+        });
     }
     declarations
 }
@@ -2175,9 +2193,13 @@ mod tests {
                 "astrocyte-fusiform-catalog-lookup",
                 "astrocyte-fusiform-history-status",
                 "astrocyte-fusiform-history-probe",
+                "astrocyte-colliculus-usage-read",
             ]
         );
-        assert_eq!(consumed_modules(&manifest), ["fusiform", "insula", "ckbus"]);
+        assert_eq!(
+            consumed_modules(&manifest),
+            ["fusiform", "insula", "ckbus", "colliculus"]
+        );
         let wire = serde_json::to_value(&manifest).unwrap();
         let signals = wire["self_signals"].as_array().unwrap();
         let lookup = signals
@@ -2221,6 +2243,7 @@ mod tests {
                 "astrocyte-fusiform-history-probe",
                 "astrocyte-fusiform-plan-prices",
                 "astrocyte-fusiform-multiplier-rates",
+                "astrocyte-colliculus-usage-read",
             ]
         );
         let wire = serde_json::to_value(&manifest).unwrap();
@@ -2240,11 +2263,13 @@ mod tests {
         assert_eq!(plan_prices["domain"], "fusiform");
     }
 
-    /// With no peer configured astrocyte still calls ckbus, whose credential
-    /// lets the bus reader follow runners' step events, and nobody else.
+    /// With file-based peers unconfigured and the media feed excluded, only
+    /// ckbus is called to let the bus reader follow runners' step events.
     #[test]
     fn manifest_declares_only_the_bus_reader_when_no_peer_is_configured() {
-        let manifest = manifest("astrocyte", &desired(false, false));
+        let mut desired = desired(false, false);
+        desired.harness_ingest.exclude.push("colliculus".into());
+        let manifest = manifest("astrocyte", &desired);
         assert_eq!(
             self_signal_names(&manifest),
             ["astrocyte-ckbus-credentials"]
@@ -2258,41 +2283,45 @@ mod tests {
     }
 
     /// BROCA is read from its store, never called over subc, so no ingest
-    /// setting makes it a consumer or gives it a self-signal: with it
-    /// ingested, excluded, or all ingestion off, the peer calls are the same.
+    /// setting makes it a consumer or gives it a self-signal. Only colliculus's
+    /// peer calls change when ingestion is disabled for every source.
     #[test]
     fn manifest_never_declares_a_broca_call() {
-        for ingest in [
-            config::HarnessIngest::all_on(),
-            config::HarnessIngest {
-                enabled: true,
-                exclude: vec!["broca".into()],
-            },
-            config::HarnessIngest {
-                enabled: false,
-                exclude: Vec::new(),
-            },
+        for (ingest, colliculus_enabled) in [
+            (config::HarnessIngest::all_on(), true),
+            (
+                config::HarnessIngest {
+                    enabled: true,
+                    exclude: vec!["broca".into()],
+                },
+                true,
+            ),
+            (
+                config::HarnessIngest {
+                    enabled: false,
+                    exclude: Vec::new(),
+                },
+                false,
+            ),
         ] {
             let mut desired = desired(true, true);
             desired.harness_ingest = ingest.clone();
             let manifest = manifest("astrocyte", &desired);
-            assert_eq!(
-                self_signal_names(&manifest),
-                [
-                    "astrocyte-insula-usage-poll",
-                    "astrocyte-insula-quota-body",
-                    "astrocyte-ckbus-credentials",
-                    "astrocyte-fusiform-catalog-lookup",
-                    "astrocyte-fusiform-history-status",
-                    "astrocyte-fusiform-history-probe",
-                ],
-                "{ingest:?}"
-            );
-            assert_eq!(
-                consumed_modules(&manifest),
-                ["fusiform", "insula", "ckbus"],
-                "{ingest:?}"
-            );
+            let mut signals = vec![
+                "astrocyte-insula-usage-poll",
+                "astrocyte-insula-quota-body",
+                "astrocyte-ckbus-credentials",
+                "astrocyte-fusiform-catalog-lookup",
+                "astrocyte-fusiform-history-status",
+                "astrocyte-fusiform-history-probe",
+            ];
+            let mut modules = vec!["fusiform", "insula", "ckbus"];
+            if colliculus_enabled {
+                signals.push("astrocyte-colliculus-usage-read");
+                modules.push("colliculus");
+            }
+            assert_eq!(self_signal_names(&manifest), signals, "{ingest:?}");
+            assert_eq!(consumed_modules(&manifest), modules, "{ingest:?}");
         }
     }
 
@@ -2306,14 +2335,18 @@ mod tests {
             [
                 "astrocyte-insula-usage-poll",
                 "astrocyte-insula-quota-body",
-                "astrocyte-ckbus-credentials"
+                "astrocyte-ckbus-credentials",
+                "astrocyte-colliculus-usage-read",
             ]
         );
-        assert_eq!(consumed_modules(&manifest), ["insula", "ckbus"]);
+        assert_eq!(
+            consumed_modules(&manifest),
+            ["insula", "ckbus", "colliculus"]
+        );
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire["consumes"],
-            json!([{"role": "service_client", "of": ["insula", "ckbus"]}])
+            json!([{"role": "service_client", "of": ["insula", "ckbus", "colliculus"]}])
         );
         let poll = &wire["self_signals"][0];
         assert_eq!(poll["name"], "astrocyte-insula-usage-poll");
@@ -2325,6 +2358,67 @@ mod tests {
             json!({"derived": {"source": "desired_config.poll_interval_secs"}})
         );
         assert_eq!(poll["domain"], "insula");
+    }
+
+    #[test]
+    fn manifest_colliculus_calls_follow_ingest_configuration() {
+        for (ingest, enabled) in [
+            (config::HarnessIngest::all_on(), true),
+            (
+                config::HarnessIngest {
+                    enabled: true,
+                    exclude: vec!["broca".into()],
+                },
+                true,
+            ),
+            (
+                config::HarnessIngest {
+                    enabled: true,
+                    exclude: vec!["colliculus".into()],
+                },
+                false,
+            ),
+            (
+                config::HarnessIngest {
+                    enabled: false,
+                    exclude: Vec::new(),
+                },
+                false,
+            ),
+        ] {
+            let mut desired = desired(false, false);
+            desired.harness_ingest = ingest.clone();
+            let manifest = manifest("astrocyte", &desired);
+            let mut modules = vec!["ckbus"];
+            let mut signals = vec!["astrocyte-ckbus-credentials"];
+            if enabled {
+                modules.push("colliculus");
+                signals.push("astrocyte-colliculus-usage-read");
+            }
+            assert_eq!(consumed_modules(&manifest), modules, "{ingest:?}");
+            assert_eq!(self_signal_names(&manifest), signals, "{ingest:?}");
+            if enabled {
+                let wire = serde_json::to_value(&manifest).unwrap();
+                let signal = wire["self_signals"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|signal| signal["name"] == "astrocyte-colliculus-usage-read")
+                    .unwrap();
+                assert_eq!(signal["domain"], "colliculus");
+                assert_eq!(signal["kind"], "poller");
+                assert_eq!(signal["effect"], "observe");
+                assert_eq!(signal["anchored_to"], "fixed_interval");
+                assert_eq!(
+                    signal["cadence"],
+                    json!({"derived":{"source":"desired_config.poll_interval_secs"}})
+                );
+                let note = signal["note"].as_str().unwrap();
+                assert!(note.contains("usage.read"));
+                assert!(note.contains("usage.ack"));
+                assert!(note.contains("committed page"));
+            }
+        }
     }
 
     #[test]

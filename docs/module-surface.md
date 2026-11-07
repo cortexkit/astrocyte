@@ -772,6 +772,7 @@ through the real dispatch and the serving path's shared permission refusal.
 |---|---|---|---|
 | fusiform (price catalog) | `tool_provider`, module `fusiform` | `catalog.status`, `catalog.get`, `plan.prices` as `{"name", "arguments"}` tool calls | A failed pricing call writes no head; the event stays queued and a later pass retries it. Recompute refuses. Route death and `module_reloading` are retried once within the call's deadline. |
 | insula (the quota module, QTA) | `management_surface`, module `insula` | `usage.get` with empty params; `events_get` with `event_key` and `event_name: "quota_sampled"` | Invalid or missing event bodies owe a snapshot. A failed snapshot records the attempt and keeps the last windows. Capacity is advisory and never blocks spend. |
+| colliculus (media usage) | `management_surface`, module `colliculus` | `usage.read` pages and `usage.ack` after each committed page | Keep the committed cursor and retry. An absent module does not degrade health; transient route refusals defer the drain, and `feed_not_admitted` degrades immediately. |
 | ckbus | Attested `management_surface`, module `ckbus` | `ckbus.credential`, `ckbus.credential_renew`, `ckbus.nonce_sign` | Retain per-tick insula polling and retry with exponential backoff (250 ms to 30 s). Never fail the module or change broker topology. |
 
 Fusiform and insula use the connection files named in the
@@ -780,6 +781,13 @@ connection file and the daemon-validated `consumer_identity` shared with HELLO,
 not the un-attested peer clients. With no fusiform connection, events are
 stored unpriced with reason `catalog_unconfigured`; with no QTA connection,
 capacity is `disabled`.
+
+Colliculus uses the module's daemon connection file while its source is ingested.
+The manifest declares its consumer and `astrocyte-colliculus-usage-read` self-signal
+by default, omitting both when `harness_ingest` is disabled or excludes `colliculus`.
+The signal describes `usage.read` as an observe poller on the refresher tick cadence;
+its note records that `usage.ack` follows each committed page and retries acknowledge
+the durable watermark before reading.
 
 Insula notices use `ck.{bus_account}.event.insula.quota_sampled.v1`, with no body.
 Astrocyte binds its pre-existing pull durable from `cortexkit-bus-naming`'s consumer
