@@ -9,6 +9,8 @@
 pub(crate) mod broca_source;
 #[path = "claude_code_source.rs"]
 mod claude_code_source;
+#[path = "claude_thalamus_source.rs"]
+mod claude_thalamus_source;
 #[path = "claude_workers_source.rs"]
 mod claude_workers_source;
 #[path = "codex_source.rs"]
@@ -1598,8 +1600,20 @@ fn refresher_harness_sources() -> Vec<Arc<dyn harness_drain::HarnessSource>> {
         Arc::new(refresher_omp_source()),
         Arc::new(refresher_kimi_source()),
         Arc::new(refresher_claude_workers_source()),
+        Arc::new(refresher_claude_thalamus_source()),
         Arc::new(refresher_opencode_thalamus_source()),
     ]
+}
+
+fn refresher_claude_thalamus_source() -> claude_thalamus_source::ClaudeThalamusSource {
+    #[cfg(any(test, feature = "test-support"))]
+    let home = std::env::temp_dir().join(format!(
+        "astrocyte-test-data-without-claude-sessions-{}",
+        std::process::id()
+    ));
+    #[cfg(not(any(test, feature = "test-support")))]
+    let home = PathBuf::from(cortexkit_store_types::resolve_data_home());
+    claude_thalamus_source::ClaudeThalamusSource::from_data_home(home)
 }
 
 fn refresher_opencode_thalamus_source() -> opencode_thalamus_source::OpenCodeThalamusSource {

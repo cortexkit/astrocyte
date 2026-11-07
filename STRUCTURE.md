@@ -63,8 +63,9 @@ Shared library; three binaries.
   harness producers sharing `refresher::harness_drain`, each with its own
   mapping and cursor.
 - `harness_paths.rs`: injectable harness paths.
-- `declared_roots.rs` (roots files, containment), `claude_workers_source.rs` (read
-  acknowledgements), `opencode_thalamus_source.rs` (read watermark): declared folders.
+- `declared_roots.rs` decodes roots and checks path containment. `claude_workers_source.rs`
+  and `claude_thalamus_source.rs` acknowledge Claude folder reads.
+  `opencode_thalamus_source.rs` publishes OpenCode read watermarks.
 - `build.rs`: stamps source and dependency provenance into the binary.
 - `test_support.rs`: waits and fixtures; gated by tests or the `test-support`
   dev-dependency feature.

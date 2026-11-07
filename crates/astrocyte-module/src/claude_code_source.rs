@@ -607,6 +607,28 @@ pub(crate) fn record_requests_in_lane(
                 thalamus_skips += 1;
                 continue;
             }
+            // THALAMUS can copy earlier history into a private session. The
+            // original event and its labels stand, even when its copy has a
+            // different owner. Check identity in the recording transaction.
+            if source_key == super::claude_thalamus_source::SOURCE_KEY {
+                let id = astrocyte_core::fact::event_id(
+                    &request.producer,
+                    request.producer_lineage.as_deref(),
+                    &request.producer_ref,
+                )
+                .map_err(|e| format!("derive Claude Code identity: {e:?}"))?;
+                let recorded: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM usage_event WHERE event_id=?1)",
+                        [&id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if recorded {
+                    dispositions.push(astrocyte_core::ingest::RecordDisposition::ExactRedelivery);
+                    continue;
+                }
+            }
             let result = astrocyte_core::ingest::record_event_in_tx(
                 tx,
                 request,

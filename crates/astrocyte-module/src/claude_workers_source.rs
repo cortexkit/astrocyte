@@ -369,7 +369,7 @@ fn update_ack(
     Ok(())
 }
 
-fn write_ack(path: &Path, ack: &Ack) -> std::io::Result<()> {
+pub(super) fn write_ack(path: &Path, ack: &impl Serialize) -> std::io::Result<()> {
     let folder = path.parent().expect("ack parent");
     fs::create_dir_all(folder)?;
     #[cfg(unix)]

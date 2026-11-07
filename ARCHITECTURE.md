@@ -77,11 +77,11 @@ write, so it needs no lease.
 - **Harness files.** Each tick reads the local harness session stores through
   `astrocyte-readers`, one isolated drain per source key; see
   [harness readers](docs/harness-readers.md). Goose emits one total per session.
-- **Declared folders.** thalamus-harness declares private folders in roots files:
-  `claude-code-workers` reads Claude workers, `opencode-thalamus` OpenCode
-  sessions, with the declared `work_class`. An acknowledgement or read watermark
-  lets it erase finished folders; see the [workers](docs/claude-workers-contract.md)
-  and [sessions](docs/thalamus-opencode-sessions-contract.md) contracts.
+- **Declared folders.** `claude-code-workers`, `claude-code-thalamus` and
+  `opencode-thalamus` read THALAMUS's private folders with owner labels and
+  acknowledge finished reads for cleanup. See the [workers](docs/claude-workers-contract.md),
+  [Claude Code](docs/thalamus-claude-code-sessions-contract.md) and
+  [OpenCode](docs/thalamus-opencode-sessions-contract.md) contracts.
 - **Colliculus feed.** Full ticks drain media usage through a management route,
   committing each page with its cursor before acknowledging it. An absent module
   leaves health untouched; see [harness readers](docs/harness-readers.md).

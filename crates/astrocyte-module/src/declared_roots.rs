@@ -1,7 +1,6 @@
 //! Roots files that thalamus-harness writes to declare its private harness
 //! folders, and the containment checks astrocyte applies to every declared path.
-//! The Claude workers contract (`docs/claude-workers-contract.md`) and the
-//! OpenCode sessions contract (`docs/thalamus-opencode-sessions-contract.md`)
+//! The Claude workers and THALAMUS Claude Code and OpenCode session contracts
 //! share file decoding and path resolution, but allow different folder shapes.
 
 use std::path::{Component, Path, PathBuf};
@@ -123,6 +122,35 @@ pub(crate) fn contain_opencode_shared(folder: &Path, declared: &Path) -> Result<
             folder
                 .parent()
                 .is_some_and(|harness| canonical == harness.join("opencode2-server/data/opencode"))
+        },
+    )
+}
+
+/// A private Claude Code config must resolve to this session's exact folder,
+/// not merely to another folder somewhere below the harness data directory.
+pub(crate) fn contain_claude_session(
+    folder: &Path,
+    declared: &Path,
+    session: &str,
+) -> Result<Contained, String> {
+    if session.is_empty() || session == "." || session == ".." || session.contains(['/', '\\']) {
+        return Ok(Contained::Refused("invalid Claude Code session id".into()));
+    }
+    contain_with(
+        Some(folder),
+        declared,
+        "Claude Code session config",
+        |folder, canonical| {
+            let Ok(relative) = canonical.strip_prefix(folder) else {
+                return false;
+            };
+            let mut parts = relative.components();
+            matches!(
+                (parts.next(), parts.next(), parts.next(), parts.next()),
+                (Some(Component::Normal(sessions)), Some(Component::Normal(id)),
+                    Some(Component::Normal(config)), None)
+                    if sessions == "sessions" && id == session && config == "config"
+            )
         },
     )
 }
