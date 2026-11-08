@@ -549,9 +549,10 @@ Reply:
 Runner rows are served: a row from a runner's `step.finished.v1` event takes
 its identity from the event. When the event carries `harness_step_ref` (runner contract 14.3,
 present for runners whose history is the host harness's own record),
-`harness` is the event's `harness` (the hosting program, such as
-`claude-code` or `opencode`) and `step_ref` is `harness_step_ref`, so
-astrocyte's later read of the harness store replaces the row. Otherwise
+`harness` is mapped through `cortexkit-usage-steps`' host table (`opencode2`
+is served as `opencode`), and `step_ref` is `harness_step_ref`, so
+astrocyte's later read of the harness store replaces the row. An unmapped
+host is counted and dropped. Without `harness_step_ref`,
 `harness` is the event's `runner` and `step_ref` is the event's `attempt_id`, a
 random id per provider attempt. There is one row per provider request actually
 sent, retries included, matching astrocyte's read of that runner's durable step

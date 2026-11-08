@@ -200,6 +200,7 @@ pub(crate) fn test_event(
     let mut body = vectors[vector].clone();
     let now = u64::try_from(crate::state::now_ms()).unwrap();
     body["runner"] = serde_json::json!(runner);
+    body["harness"] = serde_json::json!("pi");
     body["started_at_ms"] = serde_json::json!(now - 1_000);
     body["finished_at_ms"] = serde_json::json!(now);
     edit(&mut body);
@@ -301,7 +302,7 @@ mod tests {
                 ("broca", "attempt_invented_b"),
                 ("thalamus-harness", "attempt_invented_b"),
                 ("thalamus", "attempt_invented_b"),
-                ("host_a", "msg_record_a"),
+                ("pi", "msg_record_a"),
             ]
         );
         for row in &rows {
@@ -324,7 +325,7 @@ mod tests {
         assert_eq!(
             full,
             json!({
-                "harness": "host_a", "source": "runner", "step_ref": "msg_record_a",
+                "harness": "pi", "source": "runner", "step_ref": "msg_record_a",
                 "session": "session_a", "run_id": "run_a", "provider": "provider_a",
                 "model": "model_a", "input": 100, "cache_read": 50, "cache_write": 30,
                 "cache_write_5m": 10, "cache_write_1h": 20, "output": 20, "reasoning": 7,
@@ -393,6 +394,62 @@ mod tests {
                 appended: 1,
                 unchanged: 1,
                 superseded: 1,
+                ..RunnerCounts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn opencode2_runner_identity_joins_the_recorded_opencode_row() {
+        let state = test_state();
+        let announced = event("full", "thalamus", |body| {
+            body["harness"] = json!("opencode2");
+            body["session"] = json!("s1");
+            body["harness_step_ref"] = json!("msg_x");
+        });
+        admit_event(&state, &announced);
+        let runner = rows(&state, json!({}));
+        assert_eq!(runner.len(), 1);
+        assert_eq!(runner[0]["source"], "runner");
+
+        record_steps_for_test(&state, "opencode", &[TestStep::now("s1", "msg_x")], false).unwrap();
+        let served = rows(&state, json!({}));
+        assert_eq!(served.len(), 1, "{served:?}");
+        assert_eq!(served[0]["harness"], "opencode");
+        assert_eq!(served[0]["step_ref"], "msg_x");
+        assert_eq!(served[0]["source"], "file");
+        assert_eq!(feed_rows(&state), 2);
+
+        admit_event(&state, &announced);
+        let newest = rows(&state, json!({}));
+        assert_eq!(newest, served);
+        assert_eq!(feed_rows(&state), 2);
+        assert_eq!(
+            state.step_feed().runner_counts(),
+            RunnerCounts {
+                appended: 1,
+                superseded: 1,
+                ..RunnerCounts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_host_runner_identity_is_counted_and_dropped() {
+        let state = test_state();
+        admit_event(
+            &state,
+            &event("full", "thalamus", |body| {
+                body["harness"] = json!("unknown-host");
+                body["harness_step_ref"] = json!("msg_x");
+            }),
+        );
+        assert!(rows(&state, json!({})).is_empty());
+        assert_eq!(feed_rows(&state), 0);
+        assert_eq!(
+            state.step_feed().runner_counts(),
+            RunnerCounts {
+                dropped: 1,
                 ..RunnerCounts::default()
             }
         );

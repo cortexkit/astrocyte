@@ -53,6 +53,7 @@ fusiform-protocol = "=0.52.0"
 # `step.finished.v1` live step event (`step_events`, added in 0.7.5).
 cortexkit-role-llm-runner = "=0.8.19"
 cortexkit-role-media = "=0.1.2"
+cortexkit-usage-steps = "=0.2.5"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

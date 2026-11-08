@@ -73,7 +73,7 @@ cortexkit-role-llm-runner = { workspace = true }
 cortexkit-role-media = { workspace = true }
 # The live step feed's row identity for runner-announced steps
 # (`live_row_identity`).
-cortexkit-usage-steps = "=0.2.1"
+cortexkit-usage-steps = { workspace = true }
 tempfile = { version = "3", optional = true }
 
 # `emulate_default_handler`: after a SIGTERM stop has finished, the process

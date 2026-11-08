@@ -743,8 +743,15 @@ fn pi_operation(
     state: &PiParseState,
     namespace: &str,
 ) -> Option<PiUsageRecord> {
-    let id = entry.id.filter(|id| !id.trim().is_empty())?;
     let usage = PiUsage::from(entry.usage?);
+    let mut identity =
+        cortexkit_usage_steps::PiEntry::new(entry.provider.as_deref().unwrap_or("pi"));
+    identity.id = entry.id.as_deref();
+    identity.timestamp = entry.timestamp.as_deref();
+    identity.is_operation = true;
+    identity.model = entry.model.as_deref();
+    pi_identity_usage(&mut identity, &usage);
+    let dedup_key = pi_step_ref_in_namespace(&identity, namespace)?;
     let normalized = usage.to_breakdown();
     let occurred_at_ms = super::utils::parse_rfc3339_millis(entry.timestamp.as_deref());
     let mut message = UnifiedMessage::new_with_agent(
@@ -758,7 +765,7 @@ fn pi_operation(
         state.agent.clone(),
     );
     message.output_reasoning_conflicted = normalized.output_reasoning_conflicted;
-    message.dedup_key = Some(format!("{namespace}:operation:{id}"));
+    message.dedup_key = Some(dedup_key);
     message.set_workspace(state.workspace_key.clone(), state.workspace_label.clone());
     Some(PiUsageRecord {
         source_offset: 0,
@@ -770,6 +777,28 @@ fn pi_operation(
         }),
         stop_reason: None,
     })
+}
+
+fn pi_identity_usage(identity: &mut cortexkit_usage_steps::PiEntry<'_>, usage: &PiUsage) {
+    // The shared key builder separates reasoning from raw output itself.
+    identity.input = usage.input;
+    identity.output = usage.output;
+    identity.cache_read = usage.cache_read;
+    identity.cache_write = usage.cache_write;
+    identity.reasoning = usage.reasoning;
+}
+
+fn pi_step_ref_in_namespace(
+    identity: &cortexkit_usage_steps::PiEntry<'_>,
+    namespace: &str,
+) -> Option<String> {
+    let key = cortexkit_usage_steps::pi_step_ref(identity)?;
+    if namespace == "pi" {
+        Some(key)
+    } else {
+        // Pi-format descendants keep their existing producer namespace.
+        Some(key.replacen("pi:", &format!("{namespace}:"), 1))
+    }
 }
 
 // ASTROCYTE DIVERGENCE: upstream keeps the per-line body inline in
@@ -1018,33 +1047,20 @@ fn parse_pi_line(
     );
     unified.output_reasoning_conflicted = normalized_usage.output_reasoning_conflicted;
     if let Some(namespace) = context.dedup_namespace {
-        let clean_response_key = message
+        let mut identity = cortexkit_usage_steps::PiEntry::new(&provider);
+        identity.id = entry
+            .id
+            .as_deref()
+            .filter(|id| accepts_replacement_field(id, options.lossy_line_reader));
+        identity.timestamp = entry.timestamp.as_deref();
+        identity.is_assistant_message = true;
+        identity.response_id = message
             .response_id
             .as_deref()
-            .filter(|id| {
-                !id.trim().is_empty() && accepts_replacement_field(id, options.lossy_line_reader)
-            })
-            .map(|id| format!("{namespace}:response:{id}"));
-        let clean_message_key = entry.id.as_deref().filter(|id| {
-            !id.trim().is_empty() && accepts_replacement_field(id, options.lossy_line_reader)
-        });
-        unified.dedup_key = clean_response_key.or_else(|| {
-                clean_message_key.map(|id| {
-                    let stable_timestamp = recorded_timestamp
-                        .map(|timestamp| timestamp.to_string())
-                        .unwrap_or_else(|| "missing".to_string());
-                    // ASTROCYTE DIVERGENCE: optional bucket spelling keeps an
-                    // absent measurement distinct from a reported zero in the
-                    // fallback identity as well as in the output record.
-                    format!(
-                        "{namespace}:message:{id}:{stable_timestamp}:{provider}:{model}:{:?}:{:?}:{:?}:{:?}",
-                        unified.tokens.input,
-                        unified.tokens.output,
-                        unified.tokens.cache_read,
-                        unified.tokens.cache_write,
-                    )
-                })
-            });
+            .filter(|id| accepts_replacement_field(id, options.lossy_line_reader));
+        identity.model = Some(model);
+        pi_identity_usage(&mut identity, usage);
+        unified.dedup_key = pi_step_ref_in_namespace(&identity, namespace);
         if unified.dedup_key.is_none() && options.lossy_line_reader {
             let has_damaged_id = entry
                 .id
@@ -1070,6 +1086,9 @@ fn parse_pi_line(
     });
     ControlFlow::Continue(())
 }
+
+#[cfg(test)]
+mod step_ref_replay;
 
 // ASTROCYTE DIVERGENCE: tokscale has no resumable Pi parse. The resume check
 // descends from tokscale's Codex incremental cache (`codex_prefix_matches` in

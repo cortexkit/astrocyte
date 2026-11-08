@@ -14,6 +14,7 @@ test-support = []
 
 [dependencies]
 chrono = { workspace = true }
+cortexkit-usage-steps = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { workspace = true }

@@ -100,6 +100,7 @@ name = "astrocyte-readers"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "cortexkit-usage-steps",
  "rusqlite",
  "ruzstd",
  "serde",
@@ -429,10 +430,11 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-usage-steps"
-version = "0.2.1"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af10d723b92f92221ce2e81d40e34a927b92775ed6fe97ccf63eb52ebc5deaf1"
+checksum = "66c2a58d1c36a942238f166d1311280cf01d80ce1f29dae3bfa71c674ec0c8ba"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
 ]
