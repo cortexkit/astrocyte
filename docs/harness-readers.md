@@ -177,8 +177,9 @@ Each source resolves its store path by these rules, implemented in
 | `kimi` | One `StatusUpdate` record | `payload.message_id` | session directory name |
 | `broca` | One session or `system_one` spend fact | `fact_id` | none |
 
-Pi's clean call keys come from `cortexkit_usage_steps::pi_step_ref`, with
-the response, message fallback and operation rules unchanged.
+Pi's call keys in the two `pi` rows above are built by
+`cortexkit_usage_steps::pi_step_ref`, the function runners also use, so a
+runner's live announcement of a Pi step carries the key astrocyte records.
 
 Rules that affect what is recorded:
 
