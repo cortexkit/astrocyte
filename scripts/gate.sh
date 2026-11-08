@@ -44,15 +44,27 @@ logs=$(mktemp -d "${TMPDIR:-/tmp}/astrocyte-gate.XXXXXX")
 linux_cmd='export ASTROCYTE_REQUIRE_NATS_SERVER=1
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked'
+# A native crash in a test's child process (an access violation) leaves no
+# stderr, only a minidump that the Windows runner writes to C:\CrashDumps. When
+# the suite fails, the newest dump written during this job is copied into the
+# workspace and returned, so the faulting module can be read afterwards.
 windows_cmd='export ASTROCYTE_REQUIRE_NATS_SERVER=1
+mkdir -p target && touch target/gate-job-start
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --all-targets --locked --no-fail-fast'
+code=0; cargo test --workspace --all-targets --locked --no-fail-fast || code=$?
+if [ "$code" != 0 ]; then
+  dump=$(find /c/CrashDumps -name "*.dmp" -newer target/gate-job-start 2>/dev/null | head -n 1 || true)
+  if [ -n "$dump" ]; then cp "$dump" target/gate-windows-crash.dmp; echo "crash dump: $dump"; fi
+fi
+exit "$code"'
+windows_dump="$PWD/target/gate-windows-crash.dmp"
+rm -f "$windows_dump"
 
 step "Linux and Windows suites (remote, in parallel)"
 ck motor run --vcpus 8 -- "set -euo pipefail
 $linux_cmd" >"$logs/linux.log" 2>&1 &
 linux_pid=$!
-ck motor run --platform windows -- "set -euo pipefail
+ck motor run --platform windows --return-path "$windows_dump" --return-max-bytes 134217728 -- "set -euo pipefail
 $windows_cmd" >"$logs/windows.log" 2>&1 &
 windows_pid=$!
 
@@ -71,6 +83,7 @@ linux_code=0; wait "$linux_pid" || linux_code=$?
 windows_code=0; wait "$windows_pid" || windows_code=$?
 report linux "$linux_code"
 report windows "$windows_code"
+if [ -f "$windows_dump" ]; then echo "windows: crash dump returned to $windows_dump"; fi
 
 if [ "$status" = 0 ]; then
   echo "ASTROCYTE_GATE_OK $(git rev-parse HEAD)"
