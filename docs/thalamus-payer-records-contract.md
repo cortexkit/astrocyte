@@ -113,11 +113,25 @@ CREATE TABLE payer_record (
 - `account_ref`: the provider account id, when known.
 - `outcome`, `provider_request_id`, `provider_response_id`: informational.
 - `usage_json`: required on every row-less kind, NULL on `main` rows. It is one
-  JSON object in BROCA's agreed attempt shape: absent counts are left out
-  (absent never means 0), `cache_write_5m` and `cache_write_1h` appear when the
-  vendor splits cache writes, `reasoning_included_in_output` is present
-  whenever reasoning is, and a fallback mid-request carries `usage_by_model`
-  (each `{model_used, usage}`) instead of top-level counts.
+  JSON object in the shape of BROCA's `bill-attempts/v1` envelope usage:
+  - `usage`: an object with any of `input_tokens`, `cached_input_tokens` (cache
+    read), `cache_write_tokens`, `output_tokens` and `reasoning_tokens`, each a
+    non-negative integer. A count the vendor didn't report is left out; absent
+    never means 0. `input_tokens` excludes cache reads and writes.
+  - `cache_write_5m_tokens`, `cache_write_1h_tokens`: optional, beside `usage`.
+    When both are present they sum to `cache_write_tokens`.
+  - `reasoning_included_in_output`: required whenever `reasoning_tokens` is
+    present, including a reported 0.
+  - A request the vendor served with more than one model carries
+    `usage_by_model` instead of `usage` and the two splits: an array of
+    `{model_used, usage, cache_write_5m_tokens?, cache_write_1h_tokens?}` in
+    provider order, never reordered or rewritten once the row is written.
+    `reasoning_included_in_output` stays beside it and applies to every entry.
+
+  Unknown members of `usage_json` are ignored, but an unknown key inside a
+  `usage` counts object makes the row unreadable, so a newly billed dimension
+  is never silently dropped. So does having both `usage` and `usage_by_model`,
+  or neither.
 
 ## 3. Reading (astrocyte)
 
@@ -141,7 +155,10 @@ and reading continues.
 - **A row-less row** is recorded as its own call: producer `thalamus-harness`,
   the session as lineage, `attempt_id` as the producer reference, measurements
   from `usage_json`, the payer from the row, and the session's
-  `owner_principal` as work class.
+  `owner_principal` as work class. A row with `usage_by_model` becomes one call
+  per entry instead, each with that entry's `model_used` and usage and the
+  producer reference `<attempt_id>#<n>`, where `n` is the entry's 1-based
+  position.
 - **An unmatched `main` row** records nothing and is counted. Its call is
   recorded from the transcript with basis unknown, so no call is counted twice,
   whatever the match rate is.
