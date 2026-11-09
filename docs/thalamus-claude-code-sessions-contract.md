@@ -85,6 +85,9 @@ into quarantined contradictions. This identity check happens in the recording
 transaction, as it does for declared OpenCode sessions. The usual overlap check
 for requests already captured by the THALAMUS gateway still applies.
 
+Who paid for each call comes from the harness module's payer store, under the
+[payer records contract](thalamus-payer-records-contract.md).
+
 ## 4. Read acknowledgement, written by astrocyte
 
 Astrocyte atomically writes

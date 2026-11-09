@@ -152,6 +152,10 @@ completion is recorded after OpenCode 2's one-hour quiet window, as for the
 user's store. In a `done` folder or shared session no further write can come,
 so such a call is recorded on the next read.
 
+Who paid for each call comes from the harness module's payer store, under the
+[payer records contract](thalamus-payer-records-contract.md). The read
+watermark below also covers that store's rows.
+
 ## 4. Read watermark (served by astrocyte)
 
 Astrocyte provides `log-read-watermark/v1` from the llm-runner contract
