@@ -4059,6 +4059,32 @@ CREATE TABLE thalamus_payer_coverage (
 ) WITHOUT ROWID;
 "#,
     },
+    Migration {
+        version: 39,
+        statements: r#"
+CREATE TABLE vault_plan_history (
+    history_id INTEGER PRIMARY KEY,
+    credential_id TEXT NOT NULL CHECK(length(credential_id)>0),
+    provider TEXT,
+    account_id TEXT,
+    plan_tier TEXT,
+    plan_key TEXT,
+    source TEXT NOT NULL,
+    effective_from_ms INTEGER NOT NULL,
+    observed_at_ms INTEGER NOT NULL
+);
+CREATE INDEX vault_plan_record_history ON vault_plan_history(credential_id,effective_from_ms,history_id);
+CREATE INDEX vault_plan_account_history ON vault_plan_history(account_id,effective_from_ms);
+CREATE TRIGGER vault_plan_history_no_update BEFORE UPDATE ON vault_plan_history
+BEGIN SELECT RAISE(ABORT, 'vault_plan_history is append-only'); END;
+CREATE TRIGGER vault_plan_history_no_delete BEFORE DELETE ON vault_plan_history
+BEGIN SELECT RAISE(ABORT, 'vault_plan_history is append-only'); END;
+CREATE TRIGGER vault_plan_history_insert_once BEFORE INSERT ON vault_plan_history
+WHEN EXISTS (SELECT 1 FROM vault_plan_history WHERE history_id=NEW.history_id)
+BEGIN SELECT RAISE(ABORT, 'vault_plan_history_insert_once'); END;
+CREATE TABLE vault_plan_seed (singleton INTEGER PRIMARY KEY CHECK(singleton=1));
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
