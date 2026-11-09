@@ -192,10 +192,43 @@ impl Route {
     }
 }
 
+/// How long to wait before asking for colliculus again after the daemon said
+/// it isn't installed. Each refusal counts at the daemon, so a machine without
+/// colliculus would otherwise log one every tick forever. The wait doubles up
+/// to `ABSENT_RETRY_MAX_MS`; colliculus keeps records until they are
+/// acknowledged, so a late first read loses nothing.
+const ABSENT_RETRY_FIRST_MS: i64 = 60_000;
+const ABSENT_RETRY_MAX_MS: i64 = 600_000;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AbsentBackoff {
+    /// When colliculus was last found absent, and how long to wait from then.
+    waiting: Option<(i64, i64)>,
+}
+
+impl AbsentBackoff {
+    fn may_try(&self, now: i64) -> bool {
+        self.waiting
+            .is_none_or(|(since, wait)| now.saturating_sub(since) >= wait)
+    }
+
+    fn absent(&mut self, now: i64) {
+        let wait = self.waiting.map_or(ABSENT_RETRY_FIRST_MS, |(_, wait)| {
+            wait.saturating_mul(2).min(ABSENT_RETRY_MAX_MS)
+        });
+        self.waiting = Some((now, wait));
+    }
+
+    fn present(&mut self) {
+        self.waiting = None;
+    }
+}
+
 pub(crate) struct ColliculusSource {
     #[cfg(test)]
     fixture_connection: Option<PathBuf>,
     transient_logged: AtomicBool,
+    absent: std::sync::Mutex<AbsentBackoff>,
 }
 
 impl ColliculusSource {
@@ -204,6 +237,7 @@ impl ColliculusSource {
             #[cfg(test)]
             fixture_connection: None,
             transient_logged: AtomicBool::new(false),
+            absent: std::sync::Mutex::new(AbsentBackoff::default()),
         }
     }
 
@@ -352,6 +386,15 @@ impl harness_drain::HarnessSource for ColliculusSource {
         if wait_for_hello && !state.quota_bus().hello_acked() {
             return Err(SourceDrainError::Deferred);
         }
+        let mut absent = self
+            .absent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !absent.may_try(now) {
+            // Still waiting after colliculus was found absent: treat it as
+            // absent again, which leaves health and runtime rows untouched.
+            return Ok(None);
+        }
         // The blocking refresher owns this runtime. Consumer tasks and their
         // connections are dropped with it after the drain ends.
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -359,6 +402,14 @@ impl harness_drain::HarnessSource for ColliculusSource {
             .build()
             .map_err(|error| error.to_string())?;
         let outcome = runtime.block_on(self.drain(state, now, stop));
+        match &outcome {
+            Err(FeedError::Absent) => absent.absent(now),
+            Err(FeedError::Stopped) => {}
+            // Any other answer, a warming refusal included, means colliculus
+            // is installed, so the next tick asks again.
+            _ => absent.present(),
+        }
+        drop(absent);
         if let Err(FeedError::Transient(reason)) = &outcome {
             if !self.transient_logged.swap(true, Ordering::Relaxed) {
                 tracing::info!(source = SOURCE_KEY, %reason, "media route temporarily unavailable; retrying next tick");

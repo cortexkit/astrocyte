@@ -421,7 +421,10 @@ id and launch nonce are the ones the SDK will present. The SDK retries route adm
 inside a tick and preserves typed refusals when that budget ends. Refusal messages
 and details are not logged because they could echo the launch credential.
 The reader never waits for colliculus during boot. An uninstalled or unregistered
-module has no runtime row and does not degrade health. Daemon warming, reloading
+module has no runtime row and does not degrade health. After that answer the
+reader waits one minute before asking again, doubling the wait up to ten minutes
+while colliculus stays absent; colliculus keeps records until they are
+acknowledged, so a late first read loses nothing. Daemon warming, reloading
 and stale-route refusals defer the drain without changing health and log once per
 episode. Other failures keep progress and mark the source failed for retry;
 `feed_not_admitted` degrades immediately with that reason.

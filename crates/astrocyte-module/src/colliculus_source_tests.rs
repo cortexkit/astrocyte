@@ -534,6 +534,70 @@ fn media_source_absent_leaves_health_and_runtime_untouched() {
     }
 }
 
+/// After colliculus is found absent, the next ticks don't ask the daemon
+/// again until the wait has passed, so a machine without colliculus doesn't
+/// add a refusal to the daemon's counters every tick.
+#[test]
+fn media_source_absent_waits_before_asking_again() {
+    let state = test_state();
+    let peer = Peer::start(Arc::new(move |_| {
+        (
+            FrameType::Error,
+            json!({"code": error_codes::UNKNOWN_MODULE}),
+        )
+    }));
+    let source = peer.source();
+    // Only route opens count: a dropped consumer's closing frame can reach the
+    // fake daemon after the tick has returned.
+    let opens = || {
+        peer.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|value| value["op"] == "route.open")
+            .count()
+    };
+    tick(&state, &source);
+    let asked = opens();
+    assert!(asked > 0);
+    tick(&state, &source);
+    tick(&state, &source);
+    assert_eq!(opens(), asked);
+    let colliculus_rows: i64 = state
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT count(*) FROM source_runtime WHERE source_key=?1",
+                [SOURCE_KEY],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+    assert_eq!(colliculus_rows, 0);
+    assert_eq!(state.producer_degraded_reason(SOURCE_KEY), None);
+}
+
+#[test]
+fn media_absent_wait_doubles_to_ten_minutes_and_resets_when_present() {
+    let mut backoff = AbsentBackoff::default();
+    assert!(backoff.may_try(0));
+    let mut now = 0;
+    let mut waits = Vec::new();
+    for _ in 0..6 {
+        backoff.absent(now);
+        let (_, wait) = backoff.waiting.unwrap();
+        assert!(!backoff.may_try(now + wait - 1));
+        assert!(backoff.may_try(now + wait));
+        waits.push(wait);
+        now += wait;
+    }
+    assert_eq!(waits, [60_000, 120_000, 240_000, 480_000, 600_000, 600_000]);
+    backoff.present();
+    assert!(backoff.may_try(now));
+    backoff.absent(now);
+    assert_eq!(backoff.waiting, Some((now, 60_000)));
+}
+
 #[test]
 fn media_feed_not_admitted_degrades_immediately() {
     let state = test_state();
