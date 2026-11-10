@@ -3154,8 +3154,9 @@ mod tests {
             .code
     }
 
-    /// Store equal session and payer watermarks, as two committed read passes
-    /// leave them, so the wire vectors pin their shared served value.
+    /// Store the same watermark for the THALAMUS session reader and the payer
+    /// reader, as each writes after a complete read of its store, so the wire
+    /// vectors pin the single value `watermark.get` serves from the two.
     fn store_thalamus_watermark(state: &SharedState, watermark_ms: u64) {
         let watermark_ms = i64::try_from(watermark_ms).unwrap();
         state

@@ -569,8 +569,12 @@ fn map_call(call: ClaudeCodeCall) -> Result<EventRecordRequest, String> {
 /// Identity is per producer, so without the skip a call the gateway captured
 /// on the wire would become a second event here. The gateway's events are
 /// immutable and stay; the transcript's copy is the one not recorded.
-/// When a payer queue is supplied, resolve its completed calls in the same
-/// transaction and adopt the proposed queue only after every ready event commits.
+/// `payer_wait` is supplied only for THALAMUS's sessions. Its queue holds
+/// completed calls still waiting for the THALAMUS payer row that says who paid.
+/// In the same transaction, each queued or newly read call is recorded once
+/// its payer row has arrived or its wait has run out, and the rest stay queued.
+/// The caller's queue is replaced with the remaining calls only after that
+/// transaction commits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_requests_in_lane(
     state: &SharedState,

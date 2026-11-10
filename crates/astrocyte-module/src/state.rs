@@ -263,9 +263,11 @@ fn read_writer_settings(conn: &Connection) -> Result<(String, u64), String> {
 }
 
 impl SharedState {
-    /// Publish a reader's current wait count after a successful commit has
-    /// replaced its previous in-memory queue. Readers of THALAMUS's declared
-    /// folders publish the sum of waiting calls across all their folders.
+    /// Publish how many transcript calls a reader is holding back while it
+    /// waits for their payer rows. Call it only after the recording
+    /// transaction commits and the reader has replaced its in-memory queue
+    /// with the queue that transaction produced. Readers of THALAMUS's declared
+    /// folders publish the sum across all their folders.
     pub(crate) fn set_payer_waiting(&self, reader: &str, count: usize) {
         self.0
             .payer_waiting

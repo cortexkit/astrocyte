@@ -72,8 +72,10 @@ impl ThalamusPayerSource {
             return Ok(());
         }
         if observed.0.is_none() {
-            // Absence is a complete empty read. Future rows are written after
-            // this pass, so the same safety margin permits session cleanup.
+            // A missing store counts as a complete read of nothing, and stores
+            // the same watermark a full read would: this pass's time minus
+            // 60 s. Any row THALAMUS writes later is newer than that, so the
+            // watermark can't let THALAMUS delete a row astrocyte hasn't read.
             if mode.is_full() {
                 state.ordered_write(|tx| {
                     tx.execute(

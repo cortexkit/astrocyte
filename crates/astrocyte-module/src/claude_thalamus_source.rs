@@ -291,8 +291,10 @@ impl ClaudeThalamusSource {
         {
             problems.push("Claude Code session calls were quarantined or refused".to_string());
         }
-        // An unusable registry cannot grant deletion, but a newly waiting call
-        // must still revoke an earlier acknowledgement from the cached roots.
+        // An acknowledgement entry tells THALAMUS it may delete that session's
+        // folder. An unusable roots file can't add entries, but a session with
+        // a call still waiting for its payer row must lose any entry it
+        // already has, so its folder isn't deleted before the call is recorded.
         let waiting = cache.payer_wait.pending_sessions();
         if registry_valid || !waiting.is_empty() {
             let mut entries: BTreeMap<_, _> = cache
@@ -347,8 +349,9 @@ impl HarnessSource for ClaudeThalamusSource {
         if cache.payer_wait.is_empty() {
             return Ok(());
         }
-        // Completed calls no longer dirty the parser's resume state. Revisit
-        // their payer facts without opening transcripts or the roots file.
+        // The parser doesn't revisit a call once it's complete, so queued calls
+        // are rechecked here for a newly arrived payer row (who paid, which
+        // login and account) without opening transcripts or the roots file.
         claude_code_source::record_requests_in_lane(
             state,
             SOURCE_KEY,

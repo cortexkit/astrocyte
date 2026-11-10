@@ -902,9 +902,10 @@ const READ_SOURCES: [ReadSource; 1] = [ReadSource {
     watermark_ms: opencode_thalamus_source::watermark_ms,
 }];
 
-/// `watermark.get` for the route's bind principal: the lower committed pass
-/// watermark of its session and payer readers, `null` until both complete.
-/// Excluding the payer reader serves the session watermark alone. A
+/// `watermark.get` for the route's bind principal: the lower of the two
+/// watermarks its session reader and payer reader store, each written only
+/// when a read of its whole store has committed. It is `null` until both
+/// have one. Excluding the payer reader serves the session watermark alone. A
 /// caller with no row in `READ_SOURCES` (a local app, any other module, no
 /// principal) and a source excluded in `harness_ingest` are both refused
 /// `not_a_read_source`. A member in the request is refused `invalid_params`,
