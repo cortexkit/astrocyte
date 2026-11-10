@@ -568,6 +568,56 @@ mod tests {
         }
     }
 
+    /// BROCA's ledger events are run segments that sum several steps, so they
+    /// are no baseline for a step. Here the segment sums two reads of about
+    /// 400k; if the next announced step were judged against it, a steady
+    /// 400k read would look like half the cache lost. The step is judged
+    /// against the session's previous announced step instead.
+    #[test]
+    fn a_broca_run_segment_is_not_a_baseline_for_the_next_step() {
+        let state = test_state();
+        let at = now_ms();
+        record_steps_for_test(
+            &state,
+            "broca",
+            &[TestStep {
+                // BROCA stamps a segment when it ends, so it sorts after the
+                // steps it sums and is the session's latest recorded event.
+                occurred_at_ms: at - 1_500,
+                cache_read: 800_000,
+                ..TestStep::now("sb", "segment")
+            }],
+            false,
+        )
+        .unwrap();
+        for (attempt, offset, read) in [
+            ("attempt-1", 2_000, 399_990_u64),
+            ("attempt-2", 1_000, 400_000),
+        ] {
+            let start = u64::try_from(at - offset).unwrap();
+            admit_event(
+                &state,
+                &event("minimal", "broca", |body| {
+                    body["harness"] = json!("broca");
+                    body["session"] = json!("sb");
+                    body["attempt_id"] = json!(attempt);
+                    body["started_at_ms"] = json!(start);
+                    body["finished_at_ms"] = json!(start + 500);
+                    body["input_tokens"] = json!(10);
+                    body["cached_input_tokens"] = json!(read);
+                }),
+            );
+        }
+        let served = rows(&state, json!({"harness": "broca", "session": "sb"}));
+        let second = served
+            .iter()
+            .find(|row| row["step_ref"] == "attempt-2")
+            .unwrap();
+        assert_eq!(second["verdict"], "stable", "{second}");
+        assert_eq!(second["retention"], json!(1.0), "{second}");
+        assert_eq!(second["prompt_dropped"], json!(false), "{second}");
+    }
+
     /// Bodies broca's publisher wrote in its own tests, pinned byte for byte
     /// (`tests/vectors/broca-step-finished/SHA256SUMS`): completed,
     /// interrupted and keep-warm steps from both of broca's session storages,

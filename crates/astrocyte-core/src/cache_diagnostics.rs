@@ -530,9 +530,17 @@ pub fn unrecorded_step(
     unrecorded: &[UnrecordedStep],
 ) -> rusqlite::Result<CacheStep> {
     let at = row.occurred_at_ms;
-    let recorded_latest: Option<i64> = conn
-        .prepare_cached(LATEST_BEFORE_SQL)?
-        .query_row(params![session, producer, at, i64::MAX], |row| row.get(0))?;
+    // Only these producers record one ledger event per model step. Another
+    // producer's events sum several steps (BROCA records a run segment, Goose
+    // a session total), so they are no baseline for a single step: such a
+    // session is judged from its announced steps alone.
+    let ledger_has_steps = CACHE_HARNESSES.contains(&producer);
+    let recorded_latest: Option<i64> = if ledger_has_steps {
+        conn.prepare_cached(LATEST_BEFORE_SQL)?
+            .query_row(params![session, producer, at, i64::MAX], |row| row.get(0))?
+    } else {
+        None
+    };
     let recorded_baseline = match recorded_latest {
         Some(_) => conn
             .prepare_cached(BASELINE_SQL)?
@@ -572,7 +580,7 @@ pub fn unrecorded_step(
         || unrecorded
             .iter()
             .any(|step| step.counts.cache_read.is_some_and(|read| read > 0))
-        || session_reads_cache(conn, producer, session)?;
+        || (ledger_has_steps && session_reads_cache(conn, producer, session)?);
     let query = StepsQuery {
         producer: producer.to_string(),
         session: session.to_string(),
