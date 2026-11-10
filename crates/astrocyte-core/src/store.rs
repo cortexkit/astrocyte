@@ -7062,14 +7062,14 @@ mod tests {
     }
 
     /// The chain restarts at v1 and is contiguous; the runner records every
-    /// version exactly once even when run twice. Derived from MIGRATIONS so a
-    /// new migration cannot silently drop this test's coverage (the typed
-    /// count it used to carry would have needed editing on every migration,
-    /// a hand-written count to maintain whenever a migration is added).
+    /// version exactly once even when run twice. The expected chain is derived
+    /// from the number of migrations, so adding one needs no edit here, while
+    /// a gap, a duplicate or a misnumbered migration still fails.
     #[test]
     fn migration_chain_restarts_at_v1_and_runner_records_it_once() {
         assert!(!MIGRATIONS.is_empty());
-        let expected: Vec<u32> = (1..=39).collect();
+        let count = u32::try_from(MIGRATIONS.len()).unwrap();
+        let expected: Vec<u32> = (1..=count).collect();
         assert_eq!(
             MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>(),
             expected,
