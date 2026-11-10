@@ -30,3 +30,4 @@ pub use refresher::{hydrate_startup, start_refresher, start_refresher_with_media
 mod route_death_peer;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub(crate) mod vault_source;

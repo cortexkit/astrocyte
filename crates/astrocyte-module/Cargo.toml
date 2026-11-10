@@ -59,6 +59,7 @@ async-nats = { workspace = true }
 base64 = { workspace = true }
 futures-util = { workspace = true }
 subc-protocol = { workspace = true }
+cortexkit-claustrum-client = { workspace = true }
 subc-transport = { workspace = true }
 # subc-client-rs links subc-control; naming it here holds it to the exact
 # workspace pin, so the wire crates move together.

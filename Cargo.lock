@@ -68,6 +68,7 @@ dependencies = [
  "cortexkit-bus-naming",
  "cortexkit-bus-nats",
  "cortexkit-bus-trait",
+ "cortexkit-claustrum-client",
  "cortexkit-log",
  "cortexkit-paths",
  "cortexkit-provider-usage",
@@ -88,7 +89,7 @@ dependencies = [
  "subc-control",
  "subc-jsonc",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.34.1",
  "subc-transport",
  "tempfile",
  "tokio",
@@ -308,6 +309,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-claustrum-client"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3b1875e932afd4c2f04dbdca4851299fcf238d00f7c7c8ecdfc4623a3c474a8"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subc-protocol 0.36.2",
+]
+
+[[package]]
 name = "cortexkit-lease"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -390,7 +404,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.34.1",
  "url",
 ]
 
@@ -405,7 +419,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2",
- "subc-protocol",
+ "subc-protocol 0.34.1",
 ]
 
 [[package]]
@@ -1667,7 +1681,7 @@ dependencies = [
  "sha2",
  "subc-control",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.34.1",
  "subc-transport",
  "tokio",
  "tokio-util",
@@ -1682,7 +1696,7 @@ checksum = "d339866d62da0f376dec7f13c897cd764ead24fc93ca6d764cb3e6ab81844d64"
 dependencies = [
  "serde",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.34.1",
 ]
 
 [[package]]
@@ -1716,6 +1730,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "subc-protocol"
+version = "0.36.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28cc916c8a00269cfc6f13a1ac4d8333132de805b10c3eb8dbc23ea868f3d9bb"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "subc-transport"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1728,7 +1752,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.34.1",
  "subtle",
  "tokio",
 ]

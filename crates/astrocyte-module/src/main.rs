@@ -1061,6 +1061,7 @@ fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
         ("fusiform", desired.fusiform_connection_file.is_some()),
         ("insula", desired.qta_connection_file.is_some()),
         ("ckbus", true),
+        ("claustrum", true),
         ("colliculus", desired.harness_ingest.ingests("colliculus")),
     ]
     .into_iter()
@@ -2199,7 +2200,7 @@ mod tests {
         );
         assert_eq!(
             consumed_modules(&manifest),
-            ["fusiform", "insula", "ckbus", "colliculus"]
+            ["fusiform", "insula", "ckbus", "claustrum", "colliculus"]
         );
         let wire = serde_json::to_value(&manifest).unwrap();
         let signals = wire["self_signals"].as_array().unwrap();
@@ -2275,11 +2276,11 @@ mod tests {
             self_signal_names(&manifest),
             ["astrocyte-ckbus-credentials"]
         );
-        assert_eq!(consumed_modules(&manifest), ["ckbus"]);
+        assert_eq!(consumed_modules(&manifest), ["ckbus", "claustrum"]);
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire["consumes"],
-            json!([{"role": "service_client", "of": ["ckbus"]}])
+            json!([{"role": "service_client", "of": ["ckbus", "claustrum"]}])
         );
     }
 
@@ -2316,7 +2317,7 @@ mod tests {
                 "astrocyte-fusiform-history-status",
                 "astrocyte-fusiform-history-probe",
             ];
-            let mut modules = vec!["fusiform", "insula", "ckbus"];
+            let mut modules = vec!["fusiform", "insula", "ckbus", "claustrum"];
             if colliculus_enabled {
                 signals.push("astrocyte-colliculus-usage-read");
                 modules.push("colliculus");
@@ -2342,12 +2343,12 @@ mod tests {
         );
         assert_eq!(
             consumed_modules(&manifest),
-            ["insula", "ckbus", "colliculus"]
+            ["insula", "ckbus", "claustrum", "colliculus"]
         );
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire["consumes"],
-            json!([{"role": "service_client", "of": ["insula", "ckbus", "colliculus"]}])
+            json!([{"role": "service_client", "of": ["insula", "ckbus", "claustrum", "colliculus"]}])
         );
         let poll = &wire["self_signals"][0];
         assert_eq!(poll["name"], "astrocyte-insula-usage-poll");
@@ -2390,7 +2391,7 @@ mod tests {
             let mut desired = desired(false, false);
             desired.harness_ingest = ingest.clone();
             let manifest = manifest("astrocyte", &desired);
-            let mut modules = vec!["ckbus"];
+            let mut modules = vec!["ckbus", "claustrum"];
             let mut signals = vec!["astrocyte-ckbus-credentials"];
             if enabled {
                 modules.push("colliculus");
