@@ -448,7 +448,7 @@ where
         connection_end: Arc::clone(&connection_end),
         subscriptions_stopping: subscriptions_stopping.clone(),
         #[cfg(test)]
-        confirmation_required: None,
+        confirmation_required: false,
     };
     // HELLO is sent once per connection, so the manifest declares the desired
     // configuration in force at this moment. Startup hydrates that
@@ -645,7 +645,7 @@ impl LoopEnd {
 /// health and how the connection ended.
 struct AstrocyteHandler {
     #[cfg(test)]
-    confirmation_required: Option<bool>,
+    confirmation_required: bool,
     state: Arc<SharedState>,
     routes: RouteBinds,
     connection_end: Arc<Mutex<Option<ConnectionEnd>>>,
@@ -672,15 +672,16 @@ impl ModuleHandler for AstrocyteHandler {
         {
             return refused;
         }
+        #[cfg(not(test))]
         let confirmation_required = ledger_write_confirmation_required();
         #[cfg(test)]
-        let confirmation_required = self.confirmation_required.unwrap_or(confirmation_required);
+        let confirmation_required = self.confirmation_required;
         if confirmation_required
             && is_mutating_operation(&request.method)
             && matches!(route.principal, Some(Principal::Direct))
         {
-            // The person may take minutes. Do not enter dispatch (and therefore
-            // the writer fence or a store transaction) until this call succeeds.
+            // The person may take minutes. Wait before dispatch acquires the
+            // lock that serializes ledger writes or starts a store transaction.
             if let Err(error) = ctx
                 .module_handle()
                 .confirm_operation(
@@ -3652,7 +3653,7 @@ mod tests {
     async fn the_bind_principal_is_forgotten_when_the_route_or_connection_goes() {
         use subc_protocol::{BindIdentity, RouteTarget};
         let handler = AstrocyteHandler {
-            confirmation_required: None,
+            confirmation_required: false,
             state: Arc::new(test_state()),
             routes: RouteBinds::default(),
             connection_end: Arc::new(Mutex::new(None)),

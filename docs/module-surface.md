@@ -112,8 +112,9 @@ or feature switch. While off, direct callers write without a prompt as before.
 When enabled, only a `Principal::Direct` caller (a local program) must obtain
 daemon confirmation for each in-flight write. The deployed daemon chooses its
 OS presence provider. Module-route calls and the refresher never prompt; flow
-routes keep their existing `flow_scopes_unsupported` refusal. The prompt names the operation
-and target, and waits outside the writer fence and store transaction. Callers
+routes keep their existing `flow_scopes_unsupported` refusal. The prompt names
+the operation and target, and waits outside the lock that serializes ledger
+writes and outside the store transaction. Callers
 must allow at least 300 seconds for the person's response. A confirmation is
 never cached or retried: any refusal or failure returns
 `operator_confirmation_refused` without dispatching or changing the store. The

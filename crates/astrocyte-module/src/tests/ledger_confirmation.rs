@@ -8,7 +8,7 @@ struct ConfirmationRig {
 }
 
 impl ConfirmationRig {
-    async fn start(required: Option<bool>, advertise_confirmation: bool) -> Self {
+    async fn start(required: bool, advertise_confirmation: bool) -> Self {
         let state = Arc::new(test_state());
         let daemon = FakeDaemon::start().await;
         let handler = AstrocyteHandler {
@@ -141,8 +141,7 @@ async fn expect_confirmation(stream: &mut TcpStream, method: &str, target: &str)
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ledger_confirmation_off_direct_write_is_unprompted() {
-    assert!(!ledger_write_confirmation_required());
-    let mut rig = ConfirmationRig::start(None, true).await;
+    let mut rig = ConfirmationRig::start(false, true).await;
     send(
         &mut rig.stream,
         request_frame(
@@ -163,7 +162,7 @@ async fn ledger_confirmation_off_direct_write_is_unprompted() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ledger_confirmation_approved_dispatches_each_write_without_holding_writer() {
-    let mut rig = ConfirmationRig::start(Some(true), true).await;
+    let mut rig = ConfirmationRig::start(true, true).await;
     bind_as(
         &mut rig.stream,
         6,
@@ -225,7 +224,7 @@ async fn ledger_confirmation_approved_dispatches_each_write_without_holding_writ
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ledger_confirmation_refusal_or_failure_leaves_store_unchanged() {
-    let mut rig = ConfirmationRig::start(Some(true), true).await;
+    let mut rig = ConfirmationRig::start(true, true).await;
     let before = store_snapshot(&rig.state);
     for (index, (code, detail)) in [
         ("operator_declined", Value::Null),
@@ -302,7 +301,7 @@ async fn ledger_confirmation_refusal_or_failure_leaves_store_unchanged() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ledger_confirmation_module_write_never_prompts() {
-    let mut rig = ConfirmationRig::start(Some(true), true).await;
+    let mut rig = ConfirmationRig::start(true, true).await;
     bind_as(
         &mut rig.stream,
         6,
@@ -334,7 +333,7 @@ async fn ledger_confirmation_module_write_never_prompts() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ledger_confirmation_direct_read_never_prompts() {
-    let mut rig = ConfirmationRig::start(Some(true), true).await;
+    let mut rig = ConfirmationRig::start(true, true).await;
     let before = store_snapshot(&rig.state);
     send(
         &mut rig.stream,
@@ -376,7 +375,7 @@ fn ledger_confirmation_manifest_declares_exactly_the_nine_writes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ledger_confirmation_all_nine_writes_name_their_targets_without_secrets() {
-    let mut rig = ConfirmationRig::start(Some(true), true).await;
+    let mut rig = ConfirmationRig::start(true, true).await;
     let before = store_snapshot(&rig.state);
     let cases = [
         (
@@ -451,7 +450,7 @@ async fn ledger_confirmation_all_nine_writes_name_their_targets_without_secrets(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ledger_confirmation_unavailable_daemon_refuses_without_a_write() {
-    let mut rig = ConfirmationRig::start(Some(true), false).await;
+    let mut rig = ConfirmationRig::start(true, false).await;
     let before = store_snapshot(&rig.state);
     send(
         &mut rig.stream,
@@ -475,7 +474,7 @@ async fn ledger_confirmation_unavailable_daemon_refuses_without_a_write() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ledger_confirmation_enabled_flow_write_keeps_existing_refusal() {
-    let mut rig = ConfirmationRig::start(Some(true), true).await;
+    let mut rig = ConfirmationRig::start(true, true).await;
     send(
         &mut rig.stream,
         control_request(2, bind_body(6, 1, Some("flow-a"))),
@@ -521,4 +520,12 @@ fn ledger_confirmation_summary_bounds_unicode_and_preserves_both_target_parts() 
         all,
         "spend.multiplier.recompute: day 2026-07-10, provider all"
     );
+}
+
+// This deliberate release tripwire pins production policy, not gate behaviour.
+// Whoever enables confirmation must update this assertion in the same release
+// commit; all serving fixtures inject their own policy independently.
+#[test]
+fn ledger_confirmation_release_tripwire_requires_gate_off_until_approved_release() {
+    assert!(!ledger_write_confirmation_required());
 }
