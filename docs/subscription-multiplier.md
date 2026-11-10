@@ -182,6 +182,19 @@ records, ChatGPT credential/account mismatches and vault-read status. Existing
 coverage backfill covers waiting calls; the multiplier itself never changes
 recorded ledger money.
 
+For a producer whose event is one call, the multiplier sums that call's input,
+cache-read and cache-write tokens to test context thresholds. Each priced role
+selects its own highest `above_context` threshold strictly below that prompt
+size, considering only that role's rate rows. A tier on another role cannot
+hide a lower applicable tier or force a role off its base rate. Mode and
+cache-write lifetime conditions still require their complete matching rate;
+they do not fall back to a less-specific condition set. An unknown prompt on a
+tiered model is unpriced. Bundled events keep base rates and the existing
+`base_rate_tier_untested_tokens` diagnostic because their per-call prompt sizes
+are unknown. The `tiered_tokens` diagnostic remains event-level: it counts all
+tokens in a per-call event whenever its prompt crosses any model threshold,
+including roles priced at base or left unpriced.
+
 Money uses checked integer arithmetic. API list numerators are summed before
 one half-even rounding of the row total. Independently displayed model lines
 may differ from that total by rounding nanodollars; they are not the source of

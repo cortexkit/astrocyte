@@ -41,7 +41,7 @@ use crate::catalog_client::{
 };
 use crate::fact::ChargeBasis;
 use crate::money::{round_nano_num, round_nano_ratio, MoneyError};
-use crate::pricing::{effective_output, prompt_size, EffectiveOutput};
+use crate::pricing::{effective_output, prompt_size, EffectiveOutput, PromptSize};
 
 mod calibration;
 mod clean;
@@ -862,6 +862,25 @@ pub struct ModelRates {
     pub reference_model: Option<CatalogModel>,
 }
 
+impl ModelRates {
+    fn context_tier_for_role(&self, role: &str, prompt: PromptSize) -> Option<u64> {
+        self.tiers
+            .iter()
+            .filter_map(|(threshold, rates)| rates.contains_key(role).then_some(*threshold))
+            .chain(self.conditional.keys().filter_map(|key| {
+                let parsed = parse_rate_key(key).ok()?;
+                if parsed.role != role {
+                    return None;
+                }
+                // Mode- or lifetime-only tiers still establish this role's
+                // threshold; the complete condition set is matched afterward.
+                parsed.selectors.get("above_context")?.parse::<u64>().ok()
+            }))
+            .filter(|threshold| prompt.exceeds(*threshold))
+            .max()
+    }
+}
+
 // JSON object keys are strings, including inside the tagged rate resolution.
 // Decode them explicitly so stored long-context thresholds remain numeric.
 fn context_tiers<'de, D: Deserializer<'de>>(
@@ -1451,8 +1470,8 @@ pub struct ModelLine {
     pub measured_tokens: RoleTokens,
     /// Reasoning subtracted from inclusive BROCA output.
     pub inclusive_output_adjustment: i64,
-    /// Tokens in events whose prompt crossed a tier threshold and were priced
-    /// at the tier's rates.
+    /// All tokens in per-request events whose prompt crossed any model tier
+    /// threshold, including roles priced at base or left unpriced.
     pub tiered_tokens: i64,
     /// Tokens of a bundling producer on a model that publishes tiers, priced at
     /// the base rate because no per-request prompt exists to test.
@@ -2184,7 +2203,7 @@ fn value_event(
     };
 
     // Tier: decided from this event's own prompt, and only where one event is
-    // one call. The largest threshold the prompt exceeds applies to every role.
+    // one call. Each role uses its own largest exceeded threshold.
     // The prompt is read from the event's measurements as stored, including
     // lifetime-split cache writes, using the ledger's prompt-size function.
     let per_request = PER_REQUEST_PRODUCERS.contains(&event.producer.as_str());
@@ -2201,7 +2220,7 @@ fn value_event(
         }
         return Ok(());
     }
-    let tier = if per_request {
+    let event_tier = if per_request {
         prompt.and_then(|prompt| {
             model_rates
                 .tiers
@@ -2218,7 +2237,8 @@ fn value_event(
         }
         None
     };
-    if tier.is_some() {
+    if event_tier.is_some() {
+        // Count the whole event when its prompt crosses any model threshold.
         line.tiered_tokens = line
             .tiered_tokens
             .checked_add(event_total)
@@ -2249,6 +2269,11 @@ fn value_event(
         } else {
             role
         };
+        let tier = if per_request {
+            prompt.and_then(|prompt| model_rates.context_tier_for_role(rate_role, prompt))
+        } else {
+            None
+        };
         let mut selectors = BTreeMap::new();
         if let Some(ttl) = ttl {
             selectors.insert("ttl".into(), ttl.into());
@@ -2256,7 +2281,7 @@ fn value_event(
         if let Some(mode) = stated_mode {
             selectors.insert("mode".into(), mode.into());
         }
-        if let Some((threshold, _)) = tier {
+        if let Some(threshold) = tier {
             selectors.insert("above_context".into(), threshold.to_string());
         }
         let exact = model_rates
@@ -2277,10 +2302,11 @@ fn value_event(
                 // A stated mode is priced at its own rate or not at all.
                 Some(_) if tier.is_some() => exact,
                 Some(rates) => rates.and_then(|rates| rates.get(rate_role)),
-                // A role whose tier key is absent is valued at its base rate, as
-                // the catalog publishes no separate long-context price for it.
+                // A role without a crossed tier uses its base rate. Conditional
+                // tiers alone do not supply an unconditional tier price.
                 None => tier
-                    .and_then(|(_, tier_rates)| tier_rates.get(rate_role))
+                    .and_then(|threshold| model_rates.tiers.get(&threshold))
+                    .and_then(|tier_rates| tier_rates.get(rate_role))
                     .or_else(|| model_rates.base.get(rate_role)),
             }
         };
@@ -3006,6 +3032,7 @@ fn observation_rows(
 #[cfg(test)]
 mod tests {
     include!("multiplier/v2_tests.rs");
+    include!("multiplier/context_tier_tests.rs");
     use super::*;
     use crate::test_support::conn;
 
