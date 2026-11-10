@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 37. A schema change appends a migration; an applied
+currently version 38. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -36,6 +36,11 @@ copies that timeout without running the table-creating probes.
 | `desired_config` | The row records the committed desired-configuration generation. | one row |
 | `source_runtime` | Each row records a producer's cursor, lineage, last successful drain and pending disclosure. | upsert |
 | `media_feed_cursor` | The row records colliculus's committed unsigned feed sequence and skipped-local count. | upsert with each page |
+| `thalamus_payer_cursor` | The row records the payer store incarnation and committed sequence. | upsert with each mirror page |
+| `thalamus_payer_session` | Each row preserves the declared owner of a THALAMUS session. | insert once per harness and session |
+| `thalamus_payer_record` | Each row preserves one payer attempt, including its original usage JSON, after THALAMUS deletes its copy. | insert only |
+| `thalamus_payer_first_seen` | Each row preserves when an undated transcript call first waited for its payer. | insert once per event |
+| `thalamus_payer_coverage` | Each row identifies one payer coverage exception, so replay cannot count it twice. | insert once per kind and identity |
 | `set_aside_record` | Each row records an unreadable producer record by source and locator, including its reason and observation times. | upsert |
 | `declared_store_cursor` | Each row records the durable read position of one store that another module declared, per source and on-disk layout. | upsert; deleted when the store is no longer declared |
 | `read_watermark` | Each row records a reader source's read watermark, the time before which everything in its declared stores is recorded. | upsert that only moves forward |
@@ -55,6 +60,11 @@ copies that timeout without running the table-creating probes.
 | `summary_cost_frequency` | Each row counts an exact current-head value in the dated, complete, currency-known work-class sample. | Rebuilds replace these rows. |
 | `summary_run_cell` | Each row stores step counts, token totals and presence, and current-charge cost maps for one run key, provider and model, and hour. | The existing hourly rebuild and audit replace these rows. |
 | `summary_audit_state` | The row records the independent audit's cursor, next start time and progress statistics. | The audit updates this row. |
+
+The payer store's incarnation identifies one database history. THALAMUS changes
+it when the database is replaced or restored, so a reader starts again at the
+lowest sequence instead of skipping a newly reused sequence number. The mirror
+keeps attempt identities across incarnations to prevent duplicate calls.
 
 ## Immutability
 

@@ -4004,6 +4004,61 @@ CREATE TABLE media_feed_cursor (
 );
 "#,
     },
+    Migration {
+        version: 38,
+        statements: r#"
+CREATE TABLE thalamus_payer_cursor (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    incarnation TEXT NOT NULL,
+    through_seq INTEGER NOT NULL
+);
+CREATE TABLE thalamus_payer_session (
+    harness TEXT NOT NULL,
+    session TEXT NOT NULL,
+    owner_principal TEXT,
+    declared_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(harness,session)
+) WITHOUT ROWID;
+CREATE TABLE thalamus_payer_record (
+    attempt_id TEXT PRIMARY KEY,
+    seq INTEGER NOT NULL,
+    incarnation TEXT NOT NULL,
+    harness TEXT NOT NULL,
+    session TEXT NOT NULL,
+    request_kind TEXT NOT NULL,
+    step_ref TEXT,
+    recorded_at_ms INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    charge_basis TEXT,
+    auth_selection TEXT NOT NULL,
+    account_ref TEXT,
+    outcome TEXT,
+    provider_request_id TEXT,
+    provider_response_id TEXT,
+    usage_json TEXT
+) WITHOUT ROWID;
+CREATE INDEX thalamus_payer_step ON thalamus_payer_record(harness,step_ref);
+CREATE TRIGGER thalamus_payer_record_insert_once BEFORE INSERT ON thalamus_payer_record
+WHEN EXISTS(SELECT 1 FROM thalamus_payer_record WHERE attempt_id=NEW.attempt_id)
+BEGIN SELECT RAISE(ABORT, 'thalamus_payer_record_insert_once'); END;
+CREATE TRIGGER thalamus_payer_record_no_update BEFORE UPDATE ON thalamus_payer_record
+BEGIN SELECT RAISE(ABORT, 'thalamus_payer_record is append-only'); END;
+CREATE TRIGGER thalamus_payer_record_no_delete BEFORE DELETE ON thalamus_payer_record
+BEGIN SELECT RAISE(ABORT, 'thalamus_payer_record is append-only'); END;
+-- Restarting a transcript reader must not restart an undated call's wait.
+CREATE TABLE thalamus_payer_first_seen (
+    event_id TEXT PRIMARY KEY,
+    first_seen_ms INTEGER NOT NULL
+) WITHOUT ROWID;
+-- A distinct identity counts once even after a cursor resets or a file is copied.
+CREATE TABLE thalamus_payer_coverage (
+    kind TEXT NOT NULL,
+    identity TEXT NOT NULL,
+    PRIMARY KEY(kind,identity)
+) WITHOUT ROWID;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.

@@ -50,7 +50,7 @@ holds the contracts and details this page summarises.
 ## Durable state
 
 One SQLite store in WAL mode, written by one process under a lease.
-`crates/astrocyte-core/src/store.rs` holds `MIGRATIONS`, at schema version 37; an
+`crates/astrocyte-core/src/store.rs` holds `MIGRATIONS`, at schema version 38; an
 older binary refuses a newer store. `initialize_connection` sets a 5000 ms busy
 timeout and in-memory temporary storage, enables foreign keys and probes needed
 SQLite features; commits use FULL sync. Triggers refuse deleting or rewriting the
