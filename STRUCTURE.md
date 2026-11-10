@@ -53,8 +53,8 @@ A library shared by three binaries: `main.rs` (`ck-astrocyte`) and two tools,
 `bin/spend_drive.rs` (calls one operation over a connection file) and
 `bin/corpus_drive.rs` (drives real exported facts through ingest).
 
-- `main.rs`: startup, `--version`, `--check-config`, the manifest, serving and
-  route-level refusals.
+- `main.rs`: startup, `--version`, `--check-config`, the manifest (also printed
+  by `--manifest`), serving and route-level refusals.
 - `ops.rs`: `PUBLIC_OPERATION_NAMES` and `dispatch`.
 - `state.rs`: `SharedState`, the writer fence, the projection and health.
 - `config.rs`: closed configuration decoding and `INGEST_SOURCES`.
