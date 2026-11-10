@@ -47,6 +47,13 @@ when exactly one provider and a tier are present. Otherwise it is unknown.
 Effective time uses optional `plan_tier_observed_at_ms`, falling back to the
 first observation of a change. Repeated lists do not move that boundary.
 
+Ledger reconciliation runs once after the first successful startup list, when
+a snapshot appends history, and on a scheduled retry. Unpriced keys retry
+at most hourly; otherwise the backstop is daily. Only those reconciles ask
+Fusiform for prices, and only ledger changes enter a writer transaction.
+Diagnostics are cached between reconciles. ChatGPT mismatches refresh on a
+changed snapshot or daily; their query is not part of an idle tick or an hourly price retry.
+
 At the first startup after schema migration 39, the committed config's identity maps seed
 source `config` rows effective at zero, preserving old day recomputation. Live
 maps and per-account price overrides are removed; stored non-null per-account
@@ -169,7 +176,7 @@ remain unchanged. Decimal scales are normalized only when the amount is exact.
 Tier changes bound vault-owned intervals and open successors at the change
 time. A hand-recorded plan is never closed or changed. Missing prices create
 no new ledger plan and remain visible, with raw provider/tier and account IDs,
-in `spend.subscription.report`; a later price is retried on the next full tick.
+in `spend.subscription.report`; a later price is picked up by the hourly retry.
 That report also shows hand/vault differences, disagreements between vault
 records, ChatGPT credential/account mismatches and vault-read status. Existing
 coverage backfill covers waiting calls; the multiplier itself never changes

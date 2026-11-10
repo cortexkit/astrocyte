@@ -20,6 +20,7 @@ use crate::state::SharedState;
 
 const BUDGET: Duration = Duration::from_secs(10);
 const DAY_MS: i64 = 86_400_000;
+const UNPRICED_RETRY_MS: i64 = 3_600_000;
 type Snapshot = Result<Vec<VaultPlan>, String>;
 
 fn decode_listing(value: Value, now: i64) -> Snapshot {
@@ -308,6 +309,10 @@ pub(crate) struct Stage {
     reader: Reader,
     available: bool,
     last_failure: Option<String>,
+    last_reconcile_ms: Option<i64>,
+    last_mismatch_ms: Option<i64>,
+    diagnostics: vault_plan::Diagnostics,
+    price_available: bool,
 }
 
 impl Stage {
@@ -316,6 +321,10 @@ impl Stage {
             reader: Reader::start(stop),
             available: false,
             last_failure: None,
+            last_reconcile_ms: None,
+            last_mismatch_ms: None,
+            diagnostics: vault_plan::Diagnostics::default(),
+            price_available: false,
         }
     }
 
@@ -336,31 +345,6 @@ impl Stage {
         source: Option<&dyn PlanPriceSource>,
         now: i64,
     ) {
-        if !self.available && !snapshots.iter().any(Result::is_ok) {
-            for snapshot in snapshots {
-                if let Err(code) = snapshot {
-                    self.failure(state, code);
-                }
-            }
-            return;
-        }
-        // Finish the peer call before any ledger write. Missing catalog prices
-        // leave the vault's known keys visible as unpriced instead of hiding them.
-        let result = source
-            .ok_or_else(|| "plan_prices_unavailable".to_string())
-            .and_then(|source| {
-                source
-                    .plan_prices(PlanPricesRequest { provider_id: None })
-                    .map_err(|_| "plan_prices_unavailable".into())
-            });
-        let price_available = result.is_ok();
-        let prices = result.unwrap_or_else(|_| fusiform_protocol::PlanPricesResponse {
-            prices: Vec::new(),
-            resolved_at_ms: now,
-            tier_vocabulary: String::new(),
-            unit_policy: String::new(),
-        });
-        let had_snapshots = !snapshots.is_empty();
         for snapshot in snapshots {
             match snapshot {
                 Err(code) => {
@@ -368,52 +352,136 @@ impl Stage {
                     self.failure(state, code);
                 }
                 Ok(plans) => {
-                    let result = state.ordered_write(|tx| {
-                        let mut changed = false;
-                        for plan in &plans {
-                            changed |= vault_plan::append_in_tx(tx, plan)
-                                .map_err(|error| error.to_string())?;
-                        }
-                        Ok(((), changed))
+                    let result = self.append_snapshot(state, &plans).and_then(|changed| {
+                        self.available = true;
+                        self.process(state, source, now, changed)?;
+                        self.publish(state);
+                        Ok(())
                     });
                     if let Err(error) = result {
                         self.failure(state, error);
                         return;
                     }
-                    self.available = true;
-                    self.reconcile(state, &prices, price_available, now);
                 }
             }
         }
-        if !had_snapshots && self.available {
-            self.reconcile(state, &prices, price_available, now);
+        if self.available {
+            match self.process(state, source, now, false) {
+                Ok(true) => self.publish(state),
+                Ok(false) => {}
+                Err(error) => self.failure(state, error),
+            }
         }
+    }
+
+    fn append_snapshot(&self, state: &SharedState, plans: &[VaultPlan]) -> Result<bool, String> {
+        let changed = state.with_conn(|conn| {
+            for plan in plans {
+                if vault_plan::differs_from_latest(conn, plan).map_err(|error| error.to_string())? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })?;
+        if !changed {
+            return Ok(false);
+        }
+        state.ordered_tail_write(|tx| {
+            let mut changed = false;
+            for plan in plans {
+                changed |= vault_plan::append_in_tx(tx, plan).map_err(|error| error.to_string())?;
+            }
+            Ok((changed, changed))
+        })
+    }
+
+    fn process(
+        &mut self,
+        state: &SharedState,
+        source: Option<&dyn PlanPriceSource>,
+        now: i64,
+        history_changed: bool,
+    ) -> Result<bool, String> {
+        let interval = if self.diagnostics.unpriced_plans.is_empty() {
+            DAY_MS
+        } else {
+            UNPRICED_RETRY_MS
+        };
+        let reconcile = history_changed
+            || self
+                .last_reconcile_ms
+                .is_none_or(|at| now.saturating_sub(at) >= interval);
+        let mismatches = history_changed
+            || self
+                .last_mismatch_ms
+                .is_none_or(|at| now.saturating_sub(at) >= DAY_MS);
+        if !reconcile && !mismatches {
+            return Ok(false);
+        }
+        let plans = state.with_conn(|conn| {
+            vault_plan::at(conn, now.saturating_add(1)).map_err(|error| error.to_string())
+        })?;
+        if mismatches {
+            self.last_mismatch_ms = Some(now);
+            self.diagnostics.chatgpt_account_mismatches =
+                state.with_conn(|conn| vault_plan::chatgpt_account_mismatches(conn, &plans))?;
+        }
+        if reconcile {
+            self.reconcile(state, &plans, source, now)?;
+        }
+        Ok(true)
     }
 
     fn reconcile(
         &mut self,
         state: &SharedState,
-        prices: &fusiform_protocol::PlanPricesResponse,
-        price_available: bool,
+        plans: &[VaultPlan],
+        source: Option<&dyn PlanPriceSource>,
         now: i64,
-    ) {
-        let result = state.ordered_write(|tx| {
-            let plans =
-                vault_plan::at(tx, now.saturating_add(1)).map_err(|error| error.to_string())?;
-            let report = vault_plan::reconcile_in_tx(tx, &plans, prices, now)?;
-            Ok((report, true))
+    ) -> Result<(), String> {
+        self.last_reconcile_ms = Some(now);
+        // Only scheduled reconciliation asks the peer, before entering any
+        // writer transaction. Missing prices remain visible for the hourly retry.
+        let result = source
+            .ok_or_else(|| "plan_prices_unavailable".to_string())
+            .and_then(|source| {
+                source
+                    .plan_prices(PlanPricesRequest { provider_id: None })
+                    .map_err(|_| "plan_prices_unavailable".into())
+            });
+        self.price_available = result.is_ok();
+        let prices = result.unwrap_or_else(|_| fusiform_protocol::PlanPricesResponse {
+            prices: Vec::new(),
+            resolved_at_ms: now,
+            tier_vocabulary: String::new(),
+            unit_policy: String::new(),
         });
-        match result {
-            Ok(report) => {
-                state.set_vault_report(json!({"vault_read_status":{"status":"available"},
-                    "plan_price_status":if price_available { "available" } else { "unavailable" },
-                    "unknown_plans":report.unknown_plans,"unpriced_plans":report.unpriced_plans,
-                    "hand_vault_differences":report.hand_vault_differences,"vault_record_differences":report.vault_record_differences,
-                    "chatgpt_account_mismatches":report.chatgpt_account_mismatches}));
-                self.last_failure = None;
-            }
-            Err(error) => self.failure(state, error),
-        }
+        let prepared = state
+            .with_conn(|conn| vault_plan::prepare_reconciliation(conn, plans, &prices, now))?;
+        let mut report = if prepared.has_changes() {
+            // A hand-set plan can win after the preview. Recheck ownership in the
+            // write transaction; if no changes remain, roll back rather than commit.
+            state.ordered_tail_write(|tx| {
+                let prepared = vault_plan::prepare_reconciliation(tx, plans, &prices, now)?;
+                let changed = prepared.has_changes();
+                Ok((prepared.apply_in_tx(tx)?, changed))
+            })?
+        } else {
+            prepared.diagnostics
+        };
+        report.chatgpt_account_mismatches = self.diagnostics.chatgpt_account_mismatches.clone();
+        self.diagnostics = report;
+        Ok(())
+    }
+
+    fn publish(&mut self, state: &SharedState) {
+        let report = &self.diagnostics;
+        state.set_vault_report(json!({"vault_read_status":{"status":"available"},
+            "plan_price_status":if self.price_available { "available" } else { "unavailable" },
+            "unknown_plans":report.unknown_plans,"unpriced_plans":report.unpriced_plans,
+            "hand_vault_differences":report.hand_vault_differences,"vault_record_differences":report.vault_record_differences,
+            "chatgpt_account_mismatches":report.chatgpt_account_mismatches}));
+        self.last_failure = None;
     }
 
     fn failure(&mut self, state: &SharedState, code: String) {

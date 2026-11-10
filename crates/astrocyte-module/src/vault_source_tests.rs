@@ -13,6 +13,10 @@ fn stage() -> Stage {
         },
         available: false,
         last_failure: None,
+        last_reconcile_ms: None,
+        last_mismatch_ms: None,
+        diagnostics: vault_plan::Diagnostics::default(),
+        price_available: false,
     }
 }
 
@@ -84,6 +88,127 @@ fn rows(state: &SharedState) -> Vec<LedgerRow> {
 
 fn report(state: &SharedState) -> Value {
     ops::dispatch(state, ops::OP_SUBSCRIPTION_REPORT, json!({})).unwrap()
+}
+
+struct CountingPrices {
+    calls: std::sync::atomic::AtomicUsize,
+    priced: AtomicBool,
+}
+
+impl PlanPriceSource for CountingPrices {
+    fn plan_prices(
+        &self,
+        request: PlanPricesRequest,
+    ) -> Result<PlanPricesResponse, CatalogCallError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Prices(if self.priced.load(Ordering::Relaxed) {
+            vec![("pro_200", 20_000)]
+        } else {
+            vec![]
+        })
+        .plan_prices(request)
+    }
+}
+
+#[test]
+fn vault_idle_full_ticks_do_not_call_prices_or_open_store_transactions() {
+    let state = test_state();
+    ingest(&state, 10);
+    let source = CountingPrices {
+        calls: 0.into(),
+        priced: AtomicBool::new(true),
+    };
+    let mut stage = stage();
+    stage.apply(&state, vec![snapshot("pro_200", 100)], Some(&source), 101);
+    assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+    let before = crate::state::transaction_attempts_for_test();
+    let expected = report(&state);
+    stage.tick(&state, Some(&source), 30_101);
+    assert_eq!(
+        crate::state::transaction_attempts_for_test(),
+        before,
+        "an idle tick must not start a writer transaction"
+    );
+    assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(report(&state), expected);
+
+    stage.apply(
+        &state,
+        vec![snapshot("pro_200", 100)],
+        Some(&source),
+        60_101,
+    );
+    assert_eq!(
+        source.calls.load(Ordering::Relaxed),
+        1,
+        "unchanged snapshots do not reconcile"
+    );
+    assert_eq!(crate::state::transaction_attempts_for_test(), before);
+
+    stage.tick(&state, Some(&source), 101 + 86_400_000);
+    assert_eq!(
+        source.calls.load(Ordering::Relaxed),
+        2,
+        "priced accounts have a daily backstop"
+    );
+    assert_eq!(
+        crate::state::transaction_attempts_for_test(),
+        before,
+        "diagnostics alone do not start a writer transaction"
+    );
+    let mut restarted = self::stage();
+    restarted.apply(
+        &state,
+        vec![snapshot("pro_200", 100)],
+        Some(&source),
+        101 + 86_400_001,
+    );
+    assert_eq!(
+        source.calls.load(Ordering::Relaxed),
+        3,
+        "startup reconciles even when persisted history is unchanged"
+    );
+    assert_eq!(crate::state::transaction_attempts_for_test(), before);
+}
+
+#[test]
+fn vault_unpriced_retry_waits_an_hour_then_applies_new_price() {
+    let state = test_state();
+    ingest(&state, 10);
+    let source = CountingPrices {
+        calls: 0.into(),
+        priced: AtomicBool::new(false),
+    };
+    let mut stage = stage();
+    stage.apply(&state, vec![snapshot("pro_200", 100)], Some(&source), 101);
+    assert!(rows(&state).is_empty());
+    assert_eq!(
+        report(&state)["unpriced_plans"][0]["plan_key"],
+        "openai/pro_200"
+    );
+    let before = crate::state::transaction_attempts_for_test();
+    source.priced.store(true, Ordering::Relaxed);
+    for now in [30_101, 101 + 3_600_000 - 1] {
+        stage.tick(&state, Some(&source), now);
+        assert_eq!(
+            source.calls.load(Ordering::Relaxed),
+            1,
+            "unpriced plans retry at most hourly"
+        );
+        assert!(rows(&state).is_empty());
+        assert_eq!(crate::state::transaction_attempts_for_test(), before);
+    }
+    stage.tick(&state, Some(&source), 101 + 3_600_000);
+    assert_eq!(source.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(rows(&state)[0].0, "openai/pro_200");
+    assert_eq!(rows(&state)[0].1, 10);
+    assert_eq!(report(&state)["unpriced_plans"], json!([]));
+    stage.tick(&state, Some(&source), 101 + 2 * 3_600_000);
+    assert_eq!(
+        source.calls.load(Ordering::Relaxed),
+        2,
+        "a priced key returns to the daily backstop"
+    );
 }
 
 #[test]
@@ -178,7 +303,7 @@ fn vault_unpriced_raw_tier_is_reported_and_later_price_records_plan() {
         &state,
         vec![],
         Some(&Prices(vec![("Odd-Tier", 25_000)])),
-        102,
+        101 + UNPRICED_RETRY_MS,
     );
     assert_eq!(rows(&state)[0].0, "openai/Odd-Tier");
     assert_eq!(rows(&state)[0].1, 10);

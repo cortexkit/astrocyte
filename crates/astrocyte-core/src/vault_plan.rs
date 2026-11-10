@@ -98,16 +98,17 @@ pub struct AccountMismatch {
     pub account_refs: Vec<String>,
 }
 
-/// Prices are resolved before this function is called. Only plans marked as
-/// vault-owned can be bounded here. The `spend.subscription.set` operation
-/// writes a NULL operator, which identifies a hand-recorded plan.
-pub fn reconcile_in_tx(
-    tx: &Transaction<'_>,
+/// Build read-only ledger actions after prices are resolved. Only vault-owned
+/// plans are eligible to close; `spend.subscription.set` writes a NULL operator,
+/// which identifies a hand-recorded plan.
+pub fn prepare_reconciliation(
+    conn: &Connection,
     plans: &[VaultPlan],
     prices: &PlanPricesResponse,
     now: i64,
-) -> Result<Diagnostics, String> {
+) -> Result<Reconciliation, String> {
     let mut diagnostics = Diagnostics::default();
+    let mut changes = Vec::new();
     for plan in plans.iter().filter(|plan| plan.source != "config") {
         if plan.plan_key.is_none() {
             diagnostics.unknown_plans.push(plan.clone());
@@ -149,7 +150,7 @@ pub fn reconcile_in_tx(
         let Some(account) = &plan.account_id else {
             continue;
         };
-        let open: Option<(String, i64, Option<String>)> = tx
+        let open: Option<(String, i64, Option<String>)> = conn
             .query_row(
                 "SELECT plan_name,effective_from_ms,operator FROM account_subscription
              WHERE provider=?1 AND account_ref=?2 AND effective_to_ms IS NULL",
@@ -179,20 +180,16 @@ pub fn reconcile_in_tx(
             continue;
         }
         if open.is_some() {
-            subscription::close_subscription_in_tx(
-                tx,
-                &CloseSubscriptionRequest {
-                    provider: provider.clone(),
-                    account_ref: account.clone(),
-                    effective_to: plan.effective_from_ms,
-                },
-            )
-            .map_err(|error| error.message())?;
+            changes.push(LedgerChange::Close(CloseSubscriptionRequest {
+                provider: provider.clone(),
+                account_ref: account.clone(),
+                effective_to: plan.effective_from_ms,
+            }));
         }
         let Some(price) = price else {
             continue;
         };
-        let first_call: Option<i64> = tx
+        let first_call: Option<i64> = conn
             .query_row(
                 "SELECT min(occurred_at_ms) FROM usage_event WHERE provider=?1 AND account_ref=?2",
                 params![provider, account],
@@ -202,7 +199,7 @@ pub fn reconcile_in_tx(
         let Some(first_call) = first_call else {
             continue;
         };
-        let has_history: bool = tx.query_row(
+        let has_history: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM account_subscription WHERE provider=?1 AND account_ref=?2)",
             params![provider,account], |row| row.get(0),
         ).map_err(|error| error.to_string())?;
@@ -211,22 +208,34 @@ pub fn reconcile_in_tx(
         } else {
             first_call
         };
-        subscription::set_subscription_in_tx(
-            tx,
-            &SetSubscriptionRequest {
-                provider: provider.clone(),
-                account_ref: account.clone(),
-                plan_name: plan.plan_key.clone().unwrap(),
-                recurring_cost_minor: price.minor_units,
-                currency: price.currency.into(),
-                amount_exponent: price.exponent,
-                period: price.period,
-                effective_from: from,
-            },
-            Some(VAULT_OPERATOR),
-        )
-        .map_err(|error| error.message())?;
+        changes.push(LedgerChange::Set(SetSubscriptionRequest {
+            provider: provider.clone(),
+            account_ref: account.clone(),
+            plan_name: plan.plan_key.clone().unwrap(),
+            recurring_cost_minor: price.minor_units,
+            currency: price.currency.into(),
+            amount_exponent: price.exponent,
+            period: price.period,
+            effective_from: from,
+        }));
     }
+    Ok(Reconciliation {
+        diagnostics,
+        changes,
+    })
+}
+
+const CHATGPT_MISMATCH_SQL: &str = "
+    SELECT DISTINCT account_ref FROM usage_event WHERE provider='openai' AND charge_basis='subscription_included'
+     AND auth_selection=?1 AND account_ref IS NOT NULL AND account_ref<>?2 ORDER BY account_ref";
+
+/// Read mismatches for the vault's credentials. The caller caches the results
+/// between snapshots and the daily check.
+pub fn chatgpt_account_mismatches(
+    conn: &Connection,
+    plans: &[VaultPlan],
+) -> Result<Vec<AccountMismatch>, String> {
+    let mut mismatches = Vec::new();
     for plan in plans
         .iter()
         .filter(|plan| plan.provider.as_deref() == Some("openai"))
@@ -234,22 +243,56 @@ pub fn reconcile_in_tx(
         let Some(account) = &plan.account_id else {
             continue;
         };
-        let refs = tx.prepare(
-            "SELECT DISTINCT account_ref FROM usage_event WHERE provider='openai' AND charge_basis='subscription_included'
-             AND auth_selection=?1 AND account_ref IS NOT NULL AND account_ref<>?2 ORDER BY account_ref",
-        ).map_err(|error| error.to_string())?.query_map(params![plan.credential_id,account], |row| row.get(0))
-            .map_err(|error| error.to_string())?.collect::<rusqlite::Result<Vec<String>>>().map_err(|error| error.to_string())?;
+        let refs = conn
+            .prepare(CHATGPT_MISMATCH_SQL)
+            .map_err(|error| error.to_string())?
+            .query_map(params![plan.credential_id, account], |row| row.get(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(|error| error.to_string())?;
         if !refs.is_empty() {
-            diagnostics
-                .chatgpt_account_mismatches
-                .push(AccountMismatch {
-                    credential_id: plan.credential_id.clone(),
-                    account_id: account.clone(),
-                    account_refs: refs,
-                });
+            mismatches.push(AccountMismatch {
+                credential_id: plan.credential_id.clone(),
+                account_id: account.clone(),
+                account_refs: refs,
+            });
         }
     }
-    Ok(diagnostics)
+    Ok(mismatches)
+}
+
+pub struct Reconciliation {
+    pub diagnostics: Diagnostics,
+    changes: Vec<LedgerChange>,
+}
+
+enum LedgerChange {
+    Close(CloseSubscriptionRequest),
+    Set(SetSubscriptionRequest),
+}
+
+impl Reconciliation {
+    pub fn has_changes(&self) -> bool {
+        !self.changes.is_empty()
+    }
+
+    /// Apply actions prepared in this write transaction, so intervening
+    /// hand-recorded plans cannot be overwritten by an earlier preview.
+    pub fn apply_in_tx(self, tx: &Transaction<'_>) -> Result<Diagnostics, String> {
+        for change in self.changes {
+            match change {
+                LedgerChange::Close(request) => {
+                    subscription::close_subscription_in_tx(tx, &request)
+                        .map_err(|error| error.message())?;
+                }
+                LedgerChange::Set(request) => {
+                    subscription::set_subscription_in_tx(tx, &request, Some(VAULT_OPERATOR))
+                        .map_err(|error| error.message())?;
+                }
+            };
+        }
+        Ok(self.diagnostics)
+    }
 }
 
 struct LedgerPrice<'a> {
@@ -401,11 +444,7 @@ pub fn seed_config_in_tx(
 /// A new listing is evidence of a change only when its plan key differs.
 /// Repeated reads must not move the effective time of the same tier.
 pub fn append_in_tx(tx: &Transaction<'_>, plan: &VaultPlan) -> rusqlite::Result<bool> {
-    let previous: Option<Option<String>> = tx.query_row(
-        "SELECT plan_key FROM vault_plan_history WHERE credential_id=?1 ORDER BY history_id DESC LIMIT 1",
-        [&plan.credential_id], |row| row.get(0),
-    ).optional()?;
-    if previous.as_ref() == Some(&plan.plan_key) {
+    if !differs_from_latest(tx, plan)? {
         return Ok(false);
     }
     tx.execute(
@@ -414,6 +453,15 @@ pub fn append_in_tx(tx: &Transaction<'_>, plan: &VaultPlan) -> rusqlite::Result<
         params![plan.credential_id,plan.provider,plan.account_id,plan.plan_tier,plan.plan_key,plan.source,plan.effective_from_ms,plan.observed_at_ms],
     )?;
     Ok(true)
+}
+
+/// Compare a listing without starting a write transaction for an unchanged key.
+pub fn differs_from_latest(conn: &Connection, plan: &VaultPlan) -> rusqlite::Result<bool> {
+    let previous: Option<Option<String>> = conn.query_row(
+        "SELECT plan_key FROM vault_plan_history WHERE credential_id=?1 ORDER BY history_id DESC LIMIT 1",
+        [&plan.credential_id], |row| row.get(0),
+    ).optional()?;
+    Ok(previous.as_ref() != Some(&plan.plan_key))
 }
 
 /// Latest effective row for each record, with a deterministic tie-break for
