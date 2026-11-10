@@ -5751,7 +5751,8 @@ mod tests {
             assert!(observation.multiplier.is_some());
             assert!(observation.fee_multiplier.is_some());
             for line in &mut observation.api_nanos_by_model {
-                // Catalog provenance changes, but the valuation must not.
+                // `rates` lists the catalog keys each model served, so it gains
+                // the extra role's key; every valued amount must stay equal.
                 line.rates = None;
             }
             observations.push(observation);
