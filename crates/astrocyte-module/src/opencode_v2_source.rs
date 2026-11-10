@@ -63,6 +63,8 @@ pub(crate) struct Outcome {
     pub absent: bool,
     pub full: bool,
     pub cost: OpenCodeScanCost,
+    #[cfg(test)]
+    pub incomplete_cost: OpenCodeScanCost,
 }
 
 pub(crate) struct OpenCodeV2Source {
@@ -271,7 +273,7 @@ impl OpenCodeV2Source {
         // another session may still be streaming while a done one is erased.
         let settled = |session: &str| options.session_settled(session);
         let page = if full {
-            self.full_page(state, path, now, stop, &settled)?
+            self.full_page(state, path, now, stop, &settled, replaced)?
         } else {
             if cache.reader.is_none() {
                 let Some(reader) = TailReader::open(path, stop).map_err(read_error)? else {
@@ -323,7 +325,7 @@ impl OpenCodeV2Source {
                         });
                     }
                     full = true;
-                    self.full_page(state, path, now, stop, &settled)?
+                    self.full_page(state, path, now, stop, &settled, true)?
                 }
                 page => page,
             }
@@ -395,11 +397,13 @@ impl OpenCodeV2Source {
         now: i64,
         stop: &AtomicBool,
         settled: &dyn Fn(&str) -> bool,
+        reset_floor: bool,
     ) -> Result<Option<Page>, SourceDrainError> {
-        let cursor = self.home.read_cursor(state)?;
+        let (cursor, floor) = self.home.read_cursor_with_open_row_floor(state)?;
         opencode_v2::read_page_with_settled_sessions(
             path,
             cursor.as_ref(),
+            floor.filter(|_| !reset_floor),
             PAGE_LIMIT,
             now,
             stop,
@@ -465,6 +469,8 @@ fn commit(
     let initial = Outcome {
         full,
         cost: page.map(|page| page.cost).unwrap_or_default(),
+        #[cfg(test)]
+        incomplete_cost: page.map(|page| page.incomplete_cost).unwrap_or_default(),
         skipped_legacy: page.map(|page| page.skipped_legacy).unwrap_or_default(),
         ..Outcome::default()
     };
@@ -555,6 +561,10 @@ fn commit(
                 now,
             )
             .map_err(|e| e.to_string())?;
+            if full && resolution.next.is_empty() {
+                home.record_open_row_floor_in_tx(tx, page.open_row_floor)
+                    .map_err(|e| e.to_string())?;
+            }
         }
         Ok(((outcome, newly_seen, resolution), true))
     });
@@ -727,6 +737,244 @@ mod tests {
                 .map_err(|e| e.to_string())
             })
             .unwrap()
+    }
+
+    fn stored_floor(state: &SharedState) -> Option<i64> {
+        state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT open_row_floor FROM source_runtime WHERE source_key='opencode-v2'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap()
+    }
+
+    fn restarted_full_pass_cost(history: i64) -> Outcome {
+        let (_temp, path, conn) = database();
+        conn.execute(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1)
+             INSERT INTO session_message
+             SELECT 'history-'||x,'session','assistant',x,10,10,?2 FROM n",
+            params![history, payload(10, true).to_string()],
+        )
+        .unwrap();
+        let state = test_state();
+        DrainMode::Full.ensure_runtime(&state, SOURCE_KEY).unwrap();
+        // Represent a history that was ingested before this process started.
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE source_runtime SET lineage='history-1',consumed_ordinal=100,
+                     high_water_ordinal=100,last_success_ms=100,pending_unknown=0
+                     WHERE source_key='opencode-v2'",
+                    [],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let source = OpenCodeV2Source::at(&path);
+        source.drain(&state, 200, &STOP).unwrap();
+        insert(&conn, "open-before-tail", 110, &payload(110, false));
+        // An open row retains the intervening completed rows, not just itself.
+        for index in 0..64 {
+            insert(&conn, &format!("tail-{index}"), 120, &payload(120, true));
+        }
+        source.require_full_pass();
+        assert_eq!(source.drain(&state, 210, &STOP).unwrap().recorded, 64);
+        drop(source);
+        insert(&conn, "new-open", 130, &payload(130, false));
+        insert(&conn, "new-complete", 140, &payload(140, true));
+        let restarted = OpenCodeV2Source::at(&path);
+        let start = std::time::Instant::now();
+        let outcome = restarted.drain(&state, 220, &STOP).unwrap();
+        println!(
+            "v2 full restart history={history}: total={:?}, incomplete={:?}, wall={:?}",
+            outcome.cost,
+            outcome.incomplete_cost,
+            start.elapsed()
+        );
+        assert!(outcome.full);
+        assert_eq!(outcome.recorded, 1);
+        assert_eq!(count(&state, "usage_event"), 65);
+        assert_eq!(quantity(&state, "output"), 65 * 13);
+        assert_eq!(runtime(&state).1, 140);
+        outcome
+    }
+
+    #[test]
+    fn v2_restart_full_pass_bounds_incomplete_json_work() {
+        let outcome = restarted_full_pass_cost(20_000);
+        assert!(
+            outcome.incomplete_cost.vm_steps < 3_000,
+            "historical JSON must not be examined after restart: {:?}",
+            outcome.incomplete_cost
+        );
+    }
+
+    #[test]
+    #[ignore = "synthetic before/after measurement, run explicitly"]
+    fn v2_full_pass_measurement() {
+        restarted_full_pass_cost(400_000);
+    }
+
+    #[test]
+    fn v2_full_floor_tracks_completion_quiet_and_new_open_rows_across_restarts() {
+        let (_temp, path, conn) = database();
+        insert(&conn, "front", 10, &payload(10, true));
+        insert(&conn, "pending", 20, &payload(20, false));
+        insert(&conn, "done", 30, &payload(30, true));
+        let state = test_state();
+        let drain = |now| {
+            OpenCodeV2Source::at(&path)
+                .drain(&state, now, &STOP)
+                .unwrap()
+        };
+        assert_eq!(drain(100).recorded, 2);
+        assert_eq!(stored_floor(&state), Some(2));
+
+        // An upgraded cursor has its timestamp but no floor; rediscover the
+        // incomplete row below that timestamp before persisting a bound.
+        state
+            .with_conn(|conn| {
+                conn.execute("UPDATE source_runtime SET open_row_floor=NULL", [])
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(drain(110).recorded, 0);
+        assert_eq!(stored_floor(&state), Some(2));
+        insert(&conn, "new-pending", 40, &payload(40, false));
+        assert_eq!(drain(120).recorded, 0);
+        assert_eq!(stored_floor(&state), Some(2));
+        assert_eq!(runtime(&state).1, 40);
+
+        let mut complete = payload(20, true);
+        complete["tokens"]["output"] = json!(29);
+        conn.execute(
+            "UPDATE session_message SET data=?1,time_updated=40 WHERE id='pending'",
+            [complete.to_string()],
+        )
+        .unwrap();
+        assert_eq!(drain(130).recorded, 1);
+        assert_eq!(stored_floor(&state), Some(4));
+        assert_eq!(quantity(&state, "output"), 55);
+        assert_eq!(drain(40 + QUIET_WINDOW - 1).recorded, 0);
+        assert_eq!(drain(40 + QUIET_WINDOW).recorded, 1);
+        assert_eq!(stored_floor(&state), Some(4));
+        let before = snapshot(&state);
+        assert_eq!(drain(50 + QUIET_WINDOW).recorded, 0);
+        assert_eq!(snapshot(&state), before);
+        assert_eq!(count(&state, "usage_event"), 4);
+        assert_eq!(quantity(&state, "output"), 68);
+        assert_eq!(count(&state, "quarantine_evidence"), 0);
+    }
+
+    #[test]
+    fn v2_deleted_floor_and_reused_rowids_keep_the_timestamp_path_unbounded() {
+        let (_temp, path, conn) = database();
+        insert(&conn, "front", 10, &payload(10, true));
+        insert(&conn, "gone-open", 20, &payload(20, false));
+        insert(&conn, "keep-open", 30, &payload(30, false));
+        insert(&conn, "gone-high", 100, &payload(100, true));
+        let state = test_state();
+        let drain = |now| {
+            OpenCodeV2Source::at(&path)
+                .drain(&state, now, &STOP)
+                .unwrap()
+        };
+        assert_eq!(drain(200).recorded, 2);
+        assert_eq!(stored_floor(&state), Some(2));
+        conn.execute("DELETE FROM session_message WHERE id='gone-open'", [])
+            .unwrap();
+        assert_eq!(drain(210).recorded, 0);
+        assert_eq!(stored_floor(&state), Some(3));
+        assert_eq!(runtime(&state).1, 100);
+
+        // Erase the entire old tail and regrow beyond its old maximum before
+        // reading again. The new open row reuses a rowid below the old floor.
+        conn.execute("DELETE FROM session_message WHERE rowid>1", [])
+            .unwrap();
+        insert(&conn, "reused-open", 110, &payload(110, false));
+        for index in 0..4 {
+            insert(&conn, &format!("regrown-{index}"), 120, &payload(120, true));
+        }
+        assert_eq!(drain(220).recorded, 4);
+        assert_eq!(stored_floor(&state), Some(2));
+        assert_eq!(runtime(&state).1, 120);
+        assert_eq!(drain(110 + QUIET_WINDOW).recorded, 1);
+        assert_eq!(stored_floor(&state), Some(6));
+        assert_eq!(quantity(&state, "output"), 7 * 13);
+        assert_eq!(count(&state, "usage_event"), 7);
+        assert_eq!(count(&state, "quarantine_evidence"), 0);
+    }
+
+    #[test]
+    fn v2_durable_floor_includes_open_rows_evicted_from_the_fast_cache() {
+        let (_temp, path, conn) = database();
+        insert(&conn, "front", 10, &payload(10, true));
+        conn.execute(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1)
+             INSERT INTO session_message SELECT 'open-'||x,'session','assistant',x+1,20,20,?2 FROM n",
+            params![i64::try_from(OPEN_CAP + 1).unwrap(), payload(20, false).to_string()],
+        )
+        .unwrap();
+        insert(&conn, "last", 30, &payload(30, true));
+        let state = test_state();
+        let source = OpenCodeV2Source::at(&path);
+        assert_eq!(source.drain(&state, 100, &STOP).unwrap().recorded, 1);
+        assert_eq!(stored_floor(&state), Some(2));
+        assert_eq!(source.cache.lock().unwrap().open.len(), OPEN_CAP);
+        assert!(!source.cache.lock().unwrap().open.contains_key(&2));
+        assert_eq!(source.drain(&state, 110, &STOP).unwrap().recorded, 1);
+        conn.execute(
+            "UPDATE session_message SET time_updated=30,data=?1 WHERE id='open-1'",
+            [payload(20, true).to_string()],
+        )
+        .unwrap();
+        let restarted = OpenCodeV2Source::at(path);
+        assert_eq!(restarted.drain(&state, 120, &STOP).unwrap().recorded, 1);
+        assert_eq!(stored_floor(&state), Some(3));
+        assert_eq!(count(&state, "usage_event"), 3);
+        assert_eq!(quantity(&state, "output"), 39);
+    }
+
+    #[test]
+    fn v2_detected_replacement_rediscovers_below_the_old_floor() {
+        let (_temp, path, conn) = database();
+        insert(&conn, "front", 10, &payload(10, true));
+        insert(&conn, "restored", 20, &payload(20, false));
+        conn.execute(
+            "UPDATE session_message SET type='user' WHERE id='restored'",
+            [],
+        )
+        .unwrap();
+        insert(&conn, "tail", 30, &payload(30, true));
+        let state = test_state();
+        let source = OpenCodeV2Source::at(path);
+        assert_eq!(source.drain(&state, 100, &STOP).unwrap().recorded, 2);
+        assert_eq!(stored_floor(&state), Some(3));
+        // A replacement may retain the front identity while restoring older
+        // incomplete calls. Force the size-shrink replacement hint without
+        // depending on a platform's file-identity implementation.
+        conn.execute(
+            "UPDATE session_message SET type='assistant' WHERE id='restored'",
+            [],
+        )
+        .unwrap();
+        source.cache.lock().unwrap().signature.as_mut().unwrap().len = u64::MAX;
+        assert_eq!(
+            source
+                .drain(&state, 20 + QUIET_WINDOW, &STOP)
+                .unwrap()
+                .recorded,
+            1
+        );
+        assert_eq!(runtime(&state).1, 30);
+        assert_eq!(stored_floor(&state), Some(3));
+        assert_eq!(count(&state, "usage_event"), 3);
+        assert_eq!(quantity(&state, "output"), 39);
     }
 
     #[test]
@@ -1027,7 +1275,9 @@ mod tests {
             .drain(&state, 30 + QUIET_WINDOW, &STOP)
             .unwrap();
         assert_eq!(result.recorded, 0);
-        assert_eq!(result.skipped_recorded, 2);
+        // The quiet call below the new floor is no longer rediscovered; only
+        // the completed row at the inclusive timestamp boundary is replayed.
+        assert_eq!(result.skipped_recorded, 1);
         state
             .with_conn(|conn| {
                 let cursor: Option<i64> = conn

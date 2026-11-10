@@ -83,36 +83,63 @@ impl CursorHome {
         &self,
         state: &SharedState,
     ) -> Result<Option<OpenCodeCursor>, String> {
+        self.read_cursor_with_open_row_floor(state)
+            .map(|(cursor, _)| cursor)
+    }
+
+    pub(crate) fn read_cursor_with_open_row_floor(
+        &self,
+        state: &SharedState,
+    ) -> Result<(Option<OpenCodeCursor>, Option<i64>), String> {
         use rusqlite::OptionalExtension;
         let row = state.with_conn(|connection| {
             match self {
                 Self::Runtime(key) => connection.query_row(
-                    "SELECT lineage,consumed_ordinal FROM source_runtime WHERE source_key=?1",
+                    "SELECT lineage,consumed_ordinal,open_row_floor FROM source_runtime WHERE source_key=?1",
                     [key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 ),
                 Self::Declared {
                     source_key,
                     store,
                     layout,
                 } => connection.query_row(
-                    "SELECT lineage,consumed_ordinal FROM declared_store_cursor
+                    "SELECT lineage,consumed_ordinal,open_row_floor FROM declared_store_cursor
                      WHERE source_key=?1 AND store_path=?2 AND layout=?3",
                     params![source_key, store, layout],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 ),
             }
             .optional()
             .map_err(|error| format!("read OpenCode durable cursor: {error}"))
         })?;
-        Ok(
-            row.and_then(|(lineage, ordinal): (Option<String>, Option<i64>)| {
-                Some(OpenCodeCursor {
-                    lineage: lineage?,
-                    ordinal: ordinal?,
-                })
-            }),
-        )
+        let Some((Some(lineage), Some(ordinal), floor)) = row else {
+            return Ok((None, None));
+        };
+        Ok((Some(OpenCodeCursor { lineage, ordinal }), floor))
+    }
+
+    /// Called in the same transaction, and only when the full cursor commits.
+    pub(crate) fn record_open_row_floor_in_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        floor: i64,
+    ) -> rusqlite::Result<usize> {
+        match self {
+            Self::Runtime(key) => tx.execute(
+                "UPDATE source_runtime SET open_row_floor=?2 WHERE source_key=?1",
+                params![key, floor],
+            ),
+            Self::Declared {
+                source_key,
+                store,
+                layout,
+            } => tx.execute(
+                "UPDATE declared_store_cursor SET open_row_floor=?4
+                 WHERE source_key=?1 AND store_path=?2 AND layout=?3",
+                params![source_key, store, layout, floor],
+            ),
+        }
     }
 
     /// Record a committed read in `tx`. For the user's own store, a full page

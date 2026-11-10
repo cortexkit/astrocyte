@@ -32,6 +32,9 @@ pub struct Page {
     pub start_rowid: i64,
     pub through_rowid: i64,
     pub cost: OpenCodeScanCost,
+    /// Work spent discovering incomplete rows below the timestamp cursor.
+    pub incomplete_cost: OpenCodeScanCost,
+    pub open_row_floor: i64,
 }
 
 #[derive(Deserialize)]
@@ -128,7 +131,7 @@ pub fn read_page(
     now_ms: i64,
     stop: &AtomicBool,
 ) -> Result<Option<Page>, OpenCodeReadError> {
-    read_page_with_settled_sessions(path, cursor, limit, now_ms, stop, &|_| false)
+    read_page_with_settled_sessions(path, cursor, None, limit, now_ms, stop, &|_| false)
 }
 
 /// Read a full page with immediate finality for sessions that can no longer write.
@@ -136,6 +139,7 @@ pub fn read_page(
 pub fn read_page_with_settled_sessions(
     path: &Path,
     cursor: Option<&OpenCodeCursor>,
+    open_row_floor: Option<i64>,
     limit: usize,
     now_ms: i64,
     stop: &AtomicBool,
@@ -154,6 +158,12 @@ pub fn read_page_with_settled_sessions(
         )
         .map_err(|e| sqlite_error(stop, "read OpenCode 2 high water", e))?;
         let represented = cursor.filter(|cursor| cursor.lineage == page.lineage);
+        // A new row can reuse a deleted rowid below this floor. The timestamp
+        // branch remains unbounded by rowid and discovers it before the cursor
+        // passes it: new writes must be stamped at or after the cursor, the
+        // same clock assumption the existing timestamp cursor requires.
+        // A replaced store or an upgrade without a floor needs one discovery.
+        let floor = represented.and(open_row_floor).unwrap_or(i64::MIN);
         let lower = represented.map_or(0, |cursor| cursor.ordinal);
         if lower > page.high_water {
             // OpenCode deletes sessions. When the deleted sessions held every
@@ -204,17 +214,36 @@ pub fn read_page_with_settled_sessions(
         }
         let legacy = table_exists(connection, &mut page.cost, "message")
             .map_err(|e| sqlite_error(stop, "detect OpenCode 1 table", e))?;
+        // Discover old incomplete rows separately so their JSON work can be
+        // measured independently of the unindexed scalar timestamp scans.
+        let mut incomplete = connection
+            .prepare(
+                "SELECT rowid FROM session_message
+                 WHERE rowid>=?3 AND type='assistant' AND time_updated<?1 AND time_updated<=?2
+                   AND CASE WHEN typeof(data)='text' AND json_valid(data)
+                     THEN json_extract(data,'$.time.completed') IS NULL ELSE 0 END",
+            )
+            .map_err(|e| sqlite_error(stop, "prepare OpenCode 2 incomplete rows", e))?;
+        let old_open = incomplete
+            .query_map(params![lower, page.consumed, floor], |row| {
+                row.get::<_, i64>(0)
+            })
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|e| sqlite_error(stop, "read OpenCode 2 incomplete rows", e))?;
+        page.incomplete_cost.add_statement(&incomplete);
+        page.cost.add_assign_saturating(&page.incomplete_cost);
+        let old_open = serde_json::to_string(&old_open)
+            .map_err(|e| format!("encode OpenCode 2 incomplete rowids: {e}"))?;
         let mut statement = connection
             .prepare(
                 "SELECT rowid,id,session_id,time_updated,data FROM session_message
              WHERE type='assistant' AND time_updated<=?2 AND
-               (time_updated>=?1 OR CASE WHEN typeof(data)='text' AND json_valid(data)
-                 THEN json_extract(data,'$.time.completed') IS NULL ELSE 0 END)
+               (time_updated>=?1 OR rowid IN (SELECT value FROM json_each(?3)))
              ORDER BY seq",
             )
             .map_err(|e| sqlite_error(stop, "prepare OpenCode 2 page", e))?;
         let mut rows = statement
-            .query(params![lower, page.consumed])
+            .query(params![lower, page.consumed, old_open])
             .map_err(|e| sqlite_error(stop, "query OpenCode 2 page", e))?;
         while let Some(row) = rows
             .next()
@@ -224,6 +253,12 @@ pub fn read_page_with_settled_sessions(
         }
         drop(rows);
         page.cost.add_statement(&statement);
+        page.open_row_floor = page
+            .open_rows
+            .iter()
+            .map(|row| row.rowid)
+            .min()
+            .unwrap_or(page.max_rowid);
         Ok(Some(page))
     })
 }

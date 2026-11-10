@@ -99,6 +99,14 @@ v2-only completed rows reach `usage.cache.steps` on the next fast interval witho
 moving the durable cursor or changing full-drain health. Both generations obey
 the `opencode` ingestion configuration key.
 
+OpenCode 2 full reads commit an open-row floor alongside the timestamp cursor,
+in `source_runtime` or the declared store's `declared_store_cursor` row. The
+floor bounds JSON discovery of older incomplete calls even after a restart;
+a null floor requires one complete discovery after upgrade. Scalar timestamp
+and page-boundary scans remain unbounded because the source has no update-time
+index. The floor includes intervening completed rows until the oldest open
+call completes, becomes quiet for an hour, or its session settles.
+
 Codex `.jsonl.zst` archives are immutable snapshots, not appendable streams.
 After a verified read, unchanged size, modification time and file identity skip
 all decompression until the same staggered daily full-check deadline. A change

@@ -4085,6 +4085,15 @@ BEGIN SELECT RAISE(ABORT, 'vault_plan_history_insert_once'); END;
 CREATE TABLE vault_plan_seed (singleton INTEGER PRIMARY KEY CHECK(singleton=1));
 "#,
     },
+    Migration {
+        version: 40,
+        statements: r#"
+-- Null preserves the complete incomplete-call discovery on the first v2 read
+-- after upgrade. Later full reads commit the floor with their timestamp cursor.
+ALTER TABLE source_runtime ADD COLUMN open_row_floor INTEGER;
+ALTER TABLE declared_store_cursor ADD COLUMN open_row_floor INTEGER;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -4092,6 +4101,68 @@ CREATE TABLE vault_plan_seed (singleton INTEGER PRIMARY KEY CHECK(singleton=1));
 #[cfg(test)]
 mod tests {
     include!("store_v33_tests.rs");
+
+    #[test]
+    fn schema_v40_adds_null_opencode_floors_without_changing_cursor_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.version < 40)
+        {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO source_runtime
+             (source_key,source_module,desired_generation,lineage,consumed_ordinal,
+              high_water_ordinal,last_success_ms,pending_known,pending_unknown)
+             VALUES ('opencode-v2','fixture',0,'front',100,120,200,0,1);
+             INSERT INTO declared_store_cursor
+             VALUES ('opencode-thalamus','/fixture','opencode-2','front',100,120);",
+        )
+        .unwrap();
+        let before = all_rows(&conn);
+        conn.execute_batch(
+            MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == 40)
+                .unwrap()
+                .statements,
+        )
+        .unwrap();
+        let expected: Vec<_> = before
+            .into_iter()
+            .map(|(table, rows)| {
+                let rows = if matches!(table.as_str(), "source_runtime" | "declared_store_cursor") {
+                    rows.into_iter()
+                        .map(|mut row| {
+                            row.push(rusqlite::types::Value::Null);
+                            row
+                        })
+                        .collect()
+                } else {
+                    rows
+                };
+                (table, rows)
+            })
+            .collect();
+        assert_eq!(all_rows(&conn), expected);
+        for table in ["source_runtime", "declared_store_cursor"] {
+            let floor: Option<i64> = conn
+                .query_row(&format!("SELECT open_row_floor FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(floor, None);
+            conn.execute(&format!("UPDATE {table} SET open_row_floor=17"), [])
+                .unwrap();
+            let floor: i64 = conn
+                .query_row(&format!("SELECT open_row_floor FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(floor, 17);
+        }
+    }
 
     fn migration_store() -> (TempStoreDirectory, SqliteStore) {
         let directory = TempStoreDirectory::new();

@@ -870,6 +870,19 @@ mod tests {
                 .unwrap()
         }
 
+        fn v2_floor(&self) -> Option<i64> {
+            self.state
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT open_row_floor FROM declared_store_cursor WHERE layout=?1",
+                        [LAYOUT_V2],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .unwrap()
+        }
+
         fn sql(&self, sql: &str) {
             self.state
                 .with_conn(|conn| conn.execute_batch(sql).map_err(|e| e.to_string()))
@@ -1280,6 +1293,7 @@ mod tests {
             f.shared_entry(vec![Fixture::shared_session("done", true)])
         ]);
         f.tick(T0);
+        assert_eq!(f.v2_floor(), Some(2));
         Connection::open(f.shared_path().join("opencode.db"))
             .unwrap()
             .execute("DELETE FROM session_message WHERE session_id='done'", [])
@@ -1294,6 +1308,54 @@ mod tests {
         f.shared_call("keeper", "later", true, T0 + 2 * TICK);
         f.tick(T0 + 3 * TICK);
         assert_eq!(f.refs(), vec!["erased", "interrupted", "keeper", "later"]);
+        assert_eq!(f.v2_floor(), Some(2));
+        assert_eq!(f.degraded(), None);
+    }
+
+    #[test]
+    fn shared_v2_floor_survives_restart_and_advances_after_completion() {
+        let mut f = Fixture::new();
+        f.shared_call("front", "front", true, CREATED);
+        f.shared_call("pending", "pending", false, T0);
+        f.declare(vec![
+            f.shared_entry(vec![Fixture::shared_session("pending", false)])
+        ]);
+        f.tick(T0);
+        assert_eq!(f.refs(), vec!["front"]);
+        assert_eq!(f.v2_floor(), Some(2));
+        f.shared_call("later", "later", true, T0 + TICK);
+        f.restart();
+        f.tick(T0 + TICK);
+        assert_eq!(f.refs(), vec!["front", "later"]);
+        assert_eq!(f.v2_floor(), Some(2));
+
+        f.sql("UPDATE declared_store_cursor SET open_row_floor=NULL");
+        f.restart();
+        f.tick(T0 + 2 * TICK);
+        assert_eq!(f.v2_floor(), Some(2));
+        let conn = Connection::open(f.shared_path().join("opencode.db")).unwrap();
+        conn.execute(
+            "UPDATE session_message SET data=?1,time_updated=?2 WHERE id='pending'",
+            params![payload(Layout::V2, true).to_string(), T0 + 3 * TICK],
+        )
+        .unwrap();
+        drop(conn);
+        f.restart();
+        f.tick(T0 + 3 * TICK);
+        assert_eq!(f.refs(), vec!["front", "later", "pending"]);
+        assert_eq!(f.v2_floor(), Some(3));
+        let output: i64 = f
+            .state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT SUM(quantity_units) FROM measurement WHERE role='output'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(output, 15);
         assert_eq!(f.degraded(), None);
     }
 
