@@ -218,10 +218,9 @@ pub fn reconcile_in_tx(
                 account_ref: account.clone(),
                 plan_name: plan.plan_key.clone().unwrap(),
                 recurring_cost_minor: price.minor_units,
-                currency: price.currency.clone(),
-                amount_exponent: u32::try_from(price.exponent)
-                    .map_err(|_| "plan price exponent out of range")?,
-                period: SubscriptionPeriod::Month,
+                currency: price.currency.into(),
+                amount_exponent: price.exponent,
+                period: price.period,
                 effective_from: from,
             },
             Some(VAULT_OPERATOR),
@@ -253,12 +252,20 @@ pub fn reconcile_in_tx(
     Ok(diagnostics)
 }
 
+struct LedgerPrice<'a> {
+    minor_units: i64,
+    exponent: u32,
+    currency: &'a str,
+    period: SubscriptionPeriod,
+}
+
 fn ledger_price<'a>(
     plan: &VaultPlan,
     prices: &'a PlanPricesResponse,
     now: i64,
-) -> Option<&'a fusiform_protocol::PlanAmount> {
-    plan.plan_key
+) -> Option<LedgerPrice<'a>> {
+    let price = plan
+        .plan_key
         .as_ref()
         .and_then(|key| {
             prices
@@ -271,15 +278,47 @@ fn ledger_price<'a>(
                 .max_by_key(|price| price.boundary_at_ms)
         })
         .filter(|price| price.refusal_reason.is_none())
-        .and_then(|price| price.price.as_ref())
-        .filter(|price| {
-            price.minor_units > 0
-                && price.currency == "USD"
-                && price.period == "month"
-                && u32::try_from(price.exponent).ok().is_some_and(|exponent| {
-                    subscription::recurring_cost_nanos(price.minor_units, exponent).is_ok()
-                })
-        })
+        .and_then(|price| price.price.as_ref())?;
+    if price.minor_units < 0
+        || price.currency.len() != 3
+        || !price.currency.bytes().all(|byte| byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let period = match price.period.as_str() {
+        "month" => SubscriptionPeriod::Month,
+        "year" => SubscriptionPeriod::Year,
+        _ => return None,
+    };
+    // Normalize only exact decimal representations. The ledger accepts scales
+    // zero through nine; never round a sourced recurring amount to fit it.
+    let (minor_units, exponent) = if price.minor_units == 0 {
+        (0, 0)
+    } else if price.exponent < 0 {
+        let zeros = u32::try_from(price.exponent.checked_neg()?).ok()?;
+        (
+            price.minor_units.checked_mul(10_i64.checked_pow(zeros)?)?,
+            0,
+        )
+    } else {
+        let mut minor = price.minor_units;
+        let mut exponent = u32::try_from(price.exponent).ok()?;
+        while exponent > 9 {
+            if minor % 10 != 0 {
+                return None;
+            }
+            minor /= 10;
+            exponent -= 1;
+        }
+        (minor, exponent)
+    };
+    subscription::recurring_cost_nanos(minor_units, exponent).ok()?;
+    Some(LedgerPrice {
+        minor_units,
+        exponent,
+        currency: &price.currency,
+        period,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

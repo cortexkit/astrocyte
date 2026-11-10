@@ -75,7 +75,9 @@ fn ingest(state: &SharedState, at: i64) -> String {
     })).unwrap()["event_id"].as_str().unwrap().into()
 }
 
-fn rows(state: &SharedState) -> Vec<(String, i64, Option<i64>, i64, Option<String>)> {
+type LedgerRow = (String, i64, Option<i64>, i64, Option<String>);
+
+fn rows(state: &SharedState) -> Vec<LedgerRow> {
     state.with_conn(|conn| conn.prepare("SELECT plan_name,effective_from_ms,effective_to_ms,recurring_cost_minor,operator FROM account_subscription ORDER BY effective_from_ms")
         .and_then(|mut stmt| stmt.query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?.collect()).map_err(|e|e.to_string())).unwrap()
 }
@@ -453,4 +455,126 @@ fn vault_shared_account_uses_latest_record_without_tick_order_churn() {
             .unwrap(),
         2
     );
+}
+
+#[test]
+fn vault_chatgpt_mismatch_report_joins_the_exact_credential() {
+    let state = test_state();
+    ingest(&state, 10);
+    for (id, credential, account) in [
+        ("wrong", "oauth:login", "other-account"),
+        ("unrelated", "other-login", "unrelated-account"),
+    ] {
+        ops::dispatch(&state,ops::OP_EVENT_INGEST,json!({"producer":"broca","producer_lineage":"lineage","producer_ref":id,
+            "provider":"openai","account_ref":account,"auth_selection":credential,"occurred_at_ms":20,
+            "charge_basis":"subscription_included","measurements":[]})).unwrap();
+    }
+    stage().apply(
+        &state,
+        vec![snapshot("pro_200", 100)],
+        Some(&Prices(vec![("pro_200", 20_000)])),
+        101,
+    );
+    assert_eq!(
+        report(&state)["chatgpt_account_mismatches"],
+        json!([{"credential_id":"oauth:login","account_id":"acct","account_refs":["other-account"]}])
+    );
+}
+
+#[test]
+fn vault_missing_catalog_keeps_raw_unpriced_key_and_available_vault_status() {
+    let state = test_state();
+    ingest(&state, 10);
+    stage().apply(&state, vec![snapshot("pro_200", 100)], None, 101);
+    assert!(rows(&state).is_empty());
+    assert_eq!(
+        report(&state)["unpriced_plans"][0]["plan_key"],
+        "openai/pro_200"
+    );
+    assert_eq!(report(&state)["vault_read_status"]["status"], "available");
+    assert_eq!(report(&state)["plan_price_status"], "unavailable");
+}
+
+#[test]
+fn vault_annual_non_usd_and_zero_sourced_prices_use_existing_ledger_rules() {
+    struct SourcedAmount {
+        minor: i64,
+        exponent: i32,
+        currency: &'static str,
+        period: &'static str,
+    }
+    impl PlanPriceSource for SourcedAmount {
+        fn plan_prices(
+            &self,
+            request: PlanPricesRequest,
+        ) -> Result<PlanPricesResponse, CatalogCallError> {
+            let mut response = Prices(vec![("pro_200", self.minor)]).plan_prices(request)?;
+            response.prices[0].price = Some(PlanAmount {
+                minor_units: self.minor,
+                exponent: self.exponent,
+                currency: self.currency.into(),
+                period: self.period.into(),
+            });
+            Ok(response)
+        }
+    }
+    for (amount, minor, exponent) in [
+        (
+            SourcedAmount {
+                minor: 12_345,
+                exponent: 2,
+                currency: "EUR",
+                period: "year",
+            },
+            12_345,
+            2,
+        ),
+        (
+            SourcedAmount {
+                minor: 0,
+                exponent: 2,
+                currency: "USD",
+                period: "month",
+            },
+            0,
+            0,
+        ),
+        (
+            SourcedAmount {
+                minor: 2,
+                exponent: -2,
+                currency: "JPY",
+                period: "month",
+            },
+            200,
+            0,
+        ),
+        (
+            SourcedAmount {
+                minor: 12_300,
+                exponent: 11,
+                currency: "USD",
+                period: "month",
+            },
+            123,
+            9,
+        ),
+    ] {
+        let state = test_state();
+        ingest(&state, 10);
+        stage().apply(&state, vec![snapshot("pro_200", 100)], Some(&amount), 101);
+        let stored: (i64,u32,String,String) = state.with_conn(|conn|conn.query_row(
+            "SELECT recurring_cost_minor,amount_exponent,currency,period FROM account_subscription",[],
+            |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(|error|error.to_string())).unwrap();
+        assert_eq!(
+            stored,
+            (
+                minor,
+                exponent,
+                amount.currency.into(),
+                amount.period.into()
+            )
+        );
+        assert_eq!(report(&state)["unpriced_plans"], json!([]));
+    }
 }

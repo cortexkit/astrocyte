@@ -728,6 +728,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vault_startup_seeds_committed_generation_before_closed_hydration_once() {
+        use cortexkit_store::{open_sqlite, Isolation, StorageBackend, StorageDescriptor};
+        let directory = tempfile::tempdir().unwrap();
+        let descriptor = StorageDescriptor {
+            module_id: "astrocyte".into(),
+            storage_namespace: "astrocyte".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: directory
+                    .path()
+                    .join("store.sqlite")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        };
+        let store = open_sqlite(&descriptor).unwrap();
+        store
+            .migrate("astrocyte", astrocyte_core::store::MIGRATIONS)
+            .unwrap();
+        let mut old: serde_json::Value = serde_json::from_str(CODEX).unwrap();
+        old["quota_providers"]["codex"]["accounts"] =
+            serde_json::json!({"acct":{"plan":"openai/pro_20x","price_override":null}});
+        old["quota_providers"]["codex"]["credentials"] = serde_json::json!({});
+        let mut credential = old["quota_providers"]["codex"].clone();
+        credential["accounts"] = serde_json::json!({});
+        credential["credentials"] =
+            serde_json::json!({"vault-key":{"plan":"opencode-go/go","price_override":null}});
+        old["quota_providers"]["opencodego"] = credential;
+        store.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("UPDATE desired_config SET generation=1,subscription_multiplier=?1,canonical_bytes=?2 WHERE id=1",
+                rusqlite::params![old.to_string(),b"{}".as_slice()])?;
+            tx.execute("UPDATE source_runtime SET desired_generation=1",[])?;
+            tx.commit()
+        }).unwrap();
+        let state = crate::state::SharedState::from_store(store).unwrap();
+        let seeded = state
+            .with_conn(|conn| {
+                astrocyte_core::vault_plan::at(conn, 1).map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(seeded.len(), 2);
+        assert!(seeded
+            .iter()
+            .all(|row| row.source == "config" && row.effective_from_ms == 0));
+        assert!(seeded
+            .iter()
+            .any(|row| row.account_id.as_deref() == Some("acct")
+                && row.plan_key.as_deref() == Some("openai/pro_20x")));
+        assert!(seeded
+            .iter()
+            .any(|row| row.account_id.is_none() && row.credential_id == "vault-key"));
+        drop(state);
+        let state =
+            crate::state::SharedState::from_store(open_sqlite(&descriptor).unwrap()).unwrap();
+        assert_eq!(
+            state
+                .with_conn(|conn| astrocyte_core::vault_plan::at(conn, 1)
+                    .map_err(|error| error.to_string()))
+                .unwrap(),
+            seeded
+        );
+        let MultiplierSetting::Recorded(config) = state.desired_config().subscription_multiplier
+        else {
+            panic!("missing hydrated declaration")
+        };
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["quota_providers"]["codex"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     /// The production document shipped with the binary must decode under this
     /// binary's closed format, or the two cannot move together.
     #[test]
