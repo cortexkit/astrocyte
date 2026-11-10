@@ -376,8 +376,10 @@ pub struct VaultPlan {
     pub observed_at_ms: i64,
 }
 
-/// Import only the null-override legacy shape. An override that contributed
-/// money cannot be discarded while claiming the old day recomputes identically.
+/// Seed plan history from an older stored config's per-account plans. Only
+/// accounts with a null `price_override` are accepted: history carries no
+/// price override, so a multiplier day once computed with a non-null override
+/// would recompute to a different value. Such a config is refused instead.
 pub fn seed_config_in_tx(
     tx: &Transaction<'_>,
     value: &serde_json::Value,

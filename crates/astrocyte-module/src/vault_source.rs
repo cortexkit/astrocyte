@@ -440,8 +440,10 @@ impl Stage {
         now: i64,
     ) -> Result<(), String> {
         self.last_reconcile_ms = Some(now);
-        // Only scheduled reconciliation asks the peer, before entering any
-        // writer transaction. Missing prices remain visible for the hourly retry.
+        // Only a scheduled reconciliation asks the plan-price source
+        // (fusiform's `plan.prices`), and it does so before any writer
+        // transaction starts. Plans it can't price stay listed as unpriced
+        // and are retried hourly.
         let result = source
             .ok_or_else(|| "plan_prices_unavailable".to_string())
             .and_then(|source| {

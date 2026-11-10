@@ -273,8 +273,9 @@ Reads never write. A refusal on a read is one of the codes below.
   schema stays at version 2. `unpriced_plans` lists `{plan_key, provider,
   plan_tier, accounts}` for exact vault keys without a usable sourced price.
   `provider` and `plan_tier` retain the vault's raw spelling, and `accounts`
-  contains account IDs, or vault record IDs for credential-keyed plans. Fusiform
-  can use this list to discover tiers needing prices. `unknown_plans` lists
+  contains account IDs, or vault record IDs for credential-keyed plans. The
+  owner of the price catalog (the fusiform module) reads this list to find
+  tiers that still need a sourced price. `unknown_plans` lists
   records without exactly one provider and a tier, with a null `plan_key`.
   `hand_vault_differences` lists `{provider, account_id, ledger_plan, vault_plan}`;
   the hand-recorded ledger interval is never changed by the vault.
