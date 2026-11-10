@@ -202,6 +202,7 @@ impl ClaudeWorkersSource {
                     claude_code_source::ClaudeCodeRead {
                         outcome: ClaudeCodeDrainOutcome::default(),
                         requests: vec![],
+                        completed_at_ms: HashMap::new(),
                         set_aside: vec![],
                         cache: ClaudeCodeCache::default(),
                     }
@@ -244,6 +245,7 @@ impl ClaudeWorkersSource {
             &mut outcome,
             &|| stop.load(Ordering::Relaxed),
             mode,
+            None,
         );
         commit?;
         cache.resumes = next_resumes;

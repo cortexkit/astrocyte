@@ -222,6 +222,9 @@ pub struct ClaudeCodeCall {
     /// Earliest record timestamp of the call. Absent when no record of the
     /// call carries a parseable timestamp: never a file mtime.
     pub occurred_at_ms: Option<i64>,
+    /// Timestamp of the terminal usage record, separate from the call's start.
+    /// Absent for interrupted calls or an undated terminal record.
+    pub completed_at_ms: Option<i64>,
     /// Claude Code's `stop_reason` verbatim, or `None` for a call that never
     /// got one and was ingested after its file went quiet.
     pub stop_reason: Option<String>,
@@ -327,6 +330,7 @@ impl ClaudeParseState {
                         project_root: record.project_root,
                         model: record.model,
                         occurred_at_ms: record.timestamp_ms,
+                        completed_at_ms: record.stop_reason.as_ref().and(record.timestamp_ms),
                         stop_reason: record.stop_reason,
                         usage: record.usage,
                         records: 1,
@@ -418,6 +422,9 @@ fn merge_record(call: &mut ClaudeCodeCall, record: &UsageRecord) -> Result<bool,
         return Err(());
     }
     let mut changed = call.usage.merge_later(&record.usage)?;
+    if call.stop_reason.is_none() && record.stop_reason.is_some() {
+        call.completed_at_ms = record.timestamp_ms;
+    }
     if let (None, Some(next)) = (&call.stop_reason, &record.stop_reason) {
         call.stop_reason = Some(next.clone());
         changed = true;

@@ -21,6 +21,7 @@ use astrocyte_readers::sessions::claudecode::{
 };
 use rusqlite::params;
 
+use crate::refresher::thalamus_payer_join::{self, WaitQueue, WaitingCall};
 use crate::refresher::{harness_drain::DrainMode, SourceDrainError};
 use crate::state::SharedState;
 
@@ -224,6 +225,7 @@ impl ClaudeCodeSource {
             requests,
             set_aside,
             cache: next_cache,
+            completed_at_ms: _,
         } = read;
         record_requests_in_lane(
             state,
@@ -234,6 +236,7 @@ impl ClaudeCodeSource {
             &mut outcome,
             &|| stop.load(Ordering::Relaxed),
             mode,
+            None,
         )?;
 
         let mut cache = self
@@ -248,6 +251,7 @@ impl ClaudeCodeSource {
 pub(crate) struct ClaudeCodeRead {
     pub(crate) outcome: ClaudeCodeDrainOutcome,
     pub(crate) requests: Vec<EventRecordRequest>,
+    pub(crate) completed_at_ms: HashMap<String, Option<i64>>,
     pub(crate) set_aside: Vec<crate::refresher::SetAsideRecord>,
     pub(crate) cache: ClaudeCodeCache,
 }
@@ -298,6 +302,7 @@ pub(crate) fn read_projects(
         windows.clone_from(&previous.windows);
     }
     let mut requests = Vec::new();
+    let mut completed_at_ms = HashMap::new();
     let mut set_aside = Vec::new();
     for (path, depth) in files {
         if stop.load(Ordering::Relaxed) {
@@ -395,9 +400,11 @@ pub(crate) fn read_projects(
         }
         for call in parse.calls {
             let locator = format!("{path:?}:line:{}", call.source_line);
+            let completed = call.completed_at_ms;
             match map_call(call) {
                 Ok(mut request) => {
                     request.work_class = work_class.map(str::to_owned);
+                    completed_at_ms.insert(request.producer_ref.clone(), completed);
                     requests.push(request);
                 }
                 Err(reason) => set_aside.push(crate::refresher::SetAsideRecord { locator, reason }),
@@ -408,6 +415,7 @@ pub(crate) fn read_projects(
     Ok(ClaudeCodeRead {
         outcome,
         requests,
+        completed_at_ms,
         set_aside,
         cache: ClaudeCodeCache {
             resume: resume_points,
@@ -561,6 +569,8 @@ fn map_call(call: ClaudeCodeCall) -> Result<EventRecordRequest, String> {
 /// Identity is per producer, so without the skip a call the gateway captured
 /// on the wire would become a second event here. The gateway's events are
 /// immutable and stay; the transcript's copy is the one not recorded.
+/// When a payer queue is supplied, resolve its completed calls in the same
+/// transaction and adopt the proposed queue only after every ready event commits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_requests_in_lane(
     state: &SharedState,
@@ -571,8 +581,9 @@ pub(crate) fn record_requests_in_lane(
     outcome: &mut ClaudeCodeDrainOutcome,
     stop_requested: &dyn Fn() -> bool,
     mode: DrainMode,
+    payer_wait: Option<(&mut WaitQueue, &[WaitingCall])>,
 ) -> Result<(), SourceDrainError> {
-    if !mode.has_work(requests.len(), set_aside.len()) {
+    if payer_wait.is_none() && !mode.has_work(requests.len(), set_aside.len()) {
         return Ok(());
     }
     let mut stopped = false;
@@ -587,6 +598,13 @@ pub(crate) fn record_requests_in_lane(
             set_aside,
             recorded_at_ms,
         )?;
+        let resolution = payer_wait
+            .as_ref()
+            .map(|(queue, calls)| queue.resolve_in_tx(tx, "claude-code", calls, recorded_at_ms))
+            .transpose()?;
+        let requests = resolution
+            .as_ref()
+            .map_or(requests, |resolved| resolved.ready.as_slice());
         let mut dispositions = Vec::with_capacity(requests.len());
         let mut thalamus_skips = 0usize;
         let mut quarantined_refs = BTreeSet::new();
@@ -652,11 +670,17 @@ pub(crate) fn record_requests_in_lane(
             )?;
         }
         Ok((
-            (dispositions, thalamus_skips, newly_seen, quarantined_refs),
+            (
+                dispositions,
+                thalamus_skips,
+                newly_seen,
+                quarantined_refs,
+                resolution,
+            ),
             true,
         ))
     });
-    let (dispositions, thalamus_skips, newly_seen, quarantined_refs) = match committed {
+    let (dispositions, thalamus_skips, newly_seen, quarantined_refs, resolution) = match committed {
         Ok(committed) => committed,
         Err(_) if stopped => return Err(SourceDrainError::Stopped),
         Err(reason) => return Err(SourceDrainError::Failed(reason)),
@@ -666,6 +690,12 @@ pub(crate) fn record_requests_in_lane(
     let tally = crate::refresher::harness_drain::RecordTally::from_dispositions(dispositions);
     outcome.rows_recorded = tally.recorded;
     outcome.exact_redeliveries = tally.exact_redeliveries;
+    if let (Some((queue, _)), Some(resolved)) = (payer_wait, resolution) {
+        outcome.exact_redeliveries += resolved.already_recorded;
+        *queue = resolved.next;
+        state.set_payer_waiting(source_key, queue.len());
+        thalamus_payer_join::warn_overflow(source_key, resolved.overflow_started);
+    }
     outcome.quarantined_redeliveries = tally.quarantined_redeliveries;
     outcome.quarantined_refs = quarantined_refs;
     Ok(())

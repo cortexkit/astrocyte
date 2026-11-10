@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::claude_code_source::{self, ClaudeCodeCache, ClaudeCodeDrainOutcome};
 use super::declared_roots::{self, Contained, RootsFile};
 use super::harness_drain::{self, HarnessSource};
+use super::thalamus_payer_join::{WaitQueue, WaitingCall};
 use super::SourceDrainError;
 use crate::harness_paths::ClaudeWorkerPaths;
 use crate::state::SharedState;
@@ -54,6 +55,7 @@ struct Cache {
     // not authorize deletion of a transcript containing that call.
     blocked: HashSet<String>,
     ack: Option<Ack>,
+    payer_wait: WaitQueue,
 }
 
 pub(crate) struct ClaudeThalamusSource {
@@ -87,6 +89,22 @@ impl ClaudeThalamusSource {
         let registry_valid =
             match declared_roots::read::<Root>(&paths.roots, "Claude Code session roots") {
                 RootsFile::Absent => {
+                    if !cache.payer_wait.is_empty() {
+                        claude_code_source::record_requests_in_lane(
+                            state,
+                            SOURCE_KEY,
+                            &[],
+                            &[],
+                            at,
+                            &mut ClaudeCodeDrainOutcome::default(),
+                            &|| stop.load(Ordering::Relaxed),
+                            harness_drain::DrainMode::Full,
+                            Some((&mut cache.payer_wait, &[])),
+                        )?;
+                        if !cache.payer_wait.is_empty() {
+                            return Ok(None);
+                        }
+                    }
                     harness_drain::remove_runtime_row(state, SOURCE_KEY)?;
                     *cache = Cache::default();
                     // Prune acknowledgements for sessions the harness removed.
@@ -205,6 +223,7 @@ impl ClaudeThalamusSource {
                     claude_code_source::ClaudeCodeRead {
                         outcome: ClaudeCodeDrainOutcome::default(),
                         requests: vec![],
+                        completed_at_ms: HashMap::new(),
                         set_aside: vec![],
                         cache: ClaudeCodeCache::default(),
                     }
@@ -234,19 +253,29 @@ impl ClaudeThalamusSource {
                     .map(|r| r.producer_ref.clone())
                     .collect::<HashSet<_>>(),
             );
-            requests.extend(read.requests);
+            requests.extend(read.requests.into_iter().map(|request| {
+                WaitingCall {
+                    completed_at_ms: read
+                        .completed_at_ms
+                        .get(&request.producer_ref)
+                        .copied()
+                        .flatten(),
+                    request,
+                }
+            }));
             set_aside.extend(read.set_aside);
             resumes.insert(canonical, read.cache);
         }
         claude_code_source::record_requests_in_lane(
             state,
             SOURCE_KEY,
-            &requests,
+            &[],
             &set_aside,
             at,
             &mut outcome,
             &|| stop.load(Ordering::Relaxed),
             harness_drain::DrainMode::Full,
+            Some((&mut cache.payer_wait, &requests)),
         )?;
         cache.resumes = resumes;
         for (session, refs) in refs_by_session {
@@ -262,19 +291,28 @@ impl ClaudeThalamusSource {
         {
             problems.push("Claude Code session calls were quarantined or refused".to_string());
         }
-        // Only a committed read of a usable registry can authorize deletion.
-        if registry_valid {
+        // An unusable registry cannot grant deletion, but a newly waiting call
+        // must still revoke an earlier acknowledgement from the cached roots.
+        let waiting = cache.payer_wait.pending_sessions();
+        if registry_valid || !waiting.is_empty() {
             let mut entries: BTreeMap<_, _> = cache
                 .ack
                 .as_ref()
                 .expect("ack loaded")
                 .read_through
                 .iter()
-                .filter(|r| accepted.contains(&r.session) && !cache.blocked.contains(&r.session))
+                .filter(|r| {
+                    (!registry_valid
+                        || (accepted.contains(&r.session) && !cache.blocked.contains(&r.session)))
+                        && !waiting.contains(&r.session)
+                })
                 .map(|r| (r.session.clone(), r.at_ms))
                 .collect();
             for session in ready {
-                if !cache.blocked.contains(&session) {
+                if registry_valid
+                    && !cache.blocked.contains(&session)
+                    && !waiting.contains(&session)
+                {
                     entries.entry(session).or_insert(at);
                 }
             }
@@ -296,6 +334,31 @@ impl ClaudeThalamusSource {
 }
 
 impl HarnessSource for ClaudeThalamusSource {
+    fn drain_fast(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+    ) -> Result<(), SourceDrainError> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| "Claude Code session cache lock poisoned".to_string())?;
+        // Completed calls no longer dirty the parser's resume state. Revisit
+        // their payer facts without opening transcripts or the roots file.
+        claude_code_source::record_requests_in_lane(
+            state,
+            SOURCE_KEY,
+            &[],
+            &[],
+            at,
+            &mut ClaudeCodeDrainOutcome::default(),
+            &|| stop.load(Ordering::Relaxed),
+            harness_drain::DrainMode::Fast,
+            Some((&mut cache.payer_wait, &[])),
+        )
+    }
+
     fn source_key(&self) -> &'static str {
         SOURCE_KEY
     }
@@ -313,6 +376,7 @@ impl HarnessSource for ClaudeThalamusSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("claude_thalamus_source_tests.rs");
     use crate::refresher::{
         claude_code_source::ClaudeCodeSource, run_iteration_with_claude_code,
         run_iteration_with_harness,
