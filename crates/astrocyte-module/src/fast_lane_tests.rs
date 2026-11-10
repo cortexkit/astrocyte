@@ -452,6 +452,22 @@ fn idle_fast_cycle_opens_nothing_and_stats_only_hot_files() {
     use astrocyte_readers::read_io;
     let mut corpus = Corpus::new();
     let hot_files = add_jsonl_inventory(&mut corpus);
+    let payer_path = corpus
+        .directory
+        .path()
+        .join("cortexkit/thalamus-harness/payer/payer.db");
+    fs::create_dir_all(payer_path.parent().unwrap()).unwrap();
+    let payer = Connection::open(payer_path).unwrap();
+    payer.execute_batch("PRAGMA journal_mode=WAL;
+CREATE TABLE payer_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE payer_session(harness TEXT NOT NULL,session TEXT NOT NULL,owner_principal TEXT,declared_at_ms INTEGER NOT NULL,PRIMARY KEY(harness,session));
+CREATE TABLE payer_record(seq INTEGER PRIMARY KEY AUTOINCREMENT,attempt_id TEXT NOT NULL UNIQUE,harness TEXT NOT NULL,session TEXT NOT NULL,request_kind TEXT NOT NULL,step_ref TEXT,recorded_at_ms INTEGER NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,charge_basis TEXT,auth_selection TEXT NOT NULL,account_ref TEXT,outcome TEXT,provider_request_id TEXT,provider_response_id TEXT,usage_json TEXT);
+INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','idle-fixture');").unwrap();
+    corpus.files.harnesses.push(Arc::new(
+        thalamus_payer_source::ThalamusPayerSource::from_data_home(
+            corpus.directory.path().to_path_buf(),
+        ),
+    ));
     corpus.append(1);
     corpus.append_v2(1);
     let state = test_state();
@@ -460,6 +476,7 @@ fn idle_fast_cycle_opens_nothing_and_stats_only_hot_files() {
     run_fast_lane(&state, &corpus.producers, &corpus.files, at, &corpus.stop);
     let health = runtime(&state);
     let events = rows(&state, "usage_event");
+    let writes = crate::state::transaction_commits_for_test();
     for _ in 0..3 {
         read_io::reset_counts();
         run_fast_lane(
@@ -475,8 +492,14 @@ fn idle_fast_cycle_opens_nothing_and_stats_only_hot_files() {
         assert_eq!(counts.directory_reads, 0, "{counts:?}");
         assert_eq!(counts.file_opens, 0, "{counts:?}");
         assert_eq!(
-            counts.metadata_calls, hot_files,
-            "each hot file is statted once: {counts:?}"
+            crate::state::transaction_commits_for_test(),
+            writes,
+            "an empty fast pass must not commit a recording transaction"
+        );
+        assert_eq!(
+            counts.metadata_calls,
+            hot_files + 2,
+            "each hot file and the payer database/WAL are statted once: {counts:?}"
         );
     }
     assert_eq!(runtime(&state), health);

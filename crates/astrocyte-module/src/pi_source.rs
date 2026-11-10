@@ -147,6 +147,7 @@ const PI_FULL_PREFIX_VERIFY_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Default)]
 struct PiCache {
+    payer_wait: super::thalamus_payer_join::WaitQueue,
     /// Where each file's next read may resume. It is committed together with
     /// `identities`, which pins an owner for every record in the consumed
     /// prefix; that is what lets a tail-only read still dedup fork copies.
@@ -291,7 +292,7 @@ impl PiSource {
                 }
             }
         }
-        let (cached_resume, cached_verified, cached_header_scans, cached_windows) = {
+        let (cached_resume, cached_verified, cached_header_scans, cached_windows, payer_wait) = {
             let cache = self
                 .cache
                 .lock()
@@ -301,6 +302,7 @@ impl PiSource {
                 cache.prefix_verified_ms.clone(),
                 cache.header_scans.clone(),
                 cache.windows.clone(),
+                cache.payer_wait.clone(),
             )
         };
         let files = mode
@@ -489,7 +491,7 @@ impl PiSource {
             select_requests(observations, &cache.identities)
         };
         outcome.observations_deduplicated = observations_deduplicated;
-        if mode.has_work(requests.len(), set_aside.len()) {
+        let next_payer_wait = if mode.has_work(requests.len() + payer_wait.len(), set_aside.len()) {
             record_requests(
                 state,
                 &requests,
@@ -498,8 +500,11 @@ impl PiSource {
                 mode.is_full(),
                 &mut outcome,
                 &|| stop.load(Ordering::Relaxed),
-            )?;
-        }
+                &payer_wait,
+            )?
+        } else {
+            payer_wait
+        };
 
         let mut cache = self
             .cache
@@ -512,6 +517,15 @@ impl PiSource {
             cache.windows = windows;
         }
         cache.identities.extend(additions);
+        cache.payer_wait = next_payer_wait;
+        state.set_payer_waiting(PI_SOURCE_KEY, cache.payer_wait.len());
+        if !cache.payer_wait.is_empty() {
+            tracing::trace!(
+                waiting_calls = cache.payer_wait.len(),
+                waiting_sessions = cache.payer_wait.pending_sessions().len(),
+                "Pi payer waits committed"
+            );
+        }
         Ok(outcome)
     }
 
@@ -902,9 +916,14 @@ fn same_call(left: &EventRecordRequest, right: &EventRecordRequest) -> bool {
         && measurements == &right.measurements
 }
 
-/// Commit good records and set-aside evidence together. With `update_runtime`,
-/// also mark `source_runtime` current and clear pending work. The test helper
+/// Commit good records, payer waits and set-aside evidence together. With
+/// `update_runtime`, refresh source health and disclose any remaining waits.
+/// The test helper
 /// `drain_file_without_cache` passes false because it creates no runtime row.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the transaction records the read and its proposed payer waits together"
+)]
 fn record_requests(
     state: &SharedState,
     requests: &[EventRecordRequest],
@@ -913,7 +932,8 @@ fn record_requests(
     update_runtime: bool,
     outcome: &mut PiDrainOutcome,
     stop_requested: &dyn Fn() -> bool,
-) -> Result<(), SourceDrainError> {
+    payer_wait: &super::thalamus_payer_join::WaitQueue,
+) -> Result<super::thalamus_payer_join::WaitQueue, SourceDrainError> {
     use crate::refresher::harness_drain::{
         mark_current_in_tx, record_events_in_tx, record_set_aside_in_tx, RecordTally,
     };
@@ -929,20 +949,34 @@ fn record_requests(
             return Err("Pi ingest stopped".into());
         }
         let newly_seen = record_set_aside_in_tx(tx, PI_SOURCE_KEY, set_aside, recorded_at_ms)?;
+        let calls = requests
+            .iter()
+            .map(|request| super::thalamus_payer_join::WaitingCall {
+                request: request.clone(),
+                // Pi writes each assistant entry with the completed response.
+                completed_at_ms: request.occurred_at_ms,
+            })
+            .collect::<Vec<_>>();
+        let payer = payer_wait.resolve_in_tx(tx, "pi", &calls, recorded_at_ms)?;
         let dispositions = record_events_in_tx(
             tx,
             "Pi",
-            requests,
+            &payer.ready,
             recorded_at_ms,
             stop_requested,
             &mut stopped,
         )?;
         if update_runtime {
             mark_current_in_tx(tx, PI_SOURCE_KEY, "Pi", recorded_at_ms)?;
+            tx.execute(
+                "UPDATE source_runtime SET pending_unknown=?2 WHERE source_key=?1",
+                rusqlite::params![PI_SOURCE_KEY, i64::from(!payer.next.is_empty())],
+            )
+            .map_err(|e| e.to_string())?;
         }
-        Ok(((dispositions, newly_seen), true))
+        Ok(((dispositions, newly_seen, payer), true))
     });
-    let (dispositions, newly_seen) = match committed {
+    let (dispositions, newly_seen, payer) = match committed {
         Ok(committed) => committed,
         Err(_) if stopped => return Err(SourceDrainError::Stopped),
         Err(reason) => return Err(SourceDrainError::Failed(reason)),
@@ -950,9 +984,10 @@ fn record_requests(
     crate::refresher::harness_drain::warn_set_aside(PI_SOURCE_KEY, &newly_seen);
     let tally = RecordTally::from_dispositions(dispositions);
     outcome.rows_recorded = tally.recorded;
-    outcome.exact_redeliveries = tally.exact_redeliveries;
+    outcome.exact_redeliveries = tally.exact_redeliveries + payer.already_recorded;
     outcome.quarantined_redeliveries = tally.quarantined_redeliveries;
-    Ok(())
+    super::thalamus_payer_join::warn_overflow(PI_SOURCE_KEY, payer.overflow_started);
+    Ok(payer.next)
 }
 
 #[cfg(test)]
@@ -994,6 +1029,7 @@ fn drain_file_without_cache(
         false,
         &mut outcome,
         &|| false,
+        &super::thalamus_payer_join::WaitQueue::default(),
     )?;
     Ok(outcome)
 }
@@ -1003,6 +1039,7 @@ fn drain_file_without_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::refresher::harness_drain::HarnessSource;
     use crate::refresher::{price_unpriced_events, run_iteration_with_pi, ExportPage, Producer};
     use crate::state::test_state;
     use astrocyte_core::ingest::EventRecordRequest;
@@ -1475,6 +1512,279 @@ mod tests {
             .unwrap();
         assert_eq!(runtime, (None, None, None, 100, 0, 0));
         assert_eq!(state.public_projection().health(100).status, "ok");
+    }
+
+    fn payer_fixture(
+        home: &Path,
+        session: &str,
+    ) -> (
+        rusqlite::Connection,
+        super::super::thalamus_payer_source::ThalamusPayerSource,
+    ) {
+        let path = home.join("cortexkit/thalamus-harness/payer/payer.db");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = rusqlite::Connection::open(path).unwrap();
+        store.execute_batch(r#"
+CREATE TABLE payer_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE payer_session(harness TEXT NOT NULL,session TEXT NOT NULL,owner_principal TEXT,declared_at_ms INTEGER NOT NULL,PRIMARY KEY(harness,session));
+CREATE TABLE payer_record(seq INTEGER PRIMARY KEY AUTOINCREMENT,attempt_id TEXT NOT NULL UNIQUE,harness TEXT NOT NULL,session TEXT NOT NULL,request_kind TEXT NOT NULL,step_ref TEXT,recorded_at_ms INTEGER NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,charge_basis TEXT,auth_selection TEXT NOT NULL,account_ref TEXT,outcome TEXT,provider_request_id TEXT,provider_response_id TEXT,usage_json TEXT);
+INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture');
+"#).unwrap();
+        store
+            .execute(
+                "INSERT INTO payer_session VALUES('pi',?1,'owner',0)",
+                [session],
+            )
+            .unwrap();
+        (
+            store,
+            super::super::thalamus_payer_source::ThalamusPayerSource::from_data_home(
+                home.to_path_buf(),
+            ),
+        )
+    }
+
+    fn payer_call(store: &rusqlite::Connection, attempt: &str, step: &str, auth: &str) {
+        store.execute("INSERT INTO payer_record(attempt_id,harness,session,request_kind,step_ref,recorded_at_ms,provider,model,charge_basis,auth_selection,account_ref) VALUES (?1,'pi','pi-session-1','main',?2,100,'anthropic','claude-sonnet-4','metered_api',?3,'account')",rusqlite::params![attempt,step,auth]).unwrap();
+    }
+
+    fn payer_tick(
+        payer: &super::super::thalamus_payer_source::ThalamusPayerSource,
+        state: &SharedState,
+        at: i64,
+    ) {
+        super::super::harness_drain::HarnessSource::drain_for_health(payer, state, at, &NEVER_STOP)
+            .unwrap();
+    }
+
+    const PI_COMPLETED: i64 = 1_788_220_801_000;
+
+    #[test]
+    fn pi_payer_join_matches_the_shared_step_key_without_changing_identity_or_usage() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join("sessions");
+        write_fixture(
+            &sessions,
+            "project",
+            &fixture("pi-session-1", "/actual/project", Some("response-1")),
+        );
+        let (store, payer) = payer_fixture(home.path(), "pi-session-1");
+        payer_call(&store, "attempt-1", "pi:response:response-1", "vault-login");
+        let state = test_state();
+        payer_tick(&payer, &state, PI_COMPLETED + 1);
+        let source = PiSource::at(&sessions);
+        assert_eq!(
+            source
+                .drain(&state, PI_COMPLETED + 1, &NEVER_STOP)
+                .unwrap()
+                .rows_recorded,
+            1
+        );
+        state.with_conn(|conn| {
+            assert_eq!(conn.query_row("SELECT producer,producer_ref,charge_basis,auth_selection,account_ref,session FROM usage_event",[],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?))).unwrap(),("pi".into(),"pi:response:response-1".into(),"metered_api".into(),"vault-login".into(),"account".into(),"pi-session-1".into()));
+            assert_eq!(conn.query_row("SELECT SUM(quantity_units) FROM measurement WHERE role='input'",[],|row|row.get::<_,i64>(0)).unwrap(),11);
+            Ok(())
+        }).unwrap();
+        assert_eq!(
+            source
+                .drain(&state, PI_COMPLETED + 2, &NEVER_STOP)
+                .unwrap()
+                .rows_recorded,
+            0
+        );
+        assert_eq!(table_count(&state, "usage_event"), 1);
+    }
+
+    #[test]
+    fn pi_payer_wait_rechecks_idle_fast_lane_then_times_out_and_ignores_late_payer() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join("sessions");
+        let path = write_fixture(
+            &sessions,
+            "project",
+            &fixture("pi-session-1", "/actual/project", Some("response-1")),
+        );
+        append(
+            &path,
+            &format!("{}\n", message_line("entry-2", "response-2", 19)),
+        );
+        let (store, payer) = payer_fixture(home.path(), "pi-session-1");
+        let state = test_state();
+        payer_tick(&payer, &state, PI_COMPLETED + 1_001);
+        let source = PiSource::at(&sessions);
+        assert_eq!(
+            source
+                .drain(&state, PI_COMPLETED + 1_001, &NEVER_STOP)
+                .unwrap()
+                .rows_recorded,
+            0
+        );
+        assert_eq!(state.payer_waiting().get(PI_SOURCE_KEY), Some(&2));
+        payer_call(&store, "attempt-1", "pi:response:response-1", "vault-login");
+        payer_tick(&payer, &state, PI_COMPLETED + 1_002);
+        astrocyte_readers::read_io::reset_counts();
+        HarnessSource::drain_fast(&source, &state, PI_COMPLETED + 1_002, &NEVER_STOP).unwrap();
+        assert_eq!(astrocyte_readers::read_io::counts().file_opens, 0);
+        assert_eq!(table_count(&state, "usage_event"), 1);
+        source
+            .drain(&state, PI_COMPLETED + 300_000, &NEVER_STOP)
+            .unwrap();
+        state.with_conn(|conn| {
+            assert_eq!(conn.query_row("SELECT last_success_ms,pending_known,pending_unknown FROM source_runtime WHERE source_key='pi'",[],|row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?))).unwrap(),(PI_COMPLETED+300_000,0,1));
+            Ok(())
+        }).unwrap();
+        HarnessSource::drain_fast(&source, &state, PI_COMPLETED + 600_999, &NEVER_STOP).unwrap();
+        assert_eq!(table_count(&state, "usage_event"), 1);
+        HarnessSource::drain_fast(&source, &state, PI_COMPLETED + 601_000, &NEVER_STOP).unwrap();
+        assert_eq!(table_count(&state, "usage_event"), 2);
+        assert_eq!(state.payer_waiting().get(PI_SOURCE_KEY), Some(&0));
+        let writes = crate::state::transaction_attempts_for_test();
+        astrocyte_readers::read_io::reset_counts();
+        HarnessSource::drain_fast(&source, &state, PI_COMPLETED + 601_001, &NEVER_STOP).unwrap();
+        assert_eq!(astrocyte_readers::read_io::counts().file_opens, 0);
+        assert_eq!(crate::state::transaction_attempts_for_test(), writes);
+        payer_call(&store, "attempt-2", "pi:response:response-2", "too-late");
+        payer_tick(&payer, &state, PI_COMPLETED + 601_001);
+        source
+            .drain(&state, PI_COMPLETED + 601_002, &NEVER_STOP)
+            .unwrap();
+        state.with_conn(|conn| {
+            assert_eq!(conn.query_row("SELECT charge_basis,auth_selection,account_ref FROM usage_event WHERE producer_ref='pi:response:response-2'",[],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,Option<String>>(2)?))).unwrap(),("unknown".into(),None,None));
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM thalamus_payer_coverage WHERE kind='without_payer'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM thalamus_payer_coverage WHERE kind='late'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn pi_payer_wait_at_restart_replays_once_with_the_payer() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join("sessions");
+        write_fixture(
+            &sessions,
+            "project",
+            &fixture("pi-session-1", "/actual/project", Some("response-1")),
+        );
+        let (store, payer) = payer_fixture(home.path(), "pi-session-1");
+        let state = test_state();
+        payer_tick(&payer, &state, PI_COMPLETED + 1);
+        let source = PiSource::at(&sessions);
+        assert_eq!(
+            source
+                .drain(&state, PI_COMPLETED + 1, &NEVER_STOP)
+                .unwrap()
+                .rows_recorded,
+            0
+        );
+        assert_eq!(source.cache.lock().unwrap().payer_wait.len(), 1);
+        drop(source);
+        payer_call(&store, "attempt-1", "pi:response:response-1", "vault-login");
+        payer_tick(&payer, &state, PI_COMPLETED + 2);
+        let source = PiSource::at(&sessions);
+        assert_eq!(
+            source
+                .drain(&state, PI_COMPLETED + 2, &NEVER_STOP)
+                .unwrap()
+                .rows_recorded,
+            1
+        );
+        drop(source);
+        let source = PiSource::at(&sessions);
+        let replay = source.drain(&state, PI_COMPLETED + 3, &NEVER_STOP).unwrap();
+        assert_eq!(replay.rows_recorded, 0);
+        assert_eq!(replay.exact_redeliveries, 1);
+        assert_eq!(table_count(&state, "usage_event"), 1);
+        state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT auth_selection FROM usage_event", [], |row| row
+                        .get::<_, String>(
+                        0
+                    ))
+                    .unwrap(),
+                    "vault-login"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn pi_payer_unmanaged_session_keeps_byte_identical_rows_and_never_waits() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join("sessions");
+        write_fixture(
+            &sessions,
+            "project",
+            &fixture("pi-session-1", "/actual/project", Some("response-1")),
+        );
+        let (_store, payer) = payer_fixture(home.path(), "some-other-session");
+        let baseline = test_state();
+        let mirrored = test_state();
+        payer_tick(&payer, &mirrored, PI_COMPLETED + 1);
+        for state in [&baseline, &mirrored] {
+            let source = PiSource::at(&sessions);
+            assert_eq!(
+                source
+                    .drain(state, PI_COMPLETED + 1, &NEVER_STOP)
+                    .unwrap()
+                    .rows_recorded,
+                1
+            );
+            assert!(source.cache.lock().unwrap().payer_wait.is_empty());
+        }
+        assert_eq!(ledger_dump(&baseline), ledger_dump(&mirrored));
+    }
+
+    #[test]
+    fn pi_payer_conflicts_set_aside_both_rows_and_record_unknown() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join("sessions");
+        write_fixture(
+            &sessions,
+            "project",
+            &fixture("pi-session-1", "/actual/project", Some("response-1")),
+        );
+        let (store, payer) = payer_fixture(home.path(), "pi-session-1");
+        payer_call(&store, "one", "pi:response:response-1", "login-one");
+        payer_call(&store, "two", "pi:response:response-1", "login-two");
+        let state = test_state();
+        payer_tick(&payer, &state, PI_COMPLETED + 1);
+        let source = PiSource::at(&sessions);
+        assert_eq!(
+            source
+                .drain(&state, PI_COMPLETED + 1, &NEVER_STOP)
+                .unwrap()
+                .rows_recorded,
+            1
+        );
+        state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT charge_basis,auth_selection,account_ref FROM usage_event",
+                        [],
+                        |row| Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?
+                        ))
+                    )
+                    .unwrap(),
+                    ("unknown".into(), None, None)
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM set_aside_record WHERE source_key='thalamus-payer'",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -2321,6 +2631,7 @@ mod tests {
                 asked.set(asked.get() + 1);
                 asked.get() == 3
             },
+            &super::super::thalamus_payer_join::WaitQueue::default(),
         );
 
         assert_eq!(result.unwrap_err(), SourceDrainError::Stopped);

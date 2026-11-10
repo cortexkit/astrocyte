@@ -137,6 +137,8 @@ fn run_ordered_transaction<T, E>(
     operation: impl FnOnce(&Transaction<'_>) -> Result<(T, bool), E>,
     skip_unchanged: bool,
 ) -> Result<(T, bool), StoreFailure<E>> {
+    #[cfg(test)]
+    TRANSACTION_ATTEMPTS.with(|count| count.set(count.get() + 1));
     let tx = conn.unchecked_transaction().map_err(sqlite_write_failure)?;
     let before = tx.total_changes();
     let output = operation(&tx).map_err(StoreFailure::Operation)?;
@@ -152,7 +154,13 @@ fn run_ordered_transaction<T, E>(
 
 #[cfg(test)]
 thread_local! {
+    static TRANSACTION_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TRANSACTION_COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn transaction_attempts_for_test() -> usize {
+    TRANSACTION_ATTEMPTS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -255,8 +263,9 @@ fn read_writer_settings(conn: &Connection) -> Result<(String, u64), String> {
 }
 
 impl SharedState {
-    /// Publish a reader's current wait count only after its queue is adopted
-    /// following a successful commit. Folder readers publish their total.
+    /// Publish a reader's current wait count after a successful commit has
+    /// replaced its previous in-memory queue. Readers of THALAMUS's declared
+    /// folders publish the sum of waiting calls across all their folders.
     pub(crate) fn set_payer_waiting(&self, reader: &str, count: usize) {
         self.0
             .payer_waiting
