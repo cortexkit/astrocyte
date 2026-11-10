@@ -562,6 +562,116 @@ mod tests {
         }
     }
 
+    /// Bodies broca's publisher wrote in its own tests, pinned byte for byte
+    /// (`tests/vectors/broca-step-finished/SHA256SUMS`): completed,
+    /// interrupted and keep-warm steps from both of broca's session storages,
+    /// plain and encrypted.
+    const BROCA_STEP_VECTORS: [(&str, &[u8]); 12] = [
+        (
+            "completed-store-encrypted",
+            include_bytes!("../tests/vectors/broca-step-finished/completed-store-encrypted.json"),
+        ),
+        (
+            "completed-store-plain",
+            include_bytes!("../tests/vectors/broca-step-finished/completed-store-plain.json"),
+        ),
+        (
+            "completed-today-encrypted",
+            include_bytes!("../tests/vectors/broca-step-finished/completed-today-encrypted.json"),
+        ),
+        (
+            "completed-today-plain",
+            include_bytes!("../tests/vectors/broca-step-finished/completed-today-plain.json"),
+        ),
+        (
+            "interrupted-store-encrypted",
+            include_bytes!("../tests/vectors/broca-step-finished/interrupted-store-encrypted.json"),
+        ),
+        (
+            "interrupted-store-plain",
+            include_bytes!("../tests/vectors/broca-step-finished/interrupted-store-plain.json"),
+        ),
+        (
+            "interrupted-today-encrypted",
+            include_bytes!("../tests/vectors/broca-step-finished/interrupted-today-encrypted.json"),
+        ),
+        (
+            "interrupted-today-plain",
+            include_bytes!("../tests/vectors/broca-step-finished/interrupted-today-plain.json"),
+        ),
+        (
+            "keep-warm-store-encrypted",
+            include_bytes!("../tests/vectors/broca-step-finished/keep-warm-store-encrypted.json"),
+        ),
+        (
+            "keep-warm-store-plain",
+            include_bytes!("../tests/vectors/broca-step-finished/keep-warm-store-plain.json"),
+        ),
+        (
+            "keep-warm-today-encrypted",
+            include_bytes!("../tests/vectors/broca-step-finished/keep-warm-today-encrypted.json"),
+        ),
+        (
+            "keep-warm-today-plain",
+            include_bytes!("../tests/vectors/broca-step-finished/keep-warm-today-plain.json"),
+        ),
+    ];
+
+    /// Every pinned broca body decodes on broca's live subject exactly as
+    /// sent, keyed by runner and attempt id since broca sends no host record.
+    /// Moved into the feed's window, each is served as its own runner row:
+    /// absent counts stay absent, and interrupted steps carry none.
+    #[test]
+    fn brocas_published_step_events_decode_and_are_served() {
+        let subject = names().live_subject("broca", STEP_EVENT, 1).unwrap();
+        let state = test_state();
+        let now = u64::try_from(now_ms()).unwrap();
+        for (index, (name, bytes)) in BROCA_STEP_VECTORS.iter().enumerate() {
+            let event = decode_step_finished(&subject, bytes)
+                .unwrap_or_else(|error| panic!("{name} does not decode: {error:?}"));
+            let sent: Value = serde_json::from_slice(bytes).unwrap();
+            let step = feed_step(event).unwrap_or_else(|| panic!("{name} has no row identity"));
+            assert_eq!(step.harness, "broca", "{name}");
+            assert_eq!(
+                step.step.step_ref,
+                sent["attempt_id"].as_str().unwrap(),
+                "{name}"
+            );
+            let mut recent = sent.clone();
+            let start = now - 60_000 + u64::try_from(index).unwrap() * 1_000;
+            let length =
+                sent["finished_at_ms"].as_u64().unwrap() - sent["started_at_ms"].as_u64().unwrap();
+            recent["started_at_ms"] = json!(start);
+            recent["finished_at_ms"] = json!(start + length);
+            admit(&state, &subject, &serde_json::to_vec(&recent).unwrap());
+        }
+        assert_eq!(
+            state.step_feed().runner_counts(),
+            RunnerCounts {
+                appended: 12,
+                ..RunnerCounts::default()
+            }
+        );
+        let served = rows(&state, json!({"harness": "broca", "session": "s1"}));
+        assert_eq!(served.len(), 12);
+        for (row, (name, bytes)) in served.iter().zip(BROCA_STEP_VECTORS) {
+            let sent: Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(row["source"], "runner", "{name}");
+            assert_eq!(row["step_ref"], sent["attempt_id"], "{name}");
+            for (event_member, row_member) in [
+                ("input_tokens", "input"),
+                ("cached_input_tokens", "cache_read"),
+                ("output_tokens", "output"),
+            ] {
+                assert_eq!(
+                    row.get(row_member),
+                    sent.get(event_member),
+                    "{name}: {row_member}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_step_older_than_the_feed_window_is_not_added() {
         let state = test_state();
