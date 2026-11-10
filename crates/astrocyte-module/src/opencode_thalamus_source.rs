@@ -5,8 +5,8 @@
 //!
 //! Each declared folder's `opencode.db` is read with the same OpenCode 1 and
 //! OpenCode 2 readers as the user's own store, each with its own durable
-//! cursor per folder. The folders are read on full refresher ticks only, never
-//! in the fast lane. Calls keep producer `opencode` and OpenCode's message id,
+//! cursor per folder. The folders are read on full refresher ticks only; the
+//! fast lane only rechecks queued payer joins. Calls keep producer `opencode` and OpenCode's message id,
 //! and carry the listed session's declaring module as `work_class`.
 
 use std::collections::{HashMap, HashSet};
@@ -20,7 +20,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 
 use super::declared_roots::{self, Contained, RootsFile};
-use super::harness_drain::{self, HarnessSource};
+use super::harness_drain::{self, DrainMode, HarnessSource};
 use super::opencode_source::{CursorHome, OpenCodeSource, ReadOptions, SessionOptions};
 use super::opencode_v2_source::OpenCodeV2Source;
 use super::SourceDrainError;
@@ -114,6 +114,10 @@ struct Folder {
 }
 
 impl Folder {
+    fn payer_waiting(&self) -> usize {
+        self.v1.payer_waiting() + self.v2.payer_waiting()
+    }
+
     fn new(folder: &Path) -> Self {
         let database = folder.join("opencode.db");
         let store = folder.to_string_lossy().into_owned();
@@ -153,6 +157,36 @@ struct Cache {
     warned: HashSet<String>,
 }
 
+impl Cache {
+    fn payer_waiting(&self) -> usize {
+        self.folders.values().map(Folder::payer_waiting).sum()
+    }
+
+    fn drain_payer_waits(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+        mode: DrainMode,
+    ) -> Result<(), SourceDrainError> {
+        let mut total = self.payer_waiting();
+        for folder in self.folders.values() {
+            let before = folder.v1.payer_waiting();
+            folder.v1.drain_payer_waits(state, at, stop, mode)?;
+            total = total.saturating_sub(before) + folder.v1.payer_waiting();
+            state.set_payer_waiting(SOURCE_KEY, total);
+            let before = folder.v2.payer_waiting();
+            folder.v2.drain_payer_waits(state, at, stop, mode)?;
+            total = total.saturating_sub(before) + folder.v2.payer_waiting();
+            state.set_payer_waiting(SOURCE_KEY, total);
+        }
+        if self.folders.is_empty() {
+            state.set_payer_waiting(SOURCE_KEY, 0);
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct OpenCodeThalamusSource {
     roots: Result<PathBuf, String>,
     cache: Mutex<Cache>,
@@ -182,13 +216,19 @@ impl OpenCodeThalamusSource {
             .as_ref()
             .map_err(|reason| SourceDrainError::Failed(reason.clone()))?;
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        // Queued payloads survive a missing store or declaration until they
+        // resolve. Neither an idle tail nor a missing file may drop a call.
+        cache.drain_payer_waits(state, at, stop, DrainMode::Full)?;
         let mut problems = Vec::new();
         let declarations_known =
             match declared_roots::read::<Entry>(roots, "OpenCode session roots") {
                 RootsFile::Absent => {
-                    *cache = Cache::default();
-                    forget_source(state)?;
-                    return Ok(None);
+                    if cache.payer_waiting() == 0 {
+                        *cache = Cache::default();
+                        forget_source(state)?;
+                        return Ok(None);
+                    }
+                    false
                 }
                 RootsFile::UnknownVersion => {
                     harness_drain::ensure_runtime_row(state, SOURCE_KEY)?;
@@ -270,12 +310,19 @@ impl OpenCodeThalamusSource {
                 ));
                 continue;
             }
+            let other_waiting = cache.payer_waiting().saturating_sub(
+                cache
+                    .folders
+                    .get(&canonical)
+                    .map_or(0, Folder::payer_waiting),
+            );
             let reader = cache
                 .folders
                 .entry(canonical.clone())
                 .or_insert_with(|| Folder::new(&canonical));
             let database = canonical.join("opencode.db");
-            match read_folder(reader, entry, &database, state, at, stop) {
+            let read = read_folder(reader, entry, &database, state, at, stop, other_waiting);
+            match read {
                 Ok(FolderRead::Gone) => {}
                 Ok(FolderRead::Read {
                     recorded_all,
@@ -305,7 +352,10 @@ impl OpenCodeThalamusSource {
                 }
             }
         }
-        cache.folders.retain(|path, _| seen.contains(path));
+        cache.folders.retain(|path, folder| {
+            seen.contains(path) || folder.v1.has_payer_waits() || folder.v2.has_payer_waits()
+        });
+        complete &= cache.payer_waiting() == 0;
         let stores = declarations_known.then(|| {
             seen.iter()
                 .map(|path| path.to_string_lossy().into_owned())
@@ -332,7 +382,19 @@ impl HarnessSource for OpenCodeThalamusSource {
         SOURCE_KEY
     }
 
-    // Full ticks only: the fast lane's default reads nothing from here.
+    // Fast ticks resolve only cached payloads, without reading roots or stores.
+    fn drain_fast(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+    ) -> Result<(), SourceDrainError> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain_payer_waits(state, at, stop, DrainMode::Fast)
+    }
+
     fn drain_for_health(
         &self,
         state: &SharedState,
@@ -352,6 +414,7 @@ fn read_folder(
     state: &SharedState,
     at: i64,
     stop: &AtomicBool,
+    other_waiting: usize,
 ) -> Result<FolderRead, SourceDrainError> {
     match astrocyte_readers::read_io::metadata(database) {
         Ok(_) => {}
@@ -405,14 +468,21 @@ fn read_folder(
             return Ok(FolderRead::Gone);
         }
         quarantined = outcome.quarantined_redeliveries;
+        // A v2 read can fail after the v1 recording transaction commits.
+        // Publish the v1 reader's updated in-memory queue count now, including
+        // waits in other layouts and folders.
+        state.set_payer_waiting(SOURCE_KEY, other_waiting + folder.payer_waiting());
     }
     folder.v2.drain_declared(state, at, stop, options)?;
+    state.set_payer_waiting(SOURCE_KEY, other_waiting + folder.payer_waiting());
     if settling {
         folder.settled = (!has_v1 || folder.v1.full_pass_reached_high_water())
             && folder.v2.full_pass_reached_high_water();
     }
     Ok(FolderRead::Read {
-        recorded_all: !settling || folder.settled,
+        recorded_all: (!settling || folder.settled)
+            && !folder.v1.has_payer_waits()
+            && !folder.v2.has_payer_waits(),
         quarantined,
     })
 }
@@ -2055,6 +2125,8 @@ mod tests {
         };
         assert!(!home.retains_connection());
     }
+
+    include!("opencode_thalamus_source_tests.rs");
 
     #[cfg(windows)]
     #[test]

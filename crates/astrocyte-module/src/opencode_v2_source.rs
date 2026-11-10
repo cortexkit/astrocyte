@@ -19,7 +19,8 @@ use astrocyte_readers::{
 };
 
 use super::harness_drain::{self, DrainMode, HarnessSource};
-use super::opencode_source::{CursorHome, PageCursor, ReadOptions};
+use super::opencode_source::{resolve_payer_in_tx, CursorHome, PageCursor, ReadOptions};
+use super::thalamus_payer_join::{self, WaitQueue, WaitingCall};
 use super::{SetAsideRecord, SourceDrainError};
 use crate::state::SharedState;
 
@@ -68,6 +69,7 @@ pub(crate) struct OpenCodeV2Source {
     root: Result<PathBuf, String>,
     home: CursorHome,
     cache: Mutex<Cache>,
+    waiting: Mutex<WaitQueue>,
 }
 
 pub(crate) fn registered() -> OpenCodeV2Source {
@@ -83,6 +85,7 @@ pub(crate) fn registered() -> OpenCodeV2Source {
         root,
         home: CursorHome::Runtime(SOURCE_KEY),
         cache: Mutex::new(Cache::default()),
+        waiting: Mutex::new(WaitQueue::default()),
     }
 }
 
@@ -93,6 +96,7 @@ impl OpenCodeV2Source {
             root: Ok(path.into()),
             home: CursorHome::Runtime(SOURCE_KEY),
             cache: Mutex::new(Cache::default()),
+            waiting: Mutex::new(WaitQueue::default()),
         }
     }
 
@@ -105,6 +109,7 @@ impl OpenCodeV2Source {
             root: Ok(database),
             home,
             cache: Mutex::new(Cache::default()),
+            waiting: Mutex::new(WaitQueue::default()),
         }
     }
 
@@ -122,6 +127,42 @@ impl OpenCodeV2Source {
     pub(crate) fn full_pass_reached_high_water(&self) -> bool {
         let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         !cache.marker_present || cache.last_full.is_some()
+    }
+
+    pub(crate) fn payer_waiting(&self) -> usize {
+        self.waiting.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    pub(crate) fn has_payer_waits(&self) -> bool {
+        !self
+            .waiting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending_sessions()
+            .is_empty()
+    }
+
+    /// Resolve queued calls even when no producer rows changed, without
+    /// reopening a declared store in the fast lane.
+    pub(crate) fn drain_payer_waits(
+        &self,
+        state: &SharedState,
+        now: i64,
+        stop: &AtomicBool,
+        mode: DrainMode,
+    ) -> Result<(), SourceDrainError> {
+        commit(
+            state,
+            &self.home,
+            None,
+            false,
+            now,
+            stop,
+            mode,
+            ReadOptions::default(),
+            &mut self.waiting.lock().unwrap_or_else(|p| p.into_inner()),
+        )?;
+        Ok(())
     }
 
     pub(crate) fn drain(
@@ -294,7 +335,17 @@ impl OpenCodeV2Source {
         if let Some(key) = self.home.runtime_key() {
             mode.ensure_runtime(state, key)?;
         }
-        let outcome = commit(state, &self.home, &page, full, now, stop, mode, options)?;
+        let outcome = commit(
+            state,
+            &self.home,
+            Some(&page),
+            full,
+            now,
+            stop,
+            mode,
+            options,
+            &mut self.waiting.lock().unwrap_or_else(|p| p.into_inner()),
+        )?;
         cache.marker_present = true;
         cache.signature = Some(signature);
         if full {
@@ -398,35 +449,46 @@ fn read_error(error: OpenCodeReadError) -> SourceDrainError {
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "one call site; the arguments are the drain's own context"
+    reason = "the page and payer queue share the drain's transactional context"
 )]
 fn commit(
     state: &SharedState,
     home: &CursorHome,
-    page: &Page,
+    page: Option<&Page>,
     full: bool,
     now: i64,
     stop: &AtomicBool,
     mode: DrainMode,
     options: ReadOptions<'_>,
+    waiting: &mut WaitQueue,
 ) -> Result<Outcome, SourceDrainError> {
+    let initial = Outcome {
+        full,
+        cost: page.map(|page| page.cost).unwrap_or_default(),
+        skipped_legacy: page.map(|page| page.skipped_legacy).unwrap_or_default(),
+        ..Outcome::default()
+    };
+    if !mode.has_work(
+        waiting
+            .len()
+            .saturating_add(page.map_or(0, |page| page.messages.len())),
+        page.map_or(0, |page| page.set_aside.len()),
+    ) {
+        return Ok(initial);
+    }
     let mut stopped = false;
     let result = mode.write(state, |tx| {
-        let mut outcome = Outcome {
-            full,
-            cost: page.cost,
-            skipped_legacy: page.skipped_legacy,
-            ..Outcome::default()
-        };
+        let mut outcome = initial;
         let mut evidence = page
-            .set_aside
-            .iter()
+            .into_iter()
+            .flat_map(|page| &page.set_aside)
             .map(|row| SetAsideRecord {
                 locator: format!("session_message:{}", row.id),
                 reason: row.reason.clone(),
             })
             .collect::<Vec<_>>();
-        for message in &page.messages {
+        let mut calls = Vec::new();
+        for message in page.into_iter().flat_map(|page| &page.messages) {
             if stop.load(Ordering::Relaxed) {
                 stopped = true;
                 return Err("OpenCode 2 ingest stopped".into());
@@ -446,22 +508,33 @@ fn commit(
             }
             match map_message(message.clone()) {
                 Ok(request) => {
-                    let request = options.stamp(request);
-                    let result = astrocyte_core::ingest::record_event_in_tx(
-                        tx,
-                        &request,
-                        now,
-                        astrocyte_core::ingest::DeliveryPath::Read,
-                    )
-                    .map_err(|e| format!("record OpenCode 2: {e:?}"))?;
-                    if result.disposition == RecordDisposition::Recorded {
-                        outcome.recorded += 1;
-                    }
+                    calls.push(WaitingCall {
+                        request: options.stamp(request),
+                        completed_at_ms: message.completed_at_ms,
+                    });
                 }
                 Err(reason) => evidence.push(SetAsideRecord {
                     locator: format!("session_message:{}", message.id),
                     reason,
                 }),
+            }
+        }
+        let resolution = resolve_payer_in_tx(tx, home, waiting, &calls, now)?;
+        outcome.skipped_recorded += resolution.already_recorded;
+        for request in &resolution.ready {
+            if stop.load(Ordering::Relaxed) {
+                stopped = true;
+                return Err("OpenCode 2 ingest stopped".into());
+            }
+            let result = astrocyte_core::ingest::record_event_in_tx(
+                tx,
+                request,
+                now,
+                astrocyte_core::ingest::DeliveryPath::Read,
+            )
+            .map_err(|e| format!("record OpenCode 2: {e:?}"))?;
+            if result.disposition == RecordDisposition::Recorded {
+                outcome.recorded += 1;
             }
         }
         if stop.load(Ordering::Relaxed) {
@@ -470,19 +543,25 @@ fn commit(
         }
         let newly_seen =
             harness_drain::record_set_aside_in_tx(tx, home.source_key(), &evidence, now)?;
-        if mode.is_full() {
+        if let Some(page) = page.filter(|_| mode.is_full()) {
             let cursor = PageCursor {
                 lineage: &page.lineage,
                 consumed_ordinal: page.consumed,
                 high_water_ordinal: page.high_water,
             };
-            home.record_read_in_tx(tx, full.then_some(&cursor), now)
-                .map_err(|e| e.to_string())?;
+            home.record_read_in_tx(
+                tx,
+                (full && resolution.next.is_empty()).then_some(&cursor),
+                now,
+            )
+            .map_err(|e| e.to_string())?;
         }
-        Ok(((outcome, newly_seen), true))
+        Ok(((outcome, newly_seen, resolution), true))
     });
     match result {
-        Ok((outcome, newly_seen)) => {
+        Ok((outcome, newly_seen, resolution)) => {
+            *waiting = resolution.next;
+            thalamus_payer_join::warn_overflow(home.source_key(), resolution.overflow_started);
             harness_drain::warn_set_aside(home.source_key(), &newly_seen);
             Ok(outcome)
         }

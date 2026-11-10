@@ -26,6 +26,9 @@ pub struct OpenCodeMessage {
     pub session_id: String,
     pub updated_at_ms: i64,
     pub occurred_at_ms: i64,
+    /// Producer completion time, separate from the event's creation time.
+    /// Missing or unusable completion values remain unknown.
+    pub completed_at_ms: Option<i64>,
     pub project_root: Option<String>,
     pub provider_id: String,
     pub model_id: String,

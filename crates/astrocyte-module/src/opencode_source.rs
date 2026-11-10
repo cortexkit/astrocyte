@@ -1,6 +1,7 @@
 //! OpenCode's on-disk SQLite producer and ledger ingest mapping.
 
 use super::harness_drain::DrainMode;
+use super::thalamus_payer_join::{self, Resolution, WaitQueue, WaitingCall};
 use std::collections::{BTreeMap, HashMap};
 #[cfg(any(test, feature = "test-support"))]
 use std::ffi::OsString;
@@ -43,6 +44,16 @@ pub(crate) enum CursorHome {
 }
 
 impl CursorHome {
+    fn joins_payer(&self) -> bool {
+        matches!(
+            self,
+            Self::Declared {
+                source_key: super::opencode_thalamus_source::SOURCE_KEY,
+                ..
+            }
+        )
+    }
+
     /// The key set-aside evidence is filed under.
     pub(crate) fn source_key(&self) -> &'static str {
         match self {
@@ -471,6 +482,7 @@ pub(crate) struct OpenCodeSource {
     home: CursorHome,
     cadence: OpenCodeCadence,
     cache: Mutex<OpenCodeCache>,
+    waiting: Mutex<WaitQueue>,
 }
 
 impl OpenCodeSource {
@@ -517,6 +529,7 @@ impl OpenCodeSource {
             home: CursorHome::Runtime(OPENCODE_SOURCE_KEY),
             cadence,
             cache: Mutex::new(OpenCodeCache::default()),
+            waiting: Mutex::new(WaitQueue::default()),
         }
     }
 
@@ -548,6 +561,42 @@ impl OpenCodeSource {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .last_full_pass_ms
             .is_some()
+    }
+
+    pub(crate) fn payer_waiting(&self) -> usize {
+        self.waiting.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    pub(crate) fn has_payer_waits(&self) -> bool {
+        !self
+            .waiting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending_sessions()
+            .is_empty()
+    }
+
+    /// Recheck queued calls without opening the producer's store. Its durable
+    /// cursor stays held until a full pass can advance it safely.
+    pub(crate) fn drain_payer_waits(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+        mode: DrainMode,
+    ) -> Result<(), SourceDrainError> {
+        commit_page_in_lane(
+            state,
+            &self.home,
+            &[],
+            &[],
+            None,
+            at,
+            &|| stop.load(Ordering::Relaxed),
+            mode,
+            &mut self.waiting.lock().unwrap_or_else(|p| p.into_inner()),
+        )?;
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -821,6 +870,7 @@ impl OpenCodeSource {
             recorded_at_ms,
             &|| stop.load(Ordering::Relaxed),
             mode,
+            &mut self.waiting.lock().unwrap_or_else(|p| p.into_inner()),
         )?;
         cache.after_tail(signature, &page, &reread, recorded_at_ms, &self.cadence);
         let mut outcome = OpenCodeDrainOutcome {
@@ -864,7 +914,7 @@ impl OpenCodeSource {
             })
             .collect();
         let requests = map_messages(root, page.messages, &mut set_aside, options);
-        let committed = commit_page_with_evidence(
+        let committed = commit_page_in_lane(
             state,
             &self.home,
             &requests,
@@ -876,6 +926,8 @@ impl OpenCodeSource {
             }),
             recorded_at_ms,
             &|| stop.load(Ordering::Relaxed),
+            DrainMode::Full,
+            &mut self.waiting.lock().unwrap_or_else(|p| p.into_inner()),
         )?;
 
         cache.after_full_pass(
@@ -964,12 +1016,16 @@ fn map_messages(
     messages: Vec<OpenCodeMessage>,
     set_aside: &mut Vec<crate::refresher::SetAsideRecord>,
     options: ReadOptions<'_>,
-) -> Vec<EventRecordRequest> {
+) -> Vec<WaitingCall> {
     let mut requests = Vec::new();
     for message in messages {
         let locator = format!("{path:?}:message:{}", message.id);
+        let completed_at_ms = message.completed_at_ms;
         match map_message(message) {
-            Ok(request) => requests.push(options.stamp(request)),
+            Ok(request) => requests.push(WaitingCall {
+                request: options.stamp(request),
+                completed_at_ms,
+            }),
             Err(reason) => set_aside.push(crate::refresher::SetAsideRecord { locator, reason }),
         }
     }
@@ -1024,6 +1080,7 @@ fn commit_page(
     )
 }
 
+#[cfg(test)]
 fn commit_page_with_evidence(
     state: &SharedState,
     home: &CursorHome,
@@ -1033,15 +1090,23 @@ fn commit_page_with_evidence(
     recorded_at_ms: i64,
     stop_requested: &dyn Fn() -> bool,
 ) -> Result<Vec<RecordDisposition>, SourceDrainError> {
+    let calls = requests
+        .iter()
+        .map(|request| WaitingCall {
+            request: request.clone(),
+            completed_at_ms: None,
+        })
+        .collect::<Vec<_>>();
     commit_page_in_lane(
         state,
         home,
-        requests,
+        &calls,
         set_aside,
         cursor,
         recorded_at_ms,
         stop_requested,
         DrainMode::Full,
+        &mut WaitQueue::default(),
     )
 }
 
@@ -1052,19 +1117,20 @@ fn commit_page_with_evidence(
 fn commit_page_in_lane(
     state: &SharedState,
     home: &CursorHome,
-    requests: &[EventRecordRequest],
+    calls: &[WaitingCall],
     set_aside: &[crate::refresher::SetAsideRecord],
     cursor: Option<&PageCursor<'_>>,
     recorded_at_ms: i64,
     stop_requested: &dyn Fn() -> bool,
     mode: DrainMode,
+    waiting: &mut WaitQueue,
 ) -> Result<Vec<RecordDisposition>, SourceDrainError> {
-    if !mode.has_work(requests.len(), set_aside.len()) {
+    if !mode.has_work(calls.len().saturating_add(waiting.len()), set_aside.len()) {
         return Ok(Vec::new());
     }
     let mut stopped = false;
     let committed = mode.write(state, |tx| {
-        if requests.is_empty() && stop_requested() {
+        if stop_requested() {
             stopped = true;
             return Err("OpenCode ingest stopped".into());
         }
@@ -1074,8 +1140,10 @@ fn commit_page_in_lane(
             set_aside,
             recorded_at_ms,
         )?;
-        let mut dispositions = Vec::with_capacity(requests.len());
-        for request in requests {
+        let resolution = resolve_payer_in_tx(tx, home, waiting, calls, recorded_at_ms)?;
+        let mut dispositions =
+            vec![RecordDisposition::ExactRedelivery; resolution.already_recorded];
+        for request in &resolution.ready {
             if stop_requested() {
                 stopped = true;
                 // Returning an error drops the transaction uncommitted.
@@ -1118,21 +1186,48 @@ fn commit_page_in_lane(
         let updated = if !mode.is_full() {
             Ok(1)
         } else {
-            home.record_read_in_tx(tx, cursor, recorded_at_ms)
+            home.record_read_in_tx(
+                tx,
+                cursor.filter(|_| resolution.next.is_empty()),
+                recorded_at_ms,
+            )
         }
         .map_err(|error| format!("record OpenCode source runtime: {error}"))?;
         if updated != 1 {
             return Err("OpenCode source runtime row disappeared before cursor commit".to_string());
         }
-        Ok(((dispositions, newly_seen), true))
+        Ok(((dispositions, newly_seen, resolution), true))
     });
     match committed {
-        Ok((dispositions, newly_seen)) => {
+        Ok((dispositions, newly_seen, resolution)) => {
+            *waiting = resolution.next;
+            thalamus_payer_join::warn_overflow(home.source_key(), resolution.overflow_started);
             crate::refresher::harness_drain::warn_set_aside(home.source_key(), &newly_seen);
             Ok(dispositions)
         }
         Err(_) if stopped => Err(SourceDrainError::Stopped),
         Err(reason) => Err(SourceDrainError::Failed(reason)),
+    }
+}
+
+/// Only declared THALAMUS stores use payer facts. The user's own store keeps
+/// its original requests and recording semantics, even if sessions overlap.
+pub(crate) fn resolve_payer_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    home: &CursorHome,
+    waiting: &WaitQueue,
+    calls: &[WaitingCall],
+    now: i64,
+) -> Result<Resolution, String> {
+    if home.joins_payer() {
+        waiting.resolve_in_tx(tx, "opencode", calls, now)
+    } else {
+        Ok(Resolution {
+            ready: calls.iter().map(|call| call.request.clone()).collect(),
+            next: waiting.clone(),
+            already_recorded: 0,
+            overflow_started: false,
+        })
     }
 }
 

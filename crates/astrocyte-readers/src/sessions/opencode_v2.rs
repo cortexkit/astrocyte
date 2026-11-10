@@ -402,6 +402,12 @@ fn take_row(
             .into_bytes();
         let message: Message =
             simd_json::from_slice(&mut bytes).map_err(|e| format!("decode data: {e}"))?;
+        let completed_at_ms = message
+            .time
+            .as_ref()
+            .and_then(|time| time.completed.as_ref())
+            .and_then(serde_json::Value::as_i64)
+            .filter(|time| *time >= 0);
         let completed = message
             .time
             .as_ref()
@@ -448,6 +454,7 @@ fn take_row(
             session_id,
             updated_at_ms,
             occurred_at_ms,
+            completed_at_ms,
             // V2 assistant data has no root. session_v2.directory/path may
             // move and may name a nested location, not the original worktree.
             project_root: None,

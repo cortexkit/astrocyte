@@ -268,6 +268,7 @@ struct StoredCache {
 #[derive(Debug, Deserialize)]
 struct StoredTime {
     created: Option<f64>,
+    completed: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -878,7 +879,13 @@ fn map_stored(
     if stored.role.as_deref() != Some("assistant") {
         return None;
     }
-    let occurred_at_ms = stored.time?.created?;
+    let time = stored.time?;
+    let completed_at_ms = time
+        .completed
+        .as_ref()
+        .and_then(serde_json::Value::as_i64)
+        .filter(|time| *time >= 0);
+    let occurred_at_ms = time.created?;
     if !occurred_at_ms.is_finite() || occurred_at_ms < 0.0 || occurred_at_ms > i64::MAX as f64 {
         return None;
     }
@@ -896,6 +903,7 @@ fn map_stored(
         session_id,
         updated_at_ms,
         occurred_at_ms,
+        completed_at_ms,
         // ASTROCYTE DIVERGENCE: use the path OpenCode stored on this message.
         // The session directory is only a session-level coordinate and can name
         // a different location than the project where this message occurred.
