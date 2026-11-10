@@ -277,6 +277,34 @@ pub fn compute_plan_observations(
         .values()
         .map(|account| account.plan.clone())
         .collect();
+    if plans.is_empty() {
+        let mut row = compute_observation(
+            conn,
+            config,
+            plan,
+            rates,
+            prices,
+            snapshot_at_ms,
+            reasoning_billed_as_output,
+        )?;
+        row.eligibility_reasons = plan
+            .provider
+            .unknown_reasons
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if row.eligibility_reasons.is_empty() {
+            row.eligibility_reasons.push("vault_plan_unknown".into());
+        }
+        row.eligibility_reasons
+            .push("insufficient_clean_hours".into());
+        row.routing_eligible = false;
+        row.multiplier = None;
+        row.fee_multiplier = None;
+        return Ok(vec![row]);
+    }
     let lookup = ModelLookup::new(rates);
     let rules = ValuationRules::from_config(config, reasoning_billed_as_output);
     let mut bad_hours = BTreeSet::new();
@@ -312,8 +340,7 @@ pub fn compute_plan_observations(
         {
             let hour = event.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS;
             match event.account_ref.as_ref().filter(|account| {
-                plan.provider.credentials.is_empty()
-                    && plan.provider.accounts.contains_key(*account)
+                !plan.provider.credential_keyed && plan.provider.accounts.contains_key(*account)
             }) {
                 Some(account) => {
                     bad_hours.insert((account.clone(), hour));
@@ -369,7 +396,7 @@ pub fn compute_plan_observations(
         // other accounts saturate, so those hours count on neither side.
         let attributed = |account: Option<&String>| {
             account.is_some_and(|account| {
-                plan.provider.credentials.is_empty() && plan.provider.accounts.contains_key(account)
+                !plan.provider.credential_keyed && plan.provider.accounts.contains_key(account)
             })
         };
         let pooled_hours: BTreeSet<i64> = plan
@@ -458,8 +485,7 @@ pub fn compute_plan_observations(
             }
             let hour = event.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS;
             match event.account_ref.as_ref().filter(|account| {
-                plan.provider.credentials.is_empty()
-                    && plan.provider.accounts.contains_key(*account)
+                !plan.provider.credential_keyed && plan.provider.accounts.contains_key(*account)
             }) {
                 Some(account) => members.contains(account) && paired(account, hour),
                 None => {
@@ -483,7 +509,7 @@ pub fn compute_plan_observations(
             let slot = event
                 .account_ref
                 .as_ref()
-                .filter(|_| plan.provider.credentials.is_empty())
+                .filter(|_| !plan.provider.credential_keyed)
                 .and_then(|account| member_slots.get(account))
                 .copied()
                 .or_else(|| (members.len() == 1).then_some(0));
@@ -547,7 +573,7 @@ pub fn compute_plan_observations(
         let mut missing_quantities = 0_u64;
         for event in plan.events.iter().filter(|event| {
             event.account_ref.as_ref().is_none_or(|account| {
-                !plan.provider.credentials.is_empty()
+                !!plan.provider.credential_keyed
                     || !plan.provider.accounts.contains_key(account)
                     || members.contains(account)
             })
@@ -595,6 +621,11 @@ pub fn compute_plan_observations(
         row.gap_share = gaps as f64 / total;
         row.unpriced_share = unpriced as f64 / total;
         row.eligibility_reasons.clear();
+        if let Some(reason) = &plan.provider.membership_reason {
+            row.eligibility_reasons.push(reason.clone());
+            row.multiplier = None;
+            row.fee_multiplier = None;
+        }
         let unresolved_price = row.accounts_excluded.iter().any(|account| {
             account["reason"] != "account_not_configured"
                 && account["reason"] != "credential_not_configured"
@@ -606,7 +637,7 @@ pub fn compute_plan_observations(
             ),
             (
                 !row.unconfigured_accounts.is_empty(),
-                if plan.provider.credentials.is_empty() {
+                if !plan.provider.credential_keyed {
                     "unconfigured_accounts"
                 } else {
                     "unconfigured_credentials"

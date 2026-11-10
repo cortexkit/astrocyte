@@ -5,6 +5,47 @@ mod common;
 use common::{ckdev_binary, entries_under, output_within_guard};
 use std::process::Command;
 
+#[test]
+fn vault_check_config_accepts_scope_only_and_refuses_removed_identity_maps() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("desired.json");
+    let mut document = serde_json::json!({"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,
+        "reasoning_billed_as_output":[],"harness_ingest":{"enabled":true,"exclude":[]},
+        "subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{"codex":{
+            "window":{"pool_key":"primary","window_minutes":10080},"scope":[{"producer":"broca","provider":"openai","charge_basis":null,"model_prefix":null}]}}}});
+    let check = || {
+        output_within_guard(
+            Command::new(ckdev_binary())
+                .arg("--check-config")
+                .arg(&path)
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("XDG_CONFIG_HOME", directory.path().join("config")),
+            "vault config preflight",
+        )
+    };
+    std::fs::write(&path, document.to_string()).unwrap();
+    let output = check();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for field in ["accounts", "credentials"] {
+        document["subscription_multiplier"]["quota_providers"]["codex"][field] =
+            serde_json::json!({"id":{"plan":"openai/pro_200","price_override":null}});
+        std::fs::write(&path, document.to_string()).unwrap();
+        let output = check();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(field));
+        document["subscription_multiplier"]["quota_providers"]["codex"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+    }
+    assert!(!directory.path().join("data").exists());
+    assert!(!directory.path().join("config").exists());
+}
+
 /// With no home variable at all, the data home resolves to a relative path.
 /// Starting there would put a second, empty ledger and its logs under
 /// whatever directory the process was launched from, and that ledger would

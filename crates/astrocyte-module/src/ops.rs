@@ -692,7 +692,9 @@ fn op_subscription_report(state: &SharedState, params: Value) -> OpResult {
         astrocyte_core::report::subscription_report(conn, &request)
             .map(|value| {
                 let mut report = json!(value);
-                if let (Some(report),Some(vault)) = (report.as_object_mut(),state.vault_report().as_object()) {
+                if let (Some(report), Some(vault)) =
+                    (report.as_object_mut(), state.vault_report().as_object())
+                {
                     report.extend(vault.clone());
                 }
                 report
@@ -2192,7 +2194,7 @@ mod tests {
         let config: multiplier::MultiplierConfig = serde_json::from_value(json!({
             "api_twins": {}, "plan_price_overrides": {},
             "quota_providers": {"claude": {"window": {"pool_key": "primary", "window_minutes": 300},
-                "scope": [{"producer": "opencode", "provider": "anthropic", "charge_basis": null, "model_prefix": null}], "credentials": {}, "accounts": {"acct": {"plan": "anthropic/max_20x", "price_override": null}}}}
+                "scope": [{"producer": "opencode", "provider": "anthropic", "charge_basis": null, "model_prefix": null}]}}
         })).unwrap();
         desired.subscription_multiplier =
             crate::config::MultiplierSetting::Recorded(config.clone());
@@ -2202,6 +2204,12 @@ mod tests {
             "provider": "anthropic", "model": "model", "charge_basis": "unknown", "occurred_at_ms": 1,
             "work_class": "head", "measurements": [{"role": "input", "unit": "token", "kind": "billed", "source": "usage", "quantity_units": 100, "quantity_exponent": 0}]})).unwrap();
         state.ordered_write(|tx| {
+            astrocyte_core::vault_plan::append_in_tx(tx,&astrocyte_core::vault_plan::VaultPlan {
+                credential_id:"vault:acct".into(),provider:Some("anthropic".into()),account_id:Some("acct".into()),
+                plan_tier:Some("max_20x".into()),plan_key:Some("anthropic/max_20x".into()),source:"detected".into(),
+                effective_from_ms:0,observed_at_ms:0,
+            }).map_err(|error|error.to_string())?;
+            tx.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes) VALUES('claude','acct','primary',0,1,300)",[]).map_err(|error|error.to_string())?;
             let mut plan = multiplier::plan_observation(tx, &config, "claude", 0, 86400000).map_err(|error| error.message())?;
             plan.token_interval_ms = Some((0, 86400000));
             let rates = multiplier::ResolvedRates {

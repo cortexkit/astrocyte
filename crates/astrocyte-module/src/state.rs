@@ -192,6 +192,7 @@ fn initialize_and_hydrate(conn: &Connection) -> Result<(AstrocyteConfig, u64), S
             "foreign key enforcement did not turn on".to_string()
         }
     })?;
+    config::seed_vault_history(conn)?;
     hydrate_config(conn)
 }
 
@@ -332,7 +333,9 @@ impl SharedState {
             source_discovery: Mutex::new(HashMap::new()),
             payer_waiting: Mutex::new(BTreeMap::new()),
             quota_bus: crate::quota_events::Control::default(),
-            vault_report: RwLock::new(serde_json::json!({"vault_read_status":{"status":"not_read"}})),
+            vault_report: RwLock::new(
+                serde_json::json!({"vault_read_status":{"status":"not_read"}}),
+            ),
             recent_steps: Mutex::new(crate::recent_steps::RecentSteps::default()),
             step_feed: crate::step_feed::FeedHub::default(),
             #[cfg(test)]
@@ -632,11 +635,19 @@ impl SharedState {
     }
 
     pub(crate) fn vault_report(&self) -> serde_json::Value {
-        self.0.vault_report.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.0
+            .vault_report
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_vault_report(&self, report: serde_json::Value) {
-        *self.0.vault_report.write().unwrap_or_else(std::sync::PoisonError::into_inner) = report;
+        *self
+            .0
+            .vault_report
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = report;
     }
 
     pub(crate) fn capacity_poll_ticket(

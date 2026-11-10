@@ -3752,10 +3752,17 @@ impl MultiplierStage {
                     continue;
                 }
                 match state.with_read_op(|conn| {
-                    for account in multiplier_config.quota_providers[quota_provider]
-                        .members()
-                        .values()
-                    {
+                    let provider = multiplier::resolve_membership(
+                        conn,
+                        &multiplier_config.quota_providers[quota_provider],
+                        quota_provider,
+                        interval_end_ms,
+                    )
+                    .map_err(|error| (error.code().to_string(), error.message()))?;
+                    if provider.members().is_empty() {
+                        return Ok(false);
+                    }
+                    for account in provider.members().values() {
                         if multiplier::observation_plan_head(
                             conn,
                             quota_provider,
@@ -4068,21 +4075,6 @@ fn compute_multiplier_day(
         message,
         needs_config: false,
     };
-    let provider = config
-        .quota_providers
-        .get(quota_provider)
-        .ok_or_else(|| DayError {
-            code: "unknown_quota_provider".into(),
-            message: format!("quota provider '{quota_provider}' is not configured"),
-            needs_config: true,
-        })?;
-    let plan_prices = multiplier::resolve_plans(plan_prices, config, provider, snapshot_at_ms)
-        .map_err(|error| DayError {
-            // Without a plan-price source only a configuration change helps;
-            // a failed call to a configured one may succeed on the next tick.
-            needs_config: plan_prices.is_none(),
-            ..failed(error)
-        })?;
     let plan = state
         .with_read_op(|conn| {
             multiplier::plan_observation(
@@ -4095,6 +4087,13 @@ fn compute_multiplier_day(
             .map_err(|error| (error.code().to_string(), error.message()))
         })
         .map_err(read_failed)?;
+    let plan_prices =
+        multiplier::resolve_plans(plan_prices, config, &plan.provider, snapshot_at_ms).map_err(
+            |error| DayError {
+                needs_config: plan_prices.is_none(),
+                ..failed(error)
+            },
+        )?;
     let models = multiplier::catalog_models(config, &plan);
     let rates = multiplier::resolve_rates(catalog, &models, snapshot_at_ms).map_err(failed)?;
     let observation = state
@@ -7850,9 +7849,7 @@ mod multiplier_stage_tests {
             "plan_price_overrides": {},
             "quota_providers": {"codex": {
                 "window": {"pool_key": "primary", "window_minutes": 10080},
-                "scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null}],
-                "credentials": {},
-                "accounts": {"acct": {"plan": "openai/pro_20x", "price_override": null}}
+                "scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null}]
             }}
         },
         "harness_ingest": {"enabled": true, "exclude": []}
@@ -7863,8 +7860,46 @@ mod multiplier_stage_tests {
     }
 
     fn publish_document(state: &Arc<SharedState>, directory: &tempfile::TempDir, document: &str) {
+        let mut document: serde_json::Value = serde_json::from_str(document).unwrap();
+        if let Some(providers) =
+            document["subscription_multiplier"]["quota_providers"].as_object_mut()
+        {
+            for provider in providers.values_mut() {
+                for field in ["accounts", "credentials"] {
+                    if let Some(members) = provider.as_object_mut().unwrap().remove(field) {
+                        for (id, member) in members.as_object().unwrap() {
+                            let key = member["plan"].as_str().unwrap();
+                            let (provider, tier) = key.split_once('/').unwrap();
+                            state
+                                .ordered_write(|tx| {
+                                    astrocyte_core::vault_plan::append_in_tx(
+                                        tx,
+                                        &astrocyte_core::vault_plan::VaultPlan {
+                                            credential_id: if field == "credentials" {
+                                                id.clone()
+                                            } else {
+                                                format!("fixture:{id}")
+                                            },
+                                            provider: Some(provider.into()),
+                                            account_id: (field == "accounts").then(|| id.clone()),
+                                            plan_tier: Some(tier.into()),
+                                            plan_key: Some(key.into()),
+                                            source: "config".into(),
+                                            effective_from_ms: 0,
+                                            observed_at_ms: 0,
+                                        },
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                    Ok(((), true))
+                                })
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+        }
         let path = directory.path().join("astrocyte.jsonc");
-        std::fs::write(&path, document).unwrap();
+        std::fs::write(&path, document.to_string()).unwrap();
         reload_config(state, Ok(path)).unwrap();
     }
 
@@ -7996,6 +8031,11 @@ mod multiplier_stage_tests {
     fn seed_usage(state: &SharedState) {
         state
             .ordered_write(|tx| {
+                astrocyte_core::vault_plan::append_in_tx(tx,&astrocyte_core::vault_plan::VaultPlan {
+                    credential_id:"fixture:acct".into(),provider:Some("openai".into()),account_id:Some("acct".into()),
+                    plan_tier:Some("pro_20x".into()),plan_key:Some("openai/pro_20x".into()),source:"config".into(),
+                    effective_from_ms:0,observed_at_ms:0,
+                }).map_err(|error|error.to_string())?;
                 // The leased fixture seeds BROCA for drain tests; this fixture
                 // has no active store reader unless a test adds one explicitly.
                 tx.execute("DELETE FROM source_runtime", [])

@@ -22,11 +22,11 @@ fn v2_event(
     conn.execute("INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent) VALUES ((SELECT event_key FROM usage_event WHERE event_id=?1),'input','token','billed','input',?2,?3)", params![id, quantity, quantity.map(|_| 0)]).unwrap();
 }
 
-fn fixture(conn: &Connection) -> MultiplierConfig {
+fn fixture(conn: &Connection) -> FixtureConfig {
     fixture_quantity(conn, Some(1_000_000))
 }
 
-fn fixture_quantity(conn: &Connection, quantity: Option<i64>) -> MultiplierConfig {
+fn fixture_quantity(conn: &Connection, quantity: Option<i64>) -> FixtureConfig {
     let config = config(vec![rule("pi", "openai", None)]);
     for minute in (0..=48 * 60).step_by(5) {
         reset_reading(
@@ -41,11 +41,11 @@ fn fixture_quantity(conn: &Connection, quantity: Option<i64>) -> MultiplierConfi
     config
 }
 
-fn stable_fixture(conn: &Connection) -> MultiplierConfig {
+fn stable_fixture(conn: &Connection) -> FixtureConfig {
     stability_fixture(conn, [1, 1, 1])
 }
 
-fn stability_fixture(conn: &Connection, daily_scale: [i64; 3]) -> MultiplierConfig {
+fn stability_fixture(conn: &Connection, daily_scale: [i64; 3]) -> FixtureConfig {
     let config = config(vec![rule("pi", "openai", None)]);
     for minute in (0..=3 * 24 * 60).step_by(5) {
         reset_reading(
@@ -72,7 +72,7 @@ fn stability_fixture(conn: &Connection, daily_scale: [i64; 3]) -> MultiplierConf
     config
 }
 
-fn rows(conn: &Connection, config: &MultiplierConfig) -> Vec<Observation> {
+fn rows(conn: &Connection, config: &FixtureConfig) -> Vec<Observation> {
     let plan = plan_observation(conn, config, "codex", 0, 48 * HOUR_MS).unwrap();
     compute_plan_observations(
         conn,
@@ -86,24 +86,42 @@ fn rows(conn: &Connection, config: &MultiplierConfig) -> Vec<Observation> {
     .unwrap()
 }
 
-fn credential_fixture(conn: &Connection, refs: &[&str]) -> MultiplierConfig {
+fn credential_fixture(conn: &Connection, refs: &[&str]) -> FixtureConfig {
     let mut config = stable_fixture(conn);
     let provider = config.quota_providers.get_mut("codex").unwrap();
     let declaration = provider.accounts.remove("acct").unwrap();
     for credential in refs {
-        provider.credentials.insert((*credential).into(), declaration.clone());
+        provider
+            .credentials
+            .insert((*credential).into(), declaration.clone());
         conn.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes,resets_at,source)
             SELECT provider,?1,pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes,resets_at,source FROM window_sample WHERE account_ref='acct'", [credential]).unwrap();
     }
+    conn.execute("DELETE FROM window_sample WHERE provider='codex'", [])
+        .unwrap();
     config.validate().unwrap();
     config
 }
 
-fn credential_rows(conn: &Connection, config: &MultiplierConfig) -> Vec<Observation> {
+fn credential_rows(conn: &Connection, config: &FixtureConfig) -> Vec<Observation> {
     let plan = plan_observation(conn, config, "codex", 0, 72 * HOUR_MS).unwrap();
-    let source = Served(PlanPricesResponse { prices: vec![served_price("pro_20x", Some(20_000), None)], resolved_at_ms: 0, tier_vocabulary: "vendor".into(), unit_policy: "list".into() });
+    let source = Served(PlanPricesResponse {
+        prices: vec![served_price("pro_20x", Some(20_000), None)],
+        resolved_at_ms: 0,
+        tier_vocabulary: "vendor".into(),
+        unit_policy: "list".into(),
+    });
     let prices = resolve_plans(Some(&source), config, &config.quota_providers["codex"], 0).unwrap();
-    compute_plan_observations(conn, config, &plan, &rates_for(&[("openai", "m")], 100, None), &prices, 72 * HOUR_MS, &[]).unwrap()
+    compute_plan_observations(
+        conn,
+        config,
+        &plan,
+        &rates_for(&[("openai", "m")], 100, None),
+        &prices,
+        72 * HOUR_MS,
+        &[],
+    )
+    .unwrap()
 }
 
 #[test]
@@ -120,10 +138,25 @@ fn v2_credential_counter_produces_eligible_plan_and_truthful_report_identity() {
     let tx = conn.transaction().unwrap();
     insert_observation_in_tx(&tx, &row).unwrap();
     tx.commit().unwrap();
-    let report = multiplier_report(&conn, &MultiplierReportRequest { from_ms: 0, to_ms: 73 * HOUR_MS }).unwrap();
-    assert_eq!(report["latest"][0]["accounts_included"][0]["credential_ref"], "apikey:one");
-    assert_eq!(report["latest"][0]["plan_prices"][0]["credential_ref"], "apikey:one");
-    assert!(report["latest"][0]["plan_prices"][0].get("account_ref").is_none());
+    let report = multiplier_report(
+        &conn,
+        &MultiplierReportRequest {
+            from_ms: 0,
+            to_ms: 73 * HOUR_MS,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        report["latest"][0]["accounts_included"][0]["credential_ref"],
+        "apikey:one"
+    );
+    assert_eq!(
+        report["latest"][0]["plan_prices"][0]["credential_ref"],
+        "apikey:one"
+    );
+    assert!(report["latest"][0]["plan_prices"][0]
+        .get("account_ref")
+        .is_none());
 }
 
 #[test]
@@ -132,7 +165,10 @@ fn v2_credential_counters_never_guess_token_shares_for_multiple_keys() {
     let config = credential_fixture(&conn, &["apikey:one", "apikey:two"]);
     let row = credential_rows(&conn, &config).remove(0);
     assert!(!row.routing_eligible);
-    assert!(row.eligibility_reasons.iter().any(|reason| reason == "multiple_credentials_without_token_attribution"));
+    assert!(row
+        .eligibility_reasons
+        .iter()
+        .any(|reason| reason == "multiple_credentials_without_token_attribution"));
     assert!(row.multiplier.is_none() && row.fee_multiplier.is_none());
     assert_eq!(row.tokens.input, 0);
     assert_eq!(row.api_nanos, 0);
@@ -168,7 +204,10 @@ fn v2_fee_ratio_counts_calls_in_every_hour_but_quota_ratio_only_clean_ones() {
     .unwrap();
     v2_event(&conn, "unclean", None, "m", 21 * HOUR_MS, Some(1_000_000));
     let row = rows(&conn, &config).remove(0);
-    assert_eq!(row.api_nanos, 100, "the quota side counts only the clean call");
+    assert_eq!(
+        row.api_nanos, 100,
+        "the quota side counts only the clean call"
+    );
     let fee = row.fee_multiplier.expect("fee ratio");
     assert!(
         (fee - 200.0 / row.fee_paid_nanos as f64).abs() < 1e-12,
@@ -217,27 +256,72 @@ fn v2_credential_scopes_and_plan_prices_use_their_own_provider_names() {
     let conn = conn();
     for (quota, ledger, tier, slot, minutes, monthly) in [
         ("opencodego", "opencode-go", "go", "tertiary", 43200, 1000),
-        ("kimi-for-coding", "kimi-code-plan-global", "allegro", "primary", 10080, 9900),
+        (
+            "kimi-for-coding",
+            "kimi-code-plan-global",
+            "allegro",
+            "primary",
+            10080,
+            9900,
+        ),
     ] {
-        let mut config = config(vec![rule("broca", ledger, None), rule("opencode", ledger, None)]);
+        let mut config = config(vec![
+            rule("broca", ledger, None),
+            rule("opencode", ledger, None),
+        ]);
         let mut provider = config.quota_providers.remove("codex").unwrap();
-        provider.window = WindowSelector { pool_key: slot.into(), window_minutes: minutes };
+        provider.window = WindowSelector {
+            pool_key: slot.into(),
+            window_minutes: minutes,
+        };
         provider.accounts.clear();
-        provider.credentials.insert(format!("apikey:{quota}"), AccountPlan { plan: format!("{ledger}/{tier}"), price_override: None });
+        provider.credentials.insert(
+            format!("apikey:{quota}"),
+            AccountPlan {
+                plan: format!("{ledger}/{tier}"),
+            },
+        );
         config.quota_providers.insert(quota.into(), provider);
         config.validate().unwrap();
         for producer in ["broca", "opencode"] {
-            event(&conn, &format!("{quota}-{producer}"), producer, ledger, "m", "unknown", HOUR_MS, &[("input", "input", 123)]);
+            event(
+                &conn,
+                &format!("{quota}-{producer}"),
+                producer,
+                ledger,
+                "m",
+                "unknown",
+                HOUR_MS,
+                &[("input", "input", 123)],
+            );
         }
-        event(&conn, &format!("{quota}-not-ledger"), "broca", quota, "wrong", "unknown", HOUR_MS, &[("input", "input", 999)]);
+        event(
+            &conn,
+            &format!("{quota}-not-ledger"),
+            "broca",
+            quota,
+            "wrong",
+            "unknown",
+            HOUR_MS,
+            &[("input", "input", 999)],
+        );
         let plan = plan_observation(&conn, &config, quota, 0, 72 * HOUR_MS).unwrap();
         assert_eq!(plan.events.len(), 2);
-        assert!(plan.events.iter().all(|event| event.tokens.provider == ledger));
+        assert!(plan
+            .events
+            .iter()
+            .all(|event| event.tokens.provider == ledger));
         let source = Served(PlanPricesResponse {
-            prices: vec![fusiform_protocol::PlanPriceWire { provider_id: ledger.into(), ..served_price(tier, Some(monthly), None) }],
-            resolved_at_ms: 0, tier_vocabulary: "vendor".into(), unit_policy: "list".into(),
+            prices: vec![fusiform_protocol::PlanPriceWire {
+                provider_id: ledger.into(),
+                ..served_price(tier, Some(monthly), None)
+            }],
+            resolved_at_ms: 0,
+            tier_vocabulary: "vendor".into(),
+            unit_policy: "list".into(),
         });
-        let prices = resolve_plans(Some(&source), &config, &config.quota_providers[quota], 0).unwrap();
+        let prices =
+            resolve_plans(Some(&source), &config, &config.quota_providers[quota], 0).unwrap();
         let price = prices.values().next().unwrap();
         assert_eq!(price.monthly_nanos, Some(monthly * 10_000_000));
         assert_eq!(price.source.as_deref(), Some("fusiform"));
@@ -530,7 +614,14 @@ fn v2_attribution_uses_own_clean_hours_and_never_pools_plans() {
         );
     }
     v2_event(&conn, "matched", Some("acct"), "m", HOUR_MS / 2, Some(7));
-    v2_event(&conn, "unmatched", None, "m", 3 * HOUR_MS + HOUR_MS / 2, Some(999));
+    v2_event(
+        &conn,
+        "unmatched",
+        None,
+        "m",
+        3 * HOUR_MS + HOUR_MS / 2,
+        Some(999),
+    );
     v2_event(&conn, "other", Some("second"), "m", 10 * HOUR_MS, Some(11));
     let same_plan = rows(&conn, &config).remove(0);
     // "matched" counts in hour 0 on its own clean account even with `second`
@@ -677,7 +768,7 @@ fn v2_measure_store_clone() {
     let path = std::env::var("ASTROCYTE_MULTIPLIER_STORE_CLONE").expect("store clone path");
     let config_path =
         std::env::var("ASTROCYTE_MULTIPLIER_MEASURE_CONFIG").expect("scope file path");
-    let config: MultiplierConfig =
+    let config: FixtureConfig =
         serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
     let conn =
         Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
@@ -1240,7 +1331,7 @@ fn v2_latest_uses_ordered_plan_heads_instead_of_legacy_pool() {
     assert_eq!(series.iter().filter(|row| row["plan"].is_null()).count(), 1);
 }
 
-fn observations_on_clone(conn: &Connection, config: &MultiplierConfig) -> Vec<Observation> {
+fn observations_on_clone(conn: &Connection, config: &FixtureConfig) -> Vec<Observation> {
     let mut rates = ResolvedRates {
         resolved_at_ms: utc_day_start_ms("2026-10-28").unwrap(),
         models: BTreeMap::new(),
@@ -1299,6 +1390,163 @@ fn observations_on_clone(conn: &Connection, config: &MultiplierConfig) -> Vec<Ob
     observations
 }
 
+#[test]
+fn vault_seeded_history_recomputes_the_day_identically_to_old_config() {
+    let mut conn = conn();
+    let config = stable_fixture(&conn);
+    let provider = config.quota_providers["codex"].clone();
+    let mut events = Vec::new();
+    for_scoped_events(&conn, &provider.scope, 0, 72 * HOUR_MS, |event| {
+        events.push(event);
+        Ok(())
+    })
+    .unwrap();
+    let accounts: Vec<_> = provider
+        .accounts
+        .keys()
+        .map(|id| {
+            clean::counter_delta(
+                &conn,
+                "codex",
+                (id, false),
+                &provider.window,
+                0,
+                72 * HOUR_MS,
+            )
+            .unwrap()
+        })
+        .collect();
+    let token_interval_ms = accounts
+        .iter()
+        .filter_map(|account| account.coverage_ms)
+        .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
+    // This is the removed config-driven planner's input: no history lookup is
+    // used to build the expected observation.
+    let legacy = ObservationPlan {
+        quota_provider: "codex".into(),
+        provider,
+        interval_start_ms: 0,
+        interval_end_ms: 72 * HOUR_MS,
+        accounts,
+        unconfigured_accounts: Vec::new(),
+        token_interval_ms,
+        models: BTreeSet::new(),
+        events,
+    };
+    let rates = rates_for(&[("openai", "m")], 100, None);
+    let expected = compute_plan_observations(
+        &conn,
+        &config,
+        &legacy,
+        &rates,
+        &priced_plan(),
+        72 * HOUR_MS,
+        &[],
+    )
+    .unwrap();
+    let tx = conn.transaction().unwrap();
+    insert_observation_in_tx(&tx, &expected[0]).unwrap();
+    crate::vault_plan::seed_config_in_tx(
+        &tx,
+        &serde_json::json!({"quota_providers":{"codex":{
+        "accounts":{"acct":{"plan":"openai/pro_20x","price_override":null}},"credentials":{}}}}),
+        123,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let actual_plan =
+        super::plan_observation(&conn, &config.declarations(), "codex", 0, 72 * HOUR_MS).unwrap();
+    let actual = compute_plan_observations(
+        &conn,
+        &config,
+        &actual_plan,
+        &rates,
+        &priced_plan(),
+        72 * HOUR_MS,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+    let row = crate::vault_plan::at(&conn, 72 * HOUR_MS)
+        .unwrap()
+        .remove(0);
+    assert_eq!((row.source.as_str(), row.effective_from_ms), ("config", 0));
+}
+
+#[test]
+fn vault_mixed_identity_namespaces_make_the_day_unmeasurable_by_name() {
+    let mut conn = conn();
+    let config = stable_fixture(&conn);
+    conn.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at)
+        SELECT provider,'apikey:one',pool_key,fetched_at_instant,used_percent,window_minutes,resets_at FROM window_sample",[]).unwrap();
+    let tx = conn.transaction().unwrap();
+    crate::vault_plan::seed_config_in_tx(
+        &tx,
+        &serde_json::json!({"quota_providers":{"codex":{
+        "accounts":{"acct":{"plan":"openai/pro_20x","price_override":null}},
+        "credentials":{"apikey:one":{"plan":"openai/pro_20x","price_override":null}}}}}),
+        123,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let plan =
+        super::plan_observation(&conn, &config.declarations(), "codex", 0, 72 * HOUR_MS).unwrap();
+    let row = compute_plan_observations(
+        &conn,
+        &config,
+        &plan,
+        &rates_for(&[("openai", "m")], 100, None),
+        &priced_plan(),
+        72 * HOUR_MS,
+        &[],
+    )
+    .unwrap()
+    .remove(0);
+    assert!(row
+        .eligibility_reasons
+        .contains(&"mixed_identity_namespaces".into()));
+    assert!(!row.routing_eligible);
+    assert!(row.multiplier.is_none() && row.fee_multiplier.is_none());
+}
+
+#[test]
+fn vault_credential_keyed_go_and_kimi_join_by_vault_id_and_day_end() {
+    for (quota, provider, tier) in [
+        ("opencodego", "opencode-go", "go"),
+        ("kimi-for-coding", "kimi-code-plan-global", "allegro"),
+    ] {
+        let mut conn = conn();
+        let config: super::MultiplierConfig = serde_json::from_value(serde_json::json!({"api_twins":{},"plan_price_overrides":{},"quota_providers":{
+            quota:{"window":{"pool_key":"primary","window_minutes":10080},"scope":[{"producer":"broca","provider":provider,"charge_basis":null,"model_prefix":null}]}}})).unwrap();
+        conn.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent,window_minutes) VALUES(?1,'vault-id','primary',0,1,10080)",[quota]).unwrap();
+        let tx = conn.transaction().unwrap();
+        crate::vault_plan::append_in_tx(
+            &tx,
+            &crate::vault_plan::VaultPlan {
+                credential_id: "vault-id".into(),
+                provider: Some(provider.into()),
+                account_id: None,
+                plan_tier: Some(tier.into()),
+                plan_key: Some(format!("{provider}/{tier}")),
+                source: "operator".into(),
+                effective_from_ms: 1,
+                observed_at_ms: 1,
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let before = super::plan_observation(&conn, &config, quota, 0, 1).unwrap();
+        assert!(before.provider.members().is_empty());
+        let after = super::plan_observation(&conn, &config, quota, 0, 2).unwrap();
+        assert_eq!(
+            after.provider.credentials["vault-id"].plan,
+            format!("{provider}/{tier}")
+        );
+        assert!(after.provider.accounts.is_empty());
+        assert_eq!(after.unconfigured_accounts.len(), 0);
+    }
+}
+
 fn sorted_json(value: Value) -> Value {
     match value {
         Value::Object(object) => {
@@ -1337,7 +1585,7 @@ fn v2_capture_store_clone_report() {
     let output = std::env::var_os("ASTROCYTE_MULTIPLIER_CAPTURE_OUTPUT").expect("output file path");
     let config_path =
         std::env::var_os("ASTROCYTE_MULTIPLIER_MEASURE_CONFIG").expect("scope file path");
-    let config: MultiplierConfig =
+    let config: FixtureConfig =
         serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
     let store = open_sqlite(&StorageDescriptor {
         module_id: "astrocyte".into(),

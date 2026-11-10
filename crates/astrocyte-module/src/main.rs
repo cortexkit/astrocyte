@@ -1055,6 +1055,7 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
 /// the bus reader authenticates with it to follow runners' step events in
 /// every configuration, and to read quota notices when insula is configured.
 /// BROCA never is: its usage is read from its store, not over subc.
+/// Claustrum is always called for subscription tiers with a list-only grant.
 /// Colliculus is called when its media source is ingested.
 fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
     let of: Vec<String> = [
@@ -2432,9 +2433,7 @@ mod tests {
             "subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},
                 "quota_providers":{"antigravity":{
                     "window":{"pool_key":"extra:13:gemini-weekly","window_minutes":10080},
-                    "scope":[{"producer":"broca","provider":"google","charge_basis":null,"model_prefix":null}],
-                    "credentials":{},
-                    "accounts":{"acct":{"plan":"google/ai_pro","price_override":null}}
+                    "scope":[{"producer":"broca","provider":"google","charge_basis":null,"model_prefix":null}]
                 }}}, "harness_ingest":{"enabled":true,"exclude":[]}});
         let mut output = Vec::new();
         std::fs::write(&path, document.to_string()).unwrap();

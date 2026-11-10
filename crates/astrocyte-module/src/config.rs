@@ -230,11 +230,27 @@ pub(crate) fn decode_multiplier_column(
         .and_then(serde_json::Value::as_object_mut)
     {
         for provider in providers.values_mut() {
-            // Older stored generations could declare account plans only.
+            // Live documents reject the removed identity maps. Stored
+            // generations retain their plans in the seeded vault history.
             if let Some(provider) = provider.as_object_mut() {
-                provider
-                    .entry("credentials")
-                    .or_insert_with(|| serde_json::json!({}));
+                for field in ["accounts", "credentials"] {
+                    if let Some(members) = provider.remove(field) {
+                        for plan in members
+                            .as_object()
+                            .ok_or_else(|| {
+                                ConfigError::Decode(format!("stored {field} must be an object"))
+                            })?
+                            .values()
+                        {
+                            if plan
+                                .get("price_override")
+                                .is_some_and(|value| !value.is_null())
+                            {
+                                return Err(ConfigError::Decode("stored per-account price_override is no longer supported; refusing to discard a non-null override".into()));
+                            }
+                        }
+                    }
+                }
             }
             if let Some(scope) = provider
                 .get_mut("scope")
@@ -253,6 +269,38 @@ pub(crate) fn decode_multiplier_column(
         .map_err(|error| ConfigError::Decode(format!("subscription_multiplier: {error}")))?;
     config.validate().map_err(ConfigError::Validation)?;
     Ok(MultiplierSetting::Recorded(config))
+}
+
+/// Seed once from the committed generation, before live config replacement
+/// can remove the old maps. The marker and rows commit together.
+pub(crate) fn seed_vault_history(conn: &rusqlite::Connection) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let seeded: bool = tx
+        .query_row("SELECT EXISTS(SELECT 1 FROM vault_plan_seed)", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| error.to_string())?;
+    if seeded {
+        return Ok(());
+    }
+    let column: Option<String> = tx
+        .query_row(
+            "SELECT subscription_multiplier FROM desired_config WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    decode_multiplier_column(column.as_deref()).map_err(|error| error.to_string())?;
+    let value = column
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(serde_json::Value::Null);
+    astrocyte_core::vault_plan::seed_config_in_tx(&tx, &value, crate::state::now_ms())?;
+    tx.commit().map_err(|error| error.to_string())
 }
 
 /// Read `reasoning_billed_as_output` from the generation JSON. If absent, use
@@ -475,9 +523,7 @@ mod tests {
         "plan_price_overrides": {},
         "quota_providers": {"codex": {
             "window": {"pool_key": "primary", "window_minutes": 10080},
-            "scope": [{"producer": "pi", "provider": "openai-codex", "charge_basis": null, "model_prefix": null}],
-            "credentials": {},
-            "accounts": {"acct": {"plan": "openai/pro_20x", "price_override": null}}
+            "scope": [{"producer": "pi", "provider": "openai-codex", "charge_basis": null, "model_prefix": null}]
         }}
     }"#;
 
@@ -618,9 +664,6 @@ mod tests {
     #[test]
     fn the_multiplier_member_is_closed_at_every_level() {
         assert!(decode(&with_multiplier(CODEX)).is_ok());
-        let missing_credentials = CODEX.replace("\"credentials\": {},", "");
-        let error = decode(&with_multiplier(&missing_credentials)).unwrap_err();
-        assert!(error.to_string().contains("credentials"), "{error}");
         // An unknown member inside a nested object.
         let unknown = CODEX.replace(
             r#""window_minutes": 10080"#,
@@ -640,25 +683,11 @@ mod tests {
             r#""model_prefix": "antigravity-gemini-""#,
         );
         assert!(decode(&with_multiplier(&prefixed)).is_ok());
-        let missing = CODEX.replace(r#", "price_override": null"#, "");
-        let error = decode(&with_multiplier(&missing)).unwrap_err();
-        assert!(error.to_string().contains("price_override"), "{error}");
-        // A repeated account would otherwise silently replace the first.
-        let duplicate = CODEX.replace(
-            r#""accounts": {"acct": {"plan": "openai/pro_20x", "price_override": null}}"#,
-            r#""accounts": {"acct": {"plan": "openai/pro_20x", "price_override": null}, "acct": {"plan": "openai/pro_5x", "price_override": null}}"#,
-        );
-        let error = decode(&with_multiplier(&duplicate)).unwrap_err();
-        assert!(
-            error.to_string().contains("duplicate member 'acct'"),
-            "{error}"
-        );
     }
 
     #[test]
     fn multiplier_values_are_validated() {
         for (from, to, needle) in [
-            ("openai/pro_20x", "pro_20x", "plan key"),
             (
                 r#""charge_basis": null"#,
                 r#""charge_basis": "free""#,
@@ -670,11 +699,6 @@ mod tests {
                 r#""model_prefix": """#,
                 "model_prefix",
             ),
-            (
-                r#""price_override": null"#,
-                r#""price_override": {"minor_units": 20000, "exponent": 2, "currency": "EUR", "period": "month"}"#,
-                "USD",
-            ),
         ] {
             let error = decode(&with_multiplier(&CODEX.replace(from, to))).unwrap_err();
             assert!(error.to_string().contains(needle), "{needle}: {error}");
@@ -682,33 +706,26 @@ mod tests {
     }
 
     #[test]
-    fn credential_plan_config_is_closed_validated_and_old_columns_still_decode() {
-        let credential = CODEX
-            .replace(
-                "\"accounts\": {\"acct\"",
-                "\"accounts\": {}, \"credentials\": {\"apikey:one\"",
-            )
-            .replace("\"credentials\": {},", "");
-        assert!(decode(&with_multiplier(&credential)).is_ok());
-        for (text, needle) in [
-            (credential.replace("apikey:one", ""), "credential_ref"),
-            (credential.replace("openai/pro_20x", "no-slash"), "plan key"),
-            (credential.replace("\"plan\":", "\"unknown\": true, \"plan\":"), "unknown"),
-            (credential.replace("\"accounts\": {}", "\"accounts\": {\"acct\": {\"plan\": \"openai/pro_20x\", \"price_override\": null}}"), "never both"),
-            (credential.replace("\"apikey:one\":", "\"apikey:one\": {\"plan\": \"openai/pro_20x\", \"price_override\": null}, \"apikey:one\":"), "duplicate member"),
-        ] {
-            let error = decode(&with_multiplier(&text)).unwrap_err();
-            assert!(error.to_string().contains(needle), "{needle}: {error}");
+    fn vault_old_config_hydrates_but_live_maps_are_refused_and_nonnull_override_is_not_lost() {
+        assert!(decode(&with_multiplier(CODEX)).is_ok());
+        for field in ["accounts", "credentials"] {
+            let mut old: serde_json::Value = serde_json::from_str(CODEX).unwrap();
+            old["quota_providers"]["codex"][field] =
+                serde_json::json!({"acct":{"plan":"openai/pro_20x","price_override":null}});
+            assert!(decode(&with_multiplier(&old.to_string()))
+                .unwrap_err()
+                .to_string()
+                .contains(field));
+            assert_eq!(
+                decode_multiplier_column(Some(&old.to_string())).unwrap(),
+                decode_multiplier_column(Some(CODEX)).unwrap()
+            );
+            old["quota_providers"]["codex"][field]["acct"]["price_override"] = serde_json::json!({"minor_units":20_000,"exponent":2,"currency":"USD","period":"month"});
+            assert!(decode_multiplier_column(Some(&old.to_string()))
+                .unwrap_err()
+                .to_string()
+                .contains("non-null override"));
         }
-        let old = CODEX.replace("\"credentials\": {},", "");
-        let stored = decode_multiplier_column(Some(&old)).unwrap();
-        let MultiplierSetting::Recorded(stored) = stored else {
-            panic!("missing stored config")
-        };
-        assert!(stored.quota_providers["codex"].credentials.is_empty());
-        assert!(stored.quota_providers["codex"]
-            .accounts
-            .contains_key("acct"));
     }
 
     /// The production document shipped with the binary must decode under this

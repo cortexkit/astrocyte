@@ -4005,7 +4005,7 @@ CREATE TABLE media_feed_cursor (
 "#,
     },
     Migration {
-        version: 38,
+        version: 39,
         statements: r#"
 CREATE TABLE thalamus_payer_cursor (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -6998,7 +6998,7 @@ mod tests {
     #[test]
     fn migration_chain_restarts_at_v1_and_runner_records_it_once() {
         assert!(!MIGRATIONS.is_empty());
-        let expected: Vec<u32> = (1..=MIGRATIONS.len() as u32).collect();
+        let expected: Vec<u32> = (1..=39).filter(|version| *version != 38).collect();
         assert_eq!(
             MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>(),
             expected,

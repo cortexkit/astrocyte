@@ -1,5 +1,5 @@
 // ck-astrocyte v2 — production config example.
-// The paths and account references below are placeholders; replace them before use.
+// The paths below are placeholders; replace them before use.
 //
 // The desired format is closed: every member below is required, a null is a
 // legal "not configured", and an unknown or missing member is a parse failure.
@@ -38,8 +38,7 @@
     "api_twins": { "openai-codex": "openai" },
 
     // Monthly price per fusiform plan key, used instead of fusiform's. None:
-    // fusiform prices openai/pro_20x and anthropic/max_20x. (It refuses bare
-    // openai/pro, which is why the accounts below name the tier.)
+    // fusiform supplies sourced prices for the vault's exact provider/tier keys.
     "plan_price_overrides": {},
 
     "quota_providers": {
@@ -51,13 +50,7 @@
           { "producer": "pi", "provider": "openai-codex", "charge_basis": null, "model_prefix": null },
           { "producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null },
           { "producer": "broca", "provider": "openai", "charge_basis": "subscription_included", "model_prefix": null }
-        ],
-        // These sample references both use the same example plan.
-        "credentials": {},
-        "accounts": {
-          "sample-codex-account-1": { "plan": "openai/pro_20x", "price_override": null },
-          "sample-codex-account-2": { "plan": "openai/pro_20x", "price_override": null }
-        }
+        ]
       },
       "claude": {
         // secondary is the overall 7-day pool every Claude model draws on,
@@ -68,18 +61,7 @@
           { "producer": "opencode", "provider": "anthropic", "charge_basis": null, "model_prefix": null },
           { "producer": "claude-code", "provider": "anthropic", "charge_basis": null, "model_prefix": null },
           { "producer": "broca", "provider": "anthropic", "charge_basis": "subscription_included", "model_prefix": null }
-        ],
-        // These sample account references are illustrative, not real account IDs.
-        "credentials": {},
-        "accounts": {
-          "sample-claude-account-1": { "plan": "anthropic/max_20x", "price_override": null },
-          "sample-claude-account-2": { "plan": "anthropic/max_20x", "price_override": null },
-          "sample-claude-account-3": { "plan": "anthropic/max_20x", "price_override": null },
-          "sample-claude-account-4": { "plan": "anthropic/max_20x", "price_override": null },
-          "sample-claude-account-5": { "plan": "anthropic/max_20x", "price_override": null },
-          "sample-claude-account-6": { "plan": "anthropic/max_20x", "price_override": null },
-          "sample-claude-account-7": { "plan": "anthropic/max_20x", "price_override": null }
-        }
+        ]
       }
     }
   },

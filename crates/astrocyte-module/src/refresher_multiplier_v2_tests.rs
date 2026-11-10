@@ -136,22 +136,32 @@ fn v2_credential_daily_stage_records_and_serves_the_plan_once() {
     let state = Arc::new(state::leased_test_state(&directory));
     let mut document: serde_json::Value = serde_json::from_str(DESIRED).unwrap();
     let provider = &mut document["subscription_multiplier"]["quota_providers"]["codex"];
-    provider["credentials"] = json!({"apikey:one": provider["accounts"]["acct"].clone()});
+    provider["credentials"] =
+        json!({"apikey:one": {"plan":"openai/pro_20x","price_override":null}});
     provider["accounts"] = json!({});
+    let providers = document["subscription_multiplier"]["quota_providers"]
+        .as_object_mut()
+        .unwrap();
+    let provider = providers.remove("codex").unwrap();
+    providers.insert("credential-pool".into(), provider);
     publish_document(&state, &directory, &document.to_string());
     let fusiform = FakeFusiform::new(false);
     install_catalog(&state, &fusiform);
     seed_usage(&state);
     state.ordered_write(|tx| {
-        tx.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at) SELECT provider,'apikey:one',pool_key,fetched_at_instant,used_percent,window_minutes,resets_at FROM window_sample", []).map_err(|error| error.to_string())?;
+        tx.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at) SELECT 'credential-pool','apikey:one',pool_key,fetched_at_instant,used_percent,window_minutes,resets_at FROM window_sample", []).map_err(|error| error.to_string())?;
         Ok(((), true))
     }).unwrap();
     MultiplierStage::new(Some(fusiform.clone())).tick(&state, false, NOW);
     assert_eq!(current_day_observations(&state).len(), 1);
     MultiplierStage::new(Some(fusiform)).tick(&state, false, NOW + 60_000);
     assert_eq!(current_day_observations(&state).len(), 1);
-    let report = crate::ops::dispatch(&state, crate::ops::OP_MULTIPLIER_REPORT,
-        json!({"from_ms": DAY_START - 1, "to_ms": DAY_START + 1})).unwrap();
+    let report = crate::ops::dispatch(
+        &state,
+        crate::ops::OP_MULTIPLIER_REPORT,
+        json!({"from_ms": DAY_START - 1, "to_ms": DAY_START + 1}),
+    )
+    .unwrap();
     assert_eq!(report["series"].as_array().unwrap().len(), 1);
     let row = &report["series"][0];
     assert_eq!(row["plan"], "openai/pro_20x");

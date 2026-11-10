@@ -123,20 +123,33 @@ pub struct QuotaProviderConfig {
     /// The traffic counted as this provider's subscription usage. Declared,
     /// never inferred: most events carry no credential attribution.
     pub scope: Vec<ScopeRule>,
+}
+
+/// Membership captured from the vault history alongside the day's counters.
+/// Unlike the declared quota-provider configuration, this is an observation
+/// input, not an operator declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedQuotaProvider {
+    pub window: WindowSelector,
+    pub scope: Vec<ScopeRule>,
     /// Account ref → the plan it holds.
-    #[serde(deserialize_with = "unique_map")]
     pub accounts: BTreeMap<String, AccountPlan>,
     /// Vault credential ref → plan, for providers whose counters have no account.
     /// Never combined with accounts.
-    #[serde(deserialize_with = "unique_map")]
     pub credentials: BTreeMap<String, AccountPlan>,
+    #[serde(skip)]
+    credential_keyed: bool,
+    #[serde(skip)]
+    unknown_reasons: BTreeMap<String, String>,
+    #[serde(skip)]
+    membership_reason: Option<String>,
 }
 
-impl QuotaProviderConfig {
+impl ResolvedQuotaProvider {
     /// A provider uses one identity namespace, so equal account and credential
     /// strings can never alias in the estimator's counter maps.
     pub fn members(&self) -> &BTreeMap<String, AccountPlan> {
-        if self.credentials.is_empty() {
+        if !self.credential_keyed {
             &self.accounts
         } else {
             &self.credentials
@@ -144,7 +157,7 @@ impl QuotaProviderConfig {
     }
 
     fn members_mut(&mut self) -> &mut BTreeMap<String, AccountPlan> {
-        if self.credentials.is_empty() {
+        if !self.credential_keyed {
             &mut self.accounts
         } else {
             &mut self.credentials
@@ -152,7 +165,7 @@ impl QuotaProviderConfig {
     }
 
     fn identity_field(&self) -> &'static str {
-        if self.credentials.is_empty() {
+        if !self.credential_keyed {
             "account_ref"
         } else {
             "credential_ref"
@@ -191,13 +204,9 @@ pub struct ScopeRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AccountPlan {
     /// A fusiform plan key, `<provider>/<tier>`, matched exactly.
     pub plan: String,
-    /// Wins over both the plan-key override and fusiform.
-    #[serde(deserialize_with = "required_nullable")]
-    pub price_override: Option<PriceOverride>,
 }
 
 /// A monthly price in minor units: `20000` at exponent `2` is 200.00.
@@ -312,26 +321,6 @@ impl MultiplierConfig {
                         "{at}: scope rule {}/{} is listed twice",
                         rule.producer, rule.provider
                     ));
-                }
-            }
-            if provider.accounts.is_empty() == provider.credentials.is_empty() {
-                return Err(format!(
-                    "{at}: name either non-empty accounts or non-empty credentials, never both"
-                ));
-            }
-            for (account, plan) in provider.members() {
-                if account.is_empty() {
-                    return Err(format!(
-                        "{at}: {} must be non-empty",
-                        provider.identity_field()
-                    ));
-                }
-                validate_plan_key(&plan.plan)
-                    .map_err(|error| format!("{at} account '{account}': {error}"))?;
-                if let Some(price) = &plan.price_override {
-                    price
-                        .validate()
-                        .map_err(|error| format!("{at} account '{account}': {error}"))?;
                 }
             }
         }
@@ -552,7 +541,7 @@ fn account_delta(
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObservationPlan {
     pub(crate) quota_provider: String,
-    pub provider: QuotaProviderConfig,
+    pub provider: ResolvedQuotaProvider,
     pub(crate) interval_start_ms: i64,
     pub(crate) interval_end_ms: i64,
     /// One entry per configured account.
@@ -568,6 +557,105 @@ pub struct ObservationPlan {
     events: Vec<ScopedEvent>,
 }
 
+pub fn resolve_membership(
+    conn: &Connection,
+    declaration: &QuotaProviderConfig,
+    quota_provider: &str,
+    end_ms: i64,
+) -> Result<ResolvedQuotaProvider, MultiplierError> {
+    let identities = |table: &str, field: &str| -> rusqlite::Result<BTreeSet<String>> {
+        conn.prepare(&format!(
+            "SELECT DISTINCT {field} FROM {table} WHERE provider=?1 AND pool_key=?2
+            AND window_minutes=?3 AND fetched_at_instant<?4"
+        ))?
+        .query_map(
+            params![
+                quota_provider,
+                declaration.window.pool_key,
+                declaration.window.window_minutes,
+                clamp_nanos(millis_to_nanos(end_ms))
+            ],
+            |row| row.get(0),
+        )?
+        .collect()
+    };
+    let accounts = identities("window_sample", "account_ref")?;
+    let credentials = identities("credential_window_sample", "credential_ref")?;
+    let history = crate::vault_plan::at(conn, end_ms)?;
+    let usable_accounts = accounts.iter().any(|id| {
+        history
+            .iter()
+            .any(|row| row.account_id.as_ref() == Some(id) && row.plan_key.is_some())
+    });
+    let usable_credentials = credentials.iter().any(|id| {
+        history.iter().any(|row| {
+            row.account_id.is_none() && &row.credential_id == id && row.plan_key.is_some()
+        })
+    });
+    let credential_keyed =
+        usable_credentials && !usable_accounts || accounts.is_empty() && !credentials.is_empty();
+    let mixed = usable_accounts && usable_credentials;
+    let (winners, differences) = crate::vault_plan::account_winners(&history);
+    let mut resolved = ResolvedQuotaProvider {
+        window: declaration.window.clone(),
+        scope: declaration.scope.clone(),
+        accounts: BTreeMap::new(),
+        credentials: BTreeMap::new(),
+        credential_keyed,
+        unknown_reasons: BTreeMap::new(),
+        membership_reason: mixed.then(|| "mixed_identity_namespaces".into()),
+    };
+    if credential_keyed {
+        for id in credentials {
+            if let Some(key) = history
+                .iter()
+                .find(|row| row.credential_id == id && row.account_id.is_none())
+                .and_then(|row| row.plan_key.as_ref())
+            {
+                resolved
+                    .credentials
+                    .insert(id, AccountPlan { plan: key.clone() });
+            } else {
+                resolved
+                    .unknown_reasons
+                    .insert(id, "vault_plan_unknown".into());
+            }
+        }
+    } else {
+        for id in accounts {
+            let providers: BTreeSet<_> = history
+                .iter()
+                .filter(|row| row.account_id.as_ref() == Some(&id))
+                .map(|row| &row.provider)
+                .collect();
+            let ambiguous = providers.len() > 1
+                || differences
+                    .iter()
+                    .any(|difference| difference.account_id == id && difference.ambiguous);
+            if ambiguous {
+                resolved
+                    .unknown_reasons
+                    .insert(id, "vault_account_ambiguous".into());
+                continue;
+            }
+            if let Some(key) = winners
+                .iter()
+                .find(|row| row.account_id.as_ref() == Some(&id))
+                .and_then(|row| row.plan_key.as_ref())
+            {
+                resolved
+                    .accounts
+                    .insert(id, AccountPlan { plan: key.clone() });
+            } else {
+                resolved
+                    .unknown_reasons
+                    .insert(id, "vault_plan_unknown".into());
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 pub fn plan_observation(
     conn: &Connection,
     config: &MultiplierConfig,
@@ -575,7 +663,7 @@ pub fn plan_observation(
     interval_start_ms: i64,
     interval_end_ms: i64,
 ) -> Result<ObservationPlan, MultiplierError> {
-    let provider = config
+    let declaration = config
         .quota_providers
         .get(quota_provider)
         .ok_or_else(|| MultiplierError::Refused {
@@ -589,18 +677,19 @@ pub fn plan_observation(
             message: "interval start must precede its end".into(),
         });
     }
+    let provider = resolve_membership(conn, &declaration, quota_provider, interval_end_ms)?;
     let mut accounts = Vec::new();
     for account in provider.members().keys() {
         accounts.push(clean::counter_delta(
             conn,
             quota_provider,
-            (account, !provider.credentials.is_empty()),
+            (account, provider.credential_keyed),
             &provider.window,
             interval_start_ms,
             interval_end_ms,
         )?);
     }
-    let seen_sql = if provider.credentials.is_empty() {
+    let seen_sql = if !provider.credential_keyed {
         "SELECT DISTINCT account_ref FROM window_sample
               WHERE provider = ?1 AND pool_key = ?2 AND window_minutes = ?3
                 AND fetched_at_instant >= ?4 AND fetched_at_instant < ?5
@@ -635,7 +724,7 @@ pub fn plan_observation(
         let measured = clean::counter_delta(
             conn,
             quota_provider,
-            (account, !provider.credentials.is_empty()),
+            (account, provider.credential_keyed),
             &provider.window,
             interval_start_ms,
             interval_end_ms,
@@ -1225,12 +1314,13 @@ pub struct PlanPriceUsed {
 pub fn resolve_plans(
     source: Option<&dyn PlanPriceSource>,
     config: &MultiplierConfig,
-    provider: &QuotaProviderConfig,
+    provider: &ResolvedQuotaProvider,
     at_ms: i64,
 ) -> Result<BTreeMap<String, PlanPriceUsed>, MultiplierError> {
-    let needs_fusiform = provider.members().values().any(|account| {
-        account.price_override.is_none() && !config.plan_price_overrides.contains_key(&account.plan)
-    });
+    let needs_fusiform = provider
+        .members()
+        .values()
+        .any(|account| !config.plan_price_overrides.contains_key(&account.plan));
     let served = if needs_fusiform {
         let source = source.ok_or_else(|| {
             MultiplierError::PlanPrices(
@@ -1253,12 +1343,12 @@ pub fn resolve_plans(
     let mut plans = BTreeMap::new();
     for (account_ref, account) in provider.members() {
         let mut used = PlanPriceUsed {
-            account_ref: if provider.credentials.is_empty() {
+            account_ref: if !provider.credential_keyed {
                 account_ref.clone()
             } else {
                 String::new()
             },
-            credential_ref: (!provider.credentials.is_empty()).then(|| account_ref.clone()),
+            credential_ref: provider.credential_keyed.then(|| account_ref.clone()),
             plan: account.plan.clone(),
             source: None,
             monthly_nanos: None,
@@ -1272,9 +1362,7 @@ pub fn resolve_plans(
             used.source = Some(origin.to_string());
             used.monthly_nanos = amount_to_nanos(price.minor_units, price.exponent);
         };
-        if let Some(price) = &account.price_override {
-            from_override(price, "account_override", &mut used);
-        } else if let Some(price) = config.plan_price_overrides.get(&account.plan) {
+        if let Some(price) = config.plan_price_overrides.get(&account.plan) {
             from_override(price, "plan_override", &mut used);
         } else if let Some(served) = &served {
             fusiform_price(served, &account.plan, at_ms, &mut used);
@@ -1843,7 +1931,7 @@ pub fn compute_observation(
     for account in &plan.unconfigured_accounts {
         accounts_excluded.push(json!({
             (plan.provider.identity_field()): account.account_ref,
-            "reason": if plan.provider.credentials.is_empty() { "account_not_configured" } else { "credential_not_configured" },
+            "reason": plan.provider.unknown_reasons.get(&account.account_ref).map(String::as_str).unwrap_or("vault_plan_unknown"),
             "delta_percent": account.delta_percent,
             "readings": account.readings,
         }));
@@ -2593,7 +2681,12 @@ pub fn multiplier_pace(
                 format!("unknown quota provider '{}'", request.quota_provider),
             )
         })?;
-    let provider = &config.quota_providers[&request.quota_provider];
+    let provider = resolve_membership(
+        conn,
+        &config.quota_providers[&request.quota_provider],
+        &request.quota_provider,
+        request.to_ms,
+    )?;
     let plans: BTreeSet<_> = provider
         .members()
         .values()
@@ -2917,6 +3010,127 @@ mod tests {
     use super::*;
     use crate::test_support::conn;
 
+    #[derive(Clone, Serialize)]
+    struct FixtureConfig {
+        #[serde(flatten)]
+        config: super::MultiplierConfig,
+        #[serde(skip)]
+        quota_providers: BTreeMap<String, ResolvedQuotaProvider>,
+    }
+
+    impl std::ops::Deref for FixtureConfig {
+        type Target = super::MultiplierConfig;
+        fn deref(&self) -> &Self::Target {
+            &self.config
+        }
+    }
+    impl std::ops::DerefMut for FixtureConfig {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.config
+        }
+    }
+    impl FixtureConfig {
+        fn declarations(&self) -> super::MultiplierConfig {
+            let mut config = self.config.clone();
+            config.quota_providers = self
+                .quota_providers
+                .iter()
+                .map(|(id, provider)| {
+                    (
+                        id.clone(),
+                        super::QuotaProviderConfig {
+                            window: provider.window.clone(),
+                            scope: provider.scope.clone(),
+                        },
+                    )
+                })
+                .collect();
+            config
+        }
+    }
+    impl<'de> Deserialize<'de> for FixtureConfig {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            #[derive(Deserialize)]
+            struct Legacy {
+                api_twins: BTreeMap<String, String>,
+                plan_price_overrides: BTreeMap<String, PriceOverride>,
+                quota_providers: BTreeMap<String, ResolvedQuotaProvider>,
+            }
+            let legacy = Legacy::deserialize(deserializer)?;
+            let mut fixture = Self {
+                config: super::MultiplierConfig {
+                    api_twins: legacy.api_twins,
+                    plan_price_overrides: legacy.plan_price_overrides,
+                    quota_providers: BTreeMap::new(),
+                },
+                quota_providers: legacy.quota_providers,
+            };
+            fixture.config = fixture.declarations();
+            Ok(fixture)
+        }
+    }
+
+    fn source_in_scope(provider: &ResolvedQuotaProvider, source: &str) -> bool {
+        super::source_in_scope(
+            &QuotaProviderConfig {
+                window: provider.window.clone(),
+                scope: provider.scope.clone(),
+            },
+            source,
+        )
+    }
+
+    fn resolve_plans(
+        source: Option<&dyn PlanPriceSource>,
+        config: &super::MultiplierConfig,
+        provider: &ResolvedQuotaProvider,
+        at: i64,
+    ) -> Result<BTreeMap<String, PlanPriceUsed>, MultiplierError> {
+        let mut provider = provider.clone();
+        provider.credential_keyed = !provider.credentials.is_empty();
+        super::resolve_plans(source, config, &provider, at)
+    }
+
+    // Existing valuation fixtures describe membership compactly. Install that
+    // input as history before exercising the same planner production uses.
+    fn plan_observation(
+        conn: &Connection,
+        config: &FixtureConfig,
+        provider: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<ObservationPlan, MultiplierError> {
+        let tx = conn.unchecked_transaction()?;
+        for provider in config.quota_providers.values() {
+            for (credential_keyed, members) in
+                [(false, &provider.accounts), (true, &provider.credentials)]
+            {
+                for (id, member) in members {
+                    let (provider, tier) = member.plan.split_once('/').unwrap();
+                    crate::vault_plan::append_in_tx(
+                        &tx,
+                        &crate::vault_plan::VaultPlan {
+                            credential_id: if credential_keyed {
+                                id.clone()
+                            } else {
+                                format!("fixture:{id}")
+                            },
+                            provider: Some(provider.into()),
+                            account_id: (!credential_keyed).then(|| id.clone()),
+                            plan_tier: Some(tier.into()),
+                            plan_key: Some(member.plan.clone()),
+                            source: "config".into(),
+                            effective_from_ms: 0,
+                            observed_at_ms: 0,
+                        },
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        super::plan_observation(conn, &config.declarations(), provider, start, end)
+    }
+
     const DAY: i64 = 86_400_000;
     /// $200.00 a month, in nanos.
     const PLAN_200: i64 = 200_000_000_000;
@@ -2939,13 +3153,19 @@ mod tests {
         }
     }
 
-    fn config(scope: Vec<ScopeRule>) -> MultiplierConfig {
-        MultiplierConfig {
-            api_twins: BTreeMap::from([("openai-codex".to_string(), "openai".to_string())]),
-            plan_price_overrides: BTreeMap::new(),
+    fn config(scope: Vec<ScopeRule>) -> FixtureConfig {
+        let mut config = FixtureConfig {
+            config: super::MultiplierConfig {
+                api_twins: BTreeMap::from([("openai-codex".to_string(), "openai".to_string())]),
+                plan_price_overrides: BTreeMap::new(),
+                quota_providers: BTreeMap::new(),
+            },
             quota_providers: BTreeMap::from([(
                 "codex".to_string(),
-                QuotaProviderConfig {
+                ResolvedQuotaProvider {
+                    credential_keyed: false,
+                    unknown_reasons: BTreeMap::new(),
+                    membership_reason: None,
                     credentials: BTreeMap::new(),
                     window: window(),
                     scope,
@@ -2953,12 +3173,13 @@ mod tests {
                         "acct".to_string(),
                         AccountPlan {
                             plan: "openai/pro_20x".into(),
-                            price_override: None,
                         },
                     )]),
                 },
             )]),
-        }
+        };
+        config.config = config.declarations();
+        config
     }
 
     #[test]
@@ -3084,7 +3305,7 @@ mod tests {
 
     fn observe(
         conn: &Connection,
-        config: &MultiplierConfig,
+        config: &FixtureConfig,
         start: i64,
         end: i64,
         rates: &ResolvedRates,
@@ -3278,7 +3499,7 @@ mod tests {
         }
     }
 
-    fn arithmetic_fixture(conn: &Connection) -> (MultiplierConfig, ObservationPlan) {
+    fn arithmetic_fixture(conn: &Connection) -> (FixtureConfig, ObservationPlan) {
         let config = config(vec![rule("codex", "openai-codex", None)]);
         reading(conn, "acct", 10, 0.0, None);
         reading(conn, "acct", 90, 50.0, None);
@@ -4675,17 +4896,14 @@ mod tests {
         }
     }
 
-    /// The account override beats the plan override, which beats fusiform; a
+    /// A plan-key override beats fusiform; a
     /// key fusiform refuses leaves the account unpriced with the reason, and a
     /// price past its review date is used but flagged.
     #[test]
     fn plan_prices_resolve_by_precedence_and_refusals_are_reasons() {
         let mut config = config(vec![rule("opencode", "openai", None)]);
         let provider = config.quota_providers.get_mut("codex").unwrap();
-        let account = |plan: &str, price_override: Option<PriceOverride>| AccountPlan {
-            plan: plan.into(),
-            price_override,
-        };
+        let account = |plan: &str| AccountPlan { plan: plan.into() };
         let usd = |minor_units| PriceOverride {
             minor_units,
             exponent: 2,
@@ -4693,14 +4911,10 @@ mod tests {
             period: "month".into(),
         };
         provider.accounts = BTreeMap::from([
-            (
-                "by-account".to_string(),
-                account("openai/pro_5x", Some(usd(12_300))),
-            ),
-            ("by-plan".to_string(), account("openai/pro_5x", None)),
-            ("by-fusiform".to_string(), account("openai/pro_20x", None)),
-            ("refused".to_string(), account("openai/pro", None)),
-            ("missing".to_string(), account("openai/team", None)),
+            ("by-plan".to_string(), account("openai/pro_5x")),
+            ("by-fusiform".to_string(), account("openai/pro_20x")),
+            ("refused".to_string(), account("openai/pro")),
+            ("missing".to_string(), account("openai/team")),
         ]);
         config.plan_price_overrides = BTreeMap::from([("openai/pro_5x".to_string(), usd(9_900))]);
         let served = Served(PlanPricesResponse {
@@ -4722,10 +4936,6 @@ mod tests {
                 used.unpriceable_reason.clone(),
             )
         };
-        assert_eq!(
-            outcome("by-account"),
-            (Some("account_override".into()), Some(123_000_000_000), None)
-        );
         assert_eq!(
             outcome("by-plan"),
             (Some("plan_override".into()), Some(99_000_000_000), None)
@@ -4792,7 +5002,7 @@ mod tests {
         observe(conn, &config, 0, DAY, &ResolvedRates::default())
     }
 
-    fn pace_fixture(conn: &mut Connection) -> (MultiplierConfig, Observation) {
+    fn pace_fixture(conn: &mut Connection) -> (FixtureConfig, Observation) {
         let config = config(vec![
             rule("opencode", "openai", None),
             rule("broca", "openai", Some("subscription_included")),
@@ -6433,7 +6643,7 @@ mod tests {
         };
         let conn =
             Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        let config: MultiplierConfig = serde_json::from_value(json!({
+        let config: FixtureConfig = serde_json::from_value(json!({
             "api_twins": {"openai-codex": "openai"},
             "plan_price_overrides": {},
             "quota_providers": {"codex": {
