@@ -99,6 +99,25 @@ pub const PUBLIC_OPERATION_NAMES: [&str; 25] = [
     OP_WATERMARK_GET,
 ];
 
+/// Reads admitted on a flow's route, shared by the manifest and serving checks.
+/// The live step feed and log watermark remain unavailable to flows, and the
+/// run reads still require a principal allowed by `step_feed::may_read_feed`.
+pub const FLOW_OPERATION_NAMES: [&str; 13] = [
+    OP_VERDICT,
+    OP_REPORT,
+    OP_SUBSCRIPTION_REPORT,
+    OP_WORKCLASS_REPORT,
+    OP_LEDGER_COVERAGE,
+    OP_CHARGE_EXPLAIN,
+    OP_RECONCILE,
+    OP_MULTIPLIER_REPORT,
+    OP_MULTIPLIER_PACE,
+    OP_CACHE_SESSIONS,
+    OP_CACHE_STEPS,
+    OP_RUNS_LIST,
+    OP_RUNS_DETAIL,
+];
+
 /// Versioned, committed operation-schema artifact embedded in the serving
 /// crate. Consumers can compare this value without parsing human documentation.
 ///

@@ -650,6 +650,11 @@ impl ModuleHandler for AstrocyteHandler {
             Err(refusal) => return refusal,
         };
         let route = self.routes.of(ctx.route_handle());
+        if let Some(refused) =
+            refuse_unsupported_flow_operation(&request.method, route.flow.as_deref())
+        {
+            return refused;
+        }
         if matches!(
             request.method.as_str(),
             ops::OP_STEPS_SUBSCRIBE | ops::OP_STEPS_READ | ops::OP_RUNS_LIST | ops::OP_RUNS_DETAIL
@@ -659,7 +664,7 @@ impl ModuleHandler for AstrocyteHandler {
             {
                 return refusal(&code, message);
             }
-            // All four are reads, so a flow's route may use them too.
+            // Flow admission does not replace the principal check on run reads.
             if request.method == ops::OP_STEPS_SUBSCRIBE {
                 return step_feed::subscribe(
                     &self.state,
@@ -741,9 +746,8 @@ impl ModuleHandler for AstrocyteHandler {
 /// What a route's bind decided, for this connection only.
 #[derive(Clone, Debug, Default)]
 struct RouteBind {
-    /// The flow the route was opened under. Astrocyte checks no caller
-    /// identity on its writes, so a route a flow opened is refused every
-    /// mutating operation (see `dispatch_route_request`); reads stay served.
+    /// The flow the route was opened under. Only `ops::FLOW_OPERATION_NAMES`
+    /// may be called on such a route, subject to the usual principal checks.
     flow: Option<String>,
     /// Whether the bind's principal may use the live step feed (see
     /// `step_feed::may_read_feed`).
@@ -794,8 +798,7 @@ impl RouteBinds {
 }
 
 /// The operations that change the money ledger. The module manifest built in
-/// `manifest()` declares exactly these as `Mutate`, and a flow-stamped route
-/// is refused exactly these.
+/// `manifest()` declares exactly these as `Mutate`; none may be flow operations.
 fn is_mutating_operation(name: &str) -> bool {
     matches!(
         name,
@@ -908,20 +911,8 @@ fn dispatch_route_request(
     request: RouteRequest,
     flow: Option<String>,
 ) -> HandlerOutcome {
-    // A flow acts for its owner without the owner present, and astrocyte
-    // checks no caller identity on its writes. Until flows have a defined
-    // place in the ledger, a route a flow opened may read but never write;
-    // it is refused before dispatch, so nothing is touched.
-    if let Some(flow_id) = flow {
-        if is_mutating_operation(&request.method) {
-            return refusal(
-                "flow_scopes_unsupported",
-                format!(
-                    "{} changes the ledger and is not served to a flow (flow {flow_id})",
-                    request.method
-                ),
-            );
-        }
+    if let Some(refused) = refuse_unsupported_flow_operation(&request.method, flow.as_deref()) {
+        return refused;
     }
     // Dispatch performs synchronous SQLite work and may bridge the fusiform
     // socket through its current-thread runtime. Leave the daemon executor
@@ -929,6 +920,18 @@ fn dispatch_route_request(
     let outcome =
         tokio::task::block_in_place(|| ops::dispatch(state, &request.method, request.params));
     route_reply(&request.method, outcome)
+}
+
+/// Flow admission precedes dispatch and the principal-specific read handlers,
+/// so an unlisted operation cannot touch the ledger or open a subscription.
+fn refuse_unsupported_flow_operation(method: &str, flow: Option<&str>) -> Option<HandlerOutcome> {
+    let flow_id = flow?;
+    (!ops::FLOW_OPERATION_NAMES.contains(&method)).then(|| {
+        refusal(
+            "flow_scopes_unsupported",
+            format!("{method} is not served to a flow (flow {flow_id})"),
+        )
+    })
 }
 
 /// One unary operation's answer as the route reply: `{"result": ...}`, or
@@ -960,6 +963,12 @@ fn route_reply(method: &str, outcome: ops::OpResult) -> HandlerOutcome {
 /// `desired`, the configuration in force when HELLO is sent: see
 /// [`declared_consumers`] and [`self_signal_declarations`].
 fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifest {
+    for operation in ops::FLOW_OPERATION_NAMES {
+        assert!(
+            ops::PUBLIC_OPERATION_NAMES.contains(&operation) && !is_mutating_operation(operation),
+            "flow operation {operation} must be a public, non-mutating operation"
+        );
+    }
     let operations = ops::PUBLIC_OPERATION_NAMES
         .iter()
         .map(|name| ManagementOperation {
@@ -1014,6 +1023,12 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
         .display_name(Some("Spend Ledger".to_string()))
         .expect("Spend Ledger is a valid module display name")
         .trust_tier(Some(TrustTier::FirstParty))
+        .flow_operations(Some(
+            ops::FLOW_OPERATION_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        ))
         .provides(vec![ProviderRole::ManagementSurface {
             // `subc_client_rs::serve` runs each request in its own task, so
             // calls are already concurrent: writes serialize on the writer
@@ -1043,6 +1058,7 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
             provides: vec![
                 LOG_READ_WATERMARK_V1.to_string(),
                 subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
+                subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
@@ -2680,12 +2696,10 @@ mod tests {
         assert!(matches!(result, Ok(LoopEnd::Eof)), "{result:?}");
     }
 
-    /// A route a flow opened may read but never write: every mutating
-    /// operation on it is refused `flow_scopes_unsupported` before dispatch,
-    /// so nothing reaches the ledger, while the same write on a route opened
-    /// without a flow goes through. Asserted by the rows the writes leave.
+    /// A flow may use only the declared reads. The same write refused on a
+    /// flow's route still works on an ordinary route, as the stored rows show.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_flow_stamped_route_may_read_but_every_write_is_refused() {
+    async fn a_flow_stamped_route_may_call_only_declared_operations() {
         let state = Arc::new(test_state());
         let daemon = FakeDaemon::start().await;
         let refresher = IdleRefresher::new();
@@ -2716,6 +2730,7 @@ mod tests {
         send(&mut stream, request(5, 10, set("flow-acct"))).await;
         send(&mut stream, request(5, 11, read.clone())).await;
         send(&mut stream, request(6, 12, set("owner-acct"))).await;
+        send(&mut stream, read_request(5, 14)).await;
         send(
             &mut stream,
             request(
@@ -2731,7 +2746,7 @@ mod tests {
 
         // Route replies are answered on their own tasks, so collect by corr.
         let mut replies = HashMap::new();
-        while replies.len() < 4 {
+        while replies.len() < 5 {
             let reply = next_frame(&mut stream).await;
             if reply.header.channel != 0 {
                 replies.insert(reply.header.corr, reply);
@@ -2747,6 +2762,7 @@ mod tests {
         );
         let refusal: ErrorBody = serde_json::from_slice(&refused.body).unwrap();
         assert_eq!(refusal.code, "flow_scopes_unsupported");
+        assert_eq!(refusal_code_of(&replies[&14]), "flow_scopes_unsupported");
         let pace_refusal: ErrorBody = serde_json::from_slice(&replies[&13].body).unwrap();
         assert_eq!(
             pace_refusal.code, "malformed",
@@ -2778,6 +2794,129 @@ mod tests {
             .unwrap();
         assert_eq!(accounts, vec!["owner-acct".to_string()]);
 
+        drop(stream);
+        let _ = served(serving, "serving did not end at EOF").await;
+    }
+
+    /// The flow allowlist must be checked before the principal-specific
+    /// handlers, even when the principal would normally be allowed to read.
+    async fn assert_flow_read_refused(method: &str, principal: Principal) {
+        let state = Arc::new(test_state());
+        store_thalamus_watermark(&state, 123);
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        record_now(&state, "s-1", "s-1:1").await;
+        let through = state.step_feed().through();
+        let changes = state.with_conn(|conn| Ok(conn.total_changes())).unwrap();
+        send(
+            &mut stream,
+            control_request(1, bind_body_as(5, 1, Some("flow-a"), principal, "h")),
+        )
+        .await;
+        assert_eq!(
+            frame_for(&mut stream, 0, 1).await.header.ty,
+            FrameType::Response
+        );
+        send(&mut stream, request_frame(5, 10, method, json!({}))).await;
+        let reply = frame_for(&mut stream, 5, 10).await;
+        assert_eq!(refusal_code_of(&reply), "flow_scopes_unsupported");
+        let refusal: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+        assert!(refusal.message.contains(method), "{}", refusal.message);
+        if method == ops::OP_STEPS_READ {
+            send(&mut stream, subscribe_request(5, 11)).await;
+            let reply = frame_for(&mut stream, 5, 11).await;
+            assert_eq!(refusal_code_of(&reply), "flow_scopes_unsupported");
+        }
+        assert_eq!(state.step_feed().open_subscriptions(), 0);
+        assert_eq!(state.step_feed().through(), through);
+        assert_eq!(
+            state.with_conn(|conn| Ok(conn.total_changes())).unwrap(),
+            changes
+        );
+        let watermark: i64 = state
+            .with_conn(|conn| {
+                conn.query_row("SELECT MIN(watermark_ms) FROM read_watermark", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(watermark, 123);
+        drop(stream);
+        let _ = served(serving, "serving did not end at EOF").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flow_stamped_feed_read_is_refused_before_dispatch() {
+        assert_flow_read_refused(ops::OP_STEPS_READ, Principal::Direct).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flow_stamped_watermark_read_is_refused_before_dispatch() {
+        assert_flow_read_refused(ops::OP_WATERMARK_GET, thalamus_harness()).await;
+    }
+
+    /// The actual HELLO must admit the report before a daemon can open a
+    /// flow's route. The bound route then returns the stored coverage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flow_stamped_subscription_report_is_advertised_and_served() {
+        let state = Arc::new(test_state());
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO usage_event (
+                    event_id,producer,producer_lineage,producer_ref,occurred_at_ms,
+                    recorded_at_ms,provider,account_ref,charge_basis
+                 ) VALUES ('event-1','producer','lineage','event-1',10,10,
+                           'provider','account','subscription_included')",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let (mut stream, hello) = daemon.accept().await;
+        let provides = &hello.manifest.capabilities.as_ref().unwrap().provides;
+        assert!(provides
+            .iter()
+            .any(|capability| capability == subc_protocol::scope::FLOW_SCOPES_CAPABILITY));
+        assert!(hello
+            .manifest
+            .flow_operations
+            .as_ref()
+            .is_some_and(|operations| operations
+                .iter()
+                .any(|operation| operation == ops::OP_SUBSCRIPTION_REPORT)));
+        send(&mut stream, hello_ack()).await;
+        send(
+            &mut stream,
+            control_request(1, bind_body(5, 1, Some("flow-a"))),
+        )
+        .await;
+        assert_eq!(
+            frame_for(&mut stream, 0, 1).await.header.ty,
+            FrameType::Response
+        );
+        let changes = state.with_conn(|conn| Ok(conn.total_changes())).unwrap();
+        send(
+            &mut stream,
+            request_frame(5, 10, ops::OP_SUBSCRIPTION_REPORT, json!({})),
+        )
+        .await;
+        let reply = frame_for(&mut stream, 5, 10).await;
+        let report = answer_of(&reply);
+        assert_eq!(report["rows"], json!([]));
+        assert_eq!(report["coverage"]["events_total"], 1);
+        assert_eq!(report["coverage"]["events_unpriced"], 1);
+        assert_eq!(
+            state.with_conn(|conn| Ok(conn.total_changes())).unwrap(),
+            changes
+        );
         drop(stream);
         let _ = served(serving, "serving did not end at EOF").await;
     }
@@ -2910,9 +3049,7 @@ mod tests {
         );
     }
 
-    /// The manifest claims `log-read-watermark/v1`, the capability
-    /// `watermark.get` serves, and `bind-no-project/v1`, in the capability
-    /// block, which the daemon validates at HELLO.
+    /// Capability claims share the block the daemon validates at HELLO.
     #[test]
     fn manifest_provides_the_log_read_watermark_capability() {
         let manifest = manifest("astrocyte", &config::intentional_empty().config);
@@ -2920,10 +3057,53 @@ mod tests {
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire["capabilities"]["provides"],
-            json!(["log-read-watermark/v1", "bind-no-project/v1"])
+            json!([
+                "log-read-watermark/v1",
+                "bind-no-project/v1",
+                "flow-scopes/v1"
+            ])
         );
         subc_protocol::manifest::validate_manifest_capability_grammar(&wire).unwrap();
         assert!(ops::PUBLIC_OPERATION_NAMES.contains(&ops::OP_WATERMARK_GET));
+    }
+
+    #[test]
+    fn manifest_provides_flow_scopes_and_exact_read_operations() {
+        let manifest = manifest("astrocyte", &config::intentional_empty().config);
+        let provides = &manifest.capabilities.as_ref().unwrap().provides;
+        assert!(provides
+            .iter()
+            .any(|capability| capability == subc_protocol::scope::FLOW_SCOPES_CAPABILITY));
+        let expected = [
+            "budget.verdict",
+            "spend.report",
+            "spend.subscription.report",
+            "spend.workclass.report",
+            "spend.ledger.coverage",
+            "spend.charge.explain",
+            "spend.reconcile",
+            "spend.multiplier.report",
+            "spend.multiplier.pace",
+            "usage.cache.sessions",
+            "usage.cache.steps",
+            "usage.runs.list",
+            "usage.runs.detail",
+        ];
+        let operations = manifest
+            .flow_operations
+            .as_ref()
+            .expect("flows have an explicit operation list");
+        assert_eq!(operations, &expected);
+        for operation in operations {
+            assert!(
+                ops::PUBLIC_OPERATION_NAMES.contains(&operation.as_str()),
+                "{operation}"
+            );
+            assert!(!is_mutating_operation(operation), "{operation}");
+        }
+        let wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(wire["flow_operations"], json!(expected));
+        subc_protocol::manifest::validate_manifest_capability_grammar(&wire).unwrap();
     }
 
     /// Two subscribers, a local app and Callosum's phone route, both get a
@@ -3074,6 +3254,63 @@ mod tests {
             let reply = frame_for(&mut stream, channel, 101).await;
             let body: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
             assert_eq!(body.code, "not_found");
+        }
+        drop(stream);
+        let _ = served(serving, "serving did not end at EOF").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flow_stamped_runs_read_keeps_principal_checks() {
+        let state = Arc::new(test_state());
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        for (channel, principal, permitted) in [
+            (5, Principal::Direct, true),
+            (
+                6,
+                Principal::Reserved {
+                    module_id: "prefrontal-core".into(),
+                },
+                false,
+            ),
+        ] {
+            send(
+                &mut stream,
+                control_request(
+                    u64::from(channel),
+                    bind_body_as(channel, 1, Some("flow-a"), principal, "h"),
+                ),
+            )
+            .await;
+            assert_eq!(
+                frame_for(&mut stream, 0, u64::from(channel))
+                    .await
+                    .header
+                    .ty,
+                FrameType::Response
+            );
+            for (corr, method, params) in [
+                (10, ops::OP_RUNS_LIST, json!({"from_ms": 0, "to_ms": 1})),
+                (
+                    11,
+                    ops::OP_RUNS_DETAIL,
+                    json!({"key":{"kind":"session","harness":"opencode","session":"ses_synthetic"}}),
+                ),
+            ] {
+                send(&mut stream, request_frame(channel, corr, method, params)).await;
+                let reply = frame_for(&mut stream, channel, corr).await;
+                if permitted {
+                    if method == ops::OP_RUNS_LIST {
+                        assert_eq!(answer_of(&reply)["totals"]["rows"], 0);
+                    } else {
+                        assert_eq!(refusal_code_of(&reply), "not_found");
+                    }
+                } else {
+                    assert_eq!(refusal_code_of(&reply), "not_permitted");
+                }
+            }
         }
         drop(stream);
         let _ = served(serving, "serving did not end at EOF").await;
