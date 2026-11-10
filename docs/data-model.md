@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 38. A schema change appends a migration; an applied
+currently version 41. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -17,6 +17,7 @@ copies that timeout without running the table-creating probes.
 | `usage_event` | Each row records one usage event per producer reference and lineage, together with its pricing projection. | insert; three projection columns, see below |
 | `measurement` | Each row records one immutable event quantity for a role and unit. | insert only |
 | `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
+| `step_message` | Each row records the host's own message id for a newly recorded event, for joining live feed rows within their harness and session. Old events are not backfilled. | insert only, once per event |
 | `cache_step_sequence` | Each row maps a ledger event to a durable cache cursor. | insert |
 | `step_feed` | Each row is one emission of a served cache step for `usage.steps.read`; the newest row for a harness and step wins. | insert; rows older than 24 hours are deleted |
 | `step_feed_state` | The row records the cache cursor the feed has caught up to and the newest feed cursor retention deleted. | one row |

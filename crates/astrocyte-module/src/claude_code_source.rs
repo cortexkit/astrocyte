@@ -545,7 +545,10 @@ fn map_call(call: ClaudeCodeCall) -> Result<EventRecordRequest, String> {
         // Nothing in a transcript says who paid for the call.
         charge_basis: ChargeBasis::Unknown,
         measurements,
-        step_detail: Default::default(),
+        step_detail: astrocyte_core::ingest::StepDetail {
+            message_id: call.message_id.filter(|id| !id.is_empty()),
+            ..Default::default()
+        },
     })
 }
 
@@ -913,6 +916,11 @@ mod tests {
         assert_eq!(measured(&state, "req_1", "output", "token"), Some(12));
         assert_eq!(measured(&state, "req_1", "input", "token"), Some(3));
         assert_eq!(measured(&state, "req_1", "cache_read", "token"), Some(5));
+        crate::step_feed::assert_message_ids_for_test(
+            &state,
+            "claude-code",
+            &[("req_1", "msg_req_1")],
+        );
     }
 
     /// Measured copies only ever grow. A later copy with a lower counter is

@@ -705,6 +705,8 @@ fn parse_pi_format_file_inner(
 pub struct PiUsageRecord {
     /// Byte offset of the record in a resumable read; not an event identity.
     pub source_offset: u64,
+    /// The host's assistant entry id, absent for non-message operations.
+    pub message_id: Option<String>,
     /// The record in tokscale's shape. For an undated record its `timestamp`
     /// is 0, because [`UnifiedMessage`] cannot say "absent"; read
     /// `occurred_at_ms` instead. [`parse_pi_file`] omits such a record rather
@@ -769,6 +771,7 @@ fn pi_operation(
     message.set_workspace(state.workspace_key.clone(), state.workspace_label.clone());
     Some(PiUsageRecord {
         source_offset: 0,
+        message_id: None,
         message,
         occurred_at_ms,
         operation: Some(PiOperationAttribution {
@@ -1079,6 +1082,9 @@ fn parse_pi_line(
     observer.observe_entry(&entry, Some(&unified));
     messages.push(PiUsageRecord {
         source_offset: 0,
+        message_id: entry.id.clone().filter(|id| {
+            !id.is_empty() && accepts_replacement_field(id, options.lossy_line_reader)
+        }),
         message: unified,
         occurred_at_ms: recorded_timestamp,
         operation: None,

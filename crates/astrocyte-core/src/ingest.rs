@@ -170,12 +170,15 @@ pub struct EventRecordRequest {
     pub step_detail: StepDetail,
 }
 
-/// The finish reason and context window a harness reader saw for one model
-/// step. Both are optional; a step with neither gets no `step_detail` row.
+/// Content-free details a harness reader saw for one model step. Finish and
+/// context limit live in `step_detail`; the host's message id lives separately
+/// in `step_message`, so its presence cannot change cache diagnostics.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StepDetail {
     pub finish: Option<String>,
     pub context_limit: Option<i64>,
+    /// The host's own message id, not the ledger's step identity.
+    pub message_id: Option<String>,
 }
 
 impl StepDetail {
@@ -651,6 +654,15 @@ fn record_event_with_facts_in_tx(
     // transition evidence rolls back with the settling act.
     insert_measurements(tx, &local_event_id, &request.measurements)?;
     record_step_detail(tx, &local_event_id, &request.step_detail)?;
+    // Only new calls get a host message id: re-reading an old call must not
+    // backfill the retained feed or change insert-once metadata.
+    if let Some(message_id) = &request.step_detail.message_id {
+        tx.execute(
+            "INSERT INTO step_message(event_key,message_id)
+             SELECT event_key,?2 FROM usage_event WHERE event_id=?1",
+            params![local_event_id, message_id],
+        )?;
+    }
     // Queued in this transaction so the queue cannot disagree with the ledger
     // after a crash: the event and its queue row commit or vanish together.
     // An event with no measurements has nothing to price and is not queued.
@@ -2030,6 +2042,7 @@ mod tests {
         request.step_detail = StepDetail {
             finish: finish.map(str::to_string),
             context_limit: limit,
+            message_id: None,
         };
         request
     }
@@ -2174,6 +2187,73 @@ mod tests {
             stored_detail(&conn, &id),
             Some((Some("stop".into()), Some(5)))
         );
+    }
+
+    #[test]
+    fn step_message_is_insert_once_and_redelivery_writes_nothing() {
+        let mut conn = conn();
+        let mut first = request("message-step", None, vec![measurement("input", Some(1))]);
+        first.step_detail.message_id = Some("host-message".into());
+        let id = record_via(&mut conn, &first, 2_000, DeliveryPath::Read).event_id;
+        assert_eq!(
+            count(&conn, "step_detail"),
+            0,
+            "a message id is not cache detail"
+        );
+        let written = conn.total_changes();
+        for message_id in ["host-message", "different-id"] {
+            first.step_detail.message_id = Some(message_id.into());
+            assert_eq!(
+                record_via(&mut conn, &first, 3_000, DeliveryPath::Read).disposition,
+                RecordDisposition::ExactRedelivery
+            );
+            assert_eq!(
+                conn.total_changes(),
+                written,
+                "metadata is not ledger content"
+            );
+        }
+        for (sql, guard) in [
+            (
+                "UPDATE step_message SET message_id='changed'",
+                "step_message_no_update",
+            ),
+            ("DELETE FROM step_message", "step_message_no_delete"),
+            (
+                "INSERT OR REPLACE INTO step_message SELECT event_key,'changed' FROM step_message",
+                "step_message_insert_once",
+            ),
+        ] {
+            let error = conn.execute(sql, []).unwrap_err();
+            assert!(error.to_string().contains(guard), "{error}");
+        }
+        let stored: String = conn.query_row(
+            "SELECT message_id FROM step_message JOIN usage_event USING(event_key) WHERE event_id=?1",
+            [id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(stored, "host-message");
+        assert_eq!(count(&conn, "usage_event"), 1);
+        assert_eq!(count(&conn, "measurement"), 1);
+        assert_eq!(count(&conn, "step_message"), 1);
+        assert_eq!(count(&conn, "rejected_delivery"), 0);
+    }
+
+    #[test]
+    fn step_message_is_never_backfilled_on_redelivery() {
+        let mut conn = conn();
+        let mut old = request("old-step", None, vec![]);
+        record_via(&mut conn, &old, 2_000, DeliveryPath::Read);
+        let written = conn.total_changes();
+        old.step_detail.message_id = Some("newly-read-id".into());
+        record_via(&mut conn, &old, 3_000, DeliveryPath::Read);
+        assert_eq!(conn.total_changes(), written);
+        assert_eq!(count(&conn, "step_message"), 0);
+        assert_eq!(count(&conn, "step_detail"), 0);
+        for value in ["NULL", "''"] {
+            let sql = format!("INSERT INTO step_message SELECT event_key,{value} FROM usage_event");
+            assert!(conn.execute(&sql, []).is_err(), "{sql}");
+        }
+        assert_eq!(count(&conn, "step_message"), 0);
     }
 
     /// A reader re-reading a file it already ingested is our action, not the

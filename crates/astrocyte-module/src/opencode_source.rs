@@ -1287,7 +1287,7 @@ fn map_message(message: OpenCodeMessage) -> Result<EventRecordRequest, String> {
         // and corpus measurement found no duplicate ids. A session lineage
         // would therefore alter identity without disambiguating anything.
         producer_lineage: None,
-        producer_ref: message.id,
+        producer_ref: message.id.clone(),
         prior_event_ref: None,
         harness: None,
         project_root: message.project_root,
@@ -1315,6 +1315,7 @@ fn map_message(message: OpenCodeMessage) -> Result<EventRecordRequest, String> {
         step_detail: StepDetail {
             finish: message.finish,
             context_limit: None,
+            message_id: Some(message.id),
         },
     })
 }

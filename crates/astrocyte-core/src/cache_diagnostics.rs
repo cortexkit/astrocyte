@@ -1644,6 +1644,7 @@ mod tests {
         first.detail = StepDetail {
             finish: Some("toolUse".into()),
             context_limit: Some(200_000),
+            message_id: None,
         };
         let second = step("pi", "s", 1, Some(20), counts(None, None, None));
         let undated = step("pi", "s", 2, None, counts(Some(1), Some(1), None));

@@ -556,6 +556,7 @@ pub fn record_steps_for_test(
             step_detail: StepDetail {
                 finish: None,
                 context_limit: None,
+                message_id: None,
             },
         }
     };
@@ -596,6 +597,36 @@ impl<'a> TestStep<'a> {
             reasoning: None,
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_message_ids_for_test(
+    state: &SharedState,
+    producer: &str,
+    expected: &[(&str, &str)],
+) {
+    let actual = state
+        .with_conn(|conn| {
+            conn.prepare(
+                "SELECT e.producer_ref,m.message_id FROM usage_event e
+            JOIN step_message m ON m.event_key=e.event_key WHERE e.producer=?1
+            ORDER BY e.producer_ref",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([producer], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+    let expected = expected
+        .iter()
+        .map(|(step, message)| (step.to_string(), message.to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
 }
 
 #[cfg(test)]

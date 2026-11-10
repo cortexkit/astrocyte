@@ -526,6 +526,7 @@ fn map_call(call: CodexCall) -> Result<EventRecordRequest, String> {
             context_limit: call
                 .context_limit
                 .and_then(|limit| i64::try_from(limit).ok()),
+            message_id: None,
         },
     })
 }

@@ -444,9 +444,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-usage-steps"
-version = "0.2.5"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66c2a58d1c36a942238f166d1311280cf01d80ce1f29dae3bfa71c674ec0c8ba"
+checksum = "3374ebe611a02c9596b3f37e90faf4f2c8f865274bd376ab2437346529c3cb0a"
 dependencies = [
  "chrono",
  "serde",

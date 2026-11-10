@@ -198,6 +198,7 @@ fn row_body(
     session: &str,
     source: FeedSource,
     step: &CacheStep,
+    message_id: Option<&str>,
 ) -> serde_json::Result<String> {
     let Value::Object(mut row) = serde_json::to_value(step)? else {
         unreachable!("a cache step serializes as an object");
@@ -207,6 +208,9 @@ fn row_body(
     row.insert("harness".into(), Value::from(producer));
     row.insert("source".into(), Value::from(source.wire_name()));
     row.insert("session".into(), Value::from(session));
+    if let Some(message_id) = message_id {
+        row.insert("message_id".into(), Value::from(message_id));
+    }
     serde_json::to_string(&Value::Object(row))
 }
 
@@ -301,7 +305,7 @@ pub fn append_runner_step(
     let unrecorded = runner_only_steps(conn, harness, session, step_ref)?;
     let served = cache::unrecorded_step(conn, harness, session, step.step.clone(), &unrecorded)?;
     let to_sql = |error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
-    let body = row_body(harness, session, FeedSource::Runner, &served).map_err(to_sql)?;
+    let body = row_body(harness, session, FeedSource::Runner, &served, None).map_err(to_sql)?;
     let Value::Object(mut row) = serde_json::from_str::<Value>(&body).map_err(to_sql)? else {
         unreachable!("a row body is an object");
     };
@@ -381,8 +385,17 @@ pub fn append_changes(
             changed.earliest_ms.max(window_start)
         };
         for step in cache::session_steps_since(conn, producer, session, since)? {
-            let body = row_body(producer, session, FeedSource::File, &step)
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let message_id: Option<String> = conn
+                .prepare_cached(MESSAGE_ID_SQL)?
+                .query_row([step.cursor], |row| row.get(0))?;
+            let body = row_body(
+                producer,
+                session,
+                FeedSource::File,
+                &step,
+                message_id.as_deref(),
+            )
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             if newest_body(conn, producer, &step.step_ref)?.as_deref() == Some(body.as_str()) {
                 continue;
             }
@@ -408,6 +421,11 @@ pub fn append_changes(
     prune(conn, window_start)?;
     Ok(appended)
 }
+
+// Look up content-free host metadata by the shared cursor, never by decoding
+// a step reference. The left join keeps older calls without an id unchanged.
+const MESSAGE_ID_SQL: &str = "SELECT m.message_id FROM cache_step_sequence s
+    LEFT JOIN step_message m ON m.event_key=s.event_key WHERE s.cursor=?1";
 
 /// Delete up to `PRUNE_BATCH` rows committed before `window_start`, and
 /// record the newest cursor deleted so reads from before it are refused.
@@ -525,6 +543,22 @@ pub fn read(conn: &Connection, request: FeedReadRequest) -> Result<FeedPage, Fee
 mod tests {
     use super::*;
     use crate::test_support::conn;
+
+    #[test]
+    fn step_message_lookup_seeks_cursor_and_message_keys() {
+        let conn = conn();
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {MESSAGE_ID_SQL}"))
+            .unwrap()
+            .query_map([1], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for table in ["s", "m"] {
+            assert!(plan.iter().any(|line| line.contains(&format!("SEARCH {table} USING INTEGER PRIMARY KEY"))), "{plan:?}");
+        }
+        assert!(!plan.iter().any(|line| line.contains("SCAN")), "{plan:?}");
+    }
 
     #[test]
     fn filtered_read_seeks_the_session_cursor_index() {

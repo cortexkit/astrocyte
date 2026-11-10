@@ -140,6 +140,7 @@ pub(super) fn record(steps: &[Step<'_>], state: &SharedState) {
             step_detail: StepDetail {
                 finish: step.finish.map(str::to_string),
                 context_limit: step.context_limit,
+                message_id: None,
             },
         }
     };

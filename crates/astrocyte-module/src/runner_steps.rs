@@ -310,6 +310,12 @@ mod tests {
             assert_eq!(wire.source, StepSource::Runner);
             assert_eq!(wire.session, "session_a");
             assert_eq!(wire.run_id.as_deref(), Some("run_a"));
+            wire.check_counts().unwrap();
+            assert_eq!(wire.message_id, None);
+            assert!(
+                row.get("message_id").is_none(),
+                "runner ids are not host message ids"
+            );
         }
         let mut full = rows[3].clone();
         full.as_object_mut().unwrap().remove("cursor");

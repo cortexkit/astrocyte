@@ -4094,6 +4094,22 @@ ALTER TABLE source_runtime ADD COLUMN open_row_floor INTEGER;
 ALTER TABLE declared_store_cursor ADD COLUMN open_row_floor INTEGER;
 "#,
     },
+    Migration {
+        version: 41,
+        statements: r#"
+CREATE TABLE step_message (
+    event_key INTEGER PRIMARY KEY REFERENCES usage_event(event_key),
+    message_id TEXT NOT NULL CHECK(length(message_id)>0)
+);
+CREATE TRIGGER step_message_no_update BEFORE UPDATE ON step_message
+BEGIN SELECT RAISE(ABORT, 'step_message_no_update'); END;
+CREATE TRIGGER step_message_no_delete BEFORE DELETE ON step_message
+BEGIN SELECT RAISE(ABORT, 'step_message_no_delete'); END;
+CREATE TRIGGER step_message_insert_once BEFORE INSERT ON step_message
+WHEN EXISTS (SELECT 1 FROM step_message WHERE event_key=NEW.event_key)
+BEGIN SELECT RAISE(ABORT, 'step_message_insert_once'); END;
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -4101,6 +4117,59 @@ ALTER TABLE declared_store_cursor ADD COLUMN open_row_floor INTEGER;
 #[cfg(test)]
 mod tests {
     include!("store_v33_tests.rs");
+
+    #[test]
+    fn step_message_migration_preserves_old_rows_without_backfill() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        let position = MIGRATIONS
+            .iter()
+            .position(|migration| migration.statements.contains("CREATE TABLE step_message"))
+            .unwrap();
+        for migration in &MIGRATIONS[..position] {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        seed_integer_chains(&conn);
+        conn.execute_batch(
+            "INSERT INTO step_detail(event_key,finish) VALUES(10,'stop');
+             INSERT INTO step_feed VALUES(1,'broca','step','runner','session',1,'{}');",
+        )
+        .unwrap();
+        let before = all_rows(&conn);
+        let detail_schema: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='step_detail'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute_batch(MIGRATIONS[position].statements).unwrap();
+        let after = all_rows(&conn);
+        assert!(after
+            .iter()
+            .find(|(table, _)| table == "step_message")
+            .unwrap()
+            .1
+            .is_empty());
+        assert_eq!(
+            after
+                .into_iter()
+                .filter(|(table, _)| table != "step_message")
+                .collect::<Vec<_>>(),
+            before,
+            "existing ledger, detail and feed rows are unchanged"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='step_detail'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            detail_schema,
+            "the existing detail constraint is unchanged"
+        );
+    }
 
     #[test]
     fn schema_v40_adds_null_opencode_floors_without_changing_cursor_state() {

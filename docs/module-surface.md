@@ -641,10 +641,25 @@ log. A step with no durable record stays a live-only row with
 - Required: `cursor`, `harness`, `source`, `step_ref`, `session`,
   `occurred_at_ms`, `prompt`, `verdict`, `prompt_dropped`. Steps without a time
   are not in the feed.
-- Optional, omitted when unknown and never zero for unknown: `run_id` (runner
-  steps), `provider`, `model`, `input`, `cache_read`, `cache_write`,
+- Optional, omitted when unknown and never zero for unknown: `message_id`,
+  `run_id` (runner steps), `provider`, `model`, `input`, `cache_read`, `cache_write`,
   `cache_write_5m`, `cache_write_1h`, `output`, `reasoning`, `finish`,
   `context_limit`, `request_body_len`, `retention`, `request_size`.
+- `message_id` is the host's own content-free message identifier, present only
+  when the host has one and never invented. Consumers join on `harness` plus
+  `session` plus `message_id`, not on `message_id` alone: it is unique only
+  within its session. `harness` plus `step_ref` remains the row identity;
+  consumers must not parse `step_ref` to recover a message id, because its
+  format is not promised. OpenCode 1 and 2 (including THALAMUS stores) use the
+  message's `id`; Pi uses the assistant entry's `id`; Claude Code uses
+  `message.id`; Gemini CLI uses the message's `id`; Kimi CLI uses
+  `StatusUpdate.payload.message_id`. Codex has turn and response ids, Oh My Pi
+  has entry and response ids, and Goose has session totals, so none supplies a
+  message id here. Pi operation entries are not messages and omit it too.
+  Runner events currently carry no `message_id`, so runner rows omit it,
+  even when `harness_step_ref` looks like a message id. Previously recorded
+  rows are not backfilled; they remain without the member and age out of the
+  24-hour feed.
 - `output` includes `reasoning`, which is a breakdown inside it, as in
   section 4.1, and `cache_write` is the sum of every cache lifetime. `cache_write_5m` and
   `cache_write_1h` are present only when the source split them.

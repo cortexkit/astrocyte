@@ -458,7 +458,7 @@ fn map_call(call: GeminiCall) -> Result<EventRecordRequest, String> {
         // The recording's `sessionId`, shared by every file that saves the
         // same session, so a copy is an exact redelivery, not a new event.
         producer_lineage: Some(call.session_id.clone()),
-        producer_ref: call.message_id,
+        producer_ref: call.message_id.clone(),
         prior_event_ref: None,
         harness: None,
         // A chat recording names no working directory.
@@ -481,7 +481,10 @@ fn map_call(call: GeminiCall) -> Result<EventRecordRequest, String> {
         // No recording says how Gemini CLI authenticated.
         charge_basis: ChargeBasis::Unknown,
         measurements,
-        step_detail: Default::default(),
+        step_detail: astrocyte_core::ingest::StepDetail {
+            message_id: Some(call.message_id),
+            ..Default::default()
+        },
     })
 }
 
@@ -623,6 +626,11 @@ mod tests {
         let outcome = drain(&GeminiSource::from_env(&env), &state, 0);
         assert_eq!(outcome.rows_recorded, 1);
         assert_eq!(quantities(&state, "override")["input"], Some(6));
+        crate::step_feed::assert_message_ids_for_test(
+            &state,
+            "gemini",
+            &[("override", "override")],
+        );
     }
 
     #[test]

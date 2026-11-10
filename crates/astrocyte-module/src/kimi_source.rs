@@ -205,7 +205,7 @@ fn map_call(call: KimiCall) -> Result<EventRecordRequest, String> {
         // a copy of a session under another group directory on the same
         // identity only if it is the same session.
         producer_lineage: Some(call.session_id.clone()),
-        producer_ref: call.message_id,
+        producer_ref: call.message_id.clone(),
         prior_event_ref: None,
         harness: None,
         // A wire record carries no working directory.
@@ -231,7 +231,10 @@ fn map_call(call: KimiCall) -> Result<EventRecordRequest, String> {
         // No wire record says how Kimi CLI authenticated.
         charge_basis: ChargeBasis::Unknown,
         measurements,
-        step_detail: Default::default(),
+        step_detail: astrocyte_core::ingest::StepDetail {
+            message_id: Some(call.message_id),
+            ..Default::default()
+        },
     })
 }
 
@@ -383,6 +386,15 @@ mod tests {
         let outcome = drain(&KimiSource::at(temp.path()), &state, 0);
         assert_eq!(outcome.skipped_lines_by_file, BTreeMap::from([(path, 1)]));
         assert_eq!(outcome.rows_recorded, 3);
+        crate::step_feed::assert_message_ids_for_test(
+            &state,
+            "kimi",
+            &[
+                ("chatcmpl-a", "chatcmpl-a"),
+                ("chatcmpl-b", "chatcmpl-b"),
+                ("chatcmpl-c", "chatcmpl-c"),
+            ],
+        );
     }
 
     /// Per-tick cost scales with new bytes, not with the file.

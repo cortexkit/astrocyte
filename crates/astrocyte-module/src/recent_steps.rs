@@ -477,6 +477,7 @@ mod tests {
             step_detail: StepDetail {
                 finish: finish.map(str::to_string),
                 context_limit: None,
+                message_id: None,
             },
         }
     }

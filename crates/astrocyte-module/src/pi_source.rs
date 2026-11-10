@@ -706,6 +706,7 @@ fn session_header_timestamp(
 fn map_message(record: PiUsageRecord) -> Result<EventRecordRequest, String> {
     let PiUsageRecord {
         message,
+        message_id,
         occurred_at_ms,
         operation,
         stop_reason,
@@ -777,6 +778,7 @@ fn map_message(record: PiUsageRecord) -> Result<EventRecordRequest, String> {
         step_detail: StepDetail {
             finish: stop_reason,
             context_limit: None,
+            message_id,
         },
     })
 }

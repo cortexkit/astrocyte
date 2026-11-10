@@ -209,6 +209,97 @@ fn rows(state: &SharedState, table: &str) -> Vec<Vec<SqlValue>> {
 }
 
 #[test]
+fn file_feed_message_ids_come_from_host_messages() {
+    let corpus = Corpus::new();
+    let state = test_state();
+    let now = crate::state::now_ms();
+    corpus.append_opencode(1);
+    corpus.append_v2(1);
+    for table in ["message", "session_message"] {
+        corpus
+            .opencode
+            .execute(
+                &format!(
+                    "UPDATE {table} SET time_created=?1,time_updated=?1,
+                     data=json_set(data,'$.time.created',?1,'$.time.completed',?1)"
+                ),
+                [now],
+            )
+            .unwrap();
+    }
+    let mut idless_entry = None;
+    for id in [Some("entry-host-id"), None] {
+        let mut entry = json!({"type":"message", "timestamp":chrono::Utc::now().to_rfc3339(),
+            "message":{"role":"assistant", "provider":"anthropic", "model":"claude-sonnet-4",
+                "responseId":if id.is_some() {"response-with-id"} else {"response-no-id"},
+                "usage":{"input":11,"output":7,"cacheRead":13,"cacheWrite":17,"reasoning":2}}});
+        if let Some(id) = id {
+            entry["id"] = json!(id);
+        } else {
+            idless_entry = Some(entry.clone());
+        }
+        writeln!(
+            OpenOptions::new()
+                .append(true)
+                .open(&corpus.pi_path)
+                .unwrap(),
+            "{entry}"
+        )
+        .unwrap();
+    }
+    corpus.full(&state, now);
+    let page = crate::ops::dispatch(&state, crate::ops::OP_STEPS_READ, json!({})).unwrap();
+    let rows = page["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 4, "{page}");
+    for (harness, session, step_ref, message_id) in [
+        ("opencode", "oc-session", "message-1", Some("message-1")),
+        (
+            "opencode",
+            "oc-v2-session",
+            "v2-message-1",
+            Some("v2-message-1"),
+        ),
+        (
+            "pi",
+            "pi-session",
+            "pi:response:response-with-id",
+            Some("entry-host-id"),
+        ),
+        ("pi", "pi-session", "pi:response:response-no-id", None),
+    ] {
+        let row = rows.iter().find(|row| row["step_ref"] == step_ref).unwrap();
+        let wire: cortexkit_usage_steps::StepRow = serde_json::from_value(row.clone()).unwrap();
+        wire.check_counts().unwrap();
+        cortexkit_usage_steps::StepRow::check_closed(row).unwrap();
+        assert_eq!(wire.harness, harness);
+        assert_eq!(wire.session, session);
+        assert_eq!(wire.message_id.as_deref(), message_id, "{row}");
+        if message_id.is_none() {
+            assert!(
+                row.get("message_id").is_none(),
+                "omit unknown ids, not null: {row}"
+            );
+        }
+    }
+    let mut redelivered = idless_entry.unwrap();
+    redelivered["id"] = json!("late-host-id");
+    writeln!(
+        OpenOptions::new()
+            .append(true)
+            .open(&corpus.pi_path)
+            .unwrap(),
+        "{redelivered}"
+    )
+    .unwrap();
+    corpus.full(&state, now);
+    assert_eq!(
+        crate::ops::dispatch(&state, crate::ops::OP_STEPS_READ, json!({})).unwrap(),
+        page,
+        "re-reading a call with a newly available host id does not backfill the feed"
+    );
+}
+
+#[test]
 fn fresh_steps_are_served_and_unknown_broca_facts_are_set_aside_on_the_next_fast_interval() {
     let corpus = Corpus::new();
     let state = test_state();
