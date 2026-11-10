@@ -9,6 +9,7 @@ use astrocyte_core::verdict::VerdictRequest;
 use cortexkit_role_llm_runner::watermark::{
     WatermarkReply, WatermarkRequest, NOT_A_READ_SOURCE, WATERMARK_GET,
 };
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use subc_protocol::Principal;
 
@@ -714,7 +715,16 @@ fn op_ledger_coverage(state: &SharedState, params: Value) -> OpResult {
         .map_err(|error| ("malformed".into(), format!("coverage params: {error}")))?;
     read_value(state, |conn| {
         astrocyte_core::report::ledger_coverage(conn, &request, now_ms())
-            .map(|value| json!(value))
+            .map(|mut value| {
+                let waiting = state.payer_waiting();
+                if !waiting.is_empty() {
+                    value
+                        .thalamus_payer
+                        .get_or_insert_with(Default::default)
+                        .waiting_calls_by_reader = waiting;
+                }
+                json!(value)
+            })
             .map_err(map_report_error)
     })
 }
@@ -892,8 +902,8 @@ const READ_SOURCES: [ReadSource; 1] = [ReadSource {
     watermark_ms: opencode_thalamus_source::watermark_ms,
 }];
 
-/// `watermark.get` for the route's bind principal: the stored watermark of
-/// the caller's own source, `null` before its first complete read pass. A
+/// `watermark.get` for the route's bind principal: the lower committed pass
+/// watermark of its session and payer readers, `null` until both complete. A
 /// caller with no row in `READ_SOURCES` (a local app, any other module, no
 /// principal) and a source excluded in `harness_ingest` are both refused
 /// `not_a_read_source`. A member in the request is refused `invalid_params`,
@@ -935,7 +945,19 @@ pub fn watermark_get(
         ));
     }
     let stored = read_value(state, |connection| {
-        (source.watermark_ms)(connection).map_err(|error| ("internal".into(), error))
+        let sessions =
+            (source.watermark_ms)(connection).map_err(|error| ("internal".into(), error))?;
+        let payer = connection
+            .query_row(
+                "SELECT watermark_ms FROM read_watermark WHERE source_key='thalamus-payer'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| ("internal".into(), error.to_string()))?;
+        Ok(sessions
+            .zip(payer)
+            .map(|(sessions, payer)| sessions.min(payer)))
     })?;
     let watermark_ms = stored
         .map(|ms| {
@@ -1000,6 +1022,85 @@ mod tests {
 
     use super::*;
     use crate::state::test_state;
+
+    #[test]
+    fn watermark_requires_both_committed_passes_and_serves_the_lower_value() {
+        let state = test_state();
+        let principal = Principal::Reserved {
+            module_id: "thalamus-harness".into(),
+        };
+        let watermark =
+            || watermark_get(&state, Some(&principal), json!({})).unwrap()["watermark_ms"].clone();
+        assert!(watermark().is_null());
+        state
+            .ordered_write(|tx| {
+                tx.execute(
+                    "INSERT INTO read_watermark VALUES ('opencode-thalamus',200000,260000)",
+                    [],
+                )
+                .unwrap();
+                Ok(((), true))
+            })
+            .unwrap();
+        assert!(
+            watermark().is_null(),
+            "the payer source has no committed complete pass"
+        );
+        state
+            .ordered_write(|tx| {
+                tx.execute(
+                    "INSERT INTO read_watermark VALUES ('thalamus-payer',100000,160000)",
+                    [],
+                )
+                .unwrap();
+                Ok(((), true))
+            })
+            .unwrap();
+        assert_eq!(watermark(), json!(100000));
+        assert!(state.ordered_write::<()>(|tx| {
+            tx.execute("UPDATE read_watermark SET watermark_ms=300000 WHERE source_key='thalamus-payer'",[]).unwrap();
+            Err("payer mirror did not commit".into())
+        }).is_err());
+        assert_eq!(watermark(), json!(100000));
+        state.ordered_write(|tx| {
+            tx.execute("UPDATE read_watermark SET watermark_ms=300000 WHERE source_key='thalamus-payer'",[]).unwrap();
+            Ok(((),true))
+        }).unwrap();
+        assert_eq!(watermark(), json!(200000));
+    }
+
+    #[test]
+    fn payer_coverage_counts_exceptions_once_and_reports_live_waits() {
+        let state = test_state();
+        state
+            .ordered_write(|tx| {
+                for (kind, identity) in [
+                    ("without_payer", "event-a"),
+                    ("late", "attempt-a"),
+                    ("unmatched_main", "attempt-b"),
+                    ("set_aside", "attempt-c"),
+                    ("set_aside", "attempt-d"),
+                    ("set_aside", "attempt-d"),
+                ] {
+                    crate::refresher::thalamus_payer_source::count_coverage(tx, kind, identity)?;
+                }
+                Ok(((), true))
+            })
+            .unwrap();
+        state.set_payer_waiting("pi", 3);
+        state.set_payer_waiting("opencode-thalamus", 2);
+        let coverage = dispatch(&state, OP_LEDGER_COVERAGE, json!({})).unwrap();
+        assert_eq!(
+            coverage["thalamus_payer"],
+            json!({"transcript_calls_without_payer":1,"late_payer_rows":1,"unmatched_main_rows":1,"set_aside_payer_rows":2,"waiting_calls_by_reader":{"pi":3,"opencode-thalamus":2}})
+        );
+        state.set_payer_waiting("pi", 0);
+        let coverage = dispatch(&state, OP_LEDGER_COVERAGE, json!({})).unwrap();
+        assert_eq!(
+            coverage["thalamus_payer"]["waiting_calls_by_reader"]["pi"],
+            0
+        );
+    }
 
     #[test]
     fn correction_ingest_requires_key_and_replays_without_moving_money() {

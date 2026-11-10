@@ -986,6 +986,7 @@ pub(super) fn coverage(
         )?
     };
     Ok(Some(LedgerCoverage {
+        thalamus_payer: load_thalamus_payer_coverage(conn)?,
         set_aside_by_source: load_set_aside_coverage(conn)?,
         skipped_local_by_source: load_skipped_local_coverage(conn)?,
         events_total: total.events,
@@ -2268,6 +2269,31 @@ mod tests {
                 .unwrap(),
             "200"
         );
+    }
+
+    #[test]
+    fn thalamus_payer_coverage_is_live_on_base_and_hourly_paths() {
+        let mut conn = conn();
+        let request:ingest::EventRecordRequest=serde_json::from_value(serde_json::json!({"producer":"fixture","producer_ref":"payer-coverage","charge_basis":"unknown","occurred_at_ms":1000,"measurements":[]})).unwrap();
+        ingest::record_event(&mut conn, &request, 1).unwrap();
+        conn.execute(
+            "INSERT INTO thalamus_payer_coverage VALUES ('late','attempt-a')",
+            [],
+        )
+        .unwrap();
+        let before = ledger_coverage_base(&conn, &LedgerCoverageRequest {}, 10_000).unwrap();
+        assert_eq!(before.thalamus_payer.as_ref().unwrap().late_payer_rows, 1);
+        catch_up(&mut conn);
+        assert!(coverage(&conn, 10_000).unwrap().is_some());
+        conn.execute(
+            "INSERT INTO thalamus_payer_coverage VALUES ('late','attempt-b')",
+            [],
+        )
+        .unwrap();
+        let hourly = ledger_coverage(&conn, &LedgerCoverageRequest {}, 10_000).unwrap();
+        let base = ledger_coverage_base(&conn, &LedgerCoverageRequest {}, 10_000).unwrap();
+        assert_eq!(hourly.thalamus_payer, base.thalamus_payer);
+        assert_eq!(hourly.thalamus_payer.unwrap().late_payer_rows, 2);
     }
 
     #[test]

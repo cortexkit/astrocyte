@@ -3154,15 +3154,15 @@ mod tests {
             .code
     }
 
-    /// Store the OpenCode-for-THALAMUS read watermark as a committed read
-    /// pass leaves it.
+    /// Store equal session and payer watermarks, as two committed read passes
+    /// leave them, so the wire vectors pin their shared served value.
     fn store_thalamus_watermark(state: &SharedState, watermark_ms: u64) {
         let watermark_ms = i64::try_from(watermark_ms).unwrap();
         state
             .with_conn(|conn| {
                 conn.execute(
                     "INSERT INTO read_watermark (source_key,watermark_ms,updated_at_ms)
-                     VALUES ('opencode-thalamus',?1,?1)",
+                     VALUES ('opencode-thalamus',?1,?1),('thalamus-payer',?1,?1)",
                     [watermark_ms],
                 )
                 .map_err(|error| error.to_string())

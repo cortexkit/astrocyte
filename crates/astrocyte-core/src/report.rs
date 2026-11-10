@@ -2035,6 +2035,8 @@ pub struct SetAsideCoverage {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LedgerCoverage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thalamus_payer: Option<ThalamusPayerCoverage>,
     pub set_aside_by_source: BTreeMap<String, SetAsideCoverage>,
     pub skipped_local_by_source: BTreeMap<String, u64>,
     pub events_total: u64,
@@ -2053,6 +2055,40 @@ pub struct LedgerCoverage {
     pub ingest_freshness: IngestFreshness,
     pub rate_staleness: RateStaleness,
     pub capacity: CapacityCoverage,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ThalamusPayerCoverage {
+    pub transcript_calls_without_payer: u64,
+    pub late_payer_rows: u64,
+    pub unmatched_main_rows: u64,
+    pub set_aside_payer_rows: u64,
+    pub waiting_calls_by_reader: BTreeMap<String, usize>,
+}
+
+fn load_thalamus_payer_coverage(
+    conn: &Connection,
+) -> Result<Option<ThalamusPayerCoverage>, ReportError> {
+    let observed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM thalamus_payer_session) OR EXISTS(SELECT 1 FROM thalamus_payer_record) OR EXISTS(SELECT 1 FROM thalamus_payer_coverage)",[],|row|row.get(0))?;
+    if !observed {
+        return Ok(None);
+    }
+    let mut coverage = ThalamusPayerCoverage::default();
+    let mut statement =
+        conn.prepare("SELECT kind,COUNT(*) FROM thalamus_payer_coverage GROUP BY kind")?;
+    for row in statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })? {
+        let (kind, count) = row?;
+        match kind.as_str() {
+            "without_payer" => coverage.transcript_calls_without_payer = count,
+            "late" => coverage.late_payer_rows = count,
+            "unmatched_main" => coverage.unmatched_main_rows = count,
+            "set_aside" => coverage.set_aside_payer_rows = count,
+            _ => {}
+        }
+    }
+    Ok(Some(coverage))
 }
 
 /// Read ledger and operational coverage in one caller-owned transaction/snapshot.
@@ -2088,6 +2124,7 @@ fn ledger_coverage_base(
     let labeled_windows = crate::capacity::windows(conn)?;
     let provider_readings = load_provider_capacity_readings(conn)?;
     Ok(LedgerCoverage {
+        thalamus_payer: load_thalamus_payer_coverage(conn)?,
         set_aside_by_source: load_set_aside_coverage(conn)?,
         skipped_local_by_source: load_skipped_local_coverage(conn)?,
         events_total: population.events_total,
