@@ -104,8 +104,9 @@ a value outside an enum) is refused `malformed`. Store failures are
 `malformed_operation_is_a_refusal_without_a_write`.
 
 All nine writes above share a daemon operator-confirmation gate, declared in the
-manifest's `confirm_operations`. The gate is **off until release**, by Ufuk's
-ruling: `ledger_write_confirmation_required()` returns `false`. Release enables
+manifest's `confirm_operations`. The gate is **off until release**, so that a
+daemon unable to prompt never blocks development:
+`ledger_write_confirmation_required()` returns `false`. Release enables
 it by changing only that function to return `true`, with no config, environment
 or feature switch. While off, direct callers write without a prompt as before.
 

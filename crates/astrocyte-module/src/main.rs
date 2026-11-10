@@ -847,7 +847,9 @@ fn is_mutating_operation(name: &str) -> bool {
 }
 
 /// Gates the nine direct ledger writes through daemon operator confirmation.
-/// It is off until release by Ufuk's ruling. Enabling it refuses direct writes
+/// It stays off during development, because a gate that refuses writes where
+/// the daemon can't prompt would block development work, and is turned on at
+/// release by changing only this function. Enabling it refuses direct writes
 /// wherever the deployed daemon cannot confirm operator presence, including
 /// Linux without an available presence provider.
 fn ledger_write_confirmation_required() -> bool {

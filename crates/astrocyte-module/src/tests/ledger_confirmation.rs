@@ -189,7 +189,8 @@ async fn ledger_confirmation_approved_dispatches_each_write_without_holding_writ
             .iter()
             .any(|(key, _)| key == account));
         // A module write completes while the person's direct write is waiting.
-        // This exercises the same writer fence and transaction, not a test lock.
+        // It goes through the real lock that serializes ledger writes and the
+        // real store transaction, so it shows the waiting write holds neither.
         let peer_account = format!("peer-{corr}");
         send(
             &mut rig.stream,
