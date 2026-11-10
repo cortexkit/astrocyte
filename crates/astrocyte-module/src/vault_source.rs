@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use astrocyte_core::vault_plan::VaultPlan;
+use astrocyte_core::vault_plan::{self, VaultPlan};
+use astrocyte_core::multiplier::PlanPriceSource;
+use fusiform_protocol::PlanPricesRequest;
 use cortexkit_claustrum_client::{decode_list_scoped_reply, WatchNotice};
 use serde_json::{json, Value};
 use subc_protocol::{Flags, Frame, FrameType, Priority};
@@ -199,4 +201,84 @@ impl Reader {
         drop(self.ticks);
         if let Some(thread) = self.thread.take() { let _ = thread.join(); }
     }
+}
+
+pub(crate) struct Stage {
+    reader: Reader,
+    available: bool,
+    last_failure: Option<String>,
+}
+
+impl Stage {
+    pub(crate) fn new(stop: Arc<AtomicBool>) -> Self {
+        Self { reader: Reader::start(stop), available: false, last_failure: None }
+    }
+
+    pub(crate) fn tick(&mut self, state: &SharedState, source: Option<&dyn PlanPriceSource>, now: i64) {
+        let snapshots = self.reader.tick(state);
+        self.apply(state, snapshots, source, now);
+    }
+
+        fn apply(&mut self, state: &SharedState, snapshots: Vec<Snapshot>, source: Option<&dyn PlanPriceSource>, now: i64) {
+        if !self.available && !snapshots.iter().any(Result::is_ok) {
+            for snapshot in snapshots { if let Err(code) = snapshot { self.failure(state,code); } }
+            return;
+        }
+        // Finish the peer call before any ledger write. Missing catalog prices
+        // leave the vault's known keys visible as unpriced instead of hiding them.
+        let result = source.ok_or_else(|| "plan_prices_unavailable".to_string())
+            .and_then(|source| source.plan_prices(PlanPricesRequest { provider_id: None }).map_err(|_| "plan_prices_unavailable".into()));
+        let price_available = result.is_ok();
+        let prices = result.unwrap_or_else(|_| fusiform_protocol::PlanPricesResponse {
+            prices: Vec::new(),resolved_at_ms:now,tier_vocabulary:String::new(),unit_policy:String::new(),
+        });
+        let had_snapshots = !snapshots.is_empty();
+        for snapshot in snapshots {
+            match snapshot {
+                Err(code) => { self.available = false; self.failure(state,code); }
+                Ok(plans) => {
+                    let result = state.ordered_write(|tx| {
+                        let mut changed = false;
+                        for plan in &plans { changed |= vault_plan::append_in_tx(tx,plan).map_err(|error|error.to_string())?; }
+                        Ok(((),changed))
+                    });
+                    if let Err(error) = result { self.failure(state,error); return; }
+                    self.available = true;
+                    self.reconcile(state,&prices,price_available,now);
+                }
+            }
+        }
+        if !had_snapshots && self.available { self.reconcile(state,&prices,price_available,now); }
+    }
+
+    fn reconcile(&mut self,state:&SharedState,prices:&fusiform_protocol::PlanPricesResponse,price_available:bool,now:i64) {
+        let result = state.ordered_write(|tx| {
+            let plans = vault_plan::at(tx,now.saturating_add(1)).map_err(|error|error.to_string())?;
+            let report = vault_plan::reconcile_in_tx(tx,&plans,prices,now)?;
+            Ok((report,true))
+        });
+        match result {
+            Ok(report) => {
+                state.set_vault_report(json!({"vault_read_status":{"status":"available"},
+                    "plan_price_status":if price_available { "available" } else { "unavailable" },
+                    "unknown_plans":report.unknown_plans,"unpriced_plans":report.unpriced_plans,
+                    "hand_vault_differences":report.hand_vault_differences,"vault_record_differences":report.vault_record_differences,
+                    "chatgpt_account_mismatches":report.chatgpt_account_mismatches}));
+                self.last_failure = None;
+            }
+            Err(error) => self.failure(state,error),
+        }
+    }
+
+    fn failure(&mut self, state: &SharedState, code: String) {
+        if self.last_failure.as_ref() != Some(&code) {
+            tracing::warn!(target: "astrocyte", reason=%code, "subscription vault read unavailable");
+            self.last_failure = Some(code.clone());
+        }
+        let mut report = state.vault_report();
+        report["vault_read_status"] = json!({"status":"unavailable","reason":code});
+        state.set_vault_report(report);
+    }
+
+    pub(crate) fn join(self) { self.reader.join(); }
 }

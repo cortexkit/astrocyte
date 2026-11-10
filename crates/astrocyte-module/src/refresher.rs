@@ -1949,7 +1949,9 @@ fn run_loop_full(
     let mut reconciler = QueueReconciler::new(QUEUE_RECONCILE_CHUNK, QUEUE_RECONCILE_TICK_BUDGET);
     let mut pricing = PricingWalk::new(PricingBudget::PER_TICK);
     let mut summaries = astrocyte_core::report::SummaryMaintenance::default();
+    let mut vault = crate::vault_source::Stage::new(Arc::clone(&stop));
     while !stop.load(Ordering::Relaxed) {
+        vault.tick(&state, multiplier.plan_prices.as_deref(), current_time_ms());
         run_tick(
             &state,
             &producers,
@@ -1984,6 +1986,7 @@ fn run_loop_full(
             );
         }
     }
+    vault.join();
 }
 
 const FAST_LANE_INTERVAL: Duration = Duration::from_secs(2);

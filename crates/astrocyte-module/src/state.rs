@@ -66,6 +66,7 @@ struct Inner {
     source_discovery: Mutex<HashMap<String, bool>>,
     payer_waiting: Mutex<BTreeMap<String, usize>>,
     quota_bus: crate::quota_events::Control,
+    vault_report: RwLock<serde_json::Value>,
     /// Recent harness steps kept for `usage.cache.steps`. Lock order: this
     /// mutex before either store connection, never the other way round.
     recent_steps: Mutex<crate::recent_steps::RecentSteps>,
@@ -331,6 +332,7 @@ impl SharedState {
             source_discovery: Mutex::new(HashMap::new()),
             payer_waiting: Mutex::new(BTreeMap::new()),
             quota_bus: crate::quota_events::Control::default(),
+            vault_report: RwLock::new(serde_json::json!({"vault_read_status":{"status":"not_read"}})),
             recent_steps: Mutex::new(crate::recent_steps::RecentSteps::default()),
             step_feed: crate::step_feed::FeedHub::default(),
             #[cfg(test)]
@@ -627,6 +629,14 @@ impl SharedState {
 
     pub(crate) fn quota_bus(&self) -> &crate::quota_events::Control {
         &self.0.quota_bus
+    }
+
+    pub(crate) fn vault_report(&self) -> serde_json::Value {
+        self.0.vault_report.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    pub(crate) fn set_vault_report(&self, report: serde_json::Value) {
+        *self.0.vault_report.write().unwrap_or_else(std::sync::PoisonError::into_inner) = report;
     }
 
     pub(crate) fn capacity_poll_ticket(
