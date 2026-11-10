@@ -86,3 +86,44 @@ fn version_prints_one_line_and_starts_nothing() {
         }
     );
 }
+
+/// SubC's placement check runs `--manifest` with no supervisor and reads
+/// `provenance.build_git_sha` to prove which commit the binary was built
+/// from. The answer is the HELLO manifest as JSON, and it starts nothing.
+#[test]
+fn manifest_prints_the_hello_manifest_and_starts_nothing() {
+    let home = std::env::temp_dir().join(format!("astrocyte-manifest-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let output = output_within_guard(
+        Command::new(ckdev_binary())
+            .arg("--manifest")
+            .env_remove("SUBC_MODULE_ID")
+            .env_remove("SUBC_LAUNCH_NONCE")
+            .env_remove("SUBC_LAUNCH_NONCE_FD")
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_CONFIG_HOME", home.join("config")),
+        "ckdev-astrocyte --manifest",
+    );
+    let written = entries_under(&home);
+    std::fs::remove_dir_all(&home).unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "exit {:?}\n{stdout}\n{stderr}",
+        output.status
+    );
+    assert!(stderr.is_empty(), "--manifest wrote to stderr: {stderr}");
+    assert!(written.is_empty(), "--manifest wrote files: {written:?}");
+    let manifest: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(manifest["module_id"], "astrocyte");
+    assert_eq!(manifest["display_name"], "Spend Ledger");
+    let build_sha = env!("CK_ASTROCYTE_BUILD_GIT_SHA");
+    if env!("CK_ASTROCYTE_BUILD_TREE_STATE") == "clean" && !build_sha.is_empty() {
+        assert_eq!(manifest["provenance"]["build_git_sha"], build_sha);
+    } else {
+        assert!(manifest["provenance"]["build_git_sha"].is_null());
+    }
+}

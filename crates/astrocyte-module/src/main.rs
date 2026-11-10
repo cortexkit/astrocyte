@@ -57,6 +57,19 @@ fn main() -> Result<std::process::ExitCode, Box<dyn Error>> {
         println!("{}", version_line());
         return Ok(std::process::ExitCode::SUCCESS);
     }
+    // `--manifest` prints the manifest astrocyte would send at HELLO, so SubC's
+    // placement check can read which commit the binary was built from
+    // (`provenance.build_git_sha`) without starting it. It touches no config,
+    // store, log or network, so the `consumes` list it shows is the one for an
+    // empty configuration, not the live one.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--manifest")
+    {
+        let manifest = manifest(DEFAULT_MODULE_ID, &config::intentional_empty().config);
+        println!("{}", serde_json::to_string(&manifest)?);
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
     // `ck` lists external command domains by running every `ck-<name>` in its
     // bin dir once with `--ck-domain` and caching the answer. Astrocyte has no
     // `ck astrocyte` subcommands, so it declines silently with a non-zero exit
