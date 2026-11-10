@@ -22,13 +22,14 @@ pub struct AstrocyteConfig {
 /// Every producer `harness_ingest.exclude` may name, by its `source_runtime`
 /// key: the local harness readers, BROCA's store and the media feed. A producer added
 /// later joins this list and is ingested unless the operator excludes it.
-pub(crate) const INGEST_SOURCES: [&str; 13] = [
+pub(crate) const INGEST_SOURCES: [&str; 14] = [
     "claude-code",
     "claude-code-workers",
     "claude-code-thalamus",
     "codex",
     "opencode",
     "opencode-thalamus",
+    "thalamus-payer",
     "pi",
     "gemini",
     "goose",

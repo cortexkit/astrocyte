@@ -43,6 +43,8 @@ pub(crate) mod opencode_thalamus_source;
 pub(crate) mod opencode_v2_source;
 #[path = "pi_source.rs"]
 mod pi_source;
+#[path = "thalamus_payer_source.rs"]
+pub(crate) mod thalamus_payer_source;
 
 use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroUsize;
@@ -1594,6 +1596,7 @@ fn refresher_kimi_source() -> kimi_source::KimiSource {
 
 fn refresher_harness_sources() -> Vec<Arc<dyn harness_drain::HarnessSource>> {
     vec![
+        Arc::new(refresher_thalamus_payer_source()),
         Arc::new(opencode_v2_source::registered()),
         Arc::new(refresher_gemini_source()),
         Arc::new(refresher_goose_source()),
@@ -1603,6 +1606,17 @@ fn refresher_harness_sources() -> Vec<Arc<dyn harness_drain::HarnessSource>> {
         Arc::new(refresher_claude_thalamus_source()),
         Arc::new(refresher_opencode_thalamus_source()),
     ]
+}
+
+fn refresher_thalamus_payer_source() -> thalamus_payer_source::ThalamusPayerSource {
+    #[cfg(any(test, feature = "test-support"))]
+    let home = std::env::temp_dir().join(format!(
+        "astrocyte-test-data-without-payer-{}",
+        std::process::id()
+    ));
+    #[cfg(not(any(test, feature = "test-support")))]
+    let home = PathBuf::from(cortexkit_store_types::resolve_data_home());
+    thalamus_payer_source::ThalamusPayerSource::from_data_home(home)
 }
 
 fn refresher_claude_thalamus_source() -> claude_thalamus_source::ClaudeThalamusSource {
@@ -2004,6 +2018,15 @@ fn run_fast_lane(
     #[cfg(all(test, target_os = "linux"))]
     let _measurement = fast_lane_measure::cycle(true);
     let ingest = state.desired_config().harness_ingest;
+    for source in &sources.harnesses {
+        if source.source_key() == thalamus_payer_source::SOURCE_KEY
+            && ingest.ingests(thalamus_payer_source::SOURCE_KEY)
+        {
+            if let Err(SourceDrainError::Failed(error)) = source.drain_fast(state, at, stop) {
+                tracing::debug!(%error, "fast payer read failed");
+            }
+        }
+    }
     let older: [Option<&dyn harness_drain::HarnessSource>; 4] = [
         sources
             .opencode
@@ -2034,6 +2057,9 @@ fn run_fast_lane(
             opencode_v2_source::SOURCE_KEY => opencode_source::OPENCODE_SOURCE_KEY,
             key => key,
         };
+        if ingest_key == thalamus_payer_source::SOURCE_KEY {
+            continue;
+        }
         if !ingest.ingests(ingest_key) {
             continue;
         }
@@ -2366,6 +2392,16 @@ fn run_iteration_all(
     // Read once per tick from the committed desired configuration, so the
     // producers skipped here always match the generation in force.
     let ingest = state.desired_config().harness_ingest;
+    // Payer sessions and rows must be committed before a transcript decides
+    // whether a call is ready or still waiting for its payer.
+    for source in harness_sources {
+        if source.source_key() == thalamus_payer_source::SOURCE_KEY
+            && ingesting(state, &ingest, thalamus_payer_source::SOURCE_KEY)
+            && !stop.load(Ordering::Relaxed)
+        {
+            drain_harness(state, *source, stop);
+        }
+    }
     let opencode_source =
         opencode_source.filter(|_| ingesting(state, &ingest, opencode_source::OPENCODE_SOURCE_KEY));
     let pi_source = pi_source.filter(|_| ingesting(state, &ingest, pi_source::PI_SOURCE_KEY));
@@ -2391,6 +2427,9 @@ fn run_iteration_all(
             break;
         }
         let key = harness.source_key();
+        if key == thalamus_payer_source::SOURCE_KEY {
+            continue;
+        }
         if !ingesting(state, &ingest, key) {
             continue;
         }
