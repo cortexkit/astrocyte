@@ -1,0 +1,106 @@
+{
+    "request": {
+      "arguments": {
+        "fact_prefixes": [
+          "rate."
+        ],
+        "model_id": "gemini-3.1-flash-image",
+        "provider_id": "google"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "fact_overrides": [
+        {
+          "established_at_ms": 1794268800000,
+          "established_by": "fusiform",
+          "fact_key": "rate.output",
+          "model": "google/gemini-3.1-flash-image",
+          "model_id": "gemini-3.1-flash-image",
+          "notes": "Only replaces the exact recorded $60/M upstream value. The Antigravity alias inherits the target's split rates; the Vertex row is untouched.",
+          "provider_id": "google",
+          "quote": "Gemini 3.1 Flash Image, Paid Tier, per 1M tokens in USD: output \"$3 (text and thinking)\", \"$60.00 (images)\". Image output token counts: 747 at 0.5K, 1120 at 1K, 1680 at 2K, 2520 at 4K.",
+          "reason": "The upstream output rate is the image price. Text and thinking output have a separate $3 per million token price, so using $60 for text overstates its cost.",
+          "replaces": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 60000000000
+          },
+          "review_by_ms": 1799452800000,
+          "source_ref": "https://ai.google.dev/gemini-api/docs/pricing (accessed 2026-11-10)",
+          "value": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 3000000000
+          }
+        },
+        {
+          "established_at_ms": 1794268800000,
+          "established_by": "fusiform",
+          "fact_key": "rate.output_image",
+          "model": "google/gemini-3.1-flash-image",
+          "model_id": "gemini-3.1-flash-image",
+          "notes": "Addition only while upstream records no image-output role. Projected through the existing Antigravity alias mechanism, not onto Vertex.",
+          "provider_id": "google",
+          "quote": "Gemini 3.1 Flash Image, Paid Tier, per 1M tokens in USD: output \"$3 (text and thinking)\", \"$60.00 (images)\". Image output token counts: 747 at 0.5K, 1120 at 1K, 1680 at 2K, 2520 at 4K.",
+          "reason": "The image output price needs its own role so it is not confused with text output.",
+          "replaces": null,
+          "review_by_ms": 1799452800000,
+          "source_ref": "https://ai.google.dev/gemini-api/docs/pricing (accessed 2026-11-10)",
+          "value": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 60000000000
+          }
+        }
+      ],
+      "models": {
+        "google/gemini-3.1-flash-image": {
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 500000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 3000000000
+          },
+          "rate.output_image": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 60000000000
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  }

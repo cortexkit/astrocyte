@@ -350,7 +350,16 @@ values only token measurements and ignores unit-rate facts beside token rates.
 
 Money is a signed 64-bit integer count of nanounits (10^-9) of the row's
 currency: nanodollars for USD. Corrections are signed deltas, so a total can
-be negative. Arithmetic is checked in 128 bits. An overflow is a data error:
+be negative.
+
+A catalog rate states its own exponent: a hand-kept row may give $30 per
+million tokens as `units 30, exponent 0`. Pricing restates the rate exactly at
+nano scale before using it, so `rate_units` and `rate_exponent` on a charge are
+always in nanounits (`rate_exponent` 9); the served value stays in
+`catalog_entry`. A measured minimum charge is restated with it. A rate finer than
+one nanounit per unit cannot be held exactly and stays unpriced with
+`arithmetic_out_of_range`; the subscription multiplier leaves such a rate
+unpriced too. Arithmetic is checked in 128 bits. An overflow is a data error:
 the measurement is stored `unpriced` with `arithmetic_out_of_range`, never
 wrapped or capped. There is one rounding site, `round_nano_num` in
 `crates/astrocyte-core/src/money.rs`, which rounds half to even. No

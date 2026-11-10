@@ -1,0 +1,81 @@
+{
+    "request": {
+      "arguments": {
+        "model_id": "gpt-image-2.6-flare",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "curated": [
+        {
+          "auth_methods": [
+            "apikey"
+          ],
+          "model": "openai/gpt-image-2.6-flare",
+          "review_by_ms": 1799452800000,
+          "source_ref": "Read 2026-11-10. https://platform.openai.com/docs/models/gpt-image-2.6-flare: \"gpt-image-2.6-flare\", \"GPT Image 2.6 Flare\". Text: \"Input | $5 | 1M tokens\", \"Cached input | $1.25 | 1M tokens\". Image: \"Input | $8 | 1M tokens\", \"Cached input | $2 | 1M tokens\", \"Output | $30 | 1M tokens\". Supported endpoints: \"/v1/images/generations\" and \"/v1/images/edits\"; Responses is not supported. https://platform.openai.com/docs/pricing: Flare text output \"-\", so no rate.output is served. Cached image input is unserved: there is no cached-image role, and the guide states cached pricing applies only through the Responses API, which this model does not support. The text cache-read price is retained as the model page states it; endpoint applicability must be checked by the caller. Text and image input produce image output."
+        }
+      ],
+      "models": {
+        "openai/gpt-image-2.6-flare": {
+          "capability.input_modalities": [
+            "image",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "image"
+          ],
+          "existence": "present",
+          "model.lineage": "gpt",
+          "model.name": "GPT Image 2.6 Flare",
+          "model.type": "image",
+          "provider.name": "OpenAI",
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 2,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 125
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 5
+          },
+          "rate.input_image": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 8
+          },
+          "rate.output_image": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 30
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://api.openai.com/v1"
+          },
+          "wire.family": "openai.images"
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  }

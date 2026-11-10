@@ -374,6 +374,17 @@ impl PriceOverride {
     }
 }
 
+/// A catalog rate of `units × 10^-exponent` dollars as whole nano-USD, or
+/// `None` when it is not a whole number of nano-USD or does not fit.
+fn rate_nanos_exact(units: i64, exponent: u8) -> Option<i64> {
+    if exponent <= NANO_EXPONENT {
+        units.checked_mul(10_i64.checked_pow(u32::from(NANO_EXPONENT - exponent))?)
+    } else {
+        let divisor = 10_i64.checked_pow(u32::from(exponent - NANO_EXPONENT))?;
+        (units % divisor == 0).then(|| units / divisor)
+    }
+}
+
 fn amount_to_nanos(minor_units: i64, exponent: i32) -> Option<i64> {
     let exponent = u8::try_from(exponent).ok()?;
     let scale = NANO_EXPONENT.checked_sub(exponent)?;
@@ -1268,12 +1279,14 @@ fn rate_state(snapshot: &CatalogSnapshot, key: &str) -> RateState {
             inherited_from: Some(_),
             ..
         }) => unpriced("rate_inherited"),
-        Ok(RateValue::Priced { amount, .. }) if amount.exponent != NANO_EXPONENT => {
-            unpriced("rate_exponent_unsupported")
+        // A rate may state any exponent; the multiplier keeps whole nano-USD per
+        // million tokens, so a rate finer than that cannot be held exactly.
+        Ok(RateValue::Priced { amount, .. }) => {
+            match rate_nanos_exact(amount.units, amount.exponent) {
+                Some(units_per_million) => RateState::Priced { units_per_million },
+                None => unpriced("rate_exponent_unsupported"),
+            }
         }
-        Ok(RateValue::Priced { amount, .. }) => RateState::Priced {
-            units_per_million: amount.units,
-        },
         // A zero marked `inherited_from` is another catalog row's statement
         // that the model is free, not this provider's, so it gets the same
         // reason as an inherited price rather than the own-zero reason.
@@ -3035,6 +3048,42 @@ mod tests {
     include!("multiplier/context_tier_tests.rs");
     use super::*;
     use crate::test_support::conn;
+
+    /// The multiplier values a rate stated at any exponent, as whole nano-USD
+    /// per million tokens: $30/M as 3000 hundredths or 30 dollars, and a finer
+    /// exponent only when it is a whole nano. A rate it can't hold exactly is
+    /// left unpriced rather than rounded.
+    #[test]
+    fn rate_state_holds_any_stated_exponent_exactly() {
+        let state = |units: i64, exponent: u8| {
+            let snapshot = CatalogSnapshot {
+                source: "test".into(),
+                resolved_at_ms: 0,
+                model_key: "provider/model".into(),
+                facts: BTreeMap::from([(
+                    "rate.input".into(),
+                    serde_json::json!({"state":"priced","units":units,"exponent":exponent,
+                        "currency":"USD","unit_provenance":{"kind":"stated"}}),
+                )]),
+                withheld_facts: BTreeMap::new(),
+                uncertain_facts: BTreeMap::new(),
+                fact_overrides: BTreeMap::new(),
+                alias_target: None,
+            };
+            rate_state(&snapshot, "rate.input")
+        };
+        let priced = |units_per_million| RateState::Priced { units_per_million };
+        assert_eq!(state(3_000, 2), priced(30_000_000_000));
+        assert_eq!(state(30, 0), priced(30_000_000_000));
+        assert_eq!(state(30_000_000_000, 9), priced(30_000_000_000));
+        assert_eq!(state(50, 10), priced(5));
+        assert_eq!(
+            state(5, 10),
+            RateState::Unpriced {
+                reason: "rate_exponent_unsupported".into()
+            }
+        );
+    }
 
     #[derive(Clone, Serialize)]
     struct FixtureConfig {

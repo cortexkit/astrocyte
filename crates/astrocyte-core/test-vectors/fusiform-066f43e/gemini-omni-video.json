@@ -1,0 +1,78 @@
+{
+    "request": {
+      "arguments": {
+        "model_id": "gemini-omni-1.2-flash",
+        "provider_id": "google"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "curated": [
+        {
+          "auth_methods": [
+            "apikey"
+          ],
+          "model": "google/gemini-omni-1.2-flash",
+          "review_by_ms": 1799452800000,
+          "source_ref": "Read 2026-11-10. https://ai.google.dev/gemini-api/docs/pricing: per 1M tokens in USD, input \"$1.50 (text / image / video)\"; output \"$9.00 (text)\", \"$12.00 (video)\"; \"calculated at a rate of 5,792 tokens per second of 720p video\"; 360p \"1,931 tokens/s\", 1080p with upsampling \"8,688 tokens/s\", 4K with upsampling \"17,376 tokens/s\". https://ai.google.dev/gemini-api/docs/models/gemini-omni-flash: Stable \"gemini-omni-1.2-flash\", \"Gemini Omni 1.2 Flash\". https://ai.google.dev/gemini-api/docs/omni: \"Interactions API\", \"POST https://generativelanguage.googleapis.com/v1beta/interactions\". Image, text and video input; text and video output. Output conversions are resolution-selected token counts, not time-billed rates; 1080p and 4K include upsampling. No unstated context, output limit or audio conversion is served."
+        }
+      ],
+      "models": {
+        "google/gemini-omni-1.2-flash": {
+          "capability.input_modalities": [
+            "image",
+            "text",
+            "video"
+          ],
+          "capability.output_modalities": [
+            "text",
+            "video"
+          ],
+          "existence": "present",
+          "limit.output_video_tokens_per_second.resolution.1080p": 8688,
+          "limit.output_video_tokens_per_second.resolution.360p": 1931,
+          "limit.output_video_tokens_per_second.resolution.4k": 17376,
+          "limit.output_video_tokens_per_second.resolution.720p": 5792,
+          "model.lineage": "gemini",
+          "model.name": "Gemini Omni 1.2 Flash",
+          "model.type": "video",
+          "provider.name": "Google",
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 2,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 150
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 9
+          },
+          "rate.output_video": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 12
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://generativelanguage.googleapis.com/v1beta"
+          },
+          "wire.family": "google.interactions"
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  }

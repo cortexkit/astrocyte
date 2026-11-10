@@ -1,0 +1,59 @@
+{
+    "request": {
+      "arguments": {
+        "model_id": "eleven_flash_v2_5",
+        "provider_id": "elevenlabs"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "curated": [
+        {
+          "auth_methods": [
+            "apikey"
+          ],
+          "model": "elevenlabs/eleven_flash_v2_5",
+          "review_by_ms": 1799452800000,
+          "source_ref": "Read 2026-11-10. https://elevenlabs.io/pricing/api: \"API usage is billed in US dollars, not credits. Text to Speech $0.08 per 1,000 characters (multilingual models) or $0.04 (Flash/Turbo).\"; \"Text to Speech is billed per character.\" https://elevenlabs.io/docs/overview/models: \"eleven_flash_v2_5\", \"Eleven Flash v2.5\", \"40,000 characters per request\". This is a character request cap, not a token context limit, and is not served as limit.context. https://elevenlabs.io/docs/api-reference/text-to-speech/convert: \"POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}\"; header \"xi-api-key\". The endpoint converts text to audio. Served as $0.04 per 1,000 characters using the typed unit-billed shape; the page states no rounding or minimum, so increment and minimum_quantity are unknown, not none. No per-token or output rate is stated."
+        }
+      ],
+      "models": {
+        "elevenlabs/eleven_flash_v2_5": {
+          "capability.input_modalities": [
+            "text"
+          ],
+          "capability.output_modalities": [
+            "audio"
+          ],
+          "existence": "present",
+          "model.name": "Eleven Flash v2.5",
+          "model.type": "speech",
+          "provider.name": "ElevenLabs",
+          "rate.input.per_character": {
+            "currency": "USD",
+            "exponent": 2,
+            "increment": {
+              "kind": "unknown"
+            },
+            "minimum_quantity": {
+              "kind": "unknown"
+            },
+            "per": 1000,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 4
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://api.elevenlabs.io/v1"
+          },
+          "wire.family": "elevenlabs.text_to_speech"
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  }

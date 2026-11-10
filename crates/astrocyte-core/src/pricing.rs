@@ -1296,16 +1296,17 @@ fn resolve_measurement(
             increment,
             minimum_quantity,
         } => {
-            if amount.exponent != NANO_EXPONENT {
-                return Err(CatalogClientError::InvalidRate {
-                    reason: format!(
-                        "priced rate exponent {} is unsupported; expected {NANO_EXPONENT}",
-                        amount.exponent
-                    ),
-                    entry: entry.clone(),
-                }
-                .into());
-            }
+            let Some((amount, floor)) = nano_scaled(amount, floor) else {
+                // The ledger records every rate at nano-USD scale. A rate
+                // finer than one nano per unit cannot be held there exactly,
+                // so the measurement stays unpriced rather than rounded.
+                return Ok(ChargeDecision::Unpriced {
+                    reason: UnpricedReason::ArithmeticOutOfRange,
+                    catalog_source: Some(snapshot.source.clone()),
+                    resolved_at_ms: Some(snapshot.resolved_at_ms),
+                    catalog_entry: Some(provenance),
+                });
+            };
             let price = if let Some(per) = per {
                 provenance["per"] = json!(per);
                 provenance["increment"] = json!(increment);
@@ -1418,6 +1419,37 @@ fn priced_quantity(plan: &RepricePlan, measurement: &MeasurementPlan) -> Option<
         EffectiveOutput::ReasoningRemoved(effective) => Some((effective, 0)),
         EffectiveOutput::ReasoningExceedsOutput => None,
     }
+}
+
+/// A rate restated at nano-USD scale. A catalog rate is `units × 10^-exponent`
+/// in its currency at whatever exponent its source states (a vendor page may
+/// say $30 per million, exponent 0), while the ledger stores every rate and
+/// charge at exponent 9. The value is unchanged; only its scale moves, and a
+/// measured minimum moves with it because it is stated at the rate's scale.
+/// `None` when the rate is finer than one nano or does not fit.
+fn nano_scaled(amount: Amount, floor: Floor) -> Option<(Amount, Floor)> {
+    let rescale = |units: i64| {
+        if amount.exponent <= NANO_EXPONENT {
+            units.checked_mul(10_i64.checked_pow(u32::from(NANO_EXPONENT - amount.exponent))?)
+        } else {
+            let divisor = 10_i64.checked_pow(u32::from(amount.exponent - NANO_EXPONENT))?;
+            (units % divisor == 0).then(|| units / divisor)
+        }
+    };
+    let floor = match floor {
+        Floor::Minimum { units } => Floor::Minimum {
+            units: rescale(units)?,
+        },
+        other => other,
+    };
+    Some((
+        Amount {
+            units: rescale(amount.units)?,
+            exponent: NANO_EXPONENT,
+            ..amount
+        },
+        floor,
+    ))
 }
 
 fn price_exact(
@@ -3011,13 +3043,59 @@ mod tests {
         assert_eq!(generation, 0);
     }
 
+    /// A rate states its own exponent; the ledger restates it at nano-USD
+    /// scale, exactly. $30/M stated as 3000 hundredths, as 30 dollars or as
+    /// nanos prices and records the same rate. A finer exponent is accepted
+    /// when it is a whole nano, and a rate finer than one nano stays unpriced
+    /// rather than rounded.
     #[test]
-    fn non_nine_catalog_exponent_refuses_without_any_stored_state() {
-        assert_catalog_refusal_without_rows(
-            "bad-exponent",
-            "rate.input",
-            json!({"state":"priced","units":3_000,"exponent":2,"currency":"USD","unit_provenance":{"kind":"stated"}}),
-        );
+    fn any_stated_rate_exponent_prices_exactly() {
+        let priced = |nanos: i64, rate: i64| (Some(nanos), Some(rate), Some(9_i64), None::<String>);
+        for (units, exponent, tokens, expected) in [
+            (
+                3_000_i64,
+                2_u8,
+                1_000_000_i64,
+                priced(30_000_000_000, 30_000_000_000),
+            ),
+            (30, 0, 1_000_000, priced(30_000_000_000, 30_000_000_000)),
+            (
+                30_000_000_000,
+                9,
+                1_000_000,
+                priced(30_000_000_000, 30_000_000_000),
+            ),
+            (50, 10, 1_000_000, priced(5, 5)),
+            (
+                5,
+                10,
+                1_000_000,
+                (None, None, None, Some("arithmetic_out_of_range".into())),
+            ),
+        ] {
+            let mut conn = conn();
+            let id = record(
+                &mut conn,
+                "exponent",
+                ChargeBasis::MeteredApi,
+                Some(700),
+                vec![measurement("input", Some(tokens))],
+            );
+            let catalog = client(FakeCatalog::new(BTreeMap::from([(
+                "rate.input".into(),
+                json!({"state":"priced","units":units,"exponent":exponent,"currency":"USD",
+                    "unit_provenance":{"kind":"stated"}}),
+            )])));
+            reprice_event(&mut conn, &id, &catalog, 1_000, PricingOrigin::PricingPass).unwrap();
+            let stored: (Option<i64>, Option<i64>, Option<i64>, Option<String>) = conn
+                .query_row(
+                    "SELECT charge_nanos, rate_units, rate_exponent, unpriced_reason FROM priced_charge",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, expected, "{units}e-{exponent} x {tokens}");
+        }
     }
 
     #[test]

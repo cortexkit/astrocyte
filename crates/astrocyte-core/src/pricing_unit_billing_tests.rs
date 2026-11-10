@@ -564,3 +564,142 @@ fn every_cache_write_lifetime_counts_toward_the_prompt() {
         assert!(prompt.exceeds(272_000), "{unit}");
     }
 }
+
+/// Records one call of `provider`/`model` with the given (role, unit,
+/// quantity) measurements, prices it against `response`, and returns each
+/// charge as (role, unit, charge in nanodollars, unpriced reason).
+fn price_against_vector(
+    response: CatalogGetResponse,
+    provider: &str,
+    model: &str,
+    measurements: &[(&str, &str, i64)],
+) -> Vec<(String, String, Option<i64>, Option<String>)> {
+    let mut conn = conn();
+    let measurements: Vec<Value> = measurements
+        .iter()
+        .map(|(role, unit, quantity)| {
+            json!({"role":role, "unit":unit, "kind":"billed", "source":"test",
+                "quantity_units":quantity, "quantity_exponent":0})
+        })
+        .collect();
+    let request = serde_json::from_value::<EventRecordRequest>(json!({
+        "producer":"producer", "producer_lineage":"lineage", "producer_ref":model,
+        "provider":provider, "model":model, "charge_basis":"metered_api",
+        "occurred_at_ms":700, "measurements":measurements,
+    }))
+    .unwrap();
+    let id = record_event(&mut conn, &request, 900).unwrap().event_id;
+    let fake = FakeCatalog::new(BTreeMap::new());
+    *fake.response.lock().unwrap() = response;
+    if let Err(error) = reprice_event(&mut conn, &id, &client(fake), 1_000, PricingOrigin::PricingPass) {
+        panic!("pricing {provider}/{model}: {error:?}");
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT role, unit, charge_nanos, unpriced_reason FROM priced_charge ORDER BY role, unit",
+        )
+        .unwrap();
+    let charges = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    charges
+}
+
+/// Fusiform's media rows as it serves them from 066f43e
+/// (test-vectors/fusiform-066f43e). Each reply must decode, and each new rate
+/// role must price a measurement of that role from its own key. Prices are per
+/// million tokens unless the key carries a denominator.
+#[test]
+fn media_rows_from_fusiform_066f43e_decode_and_price_each_role() {
+    let row = |role: &str, unit: &str, nanos: i64| {
+        (role.to_string(), unit.to_string(), Some(nanos), None::<String>)
+    };
+    let vector = |name: &str, bytes: &[u8], sha256: &str| cache_lifetime_vector(name, bytes, sha256);
+
+    // $0.04 per 1,000 characters.
+    let eleven = vector(
+        "eleven-flash-tts",
+        include_bytes!("../test-vectors/fusiform-066f43e/eleven-flash-tts.json"),
+        "d52ec0b31abdcca1d28ef07980d14d725af6d6ca8ef5a47e394e9571a16096a9",
+    );
+    assert_eq!(
+        price_against_vector(eleven, "elevenlabs", "eleven_flash_v2_5", &[("input", "character", 1_000)]),
+        [row("input", "character", 40_000_000)]
+    );
+
+    // Image input $8/M and image output $30/M, apart from text input.
+    let flare = vector(
+        "gpt-image-flare",
+        include_bytes!("../test-vectors/fusiform-066f43e/gpt-image-flare.json"),
+        "d6ec584db238bf8bed29617d3c40d8b6478c8e6acb39bac46e42580efca50d84",
+    );
+    assert_eq!(
+        price_against_vector(
+            flare,
+            "openai",
+            "gpt-image-2.6-flare",
+            &[("input_image", "token", 1_000_000), ("output_image", "token", 1_000_000)]
+        ),
+        [row("input_image", "token", 8_000_000_000), row("output_image", "token", 30_000_000_000)]
+    );
+
+    // Text output $3/M and image output $60/M are separate roles.
+    let flash_image = vector(
+        "gemini-flash-image-split",
+        include_bytes!("../test-vectors/fusiform-066f43e/gemini-flash-image-split.json"),
+        "f680e3324ac32fa280466afbc02b96847f8d7c5be477d857b9a0534c4cc01642",
+    );
+    assert_eq!(
+        price_against_vector(
+            flash_image,
+            "google",
+            "gemini-3.1-flash-image",
+            &[("output", "token", 1_000_000), ("output_image", "token", 1_000_000)]
+        ),
+        [row("output", "token", 3_000_000_000), row("output_image", "token", 60_000_000_000)]
+    );
+
+    // The Antigravity alias inherits those rates, which the ledger never
+    // charges as its own, so each role stays unpriced as inherited.
+    let alias = vector(
+        "gemini-flash-image-alias-split",
+        include_bytes!("../test-vectors/fusiform-066f43e/gemini-flash-image-alias-split.json"),
+        "bc4a7259696c521296ee50803ef5615be5129625718ebcccd7e4cf6a33ab13cb",
+    );
+    let alias_charges = price_against_vector(
+        alias,
+        "google",
+        "antigravity-gemini-3.1-flash-image",
+        &[("output", "token", 1_000_000), ("output_image", "token", 1_000_000)],
+    );
+    assert!(
+        alias_charges
+            .iter()
+            .all(|(_, _, nanos, reason)| nanos.is_none() && reason.as_deref() == Some("rate_inherited")),
+        "{alias_charges:?}"
+    );
+
+    // Audio output $9/M.
+    let tts = vector(
+        "gemini-flash-tts",
+        include_bytes!("../test-vectors/fusiform-066f43e/gemini-flash-tts.json"),
+        "54c4642866c4790b134c87b49037b5cebeb622b7353c55b66a2d2b39301d585a",
+    );
+    assert_eq!(
+        price_against_vector(tts, "google", "gemini-3.8-flash-tts", &[("output_audio", "token", 1_000_000)]),
+        [row("output_audio", "token", 9_000_000_000)]
+    );
+
+    // Video output $12/M; the per-resolution limit facts don't affect pricing.
+    let omni = vector(
+        "gemini-omni-video",
+        include_bytes!("../test-vectors/fusiform-066f43e/gemini-omni-video.json"),
+        "4b3ea9c6ddf01056975496f61d097db506bb9111f431bae2e9cfa86cd1fc4df3",
+    );
+    assert_eq!(
+        price_against_vector(omni, "google", "gemini-omni-1.2-flash", &[("output_video", "token", 1_000_000)]),
+        [row("output_video", "token", 12_000_000_000)]
+    );
+}

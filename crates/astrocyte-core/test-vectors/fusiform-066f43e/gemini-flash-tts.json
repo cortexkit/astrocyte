@@ -1,0 +1,65 @@
+{
+    "request": {
+      "arguments": {
+        "model_id": "gemini-3.8-flash-tts",
+        "provider_id": "google"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "curated": [
+        {
+          "auth_methods": [
+            "apikey"
+          ],
+          "model": "google/gemini-3.8-flash-tts",
+          "review_by_ms": 1799452800000,
+          "source_ref": "Read 2026-11-10. https://ai.google.dev/gemini-api/docs/pricing: \"Paid Tier, per 1M tokens in USD\"; input \"$0.50 (text) through December 31, 2026.\"; output \"$9.00 (audio) through December 31, 2026.\"; \"Audio tokens correspond to 25 tokens per second of audio.\" Both prices double on 2027-01-01 to $1.00 input and $18.00 audio output; those future prices are not served. https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash-tts: \"Gemini 3.8 Flash TTS\"; \"Input token limit 8,192\"; \"Output token limit 16,384\"; supported methods include \"GenerateContent\". https://ai.google.dev/gemini-api/docs/speech-generation: model id \"gemini-3.8-flash-tts\"; text input and audio output. No text-output rate is stated, so no rate.output is served."
+        }
+      ],
+      "models": {
+        "google/gemini-3.8-flash-tts": {
+          "capability.input_modalities": [
+            "text"
+          ],
+          "capability.output_modalities": [
+            "audio"
+          ],
+          "existence": "present",
+          "limit.context": 8192,
+          "limit.output": 16384,
+          "limit.output_audio_tokens_per_second": 25,
+          "model.lineage": "gemini",
+          "model.name": "Gemini 3.8 Flash TTS",
+          "model.type": "speech",
+          "provider.name": "Google",
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 2,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 50
+          },
+          "rate.output_audio": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "stated"
+            },
+            "units": 9
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://generativelanguage.googleapis.com/v1beta"
+          },
+          "wire.family": "google.generate_content"
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  }
