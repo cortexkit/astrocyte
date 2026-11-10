@@ -25,9 +25,12 @@ fn vault_check_config_accepts_scope_only_and_refuses_removed_identity_maps() {
     };
     std::fs::write(&path, document.to_string()).unwrap();
     let output = check();
+    // The status is in the message for the same reason as in the test below:
+    // a process that never started also fails with empty stderr.
     assert!(
         output.status.success(),
-        "{}",
+        "--check-config refused a valid config (exit {:?}): {}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
     for field in ["accounts", "credentials"] {
