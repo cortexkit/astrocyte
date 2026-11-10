@@ -1,0 +1,46 @@
+{
+  "serializer": "cortexkit-role-llm-runner 0.8.36 StepFinished via broca step_events::event",
+  "sessions": "synthetic only; before bodies serialized before production edits; after bodies serialized through the new report path",
+  "files": [
+    {
+      "file": "after/anthropic-1h-off.json",
+      "sha256": "9cb9a4dcd359c65d5b1deaea85a60c51884dade2f2d26dbfd3e22c30ea4b7410"
+    },
+    {
+      "file": "after/anthropic-5m-auto-on.json",
+      "sha256": "d11aad589130e6762352bb8f2151c7ce14f1a194667632e7119f457d47479e66"
+    },
+    {
+      "file": "after/anthropic-5m-auto-stopped.json",
+      "sha256": "71cb6bf95bc489900dc9b0147ed23986f7162fcb4004ebe2afd2975c47ee6907"
+    },
+    {
+      "file": "after/anthropic-5m-off.json",
+      "sha256": "fefec227184568fe006979df8aa85c195d920420cd4b2662a476e2b4ba1d8f60"
+    },
+    {
+      "file": "after/chatgpt-implicit-off.json",
+      "sha256": "1a7c46c0d0ebac1248ff19cdabcc8b752ec78d04f7fd0a262b60169c7ccfd4d6"
+    },
+    {
+      "file": "before/anthropic-1h-off.json",
+      "sha256": "c8dee1e32409be4f17928a8bf22d3121cbf75487e3f9d030a9afb259816aed84"
+    },
+    {
+      "file": "before/anthropic-5m-auto-on.json",
+      "sha256": "b75a91568e6bca64727ff2d3690020b0076c97a72933d8e0d47d3558939506f1"
+    },
+    {
+      "file": "before/anthropic-5m-auto-stopped.json",
+      "sha256": "356b516e21d888b18a47ab10c6901280adb8be39b1452f6883116055bbf0444e"
+    },
+    {
+      "file": "before/anthropic-5m-off.json",
+      "sha256": "fd7963587be46c8ae10f2d41e86f789f3237ebc637c2599e3771caf9685ab14a"
+    },
+    {
+      "file": "before/chatgpt-implicit-off.json",
+      "sha256": "0be948d1cf6d586be7ff699d01eea09725a2e4af83dca1bbbfe8afce608f5bff"
+    }
+  ]
+}

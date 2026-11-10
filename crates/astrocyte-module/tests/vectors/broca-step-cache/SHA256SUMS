@@ -1,0 +1,11 @@
+9cb9a4dcd359c65d5b1deaea85a60c51884dade2f2d26dbfd3e22c30ea4b7410  ./after/anthropic-1h-off.json
+d11aad589130e6762352bb8f2151c7ce14f1a194667632e7119f457d47479e66  ./after/anthropic-5m-auto-on.json
+71cb6bf95bc489900dc9b0147ed23986f7162fcb4004ebe2afd2975c47ee6907  ./after/anthropic-5m-auto-stopped.json
+fefec227184568fe006979df8aa85c195d920420cd4b2662a476e2b4ba1d8f60  ./after/anthropic-5m-off.json
+1a7c46c0d0ebac1248ff19cdabcc8b752ec78d04f7fd0a262b60169c7ccfd4d6  ./after/chatgpt-implicit-off.json
+c8dee1e32409be4f17928a8bf22d3121cbf75487e3f9d030a9afb259816aed84  ./before/anthropic-1h-off.json
+b75a91568e6bca64727ff2d3690020b0076c97a72933d8e0d47d3558939506f1  ./before/anthropic-5m-auto-on.json
+356b516e21d888b18a47ab10c6901280adb8be39b1452f6883116055bbf0444e  ./before/anthropic-5m-auto-stopped.json
+fd7963587be46c8ae10f2d41e86f789f3237ebc637c2599e3771caf9685ab14a  ./before/anthropic-5m-off.json
+0be948d1cf6d586be7ff699d01eea09725a2e4af83dca1bbbfe8afce608f5bff  ./before/chatgpt-implicit-off.json
+e8cebcd80a3c7fa9bd2a2d8f6b66d6d089bf3c1a2e43919feebc6ef5960d7167  ./manifest.json

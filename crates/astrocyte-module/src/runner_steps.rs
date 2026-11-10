@@ -728,6 +728,60 @@ mod tests {
         }
     }
 
+    /// Broca's step events before and after it fills the optional `cache`
+    /// report (`tests/vectors/broca-step-cache/SHA256SUMS`, serialized by
+    /// broca with llm-runner 0.8.36): each decodes on broca's subject and is
+    /// served with its cache write and its 5-minute and 1-hour split.
+    #[test]
+    fn brocas_step_events_with_a_cache_report_decode_and_are_served() {
+        let subject = names().live_subject("broca", STEP_EVENT, 1).unwrap();
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/broca-step-cache");
+        let mut decoded = 0;
+        for phase in ["before", "after"] {
+            let mut files: Vec<_> = std::fs::read_dir(directory.join(phase))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            files.sort();
+            for path in files {
+                let name = path.display().to_string();
+                // The samples come from broca's serializer on a synthetic
+                // session, whose runner is the contract's placeholder
+                // `runner_a`. Broca's live events name `broca`, which its
+                // subject requires, so only that member and the times are set.
+                let mut recent: Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                let now = u64::try_from(now_ms()).unwrap();
+                recent["runner"] = json!("broca");
+                recent["started_at_ms"] = json!(now - 2_000);
+                recent["finished_at_ms"] = json!(now - 1_000);
+                let bytes = serde_json::to_vec(&recent).unwrap();
+                let event = decode_step_finished(&subject, &bytes)
+                    .unwrap_or_else(|error| panic!("{name} does not decode: {error:?}"));
+                assert!(feed_step(event).is_some(), "{name} has no row identity");
+                let state = test_state();
+                admit(&state, &subject, &bytes);
+                assert_eq!(state.step_feed().runner_counts().appended, 1, "{name}");
+                let served = rows(
+                    &state,
+                    json!({"harness": "broca", "session": recent["session"]}),
+                );
+                assert_eq!(served.len(), 1, "{name}");
+                for member in ["cache_write", "cache_write_5m", "cache_write_1h"] {
+                    let sent = format!("{member}_tokens");
+                    assert_eq!(
+                        served[0].get(member),
+                        recent.get(sent.as_str()),
+                        "{name}: {member}"
+                    );
+                }
+                decoded += 1;
+            }
+        }
+        assert_eq!(decoded, 10);
+    }
+
     #[test]
     fn a_step_older_than_the_feed_window_is_not_added() {
         let state = test_state();
