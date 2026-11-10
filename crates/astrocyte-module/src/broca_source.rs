@@ -1197,6 +1197,64 @@ mod tests {
         assert!(projects[1].1.as_deref().unwrap().ends_with("/elsewhere"));
     }
 
+    /// Two session facts from BROCA's real billing builder with its lifetime
+    /// split switched on (tests/vectors/broca-cache-write-split, 2026-11-10):
+    /// one reporting a 30-token cache write as 10 five-minute and 20 one-hour
+    /// tokens, one reporting only the total. The split must be recorded as one
+    /// measurement per lifetime, so each prices at its own rate, and the
+    /// total alone as a plain cache write. Both samples carry the same fact
+    /// id, so each is drained into its own store.
+    #[test]
+    fn broca_cache_write_lifetime_split_is_recorded_per_lifetime() {
+        let cache_writes = |name: &str| {
+            let wire = std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/vectors/broca-cache-write-split")
+                    .join(name),
+            )
+            .unwrap();
+            let fact = "fc07bbda7b53f37e36b57c65d801576d13a50b3fb38dd39b868dba2e857f9a37";
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("run-index.db");
+            create_store(&path, "instance-a", 1);
+            add_segment(&path, 1, fact, wire.trim_end());
+            let state = test_state();
+            let outcome =
+                drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
+            assert_eq!(outcome.events_recorded, 1, "{name}");
+            assert!(set_aside_rows(&state).is_empty(), "{name}");
+            state
+                .with_conn(|conn| {
+                    let mut statement = conn
+                        .prepare(
+                            "SELECT unit,source,quantity_units FROM measurement
+                             WHERE role='cache_write' ORDER BY unit",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let rows = statement
+                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                        .map_err(|error| error.to_string())?;
+                    rows.collect::<Result<Vec<(String, String, Option<i64>)>, _>>()
+                        .map_err(|error| error.to_string())
+                })
+                .unwrap()
+        };
+        let row = |unit: &str, source: &str, quantity: i64| {
+            (unit.to_string(), source.to_string(), Some(quantity))
+        };
+        assert_eq!(
+            cache_writes("anthropic-both-lifetimes.json"),
+            [
+                row("token_cache_1h", "usage.cache_write_1h_tokens", 20),
+                row("token_cache_5m", "usage.cache_write_5m_tokens", 10),
+            ]
+        );
+        assert_eq!(
+            cache_writes("anthropic-total-only.json"),
+            [row("token", "usage.cache_write_tokens", 30)]
+        );
+    }
+
     /// The two batch facts BROCA captured from its real producer path, as the
     /// exact `segment_json` bytes it stores (broca
     /// crates/broca-module-serve/tests/golden/, source 32a91294). They pin the
