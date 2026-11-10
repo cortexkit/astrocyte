@@ -690,7 +690,13 @@ fn op_subscription_report(state: &SharedState, params: Value) -> OpResult {
         })?;
     read_value(state, |conn| {
         astrocyte_core::report::subscription_report(conn, &request)
-            .map(|value| json!(value))
+            .map(|value| {
+                let mut report = json!(value);
+                if let (Some(report),Some(vault)) = (report.as_object_mut(),state.vault_report().as_object()) {
+                    report.extend(vault.clone());
+                }
+                report
+            })
             .map_err(map_report_error)
     })
 }

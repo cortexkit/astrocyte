@@ -268,7 +268,31 @@ Reads never write. A refusal on a read is one of the codes below.
   `day`, `week` or `month`; `timezone` is an IANA name. Refusals:
   `invalid_grouping` (unknown or repeated), `invalid_grain`,
   `invalid_timezone`. Test: `spend_report_refusal_keeps_its_code`.
-- `spend.subscription.report`: `rows`, `coverage`, `ingest_freshness`.
+- `spend.subscription.report` keeps `rows`, `coverage` and `ingest_freshness`.
+  It adds optional diagnostic members; the request remains `{}`, so the params
+  schema stays at version 2. `unpriced_plans` lists `{plan_key, provider,
+  plan_tier, accounts}` for exact vault keys without a usable sourced price.
+  `provider` and `plan_tier` retain the vault's raw spelling, and `accounts`
+  contains account IDs, or vault record IDs for credential-keyed plans. Fusiform
+  can use this list to discover tiers needing prices. `unknown_plans` lists
+  records without exactly one provider and a tier, with a null `plan_key`.
+  `hand_vault_differences` lists `{provider, account_id, ledger_plan, vault_plan}`;
+  the hand-recorded ledger interval is never changed by the vault.
+  `vault_record_differences` lists disagreements between records sharing an
+  account, with `provider`, `account_id`, `records`, `winning_plan` and
+  `ambiguous`. The latest effective observation wins; equal-time disagreements
+  have no winner and cannot change the ledger. Records include `credential_id`,
+  `provider`, `account_id`, `plan_tier`, `plan_key`, `source`,
+  `effective_from_ms` and `observed_at_ms`. `chatgpt_account_mismatches` lists
+  `{credential_id, account_id, account_refs}` where subscription calls attributed
+  to that OpenAI credential carry a different account reference.
+  `vault_read_status` is `{status: "not_read" | "available" | "unavailable"}`,
+  with a safe `reason` on failures; it is process-local and resets on restart.
+  `plan_price_status` is `available` or `unavailable`, independently of the vault
+  read. A failed vault read changes no recorded plans or history. Tests:
+  `vault_hand_plan_is_untouched_and_difference_is_reported`,
+  `vault_unpriced_raw_tier_is_reported_and_later_price_records_plan` and
+  `vault_shared_account_uses_latest_record_without_tick_order_churn`.
 - `spend.workclass.report`: `rows`, `producers`.
 - `spend.ledger.coverage`: `set_aside_by_source`, `skipped_local_by_source`, `events_total`,
   `events_unpriced`, `events_undated`, `zero_measurement_events`,

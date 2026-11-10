@@ -282,3 +282,7 @@ impl Stage {
 
     pub(crate) fn join(self) { self.reader.join(); }
 }
+
+#[cfg(test)]
+#[path = "vault_source_tests.rs"]
+mod tests;
