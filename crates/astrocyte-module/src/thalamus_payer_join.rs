@@ -259,7 +259,8 @@ mod tests {
         let mut queue = WaitQueue::default();
         state
             .ordered_write(|tx| {
-                let resolved = queue.resolve_in_tx(tx, "pi", &[original.clone()], 101)?;
+                let resolved =
+                    queue.resolve_in_tx(tx, "pi", std::slice::from_ref(&original), 101)?;
                 assert_eq!(resolved.ready, vec![original.request.clone()]);
                 assert!(resolved.next.is_empty());
                 Ok(((), true))
@@ -379,7 +380,7 @@ mod tests {
         manage(&state);
         let original = call("undated", None);
         let mut queue = WaitQueue::default();
-        pass(&state, &mut queue, &[original.clone()], 10_000);
+        pass(&state, &mut queue, std::slice::from_ref(&original), 10_000);
         // A restarted reader replays its held cursor or process-local files.
         queue = WaitQueue::default();
         assert_eq!(pass(&state, &mut queue, &[original], 609_999).0, 0);

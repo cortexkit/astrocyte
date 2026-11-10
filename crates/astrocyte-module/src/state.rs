@@ -64,6 +64,7 @@ struct Inner {
     /// Last observed store presence per source, kept after an absent store deletes
     /// its runtime row so the change is logged only once.
     source_discovery: Mutex<HashMap<String, bool>>,
+    payer_waiting: Mutex<BTreeMap<String, usize>>,
     quota_bus: crate::quota_events::Control,
     /// Recent harness steps kept for `usage.cache.steps`. Lock order: this
     /// mutex before either store connection, never the other way round.
@@ -254,6 +255,24 @@ fn read_writer_settings(conn: &Connection) -> Result<(String, u64), String> {
 }
 
 impl SharedState {
+    /// Publish a reader's current wait count only after its queue is adopted
+    /// following a successful commit. Folder readers publish their total.
+    pub(crate) fn set_payer_waiting(&self, reader: &str, count: usize) {
+        self.0
+            .payer_waiting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(reader.to_owned(), count);
+    }
+
+    pub(crate) fn payer_waiting(&self) -> BTreeMap<String, usize> {
+        self.0
+            .payer_waiting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     pub fn from_store(store: SqliteStore) -> Result<Self, String> {
         // The closure always returns Ok so that `SqliteStore::with_conn` only
         // fails for reasons of its own; the hydration result travels out
@@ -299,6 +318,7 @@ impl SharedState {
                 capacity_runtime: None,
             }),
             source_discovery: Mutex::new(HashMap::new()),
+            payer_waiting: Mutex::new(BTreeMap::new()),
             quota_bus: crate::quota_events::Control::default(),
             recent_steps: Mutex::new(crate::recent_steps::RecentSteps::default()),
             step_feed: crate::step_feed::FeedHub::default(),
