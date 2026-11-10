@@ -29,6 +29,8 @@ copies that timeout without running the table-creating probes.
 | `pricing_pending` | Each row identifies an event with a measurement that has no current charge head. | queue |
 | `pricing_selection_state` | The row records the plan generation and the generation that coverage backfill has drained. | one row |
 | `account_subscription` | Each row declares an effective-dated subscription plan for a provider account. | insert; close once |
+| `vault_plan_history` | Each row preserves a vault record's changed plan key, raw provider and tier, optional account, source, effective time and observation time. | insert only, including unknown-plan changes |
+| `vault_plan_seed` | The singleton marks completion of the committed config's one-time plan-history import. | insert once |
 | `statement` | Each row records a vendor statement identity. | insert only |
 | `statement_line` | Each row preserves immutable statement line content and its current match projection. | insert; match projection |
 | `match_attempt` | Each row records a statement-line match attempt and the amounts captured for that attempt. | insert only |

@@ -20,7 +20,7 @@ Internal records live in the ignored `.cortexkit/` folder, which tracks only
 
 ## `crates/astrocyte-core/src`
 
-- `store.rs`: `MIGRATIONS` (1 to 38), connection setup and `migrate_store`.
+- `store.rs`: `MIGRATIONS` (1 to 39), connection setup and `migrate_store`.
 - `fact.rs`: call and measurement identity.
 - `ingest.rs`: recording calls in one transaction, redelivery and quarantine,
   chargeability settlement, adjustments and charge-basis correction.
@@ -29,6 +29,8 @@ Internal records live in the ignored `.cortexkit/` folder, which tracks only
 - `media.rs`: maps colliculus usage records into calls without rounding.
 - `attempt_usage.rs`: decodes shared attempt usage without inventing counts.
 - `subscription.rs`: effective-dated ledger plans and coverage.
+- `vault_plan.rs` keeps immutable tier history, seeds old config and reconciles
+  vault-owned ledger plans.
 - `multiplier.rs`: the subscription multiplier: config, valuation, the daily
   observation, recompute and report. `multiplier/clean.rs` finds clean
   account-hours; `multiplier/calibration.rs` holds the stability checks.
@@ -76,6 +78,8 @@ A library shared by three binaries: `main.rs` (`ck-astrocyte`) and two tools,
 - `quota_events.rs`, `quota_bus_client.rs`: the bus reader for insula's quota
   events, with polling failover, and its attested ckbus calls. `runner_steps.rs`
   admits live runner step events into the step feed.
+- `vault_source.rs` reads vault metadata and watch notices outside recording
+  transactions, then applies plan changes on full ticks.
 - `recent_steps.rs`: the in-memory recent steps behind `usage.cache.steps`.
 - `step_feed.rs`: serving the step feed, its subscribers and who may read it.
 - `test_support.rs`: test fixtures, also built under the `test-support` feature.

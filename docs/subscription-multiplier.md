@@ -25,21 +25,42 @@ share a counter. Readings with neither identity remain latest-only and cannot
 produce a multiplier. Earlier latest-only readings cannot be reconstructed as
 credential history.
 
-Declare account plans in `accounts` or credential plans in `credentials`, not
-both for one quota provider. Credential counters use the same reset, high-water,
+Plans come from `vault_plan_history`, not per-account configuration. For each
+day the latest effective observation before its ending midnight supplies the
+plan, joined by account ID or exact vault record ID. Quota provider names need
+not match vault providers. Credential counters use the same reset, high-water,
 clean-hour, saturation and stability rules described below. The report's
 historically named `accounts_included` and `accounts_excluded` lists contain
 `credential_ref` instead of `account_ref` for credential rows; `plan_prices`
 also shows the identity actually priced. Account rows keep their existing shape.
 Unconfigured credential readings are listed in the legacy-named
 `unconfigured_accounts` array and reject the row with `unconfigured_credentials`.
-Their exclusion diagnostics use `credential_ref` and `credential_not_configured`.
+Their exclusion diagnostics use `credential_ref` and `vault_plan_unknown`.
 
-With exactly one configured credential, in-scope provider tokens are
+The vault reader uses only `credential.list_scoped` and `auth.watch_scoped`
+under the reserved module's `list` grant on `llm-provider`; it never fetches
+secrets. It lists at startup, after every notice and daily as a backstop.
+`unknown_method` on the watch switches to polling on full ticks only. Network
+work runs outside startup and recording transactions, and a notice's new plan
+applies on the next full tick. The key is exactly `<provider_ids[0]>/<plan_tier>`
+when exactly one provider and a tier are present. Otherwise it is unknown.
+Effective time uses optional `plan_tier_observed_at_ms`, falling back to the
+first observation of a change. Repeated lists do not move that boundary.
+
+At the first startup after schema migration 39, the committed config's identity maps seed
+source `config` rows effective at zero, preserving old day recomputation. Live
+maps and per-account price overrides are removed; stored non-null per-account
+overrides refuse hydration instead of being discarded. Plan-key overrides stay.
+Multiple records for one account/provider use the latest effective observation;
+equal-time disagreements have no winner. An account spanning two vault providers
+is unmeasurable. If both identity namespaces have usable histories for one quota
+provider, the day's row names `mixed_identity_namespaces` and has null ratios.
+
+With exactly one joined credential, in-scope provider tokens are
 attributed to that credential, in the clean hours only, under the same
 clean-hour rules as account counters. Ledger credential labels are not
 used as a quota identity: some producers omit them and their names need not
-match vault references. More than one configured credential makes every plan
+match vault references. More than one joined credential makes every plan
 row ineligible with `multiple_credentials_without_token_attribution`, even when
 the credentials hold the same plan. Those rows have null ratios and no tokens
 assigned to an individual key or plan. Unpriced diagnostics remain visible.
@@ -123,13 +144,14 @@ from excluded hours so exclusions are visible, even though `tokens` and
 `api_nanos` describe retained hours.
 
 Every account with valid readings in the provider's selected pool and window
-must have a configured plan. Otherwise every plan row names it in
-`unconfigured_accounts`, has null ratios and is ineligible. Configured plans
+must have a known vault plan. Otherwise every plan row names it in
+`unconfigured_accounts`, has null ratios and is ineligible. Observed plans
 without a resolved monthly price likewise have null ratios and cannot be eligible. Events with an
 unknown account reference are treated as unattributed, not silently assigned to
 another configured account.
 
-New rows are per **(quota provider, plan)**. There is no new pooled provider row.
+Measurable rows are per **(quota provider, plan)**. A day with no known plan
+records a diagnostic row with null plan and ratios rather than disappearing.
 Plans can differ in capacity and usage behavior; normalizing their fees does
 not make their quota points interchangeable.
 Historical provider rows remain unchanged; their new fields default to null
@@ -138,6 +160,20 @@ append-only history and gives each plan an independent supersession chain.
 In the report, `latest` is ordered by quota provider and plan. A legacy pooled
 head appears there only while its provider has no plan-specific observation;
 `series` retains both legacy and plan-specific heads in the requested range.
+
+For account-bearing plans the same vault history creates ledger coverage from
+the account's first recorded call, using fusiform's sourced recurring price.
+Ledger plans retain any representable sourced currency and monthly or annual
+period, including a zero price; the multiplier's USD/month pricing restrictions
+remain unchanged. Decimal scales are normalized only when the amount is exact.
+Tier changes bound vault-owned intervals and open successors at the change
+time. A hand-recorded plan is never closed or changed. Missing prices create
+no new ledger plan and remain visible, with raw provider/tier and account IDs,
+in `spend.subscription.report`; a later price is retried on the next full tick.
+That report also shows hand/vault differences, disagreements between vault
+records, ChatGPT credential/account mismatches and vault-read status. Existing
+coverage backfill covers waiting calls; the multiplier itself never changes
+recorded ledger money.
 
 Money uses checked integer arithmetic. API list numerators are summed before
 one half-even rounding of the row total. Independently displayed model lines

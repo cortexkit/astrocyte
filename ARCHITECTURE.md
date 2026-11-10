@@ -46,13 +46,11 @@ holds the contracts and details this page summarises.
 
 ## Durable state
 
-One SQLite store in WAL mode, written by one process under a lease.
-`crates/astrocyte-core/src/store.rs` holds `MIGRATIONS`, at schema version 38; an
-older binary refuses a newer store. `initialize_connection` sets a 5000 ms busy
-timeout and in-memory temporary storage, enables foreign keys and probes needed
-SQLite features; commits use FULL sync. Triggers refuse deleting or rewriting the
-append-only tables, even through `INSERT OR REPLACE`. Integer keys are never
-served. The [data model](docs/data-model.md#tables) lists every table.
+The leased SQLite store uses WAL, FULL synchronization and foreign keys, with a
+5000 ms busy timeout. `store.rs` owns `MIGRATIONS`, now at version 39; an older
+binary refuses a newer store. Immutable-table triggers reject rewrites even
+through `INSERT OR REPLACE`. Integer keys are never served. The
+[data model](docs/data-model.md#tables) describes the tables.
 
 ## Where usage comes from
 
@@ -140,16 +138,13 @@ Details: [data model](docs/data-model.md#hourly-summaries).
 
 ## Subscription multiplier
 
-The multiplier estimates how much list-price API value a subscription delivers per
-unit of its quota. Each UTC day it writes one row per quota provider and plan for
-the seven days before that midnight. It counts only clean account-hours: closely
-bracketed by quota readings, unsaturated, with usable reset times and all calls
-priced. `routing_eligible` and its reasons come from sample-size and stability
-gates. Readings match by account id, or by vault credential for account-less
-plans; plan models without prices are valued at their public API twin. Missed
-days are retried for a week, and `spend.multiplier.recompute` appends a new row
-for a day. The ledger is never changed. The rules and thresholds are in
-[subscription multiplier](docs/subscription-multiplier.md).
+The multiplier records clean account-hour API list value per quota point, once
+per UTC day, quota provider and plan over a trailing week. It joins day-end vault
+tier history by account or credential ID, seeded once from old config; scope and
+windows remain configured. `routing_eligible` carries sample-size and stability
+results. It retries missing days for a week and appends recomputations without
+changing the ledger. The [subscription multiplier](docs/subscription-multiplier.md)
+explains the thresholds and public API-twin valuation.
 
 ## Cache diagnostics and the step feed
 
@@ -178,16 +173,13 @@ GOODBYE exit 0. On Unix, SIGTERM stops cleanly and then re-raises.
 
 ## Configuration
 
-The config is a closed JSONC object with six required members:
-`poll_interval_secs`, `qta_connection_file`, `fusiform_connection_file`,
-`subscription_multiplier`, `harness_ingest` and `reasoning_billed_as_output`. An
-unknown or missing member fails decoding at every level, so the config file and
-the binary must change together. `harness_ingest.exclude` takes keys from
-`config::INGEST_SOURCES`. `hydrate_startup` reads the file once at startup, and
-each accepted file becomes a stored generation. An invalid file stops the first
-start; later it keeps the stored generation and degrades health.
-`ck-astrocyte --check-config <path>` validates a file offline. See
-[configuration](docs/configuration.md).
+The closed JSONC config has six required members, detailed in
+[configuration](docs/configuration.md). Config and binary deploy together;
+unknown or missing members fail decoding. Accepted files become stored
+generations. An invalid first file refuses startup; later failures retain the
+committed generation and degrade health. `ck-astrocyte --check-config <path>`
+validates a file offline. Live multiplier account maps are removed; old stored
+maps seed plan history before hydration discards their null-override declarations.
 
 ## Served operations
 
@@ -224,7 +216,10 @@ Dispatch and the manifest share `PUBLIC_OPERATION_NAMES` in
 
 Astrocyte calls fusiform (`catalog.status`, `catalog.get`, `plan.prices`), insula
 (`usage.get`, `events_get`), colliculus (`usage.read`, `usage.ack`) and the ckbus
-credential operations. The [module surface](docs/module-surface.md) is the
+credential operations. Claustrum supplies plan tiers through attested list-only
+reads and a held watch, never secret reads. Full ticks apply changes without
+restarting, protect hand-set plans and report missing prices or vault failures.
+The [module surface](docs/module-surface.md) is the
 contract.
 
 ## Health

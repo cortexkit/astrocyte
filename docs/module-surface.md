@@ -826,6 +826,7 @@ through the real dispatch and the serving path's shared permission refusal.
 | insula (the quota module, QTA) | `management_surface`, module `insula` | `usage.get` with empty params; `events_get` with `event_key` and `event_name: "quota_sampled"` | Invalid or missing event bodies owe a snapshot. A failed snapshot records the attempt and keeps the last windows. Capacity is advisory and never blocks spend. |
 | colliculus (media usage) | `management_surface`, module `colliculus` | `usage.read` pages and `usage.ack` after each committed page | Keep the committed cursor and retry. An absent module does not degrade health; transient route refusals (the module warming or reloading) defer the drain. `feed_not_admitted` means colliculus is not configured to let astrocyte read its usage feed; that won't fix itself, so it degrades health immediately. |
 | ckbus | Attested `management_surface`, module `ckbus` | `ckbus.credential`, `ckbus.credential_renew`, `ckbus.nonce_sign` | Retain per-tick insula polling and retry with exponential backoff (250 ms to 30 s). Never fail the module or change broker topology. |
+| claustrum (credential vault) | Attested `management_surface`, module `claustrum` | `credential.list_scoped` and held `auth.watch_scoped`, with empty params | Startup never waits for the peer. Missing vault or grant changes no history or ledger plans, is logged on transition and is shown in `spend.subscription.report`. `unknown_method` on watch enables full-tick-only list polling. |
 
 Fusiform and insula use the connection files named in the
 [configuration](configuration.md). The ckbus route uses the module's daemon
@@ -833,6 +834,14 @@ connection file and the daemon-validated `consumer_identity` shared with HELLO,
 not the un-attested peer clients. With no fusiform connection, events are
 stored unpriced with reason `catalog_unconfigured`; with no QTA connection,
 capacity is `disabled`.
+
+Claustrum uses the module's daemon connection and launch identity, as colliculus
+does, under `reserved:astrocyte`'s category `llm-provider` `list` grant. No `read`
+grant or `credential.get_scoped` call is needed. The published
+`cortexkit-claustrum-client` 0.9.0 decoder and watch types validate replies;
+Astrocyte's existing transport presents the cached launch nonce. The reader
+re-lists after every notice and on daily full-tick backstops. Only full ticks
+record its queued observations, outside all peer calls.
 
 Colliculus uses the module's daemon connection file while its source is ingested.
 The manifest declares its consumer and `astrocyte-colliculus-usage-read` self-signal

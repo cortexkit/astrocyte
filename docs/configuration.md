@@ -123,7 +123,7 @@ ledger. All three members are required; use `{}` to declare nothing.
 | `plan_price_overrides` | map of plan key to price | A monthly price used instead of fusiform's for that plan key. |
 | `quota_providers` | map of quota provider to declaration | One entry per quota provider, keyed by the provider name the quota module reports. |
 
-A quota provider declaration has four required members:
+A quota provider declaration has two required members:
 
 - `window`: `{"pool_key": <non-empty>, "window_minutes": 1..43200}`, the one
   quota window the used percentage is read from.
@@ -133,17 +133,23 @@ A quota provider declaration has four required members:
   `subscription_included`, `unknown`. `model_prefix` is also required and is
   `null` (every model) or a non-empty, literal, case-sensitive model prefix.
   A rule may not repeat; rules differing only by prefix are distinct.
-- `accounts`: a map of account reference to `{"plan": "<provider>/<tier>",
-  "price_override": <price or null>}`.
-- `credentials`: the same plan map, keyed by the exact vault `credential_ref`.
-  Use it only for quota readings that have no account. Exactly one of `accounts`
-  and `credentials` must be non-empty; write `{}` for the other. Empty references,
-  duplicate keys and unknown members are refused in both maps. Older stored
-  generations decode with an empty credential map; new files must include it.
+
+The removed `accounts` and `credentials` maps, including per-account
+`price_override`, are refused in live documents. Deploy this config shape and
+the binary together. Plans now come from the vault's recorded tier without a
+restart, by account ID or, for account-less plans, by vault record ID. There is
+no quota-provider-to-vault-provider mapping: the identity is the join.
+
+At first startup, the committed generation's old maps seed append-only plan
+history with source `config` and effective time zero. Older stored generations
+still hydrate after those maps are removed from their decoded declarations.
+Null per-account overrides are accepted for this lift; a non-null override
+refuses hydration rather than silently changing a historical calculation.
 
 A price is `{"minor_units": >0, "exponent": 0..9, "currency": "USD",
-"period": "month"}`; `20000` at exponent `2` is 200.00. An identity's
-`price_override` wins over `plan_price_overrides`, which wins over fusiform.
+"period": "month"}`; `20000` at exponent `2` is 200.00.
+`plan_price_overrides` still wins over fusiform for multiplier valuation, not for
+the ledger's automatic subscription records.
 
 For Antigravity's Gemini weekly pool, use quota provider `antigravity` with
 `"window": {"pool_key": "extra:13:gemini-weekly", "window_minutes": 10080}`.
@@ -154,21 +160,19 @@ an equivalent `opencode` rule to include that producer. Older stored config
 generations hydrate a missing `model_prefix` as `null`; new files must include it.
 
 For OpenCode Go, use quota provider `opencodego`, window
-`{"pool_key": "tertiary", "window_minutes": 43200}`, and credential plan
-`"apikey:opencode-go": {"plan": "opencode-go/go", "price_override": null}`.
+`{"pool_key": "tertiary", "window_minutes": 43200}`. The vault record supplies
+plan `opencode-go/go` and its record ID joins the credential quota history.
 For Kimi for Coding, use quota provider `kimi-for-coding`, window
-`{"pool_key": "primary", "window_minutes": 10080}`, and credential plan
-`"apikey:kimi-for-coding": {"plan": "kimi-code-plan-global/allegro", "price_override": null}`.
-Use the actual vault reference if it differs from these examples. Leave
-`accounts` empty. Monthly prices come from fusiform's `plan.prices` unless
-explicitly overridden.
+`{"pool_key": "primary", "window_minutes": 10080}`; the vault supplies plan
+`kimi-code-plan-global/allegro`. Monthly prices come from fusiform's
+`plan.prices` unless overridden by plan key for the multiplier.
 
 Their ledger names differ from the quota names. Declare both `broca` and
 `opencode` producer rules with ledger provider `opencode-go` or
 `kimi-code-plan-global`, respectively, and `charge_basis: null` and
 `model_prefix: null`. A subscription-only charge-basis filter would omit
 OpenCode Go usage whose basis is recorded as unknown. Provider-wide scope is
-usable only with one configured credential. Multiple credentials make every
+usable only with one joined credential. Multiple credentials make every
 plan row ineligible with `multiple_credentials_without_token_attribution`;
 tokens are not divided between keys. Paid extra usage on Go cannot be separated
 from included traffic by this scope and would distort the ratio. Do not treat
@@ -195,12 +199,15 @@ line in `api_nanos_by_model` records the target's `provider_id` and `model_id` i
 token counts. These rules apply only to the multiplier; ledger pricing still
 refuses inherited rates, including aliases.
 
-The estimator records a separate row per quota provider and configured plan;
+The estimator records a separate row per quota provider and observed plan;
 different plans never pool their points. Every account with readings in the
-selected pool/window must have a configured plan. An unconfigured account or
+selected pool/window must have a known vault plan. An unknown account or
 unresolved plan price makes the ratios `null`, not zero or free usage.
-The report names unconfigured accounts. Add their plan declarations before
+The report names unmatched accounts. Correct their vault identity or tier before
 recomputing; omitting an account is not a way to exclude its traffic safely.
+An account with rows from different vault providers, or an equal-time tier
+disagreement, is unmeasurable. Simultaneous usable account and credential
+namespaces produce the named `mixed_identity_namespaces` reason.
 
 Only clean account-hours contribute to the quota multiplier. Saturated hours,
 changed-counter gaps over 15 minutes and hours containing unknown usage are
