@@ -342,6 +342,13 @@ Rules that affect what is recorded:
   captured from BROCA's real producer are pinned in
   `crates/astrocyte-module/tests/vectors/broca-system-one/` (test:
   `broca_captured_system_one_facts_are_recorded_with_their_provenance`).
+- A session fact whose `usage` carries both `cache_write_5m_tokens` and
+  `cache_write_1h_tokens`, summing to `cache_write_tokens`, records one
+  cache-write measurement per lifetime (units `token_cache_5m` and
+  `token_cache_1h`) in place of the total, so each lifetime prices at its own
+  rate. Any other split keeps the total with no quantity and a source ending
+  `:conflicted`; a total alone is recorded as `token`. Test:
+  `a_cache_write_lifetime_split_is_recorded_per_lifetime`.
 - BROCA steps will arrive from its step log, not `export_facts`.
 - A BROCA row is set aside, with the reason, when its segment has any unknown
   `kind`, including `model_step`, or is a

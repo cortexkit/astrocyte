@@ -109,6 +109,11 @@ pub struct WireUsage {
     pub input_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
+    /// The parts of `cache_write_tokens` written for Anthropic's 5-minute and
+    /// 1-hour cache lifetimes, when the provider reported them. The two
+    /// lifetimes are priced at different rates.
+    pub cache_write_5m_tokens: Option<u64>,
+    pub cache_write_1h_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
 }
@@ -211,6 +216,53 @@ fn reported_token_measurements<'a>(
         .collect()
 }
 
+/// The cache-write measurements for a fact.
+///
+/// - No lifetime split: the total, as before.
+/// - Both parts present and summing to the total: one measurement per
+///   lifetime (units `token_cache_5m` and `token_cache_1h`, as the Claude Code
+///   reader records them) in place of the total, so each prices at its own
+///   rate.
+/// - Any other split (one part missing, or parts that don't sum to the
+///   total): the total is kept with no quantity under a `:conflicted` source,
+///   like a contradictory output count. The call still counts, and pricing
+///   refuses the role instead of pricing a guessed lifetime.
+fn cache_write_measurements(usage: &WireUsage) -> Result<Vec<MeasurementInput>, String> {
+    let (five, hour) = (usage.cache_write_5m_tokens, usage.cache_write_1h_tokens);
+    if five.is_none() && hour.is_none() {
+        return reported_token_measurements([(
+            "cache_write",
+            "cache_write_tokens",
+            usage.cache_write_tokens,
+        )]);
+    }
+    let split = five.zip(hour).filter(|(five, hour)| {
+        five.checked_add(*hour)
+            .is_some_and(|sum| Some(sum) == usage.cache_write_tokens)
+    });
+    let Some((five, hour)) = split else {
+        return Ok(vec![MeasurementInput {
+            role: "cache_write".into(),
+            unit: "token".into(),
+            kind: "billed".into(),
+            source: "usage.cache_write_tokens:conflicted".into(),
+            quantity_units: None,
+            quantity_exponent: None,
+        }]);
+    };
+    [
+        ("token_cache_5m", "cache_write_5m_tokens", five),
+        ("token_cache_1h", "cache_write_1h_tokens", hour),
+    ]
+    .into_iter()
+    .map(|(unit, field, quantity)| {
+        let mut measurement = token_measurement("cache_write", field, quantity)?;
+        measurement.unit = unit.into();
+        Ok(measurement)
+    })
+    .collect()
+}
+
 pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String> {
     let output = output_measurement(&wire)?;
     let mut measurements = reported_token_measurements([
@@ -220,13 +272,13 @@ pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String
             "cached_input_tokens",
             wire.usage.cached_input_tokens,
         ),
-        (
-            "cache_write",
-            "cache_write_tokens",
-            wire.usage.cache_write_tokens,
-        ),
-        ("reasoning", "reasoning_tokens", wire.usage.reasoning_tokens),
     ])?;
+    measurements.extend(cache_write_measurements(&wire.usage)?);
+    measurements.extend(reported_token_measurements([(
+        "reasoning",
+        "reasoning_tokens",
+        wire.usage.reasoning_tokens,
+    )])?);
     // Output goes back in its original position, before reasoning, so the
     // measurement order is unchanged from the verbatim mapping.
     let reasoning_at = measurements.len() - usize::from(wire.usage.reasoning_tokens.is_some());
@@ -521,6 +573,67 @@ mod tests {
                 ("output".into(), "token".into(), 15, 0),
                 ("reasoning".into(), "token".into(), 5, 0),
             ]
+        );
+    }
+
+    /// The cache-write measurements a fact with this usage produces, as
+    /// (unit, source, quantity).
+    fn cache_writes(usage: serde_json::Value) -> Vec<(String, String, Option<i64>)> {
+        let mut wire = wire_fixture();
+        wire["usage"] = usage;
+        map_fact(serde_json::from_value(wire).unwrap())
+            .unwrap()
+            .measurements
+            .into_iter()
+            .filter(|measurement| measurement.role == "cache_write")
+            .map(|measurement| {
+                (
+                    measurement.unit,
+                    measurement.source,
+                    measurement.quantity_units,
+                )
+            })
+            .collect()
+    }
+
+    /// A reported lifetime split replaces the total with one measurement per
+    /// lifetime, so a 1-hour write prices at the 1-hour rate. A split that
+    /// can't be the total's parts keeps the total with no quantity, and a
+    /// total alone is recorded as before.
+    #[test]
+    fn a_cache_write_lifetime_split_is_recorded_per_lifetime() {
+        assert_eq!(
+            cache_writes(serde_json::json!({
+                "cache_write_tokens": 30, "cache_write_5m_tokens": 10, "cache_write_1h_tokens": 20
+            })),
+            [
+                (
+                    "token_cache_5m".into(),
+                    "usage.cache_write_5m_tokens".into(),
+                    Some(10)
+                ),
+                (
+                    "token_cache_1h".into(),
+                    "usage.cache_write_1h_tokens".into(),
+                    Some(20)
+                ),
+            ]
+        );
+        let conflicted = vec![(
+            "token".to_string(),
+            "usage.cache_write_tokens:conflicted".to_string(),
+            None,
+        )];
+        for usage in [
+            serde_json::json!({"cache_write_tokens": 31, "cache_write_5m_tokens": 10, "cache_write_1h_tokens": 20}),
+            serde_json::json!({"cache_write_tokens": 30, "cache_write_1h_tokens": 30}),
+            serde_json::json!({"cache_write_5m_tokens": 10, "cache_write_1h_tokens": 20}),
+        ] {
+            assert_eq!(cache_writes(usage.clone()), conflicted, "{usage}");
+        }
+        assert_eq!(
+            cache_writes(serde_json::json!({"cache_write_tokens": 30})),
+            [("token".into(), "usage.cache_write_tokens".into(), Some(30))]
         );
     }
 
