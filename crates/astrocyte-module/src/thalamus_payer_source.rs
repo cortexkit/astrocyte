@@ -451,7 +451,12 @@ pub(crate) fn payer_match(
     })
 }
 
-fn mark_conflicts(tx: &Transaction<'_>, harness: &str, step: &str, at: i64) -> Result<(), String> {
+pub(crate) fn mark_conflicts(
+    tx: &Transaction<'_>,
+    harness: &str,
+    step: &str,
+    at: i64,
+) -> Result<(), String> {
     if payer_match(tx, harness, step)? != PayerMatch::Conflict {
         return Ok(());
     }

@@ -43,6 +43,8 @@ pub(crate) mod opencode_thalamus_source;
 pub(crate) mod opencode_v2_source;
 #[path = "pi_source.rs"]
 mod pi_source;
+#[path = "thalamus_payer_join.rs"]
+pub(crate) mod thalamus_payer_join;
 #[path = "thalamus_payer_source.rs"]
 pub(crate) mod thalamus_payer_source;
 
