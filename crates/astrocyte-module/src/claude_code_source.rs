@@ -583,7 +583,10 @@ pub(crate) fn record_requests_in_lane(
     mode: DrainMode,
     payer_wait: Option<(&mut WaitQueue, &[WaitingCall])>,
 ) -> Result<(), SourceDrainError> {
-    if payer_wait.is_none() && !mode.has_work(requests.len(), set_aside.len()) {
+    let payer_has_work = payer_wait
+        .as_ref()
+        .is_some_and(|(queue, calls)| !queue.is_empty() || !calls.is_empty());
+    if !payer_has_work && !mode.has_work(requests.len(), set_aside.len()) {
         return Ok(());
     }
     let mut stopped = false;

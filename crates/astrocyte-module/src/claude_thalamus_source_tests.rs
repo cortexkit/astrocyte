@@ -1,5 +1,33 @@
 const PAYER_COMPLETION_MS: i64 = 1_788_220_801_000;
 
+#[test]
+fn claude_payer_idle_fast_pass_starts_no_store_transaction() {
+    use crate::state::transaction_attempts_for_test;
+
+    let f = Fixture::new();
+    let before = transaction_attempts_for_test();
+    f.fast(PAYER_COMPLETION_MS);
+    let after_source = transaction_attempts_for_test();
+    let mut queue = WaitQueue::default();
+    claude_code_source::record_requests_in_lane(
+        &f.state,
+        SOURCE_KEY,
+        &[],
+        &[],
+        PAYER_COMPLETION_MS,
+        &mut ClaudeCodeDrainOutcome::default(),
+        &|| false,
+        harness_drain::DrainMode::Fast,
+        Some((&mut queue, &[])),
+    )
+    .unwrap();
+    let after_recorder = transaction_attempts_for_test();
+    assert_eq!(
+        (after_source - before, after_recorder - after_source),
+        (0, 0)
+    );
+}
+
 impl Fixture {
     fn manage_payer_session(&self) {
         self.state

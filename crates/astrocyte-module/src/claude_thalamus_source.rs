@@ -344,6 +344,9 @@ impl HarnessSource for ClaudeThalamusSource {
             .cache
             .lock()
             .map_err(|_| "Claude Code session cache lock poisoned".to_string())?;
+        if cache.payer_wait.is_empty() {
+            return Ok(());
+        }
         // Completed calls no longer dirty the parser's resume state. Revisit
         // their payer facts without opening transcripts or the roots file.
         claude_code_source::record_requests_in_lane(
