@@ -1,5 +1,8 @@
 .DS_Store
 target/
+# Written by scripts/gate.sh's Windows lane.
+/gate-job-start
+/gate-windows-crash.dmp
 # Internal notes and tool state under .cortexkit/ stay out of git. Only these
 # folders and WORKER.md, the build and test guide, are tracked.
 /.cortexkit/*

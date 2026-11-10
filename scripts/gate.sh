@@ -45,19 +45,26 @@ linux_cmd='export ASTROCYTE_REQUIRE_NATS_SERVER=1
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked'
 # A native crash in a test's child process (an access violation) leaves no
-# stderr, only a minidump that the Windows runner writes to C:\CrashDumps. When
-# the suite fails, the newest dump written during this job is copied into the
-# workspace and returned, so the faulting module can be read afterwards.
+# stderr, only a minidump that Windows Error Reporting writes to C:\CrashDumps a
+# few seconds after the process dies. When the suite fails, the job waits up to
+# 60 s for a dump written during this job and copies it to the checkout root to
+# be returned, so the faulting module can be read afterwards. In a Windows job
+# `target/` links out of the checkout, and a returned file must sit inside it.
 windows_cmd='export ASTROCYTE_REQUIRE_NATS_SERVER=1
-mkdir -p target && touch target/gate-job-start
+touch gate-job-start
 cargo clippy --workspace --all-targets --locked -- -D warnings
 code=0; cargo test --workspace --all-targets --locked --no-fail-fast || code=$?
 if [ "$code" != 0 ]; then
-  dump=$(find /c/CrashDumps -name "*.dmp" -newer target/gate-job-start 2>/dev/null | head -n 1 || true)
-  if [ -n "$dump" ]; then cp "$dump" target/gate-windows-crash.dmp; echo "crash dump: $dump"; fi
+  dump=""
+  for _ in $(seq 1 12); do
+    dump=$(find /c/CrashDumps -name "*.dmp" -newer gate-job-start 2>/dev/null | head -n 1 || true)
+    [ -n "$dump" ] && break
+    sleep 5
+  done
+  if [ -n "$dump" ]; then cp "$dump" gate-windows-crash.dmp; echo "crash dump: $dump"; else echo "crash dump: none written within 60 s"; fi
 fi
 exit "$code"'
-windows_dump="$PWD/target/gate-windows-crash.dmp"
+windows_dump="$PWD/gate-windows-crash.dmp"
 rm -f "$windows_dump"
 
 step "Linux and Windows suites (remote, in parallel)"
