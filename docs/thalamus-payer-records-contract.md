@@ -174,5 +174,7 @@ and astrocyte's `watermark.get` (served under `log-read-watermark/v1`) is at or
 past the row's `recorded_at_ms` plus 60 seconds. Astrocyte's watermark does not
 pass a payer row until that row is committed in astrocyte's own store,
 including a `main` row still waiting for its transcript call, which astrocyte
-keeps itself. A `payer_session` row is deleted with the session's last
+keeps itself. While the store doesn't exist, astrocyte counts each full pass
+as a complete read of nothing, so the watermark keeps moving: any row written
+later is newer than it. A `payer_session` row is deleted with the session's last
 `payer_record` row. The harness module never deletes an unread row on a timer.
