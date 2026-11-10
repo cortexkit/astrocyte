@@ -529,8 +529,11 @@ pub(crate) mod tests {
         assert_eq!(stored, (5, "catalog_unconfigured".into()));
     }
 
+    /// A live peer may state a rate at any exponent. The peer here serves
+    /// 3,000 at exponent 6 ($0.003 per million tokens), which the ledger
+    /// records at nano scale as 3,000,000 at exponent 9.
     #[test]
-    fn live_catalog_non_nine_exponent_refuses_without_priced_charge_rows() {
+    fn live_catalog_non_nine_exponent_prices_at_nano_scale() {
         let event_at = 1_000;
         let peer = CatalogPeer::start(event_at - 1, 6, 55_555);
         let state = test_state();
@@ -538,16 +541,23 @@ pub(crate) mod tests {
 
         run_one_iteration(&state, event(event_at));
 
-        let count = state
+        let rates: Vec<(String, Option<i64>, Option<i64>)> = state
             .with_conn(|conn| {
-                conn.query_row("SELECT COUNT(*) FROM priced_charge", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .map_err(|error| error.to_string())
+                let mut statement = conn
+                    .prepare("SELECT outcome, rate_units, rate_exponent FROM priced_charge")
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<_, _>>()
+                    .map_err(|error| error.to_string())
             })
             .unwrap();
-        assert_eq!(count, 0);
-        // The refusal must come from the rate the peer served, not from a
+        assert!(!rates.is_empty());
+        for rate in rates {
+            assert_eq!(rate, ("priced".into(), Some(3_000_000), Some(9)));
+        }
+        // The price must come from the rate the peer served, not from a
         // resolution that never reached it.
         assert_resolved_through_the_peer(&peer.finish(), event_at);
     }
