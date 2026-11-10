@@ -1011,6 +1011,8 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
         );
     }
     ModuleManifest::builder(module_id.to_string(), env!("CARGO_PKG_VERSION").to_string())
+        .display_name(Some("Spend Ledger".to_string()))
+        .expect("Spend Ledger is a valid module display name")
         .trust_tier(Some(TrustTier::FirstParty))
         .provides(vec![ProviderRole::ManagementSurface {
             // `subc_client_rs::serve` runs each request in its own task, so
@@ -2128,6 +2130,14 @@ mod tests {
                 "watermark.get",
             ])
         );
+    }
+
+    #[test]
+    fn manifest_display_name_is_spend_ledger() {
+        let manifest = manifest("astrocyte", &config::intentional_empty().config);
+        assert_eq!(manifest.display_name.as_deref(), Some("Spend Ledger"));
+        let wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(wire["display_name"], "Spend Ledger");
     }
 
     #[test]
