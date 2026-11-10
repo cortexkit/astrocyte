@@ -521,6 +521,9 @@ A payer row arriving after its call was recorded is counted and never rewrites
 that event. Coverage exposes those exceptions and current per-reader wait counts.
 The served THALAMUS watermark is the lower of the session source's and payer
 source's committed pass watermarks, and is null until both have a complete pass.
+An absent payer store counts as an empty full pass: its watermark advances
+without a runtime row or health change. Excluding `thalamus-payer` instead serves
+the session watermark alone.
 The payer pass advances only after every page commits, using pass start minus
 60 seconds, without consulting health timestamps or waiting queues.
 

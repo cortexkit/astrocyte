@@ -72,7 +72,19 @@ impl ThalamusPayerSource {
             return Ok(());
         }
         if observed.0.is_none() {
-            mode.remove_runtime(state, SOURCE_KEY)?;
+            // Absence is a complete empty read. Future rows are written after
+            // this pass, so the same safety margin permits session cleanup.
+            if mode.is_full() {
+                state.ordered_write(|tx| {
+                    tx.execute(
+                        "DELETE FROM source_runtime WHERE source_key=?1",
+                        [SOURCE_KEY],
+                    )
+                    .map_err(sql)?;
+                    store_watermark_in_tx(tx, at)?;
+                    Ok(((), true))
+                })?;
+            }
             *last = Some(observed);
             return Ok(());
         }
@@ -117,7 +129,7 @@ impl ThalamusPayerSource {
                 tx.execute("INSERT INTO thalamus_payer_cursor(singleton,incarnation,through_seq) VALUES (1,?1,?2) ON CONFLICT(singleton) DO UPDATE SET incarnation=excluded.incarnation,through_seq=excluded.through_seq",params![page.incarnation,page.through]).map_err(sql)?;
                 tx.execute("UPDATE source_runtime SET lineage=?2,consumed_ordinal=?3,high_water_ordinal=?4,last_success_ms=?5,pending_known=?6,pending_unknown=0 WHERE source_key=?1",params![SOURCE_KEY,page.incarnation,page.through,page.high_water,at,page.high_water.saturating_sub(page.through)]).map_err(sql)?;
                 if complete {
-                    tx.execute("INSERT INTO read_watermark(source_key,watermark_ms,updated_at_ms) VALUES (?1,?2,?3) ON CONFLICT(source_key) DO UPDATE SET watermark_ms=MAX(watermark_ms,excluded.watermark_ms),updated_at_ms=excluded.updated_at_ms",params![SOURCE_KEY,at.saturating_sub(60_000),at]).map_err(sql)?;
+                    store_watermark_in_tx(tx,at)?;
                 }
                 Ok(((),true))
             })?;
@@ -191,6 +203,11 @@ struct Page {
 
 fn sql(error: rusqlite::Error) -> String {
     error.to_string()
+}
+
+fn store_watermark_in_tx(tx: &Transaction<'_>, at: i64) -> Result<(), String> {
+    tx.execute("INSERT INTO read_watermark(source_key,watermark_ms,updated_at_ms) VALUES (?1,?2,?3) ON CONFLICT(source_key) DO UPDATE SET watermark_ms=MAX(watermark_ms,excluded.watermark_ms),updated_at_ms=excluded.updated_at_ms",params![SOURCE_KEY,at.saturating_sub(60_000),at]).map_err(sql)?;
+    Ok(())
 }
 
 fn read_page(path: &Path, cursor: Option<&(String, i64)>) -> Result<Page, String> {
@@ -523,6 +540,166 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
 
     fn insert(store: &Connection, attempt: &str) {
         store.execute("INSERT INTO payer_record(attempt_id,harness,session,request_kind,recorded_at_ms,provider,model,charge_basis,auth_selection,account_ref,usage_json) VALUES (?1,'pi','session-a','keep_warm',1000,'anthropic','model-a','metered_api','login-a','account-a',?2)", params![attempt,r#"{"usage":{"input_tokens":17,"output_tokens":11,"reasoning_tokens":4,"cache_write_tokens":12},"cache_write_5m_tokens":5,"cache_write_1h_tokens":7,"reasoning_included_in_output":true}"#]).unwrap();
+    }
+
+    fn session_watermark(state: &SharedState, at: i64) {
+        state.ordered_write(|tx| {
+            tx.execute("INSERT INTO read_watermark VALUES ('opencode-thalamus',?1,?1) ON CONFLICT(source_key) DO UPDATE SET watermark_ms=excluded.watermark_ms",[at]).map_err(sql)?;
+            Ok(((),true))
+        }).unwrap();
+    }
+
+    fn served_watermark(state: &SharedState) -> serde_json::Value {
+        let principal = subc_protocol::Principal::Reserved {
+            module_id: "thalamus-harness".into(),
+        };
+        crate::ops::watermark_get(state, Some(&principal), serde_json::json!({})).unwrap()
+            ["watermark_ms"]
+            .clone()
+    }
+
+    #[test]
+    fn payer_watermark_absent_store_full_pass_serves_session_progress_without_a_lane() {
+        let home = TempDir::new().unwrap();
+        let source = ThalamusPayerSource::from_data_home(home.path().to_path_buf());
+        let state = test_state();
+        session_watermark(&state, 40_000);
+        assert!(served_watermark(&state).is_null());
+        let health_before = state.public_projection().health(100_000);
+        astrocyte_readers::read_io::reset_counts();
+        assert_eq!(
+            source
+                .drain_for_health(&state, 100_000, &AtomicBool::new(false))
+                .unwrap(),
+            None
+        );
+        assert_eq!(served_watermark(&state), serde_json::json!(40_000));
+        assert_eq!(astrocyte_readers::read_io::counts().connection_opens, 0);
+        let health_after = state.public_projection().health(100_000);
+        assert_eq!(health_after.status, health_before.status);
+        assert_eq!(health_after.degraded_reason, health_before.degraded_reason);
+        state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM source_runtime WHERE source_key=?1",
+                        [SOURCE_KEY],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+        let attempts = crate::state::transaction_attempts_for_test();
+        source
+            .drain_fast(&state, 200_000, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(crate::state::transaction_attempts_for_test(), attempts);
+        assert_eq!(served_watermark(&state), serde_json::json!(40_000));
+        session_watermark(&state, 120_000);
+        source
+            .drain_for_health(&state, 200_000, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(served_watermark(&state), serde_json::json!(120_000));
+        state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT watermark_ms FROM read_watermark WHERE source_key=?1",
+                        [SOURCE_KEY],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    140_000
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn payer_watermark_excluded_source_serves_only_session_progress() {
+        let state = test_state();
+        session_watermark(&state, 40_000);
+        let mut config = state.desired_config();
+        config.harness_ingest.exclude.push(SOURCE_KEY.into());
+        state.publish_desired(config, 1);
+        assert_eq!(served_watermark(&state), serde_json::json!(40_000));
+        state
+            .ordered_write(|tx| {
+                tx.execute(
+                    "INSERT INTO read_watermark VALUES (?1,1000,61000)",
+                    [SOURCE_KEY],
+                )
+                .map_err(sql)?;
+                Ok(((), true))
+            })
+            .unwrap();
+        assert_eq!(served_watermark(&state), serde_json::json!(40_000));
+        let mut config = state.desired_config();
+        config.harness_ingest.exclude.clear();
+        state.publish_desired(config, 2);
+        assert_eq!(served_watermark(&state), serde_json::json!(1000));
+    }
+
+    #[test]
+    fn payer_watermark_store_appearing_after_absence_cannot_pass_its_uncommitted_first_row() {
+        let home = TempDir::new().unwrap();
+        let source = ThalamusPayerSource::from_data_home(home.path().to_path_buf());
+        let state = test_state();
+        session_watermark(&state, 1_000_000);
+        source
+            .drain_for_health(&state, 100_000, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(served_watermark(&state), serde_json::json!(40_000));
+        std::fs::create_dir_all(source.path.parent().unwrap()).unwrap();
+        let store = Connection::open(&source.path).unwrap();
+        store.execute_batch(DDL).unwrap();
+        store.execute("INSERT INTO payer_record(attempt_id,harness,session,request_kind,step_ref,recorded_at_ms,provider,model,auth_selection) VALUES ('first','pi','session-a','main',NULL,150000,'anthropic','model-a','login')",[]).unwrap();
+        assert_eq!(served_watermark(&state), serde_json::json!(40_000));
+        state.ordered_write(|tx| {
+            tx.execute_batch("CREATE TRIGGER reject_first_payer BEFORE INSERT ON thalamus_payer_record BEGIN SELECT RAISE(ABORT,'injected mirror failure'); END;").map_err(sql)?;
+            Ok(((),true))
+        }).unwrap();
+        assert!(source
+            .drain_for_health(&state, 200_000, &AtomicBool::new(false))
+            .is_err());
+        assert_eq!(served_watermark(&state), serde_json::json!(40_000));
+        state
+            .ordered_write(|tx| {
+                assert_eq!(
+                    tx.query_row("SELECT COUNT(*) FROM thalamus_payer_record", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                    0
+                );
+                tx.execute_batch("DROP TRIGGER reject_first_payer;")
+                    .map_err(sql)?;
+                Ok(((), true))
+            })
+            .unwrap();
+        source
+            .drain_for_health(&state, 300_000, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(served_watermark(&state), serde_json::json!(240_000));
+        state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT attempt_id,recorded_at_ms FROM thalamus_payer_record",
+                        [],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    )
+                    .unwrap(),
+                    ("first".into(), 150_000)
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

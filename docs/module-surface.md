@@ -682,7 +682,11 @@ The names and wire types are the `watermark` module of
   read-only connection; `{"watermark_ms": null}` (present, not omitted)
   until both sources have committed a complete read pass. Each payer pass uses
   its start minus 60 seconds and advances only after all mirror pages commit;
-  health timestamps and waiting queues do not determine this value. See the
+  a full pass that finds no payer store publishes the same safe empty-pass
+  watermark without creating a runtime row or changing health. Fast absent-store
+  checks do not advance it. When `thalamus-payer` is excluded, its component is
+  ignored and the session source's value is served alone.
+  Health timestamps and waiting queues do not determine this value. See the
   [payer contract](thalamus-payer-records-contract.md) §4.
 - Refusal `not_a_read_source`: the caller is not in that table (a local app's
   `Direct` principal, any other module), or its source is excluded in
@@ -695,6 +699,10 @@ Tests: `watermark_get_answers_thalamus_harness_as_the_crate_vectors_pin`,
 `manifest_provides_the_log_read_watermark_capability`.
 The minimum and rollback rules are covered by
 `watermark_requires_both_committed_passes_and_serves_the_lower_value`.
+Absent, excluded and newly appearing payer stores are covered by
+`payer_watermark_absent_store_full_pass_serves_session_progress_without_a_lane`,
+`payer_watermark_excluded_source_serves_only_session_progress` and
+`payer_watermark_store_appearing_after_absence_cannot_pass_its_uncommitted_first_row`.
 
 ### 4.4 Runs cost reads (`usage-runs-v1`)
 

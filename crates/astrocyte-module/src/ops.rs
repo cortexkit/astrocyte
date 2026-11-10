@@ -903,7 +903,8 @@ const READ_SOURCES: [ReadSource; 1] = [ReadSource {
 }];
 
 /// `watermark.get` for the route's bind principal: the lower committed pass
-/// watermark of its session and payer readers, `null` until both complete. A
+/// watermark of its session and payer readers, `null` until both complete.
+/// Excluding the payer reader serves the session watermark alone. A
 /// caller with no row in `READ_SOURCES` (a local app, any other module, no
 /// principal) and a source excluded in `harness_ingest` are both refused
 /// `not_a_read_source`. A member in the request is refused `invalid_params`,
@@ -931,11 +932,8 @@ pub fn watermark_get(
             "astrocyte reads no logs written by this caller".into(),
         )
     })?;
-    if !state
-        .desired_config()
-        .harness_ingest
-        .ingests(source.source_key)
-    {
+    let ingest = state.desired_config().harness_ingest;
+    if !ingest.ingests(source.source_key) {
         return Err((
             NOT_A_READ_SOURCE.into(),
             format!(
@@ -947,6 +945,9 @@ pub fn watermark_get(
     let stored = read_value(state, |connection| {
         let sessions =
             (source.watermark_ms)(connection).map_err(|error| ("internal".into(), error))?;
+        if !ingest.ingests(crate::refresher::thalamus_payer_source::SOURCE_KEY) {
+            return Ok(sessions);
+        }
         let payer = connection
             .query_row(
                 "SELECT watermark_ms FROM read_watermark WHERE source_key='thalamus-payer'",
