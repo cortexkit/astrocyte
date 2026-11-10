@@ -5671,6 +5671,70 @@ mod tests {
     }
 
     #[test]
+    fn media_token_roles_without_measurements_preserve_multiplier_values() {
+        let mut observations = Vec::new();
+        for extra_role in [
+            None,
+            Some("input_image"),
+            Some("output_image"),
+            Some("output_video"),
+        ] {
+            let mut conn = conn();
+            let config = config(vec![rule("opencode", "google", None)]);
+            reading(&conn, "acct", 10, 0.0, None);
+            reading(&conn, "acct", 90, 50.0, None);
+            event(
+                &conn,
+                "tokens",
+                "opencode",
+                "google",
+                "gemini-3.8-flash",
+                "metered_api",
+                20,
+                &[
+                    ("input", "usage.input", 1_000_000),
+                    ("output", "usage.output", 1_000_000),
+                ],
+            );
+            let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
+            let rates = resolve_rates(
+                &token_catalog(extra_role),
+                &catalog_models(&config, &plan),
+                100,
+            )
+            .unwrap();
+            let mut observation = super::compute_observation(
+                &conn,
+                &config,
+                &plan,
+                &rates,
+                &priced_plan(),
+                100,
+                &["google".into()],
+            )
+            .unwrap();
+            let tx = conn.transaction().unwrap();
+            insert_observation_in_tx(&tx, &observation).unwrap();
+            tx.commit().unwrap();
+            let stored: (i64, i64, i64, String) = conn.query_row(
+                "SELECT api_nanos,input_tokens,output_tokens,unpriced_tokens FROM multiplier_observation",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            assert_eq!(stored, (18_000_000_000, 1_000_000, 1_000_000, "[]".into()));
+            assert!(observation.multiplier.is_some());
+            assert!(observation.fee_multiplier.is_some());
+            for line in &mut observation.api_nanos_by_model {
+                // Catalog provenance changes, but the valuation must not.
+                line.rates = None;
+            }
+            observations.push(observation);
+        }
+        for observation in &observations[1..] {
+            assert_eq!(&observations[0], observation);
+        }
+    }
+
+    #[test]
     fn unknown_input_video_catalog_role_fails_the_day_without_rows() {
         let conn = conn();
         let config = config(vec![rule("opencode", "google", None)]);

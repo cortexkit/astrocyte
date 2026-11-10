@@ -348,7 +348,7 @@ fn alias_target_from_rates(facts: &BTreeMap<String, Value>) -> Option<CatalogMod
 }
 
 /// The token roles the catalog prices, each at `rate.<role>`.
-pub const RATE_ROLES: [&str; 8] = [
+pub const RATE_ROLES: [&str; 11] = [
     "input",
     "output",
     "cache_read",
@@ -357,6 +357,9 @@ pub const RATE_ROLES: [&str; 8] = [
     "input_audio",
     "output_audio",
     "cached_input_audio",
+    "input_image",
+    "output_image",
+    "output_video",
 ];
 
 /// Non-token units have explicit denominators rather than an implied million.
@@ -1002,6 +1005,35 @@ mod tests {
         ] {
             assert!(parse_rate_key(key).is_err(), "{key}");
         }
+    }
+
+    #[test]
+    fn media_token_roles_parse_in_catalog_replies_with_token_conditions() {
+        let mut facts = BTreeMap::new();
+        for role in ["input_image", "output_image", "output_video"] {
+            for suffix in [
+                "",
+                ".above_context.200000",
+                ".mode.fast",
+                ".ttl.1h",
+                ".mode.fast.ttl.1h.above_context.200000",
+            ] {
+                facts.insert(format!("rate.{role}{suffix}"), priced_rate(9));
+            }
+        }
+        let connection = Arc::new(FakeConnection::new(100, facts.clone()));
+        let client = CatalogClient::new(connection, 100);
+        let lookup = client.get("provider", "model", 150).unwrap();
+        let CatalogLookup::Resolved(snapshot) = lookup else {
+            panic!("media token rates did not resolve: {lookup:?}");
+        };
+        assert_eq!(snapshot.facts, facts);
+        for key in snapshot.facts.keys() {
+            let parsed = parse_rate_key(key).unwrap();
+            assert!(parsed.unit.is_none(), "{key} gained a denominator");
+            assert!(parsed.has_only_known_token_selectors(), "{key}");
+        }
+        assert_eq!(tier_thresholds(&facts).unwrap(), BTreeSet::from([200_000]));
     }
 
     #[test]

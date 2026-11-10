@@ -303,8 +303,11 @@ original per quota provider and day. Test:
 
 Token rates retain the implicit denominator of one million tokens. Their keys are
 `rate.<role>` followed by zero or more distinct `<selector>.<value>` pairs, in any
-order. Repeated selectors and empty segments are refused. Audio token roles include
-`input_audio`, `output_audio`, and `cached_input_audio`. A token rate must not state `per`.
+order. Repeated selectors and empty segments are refused. Token roles are `input`,
+`output`, `cache_read`, `cache_write`, `reasoning`, `input_audio`, `output_audio`,
+`cached_input_audio`, `input_image`, `output_image`, and `output_video`. The image
+and video token roles price only at their own keys; an absent key is `no_rate`,
+never another role's price. A token rate must not state `per`.
 The token `above_context.<threshold>` selector tests prompt size;
 its threshold must be a whole number. `mode.<name>` requires a stated non-standard
 mode and never falls back. `ttl` accepts only `5m`, `30m`, `1h`, `12h`, or `24h`.

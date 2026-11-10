@@ -179,8 +179,9 @@ that ratio as an included-quota calibration when extra usage is enabled.
 
 Ledger pricing and the multiplier accept `rate.<role>` and
 `rate.<role>.<selector>.<value>` keys. The recognized roles are `input`, `output`,
-`cache_read`, `cache_write`, `reasoning`, `input_audio`, `output_audio`, and
-`cached_input_audio`; other token roles are refused.
+`cache_read`, `cache_write`, `reasoning`, `input_audio`, `output_audio`,
+`cached_input_audio`, `input_image`, `output_image`, and `output_video`; other
+token roles are refused.
 The per-million-token `rate.input_audio` price is unused unless an event records an
 `input_audio` measurement. No usage-event reader currently records that role.
 Ledger pricing also accepts unit-billed rates with an explicit denominator;

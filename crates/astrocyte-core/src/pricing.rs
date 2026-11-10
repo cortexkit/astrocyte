@@ -1620,6 +1620,9 @@ fn rate_fact_key(role: &str, unit: &str) -> Option<&'static str> {
         "input_audio" => Some("rate.input_audio"),
         "output_audio" => Some("rate.output_audio"),
         "cached_input_audio" => Some("rate.cached_input_audio"),
+        "input_image" => Some("rate.input_image"),
+        "output_image" => Some("rate.output_image"),
+        "output_video" => Some("rate.output_video"),
         _ => None,
     }
 }

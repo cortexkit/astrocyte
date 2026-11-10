@@ -1,3 +1,137 @@
+#[test]
+fn media_token_roles_price_only_from_their_own_per_million_keys() {
+    let mut conn = conn();
+    let id = record(
+        &mut conn,
+        "media-tokens",
+        ChargeBasis::MeteredApi,
+        Some(700),
+        vec![
+            measurement("input_image", Some(250_000)),
+            measurement("output_image", Some(500_000)),
+            measurement("output_video", Some(2_000_000)),
+        ],
+    );
+    let catalog = client(FakeCatalog::new(BTreeMap::from([
+        ("rate.input".into(), rate(1_000_000_000)),
+        ("rate.output".into(), rate(2_000_000_000)),
+        ("rate.input_image".into(), rate(7_000_000_000)),
+        ("rate.output_image".into(), rate(8_000_000_000)),
+        ("rate.output_video".into(), rate(9_000_000_000)),
+    ])));
+    reprice_event(&mut conn, &id, &catalog, 1_000, PricingOrigin::PricingPass).unwrap();
+    let rows = conn
+        .prepare(
+            "SELECT role,unit,outcome,charge_nanos,json_extract(catalog_entry,'$.fact_key')
+             FROM priced_charge ORDER BY role",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "input_image".into(),
+                "token".into(),
+                "priced".into(),
+                1_750_000_000,
+                "rate.input_image".into(),
+            ),
+            (
+                "output_image".into(),
+                "token".into(),
+                "priced".into(),
+                4_000_000_000,
+                "rate.output_image".into(),
+            ),
+            (
+                "output_video".into(),
+                "token".into(),
+                "priced".into(),
+                18_000_000_000,
+                "rate.output_video".into(),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn media_token_roles_without_own_keys_stay_no_rate_despite_text_rates() {
+    let mut conn = conn();
+    let id = record(
+        &mut conn,
+        "missing-media-token-rates",
+        ChargeBasis::MeteredApi,
+        Some(700),
+        vec![
+            measurement("input_image", Some(1_000_000)),
+            measurement("output_image", Some(1_000_000)),
+            measurement("output_video", Some(1_000_000)),
+        ],
+    );
+    let catalog = client(FakeCatalog::new(BTreeMap::from([
+        ("rate.input".into(), rate(1_000_000_000)),
+        ("rate.output".into(), rate(2_000_000_000)),
+    ])));
+    reprice_event(&mut conn, &id, &catalog, 1_000, PricingOrigin::PricingPass).unwrap();
+    let rows = conn
+        .prepare(
+            "SELECT role,outcome,charge_nanos,unpriced_reason,catalog_entry
+             FROM priced_charge ORDER BY role",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            let entry: Option<String> = row.get(4)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, String>(3)?,
+                entry.map(|entry| serde_json::from_str::<Value>(&entry).unwrap()),
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "input_image".into(),
+                "unpriced".into(),
+                None,
+                "no_rate".into(),
+                Some(json!({"fact_key":"rate.input_image", "state":"absent"})),
+            ),
+            (
+                "output_image".into(),
+                "unpriced".into(),
+                None,
+                "no_rate".into(),
+                Some(json!({"fact_key":"rate.output_image", "state":"absent"})),
+            ),
+            (
+                "output_video".into(),
+                "unpriced".into(),
+                None,
+                "no_rate".into(),
+                Some(json!({"fact_key":"rate.output_video", "state":"absent"})),
+            ),
+        ]
+    );
+}
+
 fn media_price_record(
     conn: &mut Connection,
     id: &str,
