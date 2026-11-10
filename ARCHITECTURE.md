@@ -165,11 +165,13 @@ transaction under the fence, then refresh the in-memory projection; network and
 file I/O come first. Served reads use `with_read_op`, so a report never blocks
 ingest.
 
-Writes check no caller identity, so a flow's route may read but never write
-(`flow_scopes_unsupported`). Only `thalamus-harness` may call `watermark.get`. A
-write panic, stopped refresher or handler panic exits 1 so the supervisor
-restarts the module; failed requests still get an `internal` reply. EOF and
-GOODBYE exit 0. On Unix, SIGTERM stops cleanly and then re-raises.
+Writes check no caller identity. A flow's route may call only the manifest's
+`flow_operations`; all other operations are refused `flow_scopes_unsupported`
+before dispatch. Flows cannot read the step feed or `watermark.get`, and allowed
+run reads retain their principal checks. Only `thalamus-harness` may call
+`watermark.get`. A write panic, stopped refresher or handler panic exits 1 so
+the supervisor restarts the module; failed requests still get an `internal`
+reply. EOF and GOODBYE exit 0. On Unix, SIGTERM stops cleanly and then re-raises.
 
 ## Configuration
 

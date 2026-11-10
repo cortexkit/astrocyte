@@ -8,8 +8,8 @@ the tables these operations read and write.
 ## 1. Transport
 
 astrocyte runs under subc, the subconscious daemon, which supervises local
-modules and routes requests between them. It serves one management surface
-under module id `astrocyte`. A
+modules and routes requests between them. It displays as "Spend Ledger" and
+serves one management surface under module id `astrocyte`. A
 client opens a route with target `{"kind": "management_surface", "module_id":
 "astrocyte"}` and sends a request body `{"method": <operation>, "params":
 <object>}` on that route. `spend_drive` is a client that does exactly this;
@@ -29,10 +29,25 @@ see [operations](operations.md).
 - A request whose handler panics is refused `internal`, and the module then
   stops with a non-zero exit, because a panic may have left shared state
   broken. Test: `handler_panic_replies_before_serving_ends_with_nonzero_exit`.
-- A route opened by a subc flow (work that runs for its owner without the
-  owner present) may call the read operations. Every write
-  operation on such a route is refused `flow_scopes_unsupported` before
-  dispatch. Test: `a_flow_stamped_route_may_read_but_every_write_is_refused`.
+- A route opened by an approved subc flow (work that runs for its owner without
+  the owner present) may call exactly these reads: `budget.verdict`,
+  `spend.report`, `spend.subscription.report`, `spend.workclass.report`,
+  `spend.ledger.coverage`, `spend.charge.explain`, `spend.reconcile`,
+  `spend.multiplier.report`, `spend.multiplier.pace`, `usage.cache.sessions`,
+  `usage.cache.steps`, `usage.runs.list` and `usage.runs.detail`. The manifest
+  declares `flow-scopes/v1` and names these in `flow_operations`; the same list
+  controls dispatch. Run reads retain their principal checks on flow routes.
+- Every other operation on a flow route is refused `flow_scopes_unsupported`
+  before dispatch, including every write and the principal-checked reads
+  `usage.steps.subscribe`, `usage.steps.read` and `watermark.get`. Without a
+  flow, the step feed admits only local apps and Callosum phones, and
+  `watermark.get` admits only `thalamus-harness`. Tests:
+  `manifest_provides_flow_scopes_and_exact_read_operations`,
+  `a_flow_stamped_subscription_report_is_advertised_and_served`,
+  `a_flow_stamped_route_may_call_only_declared_operations`,
+  `a_flow_stamped_feed_read_is_refused_before_dispatch`,
+  `a_flow_stamped_watermark_read_is_refused_before_dispatch` and
+  `a_flow_stamped_runs_read_keeps_principal_checks`.
 
 The manifest advertises the operation list and a versioned params schema per
 operation (`operation_schemas`, `OPERATION_SCHEMA_VERSION` = 2). Every params
