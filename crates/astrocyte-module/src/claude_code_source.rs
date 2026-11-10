@@ -314,20 +314,6 @@ pub(crate) fn read_projects(
         if !mode.is_full() && !stat.fast_changed(previous.windows.get(&path), recorded_at_ms) {
             continue;
         }
-        if !mode.is_full() && work_class.is_some() {
-            // Cached worker roots are checked only on full ticks. Before reading
-            // changed content, reject a directory redirected outside that root.
-            let canonical = std::fs::canonicalize(&path).map_err(|error| {
-                format!("resolve worker transcript {}: {error}", path.display())
-            })?;
-            if !canonical.starts_with(root) {
-                return Err(format!(
-                    "worker transcript outside declared projects: {}",
-                    path.display()
-                )
-                .into());
-            }
-        }
         resume_points.remove(&path);
         let point = previous_points.remove(&path);
         let check = if mode.prefix_check(

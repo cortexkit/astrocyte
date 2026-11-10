@@ -89,14 +89,13 @@ catalog. With `null`, every event is stored unpriced with reason
 
 Which sources the refresher drains. `enabled: false` turns every source off.
 Otherwise each source key in `exclude` is skipped. Valid keys are the
-`INGEST_SOURCES` list: `claude-code`, `claude-code-workers`, `codex`,
+`INGEST_SOURCES` list: `claude-code`, `codex`,
 `opencode`, `opencode-thalamus`, `pi`, `gemini`, `goose`, `omp`, `kimi`, `broca`. A skipped source
 is not read and its `source_runtime` row is removed, so it never reads as
 stale. Events it already recorded stay. Refused: an unknown key, a key listed
 twice, and `enabled: false` with a non-empty `exclude`. Tests:
 `an_unknown_excluded_producer_is_refused_by_name`,
-`ingestion_off_with_a_non_empty_exclude_is_refused_as_contradictory`,
-`excluded_workers_are_not_read_and_runtime_is_removed`.
+`ingestion_off_with_a_non_empty_exclude_is_refused_as_contradictory`.
 
 ### `reasoning_billed_as_output`
 

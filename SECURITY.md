@@ -26,14 +26,12 @@ projects were worked on, when, with which models, and what that cost. Treat it
 and its backups as sensitive.
 
 Harness stores are opened read-only (SQLite `mode=ro`, or plain reads of
-append-only files). astrocyte never writes a harness's store. The one file it
-writes outside its own store is the Claude worker read acknowledgement,
-`<data home>/cortexkit/astrocyte/acks/claude-workers.json`, created with mode
-`0600` in a directory set to `0700` on Unix. A declared Claude worker root must
-resolve, after symlinks, inside the folder that holds the harness module's
-`roots.json`; any other root is refused, so a declaration cannot point
-astrocyte at arbitrary folders. See the
-[Claude workers contract](docs/claude-workers-contract.md).
+append-only files). astrocyte never writes a harness's store. The Claude Code
+session read acknowledgement, `<data home>/cortexkit/astrocyte/acks/claude-code.json`,
+is created with mode `0600` in a directory set to `0700` on Unix. A declared
+Claude Code session root must resolve, after symlinks, to its expected private
+config directory, so a declaration cannot point astrocyte at arbitrary folders.
+See the [Claude Code sessions contract](docs/thalamus-claude-code-sessions-contract.md).
 
 astrocyte trusts the local subc daemon to authenticate clients and to decide
 who may open a route to astrocyte's management surface. Served operations
@@ -57,9 +55,11 @@ daemon, module binaries, data home and user account as one trust boundary.
 
 The read-only harness access is in
 [`sqlite_read.rs`](crates/astrocyte-readers/src/sessions/sqlite_read.rs) and
-[`sqlite_uri.rs`](crates/astrocyte-readers/src/sqlite_uri.rs); the worker-root
-containment and acknowledgement write are in
-[`claude_workers_source.rs`](crates/astrocyte-module/src/claude_workers_source.rs);
+[`sqlite_uri.rs`](crates/astrocyte-readers/src/sqlite_uri.rs); declared-root
+containment is in
+[`declared_roots.rs`](crates/astrocyte-module/src/declared_roots.rs), and the
+Claude Code session acknowledgement write is in
+[`claude_thalamus_source.rs`](crates/astrocyte-module/src/claude_thalamus_source.rs);
 the statement file checks are `read_statement_file` in
 [`ops.rs`](crates/astrocyte-module/src/ops.rs). See the
 [architecture](ARCHITECTURE.md) for the data flow.

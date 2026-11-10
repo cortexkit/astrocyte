@@ -274,8 +274,8 @@ Legacy observations without those inputs report null stability diagnostics.
 Readiness requires `last_success_ms` at/after the interval end **and** no
 `pending_known` or `pending_unknown`. Before two hours after the boundary the
 operation waits; afterwards it may append a diagnostic row, never an eligible
-one. Recompute rechecks the same readiness even for existing rows. Reader aliases
-`opencode-v2` and `claude-code-workers` inherit their ledger producer's scope.
+one. Recompute rechecks the same readiness even for existing rows. The reader alias
+`opencode-v2` inherits its ledger producer's scope.
 Sources absent from `source_runtime` are not independently certified; neither
 this gate nor configuration proves that traffic outside ingestion is visible.
 

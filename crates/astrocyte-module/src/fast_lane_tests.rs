@@ -417,19 +417,11 @@ fn add_jsonl_inventory(corpus: &mut Corpus) -> usize {
         ("gemini/chats", "session.jsonl"),
         ("omp/project", "session.jsonl"),
         ("kimi/group/session", "wire.jsonl"),
-        (
-            "cortexkit/thalamus-harness/claude-workers/worker/projects/project",
-            "session.jsonl",
-        ),
     ] {
         let directory = root.join(directory);
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join(file), "{}\n").unwrap();
     }
-    fs::write(root.join("cortexkit/thalamus-harness/claude-workers/roots.json"), json!({
-        "version":1, "roots":[{"worker_id":"w-00000000000000000000000000000001", "path": root.join("cortexkit/thalamus-harness/claude-workers/worker"),
-            "work_class":"subagent", "state":"active"}]
-    }).to_string()).unwrap();
     corpus.files.claude_code = Some(Arc::new(claude_code_source::ClaudeCodeSource::at(
         root.join("claude"),
     )));
@@ -438,12 +430,9 @@ fn add_jsonl_inventory(corpus: &mut Corpus) -> usize {
         Arc::new(gemini_source::GeminiSource::at(root.join("gemini"))),
         Arc::new(omp_source::OmpSource::at(root.join("omp"))),
         Arc::new(kimi_source::KimiSource::at(root.join("kimi"))),
-        Arc::new(claude_workers_source::ClaudeWorkersSource::from_data_home(
-            root.into(),
-        )),
     ];
     corpus.files.harnesses.extend(jsonl);
-    7
+    6
 }
 
 #[cfg(unix)]

@@ -11,8 +11,6 @@ pub(crate) mod broca_source;
 mod claude_code_source;
 #[path = "claude_thalamus_source.rs"]
 mod claude_thalamus_source;
-#[path = "claude_workers_source.rs"]
-mod claude_workers_source;
 #[path = "codex_source.rs"]
 mod codex_source;
 #[path = "colliculus_source.rs"]
@@ -1455,8 +1453,7 @@ struct FileSources {
     pi: Option<Arc<pi_source::PiSource>>,
     claude_code: Option<Arc<claude_code_source::ClaudeCodeSource>>,
     codex: Option<Arc<codex_source::CodexSource>>,
-    /// Additional transcript readers: Gemini CLI, Goose, Oh My Pi, Kimi CLI,
-    /// and Claude workers listed in the harness module's roots.json.
+    /// Additional harness readers, including the declared THALAMUS sessions.
     harnesses: Vec<Arc<dyn harness_drain::HarnessSource>>,
 }
 
@@ -1604,7 +1601,6 @@ fn refresher_harness_sources() -> Vec<Arc<dyn harness_drain::HarnessSource>> {
         Arc::new(refresher_goose_source()),
         Arc::new(refresher_omp_source()),
         Arc::new(refresher_kimi_source()),
-        Arc::new(refresher_claude_workers_source()),
         Arc::new(refresher_claude_thalamus_source()),
         Arc::new(refresher_opencode_thalamus_source()),
     ]
@@ -1641,17 +1637,6 @@ fn refresher_opencode_thalamus_source() -> opencode_thalamus_source::OpenCodeTha
     #[cfg(not(any(test, feature = "test-support")))]
     let home = PathBuf::from(cortexkit_store_types::resolve_data_home());
     opencode_thalamus_source::OpenCodeThalamusSource::from_data_home(home)
-}
-
-fn refresher_claude_workers_source() -> claude_workers_source::ClaudeWorkersSource {
-    #[cfg(any(test, feature = "test-support"))]
-    let home = std::env::temp_dir().join(format!(
-        "astrocyte-test-data-without-claude-workers-{}",
-        std::process::id()
-    ));
-    #[cfg(not(any(test, feature = "test-support")))]
-    let home = PathBuf::from(cortexkit_store_types::resolve_data_home());
-    claude_workers_source::ClaudeWorkersSource::from_data_home(home)
 }
 
 /// Releases the pricing-pass hold on drop, so a failed assertion cannot keep

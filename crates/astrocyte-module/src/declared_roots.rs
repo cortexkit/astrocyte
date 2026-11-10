@@ -1,6 +1,6 @@
 //! Roots files that thalamus-harness writes to declare its private harness
 //! folders, and the containment checks astrocyte applies to every declared path.
-//! The Claude workers and THALAMUS Claude Code and OpenCode session contracts
+//! The THALAMUS Claude Code and OpenCode session contracts
 //! share file decoding and path resolution, but allow different folder shapes.
 
 use std::path::{Component, Path, PathBuf};

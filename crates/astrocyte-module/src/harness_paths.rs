@@ -4,38 +4,26 @@ use std::path::PathBuf;
 
 use cortexkit_paths::{env_absolute_path, with_env, EnvSource, PathsError};
 
-pub(crate) struct ClaudeWorkerPaths {
+pub(crate) struct ClaudeSessionPaths {
     pub(crate) roots: PathBuf,
     pub(crate) ack: PathBuf,
 }
 
-/// Accept the same resolved data home as Astrocyte's store, never a cwd-relative one.
-pub(crate) fn claude_workers(data_home: PathBuf) -> Result<ClaudeWorkerPaths, String> {
-    if !data_home.is_absolute() {
-        return Err(format!("the data home resolved to the relative {data_home:?}; refusing to resolve Claude worker roots"));
-    }
-    let cortexkit = data_home.join("cortexkit");
-    Ok(ClaudeWorkerPaths {
-        roots: cortexkit.join("thalamus-harness/claude-workers/roots.json"),
-        ack: cortexkit.join("astrocyte/acks/claude-workers.json"),
-    })
-}
-
 /// Private Claude Code session declarations use the same resolved data home as the store.
-pub(crate) fn claude_sessions(data_home: PathBuf) -> Result<ClaudeWorkerPaths, String> {
+pub(crate) fn claude_sessions(data_home: PathBuf) -> Result<ClaudeSessionPaths, String> {
     if !data_home.is_absolute() {
         return Err(format!("the data home resolved to the relative {data_home:?}; refusing to resolve Claude Code session roots"));
     }
     let cortexkit = data_home.join("cortexkit");
-    Ok(ClaudeWorkerPaths {
+    Ok(ClaudeSessionPaths {
         roots: cortexkit.join("thalamus-harness/claude-code/roots.json"),
         ack: cortexkit.join("astrocyte/acks/claude-code.json"),
     })
 }
 
 /// The roots file declaring the OpenCode sessions thalamus-harness runs in
-/// private OpenCode servers. The session folders sit beside it. Like the
-/// Claude worker roots, it is resolved under Astrocyte's own data home.
+/// private OpenCode servers. The session folders sit beside it, under
+/// Astrocyte's own data home.
 pub(crate) fn opencode_sessions_roots(data_home: PathBuf) -> Result<PathBuf, String> {
     if !data_home.is_absolute() {
         return Err(format!("the data home resolved to the relative {data_home:?}; refusing to resolve OpenCode session roots"));

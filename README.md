@@ -46,7 +46,6 @@ Windows clippy pass needs the `x86_64-pc-windows-gnu` target
 - [Harness readers](docs/harness-readers.md): where each harness store is found and what one event is.
 - [Module surface](docs/module-surface.md): the served operations and the peer calls.
 - [Money ingest](docs/money-ingest.md): caller corrections and statement attribution.
-- [Claude workers contract](docs/claude-workers-contract.md): declared worker roots and acknowledgements.
 - [Configuration](docs/configuration.md): the desired configuration file.
 - [Operations](docs/operations.md): subscriptions, repricing, basis corrections and multiplier recomputes.
 - [CONTRIBUTING.md](CONTRIBUTING.md): contribution workflow and verification.

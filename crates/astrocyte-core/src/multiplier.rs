@@ -179,7 +179,6 @@ pub fn source_in_scope(provider: &QuotaProviderConfig, source: &str) -> bool {
         source == rule.producer
             || source.starts_with(&format!("{}:", rule.producer))
             || (rule.producer == "opencode" && source == "opencode-v2")
-            || (rule.producer == "claude-code" && source == "claude-code-workers")
     })
 }
 

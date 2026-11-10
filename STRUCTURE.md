@@ -67,7 +67,7 @@ A library shared by three binaries: `main.rs` (`ck-astrocyte`) and two tools,
   `jsonl_schedule.rs` holds each JSONL file's next read deadlines, such as the
   staggered daily full re-read.
 - Declared folders: `declared_roots.rs` (roots files and path containment),
-  `claude_workers_source.rs`, `claude_thalamus_source.rs` and
+  `claude_thalamus_source.rs` and
   `opencode_thalamus_source.rs`. `harness_paths.rs` resolves every harness path.
 - `broca_source.rs`, `wire_map.rs`: BROCA's `run-index.db` reader and fact mapping.
 - `colliculus_source.rs`: the colliculus media usage feed.
@@ -121,7 +121,6 @@ tests; samples pinned from peers are in `tests/vectors/`.
 ## Docs
 
 - Contracts: `docs/module-surface.md` (every operation), `docs/money-ingest.md`,
-  `docs/claude-workers-contract.md`,
   `docs/thalamus-claude-code-sessions-contract.md`,
   `docs/thalamus-opencode-sessions-contract.md`.
 - How it works: `docs/data-model.md`, `docs/harness-readers.md`,

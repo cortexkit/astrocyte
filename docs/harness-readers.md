@@ -23,7 +23,7 @@ a changed prefix makes the file be read again from the start. Events already
 recorded then come back as exact redeliveries, because each event's identity
 and content come from the file alone.
 
-Pi, Claude Code (including declared workers), Codex, Oh My Pi, Kimi and Gemini
+Pi, Claude Code, Codex, Oh My Pi, Kimi and Gemini
 JSONL verify the whole consumed prefix at least every 24 hours. Each path has
 a deterministic daily phase, so adding files does not move existing deadlines.
 The first deadline is within 24 hours of a verified read, not a day plus an
@@ -49,7 +49,7 @@ their separate hourly verification policy. Goose stays on full ticks.
 
 Between full ticks, the refresher's single writer runs a fast lane every two
 seconds (`FAST_LANE_INTERVAL`). It reads OpenCode 1 and 2 rowid tails and BROCA's
-`export_facts` tail. Pi, Oh My Pi, Claude Code, declared Claude workers, Codex,
+`export_facts` tail. Pi, Oh My Pi, Claude Code, Codex,
 Kimi and Gemini JSONL readers retain a hot set from full ticks: files modified
 within the last five minutes, plus newly discovered files. A file that keeps
 growing stays hot. Fast cycles walk no directories and check each hot path with
@@ -62,7 +62,7 @@ Brand-new session files wait for discovery on the next full tick, at most
 `poll_interval_secs` (30 seconds in production). Codex archives,
 Gemini JSON documents and declared OpenCode store reads stay on full ticks;
 declared readers also check their payer waits in the fast lane. Full-prefix verification, quiet-file
-checks, worker deletion acknowledgements, pricing, quota polling, multiplier
+checks, session deletion acknowledgements, pricing, quota polling, multiplier
 work, audits and retention keep their existing schedules.
 
 A fast read uses the same event mapping, identities and commit ordering as a full
@@ -122,7 +122,6 @@ The `thalamus-payer` source records row-less calls as producer `thalamus-harness
 | Source key | Harness | Store |
 |---|---|---|
 | `claude-code` | Claude Code | `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/**/*.jsonl` |
-| `claude-code-workers` | Claude Code workers declared by thalamus-harness | `<root>/projects/**/*.jsonl` for each declared root |
 | `codex` | Codex CLI | `<CODEX_HOME or ~/.codex>/sessions/` and `archived_sessions/`, `*.jsonl` and `*.jsonl.zst` |
 | `opencode` | OpenCode | `OPENCODE_DB`, else `<XDG data home>/opencode/opencode.db`, tables `message` and `session_message` |
 | `opencode-thalamus` | OpenCode sessions declared by thalamus-harness | `<path>/opencode.db` for each declared folder, both OpenCode layouts |
@@ -150,9 +149,6 @@ Each source resolves its store path by these rules, implemented in
   `%APPDATA%\Block\goose\data` on Windows (test: `goose_windows_default`).
 - Oh My Pi has no override. It does not read `PI_CODING_AGENT_DIR`, which
   belongs to Pi, so the two sources never read one tree.
-- The Claude worker roots come from
-  `<data home>/cortexkit/thalamus-harness/claude-workers/roots.json`. The
-  binding rules are the [Claude workers contract](claude-workers-contract.md).
 - The OpenCode session folders come from
   `<data home>/cortexkit/thalamus-harness/opencode-sessions/roots.json`. The
   folders may be inside `opencode-sessions/` or at the sibling
@@ -167,7 +163,7 @@ Each source resolves its store path by these rules, implemented in
 | Source key | One event | `producer_ref` | `producer_lineage` |
 |---|---|---|---|
 | `thalamus-payer` | One row-less attempt, or one entry of its model fallback array | `attempt_id`, or `<attempt_id>#<1-based entry position>` | session |
-| `claude-code`, `claude-code-workers` | One API request: the records sharing a `requestId`, folded at the per-field maximum | `requestId` | none |
+| `claude-code` | One API request: the records sharing a `requestId`, folded at the per-field maximum | `requestId` | none |
 | `codex` | One advancing `token_count` record (`last_token_usage`) | `<turn id>:<n>` for the n-th response of the turn, else `<thread id>:ordinal:<n>` | `session_meta.session_id` |
 | `codex` | One otherwise unconfirmed `token_usage_record` | `<thread id>:request:response:<response id>`, else `<thread id>:request:ordinal:<n>` | `session_meta.session_id` |
 | `opencode`, `opencode-thalamus` | One assistant `message` row whose tokens are final (`time.completed` or `finish` set) | `message.id` | none |
@@ -259,9 +255,6 @@ Rules that affect what is recorded:
   summed into a second event. Tests:
   `a_session_is_one_event_once_its_quiet_window_has_passed`,
   `a_session_that_grows_after_being_recorded_is_quarantined_not_re_summed`.
-- Declared Claude worker events keep producer `claude-code` and the same
-  identity, and carry the declared `work_class`. Test:
-  `worker_events_stamp_declared_class_without_changing_identity`.
 - Declared OpenCode sessions are read from each folder in thalamus-harness's
   `roots.json`, which astrocyte re-reads on every full tick. A folder's path
   must be absolute and, after symlinks are resolved, either strictly inside
@@ -269,8 +262,8 @@ Rules that affect what is recorded:
   exactly `<H>/launch-head-<name>/data/opencode`, where `<H>` is that folder's
   canonical parent and `<name>` is one non-empty path component. Any other
   entry is logged once and skipped while the other entries still read.
-  Roots-file decoding and path resolution share code with the Claude workers
-  (`declared_roots.rs`), but only OpenCode sessions accept runner-head paths.
+  Roots-file decoding and path resolution use `declared_roots.rs`, but only
+  OpenCode sessions accept runner-head paths.
   A missing roots file means no sessions: there is no
   runtime row and no folder cursor. An unknown `version` reads nothing and
   degrades the source. An unreadable or malformed file, including one that

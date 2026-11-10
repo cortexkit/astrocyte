@@ -59,11 +59,10 @@ through `INSERT OR REPLACE`. Integer keys are never served. The
   past a cursor, refuses a cursor that moves backwards, and commits facts and
   cursor together. BROCA plans to replace this with an acknowledged billing feed.
 - **Declared folders.** THALAMUS lists its private sessions in roots files, read as
-  `claude-code-workers`, `claude-code-thalamus` and `opencode-thalamus`. Each entry
+  `claude-code-thalamus` and `opencode-thalamus`. Each entry
   must resolve to its exact expected path. After commit astrocyte acknowledges
   reads (or serves a watermark through `watermark.get`), and only then may
   THALAMUS delete a folder. See the
-  [workers](docs/claude-workers-contract.md),
   [Claude Code](docs/thalamus-claude-code-sessions-contract.md) and
   [OpenCode](docs/thalamus-opencode-sessions-contract.md) contracts.
 - **THALAMUS payers.** `thalamus-payer` mirrors the harness's payer store before
@@ -97,8 +96,8 @@ transaction as the good calls and the cursor, and coverage counts them.
 
 Then the loop rebuilds dirty summary hours for up to 1.5 seconds and runs the
 multiplier stage. Between full ticks it applies quota events every 250 ms and,
-every two seconds (`FAST_LANE_INTERVAL`), a fast lane: the harness readers except
-Goose, the Claude worker folders and BROCA tail only what changed. Other sources
+every two seconds (`FAST_LANE_INTERVAL`), a fast lane: BROCA and the harness
+readers except Goose tail only what changed. Other sources
 wait for full ticks. Fast cycles commit nothing when idle and never count as a
 source's successful drain.
 

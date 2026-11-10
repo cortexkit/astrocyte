@@ -52,11 +52,10 @@ THALAMUS atomically replaces
 - `owner_principal` is stored verbatim as `work_class` on newly recorded calls.
 - `state` is exactly `active` or `done`. Once `done`, the session will never write
   again. `done_at_ms` is null while active and the Unix millisecond completion
-  time when done; like the worker reader, astrocyte uses `state`, not this time,
+  time when done; astrocyte uses `state`, not this time,
   to decide whether the session can be acknowledged.
 
-The decoder follows the [worker roots decoder](claude-workers-contract.md):
-known required fields and their types must decode, and unknown fields at the
+Known required fields and their types must decode, and unknown fields at the
 top level or in an entry are ignored. `done_at_ms` is not interpreted by the
 reader. Missing or malformed versions degrade the source; an unknown unsigned
 integer version skips the roots and degrades rather than guessing. An unreadable
@@ -91,8 +90,7 @@ Who paid for each call comes from the harness module's payer store, under the
 ## 4. Read acknowledgement, written by astrocyte
 
 Astrocyte atomically writes
-`<cortexkit data home>/astrocyte/acks/claude-code.json`, using the worker
-acknowledgement shape but keyed by `session`:
+`<cortexkit data home>/astrocyte/acks/claude-code.json`, keyed by `session`:
 
 ```json
 {"version": 1, "read_through": [{"session": "01234567-89ab-4cde-8123-456789abcdef", "at_ms": 1791850000000}]}
@@ -109,8 +107,8 @@ The acknowledgement is written only after the ledger transaction commits. A
 failed transaction neither advances the reader's in-memory offsets nor issues
 an acknowledgement. `at_ms` is when astrocyte determined the session was fully
 read; an existing timestamp is preserved across ticks and restarts. Entries no
-longer declared are removed so the file stays small. The file uses the same
-atomic replacement and private Unix permissions as worker acknowledgements.
+longer declared are removed so the file stays small. The file is written by
+atomic replacement with private Unix permissions.
 
 ## 5. Retention belongs to THALAMUS
 
