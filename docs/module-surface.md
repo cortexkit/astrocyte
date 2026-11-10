@@ -103,6 +103,28 @@ a value outside an enum) is refused `malformed`. Store failures are
 `internal`. A refusal writes nothing. Test:
 `malformed_operation_is_a_refusal_without_a_write`.
 
+All nine writes above share a daemon operator-confirmation gate, declared in the
+manifest's `confirm_operations`. The gate is **off until release**, by Ufuk's
+ruling: `ledger_write_confirmation_required()` returns `false`. Release enables
+it by changing only that function to return `true`, with no config, environment
+or feature switch. While off, direct callers write without a prompt as before.
+
+When enabled, only a `Principal::Direct` caller (a local program) must obtain
+daemon confirmation for each in-flight write. The deployed daemon chooses its
+OS presence provider. Module-route calls and the refresher never prompt; flow
+routes keep their existing `flow_scopes_unsupported` refusal. The prompt names the operation
+and target, and waits outside the writer fence and store transaction. Callers
+must allow at least 300 seconds for the person's response. A confirmation is
+never cached or retried: any refusal or failure returns
+`operator_confirmation_refused` without dispatching or changing the store. The
+message includes the daemon's reason, not request secrets. Any confirmation
+error refuses the write, on every platform. This includes direct Linux writes
+when the deployed daemon cannot confirm the person, for example before its
+polkit provider is available; there is no platform bypass.
+
+`spend_drive` allows 300 seconds for these writes, even while the gate is off;
+its reads and authentication retain their 15-second deadlines.
+
 ### 3.1 `spend.event.ingest`
 
 Records one usage event pushed by a peer. Required: `producer`,

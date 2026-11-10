@@ -53,6 +53,20 @@ pub const OP_STEPS_READ: &str = "usage.steps.read";
 pub const OP_WATERMARK_GET: &str = "watermark.get";
 const _: () = assert!(same_str(OP_WATERMARK_GET, WATERMARK_GET));
 
+/// The serving gate, manifest and management client's confirmation timeout
+/// share the operations that change the money ledger.
+pub const LEDGER_WRITE_OPERATIONS: [&str; 9] = [
+    OP_EVENT_INGEST,
+    OP_CORRECTION_INGEST,
+    OP_CHARGEABILITY_SETTLE,
+    OP_STATEMENT_IMPORT,
+    OP_SUBSCRIPTION_SET,
+    OP_SUBSCRIPTION_CLOSE,
+    OP_EVENT_REPRICE,
+    OP_BASIS_CORRECT,
+    OP_MULTIPLIER_RECOMPUTE,
+];
+
 /// Byte equality of two strings, usable in a constant assertion.
 const fn same_str(left: &str, right: &str) -> bool {
     let (left, right) = (left.as_bytes(), right.as_bytes());

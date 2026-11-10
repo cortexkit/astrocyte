@@ -8,11 +8,11 @@
 // The in-process test server uses ops::dispatch so refusals and SQLite writes
 // exercise the running module's implementation, not a client-side imitation.
 #[cfg(test)]
-use astrocyte_module::{ops, state, test_support::test_state};
+use astrocyte_module::{state, test_support::test_state};
 
 use std::{io::Write, path::Path, time::Duration};
 
-use astrocyte_module::config::DEFAULT_MODULE_ID;
+use astrocyte_module::{config::DEFAULT_MODULE_ID, ops};
 use serde_json::{json, Value};
 use subc_protocol::{Frame, FrameType};
 use subc_transport::{authenticate_client, connection_file};
@@ -22,6 +22,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
+
+fn request_timeout(operation: &str) -> Duration {
+    if ops::LEDGER_WRITE_OPERATIONS.contains(&operation) {
+        // The daemon allows 290 seconds for operator confirmation. Leave time
+        // for its reply without extending read or authentication deadlines.
+        Duration::from_secs(300)
+    } else {
+        TIMEOUT
+    }
+}
 const REPRICE_NOTICE: &str = "a plan reprices events already recorded: the autonomous pass also takes unpriced heads whose reason is no_subscription_in_force and whose instant falls inside this plan's range, bounded per tick, draining until none remain. COVERAGE IS ONE-WAY: a covered head is a priced head, and reprice re-resolves only unpriced ones, so an event this plan covers cannot be uncovered by closing or superseding the plan.";
 
 type Reply = Result<Value, (String, String)>;
@@ -41,7 +51,7 @@ async fn main() {
         }
     };
     let reply = match tokio::time::timeout(
-        TIMEOUT,
+        request_timeout(&args[1]),
         connect_and_call(Path::new(&args[0]), &args[1], params),
     )
     .await
@@ -169,6 +179,22 @@ fn render(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ledger_confirmation_write_timeout_preserves_read_and_auth_deadlines() {
+        assert_eq!(super::TIMEOUT, std::time::Duration::from_secs(15));
+        for operation in astrocyte_module::ops::PUBLIC_OPERATION_NAMES {
+            let expected = if astrocyte_module::ops::LEDGER_WRITE_OPERATIONS.contains(&operation) {
+                300
+            } else {
+                15
+            };
+            assert_eq!(
+                super::request_timeout(operation),
+                std::time::Duration::from_secs(expected),
+                "{operation}"
+            );
+        }
+    }
     use super::*;
 
     fn plan() -> Value {

@@ -1,10 +1,9 @@
 # Architecture
 
-Astrocyte (`ck-astrocyte`) records AI usage on one machine and prices it in
-nanodollars against fusiform. It serves spend, run costs, cache diagnostics,
-live steps and subscription multipliers over subc. It reads after the fact:
-`budget.verdict` always answers `allow`. `STRUCTURE.md` maps the files; `docs/`
-holds the contracts and details this page summarises.
+Astrocyte (`ck-astrocyte`) records local AI usage and prices it in nanodollars
+against fusiform. It serves spend and usage diagnostics over subc.
+`budget.verdict` always answers `allow`.
+`STRUCTURE.md` maps the files; `docs/` holds the contracts.
 
 ## Rules the design keeps
 
@@ -165,7 +164,9 @@ transaction under the fence, then refresh the in-memory projection; network and
 file I/O come first. Served reads use `with_read_op`, so a report never blocks
 ingest.
 
-Writes check no caller identity. A flow's route may call only the manifest's
+Direct ledger writes have a daemon confirmation gate, off until release; enabling
+it refuses writes wherever the deployed daemon cannot confirm the person.
+A flow's route may call only the manifest's
 `flow_operations`; all other operations are refused `flow_scopes_unsupported`
 before dispatch. Flows cannot read the step feed or `watermark.get`, and allowed
 run reads retain their principal checks. Only `thalamus-harness` may call

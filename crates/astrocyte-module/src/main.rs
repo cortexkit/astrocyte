@@ -29,8 +29,8 @@ use serde_json::{json, Value};
 use state::{now_ms, PublicProjection, SharedState};
 use subc_client_rs::{
     async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, HealthStatus,
-    ModuleHandler, ModuleStopHandle, RequestClass, RequestCtx, RequestPools, RouteBindRequest,
-    RouteCloseReason, RouteHandle, ServeOptions, SubcModuleError,
+    ModuleHandler, ModuleStopHandle, OperatorConfirmError, RequestClass, RequestCtx, RequestPools,
+    RouteBindRequest, RouteCloseReason, RouteHandle, ServeOptions, SubcModuleError,
 };
 use subc_protocol::{
     manifest::{
@@ -447,6 +447,8 @@ where
         routes: RouteBinds::default(),
         connection_end: Arc::clone(&connection_end),
         subscriptions_stopping: subscriptions_stopping.clone(),
+        #[cfg(test)]
+        confirmation_required: None,
     };
     // HELLO is sent once per connection, so the manifest declares the desired
     // configuration in force at this moment. Startup hydrates that
@@ -642,6 +644,8 @@ impl LoopEnd {
 /// Astrocyte's side of the serve helper: request dispatch, route binds,
 /// health and how the connection ended.
 struct AstrocyteHandler {
+    #[cfg(test)]
+    confirmation_required: Option<bool>,
     state: Arc<SharedState>,
     routes: RouteBinds,
     connection_end: Arc<Mutex<Option<ConnectionEnd>>>,
@@ -667,6 +671,33 @@ impl ModuleHandler for AstrocyteHandler {
             refuse_unsupported_flow_operation(&request.method, route.flow.as_deref())
         {
             return refused;
+        }
+        let confirmation_required = ledger_write_confirmation_required();
+        #[cfg(test)]
+        let confirmation_required = self.confirmation_required.unwrap_or(confirmation_required);
+        if confirmation_required
+            && is_mutating_operation(&request.method)
+            && matches!(route.principal, Some(Principal::Direct))
+        {
+            // The person may take minutes. Do not enter dispatch (and therefore
+            // the writer fence or a store transaction) until this call succeeds.
+            if let Err(error) = ctx
+                .module_handle()
+                .confirm_operation(
+                    &ledger_write_summary(&request),
+                    &ctx.route_handle(),
+                    &request.method,
+                )
+                .await
+            {
+                return refusal(
+                    "operator_confirmation_refused",
+                    format!(
+                        "Ledger write confirmation refused: {}",
+                        confirmation_reason(error)
+                    ),
+                );
+            }
         }
         if matches!(
             request.method.as_str(),
@@ -810,21 +841,75 @@ impl RouteBinds {
     }
 }
 
-/// The operations that change the money ledger. The module manifest built in
-/// `manifest()` declares exactly these as `Mutate`; none may be flow operations.
 fn is_mutating_operation(name: &str) -> bool {
-    matches!(
-        name,
-        ops::OP_EVENT_INGEST
-            | ops::OP_CORRECTION_INGEST
-            | ops::OP_CHARGEABILITY_SETTLE
-            | ops::OP_STATEMENT_IMPORT
-            | ops::OP_SUBSCRIPTION_SET
-            | ops::OP_SUBSCRIPTION_CLOSE
-            | ops::OP_EVENT_REPRICE
-            | ops::OP_BASIS_CORRECT
-            | ops::OP_MULTIPLIER_RECOMPUTE
-    )
+    ops::LEDGER_WRITE_OPERATIONS.contains(&name)
+}
+
+/// Gates the nine direct ledger writes through daemon operator confirmation.
+/// It is off until release by Ufuk's ruling. Enabling it refuses direct writes
+/// wherever the deployed daemon cannot confirm operator presence, including
+/// Linux without an available presence provider.
+fn ledger_write_confirmation_required() -> bool {
+    false
+}
+
+/// Only identifiers belong in prompts, never free-form reasons, notes,
+/// credentials, statement paths or the full request. Bound each identifier so
+/// both parts of a compound target remain visible within the daemon's limit.
+fn ledger_write_summary(request: &RouteRequest) -> String {
+    let target = |field: &str, absent: &str| {
+        let text = request.params[field].as_str().unwrap_or(absent);
+        let mut chars = text
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch });
+        let mut short: String = chars.by_ref().take(59).collect();
+        if chars.next().is_some() {
+            short.push('…');
+        }
+        short
+    };
+    let description = match request.method.as_str() {
+        ops::OP_EVENT_INGEST => format!(
+            "producer {}, event {}",
+            target("producer", "(not supplied)"),
+            target("producer_ref", "(not supplied)")
+        ),
+        ops::OP_STATEMENT_IMPORT | ops::OP_SUBSCRIPTION_SET | ops::OP_SUBSCRIPTION_CLOSE => {
+            format!(
+                "provider {}, account {}",
+                target("provider", "(not supplied)"),
+                target("account_ref", "(not supplied)")
+            )
+        }
+        ops::OP_MULTIPLIER_RECOMPUTE => format!(
+            "day {}, provider {}",
+            target("observation_day", "(not supplied)"),
+            target("quota_provider", "all")
+        ),
+        _ => format!("event {}", target("event_id", "(not supplied)")),
+    };
+    format!("{}: {description}", request.method)
+        .chars()
+        .take(200)
+        .collect()
+}
+
+/// The client reduces daemon failures to typed reasons. Do not echo daemon
+/// messages, which may contain private detail, or retry a failed confirmation.
+fn confirmation_reason(error: OperatorConfirmError) -> &'static str {
+    match error {
+        OperatorConfirmError::Declined => "operator_declined",
+        OperatorConfirmError::Backoff { .. } => "operator_declined (backoff)",
+        OperatorConfirmError::PresenceUnavailable => "operator_presence_unavailable",
+        OperatorConfirmError::PresenceUnsupportedPlatform => {
+            "operator_presence_unavailable (unsupported_platform)"
+        }
+        OperatorConfirmError::SummaryInvalid => "operator_summary_invalid",
+        OperatorConfirmError::OperationInvalid => "operator_operation_invalid",
+        OperatorConfirmError::NotPermitted => "operator confirmation not permitted for this route",
+        OperatorConfirmError::Unsupported => "daemon does not support operator confirmation",
+        _ => "operator_presence_unavailable",
+    }
 }
 
 fn health_report(public_projection: &PublicProjection) -> HealthReport {
@@ -1036,6 +1121,12 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
         .display_name(Some("Spend Ledger".to_string()))
         .expect("Spend Ledger is a valid module display name")
         .trust_tier(Some(TrustTier::FirstParty))
+        .confirm_operations(Some(
+            ops::LEDGER_WRITE_OPERATIONS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        ))
         .flow_operations(Some(
             ops::FLOW_OPERATION_NAMES
                 .iter()
@@ -1347,6 +1438,7 @@ impl Error for ModuleError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod ledger_confirmation;
     use crate::test_support::{self as refresher, test_state, HANG_GUARD};
 
     #[test]
@@ -3560,6 +3652,7 @@ mod tests {
     async fn the_bind_principal_is_forgotten_when_the_route_or_connection_goes() {
         use subc_protocol::{BindIdentity, RouteTarget};
         let handler = AstrocyteHandler {
+            confirmation_required: None,
             state: Arc::new(test_state()),
             routes: RouteBinds::default(),
             connection_end: Arc::new(Mutex::new(None)),
