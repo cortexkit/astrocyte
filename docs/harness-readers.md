@@ -13,8 +13,7 @@ degrades only that source's health. A source whose store is absent is not
 ingested and has no `source_runtime` row. A source named in
 `harness_ingest.exclude` is not read at all (see [configuration](configuration.md)).
 
-Readers open SQLite stores read-only through a `mode=ro` URI
-(`sqlite_readonly_uri`) inside one read snapshot, and read JSONL and JSON
+Readers open SQLite stores read-only inside one read snapshot, and read JSONL and JSON
 files with plain reads. JSONL readers resume from a byte offset that always
 ends on a newline; an unterminated tail is left for the next read. Before
 trusting the offset they re-hash the consumed prefix with SHA-256: the last
@@ -61,7 +60,8 @@ with equal size, modification time and creation time can be missed by a Windows
 fast cycle; the next full tick keeps the real open-handle identity check.
 Brand-new session files wait for discovery on the next full tick, at most
 `poll_interval_secs` (30 seconds in production). Codex archives,
-Gemini JSON documents and declared OpenCode sessions stay on full ticks. Full-prefix verification, quiet-file
+Gemini JSON documents and declared OpenCode store reads stay on full ticks;
+declared readers also check their payer waits in the fast lane. Full-prefix verification, quiet-file
 checks, worker deletion acknowledgements, pricing, quota polling, multiplier
 work, audits and retention keep their existing schedules.
 
@@ -71,7 +71,7 @@ fact cursor with new facts; each OpenCode reader retains its own in-memory rowid
 After startup or a detected store replacement, OpenCode waits for a full pass to
 establish the store identity. An idle fast cycle commits nothing, including when
 OpenCode's initial tail seed returns only exact redeliveries. Fast reads never
-advance `last_success_ms` or clear degraded health. Committed events refresh the
+advance `last_success_ms` or clear degraded health for transcript sources. Committed events refresh the
 recent-steps memory through the normal post-commit path. Both lanes run on the
 same refresher thread and use the same stop signal.
 
@@ -117,6 +117,7 @@ The source key is normally the `producer` stored on every event and the key used
 row, but shares the `opencode` producer and configuration key with OpenCode 1.
 Declared OpenCode sessions record producer `opencode` too, but have their own
 `opencode-thalamus` runtime row, set-aside source and configuration key.
+The `thalamus-payer` source records row-less calls as producer `thalamus-harness`.
 
 | Source key | Harness | Store |
 |---|---|---|
@@ -125,6 +126,7 @@ Declared OpenCode sessions record producer `opencode` too, but have their own
 | `codex` | Codex CLI | `<CODEX_HOME or ~/.codex>/sessions/` and `archived_sessions/`, `*.jsonl` and `*.jsonl.zst` |
 | `opencode` | OpenCode | `OPENCODE_DB`, else `<XDG data home>/opencode/opencode.db`, tables `message` and `session_message` |
 | `opencode-thalamus` | OpenCode sessions declared by thalamus-harness | `<path>/opencode.db` for each declared folder, both OpenCode layouts |
+| `thalamus-payer` | THALAMUS payer facts and calls absent from transcripts | `<data home>/cortexkit/thalamus-harness/payer/payer.db` |
 | `pi` | Pi | `PI_CODING_AGENT_SESSION_DIR`, else `<PI_CODING_AGENT_DIR or ~/.pi/agent>/sessions/**/*.jsonl` |
 | `gemini` | Gemini CLI | `<GEMINI_CLI_HOME or ~>/.gemini/tmp/`, `session-*.json(l)` and files under `chats/` |
 | `goose` | Goose | `GOOSE_PATH_ROOT/data/`, else the platform data directory, `sessions/sessions.db`, table `sessions` |
@@ -164,6 +166,7 @@ Each source resolves its store path by these rules, implemented in
 
 | Source key | One event | `producer_ref` | `producer_lineage` |
 |---|---|---|---|
+| `thalamus-payer` | One row-less attempt, or one entry of its model fallback array | `attempt_id`, or `<attempt_id>#<1-based entry position>` | session |
 | `claude-code`, `claude-code-workers` | One API request: the records sharing a `requestId`, folded at the per-field maximum | `requestId` | none |
 | `codex` | One advancing `token_count` record (`last_token_usage`) | `<turn id>:<n>` for the n-th response of the turn, else `<thread id>:ordinal:<n>` | `session_meta.session_id` |
 | `codex` | One otherwise unconfirmed `token_usage_record` | `<thread id>:request:response:<response id>`, else `<thread id>:request:ordinal:<n>` | `session_meta.session_id` |
@@ -389,8 +392,9 @@ Tests: `disjoint_roles_subtract_cached_input_and_reasoning_output`,
 
 ## 5. Provider, model and charge basis
 
-Every harness event is recorded with charge basis `unknown`: no transcript
-says whether the call was paid per token or covered by a subscription. Such
+Harness transcripts alone record charge basis `unknown`: they do not say whether
+the call was paid per token or covered by a subscription. THALAMUS payer facts
+provide the exception described below. Other such
 events stay unpriced with reason `charge_basis_unknown` until an operator
 corrects the basis (see [operations](operations.md)). broca states a basis on
 each fact. Test: `pi_event_is_unpriced_because_charge_basis_is_unknown`.
@@ -458,3 +462,71 @@ billable measurement unpriced with `no_rate`, and its catalog evidence preserves
 both conflicting values rather than silently choosing either rate. Other selectors
 select exact unit-rate keys. A missing matching rate leaves the
 measurement unpriced, including failed or cancelled attempts with billed work.
+
+## THALAMUS payer facts
+
+The binding [payer contract](thalamus-payer-records-contract.md) defines the
+read-only `thalamus-payer` source. It is enabled by default and may be excluded
+with `harness_ingest.exclude`. The source resolves the same absolute data home
+as the declared-session readers. An absent store creates no runtime row and
+changes no health. An unknown schema version reads nothing and degrades the
+source. Every external read closes its SQLite connection before recording any
+ledger rows, on every operating system.
+
+Both refresher lanes drain payer facts before transcript readers. Full ticks
+always read the store; incremental cycles first compare the size and modification
+time of `payer.db` and `payer.db-wal`, opening neither when those hints are
+unchanged. Reads use bounded sequence pages. Each page commits the session and
+insert-once attempt mirrors together with its incarnation and sequence cursor.
+The incarnation identifies one database history and changes when the store is
+created or restored. A change restarts at the lowest sequence, skipping attempt
+identities already mirrored. THALAMUS may delete its original rows only after the committed
+watermark permits it; the ledger's mirror remains available for later joins.
+
+The contract's row-less request kinds become ledger calls with producer
+`thalamus-harness`, session lineage, the attempt reference, the row's payer facts
+and the session owner's work class. `astrocyte-core::attempt_usage` decodes the
+shared attempt envelope: absent counts stay absent, lifetime cache writes retain
+their units, and reasoning included in output is subtracted to keep disjoint
+measurements. A fallback array becomes one call per model entry, in stored order,
+with references `<attempt_id>#1`, `<attempt_id>#2` and so on. Each is priced using
+its own model. An unreadable row is mirrored where its columns decode and set
+aside with its location and reason; the next row still reads.
+
+A completed transcript call in a mirrored payer session joins by harness and
+its existing producer reference: Claude Code's `requestId`, OpenCode's message
+id or Pi's shared `pi_step_ref`. Only `subscription_included` and `metered_api`
+are known bases; other values and NULL stay unknown. A matching row supplies
+`auth_selection` and `account_ref` without guessing from the login's type.
+Without a matching row, the parsed call waits in the reader's bounded queue
+until ten minutes after completion. If completion is undated, its first observed
+time is persisted so a restart does not reset the wait. Queues are checked before
+new candidates on full and incremental drains, including when no file changed.
+They hold at most 10,000 calls per reader. Beyond the bound, new calls record
+unknown immediately, with one warning per overflow episode.
+
+Only committed records remove waits. Pi keeps its parsed waits beside its
+process-local resume state; restarting re-reads the files and stable event
+identity prevents duplicates. Declared-session readers hold deletion
+acknowledgements and durable cursor progress past waiting calls. Successful
+full drains still refresh source health while calls wait. Timeout and overflow
+calls record unknown without a payer and count in coverage; waits do not degrade
+health. Sessions absent from the mirror do not wait and preserve their original
+ledger rows byte for byte.
+
+Conflicting payer facts for one step set both rows aside and record the call
+unknown. A `payer_record` with `request_kind='main'` and no `step_ref` records
+no call and increments coverage's `unmatched_main_rows`.
+A payer row arriving after its call was recorded is counted and never rewrites
+that event. Coverage exposes those exceptions and current per-reader wait counts.
+The served THALAMUS watermark is the lower of the session source's and payer
+source's committed pass watermarks, and is null until both have a complete pass.
+The payer pass advances only after every page commits, using pass start minus
+60 seconds, without consulting health timestamps or waiting queues.
+
+Tests include `thalamus_payer_rowless_records_and_mirrors_once_with_exact_payer_and_usage`,
+`thalamus_payer_fallback_records_and_prices_each_model_once`,
+`thalamus_payer_incarnation_reset_replays_low_sequences_without_duplicates`,
+`thalamus_payer_watermark_never_passes_an_uncommitted_mirror`,
+`pi_payer_wait_at_restart_replays_once_with_the_payer`, and
+`payer_wait_queue_later_pass_records_once_and_timeout_uses_completion`.

@@ -20,13 +20,14 @@ Internal records live in the ignored `.cortexkit/` folder, which tracks only
 
 ## `crates/astrocyte-core/src`
 
-- `store.rs`: `MIGRATIONS` (1 to 37), connection setup and `migrate_store`.
+- `store.rs`: `MIGRATIONS` (1 to 38), connection setup and `migrate_store`.
 - `fact.rs`: call and measurement identity.
 - `ingest.rs`: recording calls in one transaction, redelivery and quarantine,
   chargeability settlement, adjustments and charge-basis correction.
 - `pricing.rs`: pricing one measurement, and resolve-then-commit repricing.
 - `catalog_client.rs`: the typed fusiform catalog boundary and `parse_rate_key`.
 - `media.rs`: maps colliculus usage records into calls without rounding.
+- `attempt_usage.rs`: decodes shared attempt usage without inventing counts.
 - `subscription.rs`: effective-dated ledger plans and coverage.
 - `multiplier.rs`: the subscription multiplier: config, valuation, the daily
   observation, recompute and report. `multiplier/clean.rs` finds clean
@@ -68,6 +69,8 @@ A library shared by three binaries: `main.rs` (`ck-astrocyte`) and two tools,
   `opencode_thalamus_source.rs`. `harness_paths.rs` resolves every harness path.
 - `broca_source.rs`, `wire_map.rs`: BROCA's `run-index.db` reader and fact mapping.
 - `colliculus_source.rs`: the colliculus media usage feed.
+- `thalamus_payer_source.rs` mirrors payer facts and records row-less calls;
+  `thalamus_payer_join.rs` holds the transcript payer wait queues.
 - `fusiform_client.rs`, `qta_client.rs`, `peer_exchange.rs`: the fusiform and
   insula clients and their shared framing. `capacity_map.rs` maps quota answers.
 - `quota_events.rs`, `quota_bus_client.rs`: the bus reader for insula's quota

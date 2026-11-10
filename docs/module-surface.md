@@ -278,6 +278,15 @@ Reads never write. A refusal on a read is one of the codes below.
   `skipped_local_by_source` is always a map of producer keys to counts of local
   work acknowledged without spend events; it is empty when no work was skipped.
   Test: `media_skipped_local_coverage_is_live_on_base_and_hourly_paths`.
+  Optional `thalamus_payer` reports lifetime counts of distinct identities:
+  `transcript_calls_without_payer` (timeout or queue overflow), `late_payer_rows`,
+  `unmatched_main_rows` and `set_aside_payer_rows`. Replays do not increase them.
+  Its additive `waiting_calls_by_reader` map reports current process-local queue
+  lengths by reader source key, including explicit zero after a queue drains.
+  A restart clears these gauges until readers replay their transcripts; it does
+  not clear the lifetime counts. Tests:
+  `payer_coverage_counts_exceptions_once_and_reports_live_waits`,
+  `thalamus_payer_coverage_is_live_on_base_and_hourly_paths`.
 - `spend.charge.explain`: `event`, `measurements`, `adjustments`,
   `transition`. Each measurement supplies `role` and `unit`; its charges are
   identified by `pricing_generation` within that measurement. There is no
@@ -665,12 +674,16 @@ The names and wire types are the `watermark` module of
 - Astrocyte answers for the principal the daemon attested when the route was
   bound, never for a module the request names. It forgets that principal when
   the route goes or the connection ends.
-- A module principal maps to one reader source. Today the only row is
+- A module principal maps to its session reader. Today the only row is
   `thalamus-harness` → `opencode-thalamus` (the
   [THALAMUS sessions contract](thalamus-opencode-sessions-contract.md) §4).
-- Reply `{"watermark_ms": <u64>}`, the source's stored watermark, read on the
+- Reply `{"watermark_ms": <u64>}`, the minimum of the stored `opencode-thalamus`
+  and `thalamus-payer` pass watermarks, read in one snapshot on the
   read-only connection; `{"watermark_ms": null}` (present, not omitted)
-  before the source's first complete read pass.
+  until both sources have committed a complete read pass. Each payer pass uses
+  its start minus 60 seconds and advances only after all mirror pages commit;
+  health timestamps and waiting queues do not determine this value. See the
+  [payer contract](thalamus-payer-records-contract.md) §4.
 - Refusal `not_a_read_source`: the caller is not in that table (a local app's
   `Direct` principal, any other module), or its source is excluded in
   `harness_ingest` (named in `exclude`, or `enabled: false`).
@@ -680,6 +693,8 @@ Tests: `watermark_get_answers_thalamus_harness_as_the_crate_vectors_pin`,
 `watermark_get_refuses_thalamus_while_its_source_is_excluded`,
 `the_bind_principal_is_forgotten_when_the_route_or_connection_goes`,
 `manifest_provides_the_log_read_watermark_capability`.
+The minimum and rollback rules are covered by
+`watermark_requires_both_committed_passes_and_serves_the_lower_value`.
 
 ### 4.4 Runs cost reads (`usage-runs-v1`)
 

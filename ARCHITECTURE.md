@@ -1,10 +1,8 @@
 # Architecture
 
-Astrocyte (`ck-astrocyte`) is the spend ledger for AI usage on one machine. It
-records every model call and media job it can observe, prices each in signed
-nanodollars against the fusiform catalog, and serves spend reports, run costs,
-cache diagnostics, a live step feed and subscription multipliers over subc. It
-reads usage after the fact, never on a call's path, and enforces nothing:
+Astrocyte (`ck-astrocyte`) records AI usage on one machine and prices it in
+nanodollars against fusiform. It serves spend, run costs, cache diagnostics,
+live steps and subscription multipliers over subc. It reads after the fact:
 `budget.verdict` always answers `allow`. `STRUCTURE.md` maps the files; `docs/`
 holds the contracts and details this page summarises.
 
@@ -14,9 +12,8 @@ holds the contracts and details this page summarises.
   rewritten; a correction appends a new generation.
 - **Absent is not zero.** An unreported count stays unknown, and an unpriced
   quantity stays unpriced with a reason.
-- **Astrocyte mints identity.** `fact.rs` derives `event_id` from the producer,
-  lineage (usually the session) and the producer's own reference, which is kept
-  verbatim. Re-reading a store records nothing twice.
+- **Stable identity.** `fact.rs` hashes the producer, lineage and verbatim
+  producer reference. Re-reading a store records nothing twice.
 - **One pricer.** Producers send usage, never cost, so reports cannot disagree
   with the ledger.
 - **One bad record never stops a source.** It is set aside as evidence with its
@@ -72,6 +69,10 @@ served. The [data model](docs/data-model.md#tables) lists every table.
   [workers](docs/claude-workers-contract.md),
   [Claude Code](docs/thalamus-claude-code-sessions-contract.md) and
   [OpenCode](docs/thalamus-opencode-sessions-contract.md) contracts.
+- **THALAMUS payers.** `thalamus-payer` mirrors the harness's payer store before
+  transcripts read. It attributes their calls, records requests absent from
+  transcripts and joins the session watermark. See the
+  [payer contract](docs/thalamus-payer-records-contract.md).
 - **Colliculus.** Media usage arrives through colliculus's feed (`usage.read`),
   each page committed with its cursor before `usage.ack`. A missing colliculus
   module leaves health untouched.
@@ -131,15 +132,11 @@ charge chain.
 
 ## Hourly summaries
 
-Reports read per-hour totals instead of scanning every call. The summaries are
-derived; per-call rows stay authoritative. Triggers mark an hour dirty in the
-transaction that records a call or changes its pricing, adjustments or
-chargeability, and the loop rebuilds dirty hours from base rows, publishing only
-if the hour has not changed since. A report combines clean hours with base rows
-for dirty hours and for hours a timezone or plan boundary splits, in one
-snapshot, so answers equal a full scan. `usage.runs.list` has its own hourly
-table, kept the same way. A daily audit requeues any hour that differs from its
-base rows. Details: [data model](docs/data-model.md#hourly-summaries).
+Reports combine clean hourly summaries with base rows for dirty or split hours
+in one snapshot, so answers equal a full scan. Triggers mark changed hours
+dirty; rebuilds publish only unchanged hours. Per-call rows stay authoritative.
+Run totals use the same method. A daily audit requeues differing hours.
+Details: [data model](docs/data-model.md#hourly-summaries).
 
 ## Subscription multiplier
 
