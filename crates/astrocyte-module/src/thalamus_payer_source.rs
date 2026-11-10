@@ -76,6 +76,7 @@ impl ThalamusPayerSource {
             *last = Some(observed);
             return Ok(());
         }
+        mode.ensure_runtime(state, SOURCE_KEY)?;
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
@@ -102,6 +103,9 @@ impl ThalamusPayerSource {
                     tx.execute("INSERT OR IGNORE INTO thalamus_payer_session(harness,session,owner_principal,declared_at_ms) VALUES (?1,?2,?3,?4)",params![session.harness,session.session,session.owner,session.declared_at]).map_err(sql)?;
                 }
                 let mut evidence = page.evidence.clone();
+                for record in &page.evidence {
+                    count_coverage(tx,"set_aside",&record.locator)?;
+                }
                 for record in &page.rows {
                     if !mirror(tx, &page.incarnation, record)? { continue; }
                     if let Some(reason) = record_row(tx,record,at)? {
@@ -262,7 +266,7 @@ fn read_page(path: &Path, cursor: Option<&(String, i64)>) -> Result<Page, String
         match decoded {
             Ok(record) => rows.push(record),
             Err(error) => evidence.push(SetAsideRecord {
-                locator: format!("{}:seq:{seq}", path.display()),
+                locator: format!("{}:incarnation:{incarnation}:seq:{seq}", path.display()),
                 reason: error.to_string(),
             }),
         }
@@ -347,6 +351,11 @@ fn record_row(tx: &Transaction<'_>, record: &Record, at: i64) -> Result<Option<S
     }
     if record.step_ref.is_some() {
         return Ok(Some("row-less row must not carry step_ref".into()));
+    }
+    if record.attempt_id.is_empty() {
+        return Ok(Some(
+            "row-less payer attempt_id cannot form an empty producer reference".into(),
+        ));
     }
     let Some(usage) = &record.usage_json else {
         return Ok(Some("row-less row requires usage_json".into()));
@@ -681,12 +690,60 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
     }
 
     #[test]
+    fn thalamus_payer_unreadable_attempt_identity_keeps_later_rows_and_progress() {
+        let (_home, source, store, state) = fixture();
+        insert(&store, "");
+        insert(&store, "valid");
+        source
+            .drain_for_health(&state, 100_000, &AtomicBool::new(false))
+            .unwrap();
+        state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT producer_ref FROM usage_event", [], |row| row
+                        .get::<_, String>(0))
+                        .unwrap(),
+                    "valid"
+                );
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM thalamus_payer_record", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                    2
+                );
+                assert_eq!(
+                    conn.query_row("SELECT through_seq FROM thalamus_payer_cursor", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                    2
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM set_aside_record WHERE source_key=?1",
+                        [SOURCE_KEY],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn thalamus_payer_watermark_never_passes_an_uncommitted_mirror() {
         let (_home, source, store, state) = fixture();
         source
             .drain_for_health(&state, 100_000, &AtomicBool::new(false))
             .unwrap();
         insert(&store, "attempt-a");
+        store
+            .execute("UPDATE payer_record SET recorded_at_ms=150000", [])
+            .unwrap();
         state.with_conn(|conn| {
             conn.execute_batch("CREATE TRIGGER refuse_payer_call BEFORE INSERT ON usage_event BEGIN SELECT RAISE(ABORT,'injected commit failure'); END;").unwrap();
             Ok(())
