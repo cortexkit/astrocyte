@@ -4127,7 +4127,104 @@ CREATE INDEX vault_plan_credential_latest
     ON vault_plan_history(credential_id, history_id);
 "#,
     },
+    Migration {
+        version: 43,
+        statements: r#"
+-- Statement imports by statement: an import's ordinal counts that statement's
+-- earlier imports, which otherwise scans the import log of every statement.
+CREATE INDEX statement_import_by_statement ON statement_import (statement_id);
+
+-- Closed plan versions by end time, so checking a new plan against an
+-- account's closed history seeks the versions ending after its start instead
+-- of walking every version the account ever had.
+CREATE INDEX account_subscription_closed_end
+    ON account_subscription (provider, account_ref, effective_to_ms)
+    WHERE effective_to_ms IS NOT NULL;
+
+-- The same overlap rule as before, split by whether the existing version is
+-- open or closed so each half can seek an index: the open version through
+-- account_subscription_one_open_interval, closed versions through
+-- account_subscription_closed_end.
+DROP TRIGGER account_subscription_no_overlap;
+CREATE TRIGGER account_subscription_no_overlap
+BEFORE INSERT ON account_subscription
+WHEN EXISTS (
+    SELECT 1 FROM account_subscription AS existing
+    WHERE existing.provider = NEW.provider
+      AND existing.account_ref = NEW.account_ref
+      AND existing.effective_to_ms IS NULL
+      AND (NEW.effective_to_ms IS NULL
+           OR existing.effective_from_ms < NEW.effective_to_ms)
+) OR EXISTS (
+    SELECT 1 FROM account_subscription AS existing
+    WHERE existing.provider = NEW.provider
+      AND existing.account_ref = NEW.account_ref
+      AND existing.effective_to_ms > NEW.effective_from_ms
+      AND (NEW.effective_to_ms IS NULL
+           OR existing.effective_from_ms < NEW.effective_to_ms)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'account_subscription_no_overlap');
+END;
+
+-- Summary hours that are not clean because they were never built at their
+-- current revision or were built in an older format. Run detail finds them
+-- here instead of reading every hour. Format 2 is the current summary format;
+-- a query that names another format can't use this index and reads the table.
+CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
+    WHERE built_revision IS NOT revision OR format_version IS NOT 2;
+"#,
+    },
 ];
+
+/// Counts the SQLite virtual-machine instructions a connection runs between
+/// `start` and `steps`. Tests compare the count for the same work at two
+/// history sizes: unlike elapsed time it is deterministic, so work that grows
+/// with unrelated history shows up as a difference.
+#[cfg(test)]
+pub(crate) struct VmCounter {
+    handle: *mut rusqlite::ffi::sqlite3,
+    steps: Box<u64>,
+}
+#[cfg(test)]
+unsafe extern "C" fn count_vm_step(pointer: *mut std::ffi::c_void) -> std::ffi::c_int {
+    unsafe {
+        *pointer.cast::<u64>() += 1;
+    }
+    0
+}
+#[cfg(test)]
+impl VmCounter {
+    /// The counter holds the raw handle rather than a borrow, so the caller
+    /// can keep using the connection mutably (for example to open a
+    /// transaction) while it counts. Drop or `steps` removes the handler.
+    pub(crate) fn start(conn: &Connection) -> Self {
+        let mut counter = Self {
+            handle: unsafe { conn.handle() },
+            steps: Box::new(0),
+        };
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(
+                counter.handle,
+                1,
+                Some(count_vm_step),
+                std::ptr::from_mut(counter.steps.as_mut()).cast(),
+            );
+        }
+        counter
+    }
+    pub(crate) fn steps(self) -> u64 {
+        *self.steps
+    }
+}
+#[cfg(test)]
+impl Drop for VmCounter {
+    fn drop(&mut self) {
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(self.handle, 0, None, std::ptr::null_mut());
+        }
+    }
+}
 
 // The migration table and configured SQLite timeout are small fixed values.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]

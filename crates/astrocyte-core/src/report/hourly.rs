@@ -300,19 +300,42 @@ impl Data {
     }
 }
 
-fn dictionary(conn: &Connection) -> Result<HashMap<i64, Option<String>>, ReportError> {
-    let mut statement = conn.prepare("SELECT value_id,value FROM summary_value")?;
-    let values = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(values)
+/// Dictionary values looked up by id on first use and remembered.
+///
+/// The dictionary keeps every value ever interned and is never pruned, so a
+/// read that loaded all of it would cost all history even for one hour. Each
+/// id is a primary-key lookup instead, and a read pays for the distinct values
+/// it touches. An id with no row is the same integrity error as before.
+struct Values<'c> {
+    conn: &'c Connection,
+    known: HashMap<i64, Option<String>>,
 }
-fn value(values: &HashMap<i64, Option<String>>, id: i64) -> Result<Option<String>, ReportError> {
-    values
-        .get(&id)
-        .cloned()
-        .ok_or(ReportError::Integrity("summary dictionary value absent"))
+impl<'c> Values<'c> {
+    fn new(conn: &'c Connection) -> Self {
+        Self {
+            conn,
+            known: HashMap::new(),
+        }
+    }
+    fn get(&mut self, id: i64) -> Result<Option<String>, ReportError> {
+        if let Some(value) = self.known.get(&id) {
+            return Ok(value.clone());
+        }
+        let value: Option<String> = self
+            .conn
+            .prepare_cached("SELECT value FROM summary_value WHERE value_id=?1")?
+            .query_row([id], |row| row.get(0))
+            .optional()?
+            .ok_or(ReportError::Integrity("summary dictionary value absent"))?;
+        self.known.insert(id, value.clone());
+        Ok(value)
+    }
 }
+fn value(values: &mut Values<'_>, id: i64) -> Result<Option<String>, ReportError> {
+    values.get(id)
+}
+/// Finds or interns `text`, remembering ids already seen by this publication.
+/// NULL is always id 0 (the dictionary's fixed first row).
 fn value_id(
     tx: &Transaction<'_>,
     values: &mut HashMap<Option<String>, i64>,
@@ -320,6 +343,17 @@ fn value_id(
 ) -> Result<i64, ReportError> {
     if let Some(id) = values.get(text) {
         return Ok(*id);
+    }
+    let Some(present) = text else {
+        return Ok(0);
+    };
+    if let Some(id) = tx
+        .prepare_cached("SELECT value_id FROM summary_value WHERE value=?1")?
+        .query_row([present], |row| row.get::<_, i64>(0))
+        .optional()?
+    {
+        values.insert(text.clone(), id);
+        return Ok(id);
     }
     tx.execute("INSERT INTO summary_value(value) VALUES(?1)", [text])?;
     let id = tx.last_insert_rowid();
@@ -332,7 +366,7 @@ fn parse_exact(value: String) -> Result<i128, ReportError> {
         .map_err(|_| ReportError::Integrity("summary integer invalid"))
 }
 fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
-    let values = dictionary(conn)?;
+    let mut values = Values::new(conn);
     let mut data = Data::default();
     let mut keys = HashMap::new();
     let mut statement=conn.prepare("SELECT cell_id,provider,model,account,auth_selection,charge_basis,work_class,project,producer,currency,payload
@@ -341,9 +375,9 @@ fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
     while let Some(row) = rows.next()? {
         let mut dims = [const { None }; 8];
         for (column, dim) in dims.iter_mut().enumerate() {
-            *dim = value(&values, row.get(column + 1)?)?;
+            *dim = value(&mut values, row.get(column + 1)?)?;
         }
-        let key = (dims, value(&values, row.get(9)?)?);
+        let key = (dims, value(&mut values, row.get(9)?)?);
         let cell = decode(&row.get::<_, String>(10)?)?;
         add_count(&mut data.events, cell.events)?;
         keys.insert(row.get::<_, i64>(0)?, key.clone());
@@ -398,14 +432,14 @@ fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
     let mut statement=conn.prepare("SELECT producer,work_class,currency,nanos,samples FROM summary_cost_frequency WHERE kind=?1 AND hour_number=?2")?;
     let mut rows = statement.query(params![hour.kind, hour.number])?;
     while let Some(row) = rows.next()? {
-        let producer = value(&values, row.get(0)?)?
+        let producer = value(&mut values, row.get(0)?)?
             .ok_or(ReportError::Integrity("summary producer absent"))?;
-        let currency = value(&values, row.get(2)?)?
+        let currency = value(&mut values, row.get(2)?)?
             .ok_or(ReportError::Integrity("summary currency absent"))?;
         data.frequencies.insert(
             (
                 producer,
-                value(&values, row.get(1)?)?,
+                value(&mut values, row.get(1)?)?,
                 currency,
                 row.get(3)?,
             ),
@@ -421,10 +455,7 @@ fn replace(
     revision: i64,
     data: &Data,
 ) -> Result<(), ReportError> {
-    let mut values: HashMap<_, _> = dictionary(tx)?
-        .into_iter()
-        .map(|(id, value)| (value, id))
-        .collect();
+    let mut values = HashMap::new();
     tx.execute(
         "DELETE FROM summary_cell WHERE kind=?1 AND hour_number=?2",
         params![hour.kind, hour.number],
@@ -551,6 +582,24 @@ fn revision(conn: &Connection, hour: Hour) -> Result<i64, ReportError> {
         .optional()?
         .unwrap_or(0))
 }
+/// The rows of one reduction chunk: the next `CHUNK` events of `hour` after the
+/// key cursor, in key order.
+///
+/// The page is picked inside a subquery pinned to the time index. Given only
+/// `event_key>cursor ORDER BY event_key LIMIT`, SQLite prefers the key range
+/// because it already yields key order, and then tests the time of every later
+/// event in the ledger: on a resumed chunk of an old hour that is all history
+/// after it. The time index reads only the hour's own events and sorts them.
+/// The outer time terms let callers that force the time index themselves
+/// (`runs::observe`) seek it rather than walk all of it.
+fn chunk_filter(hour: Hour, after: Option<i64>) -> String {
+    let time = hour.filter();
+    let after = after.map_or_else(String::new, |key| format!(" AND event_key>{key}"));
+    format!(
+        "({time}) AND event_key IN (SELECT event_key FROM usage_event INDEXED BY usage_event_summary_time
+            WHERE ({time}){after} ORDER BY event_key LIMIT {CHUNK}) ORDER BY event_key"
+    )
+}
 fn next_audit(conn: &Connection) -> Result<Option<Hour>, ReportError> {
     let (kind, number): (Option<i64>, Option<i64>) = conn.query_row(
         "SELECT after_kind,after_hour FROM summary_audit_state WHERE id=1",
@@ -647,13 +696,7 @@ impl SummaryMaintenance {
         if build.revision != revision(conn, build.hour)? {
             return Ok(false);
         }
-        let after = build
-            .after
-            .map_or_else(String::new, |key| format!(" AND event_key>{key}"));
-        let filter = format!(
-            "({}){after} ORDER BY event_key LIMIT {CHUNK}",
-            build.hour.filter()
-        );
+        let filter = chunk_filter(build.hour, build.after);
         let count = build.data.observe(conn, &filter)?;
         build.after = conn.query_row(
             &format!(
@@ -765,12 +808,12 @@ impl SummaryMaintenance {
     }
 }
 
-struct Frame {
+struct Frame<'c> {
     cells: Vec<(i64, Hour, Key, Cell)>,
     clean: BTreeSet<Hour>,
     dirty: String,
     live: Data,
-    values: HashMap<i64, Option<String>>,
+    values: Values<'c>,
 }
 fn merge_map(
     target: &mut BTreeMap<String, u64>,
@@ -833,11 +876,22 @@ fn disjunction(parts: &[String]) -> String {
         }
     }
 }
-fn frame(
-    conn: &Connection,
+/// Reads the clean summary hours, with live reductions of the dirty ones.
+///
+/// `select` names the cells the caller reads; only those are kept. Every cell
+/// of every clean hour is still decoded and checked: an undecodable payload,
+/// an unknown dictionary id or cell events that don't add up to the hour's
+/// `events_total` mean the summary was changed outside `replace`, and such an
+/// hour is reduced from the ledger instead (or the whole read errors and the
+/// caller falls back to the ledger). No report request carries a time range,
+/// so the check covers every hour; skipping hours without a selected cell
+/// would miss a selected cell that was deleted out of band.
+fn frame<'c>(
+    conn: &'c Connection,
     mut seam: impl FnMut(Hour, &Key) -> Result<bool, ReportError>,
     live_data: bool,
-) -> Result<Option<Frame>, ReportError> {
+    select: impl Fn(&Key) -> bool,
+) -> Result<Option<Frame<'c>>, ReportError> {
     if !conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='summary_hour')",
         [],
@@ -868,7 +922,7 @@ fn frame(
     if clean.is_empty() {
         return Ok(None);
     }
-    let values = dictionary(conn)?;
+    let mut values = Values::new(conn);
     let mut cells = Vec::new();
     let mut observed = BTreeMap::new();
     let mut split = BTreeSet::new();
@@ -885,16 +939,18 @@ fn frame(
         }
         let mut dims = [const { None }; 8];
         for (column, dim) in dims.iter_mut().enumerate() {
-            *dim = value(&values, row.get(column + 3)?)?;
+            *dim = value(&mut values, row.get(column + 3)?)?;
         }
-        let key = (dims, value(&values, row.get(11)?)?);
+        let key = (dims, value(&mut values, row.get(11)?)?);
         let payload: String = row.get(12)?;
         let cell = decode(&payload)?;
         add_count(observed.entry(hour).or_default(), cell.events)?;
         if seam(hour, &key)? {
             split.insert(hour);
         }
-        cells.push((row.get(0)?, hour, key, cell));
+        if select(&key) {
+            cells.push((row.get(0)?, hour, key, cell));
+        }
     }
     for hour in &clean {
         if observed.get(hour).copied().unwrap_or(0) != hours[hour] {
@@ -962,7 +1018,7 @@ pub(super) fn coverage(
     conn: &Connection,
     now_ms: i64,
 ) -> Result<Option<LedgerCoverage>, ReportError> {
-    let Some(frame) = frame(conn, |_, _| Ok(false), true)? else {
+    let Some(frame) = frame(conn, |_, _| Ok(false), true, |_| true)? else {
         return Ok(None);
     };
     let total = totals(&frame)?;
@@ -1027,7 +1083,7 @@ fn weighted_rank(values: &BTreeMap<i64, u64>, percentile: usize) -> Option<i64> 
     None
 }
 pub(super) fn workclass(conn: &Connection) -> Result<Option<WorkClassReport>, ReportError> {
-    let Some(frame) = frame(conn, |_, _| Ok(false), true)? else {
+    let Some(mut frame) = frame(conn, |_, _| Ok(false), true, |_| true)? else {
         return Ok(None);
     };
     type Group = (String, Option<String>, Option<String>);
@@ -1079,14 +1135,14 @@ pub(super) fn workclass(conn: &Connection) -> Result<Option<WorkClassReport>, Re
             kind: row.get(0)?,
             number: row.get(1)?,
         }) {
-            let producer = value(&frame.values, row.get(2)?)?
+            let producer = value(&mut frame.values, row.get(2)?)?
                 .ok_or(ReportError::Integrity("summary producer absent"))?;
-            let currency = value(&frame.values, row.get(4)?)?
+            let currency = value(&mut frame.values, row.get(4)?)?
                 .ok_or(ReportError::Integrity("summary currency absent"))?;
             add(
                 (
                     producer,
-                    value(&frame.values, row.get(3)?)?,
+                    value(&mut frame.values, row.get(3)?)?,
                     currency,
                     row.get(5)?,
                 ),
@@ -1198,6 +1254,7 @@ pub(super) fn spend(
             Ok(seam)
         },
         false,
+        |_| true,
     )?
     else {
         return Ok(None);
@@ -1356,7 +1413,7 @@ pub(super) fn subscription(
     let plans = load_subscriptions(conn)?;
     let index = SubscriptionIndex::new(&plans);
     let mut seams = BTreeMap::new();
-    let Some(frame) = frame(
+    let Some(mut frame) = frame(
         conn,
         |hour, key| {
             if hour.kind == 1 || !is_subscription(key) {
@@ -1395,6 +1452,7 @@ pub(super) fn subscription(
             Ok(seam)
         },
         false,
+        is_subscription,
     )?
     else {
         return Ok(None);
@@ -1425,7 +1483,9 @@ pub(super) fn subscription(
                 .add(quantity.quantity_units, quantity.quantity_exponent)?;
         }
     }
-    let mut attribution = HashMap::new();
+    // Ordered by cell id so quantities are added in the same order a scan of
+    // summary_quantity's primary key would visit them.
+    let mut attribution = BTreeMap::new();
     for (id, hour, key, cell) in frame.cells {
         if !is_subscription(&key) {
             continue;
@@ -1472,24 +1532,25 @@ pub(super) fn subscription(
         )?;
         attribution.insert(id, bucket);
     }
-    let mut statement=conn.prepare("SELECT cell_id,unit,role,exponent,covered_units FROM summary_quantity WHERE covered_observations>0 AND exponent<=0")?;
-    let mut quantities = statement.query([])?;
-    while let Some(quantity) = quantities.next()? {
-        let Some(bucket) = attribution.get(&quantity.get::<_, i64>(0)?) else {
-            continue;
-        };
-        let unit = value(&frame.values, quantity.get(1)?)?
-            .ok_or(ReportError::Integrity("summary unit absent"))?;
-        let role = value(&frame.values, quantity.get(2)?)?
-            .ok_or(ReportError::Integrity("summary role absent"))?;
-        let units =
-            i64::try_from(parse_exact(quantity.get(4)?)?).map_err(|_| ReportError::Arithmetic)?;
-        rows.get_mut(bucket)
-            .ok_or(ReportError::Integrity("subscription bucket absent"))?
-            .quantities
-            .entry((unit, role))
-            .or_default()
-            .add(units, quantity.get(3)?)?;
+    // Only the attributed cells' quantities are read, each by its primary key,
+    // rather than every covered quantity ever summarised.
+    let mut statement=conn.prepare("SELECT unit,role,exponent,covered_units FROM summary_quantity WHERE cell_id=?1 AND covered_observations>0 AND exponent<=0")?;
+    for (cell_id, bucket) in &attribution {
+        let mut quantities = statement.query([cell_id])?;
+        while let Some(quantity) = quantities.next()? {
+            let unit = value(&mut frame.values, quantity.get(0)?)?
+                .ok_or(ReportError::Integrity("summary unit absent"))?;
+            let role = value(&mut frame.values, quantity.get(1)?)?
+                .ok_or(ReportError::Integrity("summary role absent"))?;
+            let units = i64::try_from(parse_exact(quantity.get(3)?)?)
+                .map_err(|_| ReportError::Arithmetic)?;
+            rows.get_mut(bucket)
+                .ok_or(ReportError::Integrity("subscription bucket absent"))?
+                .quantities
+                .entry((unit, role))
+                .or_default()
+                .add(units, quantity.get(2)?)?;
+        }
     }
     let rows = rows
         .into_iter()
@@ -1535,9 +1596,8 @@ pub(super) fn verdict(
     conn: &Connection,
     request: &crate::verdict::VerdictRequest,
 ) -> Result<Option<crate::verdict::VerdictResponse>, ReportError> {
-    let Some(frame) = frame(conn, |_, _| Ok(false), true)? else {
-        return Ok(None);
-    };
+    let filtered =
+        request.project_root.is_some() || request.provider.is_some() || request.model.is_some();
     let selected = |key: &Key| {
         request
             .project_root
@@ -1551,6 +1611,9 @@ pub(super) fn verdict(
                 .model
                 .as_ref()
                 .is_none_or(|value| key.0[Grouping::Model as usize].as_ref() == Some(value))
+    };
+    let Some(mut frame) = frame(conn, |_, _| Ok(false), true, |key| selected(key))? else {
+        return Ok(None);
     };
     let mut total = 0_u64;
     let mut uncertain = 0_u64;
@@ -1576,18 +1639,39 @@ pub(super) fn verdict(
             add_count(&mut contributions, amount.contributions)?;
         }
     }
-    let mut statement =
-        conn.prepare("SELECT cell_id,currency,nanos,contributions FROM summary_money")?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        if cells.contains(&row.get::<_, i64>(0)?) {
-            let currency = value(&frame.values, row.get(1)?)?
-                .ok_or(ReportError::Integrity("summary money currency absent"))?;
-            sum(
-                money.entry(currency).or_default(),
-                parse_exact(row.get(2)?)?,
-            )?;
-            add_count(&mut contributions, row.get(3)?)?;
+    if filtered {
+        // A filtered verdict reads the money of its own cells by primary key,
+        // in cell order, instead of scanning every summarised money row.
+        let mut statement = conn
+            .prepare("SELECT currency,nanos,contributions FROM summary_money WHERE cell_id=?1")?;
+        for id in &cells {
+            let mut rows = statement.query([id])?;
+            while let Some(row) = rows.next()? {
+                let currency = value(&mut frame.values, row.get(0)?)?
+                    .ok_or(ReportError::Integrity("summary money currency absent"))?;
+                sum(
+                    money.entry(currency).or_default(),
+                    parse_exact(row.get(1)?)?,
+                )?;
+                add_count(&mut contributions, row.get(2)?)?;
+            }
+        }
+    } else {
+        // Unfiltered, every clean cell is selected, so one scan is cheaper
+        // than a lookup per cell.
+        let mut statement =
+            conn.prepare("SELECT cell_id,currency,nanos,contributions FROM summary_money")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if cells.contains(&row.get::<_, i64>(0)?) {
+                let currency = value(&mut frame.values, row.get(1)?)?
+                    .ok_or(ReportError::Integrity("summary money currency absent"))?;
+                sum(
+                    money.entry(currency).or_default(),
+                    parse_exact(row.get(2)?)?,
+                )?;
+                add_count(&mut contributions, row.get(3)?)?;
+            }
         }
     }
     if !compatible_limb_population(contributions) {
@@ -2457,5 +2541,226 @@ mod tests {
             catch_up(&mut conn);
             compare(&conn);
         }
+    }
+
+    fn query_plan(conn: &Connection, sql: &str) -> String {
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let mut rows = statement.query([]).unwrap();
+        let mut text = String::new();
+        while let Some(row) = rows.next().unwrap() {
+            text.push_str(&row.get::<_, String>(3).unwrap());
+            text.push('\n');
+        }
+        text
+    }
+
+    /// Fills one old hour with more events than one chunk holds, then adds
+    /// `later` events in a much later hour, all through plain inserts so the
+    /// fixture is quick at any size.
+    fn busy_old_hour(later: i64) -> Connection {
+        let conn = conn();
+        let events = i64::try_from(CHUNK).unwrap() + 10;
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<{events}-1)
+             INSERT INTO usage_event(event_id,producer,producer_ref,occurred_at_ms,recorded_at_ms,charge_basis)
+             SELECT 'old-'||i,'fixture','old-'||i,i,1,'metered_api' FROM n;
+             WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<{later}-1)
+             INSERT INTO usage_event(event_id,producer,producer_ref,occurred_at_ms,recorded_at_ms,charge_basis)
+             SELECT 'new-'||i,'fixture','new-'||i,{}+i,1,'metered_api' FROM n;",
+            1_000 * HOUR_MS
+        ))
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn resumed_hour_chunk_reads_its_hour_not_the_later_ledger() {
+        let mut measured = Vec::new();
+        for later in [1_000, 5_000] {
+            let conn = busy_old_hour(later);
+            let mut maintenance = SummaryMaintenance::default();
+            // The first chunk takes the first CHUNK events of the old hour.
+            assert!(!maintenance.read_chunk(&conn, 10_000).unwrap());
+            assert_eq!(
+                maintenance.pending.as_ref().unwrap().hour,
+                Hour { kind: 0, number: 0 }
+            );
+            let counter = crate::store::VmCounter::start(&conn);
+            let ready = maintenance.read_chunk(&conn, 10_000).unwrap();
+            measured.push(counter.steps());
+            let build = maintenance.pending.as_ref().unwrap();
+            assert!(ready);
+            assert_eq!(build.data.events, u64::try_from(CHUNK).unwrap() + 10);
+            assert_eq!(build.after, Some(i64::try_from(CHUNK).unwrap() + 10));
+        }
+        // 4,000 more later events must not cost the resumed chunk anything.
+        assert!(
+            measured[1] < measured[0] + 100,
+            "resumed chunk VM steps grew with later history: {measured:?}"
+        );
+        let conn = busy_old_hour(10);
+        let plan = query_plan(
+            &conn,
+            &format!(
+                "SELECT MAX(event_key) FROM (SELECT event_key FROM usage_event WHERE {})",
+                chunk_filter(Hour { kind: 0, number: 0 }, Some(5_000))
+            ),
+        );
+        assert!(plan.contains("usage_event_summary_time"), "{plan}");
+        assert!(!plan.contains("rowid>"), "{plan}");
+        assert!(!plan.contains("SCAN usage_event"), "{plan}");
+    }
+
+    fn unused_dictionary_values(conn: &Connection, count: i64) {
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{count})
+             INSERT INTO summary_value(value) SELECT 'unused-'||i FROM n;"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn publishing_and_reading_one_hour_load_only_the_dictionary_values_it_uses() {
+        let mut publish = Vec::new();
+        let mut read = Vec::new();
+        let mut published = Vec::new();
+        for unused in [100, 2_000] {
+            let mut conn = conn();
+            let id = record(&mut conn, "one", Some(1_000), ChargeBasis::MeteredApi, None);
+            priced(&mut conn, &id, "USD", 100);
+            unused_dictionary_values(&conn, unused);
+            let counter = crate::store::VmCounter::start(&conn);
+            catch_up(&mut conn);
+            publish.push(counter.steps());
+            let hour = Hour { kind: 0, number: 0 };
+            let counter = crate::store::VmCounter::start(&conn);
+            let data = stored(&conn, hour).unwrap();
+            read.push(counter.steps());
+            assert_eq!(data.events, 1);
+            published.push(format!("{data:?}"));
+            compare(&conn);
+        }
+        assert_eq!(published[0], published[1]);
+        assert!(publish[1] < publish[0] + 100, "publication: {publish:?}");
+        assert!(read[1] < read[0] + 100, "stored hour read: {read:?}");
+    }
+
+    fn record_project(conn: &mut Connection, id: &str, project: &str) -> String {
+        let request: ingest::EventRecordRequest = serde_json::from_value(serde_json::json!({
+            "producer":"fixture","producer_ref":id,"provider":"provider","model":"model","account_ref":"account",
+            "project_root":project,"charge_basis":"metered_api","occurred_at_ms":1_000,
+            "measurements":[{"role":"input","unit":"token","kind":"billed","source":"fixture","quantity_units":12,"quantity_exponent":0},
+                {"role":"output","unit":"token","kind":"billed","source":"fixture","quantity_units":0,"quantity_exponent":0}]
+        }))
+        .unwrap();
+        ingest::record_event(conn, &request, 1).unwrap().event_id
+    }
+    fn project_request(project: Option<&str>) -> verdict::VerdictRequest {
+        verdict::VerdictRequest {
+            project_root: project.map(str::to_owned),
+            provider: None,
+            model: None,
+            est_cost_nanos: None,
+        }
+    }
+    /// One clean hour holding a selected and an unselected project cell. The
+    /// unselected cell then gets `extra` money and quantity rows in as many
+    /// new dictionary values: summary history a filtered report never uses.
+    fn unselected_summary_history(extra: i64) -> Connection {
+        let mut conn = conn();
+        let selected = record_project(&mut conn, "selected", "/fixture/selected");
+        priced(&mut conn, &selected, "USD", 100);
+        let other = record_project(&mut conn, "other", "/fixture/other");
+        priced(&mut conn, &other, "USD", 50);
+        catch_up(&mut conn);
+        compare(&conn);
+        unused_dictionary_values(&conn, extra);
+        conn.execute_batch(
+            "INSERT INTO summary_money SELECT c.cell_id,0,v.value_id,'0',1
+               FROM summary_cell c JOIN summary_value p ON p.value_id=c.project, summary_value v
+              WHERE p.value='/fixture/other' AND v.value LIKE 'unused-%';
+             INSERT INTO summary_quantity SELECT c.cell_id,v.value_id,v.value_id,0,'1',1,'1',1
+               FROM summary_cell c JOIN summary_value p ON p.value_id=c.project, summary_value v
+              WHERE p.value='/fixture/other' AND v.value LIKE 'unused-%';",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn filtered_and_scalar_reports_skip_unselected_summary_history() {
+        let mut verdicts = Vec::new();
+        let mut subscriptions = Vec::new();
+        let mut coverages = Vec::new();
+        for extra in [100, 2_000] {
+            let conn = unselected_summary_history(extra);
+            let request = project_request(Some("/fixture/selected"));
+            let counter = crate::store::VmCounter::start(&conn);
+            let hourly = super::verdict(&conn, &request)
+                .unwrap()
+                .expect("summaries used");
+            verdicts.push(counter.steps());
+            equal(&hourly, &verdict::evaluate_base(&conn, &request).unwrap());
+            assert_eq!(hourly.consumed_nanos["USD"], 100);
+
+            let counter = crate::store::VmCounter::start(&conn);
+            let report = super::subscription(&conn, &SubscriptionReportRequest {})
+                .unwrap()
+                .expect("summaries used");
+            subscriptions.push(counter.steps());
+            equal(
+                &report,
+                &subscription_report_base(&conn, &SubscriptionReportRequest {}, None).unwrap(),
+            );
+
+            let counter = crate::store::VmCounter::start(&conn);
+            coverage(&conn, 10_000).unwrap().expect("summaries used");
+            coverages.push(counter.steps());
+
+            // Only the selected cell is kept, though both were read and checked.
+            let frame = frame(
+                &conn,
+                |_, _| Ok(false),
+                true,
+                |key| key.0[Grouping::Project as usize].as_deref() == Some("/fixture/selected"),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(frame.cells.len(), 1);
+        }
+        assert!(verdicts[1] < verdicts[0] + 100, "verdict: {verdicts:?}");
+        assert!(
+            subscriptions[1] < subscriptions[0] + 100,
+            "subscription: {subscriptions:?}"
+        );
+        assert!(coverages[1] < coverages[0] + 100, "coverage: {coverages:?}");
+    }
+
+    #[test]
+    fn deleting_a_selected_cell_out_of_band_still_reads_the_ledger_for_it() {
+        let mut conn = conn();
+        let selected = record_project(&mut conn, "selected", "/fixture/selected");
+        priced(&mut conn, &selected, "USD", 100);
+        let other = record_project(&mut conn, "other", "/fixture/other");
+        priced(&mut conn, &other, "USD", 50);
+        catch_up(&mut conn);
+        let request = project_request(Some("/fixture/selected"));
+        assert_eq!(
+            super::verdict(&conn, &request)
+                .unwrap()
+                .unwrap()
+                .consumed_nanos["USD"],
+            100
+        );
+        // A write that bypasses `replace`: the hour's cells no longer add up
+        // to its events_total, so the hour must be reduced from the ledger.
+        conn.execute_batch(
+            "DELETE FROM summary_cell WHERE project=(SELECT value_id FROM summary_value WHERE value='/fixture/selected')",
+        )
+        .unwrap();
+        let response = verdict::evaluate(&conn, &request).unwrap();
+        assert_eq!(response.consumed_nanos["USD"], 100);
+        assert_eq!(response.uncertainty.events_total, 1);
+        equal(&response, &verdict::evaluate_base(&conn, &request).unwrap());
     }
 }

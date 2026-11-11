@@ -810,7 +810,11 @@ pub fn list(conn: &Connection, request: &ListRequest) -> Result<ListReply, Error
         total.merge(&cell.totals)?;
     }
     probe.phase("aggregate");
-    let mut row_count:u64=conn.query_row(&format!("SELECT count(*) FROM (SELECT run_key FROM summary_run_cell c INDEXED BY summary_run_key_time WHERE {} GROUP BY run_key)",frame.clean),[],|r|r.get(0))?;
+    // The count reads only the clean hours' cells through the primary key's
+    // (kind,hour_number) range and groups them in a temporary B-tree; the run
+    // key index would give the grouping order for free but has to be walked
+    // across every hour ever summarised to find the range's cells.
+    let mut row_count: u64 = conn.query_row(&distinct_runs_sql(&frame.clean), [], |r| r.get(0))?;
     probe.phase("distinct_keys");
     let mut fallback_last: BTreeMap<String, i64> = BTreeMap::new();
     for ((key, _, _), cell) in &frame.fallback {
@@ -849,7 +853,7 @@ pub fn list(conn: &Connection, request: &ListRequest) -> Result<ListReply, Error
             )
         },
     );
-    let sql=format!("SELECT c.run_key,c.last_ms FROM summary_run_cell c INDEXED BY summary_run_activity WHERE ({}) AND {resume} AND NOT EXISTS(SELECT 1 FROM summary_run_cell newer INDEXED BY summary_run_key_time WHERE newer.run_key=c.run_key AND ({}) AND newer.last_ms>c.last_ms) ORDER BY c.last_ms DESC,c.run_key",frame.clean,frame.clean.replace("c.","newer."));
+    let sql = candidates_sql(&frame.clean, request, &resume);
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
     let mut seen = BTreeSet::new();
@@ -953,10 +957,10 @@ pub fn detail(conn: &Connection, request: &DetailRequest) -> Result<DetailReply,
     let mut probe = Probe::new(conn);
     let clean=format!("c.run_key={} AND EXISTS(SELECT 1 FROM summary_hour h WHERE h.kind=c.kind AND h.hour_number=c.hour_number AND h.built_revision=h.revision AND h.format_version={FORMAT} AND NOT EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=h.kind AND d.hour_number=h.hour_number))",quoted(&key_text(&request.key)?));
     let (_, mut totals) = summed(conn, &clean)?;
-    let mut stmt=conn.prepare("SELECT kind,hour_number FROM summary_hour h WHERE built_revision IS NOT revision OR format_version IS NOT ?1 OR EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=h.kind AND d.hour_number=h.hour_number)")?;
+    let mut stmt = conn.prepare(&stale_hours_sql())?;
     let hours = stmt
-        .query_map([FORMAT], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
-        .collect::<Result<Vec<_>, _>>()?;
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
     for (kind, hour) in hours {
         let time = if kind == 1 {
             "occurred_at_ms IS NULL".into()
@@ -1040,6 +1044,31 @@ pub fn detail(conn: &Connection, request: &DetailRequest) -> Result<DetailReply,
         totals,
         next,
     })
+}
+
+fn distinct_runs_sql(clean: &str) -> String {
+    format!("SELECT count(*) FROM (SELECT run_key FROM summary_run_cell c WHERE {clean} GROUP BY run_key)")
+}
+/// Clean range cells newest first, one per run key. A clean hour lies wholly
+/// inside the requested range, so every one of its cells' `last_ms` does too;
+/// stating that bound lets the activity index start at the range's end rather
+/// than walk every newer cell before reaching it.
+fn candidates_sql(clean: &str, request: &ListRequest, resume: &str) -> String {
+    format!("SELECT c.run_key,c.last_ms FROM summary_run_cell c INDEXED BY summary_run_activity WHERE ({clean}) AND c.last_ms>={} AND c.last_ms<{} AND {resume} AND NOT EXISTS(SELECT 1 FROM summary_run_cell newer INDEXED BY summary_run_key_time WHERE newer.run_key=c.run_key AND ({}) AND newer.last_ms>c.last_ms) ORDER BY c.last_ms DESC,c.run_key",
+        request.from_ms,request.to_ms,clean.replace("c.","newer."))
+}
+
+/// Every summary hour that is not clean: queued as dirty, or not built at its
+/// current revision and format. Each half seeks a small set (the dirty queue,
+/// the `summary_hour_stale` partial index) rather than reading every hour,
+/// which the planner can do only while the format named here matches the
+/// index's. A dirty-queue row always has its `summary_hour` row (foreign key);
+/// the join keeps the answer the same even if one did not.
+fn stale_hours_sql() -> String {
+    format!(
+        "SELECT kind,hour_number FROM summary_hour WHERE built_revision IS NOT revision OR format_version IS NOT {FORMAT}
+        UNION SELECT h.kind,h.hour_number FROM summary_dirty_hour d CROSS JOIN summary_hour h ON h.kind=d.kind AND h.hour_number=d.hour_number"
+    )
 }
 
 fn fallback_maxima_sql(clean: &str, keys: &[String]) -> String {

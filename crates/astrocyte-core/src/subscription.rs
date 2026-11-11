@@ -254,9 +254,7 @@ pub fn set_subscription_in_tx(
         .optional()?;
     let closed_overlap = tx
         .query_row(
-            "SELECT 1 FROM account_subscription
-             WHERE provider=?1 AND account_ref=?2 AND effective_to_ms>?3
-             LIMIT 1",
+            CLOSED_OVERLAP_SQL,
             params![
                 request.provider,
                 request.account_ref,
@@ -409,6 +407,26 @@ fn validate_close_request(request: &CloseSubscriptionRequest) -> Result<(), Subs
     Ok(())
 }
 
+/// A closed plan version of the account that ends after `?3`. It seeks
+/// `account_subscription_closed_end` to the versions ending after that
+/// instant rather than walking every version the account ever had.
+const CLOSED_OVERLAP_SQL: &str = "SELECT 1 FROM account_subscription
+     WHERE provider=?1 AND account_ref=?2 AND effective_to_ms>?3
+     LIMIT 1";
+
+/// Plans of one account never overlap (the insert trigger refuses it), so the
+/// only plan that can be in force at an instant is the one that started last
+/// at or before it. The subquery seeks that start through the primary key;
+/// testing every earlier start's end instead walks the account's whole plan
+/// history whenever the instant falls after the last plan ended.
+const IN_FORCE_SQL: &str = "SELECT account_ref,provider,plan_name,recurring_cost_minor,currency,
+        amount_exponent,period,effective_from_ms,effective_to_ms,operator
+     FROM account_subscription
+     WHERE provider=?1 AND account_ref=?2
+       AND effective_from_ms=(SELECT MAX(effective_from_ms) FROM account_subscription
+           WHERE provider=?1 AND account_ref=?2 AND effective_from_ms<=?3)
+       AND (effective_to_ms IS NULL OR effective_to_ms>?3)";
+
 pub fn subscription_in_force(
     conn: &Connection,
     provider: &str,
@@ -416,12 +434,7 @@ pub fn subscription_in_force(
     instant_ms: i64,
 ) -> Result<Option<AccountSubscription>, SubscriptionError> {
     conn.query_row(
-        "SELECT account_ref,provider,plan_name,recurring_cost_minor,currency,
-                amount_exponent,period,effective_from_ms,effective_to_ms,operator
-         FROM account_subscription
-         WHERE provider=?1 AND account_ref=?2
-           AND effective_from_ms<=?3
-           AND (effective_to_ms IS NULL OR effective_to_ms>?3)",
+        IN_FORCE_SQL,
         params![provider, account_ref, instant_ms],
         read_subscription,
     )
@@ -1953,6 +1966,132 @@ mod tests {
                 message.contains(detail),
                 "the store failure's {detail} must reach the message: {message}"
             );
+        }
+    }
+
+    /// `versions` back-to-back closed plan versions of one account, the last
+    /// closed at `versions*10+5`, so no plan is in force after that.
+    fn closed_plan_history(versions: i64) -> Connection {
+        let mut conn = conn();
+        for version in 0..versions {
+            set_subscription(
+                &mut conn,
+                &request("plan", "USD", 2, SubscriptionPeriod::Month, version * 10),
+                None,
+            )
+            .unwrap();
+        }
+        close_subscription(&mut conn, &close_request(versions * 10 + 5)).unwrap();
+        conn
+    }
+
+    #[test]
+    fn setting_and_finding_a_plan_seek_past_the_accounts_closed_versions() {
+        let mut in_force = Vec::new();
+        let mut set = Vec::new();
+        for versions in [50, 500] {
+            let mut conn = closed_plan_history(versions);
+            let after = versions * 10 + 100;
+            let counter = crate::store::VmCounter::start(&conn);
+            let found = subscription_in_force(&conn, "provider-a", "account-a", after).unwrap();
+            in_force.push(counter.steps());
+            assert!(found.is_none());
+            // The last version still covers its own interval, and only it.
+            let last = subscription_in_force(&conn, "provider-a", "account-a", versions * 10)
+                .unwrap()
+                .unwrap();
+            assert_eq!(last.effective_from, (versions - 1) * 10);
+            assert_eq!(last.effective_to, Some(versions * 10 + 5));
+            let tx = conn.transaction().unwrap();
+            let counter = crate::store::VmCounter::start(&tx);
+            set_subscription_in_tx(
+                &tx,
+                &request("next", "USD", 2, SubscriptionPeriod::Month, after),
+                None,
+            )
+            .unwrap();
+            set.push(counter.steps());
+            tx.commit().unwrap();
+            assert_eq!(count_subscriptions(&conn), versions + 1);
+        }
+        assert!(in_force[1] < in_force[0] + 100, "in force: {in_force:?}");
+        assert!(set[1] < set[0] + 100, "set with its overlap guard: {set:?}");
+
+        let conn = conn();
+        let plan = |sql: &str| -> String {
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let lines: Vec<String> = statement
+                .query_map(["provider", "account", "1"], |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            lines.join("\n")
+        };
+        let overlap = plan(CLOSED_OVERLAP_SQL);
+        assert!(
+            overlap.contains("account_subscription_closed_end (provider=? AND account_ref=? AND effective_to_ms>?)"),
+            "{overlap}"
+        );
+        let in_force = plan(IN_FORCE_SQL);
+        assert!(!in_force.contains("SCAN"), "{in_force}");
+        assert!(
+            in_force.contains("effective_from_ms<?") || in_force.contains("effective_from_ms=?"),
+            "{in_force}"
+        );
+    }
+
+    /// The overlap guard was split into an open-version half and a
+    /// closed-version half so each can seek an index. This checks it refuses
+    /// exactly the half-open intervals the single condition refused.
+    #[test]
+    fn split_overlap_guard_refuses_exactly_the_overlapping_intervals() {
+        // Stored: closed [100,200), closed [300,400), open [500,∞).
+        let stored: [(i64, Option<i64>); 3] = [(100, Some(200)), (300, Some(400)), (500, None)];
+        let overlaps = |from: i64, to: Option<i64>| {
+            stored.iter().any(|(start, end)| {
+                end.is_none_or(|end| from < end) && to.is_none_or(|to| *start < to)
+            })
+        };
+        for from in (50..=600).step_by(50) {
+            for to in [
+                None,
+                Some(from + 10),
+                Some(from + 50),
+                Some(from + 150),
+                Some(from + 400),
+            ] {
+                let conn = conn();
+                conn.execute_batch(
+                    "INSERT INTO account_subscription VALUES ('a','p','one',1,'USD',2,'month',100,200,NULL);
+                     INSERT INTO account_subscription VALUES ('a','p','two',1,'USD',2,'month',300,400,NULL);
+                     INSERT INTO account_subscription VALUES ('a','p','open',1,'USD',2,'month',500,NULL,NULL);",
+                )
+                .unwrap();
+                let result = conn.execute(
+                    "INSERT INTO account_subscription VALUES ('a','p','new',1,'USD',2,'month',?1,?2,NULL)",
+                    params![from, to],
+                );
+                // Every overlapping insert is refused and every other one lands.
+                assert_eq!(
+                    result.is_err(),
+                    overlaps(from, to),
+                    "[{from},{to:?}): {result:?}"
+                );
+                // Where no other guard applies (a closed interval with a new
+                // start), the refusal must be the overlap guard's.
+                let guarded_elsewhere = to.is_none() || [100, 300, 500].contains(&from);
+                if let Some(message) = result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .filter(|_| !guarded_elsewhere)
+                {
+                    assert!(
+                        message.contains("account_subscription_no_overlap"),
+                        "{message}"
+                    );
+                }
+            }
         }
     }
 }

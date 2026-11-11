@@ -483,9 +483,34 @@ fn runs_query_plans_seek_base_ranges_and_batched_keys_without_statistics() {
     let p=plan(&c,&format!("SELECT run_key FROM summary_run_cell c INDEXED BY summary_run_activity WHERE {clean} ORDER BY last_ms DESC,run_key LIMIT 51"));
     assert!(p.contains("summary_run_activity"));
     assert!(!p.contains("TEMP B-TREE"), "{p}");
-    let p=plan(&c,&format!("SELECT run_key FROM summary_run_cell c INDEXED BY summary_run_key_time WHERE {clean} GROUP BY run_key"));
-    assert!(p.contains("COVERING INDEX summary_run_key_time"));
+    // The distinct-run count seeks the clean range through the primary key
+    // and groups it in a temporary B-tree. It used to force the run-key
+    // index, which has no range on hours and so walked every summarised hour.
+    let p = plan(&c, &distinct_runs_sql(clean));
+    assert!(
+        p.contains("SEARCH c USING PRIMARY KEY (kind=? AND hour_number>? AND hour_number<?)"),
+        "{p}"
+    );
     assert!(!p.contains("usage_event"));
+    let request = ListRequest {
+        from_ms: 0,
+        to_ms: 721 * HOUR_MS,
+        harness: None,
+        limit: None,
+        after: None,
+    };
+    let p = plan(&c, &candidates_sql(clean, &request, "1"));
+    assert!(
+        p.contains("summary_run_activity (kind=? AND last_ms>? AND last_ms<?)"),
+        "{p}"
+    );
+    let p = plan(&c, &stale_hours_sql());
+    assert!(p.contains("summary_hour_stale"), "{p}");
+    assert!(
+        !p.lines()
+            .any(|line| line.trim() == "SCAN summary_hour" || line.trim() == "SCAN h"),
+        "{p}"
+    );
 }
 
 fn edge(
@@ -744,4 +769,109 @@ fn runs_actual_list_and_detail_queries_never_scan_base_events_or_measurements() 
         assert!(!p.contains("SCAN usage_event"), "{sql}\n{p}");
         assert!(!p.contains("SCAN m"), "{sql}\n{p}");
     }
+}
+
+/// Thirty real events in the first hours, summarised, plus `extra` clean
+/// summary hours far later. Those later hours carry one run cell each when
+/// `cells` is set. None of them is inside the ranges or keys read below.
+fn later_summary_history(extra: i64, cells: bool) -> Connection {
+    let mut c = conn();
+    for i in 0..30 {
+        record(&mut c, i, "priced", Some(i64::from(i) * HOUR_MS / 5));
+    }
+    fill(&mut c);
+    c.execute_batch(&format!(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{extra})
+         INSERT INTO summary_hour(kind,hour_number,revision,built_revision,format_version,events_total)
+         SELECT 0,100000+i,1,1,{FORMAT},1 FROM n;"
+    ))
+    .unwrap();
+    if cells {
+        c.execute_batch(
+            "INSERT INTO summary_run_cell
+             SELECT c.kind,h.hour_number,'{\"later\":'||h.hour_number||'}',c.provider,c.model,
+                    h.hour_number*3600000,h.hour_number*3600000,c.steps,c.input,c.output,c.reasoning,
+                    c.cache_read,c.cache_write,c.priced,c.covered,c.unpriced,c.pending,c.reasons,c.session,c.work_class
+             FROM (SELECT * FROM summary_run_cell LIMIT 1) c
+             CROSS JOIN summary_hour h WHERE h.hour_number>=100000;",
+        )
+        .unwrap();
+    }
+    c
+}
+
+#[test]
+fn runs_list_of_an_old_range_skips_later_summary_cells() {
+    let request = ListRequest {
+        from_ms: 0,
+        to_ms: 24 * HOUR_MS,
+        harness: None,
+        limit: Some(2),
+        after: None,
+    };
+    let mut steps = Vec::new();
+    let mut replies = Vec::new();
+    for extra in [200, 2_000] {
+        let c = later_summary_history(extra, true);
+        let counter = crate::store::VmCounter::start(&c);
+        let reply = list(&c, &request).unwrap();
+        steps.push(counter.steps());
+        assert_eq!(reply.rows.len(), 2);
+        assert!(reply.next.is_some());
+        replies.push(serde_json::to_value(reply).unwrap());
+    }
+    assert_eq!(replies[0], replies[1]);
+    assert!(
+        steps[1] < steps[0] + 100,
+        "runs list VM steps grew with later summary cells: {steps:?}"
+    );
+}
+
+#[test]
+fn runs_detail_finds_unclean_hours_without_reading_every_hour() {
+    let request = DetailRequest {
+        key: RunKey::Session {
+            harness: "opencode".into(),
+            session: "ses_synthetic_3".into(),
+        },
+        limit: Some(2),
+        after: None,
+    };
+    let mut steps = Vec::new();
+    let mut replies = Vec::new();
+    for extra in [200, 2_000] {
+        let c = later_summary_history(extra, false);
+        let counter = crate::store::VmCounter::start(&c);
+        let reply = detail(&c, &request).unwrap();
+        steps.push(counter.steps());
+        replies.push(serde_json::to_value(reply).unwrap());
+    }
+    assert_eq!(replies[0], replies[1]);
+    assert!(
+        steps[1] < steps[0] + 100,
+        "runs detail VM steps grew with clean summary hours: {steps:?}"
+    );
+    // A dirty hour and a stale-format hour are both still found, and the
+    // totals reduced from the ledger for them match the summarised ones.
+    let c = later_summary_history(10, false);
+    let clean = serde_json::to_value(detail(&c, &request).unwrap()).unwrap();
+    c.execute_batch(
+        "INSERT INTO summary_dirty_hour VALUES(0,0);
+         UPDATE summary_hour SET format_version=1 WHERE kind=0 AND hour_number=1;",
+    )
+    .unwrap();
+    let p = plan(&c, &stale_hours_sql());
+    assert!(p.contains("summary_hour_stale"), "{p}");
+    let stale: Vec<(i64, i64)> = c
+        .prepare(&stale_hours_sql())
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(stale, vec![(0, 0), (0, 1)]);
+    assert_eq!(
+        serde_json::to_value(detail(&c, &request).unwrap()).unwrap(),
+        clean
+    );
 }

@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 42. A schema change appends a migration; an applied
+currently version 43. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -413,6 +413,23 @@ indexes. The relation is disposable, including its undated partition. Runs costs
 exclude adjustments and covered/unpriced/pending money; output tokens include
 reasoning on each event only when output was reported. See the Runs subsection
 of [module surface](module-surface.md#44-runs-cost-reads-usage-runs-v1).
+
+Migration 43 adds indexes so that repeated reads follow the work they serve
+rather than all recorded history. The partial index `summary_hour_stale` on
+`summary_hour(kind, hour_number)` holds only the hours that were not built at
+their current revision or were built in a format other than 2, so run detail
+finds hours that need a fresh reduction without reading every hour. A query
+that names a different format cannot use the index and reads the table
+instead. `statement_import_by_statement` on `statement_import(statement_id)`
+lets an import count its own statement's earlier imports, which its import
+ordinal needs, without reading the import log of every statement. The partial
+index `account_subscription_closed_end` on `account_subscription(provider,
+account_ref, effective_to_ms)`, restricted to closed versions, lets the overlap
+check seek the closed versions that end after a new plan's start. The same
+migration replaces the `account_subscription_no_overlap` trigger with an
+equivalent condition split into an open-version test and a closed-version test,
+so that each test can use an index; it refuses exactly the intervals the
+previous trigger refused.
 
 
 Migration 24 adds derived summary tables beside the ledger; it does not delete

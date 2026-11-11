@@ -125,6 +125,12 @@ fn parse_and_validate(
     })
 }
 
+/// An import's ordinal is the number of earlier imports of the same statement.
+/// It feeds the import id's hash, so its meaning must not change; the
+/// `statement_import_by_statement` index keeps it from reading other
+/// statements' imports.
+const IMPORT_ORDINAL_SQL: &str = "SELECT count(*) FROM statement_import WHERE statement_id=?1";
+
 fn import_statement_in_tx_parsed(
     tx: &Transaction<'_>,
     request: &StatementImportRequest,
@@ -170,11 +176,8 @@ fn import_statement_in_tx_parsed(
         StatementContentOutcome::Created => (line_count, 0),
         StatementContentOutcome::NoOp => (0, line_count),
     };
-    let import_ordinal: i64 = tx.query_row(
-        "SELECT count(*) FROM statement_import WHERE statement_id=?1",
-        [&parsed.statement_id],
-        |row| row.get(0),
-    )?;
+    let import_ordinal: i64 =
+        tx.query_row(IMPORT_ORDINAL_SQL, [&parsed.statement_id], |row| row.get(0))?;
     let import_id = canonical_hash(&json!({
         "statement_id": parsed.statement_id,
         "file_sha256": parsed.file_sha256,
@@ -1711,5 +1714,60 @@ mod tests {
             )
             .is_err());
         assert_eq!(statement_state(&conn), before);
+    }
+
+    #[test]
+    fn import_ordinal_counts_only_the_imported_statements_earlier_imports() {
+        let mut steps = Vec::new();
+        let mut outcomes = Vec::new();
+        for others in [200, 2_000] {
+            let mut conn = conn();
+            let mut other = request();
+            other.account_ref = "other-acct".into();
+            let first =
+                import_statement(&mut conn, &other, &standard_line("missing"), None, 300).unwrap();
+            conn.execute(
+                &format!(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{others})
+                     INSERT INTO statement_import (
+                         import_id,statement_id,file_sha256,source_path,imported_at_ms,outcome,
+                         lines_created,lines_skipped,unmatched_lines,settled_lines,ambiguous_lines,
+                         already_settled_lines,unpriced_target_lines,currency_mismatch_lines,
+                         changed_outcomes
+                     ) SELECT 'other-'||i,?1,?2,'/other',301,'no_op',0,1,1,0,0,0,0,0,0 FROM n"
+                ),
+                params![first.statement_id, "0".repeat(64)],
+            )
+            .unwrap();
+            let tx = conn.transaction().unwrap();
+            let counter = crate::store::VmCounter::start(&tx);
+            let outcome =
+                import_statement_in_tx(&tx, &request(), &standard_line("missing"), None, 400)
+                    .unwrap();
+            steps.push(counter.steps());
+            tx.commit().unwrap();
+            outcomes.push(format!("{outcome:?}"));
+        }
+        // The new statement's import id hashes ordinal 0 at both sizes.
+        assert_eq!(outcomes[0], outcomes[1]);
+        assert!(
+            steps[1] < steps[0] + 100,
+            "import VM steps grew with other statements' imports: {steps:?}"
+        );
+        let conn = conn();
+        let mut plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {IMPORT_ORDINAL_SQL}"))
+            .unwrap();
+        let detail: Vec<String> = plan
+            .query_map(["statement"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            detail
+                .iter()
+                .any(|line| line.contains("INDEX statement_import_by_statement (statement_id=?)")),
+            "{detail:?}"
+        );
     }
 }
