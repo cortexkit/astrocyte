@@ -27,7 +27,9 @@
 //! Claude Code writes one JSONL record per content block of a response
 //! (thinking, text, tool_use), and every one of those records carries the
 //! usage of the WHOLE response. The records of one call share a `requestId`.
-//! This reader folds them back into one [`ClaudeCodeCall`] per `requestId`.
+//! This reader folds them back into one [`ClaudeCodeCall`] per `requestId`,
+//! or per `message.id` for a billed call whose transcript entry has no
+//! `requestId` (see [`ClaudeCodeCall::call_key`]).
 
 use super::jsonl_resume::{JsonlResumePoint, PrefixCheck, PREFIX_WINDOW_BYTES};
 use super::normalize_workspace_key;
@@ -168,6 +170,20 @@ impl ClaudeCallUsage {
         }
     }
 
+    /// True when at least one counter is present and above zero.
+    fn any_nonzero(&self) -> bool {
+        [
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_write_5m,
+            self.cache_write_1h,
+            self.cache_write_unsplit,
+        ]
+        .iter()
+        .any(|counter| counter.is_some_and(|count| count > 0))
+    }
+
     /// Per-field maximum of `self` and a LATER copy of the same call.
     ///
     /// ASTROCYTE DIVERGENCE: upstream's `merge_claude_duplicate` takes the
@@ -209,11 +225,22 @@ impl ClaudeCallUsage {
 pub struct ClaudeCodeCall {
     /// One-based line of the first record folded into this call.
     pub source_line: u64,
-    /// `requestId`: unique per call across the measured corpus (1,469
+    /// The call's identity within its producer: the `requestId` when the
+    /// entry has one, otherwise the `message.id`.
+    ///
+    /// `requestId` is unique per call across the measured corpus (1,469
     /// distinct values over 2,671 records, none in two files, one-to-one with
     /// `message.id`), and the same value a gateway stores as its vendor
-    /// request id.
-    pub request_id: String,
+    /// request id. A gateway in front of Anthropic may drop or replace the
+    /// `request-id` header, and then Claude Code writes the entry without a
+    /// `requestId`. Such a call is keyed by its `message.id`, which is also
+    /// the value THALAMUS stores as the payer row's `step_ref` when it saw no
+    /// request id, so the two still meet. Anthropic request ids start `req_`
+    /// and message ids `msg_`, so the two kinds of key never name the same
+    /// string; if they ever do, the call is refused rather than merged.
+    pub call_key: String,
+    /// `requestId` verbatim, or `None` for a call keyed by its message id.
+    pub request_id: Option<String>,
     pub message_id: Option<String>,
     pub session_id: Option<String>,
     /// The record's own `cwd`, normalized.
@@ -283,11 +310,11 @@ impl ClaudeParseState {
     }
 
     fn observe(&mut self, record: UsageRecord, counts: &mut ClaudeParseCounts) {
-        if self.refused.contains(&record.request_id) {
+        if self.refused.contains(&record.key) {
             return;
         }
         if record.is_compaction_replay(self.last_compact_boundary_ms) {
-            match self.calls.get(&record.request_id) {
+            match self.calls.get(&record.key) {
                 // The original was read (in this parse or an earlier resumed
                 // one: the aggregates survive resumes). The copy is not a
                 // later snapshot, so it is neither merged nor refused.
@@ -304,26 +331,27 @@ impl ClaudeParseState {
                 // never reported; it is counted and never emitted.
                 None => {
                     counts.replayed_records += 1;
-                    if self.replay_only.insert(record.request_id) {
+                    if self.replay_only.insert(record.key) {
                         counts.replay_only_calls += 1;
                     }
                     return;
                 }
             }
         }
-        let Some(aggregate) = self.calls.get_mut(&record.request_id) else {
+        let Some(aggregate) = self.calls.get_mut(&record.key) else {
             // A genuine record for a request id seen so far only in replays
             // starts the call as usual.
-            self.replay_only.remove(&record.request_id);
+            self.replay_only.remove(&record.key);
             let ordinal = self.next_ordinal;
             self.next_ordinal += 1;
-            self.dirty.insert(record.request_id.clone());
+            self.dirty.insert(record.key.clone());
             self.pending += 1;
             self.calls.insert(
-                record.request_id.clone(),
+                record.key.clone(),
                 CallAggregate {
                     call: ClaudeCodeCall {
                         source_line: self.lines,
+                        call_key: record.key,
                         request_id: record.request_id,
                         message_id: record.message_id,
                         session_id: record.session_id,
@@ -345,7 +373,7 @@ impl ClaudeParseState {
             Ok(changed) => {
                 aggregate.call.records += 1;
                 if changed {
-                    self.dirty.insert(record.request_id);
+                    self.dirty.insert(record.key);
                 }
             }
             Err(()) => {
@@ -355,9 +383,9 @@ impl ClaudeParseState {
                 } else {
                     self.pending -= 1;
                 }
-                self.dirty.remove(&record.request_id);
-                self.calls.remove(&record.request_id);
-                self.refused.insert(record.request_id);
+                self.dirty.remove(&record.key);
+                self.calls.remove(&record.key);
+                self.refused.insert(record.key);
             }
         }
     }
@@ -397,14 +425,16 @@ impl ClaudeParseState {
 }
 
 /// True when a record names a different call than the one held: another
-/// message id, session, cwd or model, or a different stop reason where both
-/// have one.
+/// request id (including one record keyed by `requestId` and the other by
+/// message id under the same key string), message id, session, cwd or model,
+/// or a different stop reason where both have one.
 ///
 /// Measured 2026-09-23: 0 of 1,469 calls disagree across their records on
 /// model, session, cwd, message id or stop_reason. A disagreement is not a
 /// streaming snapshot, so it is refused rather than resolved by a guess.
 fn identity_disagrees(call: &ClaudeCodeCall, record: &UsageRecord) -> bool {
-    call.message_id != record.message_id
+    call.request_id != record.request_id
+        || call.message_id != record.message_id
         || call.session_id != record.session_id
         || call.project_root != record.project_root
         || call.model != record.model
@@ -440,7 +470,9 @@ fn merge_record(call: &mut ClaudeCodeCall, record: &UsageRecord) -> Result<bool,
 
 /// One usage-bearing assistant record.
 struct UsageRecord {
-    request_id: String,
+    /// The call key: `requestId`, or `message.id` when there is none.
+    key: String,
+    request_id: Option<String>,
     message_id: Option<String>,
     session_id: Option<String>,
     project_root: Option<String>,
@@ -506,12 +538,19 @@ pub struct ClaudeParseCounts {
     /// record whose fields do not decode. Reading continues past them. An
     /// unterminated final line is never consumed and never counted here.
     pub skipped_lines: u64,
-    /// Assistant records carrying usage and a `requestId`.
+    /// Assistant records carrying usage and a call key: a `requestId`, or a
+    /// message id (see `records_keyed_by_message_id`).
     pub usage_records: u64,
-    /// Assistant records carrying usage but no `requestId`. Every one in the
-    /// measured corpus is a local `<synthetic>` notice with zero usage; with
-    /// no request id there is no call identity to ingest under.
+    /// Assistant records carrying usage but no `requestId` that are not
+    /// ingested: every usage counter is zero or absent, or there is no
+    /// `message.id` to key the call by. Every such record in the measured
+    /// corpus is a local notice with zero usage.
     pub records_without_request_id: u64,
+    /// Assistant records with no `requestId` but a `message.id` and at least
+    /// one non-zero usage counter, keyed by the message id. A subset of
+    /// `usage_records`. These are billed calls whose `request-id` header a
+    /// gateway between Claude Code and Anthropic dropped or replaced.
+    pub records_keyed_by_message_id: u64,
     /// Assistant records with the `<synthetic>` placeholder model, which
     /// Claude Code writes for local notices, not API calls.
     pub synthetic_records: u64,
@@ -631,15 +670,31 @@ fn parse_line(
         return;
     }
     // ASTROCYTE DIVERGENCE: upstream falls back to a `message:{id}` key when
-    // `requestId` is absent. Without a request id the call cannot be joined
-    // to a gateway's record of it, and every such record measured is a
-    // zero-usage local notice, so it is counted and not ingested.
-    let Some(request_id) = entry.request_id.filter(|id| !id.is_empty()) else {
-        counts.records_without_request_id += 1;
-        return;
+    // `requestId` is absent. Here the fallback is the bare message id, and
+    // only for a record that reports some usage. A gateway that drops
+    // Anthropic's `request-id` header leaves billed calls without a
+    // `requestId`; THALAMUS then records the message id as the payer row's
+    // `step_ref`, so keying by the bare message id lets the two meet. Every
+    // record without a request id measured before such gateways existed is a
+    // local notice whose counters are all zero or absent, so a record like
+    // that is still counted and not ingested. A `requestId` that is absent,
+    // null or empty counts as missing.
+    let usage_counts = ClaudeCallUsage::from_usage(usage);
+    let request_id = entry.request_id.filter(|id| !id.is_empty());
+    let key = match (&request_id, &message.id) {
+        (Some(request_id), _) => request_id.clone(),
+        (None, Some(message_id)) if !message_id.is_empty() && usage_counts.any_nonzero() => {
+            counts.records_keyed_by_message_id += 1;
+            message_id.clone()
+        }
+        (None, _) => {
+            counts.records_without_request_id += 1;
+            return;
+        }
     };
     counts.usage_records += 1;
     let record = UsageRecord {
+        key,
         request_id,
         message_id: message.id,
         session_id: entry.session_id,
@@ -647,7 +702,7 @@ fn parse_line(
         model: message.model,
         timestamp_ms: parse_rfc3339_millis(entry.timestamp.as_deref()),
         stop_reason: message.stop_reason,
-        usage: ClaudeCallUsage::from_usage(usage),
+        usage: usage_counts,
         flat_counters_zero: [
             usage.input_tokens,
             usage.output_tokens,
@@ -859,7 +914,7 @@ mod tests {
         assert_eq!(
             first
                 .iter()
-                .map(|call| call.request_id.as_str())
+                .map(|call| call.call_key.as_str())
                 .collect::<Vec<_>>(),
             ["a"]
         );
@@ -881,7 +936,7 @@ mod tests {
         assert_eq!(
             quiet
                 .iter()
-                .map(|call| call.request_id.as_str())
+                .map(|call| call.call_key.as_str())
                 .collect::<Vec<_>>(),
             ["z", "a"]
         );
@@ -985,6 +1040,71 @@ mod tests {
         assert!(parse.calls.is_empty());
         assert_eq!(parse.counts.synthetic_records, 1);
         assert_eq!(parse.counts.records_without_request_id, 1);
+        assert_eq!(parse.counts.records_keyed_by_message_id, 0);
+    }
+
+    /// One record of a call whose `requestId` a gateway dropped. `request`
+    /// is the raw JSON member for `requestId` (or empty for none).
+    fn gateway_record(request: &str, message: &str, input: u64, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-09-01T00:00:01.000Z",{request}"sessionId":"s1","cwd":"/work/gw","message":{{"id":"{message}","model":"claude-opus-5","stop_reason":"end_turn","usage":{{"input_tokens":{input},"output_tokens":{output}}}}}}}"#
+        ) + "\n"
+    }
+
+    #[test]
+    fn billed_record_without_request_id_is_keyed_by_its_message_id() {
+        // Absent, null and empty `requestId` all count as missing. The two
+        // records of the second call fold into one call under one key.
+        let (_dir, path) = file_with(
+            &[
+                gateway_record("", "msg_gw_1", 1200, 42),
+                gateway_record(r#""requestId":null,"#, "msg_gw_2", 10, 1),
+                gateway_record(r#""requestId":"","#, "msg_gw_2", 10, 2),
+                // Zero usage with a message id: still a local notice.
+                gateway_record("", "msg_notice", 0, 0),
+                // Usage but no message id: nothing to key the call by.
+                gateway_record("", "", 5, 5),
+                record("req_1", 3, Some("end_turn")),
+            ]
+            .concat(),
+        );
+        let parse = parse(&path, None, 0);
+        let keys = parse
+            .calls
+            .iter()
+            .map(|call| (call.call_key.as_str(), call.request_id.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                ("msg_gw_1", None),
+                ("msg_gw_2", None),
+                ("req_1", Some("req_1"))
+            ]
+        );
+        assert_eq!(parse.calls[0].message_id.as_deref(), Some("msg_gw_1"));
+        assert_eq!(parse.calls[0].usage.input, Some(1200));
+        assert_eq!(parse.calls[1].records, 2);
+        assert_eq!(parse.calls[1].usage.output, Some(2));
+        assert_eq!(parse.counts.records_keyed_by_message_id, 3);
+        assert_eq!(parse.counts.records_without_request_id, 2);
+        assert_eq!(parse.counts.usage_records, 4);
+    }
+
+    #[test]
+    fn message_id_key_equal_to_a_request_id_key_is_refused_not_merged() {
+        // Anthropic ids never collide (`req_` against `msg_`); a transcript
+        // where they do is not trusted to say which call is which.
+        let (_dir, path) = file_with(
+            &[
+                record("same", 3, Some("end_turn")),
+                gateway_record("", "same", 10, 1),
+            ]
+            .concat(),
+        );
+        let parse = parse(&path, None, 0);
+        assert!(parse.calls.is_empty(), "{:?}", parse.calls);
+        assert_eq!(parse.counts.calls_refused, 1);
     }
 
     #[test]
@@ -1177,7 +1297,7 @@ mod tests {
         let ids: Vec<&str> = parse
             .calls
             .iter()
-            .map(|call| call.request_id.as_str())
+            .map(|call| call.call_key.as_str())
             .collect();
         assert_eq!(ids, ["req_Z1", "req_Z2"]);
         for call in &parse.calls {
@@ -1195,6 +1315,6 @@ mod tests {
         let second = parse(&path, first.resume, 1);
         assert!(!second.resumed);
         assert_eq!(second.calls.len(), 1);
-        assert_eq!(second.calls[0].request_id, "r2");
+        assert_eq!(second.calls[0].call_key, "r2");
     }
 }

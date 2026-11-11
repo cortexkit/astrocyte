@@ -528,6 +528,10 @@ pub(crate) fn basis(value: Option<&str>) -> ChargeBasis {
 mod lookup_tests;
 
 #[cfg(test)]
+#[path = "thalamus_payer_gateway_tests.rs"]
+mod gateway_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::test_state;

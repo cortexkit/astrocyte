@@ -1,0 +1,94 @@
+{
+  "payer_meta": [
+    {
+      "key": "incarnation",
+      "value": "36246a7a39d544bb015b235c4e6b55f1"
+    },
+    {
+      "key": "schema_version",
+      "value": "1"
+    }
+  ],
+  "payer_session": [
+    {
+      "harness": "claude-code",
+      "session": "c8fc54c0-929c-46ed-a78a-d56360936a61",
+      "owner_principal": "prefrontal-core",
+      "declared_at_ms": 1794417449991
+    }
+  ],
+  "payer_record": [
+    {
+      "seq": 1,
+      "attempt_id": "76d75fe1-f70d-46d6-aa97-89549eb2c4ca",
+      "harness": "claude-code",
+      "session": "c8fc54c0-929c-46ed-a78a-d56360936a61",
+      "request_kind": "main",
+      "step_ref": "req_standin_gw_1",
+      "recorded_at_ms": 1794417450420,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "charge_basis": "metered_api",
+      "auth_selection": "oauth:anthropic:two",
+      "account_ref": "acct-2",
+      "outcome": "completed",
+      "provider_request_id": "req_standin_gw_1",
+      "provider_response_id": "msg_standin_gw_1",
+      "usage_json": null
+    },
+    {
+      "seq": 2,
+      "attempt_id": "07bdc054-e152-452e-a705-93d3b80ee770",
+      "harness": "claude-code",
+      "session": "c8fc54c0-929c-46ed-a78a-d56360936a61",
+      "request_kind": "main",
+      "step_ref": "req_standin_gw_2",
+      "recorded_at_ms": 1794417450680,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "charge_basis": "metered_api",
+      "auth_selection": "oauth:anthropic:two",
+      "account_ref": "acct-2",
+      "outcome": "completed",
+      "provider_request_id": "req_standin_gw_2",
+      "provider_response_id": "msg_standin_gw_2",
+      "usage_json": null
+    },
+    {
+      "seq": 3,
+      "attempt_id": "dd748f77-6bb6-4b0a-845f-266d1f4d375b",
+      "harness": "claude-code",
+      "session": "c8fc54c0-929c-46ed-a78a-d56360936a61",
+      "request_kind": "main",
+      "step_ref": "req_standin_gw_3",
+      "recorded_at_ms": 1794417450727,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "charge_basis": "metered_api",
+      "auth_selection": "oauth:anthropic:two",
+      "account_ref": "acct-2",
+      "outcome": "completed",
+      "provider_request_id": "req_standin_gw_3",
+      "provider_response_id": "msg_standin_gw_3",
+      "usage_json": null
+    },
+    {
+      "seq": 4,
+      "attempt_id": "94f56122-c915-4ef4-a6d0-bcf112658d72",
+      "harness": "claude-code",
+      "session": "c8fc54c0-929c-46ed-a78a-d56360936a61",
+      "request_kind": "failed_before_row",
+      "step_ref": null,
+      "recorded_at_ms": 1794417450947,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "charge_basis": "metered_api",
+      "auth_selection": "oauth:anthropic:two",
+      "account_ref": "acct-2",
+      "outcome": "failed",
+      "provider_request_id": "req_standin_gw_4",
+      "provider_response_id": null,
+      "usage_json": "{\"usage\":{}}"
+    }
+  ]
+}

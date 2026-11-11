@@ -449,6 +449,7 @@ fn add_counts(total: &mut ClaudeParseCounts, add: &ClaudeParseCounts) {
     total.skipped_lines += add.skipped_lines;
     total.usage_records += add.usage_records;
     total.records_without_request_id += add.records_without_request_id;
+    total.records_keyed_by_message_id += add.records_keyed_by_message_id;
     total.synthetic_records += add.synthetic_records;
     total.calls_refused += add.calls_refused;
     total.calls_refused_after_emission += add.calls_refused_after_emission;
@@ -522,7 +523,7 @@ fn map_call(call: ClaudeCodeCall) -> Result<EventRecordRequest, String> {
         // distinct ids, none in two files, one-to-one with `message.id`), so
         // a lineage would change identity without disambiguating anything.
         producer_lineage: None,
-        producer_ref: call.request_id.clone(),
+        producer_ref: call.call_key.clone(),
         prior_event_ref: None,
         harness: None,
         project_root: call.project_root,
@@ -535,7 +536,9 @@ fn map_call(call: ClaudeCodeCall) -> Result<EventRecordRequest, String> {
         // Claude Code's stop_reason verbatim; absent for an interrupted call.
         terminal_status: call.stop_reason,
         attempt_ordinal: None,
-        vendor_request_id: Some(call.request_id),
+        // Absent for a call keyed by its message id: a message id is not a
+        // request id.
+        vendor_request_id: call.request_id,
         provider,
         model: call.model,
         account_ref: None,
