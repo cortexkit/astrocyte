@@ -8,7 +8,9 @@ use std::sync::{
 use std::time::SystemTime;
 
 use astrocyte_core::{
-    attempt_usage::decode_attempt_usage, fact::ChargeBasis, ingest::EventRecordRequest,
+    attempt_usage::decode_attempt_usage,
+    fact::{event_id, ChargeBasis},
+    ingest::EventRecordRequest,
 };
 use rusqlite::{params, OptionalExtension, Transaction};
 
@@ -20,6 +22,7 @@ use crate::state::SharedState;
 
 pub(crate) const SOURCE_KEY: &str = "thalamus-payer";
 const PAGE_LIMIT: i64 = 512;
+const LATE_MAIN_LOOKUP_SQL: &str = "SELECT EXISTS(SELECT 1 FROM usage_event WHERE event_id=?1)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Stamp(Option<(u64, SystemTime)>, Option<(u64, SystemTime)>);
@@ -344,7 +347,16 @@ fn record_row(tx: &Transaction<'_>, record: &Record, at: i64) -> Result<Option<S
                 "pi" => "pi",
                 _ => return Ok(Some("unknown payer harness".into())),
             };
-            let recorded: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM usage_event WHERE producer=?1 AND producer_ref=?2)",params![producer,step],|row|row.get(0)).map_err(sql)?;
+            // Transcript readers derive the event ID from the producer and step
+            // reference with no lineage value. Probe that ID, not the producer's history.
+            let id = event_id(producer, None, step)
+                .map_err(|error| format!("derive transcript call identity: {error:?}"))?;
+            let mut lookup = tx.prepare(LATE_MAIN_LOOKUP_SQL).map_err(sql)?;
+            let recorded: bool = lookup.query_row([&id], |row| row.get(0)).map_err(sql)?;
+            #[cfg(test)]
+            lookup_tests::LOOKUP_VM_STEPS.with(|steps| {
+                steps.set(lookup.get_status(rusqlite::StatementStatus::VmStep));
+            });
             if recorded {
                 count_coverage(tx, "late", &record.attempt_id)?;
             }
@@ -512,6 +524,10 @@ pub(crate) fn basis(value: Option<&str>) -> ChargeBasis {
 }
 
 #[cfg(test)]
+#[path = "thalamus_payer_source_tests.rs"]
+mod lookup_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::test_state;
@@ -531,7 +547,7 @@ INSERT INTO payer_meta VALUES ('schema_version','1'),('incarnation','first');
 INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
 "#;
 
-    fn fixture() -> (TempDir, ThalamusPayerSource, Connection, SharedState) {
+    pub(super) fn fixture() -> (TempDir, ThalamusPayerSource, Connection, SharedState) {
         let home = TempDir::new().unwrap();
         let source = ThalamusPayerSource::from_data_home(home.path().to_path_buf());
         std::fs::create_dir_all(source.path.parent().unwrap()).unwrap();
