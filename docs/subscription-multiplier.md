@@ -37,6 +37,16 @@ Unconfigured credential readings are listed in the legacy-named
 `unconfigured_accounts` array and reject the row with `unconfigured_credentials`.
 Their exclusion diagnostics use `credential_ref` and `vault_plan_unknown`.
 
+Membership counts every identity with a reading of the provider's pool and
+window before the day's end, however old. The quota sample tables' primary keys
+put the identity before the pool and time, so these lookups jump from one
+identity to the next through the key and check each with one seek, instead of
+visiting every reading. The window is not in the key: an identity's readings
+in the same pool under a different window are still stepped over until its
+first matching one. The plan snapshot likewise seeks each vault record's
+latest row before the end, and a counter's reading range stops at its first
+reading after the interval rather than reading all later history.
+
 The vault reader uses only `credential.list_scoped` and `auth.watch_scoped`
 under the reserved module's `list` grant on `llm-provider`; it never fetches
 secrets. It lists at startup, after every notice and daily as a backstop.

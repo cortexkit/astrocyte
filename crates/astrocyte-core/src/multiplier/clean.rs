@@ -79,6 +79,33 @@ fn account_calibration_bin(
     })
 }
 
+/// The readings a counter needs: every matching reading from `?5` through
+/// `?6`, plus the first matching reading after `?6`, which closes the last
+/// interval for coverage interpolation.
+///
+/// The upper bound is that first later reading (or `?6` when none exists), so
+/// the primary key's time range stops there. No matching reading lies between
+/// `?6` and it, so this selects exactly the rows that "through `?6`, or equal
+/// to the first later reading" would. Written as that OR, SQLite could only
+/// bound the range below and would read every later reading of the identity.
+pub(super) fn counter_samples_sql(credential: bool) -> String {
+    let sql =
+        "SELECT fetched_at_instant, COALESCE(raw_used_percent, used_percent), resets_at, source
+         FROM window_sample WHERE provider=?1 AND account_ref=?2 AND pool_key=?3
+         AND window_minutes=?4 AND fetched_at_instant>=?5
+         AND fetched_at_instant<=COALESCE((
+             SELECT MIN(tail.fetched_at_instant) FROM window_sample tail
+             WHERE tail.provider=?1 AND tail.account_ref=?2 AND tail.pool_key=?3
+               AND tail.window_minutes=?4 AND tail.fetched_at_instant>?6), ?6)
+         ORDER BY fetched_at_instant, rowid";
+    if credential {
+        sql.replace("window_sample", "credential_window_sample")
+            .replace("account_ref", "credential_ref")
+    } else {
+        sql.to_string()
+    }
+}
+
 pub(super) fn counter_delta(
     conn: &Connection,
     provider: &str,
@@ -91,22 +118,7 @@ pub(super) fn counter_delta(
     let tolerance = reset_tolerance(window);
     // Only the identity column and table differ; reset and coverage rules are
     // shared so a credential counter cannot receive a more permissive estimate.
-    let sql =
-        "SELECT fetched_at_instant, COALESCE(raw_used_percent, used_percent), resets_at, source
-         FROM window_sample WHERE provider=?1 AND account_ref=?2 AND pool_key=?3
-         AND window_minutes=?4 AND fetched_at_instant>=?5
-         AND (fetched_at_instant<=?6 OR fetched_at_instant=(
-             SELECT MIN(tail.fetched_at_instant) FROM window_sample tail
-             WHERE tail.provider=?1 AND tail.account_ref=?2 AND tail.pool_key=?3
-               AND tail.window_minutes=?4 AND tail.fetched_at_instant>?6))
-         ORDER BY fetched_at_instant, rowid";
-    let sql = if credential {
-        sql.replace("window_sample", "credential_window_sample")
-            .replace("account_ref", "credential_ref")
-    } else {
-        sql.to_string()
-    };
-    let mut statement = conn.prepare_cached(&sql)?;
+    let mut statement = conn.prepare_cached(&counter_samples_sql(credential))?;
     let rows = statement.query_map(
         params![
             provider,

@@ -459,33 +459,224 @@ pub fn append_in_tx(tx: &Transaction<'_>, plan: &VaultPlan) -> rusqlite::Result<
 
 /// Compare a listing without starting a write transaction for an unchanged key.
 pub fn differs_from_latest(conn: &Connection, plan: &VaultPlan) -> rusqlite::Result<bool> {
-    let previous: Option<Option<String>> = conn.query_row(
-        "SELECT plan_key FROM vault_plan_history WHERE credential_id=?1 ORDER BY history_id DESC LIMIT 1",
-        [&plan.credential_id], |row| row.get(0),
-    ).optional()?;
+    let previous: Option<Option<String>> = conn
+        .query_row(LATEST_PLAN_SQL, [&plan.credential_id], |row| row.get(0))
+        .optional()?;
     Ok(previous.as_ref() != Some(&plan.plan_key))
 }
 
+const AT_SQL: &str = "WITH RECURSIVE credential(id) AS (
+         SELECT (SELECT credential_id FROM vault_plan_history ORDER BY credential_id LIMIT 1)
+         UNION ALL
+         SELECT (SELECT n.credential_id FROM vault_plan_history n WHERE n.credential_id>credential.id
+                 ORDER BY n.credential_id LIMIT 1)
+           FROM credential WHERE credential.id IS NOT NULL)
+     SELECT h.credential_id,h.provider,h.account_id,h.plan_tier,h.plan_key,h.source,
+            h.effective_from_ms,h.observed_at_ms
+       FROM credential CROSS JOIN vault_plan_history h
+      WHERE h.history_id=(SELECT l.history_id FROM vault_plan_history l
+                           WHERE l.credential_id=credential.id AND l.effective_from_ms<?1
+                           ORDER BY l.effective_from_ms DESC, l.history_id DESC LIMIT 1)
+      ORDER BY h.effective_from_ms,h.history_id";
+
+/// Newest row of one credential by history ID, read through
+/// `vault_plan_credential_latest` so an unchanged listing costs one seek.
+const LATEST_PLAN_SQL: &str =
+    "SELECT plan_key FROM vault_plan_history WHERE credential_id=?1 ORDER BY history_id DESC LIMIT 1";
+
 /// Latest effective row for each record, with a deterministic tie-break for
 /// observations whose vault timestamp has millisecond resolution.
+///
+/// The recursive step jumps from one credential to the next through a
+/// credential-leading index, and each credential's row is one backwards seek
+/// on `vault_plan_record_history`, so the work follows the number of credentials rather
+/// than re-reading a credential's history once per row it holds. The result
+/// keeps the order by effective time and history ID.
 pub fn at(conn: &Connection, end_ms: i64) -> rusqlite::Result<Vec<VaultPlan>> {
-    conn.prepare(
-        "SELECT credential_id,provider,account_id,plan_tier,plan_key,source,effective_from_ms,observed_at_ms
-         FROM vault_plan_history h WHERE effective_from_ms<?1 AND NOT EXISTS (
-           SELECT 1 FROM vault_plan_history n WHERE n.credential_id=h.credential_id
-            AND n.effective_from_ms<?1 AND (n.effective_from_ms>h.effective_from_ms
-             OR (n.effective_from_ms=h.effective_from_ms AND n.history_id>h.history_id)))
-         ORDER BY effective_from_ms,history_id",
-    )?.query_map([end_ms], |row| Ok(VaultPlan {
-        credential_id: row.get(0)?, provider: row.get(1)?, account_id: row.get(2)?,
-        plan_tier: row.get(3)?, plan_key: row.get(4)?, source: row.get(5)?,
-        effective_from_ms: row.get(6)?, observed_at_ms: row.get(7)?,
-    }))?.collect()
+    conn.prepare(AT_SQL)?
+        .query_map([end_ms], |row| {
+            Ok(VaultPlan {
+                credential_id: row.get(0)?,
+                provider: row.get(1)?,
+                account_id: row.get(2)?,
+                plan_tier: row.get(3)?,
+                plan_key: row.get(4)?,
+                source: row.get(5)?,
+                effective_from_ms: row.get(6)?,
+                observed_at_ms: row.get(7)?,
+            })
+        })?
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multiplier::vm_steps;
+
+    fn history_row(
+        conn: &Connection,
+        credential: &str,
+        account: Option<&str>,
+        plan: Option<&str>,
+        effective_from_ms: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO vault_plan_history(credential_id,provider,account_id,plan_tier,plan_key,
+                 source,effective_from_ms,observed_at_ms)
+             VALUES(?1,'anthropic',?2,'tier',?3,'detected',?4,?4)",
+            params![credential, account, plan, effective_from_ms],
+        )
+        .unwrap();
+    }
+
+    /// The snapshot as it was first written: every row before the end that no
+    /// later-effective row of its credential replaces.
+    fn successor_rule_at(conn: &Connection, end_ms: i64) -> Vec<VaultPlan> {
+        conn.prepare(
+            "SELECT credential_id,provider,account_id,plan_tier,plan_key,source,effective_from_ms,observed_at_ms
+             FROM vault_plan_history h WHERE effective_from_ms<?1 AND NOT EXISTS (
+               SELECT 1 FROM vault_plan_history n WHERE n.credential_id=h.credential_id
+                AND n.effective_from_ms<?1 AND (n.effective_from_ms>h.effective_from_ms
+                 OR (n.effective_from_ms=h.effective_from_ms AND n.history_id>h.history_id)))
+             ORDER BY effective_from_ms,history_id",
+        )
+        .unwrap()
+        .query_map([end_ms], |row| {
+            Ok(VaultPlan {
+                credential_id: row.get(0)?,
+                provider: row.get(1)?,
+                account_id: row.get(2)?,
+                plan_tier: row.get(3)?,
+                plan_key: row.get(4)?,
+                source: row.get(5)?,
+                effective_from_ms: row.get(6)?,
+                observed_at_ms: row.get(7)?,
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn query_plan(conn: &Connection, sql: &str) -> String {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    #[test]
+    fn snapshot_matches_the_successor_rule_at_every_end() {
+        let conn = crate::test_support::conn();
+        // Equal effective times break by history ID; a later row with an
+        // absent plan still replaces an earlier known one.
+        for (credential, account, plan, effective) in [
+            ("c", Some("acct"), Some("anthropic/max"), 5),
+            ("a", Some("acct"), Some("anthropic/pro"), 1),
+            ("a", Some("acct"), None, 3),
+            ("b", None, Some("anthropic/max"), 3),
+            ("b", None, Some("anthropic/pro"), 3),
+            ("a", Some("acct"), Some("anthropic/max"), 3),
+            ("c", Some("acct"), None, 0),
+            ("d", None, None, 9),
+            ("b", None, Some("anthropic/team"), 2),
+        ] {
+            history_row(&conn, credential, account, plan, effective);
+        }
+        for end in [i64::MIN, -1, 0, 1, 2, 3, 4, 5, 6, 9, 10, i64::MAX] {
+            assert_eq!(
+                at(&conn, end).unwrap(),
+                successor_rule_at(&conn, end),
+                "end {end}"
+            );
+        }
+        assert_eq!(at(&conn, 10).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn snapshot_reads_one_row_per_record_not_its_history() {
+        let measure = |versions: i64| {
+            let conn = crate::test_support::conn();
+            for effective in 0..versions {
+                let plan = ["anthropic/pro", "anthropic/max"][usize::from(effective % 2 == 0)];
+                history_row(&conn, "busy", Some("acct"), Some(plan), effective);
+            }
+            history_row(
+                &conn,
+                "busy",
+                Some("acct"),
+                Some("anthropic/team"),
+                1_000_000,
+            );
+            for other in ["x", "y", "z"] {
+                history_row(&conn, other, None, Some("anthropic/pro"), 5);
+                history_row(&conn, other, None, None, 7);
+            }
+            vm_steps(&conn, || at(&conn, 2_000_000).unwrap())
+        };
+        let (small, small_steps) = measure(100);
+        let (large, large_steps) = measure(1_000);
+        assert_eq!(small, large);
+        assert_eq!(small.len(), 4);
+        assert_eq!(
+            large_steps, small_steps,
+            "{small_steps} -> {large_steps} VM steps"
+        );
+        let conn = crate::test_support::conn();
+        let plan = query_plan(&conn, AT_SQL);
+        for expected in [
+            "SEARCH h USING INTEGER PRIMARY KEY (rowid=?)",
+            "SEARCH l USING COVERING INDEX vault_plan_record_history (credential_id=? AND effective_from_ms<?)",
+        ] {
+            assert!(plan.contains(expected), "{expected} missing from:\n{plan}");
+        }
+        assert!(plan.contains("SEARCH n USING COVERING INDEX"), "{plan}");
+        assert!(
+            !plan.contains("SCAN h") && !plan.contains("SCAN l"),
+            "{plan}"
+        );
+    }
+
+    #[test]
+    fn unchanged_listing_reads_only_the_newest_row() {
+        let measure = |versions: i64| {
+            let conn = crate::test_support::conn();
+            // Effective times run backwards so the newest row by history ID
+            // is not the newest by effective time.
+            for version in 0..versions {
+                let plan = ["anthropic/pro", "anthropic/max"][usize::from(version % 2 == 0)];
+                history_row(&conn, "busy", Some("acct"), Some(plan), versions - version);
+            }
+            history_row(&conn, "busy", Some("acct"), Some("anthropic/team"), 0);
+            let listing = VaultPlan {
+                credential_id: "busy".into(),
+                provider: Some("anthropic".into()),
+                account_id: Some("acct".into()),
+                plan_tier: Some("tier".into()),
+                plan_key: Some("anthropic/team".into()),
+                source: "detected".into(),
+                effective_from_ms: 0,
+                observed_at_ms: 0,
+            };
+            vm_steps(&conn, || differs_from_latest(&conn, &listing).unwrap())
+        };
+        let (small, small_steps) = measure(100);
+        let (large, large_steps) = measure(1_000);
+        assert!(!small && !large, "the newest row by history ID matches");
+        assert_eq!(
+            large_steps, small_steps,
+            "{small_steps} -> {large_steps} VM steps"
+        );
+        let plan = query_plan(&crate::test_support::conn(), LATEST_PLAN_SQL);
+        assert_eq!(
+            plan,
+            "SEARCH vault_plan_history USING INDEX vault_plan_credential_latest (credential_id=?)"
+        );
+    }
 
     #[test]
     fn vault_plan_history_appends_only_changes_and_cannot_be_replaced() {

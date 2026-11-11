@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 41. A schema change appends a migration; an applied
+currently version 42. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -296,6 +296,18 @@ re-checks the queue against the full ledger.
 row supersedes, and `multiplier_observation_one_original_per_day` allows one
 original per quota provider and day. Test:
 `pace_uses_the_latest_day_head_not_a_superseded_row`.
+
+That partial index cannot serve a head lookup, because a day's head may be a
+correction rather than its original. Migration 42 adds the full index
+`multiplier_observation_provider_day_plan` on `(quota_provider,
+observation_day, plan)`, so a day's head, its existence check and the pace
+head are seeks rather than scans of every observation. It also adds
+`vault_plan_credential_latest` on `vault_plan_history(credential_id,
+history_id)`, so comparing a vault listing with its credential's newest row
+reads one row instead of sorting that credential's history. Neither table is
+large or written per call. The quota sample tables get no new index: identity
+lookups jump between identities through their primary keys instead (see
+`docs/subscription-multiplier.md`).
 
 ## Money
 

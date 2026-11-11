@@ -567,6 +567,71 @@ pub struct ObservationPlan {
     events: Vec<ScopedEvent>,
 }
 
+/// A reading that makes an identity "seen" inside `[?4, ?5)`. Antigravity
+/// vault readings before the fixed cutoff queried the wrong pool, so they do
+/// not count.
+const SEEN_READING: &str = "s.fetched_at_instant>=?4 AND s.fetched_at_instant<?5
+    AND NOT(s.provider='antigravity' AND s.source IS 'vault' AND s.fetched_at_instant<?6)";
+
+/// The distinct identities of one quota sample table (`window_sample` by
+/// `account_ref`, `credential_window_sample` by `credential_ref`) that have a
+/// reading of provider `?1`, pool `?2` and window `?3` matching `reading`, a
+/// predicate over the sample alias `s`. Ascending identity order.
+///
+/// A `SELECT DISTINCT` over the readings would visit every reading of the
+/// provider, because the primary key `(provider, identity, pool_key,
+/// fetched_at_instant)` puts the identity before the pool and time. Instead
+/// the recursive step jumps from one identity to the next through that key,
+/// and each identity is then checked by one seek on `(provider, identity,
+/// pool_key)` plus its time range. The work follows the number of identities,
+/// not the number of readings. `window_minutes` is not in the key, so the
+/// check still steps over that identity's readings in the time range that
+/// carry a different window, up to the first matching one.
+fn sample_identities_sql(table: &str, field: &str, reading: &str) -> String {
+    format!(
+        "WITH RECURSIVE identity(id) AS (
+             SELECT (SELECT {field} FROM {table} WHERE provider=?1 ORDER BY {field} LIMIT 1)
+             UNION ALL
+             SELECT (SELECT n.{field} FROM {table} n WHERE n.provider=?1 AND n.{field}>identity.id
+                     ORDER BY n.{field} LIMIT 1)
+               FROM identity WHERE identity.id IS NOT NULL)
+         SELECT id FROM identity WHERE id IS NOT NULL AND EXISTS (
+             SELECT 1 FROM {table} s WHERE s.provider=?1 AND s.{field}=identity.id
+                AND s.pool_key=?2 AND s.window_minutes=?3 AND {reading})
+         ORDER BY id"
+    )
+}
+
+/// The SQLite VM instructions `work` runs on `conn`, across every statement,
+/// prepared or cached. Tests use it to show that a read's cost follows its
+/// answer rather than the stored history.
+#[cfg(test)]
+pub(crate) fn vm_steps<T>(conn: &Connection, work: impl FnOnce() -> T) -> (T, u64) {
+    unsafe extern "C" fn count(counter: *mut std::ffi::c_void) -> std::ffi::c_int {
+        // SAFETY: the pointer is the boxed counter below, which outlives the
+        // handler: the handler is removed before the box is dropped.
+        unsafe { *counter.cast::<u64>() += 1 };
+        0
+    }
+    let mut steps = Box::new(0_u64);
+    // SAFETY: `conn` is a live connection and the counter stays allocated
+    // until the handler is cleared below.
+    unsafe {
+        rusqlite::ffi::sqlite3_progress_handler(
+            conn.handle(),
+            1,
+            Some(count),
+            std::ptr::from_mut(steps.as_mut()).cast(),
+        );
+    }
+    let result = work();
+    // SAFETY: clearing the handler on the same live connection.
+    unsafe {
+        rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut());
+    }
+    (result, *steps)
+}
+
 pub fn resolve_membership(
     conn: &Connection,
     declaration: &QuotaProviderConfig,
@@ -574,9 +639,10 @@ pub fn resolve_membership(
     end_ms: i64,
 ) -> Result<ResolvedQuotaProvider, MultiplierError> {
     let identities = |table: &str, field: &str| -> rusqlite::Result<BTreeSet<String>> {
-        conn.prepare(&format!(
-            "SELECT DISTINCT {field} FROM {table} WHERE provider=?1 AND pool_key=?2
-            AND window_minutes=?3 AND fetched_at_instant<?4"
+        conn.prepare(&sample_identities_sql(
+            table,
+            field,
+            "s.fetched_at_instant<?4",
         ))?
         .query_map(
             params![
@@ -699,21 +765,13 @@ pub fn plan_observation(
             interval_end_ms,
         )?);
     }
-    let seen_sql = if !provider.credential_keyed {
-        "SELECT DISTINCT account_ref FROM window_sample
-              WHERE provider = ?1 AND pool_key = ?2 AND window_minutes = ?3
-                AND fetched_at_instant >= ?4 AND fetched_at_instant < ?5
-                AND NOT(provider='antigravity' AND source IS 'vault' AND fetched_at_instant < ?6)
-             ORDER BY account_ref"
+    let (table, field) = if provider.credential_keyed {
+        ("credential_window_sample", "credential_ref")
     } else {
-        "SELECT DISTINCT credential_ref FROM credential_window_sample
-              WHERE provider = ?1 AND pool_key = ?2 AND window_minutes = ?3
-                AND fetched_at_instant >= ?4 AND fetched_at_instant < ?5
-                AND NOT(provider='antigravity' AND source IS 'vault' AND fetched_at_instant < ?6)
-             ORDER BY credential_ref"
+        ("window_sample", "account_ref")
     };
     let seen: Vec<String> = conn
-        .prepare(seen_sql)?
+        .prepare(&sample_identities_sql(table, field, SEEN_READING))?
         .query_map(
             params![
                 quota_provider,
@@ -3046,6 +3104,7 @@ fn observation_rows(
 mod tests {
     include!("multiplier/v2_tests.rs");
     include!("multiplier/context_tier_tests.rs");
+    include!("multiplier/history_scaling_tests.rs");
     use super::*;
     use crate::test_support::conn;
 

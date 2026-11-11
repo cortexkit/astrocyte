@@ -4110,6 +4110,23 @@ WHEN EXISTS (SELECT 1 FROM step_message WHERE event_key=NEW.event_key)
 BEGIN SELECT RAISE(ABORT, 'step_message_insert_once'); END;
 "#,
     },
+    Migration {
+        version: 42,
+        statements: r#"
+-- A day's head lookups name its provider, day and plan. The only index that
+-- starts with provider and day is partial on supersedes IS NULL, which a head
+-- query cannot use because a correction supersedes its day's original. This
+-- index covers every row, so finding a day's head, or whether the day has any
+-- row, is a seek rather than a scan of every observation.
+CREATE INDEX multiplier_observation_provider_day_plan
+    ON multiplier_observation(quota_provider, observation_day, plan);
+-- A listing is compared with the credential's newest plan row by history ID.
+-- vault_plan_record_history orders a credential's rows by effective time
+-- first, so that comparison sorted the credential's whole history.
+CREATE INDEX vault_plan_credential_latest
+    ON vault_plan_history(credential_id, history_id);
+"#,
+    },
 ];
 
 // The migration table and configured SQLite timeout are small fixed values.
@@ -4117,6 +4134,83 @@ BEGIN SELECT RAISE(ABORT, 'step_message_insert_once'); END;
 #[cfg(test)]
 mod tests {
     include!("store_v33_tests.rs");
+
+    #[test]
+    fn lookup_index_migration_adds_two_indexes_and_changes_no_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        let position = MIGRATIONS
+            .iter()
+            .position(|migration| {
+                migration
+                    .statements
+                    .contains("CREATE INDEX multiplier_observation_provider_day_plan")
+            })
+            .unwrap();
+        for migration in &MIGRATIONS[..position] {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO vault_plan_history(credential_id,provider,account_id,plan_tier,plan_key,
+                 source,effective_from_ms,observed_at_ms)
+             VALUES('cred','anthropic','acct','max','anthropic/max','detected',1,2),
+                   ('cred','anthropic','acct',NULL,NULL,'detected',3,4);",
+        )
+        .unwrap();
+        let schema = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare("SELECT type,name FROM sqlite_schema ORDER BY type,name")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let before = all_rows(&conn);
+        let mut expected_schema = schema(&conn);
+        conn.execute_batch(MIGRATIONS[position].statements).unwrap();
+        assert_eq!(all_rows(&conn), before, "no stored row changes");
+        for name in [
+            "multiplier_observation_provider_day_plan",
+            "vault_plan_credential_latest",
+        ] {
+            expected_schema.push(("index".into(), name.into()));
+        }
+        expected_schema.sort();
+        assert_eq!(
+            schema(&conn),
+            expected_schema,
+            "only the two indexes are added"
+        );
+        for (index, columns) in [
+            (
+                "multiplier_observation_provider_day_plan",
+                vec!["quota_provider", "observation_day", "plan"],
+            ),
+            (
+                "vault_plan_credential_latest",
+                vec!["credential_id", "history_id"],
+            ),
+        ] {
+            let found: Vec<String> = conn
+                .prepare(&format!(
+                    "SELECT name FROM pragma_index_info('{index}') ORDER BY seqno"
+                ))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(found, columns, "{index}");
+            let partial: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE name=?1",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!partial.contains("WHERE"), "{index} covers every row");
+        }
+    }
 
     #[test]
     fn step_message_migration_preserves_old_rows_without_backfill() {
