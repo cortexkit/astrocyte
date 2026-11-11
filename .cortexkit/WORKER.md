@@ -29,6 +29,10 @@ cargo test --workspace --locked <filter>                  # tests for what you c
   run the job, then undo the change locally. Never edit or restore a tracked file inside
   the job: the edit fails, the test runs against the fix, and it reads as a false proof. Regenerate test
   vectors locally, or name the files in the job's `return_paths`.
+- A remote job receives only files git doesn't ignore, so a scratch script under
+  `.cortexkit/` never reaches it. Put a scratch script or measurement runner at the
+  checkout root as an untracked file, run it remotely, and delete it before delivery.
+  Never commit it; if your report depends on it, copy its text into the report.
 - Never run `cargo` on the shared development machine. Local builds compete with all
   other work there, and on macOS each freshly built test binary also costs a security
   scan. If a remote job is refused for capacity, retry it later or with fewer vCPUs.
