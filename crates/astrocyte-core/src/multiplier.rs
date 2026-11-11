@@ -568,8 +568,9 @@ pub struct ObservationPlan {
 }
 
 /// A reading that makes an identity "seen" inside `[?4, ?5)`. Antigravity
-/// vault readings before the fixed cutoff queried the wrong pool, so they do
-/// not count.
+/// readings from the `vault` source taken before `?6` (the instant insula
+/// started reading the right Google pool for that source) measured a
+/// different pool, so they do not count.
 const SEEN_READING: &str = "s.fetched_at_instant>=?4 AND s.fetched_at_instant<?5
     AND NOT(s.provider='antigravity' AND s.source IS 'vault' AND s.fetched_at_instant<?6)";
 
