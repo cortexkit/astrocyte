@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 43. A schema change appends a migration; an applied
+currently version 44. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -19,6 +19,8 @@ copies that timeout without running the table-creating probes.
 | `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
 | `step_message` | Each row records the host's own message id for a newly recorded event, for joining live feed rows within their harness and session. Old events are not backfilled. | insert only, once per event |
 | `cache_step_sequence` | Each row maps a ledger event to a durable cache cursor. | insert |
+| `cache_read_session` | Each row names a producer's session with a dated cache-read step and records the cursor of its first positive read. | derived; a measurement trigger inserts it and lowers the cursor |
+| `cache_read_step` | Each row locates one dated step of a session that carries a plain cache-read measurement, zero reads included. | derived; a measurement trigger inserts it |
 | `step_feed` | Each row is one emission of a served cache step for `usage.steps.read`; the newest row for a harness and step wins. | insert; rows older than 24 hours are deleted |
 | `step_feed_state` | The row records the cache cursor the feed has caught up to and the newest feed cursor retention deleted. | one row |
 | `chargeability_transition` | Each row records the one terminal settlement of an event's chargeability. | insert only |
@@ -155,6 +157,31 @@ when that high water exceeds every surviving cursor. The migration refuses
 stores containing BROCA diagnostic cursor rows rather than discarding them.
 BROCA steps will arrive from its step log. The cursor mapping is separate from
 spend and survives process restarts.
+
+`cache_read_session` and `cache_read_step` (migration 44) are a derived
+projection of cache-read facts that `usage_event`, `measurement` and
+`cache_step_sequence` already hold. After every commit that touches a
+session, and for `usage.cache.steps` and `usage.cache.sessions`, cache
+diagnostics need two facts about the session: the last step before a point
+that reported a cache read (the verdict baseline), and whether a dated step
+ever read a positive number of cached tokens, or did so at or below a cursor.
+Read from the ledger, both walked the session's whole history when it had no
+such step. `cache_read_step` holds one row per dated step with a
+`cache_read` measurement of exponent 0, zero reads included, keyed by session,
+time and event key, so the baseline is one backwards seek. `cache_read_session`
+holds one row per producer and session with such a step, and
+`first_positive_cursor` is the smallest cursor of a step whose measurement is
+above zero, or NULL. The `cache_read_projection` trigger on `measurement`
+insert maintains both, so a late measurement for an old event or a step with
+an old time is covered. An event's producer, session and time never change and
+measurements are insert-only, so no other write can change the projection.
+The migration backfills both tables from the ledger; on a synthetic store of
+2.05 million calls with a cache read each, that took about 31 seconds. A future
+migration that rebuilds `measurement` must recreate the trigger. No index is
+added to `usage_event`, `measurement` or `priced_charge`. Tests:
+`projection_reads_serve_exactly_what_the_ledger_walks_served`,
+`the_projection_migration_backfills_what_the_trigger_maintains`,
+`a_session_without_cache_reads_costs_the_same_whatever_its_history`.
 
 `step_feed` (schema 29) is the live step feed. After each commit, astrocyte
 recomputes the served rows of each session that gained or changed steps and

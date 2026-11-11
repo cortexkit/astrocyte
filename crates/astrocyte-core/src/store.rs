@@ -4175,6 +4175,92 @@ CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
     WHERE built_revision IS NOT revision OR format_version IS NOT 2;
 "#,
     },
+    Migration {
+        version: 44,
+        statements: r#"
+-- A derived projection of the cache-read facts already in usage_event,
+-- measurement and cache_step_sequence. Cache diagnostics ask, after every
+-- commit that touches a session, for the last step before a point that
+-- reported a cache read and whether any dated step read a positive count.
+-- Answered from the ledger, both walk the session's whole history when it has
+-- no such step; answered here, each is one seek.
+
+-- One row per (producer, session) with a dated step that has a plain
+-- cache-read measurement (role 'cache_read', exponent 0). first_positive_cursor
+-- is the smallest cache cursor of such a step whose measurement is above
+-- zero; NULL means no dated step of the session has read a positive count.
+CREATE TABLE cache_read_session (
+    session_id INTEGER PRIMARY KEY,
+    producer TEXT NOT NULL,
+    session TEXT NOT NULL,
+    first_positive_cursor INTEGER,
+    UNIQUE (producer, session)
+);
+-- One row per dated step with a plain cache-read measurement, zero reads
+-- included: a step that read zero is still the baseline of the next one. The
+-- key orders a session's steps by time, then event key, as the baseline read
+-- orders them, so the newest one before a point is one backwards seek.
+CREATE TABLE cache_read_step (
+    session_id INTEGER NOT NULL,
+    occurred_at_ms INTEGER NOT NULL,
+    event_key INTEGER NOT NULL,
+    cursor INTEGER NOT NULL,
+    PRIMARY KEY (session_id, occurred_at_ms, event_key)
+) WITHOUT ROWID;
+
+-- Backfill from the ledger before the trigger exists.
+INSERT INTO cache_read_session(producer, session, first_positive_cursor)
+SELECT e.producer, e.session, MIN(CASE WHEN m.quantity_units > 0 THEN s.cursor END)
+FROM measurement m
+CROSS JOIN usage_event e ON e.event_key = m.event_key
+CROSS JOIN cache_step_sequence s ON s.event_key = e.event_key
+WHERE m.role = 'cache_read' AND m.quantity_exponent = 0
+  AND e.session IS NOT NULL AND e.occurred_at_ms IS NOT NULL
+GROUP BY e.producer, e.session;
+INSERT INTO cache_read_step(session_id, occurred_at_ms, event_key, cursor)
+SELECT DISTINCT c.session_id, e.occurred_at_ms, e.event_key, s.cursor
+FROM measurement m
+CROSS JOIN usage_event e ON e.event_key = m.event_key
+CROSS JOIN cache_step_sequence s ON s.event_key = e.event_key
+CROSS JOIN cache_read_session c ON c.producer = e.producer AND c.session = e.session
+WHERE m.role = 'cache_read' AND m.quantity_exponent = 0
+  AND e.occurred_at_ms IS NOT NULL
+ORDER BY 1, 2, 3;
+
+-- Measurements are insert-only and an event's producer, session and time
+-- never change, so maintaining the projection on measurement insert keeps it
+-- exact in any ingest order, including a late measurement for an old event.
+-- NOT EXISTS guards, rather than OR IGNORE, keep every statement free of
+-- conflicts whatever conflict clause the outer insert uses.
+CREATE TRIGGER cache_read_projection AFTER INSERT ON measurement
+WHEN NEW.role = 'cache_read' AND NEW.quantity_exponent = 0
+BEGIN
+    INSERT INTO cache_read_session(producer, session)
+    SELECT e.producer, e.session FROM usage_event e
+    WHERE e.event_key = NEW.event_key AND e.session IS NOT NULL
+      AND e.occurred_at_ms IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM cache_read_session c
+          WHERE c.producer = e.producer AND c.session = e.session);
+    INSERT INTO cache_read_step(session_id, occurred_at_ms, event_key, cursor)
+    SELECT c.session_id, e.occurred_at_ms, e.event_key, s.cursor
+    FROM usage_event e
+    CROSS JOIN cache_read_session c ON c.producer = e.producer AND c.session = e.session
+    CROSS JOIN cache_step_sequence s ON s.event_key = e.event_key
+    WHERE e.event_key = NEW.event_key AND e.occurred_at_ms IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM cache_read_step r WHERE r.session_id = c.session_id
+          AND r.occurred_at_ms = e.occurred_at_ms AND r.event_key = e.event_key);
+    UPDATE cache_read_session
+    SET first_positive_cursor =
+        (SELECT s.cursor FROM cache_step_sequence s WHERE s.event_key = NEW.event_key)
+    WHERE NEW.quantity_units > 0
+      AND session_id = (SELECT c.session_id FROM usage_event e
+          CROSS JOIN cache_read_session c ON c.producer = e.producer AND c.session = e.session
+          WHERE e.event_key = NEW.event_key AND e.occurred_at_ms IS NOT NULL)
+      AND (first_positive_cursor IS NULL OR first_positive_cursor >
+          (SELECT s.cursor FROM cache_step_sequence s WHERE s.event_key = NEW.event_key));
+END;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between

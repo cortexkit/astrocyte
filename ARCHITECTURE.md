@@ -46,7 +46,7 @@ against fusiform. It serves spend and usage diagnostics over subc.
 ## Durable state
 
 The leased SQLite store uses WAL, FULL synchronization and foreign keys, with a
-5000 ms busy timeout. `store.rs` owns `MIGRATIONS`, now at version 43; an older
+5000 ms busy timeout. `store.rs` owns `MIGRATIONS`, now at version 44; an older
 binary refuses a newer store. Immutable-table triggers reject rewrites even
 through `INSERT OR REPLACE`. Integer keys are never served. The
 [data model](docs/data-model.md#tables) describes the tables.

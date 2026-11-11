@@ -357,21 +357,26 @@ const EARLIER_SQL: &str = "SELECT EXISTS (SELECT 1 FROM usage_event e
      JOIN cache_step_sequence s ON s.event_key=e.event_key
      WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL
         AND (e.occurred_at_ms,s.cursor)<(?3,?4))";
-/// The last dated step before `(?3 time, ?4 key)` with a plain token count
-/// written by a cache-read measurement.
+/// The last dated step before `(?3 time, ?4 cursor)` with a plain token
+/// count written by a cache-read measurement, newest by time and then event
+/// key. `cache_read_step` holds exactly those steps, keyed in that order, so
+/// this is one backwards seek however many steps of the session reported no
+/// cache read. Asking the ledger instead walked every earlier step of the
+/// session when none had reported one. The `<=` bound lets the seek start at
+/// `?3`; the row-value test then drops the steps at `?3` from `?4` on.
 const BASELINE_SQL: &str = concat!(
     "SELECT ",
     step_columns!(),
-    " WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL",
-    " AND (e.occurred_at_ms,s.cursor)<(?3,?4)",
-    " AND EXISTS (SELECT 1 FROM measurement m WHERE m.event_key=e.event_key",
-    " AND m.role='cache_read' AND m.quantity_exponent=0)",
-    " ORDER BY e.occurred_at_ms DESC, e.event_key DESC LIMIT 1"
+    " WHERE e.event_key=(SELECT r.event_key FROM cache_read_session c",
+    " CROSS JOIN cache_read_step r ON r.session_id=c.session_id",
+    " WHERE c.producer=?2 AND c.session=?1 AND r.occurred_at_ms<=?3",
+    " AND (r.occurred_at_ms,r.cursor)<(?3,?4)",
+    " ORDER BY r.occurred_at_ms DESC, r.event_key DESC LIMIT 1)"
 );
-const READS_CACHE_SQL: &str = "SELECT EXISTS (SELECT 1 FROM usage_event e
-     JOIN measurement m ON m.event_key=e.event_key
-     WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL
-       AND m.role='cache_read' AND m.quantity_exponent=0 AND m.quantity_units>0)";
+/// Whether a dated step of the session read a positive number of cached
+/// tokens, from the session's row in the cache-read projection.
+const READS_CACHE_SQL: &str = "SELECT EXISTS (SELECT 1 FROM cache_read_session
+     WHERE producer=?2 AND session=?1 AND first_positive_cursor IS NOT NULL)";
 const UNDATED_SQL: &str = "SELECT COUNT(*) FROM usage_event
      WHERE session=?1 AND producer=?2 AND occurred_at_ms IS NULL";
 /// `?1` since, `?2` one producer or NULL, `?3` limit. The unary `+` keeps
@@ -409,6 +414,23 @@ const SINCE_SQL: &str = concat!(
 const PROJECT_ROOT_SQL: &str = "SELECT project_root FROM usage_event
      WHERE session=?1 AND producer=?2 AND occurred_at_ms>=?3 AND project_root IS NOT NULL
       ORDER BY occurred_at_ms DESC, event_key DESC LIMIT 1";
+
+/// The statement a cache-read projection read runs. Under test it can be
+/// switched back to the ledger walk it replaced (`tests::LEDGER_WALK`), so
+/// the differential tests can show both give the same answers.
+macro_rules! projection_sql {
+    ($projection:ident, $walk:ident) => {{
+        #[cfg(test)]
+        let sql = if tests::LEDGER_WALK.with(std::cell::Cell::get) {
+            tests::$walk
+        } else {
+            $projection
+        };
+        #[cfg(not(test))]
+        let sql = $projection;
+        sql
+    }};
+}
 
 fn count(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<u64>> {
     row.get::<_, Option<i64>>(column)?
@@ -489,7 +511,7 @@ fn lead_before(
         return Ok(Lead::default());
     }
     let baseline = conn
-        .prepare_cached(BASELINE_SQL)?
+        .prepare_cached(projection_sql!(BASELINE_SQL, WALK_BASELINE_SQL))?
         .query_row(
             params![session, producer, step.occurred_at_ms, step.cursor],
             step_row,
@@ -543,7 +565,7 @@ pub fn unrecorded_step(
     };
     let recorded_baseline = match recorded_latest {
         Some(_) => conn
-            .prepare_cached(BASELINE_SQL)?
+            .prepare_cached(projection_sql!(BASELINE_SQL, WALK_BASELINE_SQL))?
             .query_row(params![session, producer, at, i64::MAX], step_row)
             .optional()?,
         None => None,
@@ -598,7 +620,7 @@ pub(crate) fn session_reads_cache(
     producer: &str,
     session: &str,
 ) -> rusqlite::Result<bool> {
-    conn.prepare_cached(READS_CACHE_SQL)?
+    conn.prepare_cached(projection_sql!(READS_CACHE_SQL, WALK_READS_CACHE_SQL))?
         .query_row(params![session, producer], |row| row.get(0))
 }
 
@@ -955,12 +977,10 @@ const DATED_STEP_BY_KEY_SQL: &str = concat!(
     harnesses_sql!()
 );
 /// Whether a dated step of the session with a cache cursor at or below `?3`
-/// read a positive number of cached tokens.
-const READ_CACHE_THROUGH_SQL: &str = "SELECT EXISTS (SELECT 1 FROM usage_event e
-     JOIN cache_step_sequence s ON s.event_key=e.event_key
-     JOIN measurement m ON m.event_key=e.event_key
-     WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL AND s.cursor<=?3
-       AND m.role='cache_read' AND m.quantity_exponent=0 AND m.quantity_units>0)";
+/// read a positive number of cached tokens: the session's first such cursor
+/// is at or below `?3`.
+const READ_CACHE_THROUGH_SQL: &str = "SELECT EXISTS (SELECT 1 FROM cache_read_session
+     WHERE producer=?2 AND session=?1 AND first_positive_cursor<=?3)";
 
 /// The sessions with a dated step whose cache cursor is in `(after,
 /// through]`, plus the sessions of the events in `late_keys` (events that
@@ -1018,8 +1038,11 @@ pub fn session_read_cache_through(
     session: &str,
     through: i64,
 ) -> rusqlite::Result<bool> {
-    conn.prepare_cached(READ_CACHE_THROUGH_SQL)?
-        .query_row(params![session, producer, through], |row| row.get(0))
+    conn.prepare_cached(projection_sql!(
+        READ_CACHE_THROUGH_SQL,
+        WALK_READ_CACHE_THROUGH_SQL
+    ))?
+    .query_row(params![session, producer, through], |row| row.get(0))
 }
 
 /// Every dated step of one session at or after `since_ms`, oldest first,
@@ -1201,6 +1224,45 @@ mod tests {
     };
     use crate::store::{initialize_connection, MIGRATIONS};
     use crate::test_support::conn;
+
+    thread_local! {
+        /// Whether this thread's cache-read projection reads run the ledger
+        /// walks they replaced instead. See `projection_sql!`.
+        pub(super) static LEDGER_WALK: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// The reads the cache-read projection replaced, as they were. Each walks
+    /// the session's history in the ledger; the differential tests use them
+    /// as the reference answers.
+    pub(super) const WALK_BASELINE_SQL: &str = concat!(
+        "SELECT ",
+        step_columns!(),
+        " WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL",
+        " AND (e.occurred_at_ms,s.cursor)<(?3,?4)",
+        " AND EXISTS (SELECT 1 FROM measurement m WHERE m.event_key=e.event_key",
+        " AND m.role='cache_read' AND m.quantity_exponent=0)",
+        " ORDER BY e.occurred_at_ms DESC, e.event_key DESC LIMIT 1"
+    );
+    pub(super) const WALK_READS_CACHE_SQL: &str = "SELECT EXISTS (SELECT 1 FROM usage_event e
+         JOIN measurement m ON m.event_key=e.event_key
+         WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL
+           AND m.role='cache_read' AND m.quantity_exponent=0 AND m.quantity_units>0)";
+    pub(super) const WALK_READ_CACHE_THROUGH_SQL: &str =
+        "SELECT EXISTS (SELECT 1 FROM usage_event e
+         JOIN cache_step_sequence s ON s.event_key=e.event_key
+         JOIN measurement m ON m.event_key=e.event_key
+         WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL AND s.cursor<=?3
+           AND m.role='cache_read' AND m.quantity_exponent=0 AND m.quantity_units>0)";
+
+    /// Run `work` with this thread's projection reads switched to the ledger
+    /// walks.
+    fn walking<T>(work: impl FnOnce() -> T) -> T {
+        LEDGER_WALK.with(|walk| walk.set(true));
+        let result = work();
+        LEDGER_WALK.with(|walk| walk.set(false));
+        result
+    }
 
     /// The changed-session read runs after every commit, so it must read only
     /// the new cursor range, never the ledger.
@@ -1977,12 +2039,17 @@ mod tests {
         assert_eq!(steps("pi", "s", Some(STEPS_MAX_LIMIT)), Ok(1_000));
     }
 
-    /// Every statement the cache-diagnostics reads prepare.
-    const ALL_SQL: [&str; 10] = [
+    /// Every statement the cache-diagnostics reads prepare, including the
+    /// ledger walks the cache-read projection replaced.
+    const ALL_SQL: [&str; 14] = [
         WINDOW_SQL,
         EARLIER_SQL,
         BASELINE_SQL,
         READS_CACHE_SQL,
+        READ_CACHE_THROUGH_SQL,
+        WALK_BASELINE_SQL,
+        WALK_READS_CACHE_SQL,
+        WALK_READ_CACHE_THROUGH_SQL,
         UNDATED_SQL,
         SINCE_SQL,
         PROJECT_ROOT_SQL,
@@ -1996,6 +2063,9 @@ mod tests {
     /// cache, so the cached statements' counters cover all of their runs.
     fn vm_steps<T>(conn: &Connection, work: impl FnOnce() -> T) -> (T, u64) {
         use rusqlite::StatementStatus::VmStep;
+        // A statement evicted from the cache would lose its counter, so the
+        // cache must hold these and every other statement `work` prepares.
+        conn.set_prepared_statement_cache_capacity(128);
         for sql in ALL_SQL {
             conn.prepare_cached(sql).unwrap().reset_status(VmStep);
         }
@@ -2009,8 +2079,9 @@ mod tests {
 
     /// Builds a store of 2,050,000 harness events with four measurements
     /// each (10,000 sessions of 200 steps over about four weeks, plus one
-    /// 50,000-step session), applies migrations 27 and 28 to it and prints the
-    /// migration time, the query plans and the VM steps of the
+    /// 50,000-step session), applies migrations 27 and 28 and then the rest
+    /// to it, and prints the migration times (the cache-read projection's
+    /// backfill among them), the query plans and the VM steps of the
     /// cache-diagnostics reads. Run on the build server:
     /// `cargo test --workspace --lib -- --ignored --nocapture measure_cache_reads`.
     #[test]
@@ -2068,6 +2139,27 @@ mod tests {
         let started = Instant::now();
         conn.execute_batch(MIGRATIONS[27].statements).unwrap();
         println!("migration 28 (shared cursors) took {:?}", started.elapsed());
+        let projection = projection_position();
+        let started = Instant::now();
+        for migration in &MIGRATIONS[28..projection] {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        println!(
+            "migrations 29 to {} took {:?}",
+            MIGRATIONS[projection - 1].version,
+            started.elapsed()
+        );
+        let started = Instant::now();
+        conn.execute_batch(MIGRATIONS[projection].statements)
+            .unwrap();
+        println!(
+            "migration {} (cache-read projection backfill) took {:?}",
+            MIGRATIONS[projection].version,
+            started.elapsed()
+        );
+        for migration in &MIGRATIONS[projection + 1..] {
+            conn.execute_batch(migration.statements).unwrap();
+        }
 
         let explain = |label: &str, sql: &str| {
             let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -2093,6 +2185,7 @@ mod tests {
             ("earlier steps", EARLIER_SQL),
             ("lead baseline", BASELINE_SQL),
             ("session reads cache", READS_CACHE_SQL),
+            ("session read cache through", READ_CACHE_THROUGH_SQL),
             ("undated count", UNDATED_SQL),
             ("sessions window", SINCE_SQL),
             ("project root", PROJECT_ROOT_SQL),
@@ -2148,5 +2241,566 @@ mod tests {
         );
         drop(conn);
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn projection_position() -> usize {
+        MIGRATIONS
+            .iter()
+            .position(|migration| {
+                migration
+                    .statements
+                    .contains("CREATE TABLE cache_read_session")
+            })
+            .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum CacheHabit {
+        /// Never stores a cache read.
+        Never,
+        /// Stores zero reads, or none.
+        ZeroOnly,
+        /// Zero reads or none in the early batches, then positive reads too.
+        LateReader,
+        /// Any mix of none, zero and positive reads.
+        Mixed,
+    }
+
+    /// The randomized fixture's sessions. Two session names recur under
+    /// several producers, which the reads must keep apart.
+    const FIXTURE_SESSIONS: [(&str, &str, CacheHabit); 9] = [
+        ("claude-code", "a", CacheHabit::Mixed),
+        ("claude-code", "never", CacheHabit::Never),
+        ("claude-code", "zero", CacheHabit::ZeroOnly),
+        ("codex", "a", CacheHabit::Mixed),
+        ("codex", "late", CacheHabit::LateReader),
+        ("opencode", "late", CacheHabit::LateReader),
+        ("opencode", "a", CacheHabit::ZeroOnly),
+        ("pi", "never", CacheHabit::Never),
+        ("gemini", "m", CacheHabit::Mixed),
+    ];
+    const FIXTURE_BATCHES: u64 = 12;
+    const FIXTURE_BASE_MS: i64 = 1_790_812_800_000;
+    const FIXTURE_NOW_MS: i64 = FIXTURE_BASE_MS + 3 * RECENT_WINDOW_MS + 3_600_000;
+
+    /// A deterministic generator, so every store built from the fixture holds
+    /// the same rows.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % bound
+        }
+
+        fn index(&mut self, len: usize) -> usize {
+            usize::try_from(self.below(u64::try_from(len).unwrap())).unwrap()
+        }
+    }
+
+    /// One batch of the fixture: steps of random sessions at random times in
+    /// three days, on a ten-minute grid so that steps tie and later batches
+    /// land before earlier ones. A tenth of them are undated.
+    fn fixture_batch(rng: &mut Lcg, batch: u64, count: u64) -> Vec<Step> {
+        (0..count)
+            .map(|index| {
+                let (producer, session, habit) =
+                    FIXTURE_SESSIONS[rng.index(FIXTURE_SESSIONS.len())];
+                let slot = i64::try_from(rng.below(432)).unwrap();
+                let at = (rng.below(10) != 0).then_some(FIXTURE_BASE_MS + slot * 600_000);
+                let positive = 1 + rng.below(200_000);
+                let cache_read = match habit {
+                    CacheHabit::Never => None,
+                    CacheHabit::ZeroOnly => (rng.below(4) != 0).then_some(0),
+                    CacheHabit::LateReader if batch < 8 => (rng.below(3) != 0).then_some(0),
+                    CacheHabit::LateReader | CacheHabit::Mixed => match rng.below(6) {
+                        0 => None,
+                        1 => Some(0),
+                        _ => Some(positive),
+                    },
+                };
+                let input = rng.below(60_000);
+                let input = (rng.below(10) != 0).then_some(input);
+                let write = rng.below(30_000);
+                let write = (rng.below(2) == 0).then_some(write);
+                step(
+                    producer,
+                    session,
+                    batch * 1_000 + index,
+                    at,
+                    counts(input, cache_read, write),
+                )
+            })
+            .collect()
+    }
+
+    /// Give a random event a cache-read measurement after it was recorded, as
+    /// a late delivery would: the event keeps its time and cursor. Some are
+    /// zero reads and some are scaled counts, which are no plain token count.
+    /// Sessions named `never` or `zero` are left alone.
+    fn late_measurement(conn: &Connection, rng: &mut Lcg) {
+        let keys = conn
+            .prepare(
+                "SELECT event_key FROM usage_event e WHERE session NOT IN ('never','zero')
+                 AND NOT EXISTS (SELECT 1 FROM measurement m WHERE m.event_key=e.event_key
+                     AND m.role='cache_read' AND m.unit='token')
+                 ORDER BY event_key",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        if keys.is_empty() {
+            return;
+        }
+        let key = keys[rng.index(keys.len())];
+        let units = i64::try_from(rng.below(3) * rng.below(100_000)).unwrap();
+        let exponent = if rng.below(5) == 0 { -3 } else { 0 };
+        conn.execute(
+            "INSERT INTO measurement (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
+             VALUES (?1,'cache_read','token','billed','late',?2,?3)",
+            params![key, units, exponent],
+        )
+        .unwrap();
+    }
+
+    /// Record the fixture batch by batch. With `feed`, bring the step feed up
+    /// to date after every batch, as the writer does after each commit, with
+    /// the ledger walks when `feed` is `Some(true)`.
+    fn record_fixture(conn: &mut Connection, feed: Option<bool>) {
+        let mut rng = Lcg(0x5eed);
+        for batch in 0..FIXTURE_BATCHES {
+            let steps = fixture_batch(&mut rng, batch, 40);
+            record(conn, &steps);
+            for _ in 0..3 {
+                late_measurement(conn, &mut rng);
+            }
+            if let Some(walk) = feed {
+                let hours_left = i64::try_from(FIXTURE_BATCHES - 1 - batch).unwrap();
+                let now = FIXTURE_NOW_MS - hours_left * 3_600_000;
+                let tx = conn.transaction().unwrap();
+                let append = || crate::step_feed::append_changes(&tx, now, &[]).unwrap();
+                if walk {
+                    walking(append);
+                } else {
+                    append();
+                }
+                tx.commit().unwrap();
+            }
+        }
+    }
+
+    fn fixture_store(walk: bool) -> Connection {
+        let mut conn = conn();
+        record_fixture(&mut conn, Some(walk));
+        conn
+    }
+
+    fn rows_of(conn: &Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = conn.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// Every served read the projection feeds, serialized as served: steps
+    /// windows with and without a cursor, the feed's per-session rows, a
+    /// runner step's row, the flip check and the sessions report.
+    fn served_reads(conn: &Connection) -> Vec<String> {
+        fn json<T: Serialize>(value: &T) -> String {
+            serde_json::to_string(value).unwrap()
+        }
+        let mut out = Vec::new();
+        let sessions = FIXTURE_SESSIONS
+            .iter()
+            .map(|(producer, session, _)| (*producer, *session))
+            .chain([("claude-code", "absent"), ("kimi", "a")]);
+        for (producer, session) in sessions {
+            for limit in [1, 2, 5, 17, 1_000] {
+                let reply = steps_from_store(conn, &query(producer, session, limit, None)).unwrap();
+                let middle = reply
+                    .steps
+                    .get(reply.steps.len() / 2)
+                    .map(|step| step.cursor);
+                out.push(json(&reply));
+                let after = steps_from_store(conn, &query(producer, session, limit, middle));
+                out.push(json(&after.unwrap()));
+            }
+            for since in [
+                FIXTURE_BASE_MS,
+                FIXTURE_BASE_MS + RECENT_WINDOW_MS,
+                FIXTURE_BASE_MS + 5 * RECENT_WINDOW_MS / 2,
+                FIXTURE_NOW_MS,
+            ] {
+                out.push(json(
+                    &session_steps_since(conn, producer, session, since).unwrap(),
+                ));
+            }
+            for at in [FIXTURE_BASE_MS + RECENT_WINDOW_MS + 300_000, FIXTURE_NOW_MS] {
+                for cache_read in [Some(0), Some(50_000)] {
+                    let row = StepRow {
+                        cursor: i64::MAX,
+                        step_ref: "announced".into(),
+                        occurred_at_ms: at,
+                        input: Some(1_000),
+                        cache_read,
+                        cache_write: None,
+                        output: None,
+                        reasoning: None,
+                        provider: None,
+                        model: None,
+                        finish: None,
+                        context_limit: None,
+                        request_body_len: None,
+                    };
+                    out.push(json(
+                        &unrecorded_step(conn, producer, session, row, &[]).unwrap(),
+                    ));
+                }
+            }
+            for through in [0, 50, 200, 400, i64::MAX] {
+                let read = session_read_cache_through(conn, producer, session, through).unwrap();
+                out.push(format!("{producer}/{session} through {through}: {read}"));
+            }
+        }
+        for harness in [None, Some("claude-code"), Some("codex"), Some("opencode")] {
+            for since in [FIXTURE_NOW_MS - RECENT_WINDOW_MS, FIXTURE_BASE_MS] {
+                let request = CacheSessionsRequest {
+                    since_ms: Some(since),
+                    harness: harness.map(str::to_string),
+                    limit: Some(SESSIONS_MAX_LIMIT),
+                };
+                out.push(json(
+                    &cache_sessions(conn, request, FIXTURE_NOW_MS).unwrap(),
+                ));
+            }
+        }
+        out
+    }
+
+    const FEED_ROWS_SQL: &str = "SELECT feed_cursor,harness,step_ref,source,session,
+         committed_at_ms,row_json FROM step_feed ORDER BY feed_cursor";
+
+    /// The step feed and every served cache read are byte-identical whether
+    /// the session facts come from the cache-read projection or from the
+    /// ledger walks it replaced, over a randomized fixture of several
+    /// producers' sessions with late arrivals, tied times, zero reads,
+    /// undated steps, late measurements and sessions that never read cache.
+    #[test]
+    fn projection_reads_serve_exactly_what_the_ledger_walks_served() {
+        let walked = fixture_store(true);
+        let projected = fixture_store(false);
+        let feed = rows_of(&projected, FEED_ROWS_SQL);
+        assert!(
+            feed.len() > 200,
+            "the fixture feeds many rows: {}",
+            feed.len()
+        );
+        assert_eq!(rows_of(&walked, FEED_ROWS_SQL), feed, "the step feed");
+        assert_eq!(
+            rows_of(&walked, "SELECT * FROM step_feed_state"),
+            rows_of(&projected, "SELECT * FROM step_feed_state"),
+        );
+        let reference = walking(|| served_reads(&projected));
+        assert_eq!(served_reads(&projected), reference, "the served reads");
+        assert_eq!(served_reads(&walked), reference);
+
+        // The fixture reaches the cases the projection must get right.
+        let mut verdicts = std::collections::BTreeSet::new();
+        let mut undated = 0;
+        for (producer, session, _) in FIXTURE_SESSIONS {
+            let reply =
+                steps_from_store(&projected, &query(producer, session, 1_000, None)).unwrap();
+            verdicts.extend(reply.steps.iter().map(|step| step.verdict));
+            undated += reply.undated_steps;
+        }
+        assert!(undated > 0);
+        for verdict in [
+            Verdict::ColdStart,
+            Verdict::Stable,
+            Verdict::Bust,
+            Verdict::FullBust,
+            Verdict::Unknown,
+        ] {
+            assert!(verdicts.contains(&verdict), "{verdict:?} in {verdicts:?}");
+        }
+        let sessions = rows_of(
+            &projected,
+            "SELECT producer,session,first_positive_cursor IS NOT NULL FROM cache_read_session
+             ORDER BY producer,session",
+        );
+        let text = |value: &str| rusqlite::types::Value::Text(value.into());
+        let flag = |value: bool| rusqlite::types::Value::Integer(i64::from(value));
+        assert!(
+            sessions.contains(&vec![text("claude-code"), text("zero"), flag(false)]),
+            "a session of zero reads has baselines but never read cache: {sessions:?}"
+        );
+        assert!(sessions.contains(&vec![text("codex"), text("late"), flag(true)]));
+        assert!(
+            !sessions.iter().any(|row| row[1] == text("never")),
+            "a session without cache reads has no row"
+        );
+    }
+
+    fn projection_rows(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut rows = rows_of(
+            conn,
+            "SELECT producer,session,first_positive_cursor FROM cache_read_session
+             ORDER BY producer,session",
+        );
+        rows.extend(rows_of(
+            conn,
+            "SELECT c.producer,c.session,r.occurred_at_ms,r.event_key,r.cursor
+             FROM cache_read_step r JOIN cache_read_session c USING (session_id)
+             ORDER BY c.producer,c.session,r.occurred_at_ms,r.event_key",
+        ));
+        rows
+    }
+
+    /// Upgrading a store backfills the projection with exactly the rows the
+    /// trigger keeps on a store that recorded the same history after the
+    /// upgrade, and the upgraded store's reads match the ledger walks.
+    #[test]
+    fn the_projection_migration_backfills_what_the_trigger_maintains() {
+        let position = projection_position();
+        let mut upgraded = Connection::open_in_memory().unwrap();
+        initialize_connection(&upgraded).unwrap();
+        for migration in &MIGRATIONS[..position] {
+            upgraded.execute_batch(migration.statements).unwrap();
+        }
+        record_fixture(&mut upgraded, None);
+        for migration in &MIGRATIONS[position..] {
+            upgraded.execute_batch(migration.statements).unwrap();
+        }
+        let mut maintained = conn();
+        record_fixture(&mut maintained, None);
+        let rows = projection_rows(&upgraded);
+        assert!(rows.len() > 200, "{}", rows.len());
+        assert_eq!(rows, projection_rows(&maintained));
+        assert_eq!(served_reads(&upgraded), walking(|| served_reads(&upgraded)));
+    }
+
+    /// One zero cache read, then `history` steps that report no cache read:
+    /// the session has a baseline only at its very start and never read its
+    /// cache. The feed is caught up through the history.
+    fn cache_free_history(history: u64) -> Connection {
+        let mut conn = conn();
+        let mut steps = vec![step(
+            "claude-code",
+            "s",
+            0,
+            Some(FIXTURE_BASE_MS),
+            counts(Some(10), Some(0), None),
+        )];
+        steps.extend((1..=history).map(|index| {
+            let at = FIXTURE_BASE_MS + i64::try_from(index).unwrap() * 1_000;
+            step(
+                "claude-code",
+                "s",
+                index,
+                Some(at),
+                counts(Some(10), None, None),
+            )
+        }));
+        record(&mut conn, &steps);
+        crate::step_feed::append_changes(&conn, FIXTURE_BASE_MS + RECENT_WINDOW_MS, &[]).unwrap();
+        conn
+    }
+
+    /// VM steps of the cache reads for one new step of a session like
+    /// [`cache_free_history`]'s: publishing it to the step feed after its
+    /// commit, serving its newest ten steps, and the sessions report.
+    fn new_step_cost(history: u64) -> [u64; 3] {
+        let mut conn = cache_free_history(history);
+        let new = step(
+            "claude-code",
+            "s",
+            history + 1,
+            Some(FIXTURE_NOW_MS - 60_000),
+            counts(Some(10), None, None),
+        );
+        record(&mut conn, &[new]);
+        let (appended, feed) = vm_steps(&conn, || {
+            crate::step_feed::append_changes(&conn, FIXTURE_NOW_MS, &[]).unwrap()
+        });
+        assert_eq!(appended, 1);
+        let (reply, steps) = vm_steps(&conn, || {
+            steps_from_store(&conn, &query("claude-code", "s", 10, None)).unwrap()
+        });
+        assert_eq!(reply.steps.len(), 10);
+        let (sessions, report) = vm_steps(&conn, || {
+            let request = CacheSessionsRequest {
+                since_ms: None,
+                harness: None,
+                limit: None,
+            };
+            cache_sessions(&conn, request, FIXTURE_NOW_MS).unwrap()
+        });
+        assert_eq!(sessions.sessions.len(), 1);
+        [feed, steps, report]
+    }
+
+    /// A session that reported no cache read for a long time costs the same
+    /// to publish and to serve however long that time was. The ledger walks
+    /// the projection replaced grew with it: they looked back through every
+    /// earlier step for the baseline and for a positive read.
+    #[test]
+    fn a_session_without_cache_reads_costs_the_same_whatever_its_history() {
+        let short = new_step_cost(100);
+        let long = new_step_cost(2_000);
+        let walked_short = walking(|| new_step_cost(100));
+        let walked_long = walking(|| new_step_cost(2_000));
+        println!(
+            "VM steps [feed, steps, sessions] at 100 / 2,000 earlier steps: \
+             projection {short:?} / {long:?}, ledger walk {walked_short:?} / {walked_long:?}"
+        );
+        assert_eq!(short, long, "the earlier history costs nothing");
+        for (short, long) in walked_short.iter().zip(walked_long) {
+            assert!(
+                long > short * 5,
+                "the walks grew with history: {short} -> {long}"
+            );
+        }
+    }
+
+    fn explain(conn: &Connection, sql: &str) -> String {
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let values = [
+            rusqlite::types::Value::Text("long".into()),
+            rusqlite::types::Value::Text("claude-code".into()),
+            rusqlite::types::Value::Integer(500_000),
+            rusqlite::types::Value::Integer(500),
+        ];
+        let count = statement.parameter_count();
+        statement
+            .query_map(rusqlite::params_from_iter(&values[..count]), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The baseline is one backwards seek in the session's cache-read steps
+    /// and the positive-read checks one probe of its session row; none of
+    /// them reads the session's events in the ledger.
+    #[test]
+    fn projection_reads_seek_the_projection_keys() {
+        let conn = long_session_store();
+        let baseline = explain(&conn, BASELINE_SQL);
+        println!(
+            "baseline plan:\n{baseline}\nwalk plan:\n{}",
+            explain(&conn, WALK_BASELINE_SQL)
+        );
+        assert!(
+            baseline.contains("SEARCH r USING PRIMARY KEY (session_id=? AND occurred_at_ms<?)"),
+            "{baseline}"
+        );
+        assert!(
+            baseline.contains(
+                "SEARCH c USING COVERING INDEX sqlite_autoindex_cache_read_session_1 \
+                 (producer=? AND session=?)"
+            ),
+            "{baseline}"
+        );
+        assert!(
+            baseline.contains("SEARCH e USING INTEGER PRIMARY KEY (rowid=?)"),
+            "{baseline}"
+        );
+        assert!(!baseline.contains("usage_event_session_time"), "{baseline}");
+        assert!(!baseline.contains("TEMP B-TREE"), "{baseline}");
+        for sql in [READS_CACHE_SQL, READ_CACHE_THROUGH_SQL] {
+            let plan = explain(&conn, sql);
+            assert!(
+                plan.contains(
+                    "SEARCH cache_read_session USING INDEX sqlite_autoindex_cache_read_session_1 \
+                     (producer=? AND session=?)"
+                ),
+                "{plan}"
+            );
+            assert!(!plan.contains("usage_event"), "{plan}");
+            assert!(!plan.contains("measurement"), "{plan}");
+        }
+    }
+
+    /// The statement ingest records a measurement with.
+    const INGEST_MEASUREMENT_SQL: &str = "INSERT INTO measurement (
+             event_key,role,unit,kind,source,quantity_units,quantity_exponent
+         ) VALUES ((SELECT event_key FROM usage_event WHERE event_id=?1),?2,?3,?4,?5,?6,?7)";
+
+    /// VM steps of recording the measurements of one Claude Code call, the
+    /// projection trigger's work included, after `history` calls of its
+    /// session.
+    fn measurement_cost(history: u64, trigger: bool) -> u64 {
+        let mut conn = conn();
+        if !trigger {
+            conn.execute_batch("DROP TRIGGER cache_read_projection")
+                .unwrap();
+        }
+        let steps = (0..history)
+            .map(|index| {
+                let at = FIXTURE_BASE_MS + i64::try_from(index).unwrap() * 1_000;
+                step(
+                    "claude-code",
+                    "s",
+                    index,
+                    Some(at),
+                    counts(Some(1), Some(index), Some(2)),
+                )
+            })
+            .collect::<Vec<_>>();
+        record(&mut conn, &steps);
+        let tx = conn.transaction().unwrap();
+        let request = EventRecordRequest {
+            session: Some("s".into()),
+            occurred_at_ms: Some(FIXTURE_NOW_MS),
+            ..cc_request("new")
+        };
+        record_event_in_tx(&tx, &request, 1, DeliveryPath::Read).unwrap();
+        let event_id: String = tx
+            .query_row(
+                "SELECT event_id FROM usage_event WHERE producer_ref='new'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut insert = tx.prepare(INGEST_MEASUREMENT_SQL).unwrap();
+        for (role, unit, units) in [
+            ("input", "token", 10),
+            ("cache_read", "token", 20_000),
+            ("cache_write", "token_cache_5m", 30),
+            ("cache_write", "token_cache_1h", 30),
+            ("output", "token", 7),
+        ] {
+            insert
+                .execute(params![event_id, role, unit, "billed", "x", units, 0])
+                .unwrap();
+        }
+        u64::try_from(insert.get_status(rusqlite::StatementStatus::VmStep)).unwrap()
+    }
+
+    /// Keeping the projection adds a fixed amount of work to recording a
+    /// call, whatever the session's history.
+    #[test]
+    fn the_projection_trigger_costs_the_same_whatever_the_history() {
+        let short = measurement_cost(10, true);
+        let long = measurement_cost(1_000, true);
+        let without = measurement_cost(10, false);
+        println!(
+            "VM steps recording one call's five measurements: {without} without the \
+             trigger, {short} with it after 10 calls, {long} after 1,000"
+        );
+        assert_eq!(short, long);
+        assert!(short > without);
     }
 }
