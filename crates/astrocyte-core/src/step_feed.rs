@@ -338,6 +338,94 @@ pub fn append_runner_step(
     Ok(RunnerAppend::Appended)
 }
 
+/// Re-judge retained runner-only steps from producers whose ledger events
+/// aggregate several steps. Run once at startup, after the feed is caught up,
+/// on the writer's connection inside a transaction or savepoint. Corrections
+/// append new rows; file rows and single-step ledger producers are untouched.
+pub fn rejudge_runner_steps(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
+    let window_start = now_ms.saturating_sub(FEED_WINDOW_MS);
+    let candidates = conn
+        .prepare_cached(
+            "SELECT f.harness,f.session,f.step_ref,f.row_json FROM step_feed f
+             WHERE f.source='runner' AND f.committed_at_ms>=?1
+               AND json_extract(f.row_json,'$.occurred_at_ms')>=?1
+               AND NOT EXISTS (SELECT 1 FROM step_feed n WHERE n.harness=f.harness
+                   AND n.step_ref=f.step_ref AND n.feed_cursor>f.feed_cursor)
+             ORDER BY json_extract(f.row_json,'$.occurred_at_ms'),f.feed_cursor",
+        )?
+        .query_map([window_start], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let to_sql = |error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
+    let mut appended = 0;
+    for (harness, session, step_ref, body) in candidates {
+        if cache::CACHE_HARNESSES.contains(&harness.as_str()) {
+            continue;
+        }
+        let mut body: Value = serde_json::from_str(&body).map_err(to_sql)?;
+        let original = body.clone();
+        let count = |name| body.get(name).and_then(Value::as_u64);
+        // Only diagnostic fields are copied back. Output, reasoning, names,
+        // run id and cache-write splits remain exactly as the runner stored them.
+        let row = cache::StepRow {
+            cursor: 0,
+            step_ref: step_ref.clone(),
+            occurred_at_ms: body["occurred_at_ms"].as_i64().unwrap_or(0),
+            input: count("input"),
+            cache_read: count("cache_read"),
+            cache_write: count("cache_write"),
+            output: None,
+            reasoning: None,
+            provider: None,
+            model: None,
+            finish: None,
+            context_limit: None,
+            request_body_len: count("request_body_len"),
+        };
+        let unrecorded = runner_only_steps(conn, &harness, &session, &step_ref)?;
+        let served = cache::unrecorded_step(conn, &harness, &session, row, &unrecorded)?;
+        let served = serde_json::to_value(served).map_err(to_sql)?;
+        let fields = body
+            .as_object_mut()
+            .expect("a stored runner row is an object");
+        for field in [
+            "prompt",
+            "retention",
+            "verdict",
+            "prompt_dropped",
+            "request_size",
+        ] {
+            if let Some(value) = served.get(field) {
+                fields.insert(field.into(), value.clone());
+            } else {
+                fields.remove(field);
+            }
+        }
+        if body == original {
+            continue;
+        }
+        conn.prepare_cached(
+            "INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
+             VALUES (?1,?2,'runner',?3,?4,?5)",
+        )?
+        .execute(params![
+            harness,
+            step_ref,
+            session,
+            now_ms,
+            body.to_string()
+        ])?;
+        appended += 1;
+    }
+    Ok(appended)
+}
+
 /// The newest stored row body for an identity, if any.
 fn newest_body(
     conn: &Connection,

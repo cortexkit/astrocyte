@@ -310,6 +310,7 @@ impl SharedState {
             generation,
         );
         state.refresh_projection()?;
+        state.rejudge_runner_steps();
         Ok(state)
     }
 
@@ -932,6 +933,28 @@ impl SharedState {
                 .publish_runner(conn, now_ms(), step)
                 .map_err(|error| describe_sqlite_error(&error))
         })
+    }
+
+    /// Repair retained runner verdicts once after startup has caught the feed
+    /// up with the ledger. A failed repair must not prevent serving the ledger.
+    fn rejudge_runner_steps(&self) {
+        let repaired = (|| {
+            let _writer = self
+                .0
+                .writer
+                .lock()
+                .map_err(|_| "store writer fence poisoned".to_string())?;
+            self.with_conn(|conn| {
+                self.0
+                    .step_feed
+                    .rejudge_runner_steps(conn, now_ms())
+                    .map_err(|error| describe_sqlite_error(&error))
+            })
+        })();
+        if let Err(error) = repaired {
+            tracing::warn!(target: "astrocyte", %error,
+                "stored runner steps not re-judged; continuing startup");
+        }
     }
 
     /// Fill the recent-steps memory from the store: the sessions active in

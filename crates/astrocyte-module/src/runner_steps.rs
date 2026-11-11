@@ -618,6 +618,155 @@ mod tests {
         assert_eq!(second["prompt_dropped"], json!(false), "{second}");
     }
 
+    fn insert_feed_row(state: &SharedState, committed_at_ms: i64, body: &Value) {
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    rusqlite::params![
+                        body["harness"].as_str().unwrap(),
+                        body["step_ref"].as_str().unwrap(),
+                        body["source"].as_str().unwrap(),
+                        body["session"].as_str().unwrap(),
+                        committed_at_ms,
+                        body.to_string(),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn startup_rejudges_stored_runner_rows_once_without_touching_protected_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::state::leased_test_state(&directory);
+        let at = now_ms();
+        record_steps_for_test(
+            &state,
+            "broca",
+            &[TestStep {
+                occurred_at_ms: at - 1_500,
+                cache_read: 800_000,
+                ..TestStep::now("sb", "segment")
+            }],
+            false,
+        )
+        .unwrap();
+        admit_event(
+            &state,
+            &event("minimal", "broca", |body| {
+                body["harness"] = json!("broca");
+                body["session"] = json!("sb");
+                body["attempt_id"] = json!("attempt-1");
+                body["started_at_ms"] = json!(at - 2_000);
+                body["finished_at_ms"] = json!(at - 1_500);
+                body["input_tokens"] = json!(10);
+                body["cached_input_tokens"] = json!(399_990);
+            }),
+        );
+        // Insert a verdict computed against the aggregate segment directly, so
+        // today's runner verdict calculation cannot correct the fixture early.
+        let wrong = json!({
+            "harness": "broca", "source": "runner", "session": "sb",
+            "step_ref": "attempt-2", "run_id": "run-2", "occurred_at_ms": at - 1_000,
+            "input": 10, "cache_read": 400_000, "cache_write": 30,
+            "cache_write_5m": 10, "cache_write_1h": 20, "output": 20, "reasoning": 7,
+            "provider": "anthropic", "model": "model", "finish": "completed",
+            "context_limit": 1_000_000, "request_body_len": 4096, "prompt": 400_040,
+            "verdict": "bust", "retention": 0.5, "prompt_dropped": true
+        });
+        insert_feed_row(&state, at, &wrong);
+        let mut protected = wrong.clone();
+        protected["step_ref"] = json!("replaced-by-file");
+        protected["session"] = json!("other-session");
+        insert_feed_row(&state, at, &protected);
+        protected["source"] = json!("file");
+        protected["message_id"] = json!("host-message");
+        insert_feed_row(&state, at, &protected);
+        let mut cached_harness = wrong.clone();
+        cached_harness["harness"] = json!("pi");
+        insert_feed_row(&state, at, &cached_harness);
+        let before = feed_rows(&state);
+        drop(state);
+
+        let state = crate::state::leased_test_state(&directory);
+        assert_eq!(feed_rows(&state), before + 1, "one correction at startup");
+        let served = rows(&state, json!({}));
+        let corrected = served.last().unwrap();
+        let mut expected = wrong.clone();
+        expected["verdict"] = json!("stable");
+        expected["retention"] = json!(1.0);
+        expected["prompt_dropped"] = json!(false);
+        let mut corrected_body = corrected.clone();
+        corrected_body.as_object_mut().unwrap().remove("cursor");
+        assert_eq!(corrected_body, expected);
+        assert!(corrected.get("message_id").is_none());
+        // Earlier emissions remain byte-for-byte intact, including the wrong
+        // runner row and the identity already replaced by a file row.
+        state
+            .with_conn(|conn| {
+                let stored: Vec<String> = conn
+                    .prepare("SELECT row_json FROM step_feed ORDER BY feed_cursor")
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert_eq!(stored[1], wrong.to_string());
+                assert_eq!(stored[3], protected.to_string());
+                assert_eq!(stored[4], cached_harness.to_string());
+                Ok(())
+            })
+            .unwrap();
+        drop(state);
+
+        let state = crate::state::leased_test_state(&directory);
+        assert_eq!(feed_rows(&state), before + 1, "a second startup is a no-op");
+    }
+
+    #[test]
+    fn startup_runner_rejudge_failure_rolls_back_and_still_serves() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::state::leased_test_state(&directory);
+        let at = now_ms();
+        for (step_ref, offset) in [("first", 2_000), ("second", 1_000)] {
+            insert_feed_row(
+                &state,
+                at,
+                &json!({
+                    "harness": "goose", "source": "runner", "session": "s",
+                    "step_ref": step_ref, "run_id": "r", "occurred_at_ms": at - offset,
+                    "input": 10, "cache_read": 100, "prompt": 110,
+                    "verdict": "bust", "retention": 0.5, "prompt_dropped": true
+                }),
+            );
+        }
+        state
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER refuse_rejudge BEFORE INSERT ON step_feed
+                 WHEN NEW.step_ref='second'
+                 BEGIN SELECT RAISE(ABORT, 'repair unavailable'); END;",
+                )
+                .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        drop(state);
+
+        let state = crate::state::leased_test_state(&directory);
+        assert_eq!(
+            feed_rows(&state),
+            2,
+            "the first correction must roll back too"
+        );
+        let served = rows(&state, json!({"harness": "goose", "session": "s"}));
+        assert_eq!(served.len(), 2);
+        assert!(served.iter().all(|row| row["verdict"] == "bust"));
+    }
+
     /// Bodies broca's publisher wrote in its own tests, pinned byte for byte
     /// (`tests/vectors/broca-step-finished/SHA256SUMS`): completed,
     /// interrupted and keep-warm steps from both of broca's session storages,

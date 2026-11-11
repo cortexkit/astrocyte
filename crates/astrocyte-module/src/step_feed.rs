@@ -202,10 +202,28 @@ impl FeedHub {
         now_ms: i64,
         late: &[i64],
     ) -> rusqlite::Result<()> {
+        self.append_and_notify(conn, || feed::append_changes(conn, now_ms, late))
+    }
+
+    /// Correct retained aggregate-producer runner verdicts at startup, using
+    /// the same committed-row notices as ordinary feed appends.
+    pub(crate) fn rejudge_runner_steps(
+        &self,
+        conn: &Connection,
+        now_ms: i64,
+    ) -> rusqlite::Result<()> {
+        self.append_and_notify(conn, || feed::rejudge_runner_steps(conn, now_ms))
+    }
+
+    fn append_and_notify(
+        &self,
+        conn: &Connection,
+        append: impl FnOnce() -> rusqlite::Result<usize>,
+    ) -> rusqlite::Result<()> {
         conn.execute_batch("SAVEPOINT step_feed")?;
         let appended = (|| {
             let before = feed::through(conn)?;
-            feed::append_changes(conn, now_ms, late)?;
+            append()?;
             let through = feed::through(conn)?;
             // Read only the appended cursor range, not the retained feed, to
             // decide which session subscriptions need a notice.
@@ -1226,6 +1244,95 @@ mod tests {
             .unwrap();
         assert_eq!(notice, br#"{"through":"c1"}"#);
         assert!(other.try_recv().is_err());
+        stop.send(true).unwrap();
+        for task in serving {
+            tokio::time::timeout(HANG_GUARD, task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rejudged_runner_rows_are_window_bounded_ordered_and_notify_subscribers() {
+        let state = test_state();
+        let at = now_ms();
+        let old = at - feed::FEED_WINDOW_MS - 1;
+        state
+            .with_conn(|conn| {
+                // Reverse the insertion order to check that correction order follows
+                // the steps' times, not their old feed cursors.
+                for (step_ref, session, occurred, committed, read) in [
+                    ("newer", "s", at - 1_000, at, 110),
+                    ("older", "s", at - 2_000, at, 100),
+                    ("expired-commit", "expired", at - 1_000, old, 100),
+                    ("expired-step", "expired", old, at, 100),
+                ] {
+                    let body = json!({
+                        "harness": "goose", "source": "runner", "session": session,
+                        "step_ref": step_ref, "run_id": "r", "occurred_at_ms": occurred,
+                        "input": 10, "cache_read": read, "prompt": read + 10,
+                        "verdict": "bust", "retention": 0.5, "prompt_dropped": true
+                    });
+                    conn.execute(
+                    "INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
+                     VALUES ('goose',?1,'runner',?2,?3,?4)",
+                    rusqlite::params![step_ref, session, committed, body.to_string()],
+                ).map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let (stop, stopping) = watch::channel(false);
+        let (own_tx, mut own) = mpsc::unbounded_channel();
+        let (other_tx, mut other) = mpsc::unbounded_channel();
+        let mut serving = Vec::new();
+        for (session, sender) in [("s", own_tx), ("expired", other_tx)] {
+            let state = state.clone();
+            let stopping = stopping.clone();
+            serving.push(tokio::spawn(async move {
+                subscribe(
+                    &state,
+                    json!({"harness": "goose", "session": session}),
+                    &ByteSink(sender),
+                    stopping,
+                )
+                .await
+            }));
+        }
+        tokio::time::timeout(HANG_GUARD, async {
+            while state.step_feed().open_subscriptions() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscriptions never registered");
+        state
+            .with_conn(|conn| {
+                state
+                    .step_feed()
+                    .rejudge_runner_steps(conn, at)
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        let notice = tokio::time::timeout(HANG_GUARD, own.recv())
+            .await
+            .expect("the correction was not announced")
+            .unwrap();
+        assert_eq!(notice, br#"{"through":"c6"}"#);
+        assert!(other.try_recv().is_err());
+        let page = read_page(&state, json!({"after":"c4"}));
+        assert_eq!(page["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(page["rows"][0]["step_ref"], "older");
+        assert_eq!(page["rows"][0]["verdict"], "cold_start");
+        assert_eq!(page["rows"][1]["step_ref"], "newer");
+        assert_eq!(page["rows"][1]["verdict"], "stable");
+        assert_eq!(page["rows"][1]["retention"], json!(1.0));
+        assert_eq!(
+            feed_rows(&state),
+            6,
+            "only the two in-window identities change"
+        );
         stop.send(true).unwrap();
         for task in serving {
             tokio::time::timeout(HANG_GUARD, task)
