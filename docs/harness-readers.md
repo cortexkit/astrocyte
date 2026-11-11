@@ -309,8 +309,9 @@ Rules that affect what is recorded:
   does not affect folder entries or the plain `opencode-v2` source. A wrong
   type makes the roots file unreadable under its existing last-good-list
   rule. Astrocyte must support the field and be live before THALAMUS writes
-  it, and THALAMUS must write the item before the copy accepts messages;
-  declarations never undo calls already recorded or waiting for a payer.
+  it, and THALAMUS must write the item before the copy accepts messages.
+  A declaration that arrives late never undoes a call already recorded, nor
+  one already held waiting for THALAMUS's payer record (who paid for it).
   See the [shared-session amendment](thalamus-opencode-sessions-contract.md#amendment-copied-history-in-a-shared-session).
   Tests: `shared_copy_cutoff_skips_history_without_holding_progress`,
   `shared_copy_cutoff_rejects_bad_values_as_unreadable_roots`,
