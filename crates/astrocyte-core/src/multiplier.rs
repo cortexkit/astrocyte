@@ -703,7 +703,7 @@ pub fn resolve_membership(
             let providers: BTreeSet<_> = history
                 .iter()
                 .filter(|row| row.account_id.as_ref() == Some(&id))
-                .map(|row| &row.provider)
+                .filter_map(|row| row.provider.as_ref())
                 .collect();
             let ambiguous = providers.len() > 1
                 || differences
@@ -717,7 +717,11 @@ pub fn resolve_membership(
             }
             if let Some(key) = winners
                 .iter()
-                .find(|row| row.account_id.as_ref() == Some(&id))
+                .find(|row| {
+                    // A providerless, planless credential carries no membership information.
+                    row.account_id.as_ref() == Some(&id)
+                        && (row.provider.is_some() || row.plan_key.is_some())
+                })
                 .and_then(|row| row.plan_key.as_ref())
             {
                 resolved
@@ -3106,6 +3110,7 @@ mod tests {
     include!("multiplier/v2_tests.rs");
     include!("multiplier/context_tier_tests.rs");
     include!("multiplier/history_scaling_tests.rs");
+    include!("multiplier/membership_tests.rs");
     use super::*;
     use crate::test_support::conn;
 

@@ -69,9 +69,11 @@ source `config` rows effective at zero, preserving old day recomputation. Live
 maps and per-account price overrides are removed; stored non-null per-account
 overrides refuse hydration instead of being discarded. Plan-key overrides stay.
 Multiple records for one account/provider use the latest effective observation;
-equal-time disagreements have no winner. An account spanning two vault providers
-is unmeasurable. If both identity namespaces have usable histories for one quota
-provider, the day's row names `mixed_identity_namespaces` and has null ratios.
+equal-time disagreements have no winner. An account spanning two known vault
+providers is unmeasurable. An unknown provider is not a second provider, and a
+record with neither a provider nor a plan cannot hide the account's planned record.
+If both identity namespaces have usable histories for one quota provider, the
+day's row names `mixed_identity_namespaces` and has null ratios.
 
 With exactly one joined credential, in-scope provider tokens are
 attributed to that credential, in the clean hours only, under the same
