@@ -645,8 +645,9 @@ log. A step with no durable record stays a live-only row with
   `run_id` (runner steps), `provider`, `model`, `input`, `cache_read`, `cache_write`,
   `cache_write_5m`, `cache_write_1h`, `output`, `reasoning`, `finish`,
   `context_limit`, `request_body_len`, `retention`, `request_size`.
-- `message_id` is the host's own content-free message identifier, present only
-  when the host has one and never invented. Consumers join on `harness` plus
+- `message_id` is a content-free message identifier: on a file row the host's
+  own, on a runner row the one the runner serves for that message. It is
+  present only when the host or runner has one and is never invented. Consumers join on `harness` plus
   `session` plus `message_id`, not on `message_id` alone: it is unique only
   within its session. `harness` plus `step_ref` remains the row identity;
   consumers must not parse `step_ref` to recover a message id, because its
