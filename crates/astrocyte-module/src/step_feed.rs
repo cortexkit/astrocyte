@@ -574,7 +574,7 @@ pub fn record_steps_for_test(
             step_detail: StepDetail {
                 finish: None,
                 context_limit: None,
-                message_id: None,
+                message_id: step.message_id.map(Into::into),
             },
         }
     };
@@ -600,6 +600,8 @@ pub struct TestStep<'a> {
     pub cache_read: u64,
     pub output: Option<u64>,
     pub reasoning: Option<u64>,
+    /// The host message id the reader would record for the step.
+    pub message_id: Option<&'a str>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -613,6 +615,7 @@ impl<'a> TestStep<'a> {
             cache_read: 100,
             output: Some(3),
             reasoning: None,
+            message_id: None,
         }
     }
 }

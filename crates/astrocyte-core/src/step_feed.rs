@@ -68,6 +68,9 @@ pub struct RunnerStep {
     pub step: cache::StepRow,
     pub cache_write_5m: Option<u64>,
     pub cache_write_1h: Option<u64>,
+    /// The id the runner serves for the assistant message the step's reply
+    /// was placed in, as the event sent it; `None` when the event has none.
+    pub message_id: Option<String>,
 }
 
 /// What [`append_runner_step`] did with a runner step.
@@ -310,6 +313,9 @@ pub fn append_runner_step(
         unreachable!("a row body is an object");
     };
     row.insert("run_id".into(), Value::from(step.run_id.as_str()));
+    if let Some(message_id) = &step.message_id {
+        row.insert("message_id".into(), Value::from(message_id.as_str()));
+    }
     for (name, value) in [
         ("cache_write_5m", step.cache_write_5m),
         ("cache_write_1h", step.cache_write_1h),

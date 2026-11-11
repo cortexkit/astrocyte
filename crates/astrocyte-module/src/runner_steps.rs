@@ -112,6 +112,8 @@ pub(crate) fn feed_step(event: StepFinished) -> Option<RunnerStep> {
         },
         cache_write_5m: event.cache_write_5m_tokens,
         cache_write_1h: event.cache_write_1h_tokens,
+        // Served only as the runner sent it: a step id is not a message id.
+        message_id: event.message_id,
     })
 }
 
@@ -517,6 +519,78 @@ mod tests {
         assert_eq!(state.step_feed().runner_counts().dropped, 0);
     }
 
+    /// Runner contract 0.8.37 adds an optional `message_id` to the closed step
+    /// event: the runner's id for the assistant message the reply was placed
+    /// in. An older decoder refuses an event carrying it. The event must
+    /// decode, and its runner row must serve that id as `message_id`, apart
+    /// from the step identity the row is keyed by.
+    #[test]
+    fn an_event_with_a_contract_0_8_37_message_id_serves_it_on_the_runner_row() {
+        let state = test_state();
+        admit_event(
+            &state,
+            &event("full", "thalamus-harness", |body| {
+                body["session"] = json!("s1");
+                body["harness_step_ref"] = json!("msg_x");
+                body["message_id"] = json!("runner-message-1");
+            }),
+        );
+        assert_eq!(
+            state.step_feed().runner_counts(),
+            RunnerCounts {
+                appended: 1,
+                ..RunnerCounts::default()
+            }
+        );
+        let served = rows(&state, json!({"harness": "pi", "session": "s1"}));
+        assert_eq!(served.len(), 1, "{served:?}");
+        assert_eq!(served[0]["source"], "runner");
+        assert_eq!(served[0]["step_ref"], "msg_x");
+        assert_eq!(served[0]["message_id"], "runner-message-1");
+    }
+
+    /// A file row that replaces a runner row serves the host's message id
+    /// for the step, or none, never the runner's.
+    #[test]
+    fn a_file_row_replacing_a_runner_row_keeps_its_own_message_id() {
+        let state = test_state();
+        for step_ref in ["msg_x", "msg_y"] {
+            admit_event(
+                &state,
+                &event("full", "thalamus-harness", |body| {
+                    body["session"] = json!("s1");
+                    body["harness_step_ref"] = json!(step_ref);
+                    body["message_id"] = json!(format!("runner-{step_ref}"));
+                }),
+            );
+        }
+        record_steps_for_test(
+            &state,
+            "pi",
+            &[
+                TestStep {
+                    message_id: Some("host-msg_x"),
+                    ..TestStep::now("s1", "msg_x")
+                },
+                TestStep::now("s1", "msg_y"),
+            ],
+            false,
+        )
+        .unwrap();
+        let served = rows(&state, json!({"harness": "pi", "session": "s1"}));
+        assert_eq!(served.len(), 2, "{served:?}");
+        let row = |step_ref: &str| {
+            served
+                .iter()
+                .find(|row| row["step_ref"] == step_ref)
+                .unwrap()
+        };
+        assert_eq!(row("msg_x")["source"], "file");
+        assert_eq!(row("msg_x")["message_id"], "host-msg_x");
+        assert_eq!(row("msg_y")["source"], "file");
+        assert!(row("msg_y").get("message_id").is_none(), "{served:?}");
+    }
+
     /// A runner row's cache fields come from the same rules as a recorded
     /// step's, over the session's recorded steps: the file row that later
     /// replaces it, with the same counts, serves the same values.
@@ -725,6 +799,58 @@ mod tests {
 
         let state = crate::state::leased_test_state(&directory);
         assert_eq!(feed_rows(&state), before + 1, "a second startup is a no-op");
+    }
+
+    /// The startup correction of a runner row changes only its cache
+    /// diagnostics: the `message_id` the runner sent stays on the new row.
+    #[test]
+    fn startup_rejudge_keeps_a_runner_rows_message_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::state::leased_test_state(&directory);
+        let at = now_ms();
+        record_steps_for_test(
+            &state,
+            "broca",
+            &[TestStep {
+                occurred_at_ms: at - 1_500,
+                cache_read: 800_000,
+                ..TestStep::now("sb", "segment")
+            }],
+            false,
+        )
+        .unwrap();
+        admit_event(
+            &state,
+            &event("minimal", "broca", |body| {
+                body["harness"] = json!("broca");
+                body["session"] = json!("sb");
+                body["attempt_id"] = json!("attempt-1");
+                body["started_at_ms"] = json!(at - 2_000);
+                body["finished_at_ms"] = json!(at - 1_500);
+                body["input_tokens"] = json!(10);
+                body["cached_input_tokens"] = json!(399_990);
+            }),
+        );
+        // A verdict judged against the aggregate segment, inserted directly
+        // so that startup has a row to correct.
+        let wrong = json!({
+            "harness": "broca", "source": "runner", "session": "sb",
+            "step_ref": "attempt-2", "run_id": "run-2", "occurred_at_ms": at - 1_000,
+            "message_id": "runner-message-2",
+            "input": 10, "cache_read": 400_000, "prompt": 400_010,
+            "verdict": "bust", "retention": 0.5, "prompt_dropped": true
+        });
+        insert_feed_row(&state, at, &wrong);
+        let before = feed_rows(&state);
+        drop(state);
+
+        let state = crate::state::leased_test_state(&directory);
+        assert_eq!(feed_rows(&state), before + 1, "one correction at startup");
+        let served = rows(&state, json!({}));
+        let corrected = served.last().unwrap();
+        assert_eq!(corrected["step_ref"], "attempt-2");
+        assert_eq!(corrected["verdict"], "stable", "{corrected}");
+        assert_eq!(corrected["message_id"], "runner-message-2");
     }
 
     #[test]

@@ -656,8 +656,11 @@ log. A step with no durable record stays a live-only row with
   `StatusUpdate.payload.message_id`. Codex has turn and response ids, Oh My Pi
   has entry and response ids, and Goose has session totals, so none supplies a
   message id here. Pi operation entries are not messages and omit it too.
-  Runner events currently carry no `message_id`, so runner rows omit it,
-  even when `harness_step_ref` looks like a message id. Previously recorded
+  A runner row carries the step event's `message_id` when the runner sends
+  one: the id the runner serves for the assistant message the step's reply
+  was placed in. A runner row without one omits it, and it is never derived
+  from `step_ref` or `harness_step_ref`. A file row that replaces a runner row
+  serves its own `message_id`, or none. Previously recorded
   rows are not backfilled; they remain without the member and age out of the
   24-hour feed.
 - `output` includes `reasoning`, which is a breakdown inside it, as in
