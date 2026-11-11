@@ -296,6 +296,25 @@ Rules that affect what is recorded:
   `declared_calls_keep_the_user_store_identity_and_carry_the_owner`,
   `an_unfinished_call_is_recorded_at_once_in_a_done_folder_and_waits_in_an_active_one`,
   `a_folder_seen_done_gets_a_full_pass_before_it_releases_the_watermark`.
+- A `kind: "shared"` entry declares THALAMUS's shared OpenCode 2 store at
+  `<H>/opencode2-server/data/opencode`. Its `sessions` items carry each listed
+  session's owner and state; unlisted sessions still read with no work class
+  and the active-session quiet window. A session item may declare
+  `imported_through_seq`, the copy's highest `session_message.seq` when it was
+  made. Only assistant rows above that boundary are eligible for billing;
+  sequence gaps do not change the comparison. Full and tail reads count rows
+  at or below it in `skipped_imported`, on the reader page and OpenCode 2 drain
+  outcome, before decoding their data or retaining open rows. These skips do
+  not hold the cursor, open-row floor or watermark. The field is optional and
+  does not affect folder entries or the plain `opencode-v2` source. A wrong
+  type makes the roots file unreadable under its existing last-good-list
+  rule. Astrocyte must support the field and be live before THALAMUS writes
+  it, and THALAMUS must write the item before the copy accepts messages;
+  declarations never undo calls already recorded or waiting for a payer.
+  See the [shared-session amendment](thalamus-opencode-sessions-contract.md#amendment-copied-history-in-a-shared-session).
+  Tests: `shared_copy_cutoff_skips_history_without_holding_progress`,
+  `shared_copy_cutoff_rejects_bad_values_as_unreadable_roots`,
+  `v2_copied_history_is_counted_without_pinning_full_or_tail_reads`.
 - After every complete pass over the declared folders, the source stores its
   read watermark (`read_watermark`, see the [data model](data-model.md)) in
   the transaction that records the pass. The stored value is the greater of

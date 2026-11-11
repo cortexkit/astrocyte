@@ -125,6 +125,49 @@ ignored, so either side can add fields without a coordinated release. In
 particular, an extra `work_class` field does not override `owner_principal`.
 A changed existing meaning bumps `version`.
 
+### Amendment: copied history in a shared session
+
+A shared-store session item may also carry `imported_through_seq`, a
+non-negative integer. It is the copy's highest `session_message.seq` at the
+moment the copy was made on the store. This covers any copied session,
+including imported or forked copies; it does not depend on how the copy was
+made. Sequence values are ordered within a session but may have gaps. For
+example, a session item may be:
+
+```json
+{
+  "session": "ses_copy",
+  "session_ref": "s-copy",
+  "owner_principal": "prefrontal-core",
+  "state": "active",
+  "done_at_ms": null,
+  "imported_through_seq": 1200
+}
+```
+
+Astrocyte records only assistant rows in that session whose `seq` is greater
+than `imported_through_seq`. Rows at or below the boundary are counted as
+skipped copied history, not recorded or set aside. They do not hold the read
+cursor, the open-row floor or the read watermark. The watermark's recording
+guarantee excludes this deliberately skipped history. Without the field,
+every row remains eligible for recording under the existing rules. The field
+applies only to shared-store session items, not to per-session folder entries
+or the user's plain `opencode-v2` source.
+
+A present value of the wrong type, including null, a negative number or a
+non-integer number, makes the session item unreadable. As with other typed
+session fields, this makes the roots file malformed: astrocyte keeps the last
+good entry list and degrades the source.
+
+An astrocyte version implementing this amendment must be deployed and live
+before THALAMUS writes the field; older readers ignore unknown fields and
+would bill the copied history. THALAMUS writes the session item, including
+the boundary, before the copy accepts any message. A row read before its
+session item or boundary is declared remains eligible for billing. A later
+declaration does not undo an already recorded call or a call already waiting
+for its payer. This preserves the existing behaviour for undeclared sessions.
+This amendment keeps roots-file `version: 1`.
+
 | Roots file state | Astrocyte's behaviour |
 |---|---|
 | Absent | No sessions: no source row, health unaffected. |
@@ -135,7 +178,7 @@ A changed existing meaning bumps `version`.
 
 Calls keep producer `opencode`, since OpenCode ran the loop, and their
 identity is OpenCode's own message id, exactly as for the user's OpenCode
-store. If a message was already recorded, including before it was imported
+store. If a message was already recorded, including before it was copied
 into a shared store from a head folder, its first record stands: it is not
 recorded again or quarantined. Astrocyte reads both OpenCode layouts
 (OpenCode 1's `message` table and OpenCode 2's `session_message`) with its

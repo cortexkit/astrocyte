@@ -87,8 +87,17 @@ struct Session {
 #[derive(Clone, Deserialize)]
 struct SharedSession {
     session: String,
+    #[serde(default, deserialize_with = "imported_through_seq")]
+    imported_through_seq: Option<u64>,
     #[serde(flatten)]
     metadata: Session,
+}
+
+fn imported_through_seq<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    // Only absence means no boundary; an explicit null is not an integer.
+    u64::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -422,8 +431,12 @@ fn read_folder(
         Err(error) => return Err(format!("inspect {}: {error}", database.display()).into()),
     }
     let mut sessions = HashMap::new();
+    let mut imported = HashMap::new();
     if let Store::Shared { sessions: listed } = &entry.store {
         for session in listed {
+            imported
+                .entry(session.session.as_str())
+                .or_insert(session.imported_through_seq);
             sessions
                 .entry(session.session.clone())
                 .or_insert(SessionOptions {
@@ -473,7 +486,14 @@ fn read_folder(
         // waits in other layouts and folders.
         state.set_payer_waiting(SOURCE_KEY, other_waiting + folder.payer_waiting());
     }
-    folder.v2.drain_declared(state, at, stop, options)?;
+    let outcome = folder
+        .v2
+        .drain_declared(state, at, stop, options, &|session| {
+            imported.get(session).copied().flatten()
+        })?;
+    tracing::debug!(target: "drain", recorded = outcome.recorded,
+        skipped_imported = outcome.skipped_imported, skipped_recorded = outcome.skipped_recorded,
+        "declared OpenCode 2 drain");
     state.set_payer_waiting(SOURCE_KEY, other_waiting + folder.payer_waiting());
     if settling {
         folder.settled = (!has_v1 || folder.v1.full_pass_reached_high_water())
@@ -1356,6 +1376,124 @@ mod tests {
             })
             .unwrap();
         assert_eq!(output, 15);
+        assert_eq!(f.degraded(), None);
+    }
+
+    #[test]
+    fn shared_copy_cutoff_rejects_bad_values_as_unreadable_roots() {
+        for bad in [
+            json!(-1),
+            json!(1.5),
+            json!(1.0),
+            json!("11"),
+            json!(null),
+            json!(true),
+            json!([]),
+            json!({}),
+        ] {
+            let f = Fixture::new();
+            f.shared_call("copy", "history", true, T0);
+            let mut session = Fixture::shared_session("copy", false);
+            session["imported_through_seq"] = bad.clone();
+            f.declare(vec![f.shared_entry(vec![session])]);
+            f.tick(T0);
+            assert!(f.events().is_empty(), "{bad}");
+            assert!(
+                f.degraded()
+                    .unwrap()
+                    .contains("decode OpenCode session roots"),
+                "{bad}"
+            );
+            assert_eq!(f.watermark(), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn shared_copy_cutoff_accepts_zero_and_unsigned_maximum() {
+        for through in [0, u64::MAX] {
+            let mut value = Fixture::shared_session("copy", false);
+            value["imported_through_seq"] = json!(through);
+            let session: SharedSession = serde_json::from_value(value).unwrap();
+            assert_eq!(session.imported_through_seq, Some(through));
+        }
+    }
+
+    #[test]
+    fn folder_entries_ignore_the_shared_copy_cutoff() {
+        let f = Fixture::new();
+        f.call(ONE, Layout::V2, "folder-call", true, T0);
+        let mut entry = f.entry(ONE, false);
+        entry["imported_through_seq"] = json!("not a shared-session field");
+        f.declare(vec![entry]);
+        f.tick(T0);
+        assert_eq!(
+            f.events(),
+            vec![("folder-call".into(), "opencode".into(), Some(OWNER.into()))]
+        );
+        assert_eq!(f.degraded(), None);
+    }
+
+    #[test]
+    fn shared_copy_cutoff_skips_history_without_holding_progress() {
+        let mut f = Fixture::new();
+        for (session, id, seq, complete) in [
+            ("copy", "copied-old", 2, true),
+            ("copy", "copied-open", 8, false),
+            ("copy", "copied-boundary", 11, true),
+            ("copy", "live-first", 19, true),
+            ("ordinary", "ordinary-call", 3, true),
+            ("unlisted", "unlisted-call", 4, true),
+        ] {
+            f.shared_call(session, id, complete, T0);
+            Connection::open(f.shared_path().join("opencode.db"))
+                .unwrap()
+                .execute(
+                    "UPDATE session_message SET seq=?1 WHERE id=?2",
+                    params![seq, id],
+                )
+                .unwrap();
+        }
+        let mut copy = Fixture::shared_session("copy", false);
+        copy["owner_principal"] = json!("copy-owner");
+        copy["imported_through_seq"] = json!(11);
+        f.declare(vec![f.shared_entry(vec![
+            copy,
+            Fixture::shared_session("ordinary", false),
+        ])]);
+        f.tick(T0);
+        assert_eq!(
+            f.events(),
+            vec![
+                (
+                    "live-first".into(),
+                    "opencode".into(),
+                    Some("copy-owner".into())
+                ),
+                (
+                    "ordinary-call".into(),
+                    "opencode".into(),
+                    Some(OWNER.into())
+                ),
+                ("unlisted-call".into(), "opencode".into(), None),
+            ]
+        );
+        assert_eq!(f.v2_floor(), Some(6));
+        assert_eq!(f.watermark(), Some(T0 - WATERMARK_MARGIN_MS));
+
+        f.shared_call("copy", "live-next", true, T0 + TICK);
+        Connection::open(f.shared_path().join("opencode.db"))
+            .unwrap()
+            .execute("UPDATE session_message SET seq=25 WHERE id='live-next'", [])
+            .unwrap();
+        f.tick(T0 + TICK);
+        f.restart();
+        f.tick(T0 + QUIET_WINDOW);
+        assert_eq!(
+            f.refs(),
+            vec!["live-first", "live-next", "ordinary-call", "unlisted-call"]
+        );
+        assert_eq!(f.v2_floor(), Some(7));
+        assert_eq!(f.watermark(), Some(T0 + QUIET_WINDOW - WATERMARK_MARGIN_MS));
         assert_eq!(f.degraded(), None);
     }
 

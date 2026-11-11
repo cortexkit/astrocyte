@@ -18,12 +18,20 @@ use crate::TokenBreakdown;
 /// process died before settlement. Recent incomplete token snapshots are not final.
 pub const QUIET_WINDOW: i64 = 60 * 60 * 1_000;
 
+/// Per-session finality and copied-history boundary for a shared store.
+#[derive(Clone, Copy, Default)]
+pub struct SessionPolicy {
+    pub settled: bool,
+    pub imported_through_seq: Option<u64>,
+}
+
 #[derive(Debug, Default)]
 pub struct Page {
     pub messages: Vec<OpenCodeMessage>,
     pub set_aside: Vec<OpenCodeSetAside>,
     pub open_rows: Vec<OpenCodeOpenRow>,
     pub skipped_legacy: usize,
+    pub skipped_imported: usize,
     pub lineage: String,
     pub consumed: i64,
     pub high_water: i64,
@@ -145,6 +153,30 @@ pub fn read_page_with_settled_sessions(
     stop: &AtomicBool,
     settled: &dyn Fn(&str) -> bool,
 ) -> Result<Option<Page>, OpenCodeReadError> {
+    read_page_with_sessions(
+        path,
+        cursor,
+        open_row_floor,
+        limit,
+        now_ms,
+        stop,
+        &|session| SessionPolicy {
+            settled: settled(session),
+            ..SessionPolicy::default()
+        },
+    )
+}
+
+/// Read a full page, consuming copied history without emitting or retaining it.
+pub fn read_page_with_sessions(
+    path: &Path,
+    cursor: Option<&OpenCodeCursor>,
+    open_row_floor: Option<i64>,
+    limit: usize,
+    now_ms: i64,
+    stop: &AtomicBool,
+    sessions: &dyn Fn(&str) -> SessionPolicy,
+) -> Result<Option<Page>, OpenCodeReadError> {
     with_read_snapshot(path, stop, |connection| {
         let Some(mut page) = begin_page(connection, stop, true)? else {
             return Ok(None);
@@ -236,7 +268,7 @@ pub fn read_page_with_settled_sessions(
             .map_err(|e| format!("encode OpenCode 2 incomplete rowids: {e}"))?;
         let mut statement = connection
             .prepare(
-                "SELECT rowid,id,session_id,time_updated,data FROM session_message
+                "SELECT rowid,id,session_id,time_updated,data,seq FROM session_message
              WHERE type='assistant' AND time_updated<=?2 AND
                (time_updated>=?1 OR rowid IN (SELECT value FROM json_each(?3)))
              ORDER BY seq",
@@ -249,7 +281,7 @@ pub fn read_page_with_settled_sessions(
             .next()
             .map_err(|e| sqlite_error(stop, "step OpenCode 2 page", e))?
         {
-            take_row(connection, row, legacy, now_ms, stop, &mut page, settled)?;
+            take_row(connection, row, legacy, now_ms, stop, &mut page, sessions)?;
         }
         drop(rows);
         page.cost.add_statement(&statement);
@@ -282,7 +314,9 @@ pub fn read_tail(
     stop: &AtomicBool,
 ) -> Result<Option<Page>, OpenCodeReadError> {
     with_read_snapshot(path, stop, |connection| {
-        read_tail_snapshot(connection, request, now_ms, stop, true, &|_| false)
+        read_tail_snapshot(connection, request, now_ms, stop, true, &|_| {
+            SessionPolicy::default()
+        })
     })
 }
 
@@ -326,8 +360,26 @@ impl TailReader {
         check_marker: bool,
         settled: &dyn Fn(&str) -> bool,
     ) -> Result<Option<Page>, OpenCodeReadError> {
+        self.read_with_sessions(path, request, now_ms, stop, check_marker, &|session| {
+            SessionPolicy {
+                settled: settled(session),
+                ..SessionPolicy::default()
+            }
+        })
+    }
+
+    /// Read a tail with the same copied-history and finality rules as a full page.
+    pub fn read_with_sessions(
+        &self,
+        path: &Path,
+        request: &OpenCodeTailRequest<'_>,
+        now_ms: i64,
+        stop: &AtomicBool,
+        check_marker: bool,
+        sessions: &dyn Fn(&str) -> SessionPolicy,
+    ) -> Result<Option<Page>, OpenCodeReadError> {
         in_read_snapshot(&self.connection, path, stop, |connection| {
-            read_tail_snapshot(connection, request, now_ms, stop, check_marker, settled)
+            read_tail_snapshot(connection, request, now_ms, stop, check_marker, sessions)
         })
     }
 }
@@ -338,7 +390,7 @@ fn read_tail_snapshot(
     now_ms: i64,
     stop: &AtomicBool,
     check_marker: bool,
-    settled: &dyn Fn(&str) -> bool,
+    sessions: &dyn Fn(&str) -> SessionPolicy,
 ) -> Result<Option<Page>, OpenCodeReadError> {
     let Some(mut page) = begin_page(connection, stop, check_marker)? else {
         return Ok(None);
@@ -357,7 +409,7 @@ fn read_tail_snapshot(
     // Range over all types so a run of user rows also advances the tail.
     let mut statement = crate::read_io::prepare_cached(
         connection,
-        "SELECT rowid,id,session_id,time_updated,data,type FROM session_message
+        "SELECT rowid,id,session_id,time_updated,data,seq,type FROM session_message
              WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT ?3",
     )
     .map_err(|e| sqlite_error(stop, "prepare OpenCode 2 tail", e))?;
@@ -376,11 +428,11 @@ fn read_tail_snapshot(
                 .map_err(|e| sqlite_error(stop, "read OpenCode 2 rowid", e))?;
         }
         if row
-            .get::<_, String>(5)
+            .get::<_, String>(6)
             .map_err(|e| sqlite_error(stop, "read OpenCode 2 type", e))?
             == "assistant"
         {
-            take_row(connection, row, legacy, now_ms, stop, &mut page, settled)?;
+            take_row(connection, row, legacy, now_ms, stop, &mut page, sessions)?;
         }
     }
     drop(rows);
@@ -391,7 +443,7 @@ fn read_tail_snapshot(
         .any(|&rowid| rowid <= page.start_rowid)
     {
         let mut lookup = crate::read_io::prepare_cached(connection,
-            "SELECT rowid,id,session_id,time_updated,data FROM session_message WHERE rowid=?1 AND type='assistant'",
+            "SELECT rowid,id,session_id,time_updated,data,seq FROM session_message WHERE rowid=?1 AND type='assistant'",
         ).map_err(|e| sqlite_error(stop, "prepare OpenCode 2 pending lookup", e))?;
         let start = page.start_rowid;
         for rowid in request.open_rowids.iter().filter(|&&id| id <= start) {
@@ -402,7 +454,7 @@ fn read_tail_snapshot(
                 .next()
                 .map_err(|e| sqlite_error(stop, "step OpenCode 2 pending row", e))?
             {
-                take_row(connection, row, legacy, now_ms, stop, &mut page, settled)?;
+                take_row(connection, row, legacy, now_ms, stop, &mut page, sessions)?;
             }
         }
         page.cost.add_statement(&lookup);
@@ -417,7 +469,7 @@ fn take_row(
     now_ms: i64,
     stop: &AtomicBool,
     page: &mut Page,
-    settled: &dyn Fn(&str) -> bool,
+    sessions: &dyn Fn(&str) -> SessionPolicy,
 ) -> Result<(), OpenCodeReadError> {
     if stop.load(Ordering::Relaxed) {
         return Err(OpenCodeReadError::Stopped);
@@ -430,6 +482,16 @@ fn take_row(
         .map_err(|e| sqlite_error(stop, "read OpenCode 2 id", e))?;
     let decoded = (|| -> Result<Option<OpenCodeMessage>, String> {
         let session_id: String = row.get(2).map_err(|e| format!("read session: {e}"))?;
+        let policy = sessions(&session_id);
+        if let Some(through) = policy.imported_through_seq {
+            let seq: i64 = row.get(5).map_err(|e| format!("read sequence: {e}"))?;
+            if i128::from(seq) <= i128::from(through) {
+                // Copied rows cannot be new spend, even if their data is
+                // incomplete or malformed. Do not let them pin an open floor.
+                page.skipped_imported += 1;
+                return Ok(None);
+            }
+        }
         let updated_at_ms = row.get(3).map_err(|e| format!("read update time: {e}"))?;
         let mut bytes = row
             .get::<_, String>(4)
@@ -448,7 +510,7 @@ fn take_row(
             .as_ref()
             .is_some_and(|time| time.completed.is_some());
         let quiet = now_ms.saturating_sub(updated_at_ms) >= QUIET_WINDOW;
-        if !completed && !quiet && !settled(&session_id) {
+        if !completed && !quiet && !policy.settled {
             page.open_rows.push(OpenCodeOpenRow {
                 rowid,
                 updated_at_ms,

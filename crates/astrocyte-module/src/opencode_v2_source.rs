@@ -12,7 +12,7 @@ use astrocyte_core::ingest::{EventRecordRequest, RecordDisposition, StepDetail};
 use astrocyte_readers::sessions::opencode::{
     OpenCodeMessage, OpenCodeReadError, OpenCodeScanCost, OpenCodeTailRequest,
 };
-use astrocyte_readers::sessions::opencode_v2::{self, Page, TailReader};
+use astrocyte_readers::sessions::opencode_v2::{self, Page, SessionPolicy, TailReader};
 use astrocyte_readers::{
     file_identity::{file_identity, same_identity},
     read_io,
@@ -59,6 +59,7 @@ impl Signature {
 pub(crate) struct Outcome {
     pub recorded: usize,
     pub skipped_legacy: usize,
+    pub skipped_imported: usize,
     pub skipped_recorded: usize,
     pub absent: bool,
     pub full: bool,
@@ -183,8 +184,16 @@ impl OpenCodeV2Source {
         now: i64,
         stop: &AtomicBool,
         options: ReadOptions<'_>,
+        imported_through_seq: &dyn Fn(&str) -> Option<u64>,
     ) -> Result<Outcome, SourceDrainError> {
-        self.drain_with_options(state, now, stop, DrainMode::Full, options)
+        self.drain_with_options(
+            state,
+            now,
+            stop,
+            DrainMode::Full,
+            options,
+            imported_through_seq,
+        )
     }
 
     fn drain_in_lane(
@@ -194,7 +203,7 @@ impl OpenCodeV2Source {
         stop: &AtomicBool,
         mode: DrainMode,
     ) -> Result<Outcome, SourceDrainError> {
-        self.drain_with_options(state, now, stop, mode, ReadOptions::default())
+        self.drain_with_options(state, now, stop, mode, ReadOptions::default(), &|_| None)
     }
 
     fn drain_with_options(
@@ -204,8 +213,9 @@ impl OpenCodeV2Source {
         stop: &AtomicBool,
         mode: DrainMode,
         options: ReadOptions<'_>,
+        imported_through_seq: &dyn Fn(&str) -> Option<u64>,
     ) -> Result<Outcome, SourceDrainError> {
-        let result = self.drain_inner(state, now, stop, mode, options);
+        let result = self.drain_inner(state, now, stop, mode, options, imported_through_seq);
         if result.is_err() || !self.home.retains_connection() {
             self.cache.lock().unwrap_or_else(|p| p.into_inner()).reader = None;
         }
@@ -219,6 +229,7 @@ impl OpenCodeV2Source {
         stop: &AtomicBool,
         mode: DrainMode,
         options: ReadOptions<'_>,
+        imported_through_seq: &dyn Fn(&str) -> Option<u64>,
     ) -> Result<Outcome, SourceDrainError> {
         if stop.load(Ordering::Relaxed) {
             return Err(SourceDrainError::Stopped);
@@ -271,9 +282,12 @@ impl OpenCodeV2Source {
         let mut extra_cost = OpenCodeScanCost::default();
         // Finality belongs to a session in a shared store, not to the server:
         // another session may still be streaming while a done one is erased.
-        let settled = |session: &str| options.session_settled(session);
+        let sessions = |session: &str| SessionPolicy {
+            settled: options.session_settled(session),
+            imported_through_seq: imported_through_seq(session),
+        };
         let page = if full {
-            self.full_page(state, path, now, stop, &settled, replaced)?
+            self.full_page(state, path, now, stop, &sessions, replaced)?
         } else {
             if cache.reader.is_none() {
                 let Some(reader) = TailReader::open(path, stop).map_err(read_error)? else {
@@ -286,7 +300,7 @@ impl OpenCodeV2Source {
                 .reader
                 .as_ref()
                 .expect("opened v2 tail reader")
-                .read_with_settled_sessions(
+                .read_with_sessions(
                     path,
                     &OpenCodeTailRequest {
                         after_rowid: cache.tail,
@@ -297,7 +311,7 @@ impl OpenCodeV2Source {
                     now,
                     stop,
                     mode.is_full(),
-                    &settled,
+                    &sessions,
                 )
                 .map_err(read_error)?;
             if !self.home.retains_connection() {
@@ -325,7 +339,7 @@ impl OpenCodeV2Source {
                         });
                     }
                     full = true;
-                    self.full_page(state, path, now, stop, &settled, true)?
+                    self.full_page(state, path, now, stop, &sessions, true)?
                 }
                 page => page,
             }
@@ -396,18 +410,18 @@ impl OpenCodeV2Source {
         path: &std::path::Path,
         now: i64,
         stop: &AtomicBool,
-        settled: &dyn Fn(&str) -> bool,
+        sessions: &dyn Fn(&str) -> SessionPolicy,
         reset_floor: bool,
     ) -> Result<Option<Page>, SourceDrainError> {
         let (cursor, floor) = self.home.read_cursor_with_open_row_floor(state)?;
-        opencode_v2::read_page_with_settled_sessions(
+        opencode_v2::read_page_with_sessions(
             path,
             cursor.as_ref(),
             floor.filter(|_| !reset_floor),
             PAGE_LIMIT,
             now,
             stop,
-            settled,
+            sessions,
         )
         .map_err(read_error)
     }
@@ -438,6 +452,7 @@ impl HarnessSource for OpenCodeV2Source {
         let outcome = self.drain(state, now, stop)?;
         tracing::debug!(target: "drain", recorded = outcome.recorded,
             skipped_legacy = outcome.skipped_legacy, skipped_recorded = outcome.skipped_recorded,
+            skipped_imported = outcome.skipped_imported,
             absent = outcome.absent, full = outcome.full, vm_steps = outcome.cost.vm_steps,
             "OpenCode 2 drain");
         Ok(None)
@@ -472,6 +487,7 @@ fn commit(
         #[cfg(test)]
         incomplete_cost: page.map(|page| page.incomplete_cost).unwrap_or_default(),
         skipped_legacy: page.map(|page| page.skipped_legacy).unwrap_or_default(),
+        skipped_imported: page.map(|page| page.skipped_imported).unwrap_or_default(),
         ..Outcome::default()
     };
     if !mode.has_work(
@@ -1163,6 +1179,57 @@ mod tests {
             1
         );
         assert_eq!(count(&state, "usage_event"), 2);
+    }
+
+    #[test]
+    fn v2_copied_history_is_counted_without_pinning_full_or_tail_reads() {
+        let (_temp, path, conn) = database();
+        insert(&conn, "copied-open", 10, &payload(10, false));
+        insert(&conn, "copied-complete", 10, &payload(10, true));
+        insert(&conn, "live", 20, &payload(20, true));
+        conn.execute("UPDATE session_message SET seq=seq*10", [])
+            .unwrap();
+        let state = test_state();
+        let source = OpenCodeV2Source::at(path);
+        let through = |session: &str| (session == "session").then_some(20);
+        let full = source
+            .drain_declared(&state, 20, &STOP, ReadOptions::default(), &through)
+            .unwrap();
+        assert!(full.full);
+        assert_eq!(full.skipped_imported, 2);
+        assert_eq!(full.recorded, 1);
+        assert_eq!(stored_floor(&state), Some(3));
+        assert!(source.cache.lock().unwrap().open.is_empty());
+        let (_, consumed, high) = runtime(&state);
+        assert_eq!((consumed, high), (20, 20));
+        let tail = source
+            .drain_declared(&state, 21, &STOP, ReadOptions::default(), &through)
+            .unwrap();
+        assert!(!tail.full);
+        assert_eq!(tail.skipped_imported, 2);
+        assert_eq!(tail.recorded, 0);
+        assert!(source.cache.lock().unwrap().open.is_empty());
+        assert_eq!(count(&state, "usage_event"), 1);
+        assert_eq!(quantity(&state, "output"), 13);
+        assert_eq!(count(&state, "set_aside_record"), 0);
+    }
+
+    #[test]
+    fn v2_copy_cutoff_releases_a_previously_open_pending_row() {
+        let (_temp, path, conn) = database();
+        insert(&conn, "pending", 10, &payload(10, false));
+        let state = test_state();
+        let source = OpenCodeV2Source::at(path);
+        source.drain(&state, 10, &STOP).unwrap();
+        source.drain(&state, 11, &STOP).unwrap();
+        assert_eq!(source.cache.lock().unwrap().open.len(), 1);
+        let tail = source
+            .drain_declared(&state, 12, &STOP, ReadOptions::default(), &|_| Some(1))
+            .unwrap();
+        assert!(!tail.full);
+        assert_eq!(tail.skipped_imported, 1);
+        assert!(source.cache.lock().unwrap().open.is_empty());
+        assert_eq!(count(&state, "usage_event"), 0);
     }
 
     #[test]
