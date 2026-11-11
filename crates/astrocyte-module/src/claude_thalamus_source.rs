@@ -26,7 +26,22 @@ struct Root {
     _session_ref: String,
     path: PathBuf,
     owner_principal: String,
+    #[serde(default, deserialize_with = "deserialize_owner_session")]
+    owner_session: Option<String>,
     state: SessionState,
+}
+
+fn deserialize_owner_session<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let session = String::deserialize(deserializer)?;
+    if session.is_empty() {
+        return Err(serde::de::Error::custom(
+            "owner_session must be a nonempty string",
+        ));
+    }
+    Ok(Some(session))
 }
 
 #[derive(Clone, Deserialize, PartialEq)]
@@ -254,7 +269,13 @@ impl ClaudeThalamusSource {
                     .map(|r| r.producer_ref.clone())
                     .collect::<HashSet<_>>(),
             );
-            requests.extend(read.requests.into_iter().map(|request| {
+            requests.extend(read.requests.into_iter().map(|mut request| {
+                let native_session = if let Some(owner_session) = &root.owner_session {
+                    request.session = Some(owner_session.clone());
+                    Some(root.session.clone())
+                } else {
+                    None
+                };
                 WaitingCall {
                     completed_at_ms: read
                         .completed_at_ms
@@ -262,10 +283,24 @@ impl ClaudeThalamusSource {
                         .copied()
                         .flatten(),
                     request,
+                    native_session,
                 }
             }));
             set_aside.extend(read.set_aside);
             resumes.insert(canonical, read.cache);
+        }
+        if !cache.payer_wait.is_empty() {
+            let sessions = roots
+                .iter()
+                .filter(|root| accepted.contains(&root.session))
+                .map(|root| {
+                    (
+                        root.session.as_str(),
+                        root.owner_session.as_deref().unwrap_or(&root.session),
+                    )
+                })
+                .collect();
+            cache.payer_wait.update_recorded_sessions(&sessions);
         }
         claude_code_source::record_requests_in_lane(
             state,

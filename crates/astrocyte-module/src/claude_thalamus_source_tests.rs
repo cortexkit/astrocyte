@@ -1,4 +1,219 @@
 const PAYER_COMPLETION_MS: i64 = 1_788_220_801_000;
+const OWNER_SESSION: &str = "ses_core_bound_conversation";
+
+impl Fixture {
+    fn live_call(&self, request: &str) {
+        self.call(SESSION, request, true);
+        let path = self.config(SESSION).join(format!(
+            "projects/encoded-cwd/session/subagents/{request}.jsonl"
+        ));
+        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // The feed retains only calls from the last day, unlike the ledger.
+        record["timestamp"] = json!(chrono::Utc::now().to_rfc3339());
+        fs::write(path, format!("{record}\n")).unwrap();
+    }
+
+    fn owned_root(&self, done: bool) -> Value {
+        let mut root = self.root(SESSION, done);
+        root["owner_session"] = json!(OWNER_SESSION);
+        root
+    }
+
+    fn event_sessions(&self) -> Vec<(String, String)> {
+        self.state
+            .with_conn(|conn| {
+                Ok(conn
+                    .prepare("SELECT producer_ref,session FROM usage_event ORDER BY producer_ref")
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap())
+            })
+            .unwrap()
+    }
+
+    fn feed_rows(&self) -> Value {
+        let page = crate::step_feed::read(&self.state, json!({}))
+            .unwrap_or_else(|error| panic!("{}: {}", error.code, error.message));
+        serde_json::to_value(page).unwrap()["rows"].clone()
+    }
+}
+
+#[test]
+fn claude_owner_session_is_recorded_in_ledger_and_step_feed() {
+    for (root_has_owner, expected) in [(true, OWNER_SESSION), (false, SESSION)] {
+        let f = Fixture::new();
+        f.live_call("one");
+        f.declare(vec![if root_has_owner {
+            f.owned_root(true)
+        } else {
+            f.root(SESSION, true)
+        }]);
+        f.tick(crate::state::now_ms());
+        assert_eq!(f.event_sessions(), vec![("one".into(), expected.into())]);
+        assert_eq!(
+            f.events(),
+            vec![(
+                "one".into(),
+                "claude-code".into(),
+                Some("prefrontal-core verbatim".into())
+            )]
+        );
+        let rows = f.feed_rows();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["session"], expected);
+        assert_eq!(rows[0]["harness"], "claude-code");
+        assert_eq!(rows[0]["step_ref"], "one");
+        assert_eq!(f.acks()["read_through"][0]["session"], SESSION);
+    }
+}
+
+#[test]
+fn claude_owner_session_refuses_empty_or_wrong_type() {
+    for value in [
+        json!(""),
+        json!(null),
+        json!(42),
+        json!(false),
+        json!([]),
+        json!({}),
+    ] {
+        let f = Fixture::new();
+        f.call(SESSION, "unreadable", true);
+        let mut root = f.root(SESSION, true);
+        root["owner_session"] = value.clone();
+        f.declare(vec![root]);
+        f.tick(PAYER_COMPLETION_MS);
+        assert!(f.events().is_empty(), "owner_session {value}");
+        assert!(f.feed_rows().as_array().unwrap().is_empty());
+        assert_eq!(f.runtime(), Some((Some(PAYER_COMPLETION_MS), true)));
+        assert!(!f.ack.exists());
+    }
+}
+
+#[test]
+fn claude_owner_session_appearing_later_preserves_recorded_calls() {
+    for managed in [false, true] {
+        let mut f = Fixture::new();
+        if managed {
+            f.manage_payer_session();
+            f.payer("old", "metered_api");
+            f.payer("new", "metered_api");
+        }
+        f.live_call("old");
+        f.declare(vec![f.root(SESSION, true)]);
+        let at = crate::state::now_ms();
+        f.tick(at);
+        assert_eq!(f.event_sessions(), vec![("old".into(), SESSION.into())]);
+        f.declare(vec![f.owned_root(true)]);
+        f.live_call("new");
+        // A fresh reader must redeliver the old call, not skip it via file offsets.
+        f.source = ClaudeThalamusSource::from_data_home(fs::canonicalize(f.temp.path()).unwrap());
+        f.tick(at + 1);
+        assert_eq!(
+            f.event_sessions(),
+            vec![
+                ("new".into(), OWNER_SESSION.into()),
+                ("old".into(), SESSION.into())
+            ]
+        );
+        let rows = f.feed_rows();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        assert_eq!(rows[0]["session"], SESSION);
+        assert_eq!(rows[1]["session"], OWNER_SESSION);
+        f.state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM rejected_delivery", [], |row| row
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(f.runtime(), Some((Some(at + 1), false)));
+        assert_eq!(f.acks()["read_through"][0]["session"], SESSION);
+    }
+}
+
+#[test]
+fn claude_owner_session_updates_unrecorded_waiting_calls() {
+    for (initial_owner, final_owner, expected) in [
+        (None, Some(OWNER_SESSION), OWNER_SESSION),
+        (Some(OWNER_SESSION), None, SESSION),
+        (Some(OWNER_SESSION), Some("ses_rebound"), "ses_rebound"),
+    ] {
+        let f = Fixture::new();
+        f.manage_payer_session();
+        f.call(SESSION, "waiting", true);
+        let mut root = f.root(SESSION, true);
+        if let Some(owner) = initial_owner {
+            root["owner_session"] = json!(owner);
+        }
+        f.declare(vec![root]);
+        f.tick(PAYER_COMPLETION_MS);
+        assert!(f.events().is_empty());
+        assert_eq!(f.state.payer_waiting().get(SOURCE_KEY), Some(&1));
+        assert_eq!(f.acks()["read_through"], json!([]));
+        let mut root = f.root(SESSION, true);
+        if let Some(owner) = final_owner {
+            root["owner_session"] = json!(owner);
+        }
+        f.declare(vec![root]);
+        f.payer("waiting", "metered_api");
+        f.tick(PAYER_COMPLETION_MS + 1);
+        assert_eq!(
+            f.event_sessions(),
+            vec![("waiting".into(), expected.into())]
+        );
+        assert_eq!(
+            f.payer_facts(),
+            vec![(
+                "waiting".into(),
+                "metered_api".into(),
+                Some("vault-login".into()),
+                Some("provider-account".into())
+            )]
+        );
+        assert_eq!(f.state.payer_waiting().get(SOURCE_KEY), Some(&0));
+        assert_eq!(f.acks()["read_through"][0]["session"], SESSION);
+    }
+}
+
+#[test]
+fn claude_owner_session_keeps_native_payer_join_and_deletion_ack() {
+    let f = Fixture::new();
+    f.manage_payer_session();
+    f.call(SESSION, "waiting", true);
+    f.declare(vec![f.owned_root(true)]);
+    f.tick(PAYER_COMPLETION_MS);
+    assert!(f.events().is_empty());
+    assert_eq!(f.state.payer_waiting().get(SOURCE_KEY), Some(&1));
+    assert_eq!(f.acks()["read_through"], json!([]));
+    f.payer("waiting", "subscription_included");
+    f.fast(PAYER_COMPLETION_MS + 1);
+    assert_eq!(
+        f.event_sessions(),
+        vec![("waiting".into(), OWNER_SESSION.into())]
+    );
+    assert_eq!(
+        f.payer_facts(),
+        vec![(
+            "waiting".into(),
+            "subscription_included".into(),
+            Some("vault-login".into()),
+            Some("provider-account".into())
+        )]
+    );
+    f.tick(PAYER_COMPLETION_MS + 2);
+    assert_eq!(
+        f.acks()["read_through"],
+        json!([{"session":SESSION,"at_ms":PAYER_COMPLETION_MS + 2}])
+    );
+    assert_eq!(f.state.payer_waiting().get(SOURCE_KEY), Some(&0));
+}
 
 #[test]
 fn claude_payer_idle_fast_pass_starts_no_store_transaction() {

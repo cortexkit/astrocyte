@@ -1,6 +1,6 @@
 //! Transactional payer selection and bounded, process-local transcript waits.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use astrocyte_core::{
     fact::{event_id, ChargeBasis},
@@ -13,12 +13,24 @@ use super::thalamus_payer_source::{count_coverage, mark_conflicts, payer_match, 
 pub(crate) const PAYER_WAIT_MS: i64 = 600_000;
 pub(crate) const MAX_WAITING_CALLS: usize = 10_000;
 
-/// A completed transcript call. Completion is separate from the immutable
+/// A completed transcript call. Completion is separate from the
 /// event payload, whose occurrence time may be the start of a streamed call.
 #[derive(Debug, Clone)]
 pub(crate) struct WaitingCall {
     pub(crate) request: EventRecordRequest,
     pub(crate) completed_at_ms: Option<i64>,
+    /// The transcript's native session id (Claude Code's own id) when
+    /// `request.session` holds core's bound conversation id. Payer membership
+    /// and deletion acknowledgements still use this native id.
+    pub(crate) native_session: Option<String>,
+}
+
+impl WaitingCall {
+    fn native_session(&self) -> Option<&str> {
+        self.native_session
+            .as_deref()
+            .or(self.request.session.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -38,6 +50,22 @@ pub(crate) struct Resolution {
 }
 
 impl WaitQueue {
+    /// Refresh only the recorded session of unrecorded calls from current
+    /// declarations. Keep the native id for payer membership and deletion acks.
+    pub(crate) fn update_recorded_sessions(&mut self, sessions: &HashMap<&str, &str>) {
+        for call in self.waiting.values_mut() {
+            let Some(native_session) = call.native_session() else {
+                continue;
+            };
+            let Some(&session) = sessions.get(native_session) else {
+                continue;
+            };
+            let native_session = native_session.to_owned();
+            call.request.session = Some(session.to_owned());
+            call.native_session = Some(native_session);
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.waiting.is_empty()
     }
@@ -50,7 +78,8 @@ impl WaitQueue {
     pub(crate) fn pending_sessions(&self) -> HashSet<String> {
         self.waiting
             .values()
-            .filter_map(|call| call.request.session.clone())
+            .filter_map(WaitingCall::native_session)
+            .map(str::to_owned)
             .collect()
     }
 
@@ -90,11 +119,12 @@ impl WaitQueue {
             )
             .map_err(|e| format!("derive waiting call identity: {e:?}"))?;
             // A transcript may redeliver a queued call while replaying a held
-            // durable cursor. Keep its original completion and parsed payload.
+            // durable cursor. Keep its completion and payload; the roots reader
+            // refreshes only the queued session attribution from declarations.
             if !was_waiting && self.waiting.contains_key(&id) {
                 continue;
             }
-            let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM thalamus_payer_session WHERE harness=?1 AND session=?2)",params![harness,request.session],|row|row.get(0)).map_err(|e|e.to_string())?;
+            let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM thalamus_payer_session WHERE harness=?1 AND session=?2)",params![harness,call.native_session()],|row|row.get(0)).map_err(|e|e.to_string())?;
             if !managed {
                 result.ready.push(request.clone());
                 continue;
@@ -198,7 +228,7 @@ mod tests {
     use serde_json::json;
 
     fn call(reference: &str, completed: Option<i64>) -> WaitingCall {
-        WaitingCall { request: serde_json::from_value(json!({"producer":"pi","producer_ref":reference,"session":"session-a","provider":"anthropic","model":"model-a","occurred_at_ms":100,"charge_basis":"unknown","measurements":[]})).unwrap(),completed_at_ms:completed }
+        WaitingCall { request: serde_json::from_value(json!({"producer":"pi","producer_ref":reference,"session":"session-a","provider":"anthropic","model":"model-a","occurred_at_ms":100,"charge_basis":"unknown","measurements":[]})).unwrap(),completed_at_ms:completed, native_session:None }
     }
     fn manage(state: &SharedState) {
         state

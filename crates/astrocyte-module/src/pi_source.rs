@@ -957,6 +957,7 @@ fn record_requests(
                 request: request.clone(),
                 // Pi writes each assistant entry with the completed response.
                 completed_at_ms: request.occurred_at_ms,
+                native_session: None,
             })
             .collect::<Vec<_>>();
         let payer = payer_wait.resolve_in_tx(tx, "pi", &calls, recorded_at_ms)?;

@@ -28,6 +28,7 @@ THALAMUS atomically replaces
       "session_ref": "runner/head",
       "path": "/home/me/.local/share/cortexkit/thalamus-harness/claude-code/sessions/01234567-89ab-4cde-8123-456789abcdef/config",
       "owner_principal": "prefrontal-core",
+      "owner_session": "ses_core_bound_conversation",
       "state": "active",
       "done_at_ms": null
     }
@@ -50,6 +51,11 @@ THALAMUS atomically replaces
   mismatched sessions and escaping symlinks are all refused. Entries resolving
   to the same folder, including aliases, are refused rather than choosing an owner.
 - `owner_principal` is stored verbatim as `work_class` on newly recorded calls.
+- `owner_session` is optional. When present, it must be a nonempty string and
+  names core's bound session id for the conversation, not Claude Code's own id.
+  A wrong type or an empty string makes the roots file unreadable: astrocyte
+  keeps the last good entry list, degrades the source, and issues no new
+  acknowledgements, as for other fields that cannot decode.
 - `state` is exactly `active` or `done`. Once `done`, the session will never write
   again. `done_at_ms` is null while active and the Unix millisecond completion
   time when done; astrocyte uses `state`, not this time,
@@ -76,8 +82,17 @@ session lineage. The independent health and progress source key is
 removes the source's runtime row. Active heads can stay active forever and are
 read on every full refresher tick.
 
+On newly recorded calls, `session` is the entry's `owner_session` when present,
+falling back to Claude Code's own session id when absent. The folder path,
+payer-session lookup and read acknowledgement still use the entry's `session`,
+Claude Code's own id. No event identity, producer reference or money changes.
+Calls still waiting for payer facts use the session attribution from the current
+valid declaration when they are recorded, without changing their other fields.
+
 If a call's identity already exists in the ledger, it counts as recorded. The
-first event, including its original work class and measurements, stands.
+first event, including its original session, work class and measurements, stands.
+Calls recorded before `owner_session` appeared keep their old session; a later
+declaration neither rewrites nor quarantines them.
 THALAMUS can move or copy a session's earlier transcripts from another config
 directory into a private folder; the new owner label must not turn that history
 into quarantined contradictions. This identity check happens in the recording
@@ -127,4 +142,7 @@ Tests live beside the source in `claude_thalamus_source.rs`. They cover valid
 reads, unchanged event identity and verbatim ownership, all refused folder
 shapes, duplicate and aliased entries, active heads, quiet-window completion,
 post-commit acknowledgements, moved transcripts, configuration exclusion,
-absent roots, unknown versions, malformed registries and blocked resumed calls.
+absent roots, unknown versions, malformed registries, blocked resumed calls,
+owner-session attribution in the ledger and the `usage.steps.read` feed,
+invalid owner-session values, unchanged earlier calls and native-session payer
+joins and acknowledgements.

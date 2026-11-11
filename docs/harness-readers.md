@@ -162,6 +162,13 @@ Each source resolves its store path by these rules, implemented in
   folders may be inside `opencode-sessions/` or at the sibling
   `launch-head-<name>/data/opencode` runner-head paths. The binding rules are the
   [OpenCode sessions contract](thalamus-opencode-sessions-contract.md).
+- THALAMUS's private Claude Code configs come from
+  `<data home>/cortexkit/thalamus-harness/claude-code/roots.json`, under the
+  [Claude Code sessions contract](thalamus-claude-code-sessions-contract.md).
+  An entry's optional, nonempty `owner_session` is core's bound conversation id
+  and becomes the recorded call's session, with Claude Code's own id as fallback.
+  Already-recorded calls keep their original session. Payer-session membership
+  and deletion acknowledgements still use Claude Code's own id.
 - broca's store is read only at the default data-home path. A
   `BROCA_STATE_ROOT` elsewhere puts it where astrocyte does not look, and it
   reads as absent.

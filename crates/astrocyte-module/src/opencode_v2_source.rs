@@ -533,6 +533,7 @@ fn commit(
                     calls.push(WaitingCall {
                         request: options.stamp(request),
                         completed_at_ms: message.completed_at_ms,
+                        native_session: None,
                     });
                 }
                 Err(reason) => evidence.push(SetAsideRecord {

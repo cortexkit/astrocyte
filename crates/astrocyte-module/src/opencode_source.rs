@@ -1052,6 +1052,7 @@ fn map_messages(
             Ok(request) => requests.push(WaitingCall {
                 request: options.stamp(request),
                 completed_at_ms,
+                native_session: None,
             }),
             Err(reason) => set_aside.push(crate::refresher::SetAsideRecord { locator, reason }),
         }
@@ -1122,6 +1123,7 @@ fn commit_page_with_evidence(
         .map(|request| WaitingCall {
             request: request.clone(),
             completed_at_ms: None,
+            native_session: None,
         })
         .collect::<Vec<_>>();
     commit_page_in_lane(
