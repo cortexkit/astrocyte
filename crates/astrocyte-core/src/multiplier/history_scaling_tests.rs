@@ -43,13 +43,14 @@ fn texts(conn: &Connection, sql: &str, bounds: &[&dyn rusqlite::ToSql]) -> Vec<S
 }
 
 fn query_plan(conn: &Connection, sql: &str) -> String {
-    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+    let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    let unbound = vec![rusqlite::types::Null; statement.parameter_count()];
+    let details: Vec<String> = statement
+        .query_map(rusqlite::params_from_iter(unbound), |row| row.get(3))
         .unwrap()
-        .query_map([], |row| row.get::<_, String>(3))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
-        .join("\n")
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    details.join("\n")
 }
 
 /// The fixture's account readings, one a minute. `history` older readings sit
@@ -115,7 +116,7 @@ fn scaled_quota_history(history: i64) -> Connection {
 #[test]
 fn membership_and_seen_identities_follow_identities_not_readings() {
     let config = config(vec![rule("pi", "openai", None)]);
-    let declaration = config.quota_providers["codex"].clone();
+    let declaration = config.config.quota_providers["codex"].clone();
     let measure = |history| {
         let conn = scaled_quota_history(history);
         let (resolved, membership) = vm_steps(&conn, || {
@@ -208,7 +209,7 @@ fn counter_delta_stops_at_the_first_reading_after_the_interval() {
 #[test]
 fn other_window_readings_after_the_first_match_are_not_read() {
     let config = config(vec![rule("pi", "openai", None)]);
-    let declaration = config.quota_providers["codex"].clone();
+    let declaration = config.config.quota_providers["codex"].clone();
     let measure = |other_window: i64| {
         let conn = conn();
         quota_reading(
@@ -457,9 +458,15 @@ fn observation_history(days: u64) -> Connection {
     let mut conn = conn();
     let mut observation = sample_observation(&conn);
     let tx = conn.transaction().unwrap();
-    let first = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+    let first = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     for day in 0..days {
-        observation.observation_day = (first + chrono::Days::new(day)).to_string();
+        // A day is named by the UTC date its interval ends on.
+        let start = i64::try_from(day).unwrap() * DAY;
+        observation.interval_start_ms = start;
+        observation.interval_end_ms = start + DAY;
+        observation.token_interval_start_ms = Some(start);
+        observation.token_interval_end_ms = Some(start + DAY);
+        observation.observation_day = (first + chrono::Days::new(day + 1)).to_string();
         insert_observation_in_tx(&tx, &observation).unwrap();
     }
     tx.commit().unwrap();
@@ -480,9 +487,9 @@ fn day_head_lookups_do_not_scan_other_days() {
         vm_steps(&conn, || {
             (
                 observation_plan_head(&conn, "codex", "2019-06-01", plan.as_deref()).unwrap(),
-                observation_plan_head(&conn, "codex", "2020-01-02", plan.as_deref()).unwrap(),
+                observation_plan_head(&conn, "codex", "1970-01-03", plan.as_deref()).unwrap(),
                 observation_exists(&conn, "codex", "2019-06-01").unwrap(),
-                observation_head(&conn, "codex", "2020-01-02").unwrap(),
+                observation_head(&conn, "codex", "1970-01-03").unwrap(),
             )
         })
     };

@@ -560,13 +560,14 @@ mod tests {
     }
 
     fn query_plan(conn: &Connection, sql: &str) -> String {
-        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let unbound = vec![rusqlite::types::Null; statement.parameter_count()];
+        let details: Vec<String> = statement
+            .query_map(rusqlite::params_from_iter(unbound), |row| row.get(3))
             .unwrap()
-            .query_map([], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap()
-            .join("\n")
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        details.join("\n")
     }
 
     #[test]
