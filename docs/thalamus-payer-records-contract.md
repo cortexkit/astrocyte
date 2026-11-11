@@ -103,7 +103,14 @@ CREATE TABLE payer_record (
   transcript call. It is that call's own key: the entry's `requestId` (the
   `request-id` response header) for Claude Code, the message id for OpenCode,
   and the shared `pi_step_ref` key from `cortexkit-usage-steps` for Pi. A
-  row-less row never carries one.
+  Claude Code request can go out through a company's own Anthropic gateway,
+  which may drop or replace the `request-id` header; Claude Code then writes
+  the entry without a `requestId`. For such a request `step_ref` is the
+  stream's message id (`message.id`, the same value as
+  `provider_response_id`), and `provider_request_id` is NULL. Astrocyte keys
+  that transcript call by its message id, so the two still meet. Anthropic
+  request ids start `req_` and message ids `msg_`, so the two kinds of key never
+  name the same string. A row-less row never carries a `step_ref`.
 - `recorded_at_ms`: when the harness module wrote the row.
 - `provider`, `model`: the provider and the model actually sent.
 - `charge_basis`: `subscription_included` or `metered_api`. It is stated, never

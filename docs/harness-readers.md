@@ -171,7 +171,7 @@ Each source resolves its store path by these rules, implemented in
 | Source key | One event | `producer_ref` | `producer_lineage` |
 |---|---|---|---|
 | `thalamus-payer` | One row-less attempt, or one entry of its model fallback array | `attempt_id`, or `<attempt_id>#<1-based entry position>` | session |
-| `claude-code` | One API request: the records sharing a `requestId`, folded at the per-field maximum | `requestId` | none |
+| `claude-code` | One API request: the records sharing a `requestId` (or, without one, a `message.id`), folded at the per-field maximum | `requestId`, else `message.id` | none |
 | `codex` | One advancing `token_count` record (`last_token_usage`) | `<turn id>:<n>` for the n-th response of the turn, else `<thread id>:ordinal:<n>` | `session_meta.session_id` |
 | `codex` | One otherwise unconfirmed `token_usage_record` | `<thread id>:request:response:<response id>`, else `<thread id>:request:ordinal:<n>` | `session_meta.session_id` |
 | `opencode`, `opencode-thalamus` | One assistant `message` row whose tokens are final (`time.completed` or `finish` set) | `message.id` | none |
@@ -234,6 +234,20 @@ Rules that affect what is recorded:
   `per_block_copies_of_one_call_become_one_event_at_the_per_field_max`,
   `an_interrupted_call_is_ingested_once_after_the_quiet_window_with_null_status`,
   `a_call_already_recorded_by_thalamus_is_skipped`.
+- A Claude Code call is keyed by its `requestId`, the Anthropic `request-id`
+  response header. A company's own Anthropic gateway may drop or replace that
+  header, and Claude Code then writes the entry without a `requestId` (absent,
+  null and empty all count as missing). Such an entry is keyed by its
+  `message.id` when it has one and at least one non-zero usage count; the event
+  then has no `vendor_request_id`, and the parse counts these records as
+  `records_keyed_by_message_id`. An entry with no `requestId` whose counts are
+  all zero or absent is a local notice: it is counted in
+  `records_without_request_id` and records nothing, as is one with no message
+  id. Anthropic request ids start `req_` and message ids `msg_`, so the two
+  kinds of key never collide; a transcript where they do has that call
+  refused, not merged. Tests:
+  `billed_record_without_request_id_is_keyed_by_its_message_id`,
+  `message_id_key_equal_to_a_request_id_key_is_refused_not_merged`.
 - A Codex subagent fork replays its parent's turns; replayed turns are
   skipped, and a moved rollout re-reads as exact redeliveries.
 - A Codex archive uses the same parser and event identities as its plain twin;
@@ -522,8 +536,9 @@ its own model. An unreadable row is mirrored where its columns decode and set
 aside with its location and reason; the next row still reads.
 
 A completed transcript call in a mirrored payer session joins by harness and
-its existing producer reference: Claude Code's `requestId`, OpenCode's message
-id or Pi's shared `pi_step_ref`. Only `subscription_included` and `metered_api`
+its existing producer reference: Claude Code's `requestId` (or its message id
+when the entry has no `requestId`, which THALAMUS then stores as `step_ref`),
+OpenCode's message id or Pi's shared `pi_step_ref`. Only `subscription_included` and `metered_api`
 are known bases; other values and NULL stay unknown. A matching row supplies
 `auth_selection` and `account_ref` without guessing from the login's type.
 Without a matching row, the parsed call waits in the reader's bounded queue
