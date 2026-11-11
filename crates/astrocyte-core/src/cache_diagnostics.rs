@@ -2414,7 +2414,8 @@ mod tests {
 
     /// Every served read the projection feeds, serialized as served: steps
     /// windows with and without a cursor, the feed's per-session rows, a
-    /// runner step's row, the flip check and the sessions report.
+    /// runner step's row, `session_read_cache_through` (whether a step at or
+    /// before a cursor read a positive cache count) and the sessions report.
     fn served_reads(conn: &Connection) -> Vec<String> {
         fn json<T: Serialize>(value: &T) -> String {
             serde_json::to_string(value).unwrap()
