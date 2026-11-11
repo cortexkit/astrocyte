@@ -582,22 +582,31 @@ fn revision(conn: &Connection, hour: Hour) -> Result<i64, ReportError> {
         .optional()?
         .unwrap_or(0))
 }
-/// The rows of one reduction chunk: the next `CHUNK` events of `hour` after the
-/// key cursor, in key order.
+/// The key of the last event in the next chunk of `hour` after the key
+/// cursor: the `CHUNK`th of the hour's later events in key order, or the
+/// hour's final one. Null when none is left.
 ///
-/// The page is picked inside a subquery pinned to the time index. Given only
+/// The selection is pinned to the time index. Given only
 /// `event_key>cursor ORDER BY event_key LIMIT`, SQLite prefers the key range
 /// because it already yields key order, and then tests the time of every later
-/// event in the ledger: on a resumed chunk of an old hour that is all history
-/// after it. The time index reads only the hour's own events and sorts them.
-/// The outer time terms let callers that force the time index themselves
-/// (`runs::observe`) seek it rather than walk all of it.
-fn chunk_filter(hour: Hour, after: Option<i64>) -> String {
+/// event in the ledger until the page fills: on the last chunk of an old hour
+/// that is all history after it. The time index reads only the hour's events.
+fn page_end_sql(hour: Hour, after: Option<i64>) -> String {
     let time = hour.filter();
     let after = after.map_or_else(String::new, |key| format!(" AND event_key>{key}"));
     format!(
-        "({time}) AND event_key IN (SELECT event_key FROM usage_event INDEXED BY usage_event_summary_time
-            WHERE ({time}){after} ORDER BY event_key LIMIT {CHUNK}) ORDER BY event_key"
+        "SELECT MAX(event_key) FROM (SELECT event_key FROM usage_event INDEXED BY usage_event_summary_time
+            WHERE ({time}){after} ORDER BY event_key LIMIT {CHUNK})"
+    )
+}
+/// The rows of one chunk: the hour's events with keys after the cursor up to
+/// and including the page end, which are exactly the page `page_end_sql`
+/// chose. Bounded on both sides, the key range holds no event after the page.
+fn chunk_filter(hour: Hour, after: Option<i64>, last: i64) -> String {
+    let after = after.map_or_else(String::new, |key| format!(" AND event_key>{key}"));
+    format!(
+        "({}){after} AND event_key<={last} ORDER BY event_key",
+        hour.filter()
     )
 }
 fn next_audit(conn: &Connection) -> Result<Option<Hour>, ReportError> {
@@ -696,15 +705,17 @@ impl SummaryMaintenance {
         if build.revision != revision(conn, build.hour)? {
             return Ok(false);
         }
-        let filter = chunk_filter(build.hour, build.after);
-        let count = build.data.observe(conn, &filter)?;
-        build.after = conn.query_row(
-            &format!(
-                "SELECT MAX(event_key) FROM (SELECT event_key FROM usage_event WHERE {filter})"
-            ),
-            [],
-            |row| row.get(0),
-        )?;
+        let last = conn.query_row(&page_end_sql(build.hour, build.after), [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?;
+        // An empty page reduces nothing, so it is not read.
+        let count = match last {
+            Some(last) => build
+                .data
+                .observe(conn, &chunk_filter(build.hour, build.after, last))?,
+            None => 0,
+        };
+        build.after = last;
         build.deferred = !build.audit
             && (build.data.cells.len()
                 + build.data.quantities.len()
@@ -2599,15 +2610,26 @@ mod tests {
             "resumed chunk VM steps grew with later history: {measured:?}"
         );
         let conn = busy_old_hour(10);
+        let hour = Hour { kind: 0, number: 0 };
+        let plan = query_plan(&conn, &page_end_sql(hour, Some(5_000)));
+        assert!(plan.contains("usage_event_summary_time"), "{plan}");
+        assert!(!plan.contains("rowid>"), "{plan}");
+        assert!(!plan.contains("SCAN usage_event"), "{plan}");
+        // Each reduction statement reads the page through a range closed on
+        // both sides, either the key range or the hour's time range.
         let plan = query_plan(
             &conn,
             &format!(
-                "SELECT MAX(event_key) FROM (SELECT event_key FROM usage_event WHERE {})",
-                chunk_filter(Hour { kind: 0, number: 0 }, Some(5_000))
+                "SELECT event_key FROM usage_event WHERE {}",
+                chunk_filter(hour, Some(5_000), 5_010)
             ),
         );
-        assert!(plan.contains("usage_event_summary_time"), "{plan}");
-        assert!(!plan.contains("rowid>"), "{plan}");
+        assert!(
+            plan.contains("(rowid>? AND rowid<?)")
+                || plan
+                    .contains("usage_event_summary_time (occurred_at_ms>? AND occurred_at_ms<?)"),
+            "{plan}"
+        );
         assert!(!plan.contains("SCAN usage_event"), "{plan}");
     }
 
