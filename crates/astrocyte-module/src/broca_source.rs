@@ -1197,6 +1197,103 @@ mod tests {
         assert!(projects[1].1.as_deref().unwrap().ends_with("/elsewhere"));
     }
 
+    /// A fork attempt's fact from BROCA's real billing builder
+    /// (tests/vectors/broca-fork-spend, 2026-11-12), beside the same call made
+    /// as an ordinary run of the head. A fork is a side question asked of a
+    /// head; BROCA bills it under the fork's own run and session, on the head's
+    /// credential. The fork's call must be recorded under its own session and
+    /// run, priced like the ordinary call, and never land in the head's session.
+    #[test]
+    fn a_broca_fork_attempt_is_recorded_under_its_own_session_and_run() {
+        let vector = |name: &str| {
+            std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/vectors/broca-fork-spend")
+                    .join(name),
+            )
+            .unwrap()
+        };
+        let fork = "142a21796560d3addebac4b60cee4e5de6954cba2d31d42997e52d9f430fc406";
+        let ordinary = "dd03e4928d18dfa65c69bebdbf893a53045154ee62572e399b4b6d38fa7e4e1f";
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("run-index.db");
+        create_store(&path, "instance-a", 1);
+        add_segment(
+            &path,
+            1,
+            ordinary,
+            vector("segment.ordinary.json").trim_end(),
+        );
+        add_segment(&path, 2, fork, vector("segment.fork.json").trim_end());
+        let state = test_state();
+
+        let outcome =
+            drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
+
+        assert_eq!(outcome.events_recorded, 2);
+        assert!(set_aside_rows(&state).is_empty());
+        type Recorded = (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Vec<(String, i64)>,
+        );
+        let recorded: Vec<Recorded> = state
+            .with_conn(|conn| {
+                let mut events = conn
+                    .prepare(
+                        "SELECT event_key,session,run_ref,account_ref,charge_basis FROM usage_event
+                         WHERE producer='broca' ORDER BY session",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = events
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                let mut measured = conn
+                    .prepare(
+                        "SELECT role,quantity_units FROM measurement
+                         WHERE event_key=?1 ORDER BY role",
+                    )
+                    .map_err(|error| error.to_string())?;
+                rows.into_iter()
+                    .map(|(key, session, run, account, basis)| {
+                        let measurements = measured
+                            .query_map([key], |row| Ok((row.get(0)?, row.get(1)?)))
+                            .map_err(|error| error.to_string())?
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|error| error.to_string())?;
+                        Ok((session, run, account, basis, measurements))
+                    })
+                    .collect()
+            })
+            .unwrap();
+        let [head, fork] = &recorded[..] else {
+            panic!("expected two calls, got {recorded:?}");
+        };
+        assert_eq!(head.0, "head");
+        assert_eq!(head.1.as_deref(), Some("head-run"));
+        assert_eq!(fork.0, "head:fork:fork-72f6bdfa7eb7fb4cdf456d38c4d99623");
+        assert_eq!(
+            fork.1.as_deref(),
+            Some("fork:1c5eb44ba863f5575b157804a784d72aee9e330ad3e7d5d8806e99272eabd6a0")
+        );
+        // The same credential, basis and usage as the ordinary call.
+        assert_eq!(fork.2.as_deref(), Some("synthetic-account"));
+        assert_eq!((&fork.2, &fork.3, &fork.4), (&head.2, &head.3, &head.4));
+        assert!(!fork.4.is_empty());
+    }
+
     /// Two session facts from BROCA's real billing builder with its lifetime
     /// split switched on (tests/vectors/broca-cache-write-split, 2026-11-10):
     /// one reporting a 30-token cache write as 10 five-minute and 20 one-hour

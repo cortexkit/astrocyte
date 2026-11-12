@@ -948,6 +948,32 @@ mod tests {
         ),
     ];
 
+    /// A fork attempt's step event as broca publishes it
+    /// (`tests/vectors/broca-fork-spend`, 2026-11-12). A fork is a side
+    /// question asked of a head: its event is an ordinary step of the fork's
+    /// own session and run, so it is served under that session. The head's
+    /// session gets no row from it, so a fork's prompt never counts as the
+    /// head's next step when the head's cache reuse is judged.
+    #[test]
+    fn a_broca_fork_step_event_is_served_under_the_fork_session() {
+        let bytes: &[u8] =
+            include_bytes!("../tests/vectors/broca-fork-spend/step-finished.fork.before.json");
+        let subject = names().live_subject("broca", STEP_EVENT, 1).unwrap();
+        let mut sent: Value = serde_json::from_slice(bytes).unwrap();
+        decode_step_finished(&subject, bytes).expect("the fork step event decodes");
+        let start = u64::try_from(now_ms()).unwrap() - 60_000;
+        sent["started_at_ms"] = json!(start);
+        sent["finished_at_ms"] = json!(start + 1_500);
+        let state = test_state();
+        admit(&state, &subject, &serde_json::to_vec(&sent).unwrap());
+        let fork_session = "head:fork:fork-72f6bdfa7eb7fb4cdf456d38c4d99623";
+        let served = rows(&state, json!({"harness": "broca", "session": fork_session}));
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0]["step_ref"], sent["attempt_id"]);
+        assert_eq!(served[0]["input"], 1200);
+        assert!(rows(&state, json!({"harness": "broca", "session": "head"})).is_empty());
+    }
+
     /// Every pinned broca body decodes on broca's live subject exactly as
     /// sent, keyed by runner and attempt id since broca sends no host record.
     /// Moved into the feed's window, each is served as its own runner row:
