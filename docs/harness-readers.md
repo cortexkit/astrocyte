@@ -23,6 +23,15 @@ a changed prefix makes the file be read again from the start. Events already
 recorded then come back as exact redeliveries, because each event's identity
 and content come from the file alone.
 
+Claude Code and Codex resume snapshots share retained call and turn history.
+Each read journals the previous values of keys it changes, rather than copying
+all historical entries. A successful ledger transaction publishes those changes;
+a failed or stopped drain explicitly restores the journal in reverse. Claude
+sessions declared in thalamus-harness's `claude-code/roots.json` resolve all staged
+file journals after their combined ledger transaction, before writing
+acknowledgements. A file rewrite starts with fresh
+history and leaves the old snapshot intact until the replacement commits.
+
 Pi, Claude Code, Codex, Oh My Pi, Kimi and Gemini
 JSONL verify the whole consumed prefix at least every 24 hours. Each path has
 a deterministic daily phase, so adding files does not move existing deadlines.
@@ -284,6 +293,13 @@ Rules that affect what is recorded:
   summed into a second event. Tests:
   `a_session_is_one_event_once_its_quiet_window_has_passed`,
   `a_session_that_grows_after_being_recorded_is_quarantined_not_re_summed`.
+  Each tick selects sessions at or beyond the last committed update time,
+  including timestamp ties, and reconsiders live or unreadable sessions. The
+  cursor is process-local and advances only after the ledger write succeeds.
+  A daily full read, or a detected store replacement, catches backdated updates.
+  The reader never adds an index to Goose's database: without a producer-owned
+  update-time index SQLite still scans timestamp metadata, but it does not decode
+  every historical session's payload and model JSON on each tick.
 - Declared OpenCode sessions are read from each folder in thalamus-harness's
   `roots.json`, which astrocyte re-reads on every full tick. A folder's path
   must be absolute and, after symlinks are resolved, either strictly inside
@@ -525,8 +541,11 @@ ledger rows, on every operating system.
 Both refresher lanes drain payer facts before transcript readers. Full ticks
 always read the store; incremental cycles first compare the size and modification
 time of `payer.db` and `payer.db-wal`, opening neither when those hints are
-unchanged. Reads use bounded sequence pages. Each page commits the session and
-insert-once attempt mirrors together with its incarnation and sequence cursor.
+unchanged. Reads use bounded sequence pages. The first page reads and mirrors
+all session declarations, including sessions with no attempts yet; later pages
+in that drain reuse the committed session snapshot instead of scanning and
+mirroring it again. A changed incarnation reloads the declarations. Each page
+commits its insert-once attempt mirrors with its incarnation and sequence cursor.
 The incarnation identifies one database history and changes when the store is
 created or restored. A change restarts at the lowest sequence, skipping attempt
 identities already mirrored. THALAMUS may delete its original rows only after the committed

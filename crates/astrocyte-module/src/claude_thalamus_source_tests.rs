@@ -339,6 +339,9 @@ fn claude_payer_mirrored_facts_are_stated_and_unmanaged_calls_stay_unchanged() {
         None,
     )
     .unwrap();
+    for transaction in read.transactions {
+        transaction.commit();
+    }
     crate::refresher::price_unpriced_events(&legacy, PAYER_COMPLETION_MS, &AtomicBool::new(false))
         .unwrap();
     fn snapshot(state: &SharedState) -> Vec<Vec<Vec<rusqlite::types::Value>>> {

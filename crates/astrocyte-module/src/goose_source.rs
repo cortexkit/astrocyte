@@ -14,7 +14,7 @@
 //! what Goose claims about the session, and it must never be overwritten or
 //! re-summed into a second event.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(any(test, feature = "test-support"))]
 use std::ffi::OsString;
 #[cfg(any(test, feature = "test-support"))]
@@ -25,7 +25,9 @@ use std::sync::Mutex;
 
 use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::EventRecordRequest;
-use astrocyte_readers::sessions::goose::{read_goose_sessions, GooseReadCounts, GooseSession};
+use astrocyte_readers::sessions::goose::{
+    read_goose_sessions_since, GooseReadCounts, GooseSession,
+};
 
 use crate::refresher::harness_drain::{
     derived_measurement, ensure_runtime_row, health_reason, record_requests,
@@ -40,6 +42,7 @@ pub(crate) const GOOSE_SOURCE_KEY: &str = "goose";
 /// accumulated usage is recorded. A day: Goose sessions are interactive, and
 /// one resumed within a day of its last change is still being used.
 pub(crate) const GOOSE_QUIET_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+const FULL_PASS_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GooseDrainOutcome {
@@ -80,6 +83,10 @@ struct GooseCache {
     /// every re-send of its changed totals would add another rejected
     /// delivery row.
     sent: HashMap<String, EventRecordRequest>,
+    through: Option<f64>,
+    recheck: HashSet<String>,
+    last_full_ms: Option<i64>,
+    signature: Option<(Option<(u64, u64)>, u64)>,
 }
 
 /// A process-local view over Goose's session store.
@@ -152,9 +159,10 @@ impl GooseSource {
 
     /// Read the store and commit every session past its quiet window.
     ///
-    /// The store is read on every drain, never skipped on an unchanged
-    /// length or mtime: file metadata is not a reliable change signal, and
-    /// the store is small enough that reading it costs nothing. Every drain
+    /// The store is queried on every drain, never skipped on an unchanged
+    /// length or mtime: file metadata is not a reliable change signal. Update
+    /// times select changed sessions; live and unreadable sessions are also
+    /// reconsidered. A daily full read catches backdated writes. Every drain
     /// also commits, even with nothing to record, because that commit is
     /// what marks the source current for health. Setting `stop` abandons the drain and
     /// returns `SourceDrainError::Stopped` having committed nothing.
@@ -178,6 +186,13 @@ impl GooseSource {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 record_source_discovery(state, GOOSE_SOURCE_KEY, db_path.display(), false);
                 remove_runtime_row(state, GOOSE_SOURCE_KEY)?;
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .map_err(|_| "Goose cache lock poisoned".to_string())?;
+                cache.through = None;
+                cache.last_full_ms = None;
+                cache.recheck.clear();
                 return Ok(GooseDrainOutcome {
                     root_absent: true,
                     ..GooseDrainOutcome::default()
@@ -189,32 +204,58 @@ impl GooseSource {
             }
         }
         ensure_runtime_row(state, GOOSE_SOURCE_KEY)?;
+        let database = astrocyte_readers::read_io::open(db_path)
+            .map_err(|error| format!("open Goose store {}: {error}", db_path.display()))?;
+        let metadata = database
+            .metadata()
+            .map_err(|error| format!("inspect Goose store {}: {error}", db_path.display()))?;
+        let signature = (
+            astrocyte_readers::file_identity::file_identity(&database, &metadata),
+            metadata.len(),
+        );
+        drop(database);
 
         let mut outcome = GooseDrainOutcome::default();
         if stop.load(Ordering::Relaxed) {
             return Err(SourceDrainError::Stopped);
         }
 
-        let mut sent = self
+        let mut cache = self
             .cache
             .lock()
-            .map_err(|_| "Goose cache lock poisoned".to_string())?
-            .sent
-            .clone();
-        let read = read_goose_sessions(db_path)?;
+            .map_err(|_| "Goose cache lock poisoned".to_string())?;
+        let replaced = cache
+            .signature
+            .is_some_and(|old| old.0 != signature.0 || signature.1 < old.1);
+        let full = replaced
+            || cache.last_full_ms.is_none_or(|last| {
+                recorded_at_ms < last
+                    || recorded_at_ms.saturating_sub(last) >= FULL_PASS_INTERVAL_MS
+            });
+        let read = read_goose_sessions_since(
+            db_path,
+            if full { None } else { cache.through },
+            &cache.recheck,
+        )?;
+        let mut recheck = read.recheck;
+        let through = read.through;
         outcome.store_read = true;
         outcome.counts = read.counts;
         let mut requests = Vec::new();
         let mut sent_now = Vec::new();
         for session in read.sessions {
             match session.updated_at_ms {
-                None => outcome.sessions_without_update_time += 1,
+                None => {
+                    recheck.insert(session.session_id);
+                    outcome.sessions_without_update_time += 1;
+                }
                 Some(updated) if recorded_at_ms.saturating_sub(updated) < self.quiet_window_ms => {
                     outcome.sessions_live += 1;
+                    recheck.insert(session.session_id);
                 }
                 Some(_) => {
                     let request = map_session(session)?;
-                    if sent.get(&request.producer_ref) != Some(&request) {
+                    if cache.sent.get(&request.producer_ref) != Some(&request) {
                         sent_now.push((request.producer_ref.clone(), request.clone()));
                         requests.push(request);
                     }
@@ -230,15 +271,19 @@ impl GooseSource {
         outcome.exact_redeliveries = tally.exact_redeliveries;
         outcome.quarantined_redeliveries = tally.quarantined_redeliveries;
 
-        *self
-            .cache
-            .lock()
-            .map_err(|_| "Goose cache lock poisoned".to_string())? = GooseCache {
-            sent: {
-                sent.extend(sent_now);
-                sent
-            },
+        cache.sent.extend(sent_now);
+        cache.recheck = recheck;
+        cache.through = if full {
+            through
+        } else {
+            through
+                .or(cache.through)
+                .map(|next| cache.through.map_or(next, |old| old.max(next)))
         };
+        if full {
+            cache.last_full_ms = Some(recorded_at_ms);
+        }
+        cache.signature = Some(signature);
         Ok(outcome)
     }
 }
@@ -334,6 +379,7 @@ mod tests {
     use super::*;
     use crate::refresher::run_iteration_with_harness;
     use crate::state::test_state;
+    use astrocyte_readers::sessions::goose::read_goose_sessions;
     use rusqlite::Connection;
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -414,6 +460,87 @@ mod tests {
                 rows
             })
             .unwrap()
+    }
+
+    #[test]
+    fn history_scaling_goose_reads_changed_sessions_and_inclusive_ties() {
+        let temp = TempDir::new().unwrap();
+        let path = store(temp.path());
+        let conn = Connection::open(&path).unwrap();
+        for index in 0..128 {
+            conn.execute("INSERT INTO sessions(id,working_dir,created_at,updated_at,provider_name,model_config_json,accumulated_input_tokens,accumulated_output_tokens) VALUES (?1,'/work','2026-07-10 00:00:00','2026-07-10 00:00:00','provider','{\"model_name\":\"model\"}',1,2)", [format!("old-{index}")]).unwrap();
+        }
+        let state = test_state();
+        let source = GooseSource::at(&path);
+        assert_eq!(drain(&source, &state, QUIET).rows_recorded, 129);
+        let idle = drain(&source, &state, QUIET + 1);
+        println!(
+            "Goose sessions=129 idle_payload_rows={}",
+            idle.counts.rows_read
+        );
+        assert_eq!(idle.counts.rows_read, 1);
+        assert_eq!(idle.sessions_emitted, 0);
+        for index in 0..3 {
+            conn.execute("INSERT INTO sessions(id,working_dir,created_at,updated_at,provider_name,model_config_json,accumulated_input_tokens,accumulated_output_tokens) VALUES (?1,'/work','2026-07-11 00:00:00','2026-07-11 14:54:30','provider','{\"model_name\":\"model\"}',1,2)", [format!("tie-{index}")]).unwrap();
+        }
+        let tied = drain(&source, &state, QUIET + 2);
+        assert_eq!(tied.rows_recorded, 3);
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM usage_event WHERE producer='goose'"
+            ),
+            132
+        );
+        conn.execute("UPDATE sessions SET accumulated_output_tokens=3,updated_at='2026-07-11 14:54:31' WHERE id='old-0'", []).unwrap();
+        let changed = drain(&source, &state, QUIET + 3);
+        assert_eq!(changed.quarantined_redeliveries, 0);
+        let quiet = drain(&source, &state, QUIET + 1_000);
+        assert_eq!(quiet.quarantined_redeliveries, 1);
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM usage_event WHERE producer='goose'"
+            ),
+            132
+        );
+    }
+
+    #[test]
+    fn history_scaling_goose_failed_commit_keeps_cursor_and_daily_full_finds_backdated_updates() {
+        let temp = TempDir::new().unwrap();
+        let path = store(temp.path());
+        let state = test_state();
+        let source = GooseSource::at(&path);
+        state.with_conn(|conn| conn.execute_batch("CREATE TRIGGER fail_goose BEFORE INSERT ON usage_event BEGIN SELECT RAISE(ABORT,'test failure'); END;").map_err(|error| error.to_string())).unwrap();
+        assert!(source.drain(&state, QUIET, &NEVER_STOP).is_err());
+        {
+            let cache = source.cache.lock().unwrap();
+            assert!(cache.through.is_none());
+            assert!(cache.sent.is_empty());
+            assert!(cache.last_full_ms.is_none());
+        }
+        state
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_goose")
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(drain(&source, &state, QUIET + 1).rows_recorded, 1);
+        grow(&path, "2026-07-10 00:00:00");
+        assert_eq!(drain(&source, &state, QUIET + 2).sessions_emitted, 0);
+        assert_eq!(
+            drain(&source, &state, QUIET + 1 + FULL_PASS_INTERVAL_MS).quarantined_redeliveries,
+            1
+        );
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM usage_event WHERE producer='goose'"
+            ),
+            1
+        );
+        assert_eq!(quantities(&state)["output"], Some(3718));
     }
 
     /// A session still inside its quiet window is not recorded; once quiet

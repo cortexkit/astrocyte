@@ -10,14 +10,14 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::EventRecordRequest;
 use astrocyte_readers::provider_identity::inferred_provider_from_model;
 use astrocyte_readers::sessions::claudecode::{
-    parse_claude_file_resumable, ClaudeCodeCall, ClaudeParseCounts, ClaudePrefixCheck,
-    ClaudeResumePoint, CLAUDE_CODE_QUIET_WINDOW_MS,
+    parse_claude_file_transactional, ClaudeCodeCall, ClaudeParseCounts, ClaudePrefixCheck,
+    ClaudeResumePoint, ReadTransaction, CLAUDE_CODE_QUIET_WINDOW_MS,
 };
 use rusqlite::params;
 
@@ -66,14 +66,23 @@ pub(crate) struct ClaudeCodeDrainOutcome {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ClaudeCodeCache {
     /// Where each file's next read may resume, with the call state its
-    /// consumed bytes produced. Taken out for a drain and put back only after
-    /// the drain's events commit, so a failed or stopped drain leaves no
-    /// resume point behind and the next drain reads every file in full,
-    /// which content-derived identity makes safe.
-    resume: HashMap<PathBuf, ClaudeResumePoint>,
+    /// consumed bytes produced. Snapshots share retained call history; staged
+    /// reads journal changed keys and roll them back if the ledger write fails.
+    /// Offsets and scheduling metadata publish only after that write commits.
+    resume: HashMap<PathBuf, Arc<ClaudeResumePoint>>,
     /// When each file's consumed prefix was last verified end to end.
     prefix_verified_ms: HashMap<PathBuf, i64>,
     windows: HashMap<PathBuf, crate::refresher::harness_drain::WindowSchedule>,
+}
+
+#[cfg(test)]
+impl ClaudeCodeCache {
+    pub(crate) fn state_snapshot(&self) -> BTreeMap<PathBuf, String> {
+        self.resume
+            .iter()
+            .map(|(path, point)| (path.clone(), point.state_snapshot()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -226,8 +235,9 @@ impl ClaudeCodeSource {
             set_aside,
             cache: next_cache,
             completed_at_ms: _,
+            transactions,
         } = read;
-        record_requests_in_lane(
+        let recorded = record_requests_in_lane(
             state,
             CLAUDE_CODE_SOURCE_KEY,
             &requests,
@@ -237,7 +247,15 @@ impl ClaudeCodeSource {
             &|| stop.load(Ordering::Relaxed),
             mode,
             None,
-        )?;
+        );
+        for transaction in transactions {
+            if recorded.is_ok() {
+                transaction.commit();
+            } else {
+                transaction.rollback();
+            }
+        }
+        recorded?;
 
         let mut cache = self
             .cache
@@ -248,12 +266,14 @@ impl ClaudeCodeSource {
     }
 }
 
+#[must_use = "resolve staged history transactions after the ledger write"]
 pub(crate) struct ClaudeCodeRead {
     pub(crate) outcome: ClaudeCodeDrainOutcome,
     pub(crate) requests: Vec<EventRecordRequest>,
     pub(crate) completed_at_ms: HashMap<String, Option<i64>>,
     pub(crate) set_aside: Vec<crate::refresher::SetAsideRecord>,
     pub(crate) cache: ClaudeCodeCache,
+    pub(crate) transactions: Vec<ReadTransaction>,
 }
 
 /// Read a Claude projects directory, returning proposed file offsets and call
@@ -266,6 +286,42 @@ pub(crate) fn read_projects(
     work_class: Option<&str>,
     stop: &AtomicBool,
     mode: DrainMode,
+) -> Result<ClaudeCodeRead, SourceDrainError> {
+    let mut transactions = Vec::new();
+    let result = read_projects_staged(
+        root,
+        previous,
+        recorded_at_ms,
+        quiet_window_ms,
+        work_class,
+        stop,
+        mode,
+        &mut transactions,
+    );
+    match result {
+        Ok(mut read) => {
+            read.transactions = transactions;
+            Ok(read)
+        }
+        Err(error) => {
+            for transaction in transactions.into_iter().rev() {
+                transaction.rollback();
+            }
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_projects_staged(
+    root: &Path,
+    previous: &ClaudeCodeCache,
+    recorded_at_ms: i64,
+    quiet_window_ms: i64,
+    work_class: Option<&str>,
+    stop: &AtomicBool,
+    mode: DrainMode,
+    transactions: &mut Vec<ReadTransaction>,
 ) -> Result<ClaudeCodeRead, SourceDrainError> {
     let files = if mode.is_full() {
         jsonl_files(root)
@@ -338,9 +394,15 @@ pub(crate) fn read_projects(
                 continue;
             }
         }
-        let previous_offset = point.as_ref().map(ClaudeResumePoint::offset);
-        let parse =
-            parse_claude_file_resumable(&path, point, check, recorded_at_ms, quiet_window_ms);
+        let previous_offset = point.as_ref().map(|point| point.offset());
+        let (parse, transaction) = parse_claude_file_transactional(
+            &path,
+            point.map(|point| (*point).clone()),
+            check,
+            recorded_at_ms,
+            quiet_window_ms,
+        );
+        transactions.push(transaction);
         if let Some(reason) = parse.io_error {
             return Err(
                 format!("read Claude Code session file {}: {reason}", path.display()).into(),
@@ -382,7 +444,7 @@ pub(crate) fn read_projects(
         outcome.calls_pending += parse.pending_calls;
         outcome.calls_emitted += parse.calls.len();
         if let Some(point) = parse.resume {
-            resume_points.insert(path.clone(), point);
+            resume_points.insert(path.clone(), Arc::new(point));
         }
         for call in parse.calls {
             let locator = format!("{path:?}:line:{}", call.source_line);
@@ -408,6 +470,7 @@ pub(crate) fn read_projects(
             prefix_verified_ms: verified_ms,
             windows,
         },
+        transactions: Vec::new(),
     })
 }
 
@@ -712,6 +775,59 @@ mod tests {
     use tempfile::TempDir;
 
     static NEVER_STOP: AtomicBool = AtomicBool::new(false);
+
+    #[test]
+    fn history_scaling_claude_fast_cycles_share_untouched_file_points() {
+        let temp = TempDir::new().unwrap();
+        let cold = write_file(
+            temp.path(),
+            "project/cold.jsonl",
+            &record("cold", 1, Some("end_turn"), CWD),
+        );
+        let hot = write_file(
+            temp.path(),
+            "project/hot.jsonl",
+            &record("hot", 1, Some("end_turn"), CWD),
+        );
+        let state = test_state();
+        let source = ClaudeCodeSource::at(temp.path());
+        assert_eq!(drain(&source, &state, 100).rows_recorded, 2);
+        let point = Arc::clone(&source.cache.lock().unwrap().resume[&cold]);
+        astrocyte_readers::sessions::claudecode::take_history_copies();
+        let idle = source
+            .drain_in_lane(&state, 101, &NEVER_STOP, DrainMode::Fast)
+            .unwrap();
+        assert_eq!(idle.calls_emitted, 0);
+        assert!(Arc::ptr_eq(
+            &point,
+            &source.cache.lock().unwrap().resume[&cold]
+        ));
+        assert_eq!(
+            astrocyte_readers::sessions::claudecode::take_history_copies(),
+            0
+        );
+        append(&hot, &record("new", 2, Some("end_turn"), CWD));
+        let next = source
+            .drain_in_lane(&state, 102, &NEVER_STOP, DrainMode::Fast)
+            .unwrap();
+        assert_eq!(next.rows_recorded, 1);
+        assert!(Arc::ptr_eq(
+            &point,
+            &source.cache.lock().unwrap().resume[&cold]
+        ));
+        assert_eq!(
+            astrocyte_readers::sessions::claudecode::take_history_copies(),
+            1
+        );
+        assert_eq!(
+            source.cache.lock().unwrap().resume[&hot].offset(),
+            fs::metadata(&hot).unwrap().len()
+        );
+        assert_eq!(
+            event_refs(&state),
+            BTreeSet::from(["cold".into(), "hot".into(), "new".into()])
+        );
+    }
 
     #[test]
     fn set_aside_claude_overflow_keeps_good_calls_and_resume() {

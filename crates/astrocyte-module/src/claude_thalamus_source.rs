@@ -93,6 +93,21 @@ impl ClaudeThalamusSource {
         at: i64,
         stop: &AtomicBool,
     ) -> Result<Option<String>, SourceDrainError> {
+        let mut transactions = Vec::new();
+        let result = self.drain_staged(state, at, stop, &mut transactions);
+        for transaction in transactions.into_iter().rev() {
+            transaction.rollback();
+        }
+        result
+    }
+
+    fn drain_staged(
+        &self,
+        state: &SharedState,
+        at: i64,
+        stop: &AtomicBool,
+        transactions: &mut Vec<astrocyte_readers::sessions::claudecode::ReadTransaction>,
+    ) -> Result<Option<String>, SourceDrainError> {
         let paths = self
             .paths
             .as_ref()
@@ -242,6 +257,7 @@ impl ClaudeThalamusSource {
                         completed_at_ms: HashMap::new(),
                         set_aside: vec![],
                         cache: ClaudeCodeCache::default(),
+                        transactions: Vec::new(),
                     }
                 }
                 Err(e) => {
@@ -252,6 +268,7 @@ impl ClaudeThalamusSource {
                     .into())
                 }
             };
+            transactions.extend(read.transactions);
             if read.outcome.counts.calls_refused > 0 || !read.set_aside.is_empty() {
                 blocked.insert(root.session.clone());
             }
@@ -313,6 +330,9 @@ impl ClaudeThalamusSource {
             harness_drain::DrainMode::Full,
             Some((&mut cache.payer_wait, &requests)),
         )?;
+        for transaction in transactions.drain(..) {
+            transaction.commit();
+        }
         cache.resumes = resumes;
         for (session, refs) in refs_by_session {
             if outcome.quarantined_refs.iter().any(|r| refs.contains(r)) {
@@ -776,6 +796,51 @@ mod tests {
             f.acks()["read_through"],
             json!([{"session":SESSION,"at_ms":200}])
         );
+    }
+
+    #[test]
+    fn history_scaling_combined_failure_restores_both_root_histories() {
+        let f = Fixture::new();
+        f.call(SESSION, "first", true);
+        f.call(OTHER, "second", true);
+        f.declare(vec![f.root(SESSION, false), f.root(OTHER, false)]);
+        f.tick(100);
+        let snapshot = || {
+            let cache = f.source.cache.lock().unwrap();
+            cache
+                .resumes
+                .iter()
+                .map(|(root, cache)| (root.clone(), cache.state_snapshot()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        for (session, old, new) in [(SESSION, "first", "third"), (OTHER, "second", "fourth")] {
+            use std::io::Write;
+            let path = f.config(session).join(format!(
+                "projects/encoded-cwd/session/subagents/{old}.jsonl"
+            ));
+            let old_line = fs::read_to_string(&path).unwrap();
+            let new_line = old_line.replace(old, new);
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            write!(file, "{old_line}{new_line}").unwrap();
+        }
+        f.state.with_conn(|conn| conn.execute_batch("CREATE TRIGGER fail_history BEFORE INSERT ON usage_event BEGIN SELECT RAISE(ABORT,'test failure'); END;").map_err(|e| e.to_string())).unwrap();
+        assert!(f
+            .source
+            .drain(&f.state, 200, &AtomicBool::new(false))
+            .is_err());
+        assert_eq!(snapshot(), before);
+        assert_eq!(f.events().len(), 2);
+        f.state
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_history")
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        f.tick(300);
+        assert_eq!(f.events().len(), 4);
+        f.tick(400);
+        assert_eq!(f.events().len(), 4);
     }
 
     #[test]

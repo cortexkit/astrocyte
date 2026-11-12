@@ -261,13 +261,25 @@ pub struct ClaudeCodeCall {
 }
 
 /// Where one call stands in a file's parse.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CallAggregate {
     call: ClaudeCodeCall,
     /// File order of the call's first record, so emission order is stable.
     first_seen: u64,
     /// Emitted at least once.
     emitted: bool,
+}
+
+impl Clone for CallAggregate {
+    fn clone(&self) -> Self {
+        #[cfg(any(test, feature = "test-support"))]
+        HISTORY_COPIES.with(|copies| copies.set(copies.get() + 1));
+        Self {
+            call: self.call.clone(),
+            first_seen: self.first_seen,
+            emitted: self.emitted,
+        }
+    }
 }
 
 #[cfg(not(test))]
@@ -279,24 +291,114 @@ use tests::CallHistory;
 ///
 /// Every call seen in the file is kept, emitted or not, so a late copy of an
 /// already-ingested call is compared against what was stored instead of
-/// being ingested as a new, partial call. A drain clones the committed state
-/// and only replaces it after commit, so failed reads and writes retain it.
+/// being ingested as a new, partial call. Resume snapshots share that history;
+/// a read journals changed keys until its caller commits or rolls it back.
 #[derive(Debug, Clone, Default)]
 struct ClaudeParseState {
     lines: u64,
-    calls: CallHistory,
+    history: std::sync::Arc<std::sync::Mutex<ClaudeHistory>>,
     /// Keys of calls with new or changed usage since last handed to ingest.
     /// Every aggregate stays in `calls` so later copies of a request can still
     /// be compared against the usage already read for that request.
     dirty: HashSet<String>,
     pending: usize,
-    refused: HashSet<String>,
     next_ordinal: u64,
     /// Timestamp of the latest `compact_boundary` record read in this file.
     last_compact_boundary_ms: Option<i64>,
-    /// Request ids seen in this file only as compaction replays (see
-    /// [`UsageRecord::is_compaction_replay`]). They are never emitted.
+}
+
+#[derive(Debug, Default)]
+struct ClaudeHistory {
+    calls: CallHistory,
+    refused: HashSet<String>,
+    /// Request ids seen only in compacted-context copies, not original usage.
+    /// See `UsageRecord::is_compaction_replay`; these copies are never emitted.
     replay_only: HashSet<String>,
+    active: bool,
+    undo: Vec<(String, Option<CallAggregate>, bool, bool)>,
+}
+
+impl ClaudeHistory {
+    fn save(&mut self, key: &str) {
+        if self.active {
+            let old = self.calls.get(key).cloned();
+            self.undo.push((
+                key.to_owned(),
+                old,
+                self.refused.contains(key),
+                self.replay_only.contains(key),
+            ));
+        }
+    }
+
+    fn resolve(&mut self, commit: bool) {
+        let undo = std::mem::take(&mut self.undo);
+        if !commit {
+            for (key, call, refused, replay) in undo.into_iter().rev() {
+                if let Some(call) = call {
+                    self.calls.insert(key.clone(), call);
+                } else {
+                    self.calls.remove(&key);
+                }
+                if refused {
+                    self.refused.insert(key.clone());
+                } else {
+                    self.refused.remove(&key);
+                }
+                if replay {
+                    self.replay_only.insert(key);
+                } else {
+                    self.replay_only.remove(&key);
+                }
+            }
+        }
+        self.active = false;
+    }
+}
+
+/// A staged reader history must be explicitly resolved after the ledger write.
+/// Dropping the token does not publish or undo the read.
+#[must_use = "commit the history after the ledger write, or explicitly roll it back"]
+#[derive(Default)]
+pub struct ReadTransaction {
+    resolutions: Vec<Box<dyn FnOnce(bool) + Send>>,
+}
+
+impl ReadTransaction {
+    pub(crate) fn add(&mut self, resolve: impl FnOnce(bool) + Send + 'static) {
+        self.resolutions.push(Box::new(resolve));
+    }
+
+    pub fn commit(self) {
+        self.resolve(true);
+    }
+
+    pub fn rollback(self) {
+        self.resolve(false);
+    }
+
+    fn resolve(self, commit: bool) {
+        for resolve in self.resolutions.into_iter().rev() {
+            resolve(commit);
+        }
+    }
+}
+
+fn begin_history(state: &ClaudeResumeState, transaction: &mut ReadTransaction) {
+    let history = std::sync::Arc::clone(&state.parse.history);
+    {
+        let mut held = history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!held.active, "a Claude history read is already staged");
+        held.active = true;
+    }
+    transaction.add(move |commit| {
+        history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolve(commit)
+    });
 }
 
 impl ClaudeParseState {
@@ -310,11 +412,16 @@ impl ClaudeParseState {
     }
 
     fn observe(&mut self, record: UsageRecord, counts: &mut ClaudeParseCounts) {
-        if self.refused.contains(&record.key) {
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if history.refused.contains(&record.key) {
             return;
         }
+        history.save(&record.key);
         if record.is_compaction_replay(self.last_compact_boundary_ms) {
-            match self.calls.get(&record.key) {
+            match history.calls.get(&record.key) {
                 // The original was read (in this parse or an earlier resumed
                 // one: the aggregates survive resumes). The copy is not a
                 // later snapshot, so it is neither merged nor refused.
@@ -331,22 +438,22 @@ impl ClaudeParseState {
                 // never reported; it is counted and never emitted.
                 None => {
                     counts.replayed_records += 1;
-                    if self.replay_only.insert(record.key) {
+                    if history.replay_only.insert(record.key) {
                         counts.replay_only_calls += 1;
                     }
                     return;
                 }
             }
         }
-        let Some(aggregate) = self.calls.get_mut(&record.key) else {
+        let Some(aggregate) = history.calls.get_mut(&record.key) else {
             // A genuine record for a request id seen so far only in replays
             // starts the call as usual.
-            self.replay_only.remove(&record.key);
+            history.replay_only.remove(&record.key);
             let ordinal = self.next_ordinal;
             self.next_ordinal += 1;
             self.dirty.insert(record.key.clone());
             self.pending += 1;
-            self.calls.insert(
+            history.calls.insert(
                 record.key.clone(),
                 CallAggregate {
                     call: ClaudeCodeCall {
@@ -384,19 +491,23 @@ impl ClaudeParseState {
                     self.pending -= 1;
                 }
                 self.dirty.remove(&record.key);
-                self.calls.remove(&record.key);
-                self.refused.insert(record.key);
+                history.calls.remove(&record.key);
+                history.refused.insert(record.key);
             }
         }
     }
 
     /// Calls to hand to ingest now, in file order; marks them emitted.
     fn take_emissions(&mut self, file_quiet: bool) -> Vec<ClaudeCodeCall> {
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut ready: Vec<String> = self
             .dirty
             .iter()
             .filter(|key| {
-                let aggregate = &self.calls[*key];
+                let aggregate = &history.calls[*key];
                 // A complete call is ready immediately. An incomplete call
                 // waits for quiet unless it was emitted before: later changes
                 // must reach the ledger's contradiction check.
@@ -404,11 +515,12 @@ impl ClaudeParseState {
             })
             .cloned()
             .collect();
-        ready.sort_by_key(|key| self.calls[key].first_seen);
+        ready.sort_by_key(|key| history.calls[key].first_seen);
         ready
             .into_iter()
             .map(|key| {
-                let aggregate = self.calls.get_mut(&key).expect("dirty call is retained");
+                history.save(&key);
+                let aggregate = history.calls.get_mut(&key).expect("dirty call is retained");
                 if !aggregate.emitted {
                     self.pending -= 1;
                 }
@@ -581,10 +693,54 @@ struct ClaudeResumeState {
 }
 
 /// Where a previous [`parse_claude_file_resumable`] stopped.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ClaudeResumePoint(JsonlResumePoint<ClaudeResumeState>);
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static HISTORY_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn take_history_copies() -> usize {
+    HISTORY_COPIES.with(|copies| copies.replace(0))
+}
+
+impl Clone for ClaudeResumePoint {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 impl ClaudeResumePoint {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn state_snapshot(&self) -> String {
+        let state = &self.0.state.parse;
+        let history = state.history.lock().unwrap();
+        let calls: std::collections::BTreeMap<_, _> = history
+            .calls
+            .iter()
+            .map(|(key, value)| (key, format!("{value:?}")))
+            .collect();
+        let refused: std::collections::BTreeSet<_> = history.refused.iter().collect();
+        let replay: std::collections::BTreeSet<_> = history.replay_only.iter().collect();
+        let dirty: std::collections::BTreeSet<_> = state.dirty.iter().collect();
+        format!(
+            "{:?}",
+            (
+                self.offset(),
+                self.0.state.last_growth_ms,
+                state.lines,
+                state.pending,
+                state.next_ordinal,
+                state.last_compact_boundary_ms,
+                calls,
+                refused,
+                replay,
+                dirty
+            )
+        )
+    }
     /// Bytes of the file already consumed; always just past a newline.
     pub fn offset(&self) -> u64 {
         self.0.offset()
@@ -743,6 +899,35 @@ pub fn parse_claude_file_resumable(
     now_ms: i64,
     quiet_window_ms: i64,
 ) -> ClaudeResumableParse {
+    let (parse, transaction) =
+        parse_claude_file_transactional(path, previous, check, now_ms, quiet_window_ms);
+    if parse.io_error.is_some() {
+        transaction.rollback();
+    } else {
+        transaction.commit();
+    }
+    parse
+}
+
+/// Stage a read against shared history. Resolve the returned transaction only
+/// after the caller's ledger write succeeds or fails. File rewrites start with
+/// fresh history, leaving the old history available on a failed write.
+pub fn parse_claude_file_transactional(
+    path: &Path,
+    previous: Option<ClaudeResumePoint>,
+    check: ClaudePrefixCheck,
+    now_ms: i64,
+    quiet_window_ms: i64,
+) -> (ClaudeResumableParse, ReadTransaction) {
+    let mut transaction = ReadTransaction::default();
+    if let Some(point) = &previous {
+        begin_history(&point.0.state, &mut transaction);
+    }
+    let fresh = ClaudeResumeState {
+        parse: ClaudeParseState::default(),
+        last_growth_ms: now_ms,
+    };
+    begin_history(&fresh, &mut transaction);
     let mut counts = ClaudeParseCounts::default();
     let mut set_aside = Vec::new();
     let mut buffer = Vec::with_capacity(4096);
@@ -751,10 +936,7 @@ pub fn parse_claude_file_resumable(
         previous.map(|point| point.0),
         check,
         // A first read, or a full re-read, counts as growth.
-        || ClaudeResumeState {
-            parse: ClaudeParseState::default(),
-            last_growth_ms: now_ms,
-        },
+        || fresh,
         |state, payload| {
             counts.lines += 1;
             let skipped = counts.skipped_lines;
@@ -770,10 +952,13 @@ pub fn parse_claude_file_resumable(
     let read = match read {
         Ok(read) => read,
         Err(error) => {
-            return ClaudeResumableParse {
-                io_error: Some(error.to_string()),
-                ..ClaudeResumableParse::default()
-            }
+            return (
+                ClaudeResumableParse {
+                    io_error: Some(error.to_string()),
+                    ..ClaudeResumableParse::default()
+                },
+                transaction,
+            )
         }
     };
     let mut state = read.state;
@@ -786,18 +971,21 @@ pub fn parse_claude_file_resumable(
     let calls = state.parse.take_emissions(file_quiet);
     let pending_calls = state.parse.pending_calls();
 
-    ClaudeResumableParse {
-        io_error: None,
-        set_aside,
-        calls,
-        resumed: read.resumed,
-        resume: read
-            .cursor
-            .map(|cursor| ClaudeResumePoint(cursor.with_state(state))),
-        hashed_bytes: read.hashed_bytes,
-        counts,
-        pending_calls,
-    }
+    (
+        ClaudeResumableParse {
+            io_error: None,
+            set_aside,
+            calls,
+            resumed: read.resumed,
+            resume: read
+                .cursor
+                .map(|cursor| ClaudeResumePoint(cursor.with_state(state))),
+            hashed_bytes: read.hashed_bytes,
+            counts,
+            pending_calls,
+        },
+        transaction,
+    )
 }
 
 #[cfg(test)]
@@ -819,7 +1007,7 @@ mod tests {
             self.visits.set(self.visits.get() + 1);
         }
 
-        pub(super) fn get(&self, key: &String) -> Option<&CallAggregate> {
+        pub(super) fn get(&self, key: &str) -> Option<&CallAggregate> {
             self.visit();
             self.rows.get(key)
         }
@@ -838,11 +1026,11 @@ mod tests {
             self.rows.remove(key);
         }
 
-        fn iter(&self) -> impl Iterator<Item = (&String, &CallAggregate)> {
+        pub(super) fn iter(&self) -> impl Iterator<Item = (&String, &CallAggregate)> {
             self.rows.iter().inspect(|_| self.visit())
         }
 
-        fn len(&self) -> usize {
+        pub(super) fn len(&self) -> usize {
             self.rows.len()
         }
     }
@@ -859,6 +1047,87 @@ mod tests {
     const WINDOW: i64 = CLAUDE_CODE_QUIET_WINDOW_MS;
 
     #[test]
+    fn history_scaling_claude_append_copies_only_changed_entries() {
+        for size in [1_000, 10_000] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let text: String = (0..size)
+                .map(|index| record(&format!("r{index}"), 1, Some("end_turn")) + "\n")
+                .collect();
+            std::fs::write(&path, text).unwrap();
+            let first =
+                parse_claude_file_resumable(&path, None, ClaudePrefixCheck::Full, 0, WINDOW);
+            assert_eq!(first.calls.len(), size);
+            let point = first.resume.unwrap();
+            take_history_copies();
+            let saved = point.clone();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "{}", record("new", 2, Some("end_turn"))).unwrap();
+            let next = parse_claude_file_resumable(
+                &path,
+                Some(point),
+                ClaudePrefixCheck::Window,
+                1,
+                WINDOW,
+            );
+            assert_eq!(next.calls.len(), 1);
+            assert_eq!(next.calls[0].call_key, "new");
+            assert_eq!(
+                next.resume.unwrap().offset(),
+                std::fs::metadata(&path).unwrap().len()
+            );
+            let copies = take_history_copies();
+            println!("Claude history={size} copied_entries={copies}");
+            assert_eq!(copies, 1, "history={size}, copied_entries={copies}");
+            drop(saved);
+        }
+    }
+
+    #[test]
+    fn history_scaling_claude_rollback_restores_inserts_overwrites_and_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, record("old", 2, Some("end_turn")) + "\n").unwrap();
+        let point = parse_claude_file_resumable(&path, None, ClaudePrefixCheck::Full, 0, WINDOW)
+            .resume
+            .unwrap();
+        let before = point.state_snapshot();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        for line in [
+            record("old", 3, Some("end_turn")),
+            record("new", 1, Some("end_turn")),
+            record("new", 0, Some("end_turn")),
+        ] {
+            writeln!(file, "{line}").unwrap();
+        }
+        let (staged, transaction) = parse_claude_file_transactional(
+            &path,
+            Some(point.clone()),
+            ClaudePrefixCheck::Window,
+            1,
+            WINDOW,
+        );
+        assert_eq!(staged.counts.calls_refused, 1);
+        let expected = staged.calls;
+        transaction.rollback();
+        assert_eq!(point.state_snapshot(), before);
+        let retried =
+            parse_claude_file_resumable(&path, Some(point), ClaudePrefixCheck::Window, 1, WINDOW);
+        assert_eq!(retried.calls, expected);
+        assert_eq!(retried.counts.calls_refused, 1);
+        assert_eq!(
+            retried.resume.unwrap().offset(),
+            std::fs::metadata(path).unwrap().len()
+        );
+    }
+
+    #[test]
     fn quiet_polls_do_not_walk_emitted_history() {
         let mut state = ClaudeParseState::default();
         let mut counts = ClaudeParseCounts::default();
@@ -873,21 +1142,24 @@ mod tests {
         }
         assert_eq!(state.take_emissions(false).len(), 32);
         assert_eq!(state.pending_calls(), 0);
-        state.calls.visits.set(0);
-        assert_eq!(state.calls.iter().count(), 32);
-        assert_eq!(state.calls.visits.get(), 32, "history walks are observed");
-        state.calls.visits.set(0);
+        {
+            let history = state.history.lock().unwrap();
+            history.calls.visits.set(0);
+            assert_eq!(history.calls.iter().count(), 32);
+            assert_eq!(history.calls.visits.get(), 32, "history walks are observed");
+            history.calls.visits.set(0);
+        }
         for _ in 0..3 {
             assert!(state.take_emissions(true).is_empty());
             assert_eq!(state.pending_calls(), 0);
         }
         assert_eq!(
-            state.calls.len(),
+            state.history.lock().unwrap().calls.len(),
             32,
             "late-copy comparisons keep their history"
         );
         assert_eq!(
-            state.calls.visits.get(),
+            state.history.lock().unwrap().calls.visits.get(),
             0,
             "quiet polls must not visit emitted aggregates"
         );

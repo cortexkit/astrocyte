@@ -438,11 +438,48 @@ struct CodexParseState {
     current_model: Option<String>,
     current_cwd: Option<String>,
     previous_total: Option<CodexTokenUsage>,
-    responses_in_turn: HashMap<String, u32>,
+    responses_in_turn: std::sync::Arc<std::sync::Mutex<TurnHistory>>,
     pending: Option<PendingRequest>,
     confirmations: VecDeque<(Option<String>, CodexTokenUsage)>,
     settled: VecDeque<(Option<String>, CodexTokenUsage)>,
     activity: bool,
+}
+
+#[derive(Debug, Default)]
+struct TurnHistory {
+    rows: HashMap<String, u32>,
+    active: bool,
+    undo: Vec<(String, Option<u32>)>,
+}
+
+fn begin_turn_history(
+    state: &CodexParseState,
+    transaction: &mut super::claudecode::ReadTransaction,
+) {
+    let history = std::sync::Arc::clone(&state.responses_in_turn);
+    {
+        let mut held = history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!held.active, "a Codex history read is already staged");
+        held.active = true;
+    }
+    transaction.add(move |commit| {
+        let mut held = history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let undo = std::mem::take(&mut held.undo);
+        if !commit {
+            for (key, value) in undo.into_iter().rev() {
+                if let Some(value) = value {
+                    held.rows.insert(key, value);
+                } else {
+                    held.rows.remove(&key);
+                }
+            }
+        }
+        held.active = false;
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -771,7 +808,18 @@ fn parse_line(
             // Counted before the replay check so a fork's copy of a parent
             // response gets the same position in the turn as the original.
             let position = state.current_turn.as_ref().map(|turn| {
-                let position = state.responses_in_turn.entry(turn.clone()).or_default();
+                let mut history = state
+                    .responses_in_turn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if history.active {
+                    let old = history.rows.get(turn).copied();
+                    #[cfg(any(test, feature = "test-support"))]
+                    HISTORY_COPIES
+                        .with(|copies| copies.set(copies.get() + usize::from(old.is_some())));
+                    history.undo.push((turn.clone(), old));
+                }
+                let position = history.rows.entry(turn.clone()).or_default();
                 *position += 1;
                 *position
             });
@@ -845,8 +893,24 @@ fn parse_line(
 }
 
 /// Where a previous [`parse_codex_file_resumable`] stopped.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CodexResumePoint(JsonlResumePoint<CodexParseState>);
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static HISTORY_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn take_history_copies() -> usize {
+    HISTORY_COPIES.with(|copies| copies.replace(0))
+}
+
+impl Clone for CodexResumePoint {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 impl CodexResumePoint {
     /// Bytes of the file already consumed; always just past a newline.
@@ -902,9 +966,31 @@ pub fn parse_codex_file_resumable(
     previous: Option<CodexResumePoint>,
     check: CodexPrefixCheck,
 ) -> CodexResumableParse {
-    if is_codex_archive(path) {
-        return archive::parse_archive(path);
+    let (parse, transaction) = parse_codex_file_transactional(path, previous, check);
+    if parse.io_error.is_some() {
+        transaction.rollback();
+    } else {
+        transaction.commit();
     }
+    parse
+}
+
+/// Stage turn-counter updates until the caller resolves the returned history
+/// transaction after its ledger write. A full reread uses fresh counters.
+pub fn parse_codex_file_transactional(
+    path: &Path,
+    previous: Option<CodexResumePoint>,
+    check: CodexPrefixCheck,
+) -> (CodexResumableParse, super::claudecode::ReadTransaction) {
+    let mut transaction = super::claudecode::ReadTransaction::default();
+    if is_codex_archive(path) {
+        return (archive::parse_archive(path), transaction);
+    }
+    if let Some(point) = &previous {
+        begin_turn_history(&point.0.state, &mut transaction);
+    }
+    let fresh = CodexParseState::default();
+    begin_turn_history(&fresh, &mut transaction);
     let mut counts = CodexParseCounts::default();
     let mut set_aside = Vec::new();
     let mut calls = Vec::new();
@@ -913,7 +999,7 @@ pub fn parse_codex_file_resumable(
         path,
         previous.map(|point| point.0),
         check,
-        CodexParseState::default,
+        || fresh,
         |state, payload| {
             state.lines += 1;
             counts.lines += 1;
@@ -927,25 +1013,31 @@ pub fn parse_codex_file_resumable(
     let read = match read {
         Ok(read) => read,
         Err(error) => {
-            return CodexResumableParse {
-                io_error: Some(error.to_string()),
-                ..CodexResumableParse::default()
-            }
+            return (
+                CodexResumableParse {
+                    io_error: Some(error.to_string()),
+                    ..CodexResumableParse::default()
+                },
+                transaction,
+            )
         }
     };
 
-    CodexResumableParse {
-        io_error: None,
-        set_aside,
-        calls,
-        resumed: read.resumed,
-        resume: read
-            .cursor
-            .map(|cursor| CodexResumePoint(cursor.with_state(read.state))),
-        hashed_bytes: read.hashed_bytes,
-        decompressed_bytes: 0,
-        counts,
-    }
+    (
+        CodexResumableParse {
+            io_error: None,
+            set_aside,
+            calls,
+            resumed: read.resumed,
+            resume: read
+                .cursor
+                .map(|cursor| CodexResumePoint(cursor.with_state(read.state))),
+            hashed_bytes: read.hashed_bytes,
+            decompressed_bytes: 0,
+            counts,
+        },
+        transaction,
+    )
 }
 
 #[cfg(test)]
@@ -1073,6 +1165,69 @@ mod tests {
             turn_context(2, TURN, "gpt-5.6-sol", "/work/a.b-c"),
         ]
         .concat()
+    }
+
+    #[test]
+    fn history_scaling_codex_append_copies_only_changed_entries() {
+        for size in [1_000_u64, 10_000] {
+            let mut text = head();
+            for index in 0..size {
+                text.push_str(&task_started(index, &format!("turn-{index}")));
+                text.push_str(&token_count(
+                    index,
+                    [index + 1, 0, 0, 0, 0],
+                    [1, 0, 0, 0, 0],
+                ));
+            }
+            let (_dir, path) = file_with(&text);
+            let first = parse(&path, None);
+            assert_eq!(first.counts.usage_records, size);
+            let point = first.resume.unwrap();
+            take_history_copies();
+            let saved = point.clone();
+            append(
+                &path,
+                &(task_started(size, "new-turn")
+                    + &token_count(size, [size + 1, 0, 0, 0, 0], [1, 0, 0, 0, 0])),
+            );
+            let next = parse(&path, Some(point));
+            assert_eq!(next.calls.len(), 1);
+            assert_eq!(next.calls[0].turn_id.as_deref(), Some("new-turn"));
+            assert_eq!(
+                next.resume.unwrap().offset(),
+                std::fs::metadata(&path).unwrap().len()
+            );
+            let copies = take_history_copies();
+            println!("Codex history={size} copied_entries={copies}");
+            assert_eq!(copies, 0, "history={size}, copied_entries={copies}");
+            drop(saved);
+        }
+    }
+
+    #[test]
+    fn history_scaling_codex_rollback_restores_new_and_existing_turn_counters() {
+        let (_dir, path) = file_with(&(head() + &token_count(3, [1, 0, 0, 0, 0], [1, 0, 0, 0, 0])));
+        let point = parse(&path, None).resume.unwrap();
+        let before = point.0.state.responses_in_turn.lock().unwrap().rows.clone();
+        let before_offset = point.offset();
+        append(
+            &path,
+            &(token_count(4, [2, 0, 0, 0, 0], [1, 0, 0, 0, 0])
+                + &task_started(5, "new-turn")
+                + &token_count(6, [3, 0, 0, 0, 0], [1, 0, 0, 0, 0])),
+        );
+        let (staged, transaction) =
+            parse_codex_file_transactional(&path, Some(point.clone()), CodexPrefixCheck::Window);
+        assert_eq!(staged.calls.len(), 2);
+        transaction.rollback();
+        assert_eq!(point.0.state.responses_in_turn.lock().unwrap().rows, before);
+        assert_eq!(point.offset(), before_offset);
+        let retried = parse(&path, Some(point));
+        assert_eq!(retried.calls, staged.calls);
+        assert_eq!(
+            retried.resume.unwrap().offset(),
+            std::fs::metadata(path).unwrap().len()
+        );
     }
 
     /// Codex nests cached input inside input and reasoning inside output;

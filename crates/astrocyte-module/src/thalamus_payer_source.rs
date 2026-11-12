@@ -1,5 +1,6 @@
 //! Durable payer facts mirrored before any THALAMUS transcript is read.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -22,6 +23,10 @@ use crate::state::SharedState;
 
 pub(crate) const SOURCE_KEY: &str = "thalamus-payer";
 const PAGE_LIMIT: i64 = 512;
+#[cfg(test)]
+thread_local! {
+    static SESSION_ROWS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 const LATE_MAIN_LOOKUP_SQL: &str = "SELECT EXISTS(SELECT 1 FROM usage_event WHERE event_id=?1)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +99,7 @@ impl ThalamusPayerSource {
             return Ok(());
         }
         mode.ensure_runtime(state, SOURCE_KEY)?;
+        let mut sessions_loaded = None;
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
@@ -109,7 +115,7 @@ impl ThalamusPayerSource {
             })?;
             // The external read ends, including its read transaction and file handle,
             // before the ledger write starts.
-            let page = read_page(&self.path, cursor.as_ref())?;
+            let page = read_page(&self.path, cursor.as_ref(), sessions_loaded.as_ref())?;
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
@@ -138,6 +144,16 @@ impl ThalamusPayerSource {
                 }
                 Ok(((),true))
             })?;
+            let snapshot = sessions_loaded.get_or_insert_with(SessionSnapshot::default);
+            if snapshot.incarnation != page.incarnation {
+                snapshot.keys.clear();
+            }
+            snapshot.incarnation = page.incarnation;
+            snapshot.keys.extend(
+                page.sessions
+                    .into_iter()
+                    .map(|session| (session.harness, session.session)),
+            );
             if complete {
                 *last = Some(observed);
                 return Ok(());
@@ -175,6 +191,23 @@ struct Session {
     session: String,
     owner: Option<String>,
     declared_at: i64,
+}
+
+#[derive(Default)]
+struct SessionSnapshot {
+    incarnation: String,
+    keys: HashSet<(String, String)>,
+}
+
+fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+    #[cfg(test)]
+    SESSION_ROWS_READ.with(|count| count.set(count.get() + 1));
+    Ok(Session {
+        harness: row.get(0)?,
+        session: row.get(1)?,
+        owner: row.get(2)?,
+        declared_at: row.get(3)?,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -215,7 +248,11 @@ fn store_watermark_in_tx(tx: &Transaction<'_>, at: i64) -> Result<(), String> {
     Ok(())
 }
 
-fn read_page(path: &Path, cursor: Option<&(String, i64)>) -> Result<Page, String> {
+fn read_page(
+    path: &Path,
+    cursor: Option<&(String, i64)>,
+    sessions_loaded: Option<&SessionSnapshot>,
+) -> Result<Page, String> {
     let conn =
         astrocyte_readers::read_io::connect(path.to_str().ok_or("payer store path is not UTF-8")?)
             .map_err(sql)?;
@@ -243,20 +280,21 @@ fn read_page(path: &Path, cursor: Option<&(String, i64)>) -> Result<Page, String
         })
         .map_err(sql)?
         .max(after);
-    let sessions = tx
-        .prepare("SELECT harness,session,owner_principal,declared_at_ms FROM payer_session")
-        .map_err(sql)?
-        .query_map([], |row| {
-            Ok(Session {
-                harness: row.get(0)?,
-                session: row.get(1)?,
-                owner: row.get(2)?,
-                declared_at: row.get(3)?,
-            })
-        })
-        .map_err(sql)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(sql)?;
+    // Session declarations are independent of the record page. Mirror their
+    // snapshot once per drain, including declarations with no records yet.
+    // A changed incarnation names a replaced or restored payer history, so
+    // its session snapshot must be loaded again even within the same drain.
+    let reused = sessions_loaded.filter(|snapshot| snapshot.incarnation == incarnation);
+    let mut sessions = if reused.is_some() {
+        Vec::new()
+    } else {
+        tx.prepare("SELECT harness,session,owner_principal,declared_at_ms FROM payer_session")
+            .map_err(sql)?
+            .query_map([], session_row)
+            .map_err(sql)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql)?
+    };
     let mut statement = tx.prepare("SELECT seq,attempt_id,harness,session,request_kind,step_ref,recorded_at_ms,provider,model,charge_basis,auth_selection,account_ref,outcome,provider_request_id,provider_response_id,usage_json FROM payer_record WHERE seq>?1 ORDER BY seq LIMIT ?2").map_err(sql)?;
     let mut query = statement.query(params![after, PAGE_LIMIT]).map_err(sql)?;
     let mut through = after;
@@ -291,6 +329,25 @@ fn read_page(path: &Path, cursor: Option<&(String, i64)>) -> Result<Page, String
                 locator: format!("{}:incarnation:{incarnation}:seq:{seq}", path.display()),
                 reason: error.to_string(),
             }),
+        }
+    }
+    if let Some(snapshot) = reused {
+        // THALAMUS may declare a new session while a backlog is being drained.
+        // Fetch that declaration before its first record without rescanning
+        // declarations already mirrored by an earlier page.
+        let mut requested = HashSet::new();
+        let mut statement = tx.prepare("SELECT harness,session,owner_principal,declared_at_ms FROM payer_session WHERE harness=?1 AND session=?2").map_err(sql)?;
+        for record in &rows {
+            let key = (record.harness.clone(), record.session.clone());
+            if !snapshot.keys.contains(&key) && requested.insert(key) {
+                if let Some(session) = statement
+                    .query_row(params![record.harness, record.session], session_row)
+                    .optional()
+                    .map_err(sql)?
+                {
+                    sessions.push(session);
+                }
+            }
         }
     }
     Ok(Page {
@@ -562,6 +619,61 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
 
     fn insert(store: &Connection, attempt: &str) {
         store.execute("INSERT INTO payer_record(attempt_id,harness,session,request_kind,recorded_at_ms,provider,model,charge_basis,auth_selection,account_ref,usage_json) VALUES (?1,'pi','session-a','keep_warm',1000,'anthropic','model-a','metered_api','login-a','account-a',?2)", params![attempt,r#"{"usage":{"input_tokens":17,"output_tokens":11,"reasoning_tokens":4,"cache_write_tokens":12},"cache_write_5m_tokens":5,"cache_write_1h_tokens":7,"reasoning_included_in_output":true}"#]).unwrap();
+    }
+
+    #[test]
+    fn history_scaling_payer_reads_session_set_once_across_pages() {
+        let (_home, source, store, state) = fixture();
+        for index in 1..12 {
+            store
+                .execute(
+                    "INSERT INTO payer_session VALUES ('pi',?1,'owner',1000)",
+                    [format!("session-{index}")],
+                )
+                .unwrap();
+        }
+        for index in 0..1_025 {
+            insert(&store, &format!("attempt-{index}"));
+        }
+        SESSION_ROWS_READ.with(|count| count.set(0));
+        source
+            .drain(&state, 100_000, &AtomicBool::new(false), DrainMode::Full)
+            .unwrap();
+        let read = SESSION_ROWS_READ.with(std::cell::Cell::get);
+        println!("payer sessions=12 pages=3 session_rows_read={read}");
+        assert_eq!(read, 12);
+        state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM thalamus_payer_session", [], |row| row
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    12
+                );
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM thalamus_payer_record", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                    1_025
+                );
+                assert_eq!(
+                    conn.query_row("SELECT through_seq FROM thalamus_payer_cursor", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                    1_025
+                );
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM usage_event", [], |row| row
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    1_025
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     fn session_watermark(state: &SharedState, at: i64) {

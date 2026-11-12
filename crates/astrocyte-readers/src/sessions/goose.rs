@@ -47,6 +47,7 @@ use super::roles::DerivedRole;
 use rusqlite::types::Value;
 use rusqlite::Row;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// The `model_config_json` field this reader uses.
@@ -111,6 +112,8 @@ pub struct GooseSession {
 /// Counts for one read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GooseReadCounts {
+    /// Session payloads decoded, including rows with unreadable counters.
+    pub rows_read: u64,
     /// Rows with a counter that is not a non-negative integer (a real, a
     /// text, a negative). Not read further and not ingested.
     pub unreadable_rows: u64,
@@ -122,6 +125,10 @@ pub struct GooseRead {
     /// Every session with usage, ordered by id.
     pub sessions: Vec<GooseSession>,
     pub counts: GooseReadCounts,
+    /// SQLite's normalized update-time ordinal, inclusive on the next read.
+    pub through: Option<f64>,
+    /// Unreadable rows must be reconsidered even if their update time is old.
+    pub recheck: HashSet<String>,
 }
 
 /// A counter column: `Ok(None)` for NULL, `Err` for anything that is not a
@@ -143,13 +150,26 @@ fn readonly_uri(path: &Path) -> Result<String, String> {
 
 const SESSIONS_QUERY: &str = "SELECT id, working_dir, created_at, updated_at, provider_name,
         model_config_json, accumulated_input_tokens, accumulated_output_tokens,
-        accumulated_cache_read_tokens, accumulated_cache_write_tokens
-     FROM sessions ORDER BY id";
+        accumulated_cache_read_tokens, accumulated_cache_write_tokens,
+        julianday(updated_at) AS update_ordinal FROM sessions";
 
 /// Reads every session row of the Goose store at `db_path` in one read-only
 /// snapshot. `Err` when the store cannot be opened or queried (a missing
 /// file included: the caller checks presence first).
 pub fn read_goose_sessions(db_path: &Path) -> Result<GooseRead, String> {
+    read_goose_sessions_since(db_path, None, &HashSet::new())
+}
+
+/// Read changed sessions, including every tie at the previous update time,
+/// plus sessions still unsettled or unreadable on the last committed read.
+/// No page limit splits timestamp ties. Goose owns the schema: without a
+/// producer update-time index SQLite still scans timestamp metadata, but old
+/// payloads and model JSON are not decoded on each tick.
+pub fn read_goose_sessions_since(
+    db_path: &Path,
+    after: Option<f64>,
+    recheck: &HashSet<String>,
+) -> Result<GooseRead, String> {
     // ASTROCYTE DIVERGENCE: upstream's `sqlite_for_each_row` opens the store
     // with its default flags. Goose owns this store, so it is opened with
     // `mode=ro` and `query_only`, the same way the OpenCode reader opens
@@ -158,24 +178,71 @@ pub fn read_goose_sessions(db_path: &Path) -> Result<GooseRead, String> {
     let connection =
         super::sqlite_read::open_read_snapshot(readonly_uri(db_path)?, db_path, "Goose")?;
     let mut statement = connection
-        .prepare(SESSIONS_QUERY)
+        .prepare(&format!("{SESSIONS_QUERY} WHERE ?1 IS NULL OR julianday(updated_at)>=?1 OR julianday(updated_at) IS NULL OR typeof(id)!='text' OR id='' ORDER BY id"))
         .map_err(|error| format!("prepare Goose sessions query: {error}"))?;
     let mut rows = statement
-        .query([])
+        .query([after])
         .map_err(|error| format!("query Goose sessions: {error}"))?;
     let mut read = GooseRead::default();
+    let mut seen = HashSet::new();
     loop {
         let row = match rows.next() {
             Ok(Some(row)) => row,
             Ok(None) => break,
             Err(error) => return Err(format!("read Goose session row: {error}")),
         };
-        read_row(row, &mut read).map_err(|error| format!("read Goose session row: {error}"))?;
+        read_selected_row(row, &mut read, &mut seen)?;
     }
+    let mut statement = connection
+        .prepare(&format!("{SESSIONS_QUERY} WHERE id=?1"))
+        .map_err(|error| format!("prepare Goose unsettled query: {error}"))?;
+    for id in recheck.difference(&seen) {
+        let mut rows = statement
+            .query([id])
+            .map_err(|error| format!("query Goose unsettled session: {error}"))?;
+        if let Some(row) = rows
+            .next()
+            .map_err(|error| format!("read Goose unsettled session: {error}"))?
+        {
+            read_selected_row(row, &mut read, &mut HashSet::new())?;
+        }
+    }
+    read.sessions
+        .sort_by(|left, right| left.session_id.cmp(&right.session_id));
     Ok(read)
 }
 
+fn read_selected_row(
+    row: &Row<'_>,
+    read: &mut GooseRead,
+    seen: &mut HashSet<String>,
+) -> Result<(), String> {
+    let ordinal = row
+        .get::<_, Option<f64>>("update_ordinal")
+        .map_err(|error| error.to_string())?;
+    if let Some(ordinal) = ordinal {
+        read.through = Some(read.through.map_or(ordinal, |old| old.max(ordinal)));
+    }
+    let id = match row
+        .get::<_, Value>("id")
+        .map_err(|error| error.to_string())?
+    {
+        Value::Text(id) => Some(id),
+        _ => None,
+    };
+    let bad_before = read.counts.unreadable_rows;
+    read_row(row, read).map_err(|error| format!("read Goose session row: {error}"))?;
+    if let Some(id) = id {
+        if bad_before != read.counts.unreadable_rows {
+            read.recheck.insert(id.clone());
+        }
+        seen.insert(id);
+    }
+    Ok(())
+}
+
 fn read_row(row: &Row<'_>, read: &mut GooseRead) -> rusqlite::Result<()> {
+    read.counts.rows_read += 1;
     let counters = [
         "accumulated_input_tokens",
         "accumulated_output_tokens",

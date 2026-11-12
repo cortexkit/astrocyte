@@ -13,12 +13,12 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::{EventRecordRequest, MeasurementInput, StepDetail};
 use astrocyte_readers::sessions::codex::{
-    is_codex_archive, parse_codex_file_resumable, CodexCall, CodexDerived, CodexParseCounts,
+    is_codex_archive, parse_codex_file_transactional, CodexCall, CodexDerived, CodexParseCounts,
     CodexPrefixCheck, CodexResumePoint,
 };
 
@@ -59,11 +59,10 @@ pub(crate) struct CodexDrainOutcome {
 #[derive(Debug, Default)]
 struct CodexCache {
     /// Where each file's next read may resume, with the parse state its
-    /// consumed bytes produced. Taken out for a drain and put back only after
-    /// the drain's events commit, so a failed or stopped drain leaves no
-    /// resume point behind and the next drain reads every file in full,
-    /// which content-derived identity makes safe.
-    resume: HashMap<PathBuf, CodexResumePoint>,
+    /// consumed bytes produced. Snapshots share turn counters; staged reads
+    /// journal changed counters and restore them if the ledger write fails.
+    /// Offsets and scheduling metadata publish only after that write commits.
+    resume: HashMap<PathBuf, Arc<CodexResumePoint>>,
     /// When each file's consumed prefix was last verified end to end.
     prefix_verified_ms: HashMap<PathBuf, i64>,
     windows: HashMap<PathBuf, crate::refresher::harness_drain::WindowSchedule>,
@@ -153,6 +152,26 @@ impl CodexSource {
         recorded_at_ms: i64,
         stop: &AtomicBool,
         mode: DrainMode,
+    ) -> Result<CodexDrainOutcome, SourceDrainError> {
+        let mut transactions = Vec::new();
+        let result = self.drain_staged(state, recorded_at_ms, stop, mode, &mut transactions);
+        for transaction in transactions.into_iter().rev() {
+            if result.is_ok() {
+                transaction.commit();
+            } else {
+                transaction.rollback();
+            }
+        }
+        result
+    }
+
+    fn drain_staged(
+        &self,
+        state: &SharedState,
+        recorded_at_ms: i64,
+        stop: &AtomicBool,
+        mode: DrainMode,
+        transactions: &mut Vec<astrocyte_readers::sessions::claudecode::ReadTransaction>,
     ) -> Result<CodexDrainOutcome, SourceDrainError> {
         let home = match &self.home {
             CodexHome::Path(home) => home,
@@ -300,8 +319,13 @@ impl CodexSource {
                     continue;
                 }
             }
-            let previous_offset = previous.as_ref().map(CodexResumePoint::offset);
-            let parse = parse_codex_file_resumable(&path, previous, check);
+            let previous_offset = previous.as_ref().map(|point| point.offset());
+            let (parse, transaction) = parse_codex_file_transactional(
+                &path,
+                previous.map(|point| (*point).clone()),
+                check,
+            );
+            transactions.push(transaction);
             if let Some(reason) = parse.io_error {
                 return Err(format!("read Codex session file {}: {reason}", path.display()).into());
             }
@@ -341,7 +365,7 @@ impl CodexSource {
             }
             outcome.calls_emitted += parse.calls.len();
             if let Some(point) = parse.resume {
-                resume_points.insert(path.clone(), point);
+                resume_points.insert(path.clone(), Arc::new(point));
             }
             for call in parse.calls {
                 let locator = format!("{path:?}:line:{}", call.source_line);
@@ -587,6 +611,7 @@ mod tests {
     use super::*;
     use crate::refresher::run_iteration_with_codex;
     use crate::state::test_state;
+    use astrocyte_readers::sessions::codex::parse_codex_file_resumable;
     use astrocyte_readers::sessions::codex::CODEX_PREFIX_WINDOW_BYTES;
     use std::collections::BTreeSet;
     use tempfile::TempDir;
@@ -1122,6 +1147,50 @@ mod tests {
 
     fn drain(source: &CodexSource, state: &SharedState, at: i64) -> CodexDrainOutcome {
         source.drain(state, at, &NEVER_STOP).unwrap()
+    }
+
+    #[test]
+    fn history_scaling_codex_fast_cycles_share_untouched_file_points() {
+        let temp = TempDir::new().unwrap();
+        let contents = |id: &str| {
+            session_meta(THREAD, None)
+                + &turn(1, id)
+                + &token_count(3, [1, 0, 0, 0, 0], [1, 0, 0, 0, 0])
+        };
+        let cold = write_file(temp.path(), "sessions/cold.jsonl", &contents("cold"));
+        let hot = write_file(temp.path(), "sessions/hot.jsonl", &contents("hot"));
+        let state = test_state();
+        let source = CodexSource::at(temp.path());
+        assert_eq!(drain(&source, &state, 100).rows_recorded, 2);
+        let point = Arc::clone(&source.cache.lock().unwrap().resume[&cold]);
+        astrocyte_readers::sessions::codex::take_history_copies();
+        let idle = source
+            .drain_in_lane(&state, 101, &NEVER_STOP, DrainMode::Fast)
+            .unwrap();
+        assert_eq!(idle.calls_emitted, 0);
+        assert!(Arc::ptr_eq(
+            &point,
+            &source.cache.lock().unwrap().resume[&cold]
+        ));
+        assert_eq!(astrocyte_readers::sessions::codex::take_history_copies(), 0);
+        append(&hot, &token_count(4, [2, 0, 0, 0, 0], [1, 0, 0, 0, 0]));
+        let next = source
+            .drain_in_lane(&state, 102, &NEVER_STOP, DrainMode::Fast)
+            .unwrap();
+        assert_eq!(next.rows_recorded, 1);
+        assert!(Arc::ptr_eq(
+            &point,
+            &source.cache.lock().unwrap().resume[&cold]
+        ));
+        assert_eq!(astrocyte_readers::sessions::codex::take_history_copies(), 1);
+        assert_eq!(
+            source.cache.lock().unwrap().resume[&hot].offset(),
+            fs::metadata(&hot).unwrap().len()
+        );
+        assert_eq!(
+            event_refs(&state),
+            BTreeSet::from(["cold:1".into(), "hot:1".into(), "hot:2".into()])
+        );
     }
 
     fn count(state: &SharedState, sql: &str) -> i64 {
