@@ -171,6 +171,23 @@ fn vault_since_accepts_zero_equal_observed_and_missing_observed() {
 }
 
 #[test]
+fn vault_observed_timestamp_changes_do_not_append_without_since_date() {
+    let state = test_state();
+    let mut stage = stage();
+    stage.apply(&state, vec![snapshot("pro_200", 100)], None, 101);
+    stage.apply(&state, vec![snapshot("pro_200", 200)], None, 201);
+    assert_eq!(history_starts(&state), vec![100]);
+    let mut invalid = listing(&["openai"], Some("pro_200"), Some(300));
+    invalid["result"]["credentials"][0]["plan_tier_since_ms"] = json!(-1);
+    stage.apply(&state, vec![decode_listing(invalid, 301)], None, 301);
+    assert_eq!(history_starts(&state), vec![100]);
+    assert_eq!(
+        report(&state)["invalid_plan_tier_since"][0]["reason"],
+        "not_non_negative_integer"
+    );
+}
+
+#[test]
 fn vault_since_missing_timestamps_keep_first_observation_until_key_changes() {
     let state = test_state();
     let mut stage = stage();
@@ -722,7 +739,7 @@ fn vault_shared_account_uses_latest_record_without_tick_order_churn() {
         vec![Ok(Listing {
             plans: vec![older.clone(), current.clone()],
             invalid_plan_tier_since: Vec::new(),
-            effective_time_unspecified: Vec::new(),
+            start_date_unspecified: Vec::new(),
         })],
         Some(&prices),
         201,
@@ -734,7 +751,7 @@ fn vault_shared_account_uses_latest_record_without_tick_order_churn() {
             vec![Ok(Listing {
                 plans,
                 invalid_plan_tier_since: Vec::new(),
-                effective_time_unspecified: Vec::new(),
+                start_date_unspecified: Vec::new(),
             })],
             Some(&prices),
             202,

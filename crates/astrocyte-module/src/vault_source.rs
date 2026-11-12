@@ -29,9 +29,9 @@ type Snapshot = Result<Listing, String>;
 pub(crate) struct Listing {
     plans: Vec<VaultPlan>,
     invalid_plan_tier_since: Vec<InvalidPlanTierSince>,
-    // With neither vault timestamp, repeated reads retain the first observation
-    // of the same plan instead of inventing a new start on every poll.
-    effective_time_unspecified: Vec<String>,
+    // Without an explicit start date, a new observation timestamp is not
+    // evidence that an unchanged plan started at a different time.
+    start_date_unspecified: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,7 +57,7 @@ fn decode_listing(value: Value, now: i64) -> Snapshot {
         .as_array()
         .ok_or("invalid_listing")?;
     let mut invalid_plan_tier_since = Vec::new();
-    let mut effective_time_unspecified = Vec::new();
+    let mut start_date_unspecified = Vec::new();
     let plans = listing
         .credentials
         .into_iter()
@@ -93,10 +93,10 @@ fn decode_listing(value: Value, now: i64) -> Snapshot {
                         }
                     }
                 });
-            let effective = since.or(observed).unwrap_or_else(|| {
-                effective_time_unspecified.push(record.id.clone());
-                now
-            });
+            if since.is_none() {
+                start_date_unspecified.push(record.id.clone());
+            }
+            let effective = since.or(observed).unwrap_or(now);
             let provider = record.provider_ids.first().cloned();
             let plan_key = if record.provider_ids.len() == 1 {
                 record
@@ -121,7 +121,7 @@ fn decode_listing(value: Value, now: i64) -> Snapshot {
     Ok(Listing {
         plans,
         invalid_plan_tier_since,
-        effective_time_unspecified,
+        start_date_unspecified,
     })
 }
 
@@ -434,7 +434,7 @@ impl Stage {
         let changed = state.with_conn(|conn| {
             let mut changed = false;
             for plan in &mut plans {
-                if listing.effective_time_unspecified.contains(&plan.credential_id) {
+                if listing.start_date_unspecified.contains(&plan.credential_id) {
                     let previous: Option<(Option<String>, i64)> = conn.query_row(
                         "SELECT plan_key,effective_from_ms FROM vault_plan_history WHERE credential_id=?1 ORDER BY history_id DESC LIMIT 1",
                         [&plan.credential_id], |row| Ok((row.get(0)?, row.get(1)?)),

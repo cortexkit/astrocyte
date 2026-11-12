@@ -59,8 +59,10 @@ later than the row's `plan_tier_observed_at_ms` (when that timestamp is present)
 Otherwise it uses `plan_tier_observed_at_ms`, falling back to the first observation
 of a change when neither time is usable. Invalid start dates are ignored and
 reported by `spend.subscription.report` in the optional `invalid_plan_tier_since`
-diagnostic. Repeated lists with the same plan and start append nothing; a date-only
-edit appends a new history row without rewriting earlier evidence.
+diagnostic. Without a valid explicit start date, an unchanged plan retains its
+previous effective time even if the vault re-stamps its observation. Repeated
+lists with the same plan and start append nothing; an explicit date-only edit
+appends a new history row without rewriting earlier evidence.
 
 For each credential, a snapshot uses the last recorded history row whose start
 is before the snapshot's exclusive end. Rows replace earlier recorded evidence
