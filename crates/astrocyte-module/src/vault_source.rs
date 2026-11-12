@@ -9,6 +9,8 @@ use astrocyte_core::multiplier::PlanPriceSource;
 use astrocyte_core::vault_plan::{self, VaultPlan};
 use cortexkit_claustrum_client::{decode_list_scoped_reply, WatchNotice};
 use fusiform_protocol::PlanPricesRequest;
+use rusqlite::OptionalExtension;
+use serde::Serialize;
 use serde_json::{json, Value};
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
@@ -21,7 +23,22 @@ use crate::state::SharedState;
 const BUDGET: Duration = Duration::from_secs(10);
 const DAY_MS: i64 = 86_400_000;
 const UNPRICED_RETRY_MS: i64 = 3_600_000;
-type Snapshot = Result<Vec<VaultPlan>, String>;
+type Snapshot = Result<Listing, String>;
+
+#[derive(Debug)]
+pub(crate) struct Listing {
+    plans: Vec<VaultPlan>,
+    invalid_plan_tier_since: Vec<InvalidPlanTierSince>,
+    // With neither vault timestamp, repeated reads retain the first observation
+    // of the same plan instead of inventing a new start on every poll.
+    effective_time_unspecified: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InvalidPlanTierSince {
+    credential_id: String,
+    reason: &'static str,
+}
 
 fn decode_listing(value: Value, now: i64) -> Snapshot {
     let listing =
@@ -39,17 +56,47 @@ fn decode_listing(value: Value, now: i64) -> Snapshot {
     let raw = value["result"]["credentials"]
         .as_array()
         .ok_or("invalid_listing")?;
-    Ok(listing
+    let mut invalid_plan_tier_since = Vec::new();
+    let mut effective_time_unspecified = Vec::new();
+    let plans = listing
         .credentials
         .into_iter()
         .filter(|record| record.categories.iter().any(|v| v == "llm-provider"))
         .map(|record| {
-            let effective = raw
+            let row = raw
                 .iter()
-                .find(|row| row["id"].as_str() == Some(&record.id))
+                .find(|row| row["id"].as_str() == Some(&record.id));
+            let observed = row
                 .and_then(|row| row.get("plan_tier_observed_at_ms"))
-                .and_then(Value::as_i64)
-                .unwrap_or(now);
+                .and_then(Value::as_i64);
+            let since = row
+                .and_then(|row| row.get("plan_tier_since_ms"))
+                .and_then(|value| {
+                    let result = match value.as_i64() {
+                        Some(since) if since >= 0 => {
+                            if observed.is_some_and(|observed| since > observed) {
+                                Err("after_observed_at")
+                            } else {
+                                Ok(since)
+                            }
+                        }
+                        _ => Err("not_non_negative_integer"),
+                    };
+                    match result {
+                        Ok(since) => Some(since),
+                        Err(reason) => {
+                            invalid_plan_tier_since.push(InvalidPlanTierSince {
+                                credential_id: record.id.clone(),
+                                reason,
+                            });
+                            None
+                        }
+                    }
+                });
+            let effective = since.or(observed).unwrap_or_else(|| {
+                effective_time_unspecified.push(record.id.clone());
+                now
+            });
             let provider = record.provider_ids.first().cloned();
             let plan_key = if record.provider_ids.len() == 1 {
                 record
@@ -70,7 +117,12 @@ fn decode_listing(value: Value, now: i64) -> Snapshot {
                 observed_at_ms: now,
             }
         })
-        .collect())
+        .collect();
+    Ok(Listing {
+        plans,
+        invalid_plan_tier_since,
+        effective_time_unspecified,
+    })
 }
 
 struct Route {
@@ -313,6 +365,7 @@ pub(crate) struct Stage {
     last_mismatch_ms: Option<i64>,
     diagnostics: vault_plan::Diagnostics,
     price_available: bool,
+    invalid_plan_tier_since: Vec<InvalidPlanTierSince>,
 }
 
 impl Stage {
@@ -325,6 +378,7 @@ impl Stage {
             last_mismatch_ms: None,
             diagnostics: vault_plan::Diagnostics::default(),
             price_available: false,
+            invalid_plan_tier_since: Vec::new(),
         }
     }
 
@@ -351,8 +405,9 @@ impl Stage {
                     self.available = false;
                     self.failure(state, code);
                 }
-                Ok(plans) => {
-                    let result = self.append_snapshot(state, &plans).and_then(|changed| {
+                Ok(listing) => {
+                    let result = self.append_snapshot(state, &listing).and_then(|changed| {
+                        self.invalid_plan_tier_since = listing.invalid_plan_tier_since;
                         self.available = true;
                         self.process(state, source, now, changed)?;
                         self.publish(state);
@@ -374,21 +429,32 @@ impl Stage {
         }
     }
 
-    fn append_snapshot(&self, state: &SharedState, plans: &[VaultPlan]) -> Result<bool, String> {
+    fn append_snapshot(&self, state: &SharedState, listing: &Listing) -> Result<bool, String> {
+        let mut plans = listing.plans.clone();
         let changed = state.with_conn(|conn| {
-            for plan in plans {
-                if vault_plan::differs_from_latest(conn, plan).map_err(|error| error.to_string())? {
-                    return Ok(true);
+            let mut changed = false;
+            for plan in &mut plans {
+                if listing.effective_time_unspecified.contains(&plan.credential_id) {
+                    let previous: Option<(Option<String>, i64)> = conn.query_row(
+                        "SELECT plan_key,effective_from_ms FROM vault_plan_history WHERE credential_id=?1 ORDER BY history_id DESC LIMIT 1",
+                        [&plan.credential_id], |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).optional().map_err(|error| error.to_string())?;
+                    if let Some((key, effective)) = previous {
+                        if key == plan.plan_key {
+                            plan.effective_from_ms = effective;
+                        }
+                    }
                 }
+                changed |= vault_plan::differs_from_latest(conn, plan).map_err(|error| error.to_string())?;
             }
-            Ok(false)
+            Ok(changed)
         })?;
         if !changed {
             return Ok(false);
         }
         state.ordered_tail_write(|tx| {
             let mut changed = false;
-            for plan in plans {
+            for plan in &plans {
                 changed |= vault_plan::append_in_tx(tx, plan).map_err(|error| error.to_string())?;
             }
             Ok((changed, changed))
@@ -478,11 +544,15 @@ impl Stage {
 
     fn publish(&mut self, state: &SharedState) {
         let report = &self.diagnostics;
-        state.set_vault_report(json!({"vault_read_status":{"status":"available"},
+        let mut value = json!({"vault_read_status":{"status":"available"},
             "plan_price_status":if self.price_available { "available" } else { "unavailable" },
             "unknown_plans":report.unknown_plans,"unpriced_plans":report.unpriced_plans,
             "hand_vault_differences":report.hand_vault_differences,"vault_record_differences":report.vault_record_differences,
-            "chatgpt_account_mismatches":report.chatgpt_account_mismatches}));
+            "chatgpt_account_mismatches":report.chatgpt_account_mismatches});
+        if !self.invalid_plan_tier_since.is_empty() {
+            value["invalid_plan_tier_since"] = json!(self.invalid_plan_tier_since);
+        }
+        state.set_vault_report(value);
         self.last_failure = None;
     }
 

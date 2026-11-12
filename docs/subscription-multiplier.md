@@ -54,8 +54,23 @@ secrets. It lists at startup, after every notice and daily as a backstop.
 work runs outside startup and recording transactions, and a notice's new plan
 applies on the next full tick. The key is exactly `<provider_ids[0]>/<plan_tier>`
 when exactly one provider and a tier are present. Otherwise it is unknown.
-Effective time uses optional `plan_tier_observed_at_ms`, falling back to the
-first observation of a change. Repeated lists do not move that boundary.
+Effective time uses `plan_tier_since_ms` when it is a non-negative integer no
+later than the row's `plan_tier_observed_at_ms` (when that timestamp is present).
+Otherwise it uses `plan_tier_observed_at_ms`, falling back to the first observation
+of a change when neither time is usable. Invalid start dates are ignored and
+reported by `spend.subscription.report` in the optional `invalid_plan_tier_since`
+diagnostic. Repeated lists with the same plan and start append nothing; a date-only
+edit appends a new history row without rewriting earlier evidence.
+
+For each credential, a snapshot uses the last recorded history row whose start
+is before the snapshot's exclusive end. Rows replace earlier recorded evidence
+from their own start onward, even when a correction moves the start backwards
+across an older row's start. A future-start row does not change earlier snapshots.
+The lookup seeks backwards in recording order and stops at the first eligible
+row, skipping future-start rows if needed. Date-only edits to an already open,
+vault-owned ledger plan with the same key leave its existing ledger interval
+unchanged. Plan history determines the multiplier's historical tier; ledger
+intervals record subscription costs and are not backdated for the same key.
 
 Ledger reconciliation runs once after the first successful startup list, when
 a snapshot appends history, and on a scheduled retry. Unpriced keys retry

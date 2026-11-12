@@ -326,6 +326,10 @@ Reads never write. A refusal on a read is one of the codes below.
   `effective_from_ms` and `observed_at_ms`. `chatgpt_account_mismatches` lists
   `{credential_id, account_id, account_refs}` where subscription calls attributed
   to that OpenAI credential carry a different account reference.
+  `invalid_plan_tier_since`, omitted when empty, lists `{credential_id, reason}`
+  for ignored `plan_tier_since_ms` values in the latest successful listing.
+  Reasons are `not_non_negative_integer` or `after_observed_at`; affected rows
+  still use the observed timestamp, or the first observation when it is absent.
   `vault_read_status` is `{status: "not_read" | "available" | "unavailable"}`,
   with a safe `reason` on failures; it is process-local and resets on restart.
   `plan_price_status` is `available` or `unavailable`, independently of the vault

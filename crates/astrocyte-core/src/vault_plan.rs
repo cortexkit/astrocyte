@@ -443,8 +443,8 @@ pub fn seed_config_in_tx(
     Ok(())
 }
 
-/// A new listing is evidence of a change only when its plan key differs.
-/// Repeated reads must not move the effective time of the same tier.
+/// A changed plan key or explicit start date appends new evidence.
+/// Repeated observations of the same key and start do not append a row.
 pub fn append_in_tx(tx: &Transaction<'_>, plan: &VaultPlan) -> rusqlite::Result<bool> {
     if !differs_from_latest(tx, plan)? {
         return Ok(false);
@@ -457,12 +457,16 @@ pub fn append_in_tx(tx: &Transaction<'_>, plan: &VaultPlan) -> rusqlite::Result<
     Ok(true)
 }
 
-/// Compare a listing without starting a write transaction for an unchanged key.
+/// Compare a listing without starting a write transaction for an unchanged plan.
 pub fn differs_from_latest(conn: &Connection, plan: &VaultPlan) -> rusqlite::Result<bool> {
-    let previous: Option<Option<String>> = conn
-        .query_row(LATEST_PLAN_SQL, [&plan.credential_id], |row| row.get(0))
+    let previous: Option<(Option<String>, i64)> = conn
+        .query_row(LATEST_PLAN_SQL, [&plan.credential_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .optional()?;
-    Ok(previous.as_ref() != Some(&plan.plan_key))
+    Ok(previous.as_ref().is_none_or(|(key, effective)| {
+        key != &plan.plan_key || *effective != plan.effective_from_ms
+    }))
 }
 
 const AT_SQL: &str = "WITH RECURSIVE credential(id) AS (
@@ -474,24 +478,24 @@ const AT_SQL: &str = "WITH RECURSIVE credential(id) AS (
      SELECT h.credential_id,h.provider,h.account_id,h.plan_tier,h.plan_key,h.source,
             h.effective_from_ms,h.observed_at_ms
        FROM credential CROSS JOIN vault_plan_history h
-      WHERE h.history_id=(SELECT l.history_id FROM vault_plan_history l
+      WHERE h.history_id=(SELECT l.history_id FROM vault_plan_history l INDEXED BY vault_plan_credential_latest
                            WHERE l.credential_id=credential.id AND l.effective_from_ms<?1
-                           ORDER BY l.effective_from_ms DESC, l.history_id DESC LIMIT 1)
+                           ORDER BY l.history_id DESC LIMIT 1)
       ORDER BY h.effective_from_ms,h.history_id";
 
 /// Newest row of one credential by history ID, read through
 /// `vault_plan_credential_latest` so an unchanged listing costs one seek.
 const LATEST_PLAN_SQL: &str =
-    "SELECT plan_key FROM vault_plan_history WHERE credential_id=?1 ORDER BY history_id DESC LIMIT 1";
+    "SELECT plan_key,effective_from_ms FROM vault_plan_history WHERE credential_id=?1 ORDER BY history_id DESC LIMIT 1";
 
-/// Latest effective row for each record, with a deterministic tie-break for
-/// observations whose vault timestamp has millisecond resolution.
+/// Newest recorded row for each credential that starts before the instant.
+/// A backdated correction replaces older evidence from its own start onward.
 ///
 /// The recursive step jumps from one credential to the next through a
 /// credential-leading index, and each credential's row is one backwards seek
-/// on `vault_plan_record_history`, so the work follows the number of credentials rather
-/// than re-reading a credential's history once per row it holds. The result
-/// keeps the order by effective time and history ID.
+/// on `vault_plan_credential_latest`, stopping at the first eligible row rather
+/// than sorting the credential's history. Future-start rows are skipped until
+/// an eligible row is found. The result keeps the order by effective time and history ID.
 pub fn at(conn: &Connection, end_ms: i64) -> rusqlite::Result<Vec<VaultPlan>> {
     conn.prepare(AT_SQL)?
         .query_map([end_ms], |row| {
@@ -530,15 +534,14 @@ mod tests {
         .unwrap();
     }
 
-    /// The snapshot as it was first written: every row before the end that no
-    /// later-effective row of its credential replaces.
+    /// Independent successor check: newer recorded evidence replaces each row
+    /// whenever both rows start before the query's exclusive end.
     fn successor_rule_at(conn: &Connection, end_ms: i64) -> Vec<VaultPlan> {
         conn.prepare(
             "SELECT credential_id,provider,account_id,plan_tier,plan_key,source,effective_from_ms,observed_at_ms
              FROM vault_plan_history h WHERE effective_from_ms<?1 AND NOT EXISTS (
                SELECT 1 FROM vault_plan_history n WHERE n.credential_id=h.credential_id
-                AND n.effective_from_ms<?1 AND (n.effective_from_ms>h.effective_from_ms
-                 OR (n.effective_from_ms=h.effective_from_ms AND n.history_id>h.history_id)))
+                AND n.effective_from_ms<?1 AND n.history_id>h.history_id)
              ORDER BY effective_from_ms,history_id",
         )
         .unwrap()
@@ -599,6 +602,61 @@ mod tests {
     }
 
     #[test]
+    fn vault_plan_backdated_gmail_correction_replaces_later_effective_older_rows() {
+        let conn = crate::test_support::conn();
+        let since = 1_794_096_000_000; // 2026-11-08T00:00Z
+        let day = 86_400_000;
+        for (plan, effective) in [
+            ("openai/pro_200", since - 7 * day),
+            ("openai/pro_200", since + day),
+            ("openai/pro_500", 1_794_393_291_713),
+            ("openai/pro_500", since),
+        ] {
+            history_row(
+                &conn,
+                "chatgpt:openai:gmail",
+                Some("acct"),
+                Some(plan),
+                effective,
+            );
+        }
+        // at() takes an exclusive interval end, so a row at the exact end
+        // belongs to the next interval rather than the one being measured.
+        for end in [since - 1, since] {
+            assert_eq!(
+                at(&conn, end).unwrap()[0].plan_key.as_deref(),
+                Some("openai/pro_200")
+            );
+        }
+        for end in [since + 1, since + day, since + 2 * day, since + 4 * day] {
+            assert_eq!(
+                at(&conn, end).unwrap()[0].plan_key.as_deref(),
+                Some("openai/pro_500"),
+                "end {end}"
+            );
+            assert_eq!(at(&conn, end).unwrap()[0].effective_from_ms, since);
+        }
+        let future = since + 7 * day;
+        history_row(
+            &conn,
+            "chatgpt:openai:gmail",
+            Some("acct"),
+            Some("openai/plus"),
+            future,
+        );
+        for end in [since + 1, since + 4 * day, future] {
+            assert_eq!(
+                at(&conn, end).unwrap()[0].plan_key.as_deref(),
+                Some("openai/pro_500")
+            );
+        }
+        assert_eq!(
+            at(&conn, future + 1).unwrap()[0].plan_key.as_deref(),
+            Some("openai/plus")
+        );
+    }
+
+    #[test]
     fn snapshot_reads_one_row_per_record_not_its_history() {
         let measure = |versions: i64| {
             let conn = crate::test_support::conn();
@@ -631,7 +689,7 @@ mod tests {
         let plan = query_plan(&conn, AT_SQL);
         for expected in [
             "SEARCH h USING INTEGER PRIMARY KEY (rowid=?)",
-            "SEARCH l USING COVERING INDEX vault_plan_record_history (credential_id=? AND effective_from_ms<?)",
+            "SEARCH l USING INDEX vault_plan_credential_latest (credential_id=?)",
         ] {
             assert!(plan.contains(expected), "{expected} missing from:\n{plan}");
         }

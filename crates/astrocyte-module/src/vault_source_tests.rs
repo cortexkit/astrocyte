@@ -17,6 +17,7 @@ fn stage() -> Stage {
         last_mismatch_ms: None,
         diagnostics: vault_plan::Diagnostics::default(),
         price_available: false,
+        invalid_plan_tier_since: Vec::new(),
     }
 }
 
@@ -35,6 +36,166 @@ fn snapshot(tier: &str, effective: i64) -> Snapshot {
         listing(&["openai"], Some(tier), Some(effective)),
         effective + 1,
     )
+}
+
+fn since_vector_listing() -> Value {
+    let mut reply = listing(&["openai"], Some("pro_500"), None);
+    let mut credentials: Vec<Value> = [
+        include_str!("../tests/vectors/vault-plan-since/antigravity.json"),
+        include_str!("../tests/vectors/vault-plan-since/chatgpt.json"),
+    ]
+    .into_iter()
+    .map(|raw| serde_json::from_str(raw).unwrap())
+    .collect();
+    for (row, account) in credentials.iter_mut().zip(["google-acct", "acct"]) {
+        row["account_id"] = json!(account);
+        row["serves"] = json!([]);
+        row["operations"] = json!(["list"]);
+    }
+    reply["result"]["credentials"] = json!(credentials);
+    reply
+}
+
+#[test]
+fn vault_since_vector_records_subscription_start_not_observation() {
+    let state = test_state();
+    let mut stage = stage();
+    let plans = decode_listing(since_vector_listing(), 1_794_500_000_000).unwrap();
+    stage.apply(&state, vec![Ok(plans)], None, 1_794_500_000_000);
+    let recorded: Vec<(String, i64)> = state.with_conn(|conn| {
+        conn.prepare("SELECT credential_id,effective_from_ms FROM vault_plan_history ORDER BY credential_id")
+            .and_then(|mut stmt| stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect())
+            .map_err(|error| error.to_string())
+    }).unwrap();
+    assert_eq!(
+        recorded,
+        vec![
+            ("antigravity:google:ufuk".into(), 1_789_084_800_000),
+            ("chatgpt:openai:gmail".into(), 1_794_096_000_000),
+        ]
+    );
+}
+
+fn history_starts(state: &SharedState) -> Vec<i64> {
+    state
+        .with_conn(|conn| {
+            conn.prepare("SELECT effective_from_ms FROM vault_plan_history ORDER BY history_id")
+                .and_then(|mut stmt| stmt.query_map([], |row| row.get(0))?.collect())
+                .map_err(|error| error.to_string())
+        })
+        .unwrap()
+}
+
+#[test]
+fn vault_since_date_only_changes_append_once_and_leave_same_key_ledger_untouched() {
+    let state = test_state();
+    ingest(&state, 100);
+    let prices = Prices(vec![("pro_200", 20_000)]);
+    let mut stage = stage();
+    let mut reply = listing(&["openai"], Some("pro_200"), Some(200));
+    stage.apply(
+        &state,
+        vec![decode_listing(reply.clone(), 300)],
+        Some(&prices),
+        300,
+    );
+    let ledger = rows(&state);
+    assert_eq!(
+        ledger,
+        vec![(
+            "openai/pro_200".into(),
+            100,
+            None,
+            20_000,
+            Some("vault".into())
+        )]
+    );
+    for (since, now) in [(50, 301), (50, 302), (25, 303), (25, 304)] {
+        reply["result"]["credentials"][0]["plan_tier_since_ms"] = json!(since);
+        stage.apply(
+            &state,
+            vec![decode_listing(reply.clone(), now)],
+            Some(&prices),
+            now,
+        );
+        assert_eq!(
+            rows(&state),
+            ledger,
+            "date-only changes never rewrite ledger plans"
+        );
+    }
+    assert_eq!(history_starts(&state), vec![200, 50, 25]);
+}
+
+#[test]
+fn vault_since_invalid_values_fall_back_and_are_reported_without_hiding_plans() {
+    let state = test_state();
+    let mut stage = stage();
+    for (invalid, reason) in [
+        (json!(201), "after_observed_at"),
+        (json!(-1), "not_non_negative_integer"),
+        (json!("50"), "not_non_negative_integer"),
+        (json!(50.5), "not_non_negative_integer"),
+        (Value::Null, "not_non_negative_integer"),
+    ] {
+        let mut reply = listing(&["openai"], Some("pro_200"), Some(200));
+        reply["result"]["credentials"][0]["plan_tier_since_ms"] = invalid;
+        stage.apply(&state, vec![decode_listing(reply, 300)], None, 300);
+        assert_eq!(history_starts(&state), vec![200]);
+        let value = report(&state);
+        assert_eq!(value["vault_read_status"]["status"], "available");
+        assert_eq!(
+            value["invalid_plan_tier_since"],
+            json!([
+                {"credential_id":"oauth:login", "reason":reason}
+            ])
+        );
+        assert_eq!(value["unpriced_plans"][0]["plan_key"], "openai/pro_200");
+    }
+    stage.apply(&state, vec![snapshot("pro_200", 200)], None, 301);
+    assert!(
+        report(&state).get("invalid_plan_tier_since").is_none(),
+        "empty diagnostics are omitted"
+    );
+}
+
+#[test]
+fn vault_since_accepts_zero_equal_observed_and_missing_observed() {
+    for (since, observed) in [(0, Some(200)), (200, Some(200)), (50, None)] {
+        let mut reply = listing(&["openai"], Some("pro_200"), observed);
+        reply["result"]["credentials"][0]["plan_tier_since_ms"] = json!(since);
+        let listing = decode_listing(reply, 300).unwrap();
+        assert_eq!(listing.plans[0].effective_from_ms, since);
+        assert!(listing.invalid_plan_tier_since.is_empty());
+    }
+}
+
+#[test]
+fn vault_since_missing_timestamps_keep_first_observation_until_key_changes() {
+    let state = test_state();
+    let mut stage = stage();
+    for (tier, now) in [
+        ("pro_200", 100),
+        ("pro_200", 200),
+        ("plus", 300),
+        ("plus", 400),
+    ] {
+        stage.apply(
+            &state,
+            vec![decode_listing(listing(&["openai"], Some(tier), None), now)],
+            None,
+            now,
+        );
+    }
+    assert_eq!(history_starts(&state), vec![100, 300]);
+    let mut invalid = listing(&["openai"], Some("plus"), None);
+    invalid["result"]["credentials"][0]["plan_tier_since_ms"] = json!(-1);
+    stage.apply(&state, vec![decode_listing(invalid, 500)], None, 500);
+    assert_eq!(history_starts(&state), vec![100, 300]);
+    assert_eq!(
+        report(&state)["invalid_plan_tier_since"][0]["reason"],
+        "not_non_negative_integer"
+    );
 }
 
 struct Prices(Vec<(&'static str, i64)>);
@@ -320,8 +481,8 @@ fn vault_multiple_providers_or_absent_tier_are_unknown_and_optional_time_falls_b
         (vec!["openai"], None),
     ] {
         let plans = decode_listing(listing(&providers, tier, None), 123).unwrap();
-        assert_eq!(plans[0].plan_key, None);
-        assert_eq!(plans[0].effective_from_ms, 123);
+        assert_eq!(plans.plans[0].plan_key, None);
+        assert_eq!(plans.plans[0].effective_from_ms, 123);
         stage.apply(
             &state,
             vec![Ok(plans)],
@@ -331,7 +492,7 @@ fn vault_multiple_providers_or_absent_tier_are_unknown_and_optional_time_falls_b
         assert!(rows(&state).is_empty());
     }
     let plans = decode_listing(listing(&["openai"], Some("pro_200"), Some(7)), 123).unwrap();
-    assert_eq!(plans[0].effective_from_ms, 7);
+    assert_eq!(plans.plans[0].effective_from_ms, 7);
 }
 
 #[test]
@@ -506,6 +667,7 @@ fn vault_watch_notice_is_applied_on_next_full_tick_without_restart() {
             .any(|snapshot| {
                 snapshot.as_ref().is_ok_and(|plans| {
                     plans
+                        .plans
                         .iter()
                         .any(|plan| plan.plan_key.as_deref() == Some("openai/plus"))
                 })
@@ -551,19 +713,32 @@ fn vault_shared_account_uses_latest_record_without_tick_order_churn() {
     let state = test_state();
     ingest(&state, 10);
     let prices = Prices(vec![("pro_200", 20_000), ("plus", 2_000)]);
-    let mut older = snapshot("pro_200", 100).unwrap().remove(0);
+    let mut older = snapshot("pro_200", 100).unwrap().plans.remove(0);
     older.credential_id = "old-login".into();
-    let current = snapshot("plus", 200).unwrap().remove(0);
+    let current = snapshot("plus", 200).unwrap().plans.remove(0);
     let mut stage = stage();
     stage.apply(
         &state,
-        vec![Ok(vec![older.clone(), current.clone()])],
+        vec![Ok(Listing {
+            plans: vec![older.clone(), current.clone()],
+            invalid_plan_tier_since: Vec::new(),
+            effective_time_unspecified: Vec::new(),
+        })],
         Some(&prices),
         201,
     );
     let expected = rows(&state);
     for plans in [vec![current.clone(), older.clone()], vec![older, current]] {
-        stage.apply(&state, vec![Ok(plans)], Some(&prices), 202);
+        stage.apply(
+            &state,
+            vec![Ok(Listing {
+                plans,
+                invalid_plan_tier_since: Vec::new(),
+                effective_time_unspecified: Vec::new(),
+            })],
+            Some(&prices),
+            202,
+        );
         assert_eq!(rows(&state), expected);
     }
     assert_eq!(expected[0].0, "openai/plus");

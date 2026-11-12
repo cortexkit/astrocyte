@@ -1,0 +1,1 @@
+{"auth_method":"chatgpt","categories":["llm-provider","openai-native"],"id":"chatgpt:openai:gmail","plan_tier":"pro_500","plan_tier_observed_at_ms":1794393291713,"plan_tier_since_ms":1794096000000,"plan_tier_source":"operator","provider_ids":["openai"],"record_version":308,"state":"active","type":"oauth"}
