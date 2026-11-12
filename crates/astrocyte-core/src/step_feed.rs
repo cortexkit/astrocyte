@@ -516,20 +516,26 @@ pub fn append_changes(
     Ok(appended)
 }
 
+const PRUNE_CANDIDATES_SQL: &str = "SELECT MAX(feed_cursor) FROM (SELECT feed_cursor,
+    committed_at_ms FROM step_feed ORDER BY feed_cursor LIMIT ?2) WHERE committed_at_ms<?1";
+
 // Look up content-free host metadata by the shared cursor, never by decoding
 // a step reference. The left join keeps older calls without an id unchanged.
 const MESSAGE_ID_SQL: &str = "SELECT m.message_id FROM cache_step_sequence s
     LEFT JOIN step_message m ON m.event_key=s.event_key WHERE s.cursor=?1";
 
-/// Delete up to `PRUNE_BATCH` rows committed before `window_start`, and
-/// record the newest cursor deleted so reads from before it are refused.
+/// Delete expired rows among the oldest `PRUNE_BATCH`, and record the newest
+/// cursor deleted so reads from before it are refused.
+///
+/// A row's cursor and commit time are assigned at the same append, so the
+/// oldest rows are the ones that expire first. Looking only at the oldest
+/// `PRUNE_BATCH` keeps every call bounded: filtering the whole table by
+/// commit time would read the full day's feed on each append whenever
+/// nothing has expired, which is most of the time.
 fn prune(conn: &Connection, window_start: i64) -> rusqlite::Result<()> {
-    let newest_expired: Option<i64> = conn.query_row(
-        "SELECT MAX(feed_cursor) FROM (SELECT feed_cursor FROM step_feed
-          WHERE committed_at_ms<?1 ORDER BY feed_cursor LIMIT ?2)",
-        params![window_start, PRUNE_BATCH],
-        |row| row.get(0),
-    )?;
+    let newest_expired: Option<i64> = conn
+        .prepare_cached(PRUNE_CANDIDATES_SQL)?
+        .query_row(params![window_start, PRUNE_BATCH], |row| row.get(0))?;
     let Some(newest_expired) = newest_expired else {
         return Ok(());
     };
@@ -637,6 +643,66 @@ pub fn read(conn: &Connection, request: FeedReadRequest) -> Result<FeedPage, Fee
 mod tests {
     use super::*;
     use crate::test_support::conn;
+
+    fn feed_rows(conn: &Connection, committed_at_ms: i64, count: usize) {
+        for _ in 0..count {
+            conn.execute(
+                "INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
+                 VALUES ('pi','s','file','x',?1,'{}')",
+                [committed_at_ms],
+            )
+            .unwrap();
+        }
+    }
+
+    fn prune_steps(conn: &Connection, window_start: i64) -> u64 {
+        let counter = crate::store::VmCounter::start(conn);
+        prune(conn, window_start).unwrap();
+        counter.steps()
+    }
+
+    #[test]
+    fn pruning_with_nothing_expired_costs_the_same_whatever_the_feed_holds() {
+        let mut costs = Vec::new();
+        for live_rows in [1_000, 10_000] {
+            let conn = conn();
+            feed_rows(&conn, 200, live_rows);
+            costs.push(prune_steps(&conn, 100));
+            let kept: i64 = conn
+                .query_row("SELECT COUNT(*) FROM step_feed", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(kept, i64::try_from(live_rows).unwrap());
+        }
+        assert!(
+            costs[1] < costs[0] + 100,
+            "an append with nothing expired must not read the whole feed: {costs:?}"
+        );
+    }
+
+    #[test]
+    fn pruning_deletes_the_oldest_expired_rows_and_records_the_cursor() {
+        let conn = conn();
+        feed_rows(&conn, 50, 3);
+        feed_rows(&conn, 200, 2);
+        prune(&conn, 100).unwrap();
+        let left: Vec<i64> = conn
+            .prepare("SELECT committed_at_ms FROM step_feed ORDER BY feed_cursor")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(left, [200, 200]);
+        let (pruned, oldest_kept): (i64, i64) = conn
+            .query_row(
+                "SELECT pruned_through, (SELECT MIN(feed_cursor) FROM step_feed)
+                 FROM step_feed_state WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pruned + 1, oldest_kept);
+    }
 
     #[test]
     fn step_message_lookup_seeks_cursor_and_message_keys() {
