@@ -200,15 +200,17 @@ impl GooseSource {
             }
             Err(error) => {
                 ensure_runtime_row(state, GOOSE_SOURCE_KEY)?;
-                return Err(format!("inspect Goose store {}: {error}", db_path.display()).into());
+                return Err(
+                    format!("inspect Goose database {}: {error}", db_path.display()).into(),
+                );
             }
         }
         ensure_runtime_row(state, GOOSE_SOURCE_KEY)?;
         let database = astrocyte_readers::read_io::open(db_path)
-            .map_err(|error| format!("open Goose store {}: {error}", db_path.display()))?;
+            .map_err(|error| format!("open Goose database {}: {error}", db_path.display()))?;
         let metadata = database
             .metadata()
-            .map_err(|error| format!("inspect Goose store {}: {error}", db_path.display()))?;
+            .map_err(|error| format!("inspect Goose database {}: {error}", db_path.display()))?;
         let signature = (
             astrocyte_readers::file_identity::file_identity(&database, &metadata),
             metadata.len(),
