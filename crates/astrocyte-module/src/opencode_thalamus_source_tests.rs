@@ -113,6 +113,53 @@ impl Fixture {
 }
 
 #[test]
+fn opencode_payer_roots_owner_wins_and_counts_owner_disagreement() {
+    let f = Fixture::new();
+    f.manage_payer_session();
+    f.payer_row("managed", "metered_api");
+    f.payer_call(Layout::V2, "managed", true, CREATED);
+    f.declare(vec![f.entry(ONE, false)]);
+    f.tick(T0);
+    assert_eq!(
+        f.events(),
+        vec![("managed".into(), "opencode".into(), Some(OWNER.into()))]
+    );
+    f.state
+        .with_conn(|conn| {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM thalamus_payer_coverage WHERE kind='owner_disagreement'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+    f.tick(T0 + TICK);
+    f.state
+        .with_conn(|conn| {
+            let coverage = astrocyte_core::report::ledger_coverage(
+                conn,
+                &astrocyte_core::report::LedgerCoverageRequest {},
+                T0 + TICK,
+            )
+            .unwrap();
+            assert_eq!(coverage.thalamus_payer.unwrap().owner_disagreements, 1);
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM rejected_delivery", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn opencode_payer_join_matched_facts_and_unmanaged_bytes() {
     for layout in LAYOUTS {
         let control = Fixture::new();

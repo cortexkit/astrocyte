@@ -1563,6 +1563,107 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
     const PI_COMPLETED: i64 = 1_788_220_801_000;
 
     #[test]
+    fn pi_payer_declared_owner_is_work_class_with_matched_payer() {
+        pi_payer_declared_owner_is_work_class(true);
+    }
+
+    #[test]
+    fn pi_payer_declared_owner_is_work_class_after_wait_expires() {
+        pi_payer_declared_owner_is_work_class(false);
+    }
+
+    fn pi_payer_declared_owner_is_work_class(matched: bool) {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join("sessions");
+        write_fixture(
+            &sessions,
+            "project",
+            &fixture("pi-session-1", "/actual/project", Some("response-1")),
+        );
+        let (store, payer) = payer_fixture(home.path(), "pi-session-1");
+        store
+            .execute(
+                "UPDATE payer_session SET owner_principal='prefrontal-core'",
+                [],
+            )
+            .unwrap();
+        if matched {
+            payer_call(&store, "attempt-1", "pi:response:response-1", "vault-login");
+        }
+        let state = test_state();
+        payer_tick(&payer, &state, PI_COMPLETED + 1);
+        let source = PiSource::at(&sessions);
+        let first = source.drain(&state, PI_COMPLETED + 1, &NEVER_STOP).unwrap();
+        if matched {
+            assert_eq!(first.rows_recorded, 1);
+        } else {
+            assert_eq!(first.rows_recorded, 0);
+            assert_eq!(table_count(&state, "usage_event"), 0);
+            assert_eq!(source.cache.lock().unwrap().payer_wait.len(), 1);
+            let expired = source
+                .drain(&state, PI_COMPLETED + 600_000, &NEVER_STOP)
+                .unwrap();
+            assert_eq!(expired.rows_recorded, 1);
+        }
+        state.with_conn(|conn| {
+            let facts = conn.query_row(
+                "SELECT work_class,charge_basis,auth_selection,account_ref FROM usage_event",
+                [],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)),
+            ).unwrap();
+            assert_eq!(facts.0.as_deref(), Some("prefrontal-core"));
+            if matched {
+                assert_eq!((facts.1, facts.2, facts.3), ("metered_api".into(), Some("vault-login".into()), Some("account".into())));
+            } else {
+                assert_eq!((facts.1, facts.2, facts.3), ("unknown".into(), None, None));
+            }
+            assert_eq!(conn.query_row("SELECT SUM(quantity_units) FROM measurement WHERE role='input'", [], |row| row.get::<_, i64>(0)).unwrap(), 11);
+            Ok(())
+        }).unwrap();
+        assert_eq!(table_count(&state, "usage_event"), 1);
+        assert_eq!(table_count(&state, "rejected_delivery"), 0);
+    }
+
+    #[test]
+    fn pi_payer_declaration_after_recording_keeps_first_record_on_reread() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join("sessions");
+        write_fixture(
+            &sessions,
+            "project",
+            &fixture("pi-session-1", "/actual/project", Some("response-1")),
+        );
+        let (_store, payer) = payer_fixture(home.path(), "pi-session-1");
+        let state = test_state();
+        let source = PiSource::at(&sessions);
+        assert_eq!(
+            source
+                .drain(&state, PI_COMPLETED + 1, &NEVER_STOP)
+                .unwrap()
+                .rows_recorded,
+            1
+        );
+        let before = ledger_dump(&state);
+        payer_tick(&payer, &state, PI_COMPLETED + 2);
+        // Windowed reads do not resume, so even an unchanged file is replayed.
+        let replay = source
+            .drain_in_window(&state, PI_COMPLETED + 3, PI_COMPLETED, PI_COMPLETED)
+            .unwrap();
+        assert_eq!(replay.rows_recorded, 0);
+        assert_eq!(replay.exact_redeliveries, 1);
+        assert_eq!(replay.quarantined_redeliveries, 0);
+        // A fresh reader also replays the file without its process-local caches.
+        let replay = PiSource::at(&sessions)
+            .drain(&state, PI_COMPLETED + 86_400_000, &NEVER_STOP)
+            .unwrap();
+        assert_eq!(replay.rows_recorded, 0);
+        assert_eq!(replay.exact_redeliveries, 1);
+        assert_eq!(replay.quarantined_redeliveries, 0);
+        assert_eq!(ledger_dump(&state), before);
+        assert_eq!(table_count(&state, "rejected_delivery"), 0);
+    }
+
+    #[test]
     fn pi_payer_join_matches_the_shared_step_key_without_changing_identity_or_usage() {
         let home = TempDir::new().unwrap();
         let sessions = home.path().join("sessions");

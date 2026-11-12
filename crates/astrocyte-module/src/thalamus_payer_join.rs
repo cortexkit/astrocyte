@@ -124,11 +124,27 @@ impl WaitQueue {
             if !was_waiting && self.waiting.contains_key(&id) {
                 continue;
             }
-            let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM thalamus_payer_session WHERE harness=?1 AND session=?2)",params![harness,call.native_session()],|row|row.get(0)).map_err(|e|e.to_string())?;
-            if !managed {
+            let owner: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT owner_principal FROM thalamus_payer_session WHERE harness=?1 AND session=?2",
+                    params![harness, call.native_session()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let Some(owner) = owner else {
                 result.ready.push(request.clone());
                 continue;
+            };
+            if let (Some(owner), Some(roots_owner)) =
+                (owner.as_deref(), request.work_class.as_deref())
+            {
+                if roots_owner != owner {
+                    count_coverage(tx, "owner_disagreement", &id)?;
+                }
             }
+            // A declaration may arrive after the call was recorded. Keep the
+            // first payload, including an absent work class, on transcript replay.
             let recorded: bool = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM usage_event WHERE event_id=?1)",
@@ -141,6 +157,9 @@ impl WaitQueue {
                 continue;
             }
             let mut ready = request.clone();
+            if ready.work_class.is_none() {
+                ready.work_class = owner;
+            }
             match payer_match(tx, harness, &request.producer_ref)? {
                 PayerMatch::Found {
                     basis,

@@ -1135,7 +1135,7 @@ mod tests {
         let coverage = dispatch(&state, OP_LEDGER_COVERAGE, json!({})).unwrap();
         assert_eq!(
             coverage["thalamus_payer"],
-            json!({"transcript_calls_without_payer":1,"late_payer_rows":1,"unmatched_main_rows":1,"set_aside_payer_rows":2,"waiting_calls_by_reader":{"pi":3,"opencode-thalamus":2}})
+            json!({"transcript_calls_without_payer":1,"late_payer_rows":1,"unmatched_main_rows":1,"set_aside_payer_rows":2,"owner_disagreements":0,"waiting_calls_by_reader":{"pi":3,"opencode-thalamus":2}})
         );
         state.set_payer_waiting("pi", 0);
         let coverage = dispatch(&state, OP_LEDGER_COVERAGE, json!({})).unwrap();

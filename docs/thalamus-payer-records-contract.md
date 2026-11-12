@@ -150,6 +150,12 @@ from the lowest `seq` and skips every `attempt_id` it already holds. A row
 astrocyte can't read is set aside as evidence with its location and reason,
 and reading continues.
 
+- **Work class.** Every call in a session declared in `payer_session` takes
+  that session's `owner_principal` as its work class, whether or not a payer
+  row matched. If a roots declaration already gives the call an owner, that
+  owner is kept. When both owners are present and differ, payer coverage
+  counts the call once in `owner_disagreements`. Calls outside declared sessions
+  are unchanged, and calls already recorded keep their original work class.
 - **A matched `main` row** gives its transcript call that charge basis,
   `auth_selection` and `account_ref`. A subscription call is then covered by
   its account's ledger plan, and a metered call is priced at list rates. The

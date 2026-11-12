@@ -2063,6 +2063,7 @@ pub struct ThalamusPayerCoverage {
     pub late_payer_rows: u64,
     pub unmatched_main_rows: u64,
     pub set_aside_payer_rows: u64,
+    pub owner_disagreements: u64,
     pub waiting_calls_by_reader: BTreeMap<String, usize>,
 }
 
@@ -2085,6 +2086,7 @@ fn load_thalamus_payer_coverage(
             "late" => coverage.late_payer_rows = count,
             "unmatched_main" => coverage.unmatched_main_rows = count,
             "set_aside" => coverage.set_aside_payer_rows = count,
+            "owner_disagreement" => coverage.owner_disagreements = count,
             _ => {}
         }
     }
@@ -2471,6 +2473,49 @@ fn pow10_i128(exponent: u32) -> Result<i128, ReportError> {
 mod tests {
     use super::*;
     use crate::test_support::conn;
+
+    #[test]
+    fn thalamus_payer_coverage_owner_disagreements_are_distinct_and_explicit_zero() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO thalamus_payer_session VALUES ('opencode','session','owner',0)",
+            [],
+        )
+        .unwrap();
+        let report = ledger_coverage(&conn, &LedgerCoverageRequest {}, 100).unwrap();
+        let wire = serde_json::to_value(&report).unwrap();
+        for counter in [
+            "transcript_calls_without_payer",
+            "late_payer_rows",
+            "unmatched_main_rows",
+            "set_aside_payer_rows",
+            "owner_disagreements",
+        ] {
+            assert_eq!(wire["thalamus_payer"][counter], serde_json::json!(0));
+        }
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO thalamus_payer_coverage VALUES ('owner_disagreement','event-a');
+             INSERT OR IGNORE INTO thalamus_payer_coverage VALUES ('owner_disagreement','event-a');
+             INSERT OR IGNORE INTO thalamus_payer_coverage VALUES ('owner_disagreement','event-b');
+             INSERT INTO thalamus_payer_coverage VALUES ('late','attempt-a');",
+        )
+        .unwrap();
+        let report = ledger_coverage(&conn, &LedgerCoverageRequest {}, 100).unwrap();
+        let coverage = report.thalamus_payer.as_ref().unwrap();
+        assert_eq!(coverage.owner_disagreements, 2);
+        assert_eq!(coverage.late_payer_rows, 1);
+        assert_eq!(coverage.transcript_calls_without_payer, 0);
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["thalamus_payer"]["owner_disagreements"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            report.thalamus_payer,
+            ledger_coverage_base(&conn, &LedgerCoverageRequest {}, 100)
+                .unwrap()
+                .thalamus_payer
+        );
+    }
 
     fn event(
         conn: &Connection,

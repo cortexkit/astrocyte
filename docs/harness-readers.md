@@ -287,6 +287,7 @@ Rules that affect what is recorded:
   in output, and their reported cost does not establish a charge basis. Existing
   assistant timestamps and fallback identities are unchanged; request-start
   timestamps are not adopted.
+  Pi calls in declared payer sessions take the session's `owner_principal` as work class; already recorded calls are not changed on reread.
 - A Goose session is recorded once its `updated_at` is 24 hours old
   (`GOOSE_QUIET_WINDOW_MS`). A session that grows after that is re-emitted
   and quarantined as a redelivery with a different payload; it is never
