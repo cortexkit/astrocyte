@@ -21,6 +21,18 @@ pub(crate) fn claude_sessions(data_home: PathBuf) -> Result<ClaudeSessionPaths, 
     })
 }
 
+/// Pi declares private session folders beside its roots-file directory.
+pub(crate) fn pi_sessions(data_home: PathBuf) -> Result<ClaudeSessionPaths, String> {
+    if !data_home.is_absolute() {
+        return Err(format!("the data home resolved to the relative {data_home:?}; refusing to resolve Pi session roots"));
+    }
+    let cortexkit = data_home.join("cortexkit");
+    Ok(ClaudeSessionPaths {
+        roots: cortexkit.join("thalamus-harness/pi/roots.json"),
+        ack: cortexkit.join("astrocyte/acks/pi.json"),
+    })
+}
+
 /// The roots file declaring the OpenCode sessions thalamus-harness runs in
 /// private OpenCode servers. The session folders sit beside it, under
 /// Astrocyte's own data home.

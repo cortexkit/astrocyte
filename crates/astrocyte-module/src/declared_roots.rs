@@ -1,12 +1,69 @@
 //! Roots files that thalamus-harness writes to declare its private harness
 //! folders, and the containment checks astrocyte applies to every declared path.
-//! The THALAMUS Claude Code and OpenCode session contracts
-//! share file decoding and path resolution, but allow different folder shapes.
+//! THALAMUS's harness session contracts share file decoding and path resolution,
+//! but allow different folder shapes. File acknowledgements share an atomic writer.
 
+use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(PartialEq, Deserialize, Serialize)]
+pub(crate) struct Ack {
+    pub(crate) version: u64,
+    pub(crate) read_through: Vec<ReadThrough>,
+}
+
+#[derive(PartialEq, Deserialize, Serialize)]
+pub(crate) struct ReadThrough {
+    pub(crate) session: String,
+    pub(crate) at_ms: i64,
+}
+
+pub(crate) fn write_ack(path: &Path, ack: &impl Serialize) -> std::io::Result<()> {
+    let folder = path.parent().expect("ack parent");
+    fs::create_dir_all(folder)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(folder, fs::Permissions::from_mode(0o700))?;
+    }
+    // Exclusive creation in the destination directory prevents partial reads.
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (temporary, mut file) = loop {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = folder.join(format!(
+            ".claude-code-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let result = (|| {
+        serde_json::to_writer(&mut file, ack)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
 
 /// What one read of a roots file found.
 pub(crate) enum RootsFile<T> {
@@ -182,4 +239,23 @@ fn contain_with(
         )));
     }
     Ok(Contained::Inside(canonical))
+}
+
+/// Pi mints its session id after launch, so only the private folder's shape,
+/// not its name, is tied to the declaration.
+pub(crate) fn contain_pi_session(folder: &Path, declared: &Path) -> Result<Contained, String> {
+    contain_with(
+        Some(folder),
+        declared,
+        "Pi session folder",
+        |folder, canonical| {
+            let Ok(relative) = canonical.strip_prefix(folder) else {
+                return false;
+            };
+            let mut parts = relative.components();
+            matches!((parts.next(), parts.next(), parts.next()),
+            (Some(Component::Normal(sessions)), Some(Component::Normal(_)), None)
+                if sessions == "pi-sessions")
+        },
+    )
 }

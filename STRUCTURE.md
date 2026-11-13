@@ -66,8 +66,8 @@ A library shared by three binaries: `main.rs` (`ck-astrocyte`) and two tools,
   `gemini_source.rs`, `goose_source.rs`, `omp_source.rs`, `kimi_source.rs`.
   `jsonl_schedule.rs` holds each JSONL file's next read deadlines, such as the
   staggered daily full re-read.
-- Declared folders: `declared_roots.rs` (roots files and path containment),
-  `claude_thalamus_source.rs` and
+- Declared folders: `declared_roots.rs` (roots, containment and atomic acks),
+  `claude_thalamus_source.rs`, `pi_thalamus_source.rs` and
   `opencode_thalamus_source.rs`. `harness_paths.rs` resolves every harness path.
 - `broca_source.rs`, `wire_map.rs`: BROCA's `run-index.db` reader and fact mapping.
 - `colliculus_source.rs`: the colliculus media usage feed.

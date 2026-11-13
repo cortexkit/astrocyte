@@ -134,6 +134,8 @@ The source key is normally the `producer` stored on every event and the key used
 row, but shares the `opencode` producer and configuration key with OpenCode 1.
 Declared OpenCode sessions record producer `opencode` too, but have their own
 `opencode-thalamus` runtime row, set-aside source and configuration key.
+Declared Pi sessions likewise keep producer `pi` and its call identity, with
+independent `pi-thalamus` health and configuration.
 The `thalamus-payer` source records row-less calls as producer `thalamus-harness`.
 
 | Source key | Harness | Store |
@@ -144,6 +146,7 @@ The `thalamus-payer` source records row-less calls as producer `thalamus-harness
 | `opencode-thalamus` | OpenCode sessions declared by thalamus-harness | `<path>/opencode.db` for each declared folder, both OpenCode layouts |
 | `thalamus-payer` | THALAMUS payer facts and calls absent from transcripts | `<data home>/cortexkit/thalamus-harness/payer/payer.db` |
 | `pi` | Pi | `PI_CODING_AGENT_SESSION_DIR`, else `<PI_CODING_AGENT_DIR or ~/.pi/agent>/sessions/**/*.jsonl` |
+| `pi-thalamus` | Pi sessions declared by thalamus-harness | Every `*.jsonl` under each declared private Pi session folder |
 | `gemini` | Gemini CLI | `<GEMINI_CLI_HOME or ~>/.gemini/tmp/`, `session-*.json(l)` and files under `chats/` |
 | `goose` | Goose | `GOOSE_PATH_ROOT/data/`, else the platform data directory, `sessions/sessions.db`, table `sessions` |
 | `omp` | Oh My Pi | `~/.omp/agent/sessions/**/*.jsonl` |
@@ -178,6 +181,15 @@ Each source resolves its store path by these rules, implemented in
   and becomes the recorded call's session, with Claude Code's own id as fallback.
   Already-recorded calls keep their original session. Payer-session membership
   and deletion acknowledgements still use Claude Code's own id.
+- THALAMUS's on-demand Pi folders come from
+  `<data home>/cortexkit/thalamus-harness/pi/roots.json`, under the
+  [Pi sessions contract](thalamus-pi-sessions-contract.md). A declaration's
+  required `owner_session` becomes the recorded call's session and keys
+  `astrocyte/acks/pi.json`; its `owner_principal` becomes the work class. The
+  native id comes from each file's header, including while the declaration's
+  `session` is null, and is retained for the Pi payer join. A non-null session
+  disagreement refuses the whole folder by name. Done folders are acknowledged
+  only after their calls commit, including calls delayed by payer waits.
 - broca's store is read only at the default data-home path. A
   `BROCA_STATE_ROOT` elsewhere puts it where astrocyte does not look, and it
   reads as absent.

@@ -1,0 +1,2 @@
+{"type":"session","id":"pi-synthetic-one","timestamp":"1970-01-01T00:00:00.000Z","cwd":"/synthetic/project"}
+{"type":"message","id":"entry-one","timestamp":"1970-01-01T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4","responseId":"pi-synthetic-response","usage":{"input":11,"output":7,"cacheRead":13,"cacheWrite":17,"reasoning":2,"totalTokens":48}}}

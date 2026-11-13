@@ -1156,6 +1156,12 @@ impl PiResumePoint {
     pub fn offset(&self) -> u64 {
         self.offset
     }
+
+    /// The native id from the consumed session header, including on a resume
+    /// that emits no calls. A declaration must not supply a substitute id.
+    pub fn session_id(&self) -> Option<&str> {
+        self.state.session_id.as_deref()
+    }
 }
 
 /// Result of one [`parse_pi_file_resumable`] call.

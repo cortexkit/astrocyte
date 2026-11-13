@@ -41,6 +41,8 @@ pub(crate) mod opencode_thalamus_source;
 pub(crate) mod opencode_v2_source;
 #[path = "pi_source.rs"]
 mod pi_source;
+#[path = "pi_thalamus_source.rs"]
+mod pi_thalamus_source;
 #[path = "thalamus_payer_join.rs"]
 pub(crate) mod thalamus_payer_join;
 #[path = "thalamus_payer_source.rs"]
@@ -1602,6 +1604,7 @@ fn refresher_harness_sources() -> Vec<Arc<dyn harness_drain::HarnessSource>> {
         Arc::new(refresher_omp_source()),
         Arc::new(refresher_kimi_source()),
         Arc::new(refresher_claude_thalamus_source()),
+        Arc::new(refresher_pi_thalamus_source()),
         Arc::new(refresher_opencode_thalamus_source()),
     ]
 }
@@ -1626,6 +1629,17 @@ fn refresher_claude_thalamus_source() -> claude_thalamus_source::ClaudeThalamusS
     #[cfg(not(any(test, feature = "test-support")))]
     let home = PathBuf::from(cortexkit_store_types::resolve_data_home());
     claude_thalamus_source::ClaudeThalamusSource::from_data_home(home)
+}
+
+fn refresher_pi_thalamus_source() -> pi_thalamus_source::PiThalamusSource {
+    #[cfg(any(test, feature = "test-support"))]
+    let home = std::env::temp_dir().join(format!(
+        "astrocyte-test-data-without-pi-sessions-{}",
+        std::process::id()
+    ));
+    #[cfg(not(any(test, feature = "test-support")))]
+    let home = PathBuf::from(cortexkit_store_types::resolve_data_home());
+    pi_thalamus_source::PiThalamusSource::from_data_home(home)
 }
 
 fn refresher_opencode_thalamus_source() -> opencode_thalamus_source::OpenCodeThalamusSource {

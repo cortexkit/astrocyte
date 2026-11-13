@@ -89,13 +89,19 @@ catalog. With `null`, every event is stored unpriced with reason
 
 Which sources the refresher drains. `enabled: false` turns every source off.
 Otherwise each source key in `exclude` is skipped. Valid keys are the
-`INGEST_SOURCES` list: `claude-code`, `codex`,
-`opencode`, `opencode-thalamus`, `pi`, `gemini`, `goose`, `omp`, `kimi`, `broca`. A skipped source
+`INGEST_SOURCES` list: `claude-code`, `claude-code-thalamus`, `codex`,
+`opencode`, `opencode-thalamus`, `pi`, `pi-thalamus`, `thalamus-payer`,
+`gemini`, `goose`, `omp`, `kimi`, `broca`, `colliculus`. A skipped source
 is not read and its `source_runtime` row is removed, so it never reads as
 stale. Events it already recorded stay. Refused: an unknown key, a key listed
 twice, and `enabled: false` with a non-empty `exclude`. Tests:
 `an_unknown_excluded_producer_is_refused_by_name`,
 `ingestion_off_with_a_non_empty_exclude_is_refused_as_contradictory`.
+
+The `pi-thalamus` source reads THALAMUS's declared on-demand Pi sessions under
+the [Pi sessions contract](thalamus-pi-sessions-contract.md). It is enabled
+unless excluded. The new exclusion value adds no config member: existing
+documents and stored generations remain compatible without naming it.
 
 ### `reasoning_billed_as_output`
 

@@ -50,6 +50,25 @@ pub(crate) struct Resolution {
 }
 
 impl WaitQueue {
+    /// A refused declaration must not release calls queued under its owner.
+    /// Full transcript scans can rediscover them once the declaration is valid.
+    pub(crate) fn retain_recorded_sessions(&mut self, owners: &HashSet<String>) {
+        self.waiting.retain(|_, call| {
+            call.request
+                .session
+                .as_ref()
+                .is_some_and(|owner| owners.contains(owner))
+        });
+    }
+
+    /// Declared Pi folders acknowledge their owner, not the native Pi id.
+    pub(crate) fn pending_recorded_sessions(&self) -> HashSet<String> {
+        self.waiting
+            .values()
+            .filter_map(|call| call.request.session.clone())
+            .collect()
+    }
+
     /// Refresh only the recorded session of unrecorded calls from current
     /// declarations. Keep the native id for payer membership and deletion acks.
     pub(crate) fn update_recorded_sessions(&mut self, sessions: &HashMap<&str, &str>) {

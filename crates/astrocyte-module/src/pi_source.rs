@@ -703,7 +703,7 @@ fn session_header_timestamp(
     }
 }
 
-fn map_message(record: PiUsageRecord) -> Result<EventRecordRequest, String> {
+pub(crate) fn map_message(record: PiUsageRecord) -> Result<EventRecordRequest, String> {
     let PiUsageRecord {
         message,
         message_id,
@@ -936,6 +936,45 @@ fn record_requests(
     stop_requested: &dyn Fn() -> bool,
     payer_wait: &super::thalamus_payer_join::WaitQueue,
 ) -> Result<super::thalamus_payer_join::WaitQueue, SourceDrainError> {
+    let calls = requests
+        .iter()
+        .map(|request| super::thalamus_payer_join::WaitingCall {
+            request: request.clone(),
+            // Pi writes each assistant entry with the completed response.
+            completed_at_ms: request.occurred_at_ms,
+            native_session: None,
+        })
+        .collect::<Vec<_>>();
+    record_calls(
+        state,
+        PI_SOURCE_KEY,
+        &calls,
+        set_aside,
+        recorded_at_ms,
+        update_runtime,
+        outcome,
+        stop_requested,
+        payer_wait,
+    )
+}
+
+/// Both Pi roots use the same payer join and recording transaction. Declared
+/// roots additionally keep the first ledger payload for copied history.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the transaction records the read and its proposed payer waits together"
+)]
+pub(crate) fn record_calls(
+    state: &SharedState,
+    source_key: &str,
+    calls: &[super::thalamus_payer_join::WaitingCall],
+    set_aside: &[crate::refresher::SetAsideRecord],
+    recorded_at_ms: i64,
+    update_runtime: bool,
+    outcome: &mut PiDrainOutcome,
+    stop_requested: &dyn Fn() -> bool,
+    payer_wait: &super::thalamus_payer_join::WaitQueue,
+) -> Result<super::thalamus_payer_join::WaitQueue, SourceDrainError> {
     use crate::refresher::harness_drain::{
         mark_current_in_tx, record_events_in_tx, record_set_aside_in_tx, RecordTally,
     };
@@ -946,50 +985,64 @@ fn record_requests(
         DrainMode::Fast
     };
     let committed = mode.write(state, |tx| {
-        if requests.is_empty() && stop_requested() {
+        if stop_requested() {
             stopped = true;
             return Err("Pi ingest stopped".into());
         }
-        let newly_seen = record_set_aside_in_tx(tx, PI_SOURCE_KEY, set_aside, recorded_at_ms)?;
-        let calls = requests
-            .iter()
-            .map(|request| super::thalamus_payer_join::WaitingCall {
-                request: request.clone(),
-                // Pi writes each assistant entry with the completed response.
-                completed_at_ms: request.occurred_at_ms,
-                native_session: None,
-            })
-            .collect::<Vec<_>>();
-        let payer = payer_wait.resolve_in_tx(tx, "pi", &calls, recorded_at_ms)?;
-        let dispositions = record_events_in_tx(
-            tx,
-            "Pi",
-            &payer.ready,
-            recorded_at_ms,
-            stop_requested,
-            &mut stopped,
-        )?;
+        let newly_seen = record_set_aside_in_tx(tx, source_key, set_aside, recorded_at_ms)?;
+        let payer = payer_wait.resolve_in_tx(tx, "pi", calls, recorded_at_ms)?;
+        let mut dispositions = Vec::new();
+        let mut copied = 0;
+        for request in &payer.ready {
+            if source_key == super::pi_thalamus_source::SOURCE_KEY {
+                let id = astrocyte_core::fact::event_id(
+                    &request.producer,
+                    request.producer_lineage.as_deref(),
+                    &request.producer_ref,
+                )
+                .map_err(|e| format!("derive Pi identity: {e:?}"))?;
+                let recorded: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM usage_event WHERE event_id=?1)",
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if recorded {
+                    copied += 1;
+                    continue;
+                }
+            }
+            dispositions.extend(record_events_in_tx(
+                tx,
+                "Pi",
+                std::slice::from_ref(request),
+                recorded_at_ms,
+                stop_requested,
+                &mut stopped,
+            )?);
+        }
         if update_runtime {
-            mark_current_in_tx(tx, PI_SOURCE_KEY, "Pi", recorded_at_ms)?;
+            mark_current_in_tx(tx, source_key, "Pi", recorded_at_ms)?;
             tx.execute(
                 "UPDATE source_runtime SET pending_unknown=?2 WHERE source_key=?1",
-                rusqlite::params![PI_SOURCE_KEY, i64::from(!payer.next.is_empty())],
+                rusqlite::params![source_key, i64::from(!payer.next.is_empty())],
             )
             .map_err(|e| e.to_string())?;
         }
-        Ok(((dispositions, newly_seen, payer), true))
+        Ok(((dispositions, newly_seen, payer, copied), true))
     });
-    let (dispositions, newly_seen, payer) = match committed {
+    let (dispositions, newly_seen, payer, copied) = match committed {
         Ok(committed) => committed,
         Err(_) if stopped => return Err(SourceDrainError::Stopped),
         Err(reason) => return Err(SourceDrainError::Failed(reason)),
     };
-    crate::refresher::harness_drain::warn_set_aside(PI_SOURCE_KEY, &newly_seen);
+    crate::refresher::harness_drain::warn_set_aside(source_key, &newly_seen);
     let tally = RecordTally::from_dispositions(dispositions);
     outcome.rows_recorded = tally.recorded;
-    outcome.exact_redeliveries = tally.exact_redeliveries + payer.already_recorded;
+    outcome.exact_redeliveries = tally.exact_redeliveries + payer.already_recorded + copied;
     outcome.quarantined_redeliveries = tally.quarantined_redeliveries;
-    super::thalamus_payer_join::warn_overflow(PI_SOURCE_KEY, payer.overflow_started);
+    super::thalamus_payer_join::warn_overflow(source_key, payer.overflow_started);
     Ok(payer.next)
 }
 

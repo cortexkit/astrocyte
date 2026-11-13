@@ -59,11 +59,12 @@ through `INSERT OR REPLACE`. Integer keys are never served. The
   past a cursor, refuses a cursor that moves backwards, and commits facts and
   cursor together. BROCA plans to replace this with an acknowledged billing feed.
 - **Declared folders.** THALAMUS lists its private sessions in roots files, read as
-  `claude-code-thalamus` and `opencode-thalamus`. Each entry
+  `claude-code-thalamus`, `pi-thalamus` and `opencode-thalamus`. Each entry
   must resolve to its exact expected path. After commit astrocyte acknowledges
   reads (or serves a watermark through `watermark.get`), and only then may
   THALAMUS delete a folder. See the
-  [Claude Code](docs/thalamus-claude-code-sessions-contract.md) and
+  [Claude Code](docs/thalamus-claude-code-sessions-contract.md),
+  [Pi](docs/thalamus-pi-sessions-contract.md) and
   [OpenCode](docs/thalamus-opencode-sessions-contract.md) contracts.
 - **THALAMUS payers.** `thalamus-payer` mirrors the harness's payer store before
   transcripts read. It attributes their calls, records requests absent from

@@ -2,15 +2,14 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::claude_code_source::{self, ClaudeCodeCache, ClaudeCodeDrainOutcome};
-use super::declared_roots::{self, Contained, RootsFile};
+use super::declared_roots::{self, write_ack, Ack, Contained, ReadThrough, RootsFile};
 use super::harness_drain::{self, HarnessSource};
 use super::thalamus_payer_join::{WaitQueue, WaitingCall};
 use super::SourceDrainError;
@@ -49,18 +48,6 @@ where
 enum SessionState {
     Active,
     Done,
-}
-
-#[derive(PartialEq, Deserialize, Serialize)]
-struct Ack {
-    version: u64,
-    read_through: Vec<ReadThrough>,
-}
-
-#[derive(PartialEq, Deserialize, Serialize)]
-struct ReadThrough {
-    session: String,
-    at_ms: i64,
 }
 
 #[derive(Default)]
@@ -433,48 +420,6 @@ impl HarnessSource for ClaudeThalamusSource {
     ) -> Result<Option<String>, SourceDrainError> {
         self.drain(state, at, stop)
     }
-}
-
-fn write_ack(path: &Path, ack: &impl Serialize) -> std::io::Result<()> {
-    let folder = path.parent().expect("ack parent");
-    fs::create_dir_all(folder)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(folder, fs::Permissions::from_mode(0o700))?;
-    }
-    // Exclusive creation in the destination directory prevents partial reads.
-    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let (temporary, mut file) = loop {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = folder.join(format!(
-            ".claude-code-{}-{sequence}.tmp",
-            std::process::id()
-        ));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&temporary) {
-            Ok(file) => break (temporary, file),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    };
-    let result = (|| {
-        serde_json::to_writer(&mut file, ack)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
 }
 
 #[cfg(test)]
