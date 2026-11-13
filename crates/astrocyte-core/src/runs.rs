@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::ReportError;
 
-pub(crate) const FORMAT: i64 = 2;
+// Version 3 rebuilds cached hourly spend reports and run costs so observed
+// readings are no longer counted as measurements awaiting pricing.
+pub(crate) const FORMAT: i64 = 3;
 const HOUR_MS: i64 = 3_600_000;
 const MAX_RANGE: i64 = 31 * 24 * HOUR_MS;
 const HARNESSES: &[&str] = &[
@@ -367,7 +369,7 @@ fn event_key(
 fn base_sql(filter: &str, index: &str) -> String {
     format!("WITH selected AS MATERIALIZED (SELECT * FROM usage_event INDEXED BY {index} WHERE {filter})
         SELECT e.event_key,e.producer,e.session,e.run_ref,e.flow_ref,e.producer_ref,e.occurred_at_ms,e.provider,e.model,e.work_class,
-        m.role,m.unit,m.quantity_units,m.quantity_exponent,h.outcome,h.charge_nanos,h.currency,h.unpriced_reason
+        m.role,m.unit,m.quantity_units,m.quantity_exponent,h.outcome,h.charge_nanos,h.currency,h.unpriced_reason,m.kind
         FROM selected e LEFT JOIN measurement m ON m.event_key=e.event_key
         LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit
             AND NOT EXISTS(SELECT 1 FROM priced_charge child WHERE child.supersedes=h.charge_key)
@@ -405,9 +407,13 @@ fn visit(
             });
         }
         if let Some(role) = row.get::<_, Option<String>>(10)? {
-            let state: String = row
-                .get::<_, Option<String>>(14)?
-                .unwrap_or_else(|| "pending".into());
+            let observed = row.get::<_, String>(18)? == "observed";
+            let state: String = if observed {
+                "unpriced".into()
+            } else {
+                row.get::<_, Option<String>>(14)?
+                    .unwrap_or_else(|| "pending".into())
+            };
             let priced = state == "priced";
             let quantity = match (row.get(12)?, row.get(13)?) {
                 (Some(units), Some(exponent)) => Some(Quantity { units, exponent }),
@@ -423,7 +429,9 @@ fn visit(
                     quantity,
                     amount_nanos: if priced { row.get(15)? } else { None },
                     currency: if priced { row.get(16)? } else { None },
-                    reason: if state == "unpriced" {
+                    reason: if observed {
+                        Some("observed_only".into())
+                    } else if state == "unpriced" {
                         row.get(17)?
                     } else {
                         None

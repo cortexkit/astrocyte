@@ -73,6 +73,75 @@ fn charge(
     }
     tx.commit().unwrap();
 }
+
+fn observed_record(c: &mut Connection, time: i64) {
+    let request = serde_json::from_value(json!({
+        "producer":"opencode","producer_ref":"readings","session":"observed-session",
+        "provider":"provider-a","model":"model-observed","occurred_at_ms":time,
+        "charge_basis":"metered_api","measurements":[
+            {"role":"duration","unit":"second","kind":"observed","source":"fixture","quantity_units":0,"quantity_exponent":0},
+            {"role":"credits","unit":"credit","kind":"observed","source":"fixture","quantity_units":12,"quantity_exponent":0}
+        ]
+    })).unwrap();
+    ingest::record_event(c, &request, 1).unwrap();
+}
+
+#[test]
+fn runs_observed_only_readings_are_unpriced_not_pending_or_free() {
+    let mut c = conn();
+    observed_record(&mut c, 1);
+    let q = ListRequest {
+        from_ms: 0,
+        to_ms: HOUR_MS,
+        harness: None,
+        limit: None,
+        after: None,
+    };
+    let scanned = list(&c, &q).unwrap();
+    let expected = Cost {
+        unpriced_measurements: 2,
+        unpriced_by_reason: BTreeMap::from([("observed_only".into(), 2)]),
+        ..Cost::default()
+    };
+    assert_eq!(scanned.rows[0].cost.pending_measurements, 0);
+    assert_eq!(scanned.rows[0].cost, expected);
+    assert_eq!(scanned.totals.cost, expected);
+    fill(&mut c);
+    assert_eq!(
+        serde_json::to_vec(&list(&c, &q).unwrap()).unwrap(),
+        serde_json::to_vec(&scanned).unwrap()
+    );
+    c.execute("UPDATE summary_hour SET format_version=?1", [FORMAT - 1])
+        .unwrap();
+    c.execute(
+        "UPDATE summary_run_cell SET pending=2,unpriced=0,reasons='{}'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&list(&c, &q).unwrap()).unwrap(),
+        serde_json::to_vec(&scanned).unwrap()
+    );
+    let d = detail(
+        &c,
+        &DetailRequest {
+            key: RunKey::Session {
+                harness: "opencode".into(),
+                session: "observed-session".into(),
+            },
+            limit: None,
+            after: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(d.totals.cost, expected);
+    assert_eq!(d.items[0].measurements.len(), 2);
+    for m in &d.items[0].measurements {
+        assert_eq!(m.state, "unpriced");
+        assert_eq!(m.reason.as_deref(), Some("observed_only"));
+        assert_eq!(m.amount_nanos, None);
+    }
+}
 fn fill(c: &mut Connection) {
     let mut maintenance = SummaryMaintenance::default();
     c.execute(
@@ -162,7 +231,7 @@ fn oracle(c: &Connection, q: &ListRequest) -> Value {
             steps: 1,
             ..Figures::default()
         };
-        let mut s=c.prepare("SELECT role,SUM(quantity_units) FROM measurement WHERE event_key=?1 AND quantity_exponent=0 GROUP BY role").unwrap();
+        let mut s=c.prepare("SELECT role,SUM(quantity_units) FROM measurement WHERE event_key=?1 AND quantity_exponent=0 AND (unit='token' OR unit GLOB 'token_cache_*') GROUP BY role").unwrap();
         for pair in s
             .query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))
             .unwrap()
@@ -174,9 +243,14 @@ fn oracle(c: &Connection, q: &ListRequest) -> Value {
         if let Some(output) = f.tokens.get_mut("output") {
             *output += reasoning;
         }
-        let mut s=c.prepare("SELECT h.outcome,h.currency,h.charge_nanos,h.unpriced_reason FROM measurement m LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit AND NOT EXISTS(SELECT 1 FROM priced_charge x WHERE x.supersedes=h.charge_key) WHERE m.event_key=?1").unwrap();
+        let mut s=c.prepare("SELECT h.outcome,h.currency,h.charge_nanos,h.unpriced_reason,m.kind FROM measurement m LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit AND NOT EXISTS(SELECT 1 FROM priced_charge x WHERE x.supersedes=h.charge_key) WHERE m.event_key=?1").unwrap();
         let mut charges = s.query([id]).unwrap();
         while let Some(r) = charges.next().unwrap() {
+            if r.get::<_, String>(4).unwrap() == "observed" {
+                f.unpriced += 1;
+                *f.reasons.entry("observed_only".into()).or_default() += 1;
+                continue;
+            }
             match r.get::<_, Option<String>>(0).unwrap().as_deref() {
                 Some("priced") => {
                     *f.priced.entry(r.get(1).unwrap()).or_default() += r.get::<_, i64>(2).unwrap()
@@ -245,6 +319,7 @@ fn oracle(c: &Connection, q: &ListRequest) -> Value {
 #[test]
 fn runs_random_base_totals_are_byte_identical_filled_dirty_and_partial() {
     let mut c = conn();
+    observed_record(&mut c, 1);
     let mut random = 1234567_u64;
     for i in 0..240 {
         random = random.wrapping_mul(6364136223846793005).wrapping_add(1);

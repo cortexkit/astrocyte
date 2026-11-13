@@ -498,11 +498,13 @@ struct LedgerEvent {
     /// Interned in `Ledger::values`, indexed by `Grouping as usize`. Only the
     /// dimensions the caller asked `load_ledger` for are filled in.
     dimensions: [Option<u32>; GROUPING_DIMENSIONS],
+    /// Only billed measurements participate in the pricing verdict.
     measurements: u32,
+    observed_measurements: u32,
     /// Measurements that have a current charge head, i.e. that some pricing
     /// pass has examined.
     examined: u32,
-    /// True when at least one measurement states a quantity of exactly zero;
+    /// True when at least one billed measurement states a quantity of exactly zero;
     /// only such events need the per-measurement zero lookup.
     has_stated_zero: bool,
     /// Bit `n` is set when a measurement declined for reason id `n` (in
@@ -519,7 +521,11 @@ struct LedgerEvent {
 }
 
 impl LedgerEvent {
-    /// True when every measurement's contribution to this event's total is
+    fn measurement_rows(&self) -> u64 {
+        u64::from(self.measurements) + u64::from(self.observed_measurements)
+    }
+
+    /// True when every billed measurement's contribution to this event's total is
     /// known: a pricing pass answered for it, or arithmetic answers for it
     /// because the producer stated a quantity of zero. An event with an exact
     /// total is not an unpriced event, however incomplete the catalog behind
@@ -542,7 +548,11 @@ impl LedgerEvent {
 
     fn exclusion_reason(&self) -> Exclusion {
         if self.measurements == 0 {
-            Exclusion::NoMeasurements
+            if self.observed_measurements > 0 {
+                Exclusion::ObservedOnly
+            } else {
+                Exclusion::NoMeasurements
+            }
         } else if self.occurred_at_ms.is_none() {
             Exclusion::Undated
         } else if self.blocking_reasons != 0 {
@@ -560,6 +570,7 @@ impl LedgerEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Exclusion {
     NoMeasurements,
+    ObservedOnly,
     Undated,
     /// EVERY blocking reason, not the first one found. Taking the first hid
     /// the second cause of an event that had two, so a catalog gap could be
@@ -585,6 +596,7 @@ impl Exclusion {
     fn label(self, reasons: &Interner) -> String {
         match self {
             Self::NoMeasurements => "no_measurements".into(),
+            Self::ObservedOnly => "observed_only".into(),
             Self::Undated => "undated".into(),
             Self::Blocking(mask) => {
                 // Sorted by name, so the same set of causes always yields the
@@ -801,6 +813,7 @@ fn load_scoped_ledger(
             charge_basis,
             dimensions: event_dimensions,
             measurements: 0,
+            observed_measurements: 0,
             examined: 0,
             has_stated_zero: false,
             blocking_reasons: 0,
@@ -815,8 +828,8 @@ fn load_scoped_ledger(
     drop(rows);
     drop(statement);
 
-    // Measurements: count per event, and remember which ones state exactly
-    // zero units, keyed by (event position, role id, unit id).
+    // Keep all rows in coverage denominators, but only billed quantities can
+    // contribute to a price or answer for an examined zero quantity.
     let mut roles = Interner::default();
     let mut units = Interner::default();
     let mut stated_zero: FastSet<(usize, u32, u32)> = FastSet::default();
@@ -824,17 +837,24 @@ fn load_scoped_ledger(
     {
         let mut lookup = EventLookup::new(&index);
         let mut statement = conn.prepare(&format!(
-            "SELECT event_key,role,unit,quantity_units FROM measurement{child_filter}"
+            "SELECT event_key,role,unit,quantity_units,kind FROM measurement{child_filter}"
         ))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let position = lookup.find(row.get(0)?)?;
             let event = &mut events[position];
-            event.measurements = event
-                .measurements
+            measurements_total = measurements_total
                 .checked_add(1)
                 .ok_or(ReportError::Arithmetic)?;
-            measurements_total = measurements_total
+            if required_text_column(row, 4)? == "observed" {
+                event.observed_measurements = event
+                    .observed_measurements
+                    .checked_add(1)
+                    .ok_or(ReportError::Arithmetic)?;
+                continue;
+            }
+            event.measurements = event
+                .measurements
                 .checked_add(1)
                 .ok_or(ReportError::Arithmetic)?;
             if row.get::<_, Option<i64>>(3)? == Some(0) {
@@ -873,10 +893,15 @@ fn load_scoped_ledger(
     let mut oldest_resolved_at_ms: Option<i64> = None;
     {
         let mut lookup = EventLookup::new(&index);
+        let charge_filter = if child_filter.is_empty() {
+            " WHERE kind <> 'observed'".to_owned()
+        } else {
+            format!("{child_filter} AND kind <> 'observed'")
+        };
         let mut statement = conn.prepare(&format!(
             "SELECT event_key,role,unit,outcome,charge_nanos,unpriced_reason,resolved_at_ms,
                     charge_key
-             FROM priced_charge{child_filter}"
+             FROM priced_charge JOIN measurement USING(event_key,role,unit){charge_filter}"
         ))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
@@ -1026,7 +1051,7 @@ struct EventPopulation {
 impl EventPopulation {
     fn observe(&mut self, event: &LedgerEvent) -> Result<(), ReportError> {
         add_count(&mut self.events_total, 1)?;
-        add_count(&mut self.measurements_total, u64::from(event.measurements))?;
+        add_count(&mut self.measurements_total, event.measurement_rows())?;
         // Declined zeros still disclose their gap even when the event is fully priced.
         for (reason, count) in &event.declined {
             add_count(
@@ -1046,7 +1071,7 @@ impl EventPopulation {
                 1,
             )?;
         }
-        if event.measurements == 0 {
+        if event.measurement_rows() == 0 {
             add_count(&mut self.zero_measurement_events, 1)?;
         }
         Ok(())
@@ -1633,19 +1658,26 @@ struct SubscriptionMeasurement {
     unit: String,
     quantity_units: Option<i64>,
     quantity_exponent: Option<i32>,
+    observed: bool,
     /// `None` when no pricing pass has examined the measurement.
     head_outcome: Option<String>,
 }
 
 impl SubscriptionEvent {
     fn is_fully_priced(&self) -> bool {
-        !self.measurements.is_empty()
-            && !self.measurements.iter().any(|measurement| {
-                blocks_event_total(
-                    measurement.head_outcome.as_deref(),
-                    measurement.quantity_units == Some(0),
-                )
-            })
+        self.measurements
+            .iter()
+            .any(|measurement| !measurement.observed)
+            && !self
+                .measurements
+                .iter()
+                .filter(|measurement| !measurement.observed)
+                .any(|measurement| {
+                    blocks_event_total(
+                        measurement.head_outcome.as_deref(),
+                        measurement.quantity_units == Some(0),
+                    )
+                })
     }
 }
 
@@ -1661,7 +1693,7 @@ fn load_subscription_events(
     let filter = filter.map_or_else(String::new, |filter| format!(" AND ({filter})"));
     let mut statement = conn.prepare(&format!(
         "SELECT e.rowid,e.occurred_at_ms,e.provider,e.account_ref,
-                m.role,m.unit,m.quantity_units,m.quantity_exponent,head.outcome
+                m.role,m.unit,m.quantity_units,m.quantity_exponent,head.outcome,m.kind
          FROM usage_event e
          LEFT JOIN measurement m ON m.event_key=e.event_key
          LEFT JOIN priced_charge head
@@ -1699,6 +1731,7 @@ fn load_subscription_events(
             quantity_units: row.get(6)?,
             quantity_exponent: row.get(7)?,
             head_outcome: row.get(8)?,
+            observed: required_text_column(row, 9)? == "observed",
         });
     }
     Ok(events)
@@ -2542,6 +2575,93 @@ mod tests {
             params![event_id, role, unit, quantity],
         )
         .unwrap();
+    }
+
+    fn observed_measurement(conn: &Connection, event_id: &str, quantity: i64) {
+        conn.execute(
+            "INSERT INTO measurement
+                (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
+             VALUES ((SELECT event_key FROM usage_event WHERE event_id=?1),'duration','second','observed','producer',?2,0)",
+            params![event_id, quantity],
+        )
+        .unwrap();
+    }
+
+    fn observed_spend(conn: &Connection) -> SpendReport {
+        spend_report(
+            conn,
+            &ReportRequest {
+                timezone: "UTC".into(),
+                grain: "day".into(),
+                grouping: vec![],
+            },
+            100,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn observed_only_spend_is_excluded_without_claiming_pricing_is_pending() {
+        let conn = conn();
+        event(&conn, "reading", None, Some(100), "metered_api");
+        observed_measurement(&conn, "reading", 12);
+        event(&conn, "empty", None, Some(100), "metered_api");
+        let report = observed_spend(&conn);
+        let row = &report.rows[0];
+        assert_eq!(
+            row.unpriced_events_by_reason,
+            BTreeMap::from([("observed_only".into(), 1), ("no_measurements".into(), 1)])
+        );
+        assert_eq!(row.events_priced, 0);
+        assert_eq!(row.cost_sample_n, 0);
+        assert_eq!(row.total_nanos, 0);
+        assert_eq!(row.zero_measurement_events, 1);
+        assert_eq!(row.measurements_total, 1);
+        assert!(row.unpriced_measurements_by_reason.is_empty());
+        let coverage = ledger_coverage(&conn, &LedgerCoverageRequest {}, 100).unwrap();
+        assert_eq!(coverage.zero_measurement_events, 1);
+        assert_eq!(coverage.rate_staleness.measurements_total, 1);
+        assert_eq!(
+            coverage.unpriced_events_by_reason,
+            row.unpriced_events_by_reason
+        );
+    }
+
+    #[test]
+    fn observed_reading_does_not_block_a_priced_billed_measurement() {
+        let conn = conn();
+        event(&conn, "mixed", None, Some(100), "metered_api");
+        measurement(&conn, "mixed", "input", "token", 2);
+        priced_heads(&conn, "mixed", &[("input", "token", 50)]);
+        observed_measurement(&conn, "mixed", 12);
+        let report = observed_spend(&conn);
+        let row = &report.rows[0];
+        assert_eq!(row.events_priced, 1);
+        assert_eq!(row.events_unpriced, 0);
+        assert_eq!(row.cost_sample_n, 1);
+        assert_eq!(row.total_nanos, 50);
+        assert_eq!(row.measurements_total, 2);
+        assert_eq!(row.zero_measurement_events, 0);
+        assert!(row.unpriced_events_by_reason.is_empty());
+    }
+
+    #[test]
+    fn observed_zero_never_answers_for_a_reading() {
+        let conn = conn();
+        event(&conn, "zero-reading", None, Some(100), "metered_api");
+        observed_measurement(&conn, "zero-reading", 0);
+        let report = observed_spend(&conn);
+        assert_eq!(report.rows[0].events_priced, 0);
+        assert_eq!(report.rows[0].cost_sample_n, 0);
+        assert_eq!(report.rows[0].zero_measurement_events, 0);
+        assert_eq!(
+            report.rows[0].unpriced_events_by_reason,
+            BTreeMap::from([("observed_only".into(), 1)])
+        );
+        let ledger = load_ledger(&conn, &[]).unwrap();
+        assert!(!ledger.events[0].has_stated_zero);
+        assert_eq!(ledger.events[0].measurements, 0);
+        assert_eq!(ledger.events[0].examined, 0);
     }
 
     /// A measurement whose size the producer never stated: both quantity

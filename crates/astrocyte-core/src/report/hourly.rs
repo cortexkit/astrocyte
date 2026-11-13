@@ -163,10 +163,10 @@ impl Data {
             let cell = self.cells.entry(key.clone()).or_default();
             add_count(&mut self.events, 1)?;
             add_count(&mut cell.events, 1)?;
-            add_count(&mut cell.measurements, u64::from(event.measurements))?;
+            add_count(&mut cell.measurements, event.measurement_rows())?;
             add_count(
                 &mut cell.zero_measurements,
-                u64::from(event.measurements == 0),
+                u64::from(event.measurement_rows() == 0),
             )?;
             add_count(&mut cell.priced, u64::from(event.is_fully_priced()))?;
             add_count(
@@ -1767,6 +1767,23 @@ mod tests {
         })).unwrap();
         ingest::record_event(conn, &request, 1).unwrap().event_id
     }
+
+    fn observed_record(conn: &mut Connection, time: i64) {
+        let request = serde_json::from_value(serde_json::json!({
+            "producer":"fixture","producer_ref":"readings","provider":"provider",
+            "model":"model","account_ref":"account","project_root":"/fixture/project",
+            "occurred_at_ms":time,"charge_basis":"metered_api","measurements":[
+                {"role":"duration","unit":"second","kind":"observed","source":"fixture","quantity_units":0,"quantity_exponent":0},
+                {"role":"credits","unit":"credit","kind":"observed","source":"fixture","quantity_units":12,"quantity_exponent":0}
+            ]
+        })).unwrap();
+        ingest::record_event(conn, &request, 1).unwrap();
+    }
+
+    fn add_reading(conn: &Connection, id: &str) {
+        conn.execute("INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent)
+            SELECT event_key,'duration','second','observed','fixture',0,0 FROM usage_event WHERE event_id=?1", [id]).unwrap();
+    }
     // Explicit priced_charge amounts keep report tests independent of catalog lookups and pricing arithmetic.
     fn priced(conn: &mut Connection, id: &str, currency: &str, nanos: i64) {
         let tx = conn.transaction().unwrap();
@@ -1917,6 +1934,78 @@ mod tests {
     }
 
     #[test]
+    fn observed_only_cells_reject_old_formats_and_rebuild_without_changing_coverage() {
+        let mut conn = conn();
+        observed_record(&mut conn, 1000);
+        for (id, time) in [
+            ("mixed-one", HOUR_MS + 1000),
+            ("mixed-two", 2 * HOUR_MS + 1000),
+        ] {
+            let event = record(
+                &mut conn,
+                id,
+                Some(time),
+                ChargeBasis::MeteredApi,
+                Some("coding"),
+            );
+            priced(&mut conn, &event, "USD", 50);
+            add_reading(&conn, &event);
+        }
+        compare(&conn);
+        catch_up(&mut conn);
+        compare(&conn);
+        let coverage = coverage(&conn, 10_000).unwrap().unwrap();
+        assert_eq!(
+            coverage.unpriced_events_by_reason,
+            BTreeMap::from([("observed_only".into(), 1)])
+        );
+        assert_eq!(coverage.zero_measurement_events, 0);
+        assert_eq!(coverage.rate_staleness.measurements_total, 8);
+
+        conn.execute("UPDATE summary_hour SET format_version=?1", [FORMAT - 1])
+            .unwrap();
+        let stale: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM summary_hour WHERE format_version<>?1",
+                [FORMAT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 3);
+        conn.execute("UPDATE summary_cell SET payload=json_set(payload,'$.reasons',json('{\"not_yet_priced\":1}'),'$.zero_measurements',1)", []).unwrap();
+        compare(&conn);
+        conn.execute(
+            "UPDATE summary_audit_state SET next_due_ms=0,after_kind=NULL,after_hour=NULL",
+            [],
+        )
+        .unwrap();
+        let mut maintenance = SummaryMaintenance::default();
+        for _ in 0..100 {
+            step(&mut conn, &mut maintenance);
+            compare(&conn);
+            let stale: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM summary_hour WHERE format_version<>?1",
+                    [FORMAT],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if stale == 0 {
+                break;
+            }
+        }
+        let stale: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM summary_hour WHERE format_version<>?1",
+                [FORMAT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0);
+        compare(&conn);
+    }
+
+    #[test]
     fn dirty_hours_use_base_money_while_workclass_keeps_head_only_samples() {
         let mut conn = conn();
         let id = record(
@@ -1935,6 +2024,8 @@ mod tests {
             None,
         );
         priced(&mut conn, &other, "JPY", 300);
+        observed_record(&mut conn, 2 * HOUR_MS + 1000);
+        add_reading(&conn, &id);
         catch_up(&mut conn);
         assert!(spend(&conn, &request("UTC", "day", &[]), 10_000)
             .unwrap()
@@ -2458,6 +2549,7 @@ mod tests {
                 .single()
                 .unwrap()
                 .timestamp_millis();
+            observed_record(&mut conn, base + 3 * HOUR_MS);
             declare(&mut conn, base + 30 * 60_000);
             let paid = record(
                 &mut conn,
@@ -2528,6 +2620,9 @@ mod tests {
                     );
                 } else {
                     reprice(&mut conn, &id);
+                }
+                if index % 7 == 0 {
+                    add_reading(&conn, &id);
                 }
             }
             compare(&conn);

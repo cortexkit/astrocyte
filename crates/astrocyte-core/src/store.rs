@@ -4261,6 +4261,16 @@ BEGIN
 END;
 "#,
     },
+    Migration {
+        version: 45,
+        statements: r#"
+-- Keep stale-hour discovery indexed after observed readings changed the
+-- hourly spend populations and run cost totals to summary format 3.
+DROP INDEX summary_hour_stale;
+CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
+    WHERE built_revision IS NOT revision OR format_version IS NOT 3;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -7438,6 +7448,17 @@ mod tests {
         drop(store);
 
         let conn = Connection::open(path).unwrap();
+        let stale_index: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='summary_hour_stale'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stale_index.contains(&format!("format_version IS NOT {}", crate::runs::FORMAT)),
+            "stale-hour index must match the current summary format: {stale_index}"
+        );
         let versions = conn
             .prepare(
                 "SELECT namespace,version FROM cortexkit_schema_version

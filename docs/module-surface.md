@@ -307,6 +307,8 @@ Reads never write. A refusal on a read is one of the codes below.
   `day`, `week` or `month`; `timezone` is an IANA name. Refusals:
   `invalid_grouping` (unknown or repeated), `invalid_grain`,
   `invalid_timezone`. Test: `spend_report_refusal_keeps_its_code`.
+  Event exclusion reasons in spend, work-class and ledger coverage include
+  `observed_only` when a producer reported readings but no billed quantity.
 - `spend.subscription.report` keeps `rows`, `coverage` and `ingest_freshness`.
   It adds optional diagnostic members; the request remains `{}`, so the params
   schema stays at version 2. `unpriced_plans` lists `{plan_key, provider,
@@ -856,8 +858,11 @@ unpriced_by_reason, pending_measurements}`. `priced` maps currency to signed
 integer nanos and includes only current `priced` charges; it is `{}` if none.
 Covered/unpriced/pending counts are never folded into money. Reasons are the
 ledger's closed set, including `no_rate`, `no_catalog_coverage`, `rate_tiered`,
-`rate_inherited`, and `stated_zero_requires_policy`. A measurement with no charge
-head is pending. All-zero counts plus empty `priced` means no measurements.
+`rate_inherited`, and `stated_zero_requires_policy`.
+Observed measurements count as unpriced under `unpriced_by_reason.observed_only`,
+never as pending or free.
+A billed measurement with no charge head is pending.
+All-zero counts plus empty `priced` means no measurements.
 
 Each detail measurement is `{role, unit, quantity, state, amount_nanos?,
 currency?, reason?}`. `quantity` is `{units, exponent}` (decimal ledger quantity),

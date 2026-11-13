@@ -266,6 +266,9 @@ zero. Token roles are disjoint: `input`, `cache_read`, `cache_write`,
 `output`, `reasoning`. How each harness's counters map onto them is in
 [harness readers](harness-readers.md).
 
+Observed measurements are never priced and are reported as `observed_only`
+when they are the only measurements on an event, or in runs' unpriced counts.
+
 ## Charge basis
 
 `charge_basis` is one of:
@@ -487,10 +490,11 @@ currency instead of treating it as absent. Contributions in different currencies
 are never added together.
 
 The event-priced count is determined before aggregation: an event needs at least
-one measurement, a current head for every measurement, and no blocking declined
-quantity. An examined, declined measurement whose stated quantity is zero does
-not block that report verdict. A declined measurement with an absent or nonzero
-quantity still blocks, as does any measurement that has no current head.
+one billed measurement, a current head for every billed measurement, and no
+blocking declined quantity. An examined, declined measurement whose stated
+quantity is zero does not block that report verdict. A declined measurement
+with an absent or nonzero quantity still blocks, as does any billed measurement
+that has no current head.
 Budget uncertainty is a separate count because its existing rule is no heads or
 any unpriced head, even when the declined quantity is zero. For populations too
 large to prove that SQLite's signed limb sums cannot overflow, the verdict keeps
