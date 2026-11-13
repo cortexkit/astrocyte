@@ -149,6 +149,79 @@ fn media_price_record(
 }
 
 #[test]
+fn observed_only_media_ingest_does_not_queue_pricing() {
+    let mut conn = conn();
+    let id = media_price_record(
+        &mut conn,
+        "observed-ingest",
+        json!({}),
+        "observed",
+        Some("api_key"),
+    );
+    assert!(pending_event_ids(&conn, None, 10).unwrap().0.is_empty());
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM measurement WHERE kind='observed'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(enqueue_if_unpriced_in_tx(&conn, &id).unwrap(), 0);
+}
+
+#[test]
+fn observed_only_media_reconciliation_does_not_queue_pricing() {
+    let mut conn = conn();
+    let id = media_price_record(
+        &mut conn,
+        "observed-reconcile",
+        json!({}),
+        "observed",
+        Some("api_key"),
+    );
+    // Start with the queue empty to exercise reconciliation independently of ingest.
+    conn.execute("DELETE FROM pricing_pending", []).unwrap();
+    let tx = conn.transaction().unwrap();
+    assert_eq!(
+        reconcile_pending_range_in_tx(&tx, None, Some(&id)).unwrap(),
+        0
+    );
+    tx.commit().unwrap();
+    assert!(pending_event_ids(&conn, None, 10).unwrap().0.is_empty());
+}
+
+#[test]
+fn observed_only_media_operator_reprice_still_refuses() {
+    let mut conn = conn();
+    let id = media_price_record(
+        &mut conn,
+        "observed-reprice",
+        json!({}),
+        "observed",
+        Some("api_key"),
+    );
+    let catalog = client(FakeCatalog::new(BTreeMap::new()));
+    assert!(matches!(
+        reprice_event(
+            &mut conn,
+            &id,
+            &catalog,
+            1_000,
+            PricingOrigin::OperatorReprice
+        ),
+        Err(PricingError::Refused(PricingRefusal::NoMeasurementsToPrice))
+    ));
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM priced_charge", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn media_transcribe_prices_90_seconds_to_6750000_nanodollars_end_to_end() {
     let mut conn = conn();
     let id = media_price_record(

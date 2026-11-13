@@ -2813,17 +2813,29 @@ struct ResolvedEvent<'a> {
     resolved: astrocyte_core::subscription::ResolvedSubscriptionReprice,
 }
 
+enum EventResolutionError {
+    NoMeasurementsToPrice,
+    Failed(String),
+}
+
 fn resolve_event<'a>(
     state: &SharedState,
     catalog: Option<&CatalogClient>,
     event_id: &'a str,
     deadline: Option<std::time::Instant>,
     now: &dyn Fn() -> std::time::Instant,
-) -> Result<Option<ResolvedEvent<'a>>, String> {
-    let plan = state.with_conn(|conn| {
-        astrocyte_core::subscription::read_reprice(conn, event_id)
-            .map_err(|error| format!("{}: {}", error.code(), error.message()))
-    })?;
+) -> Result<Option<ResolvedEvent<'a>>, EventResolutionError> {
+    let plan = state
+        .with_conn(|conn| Ok(astrocyte_core::subscription::read_reprice(conn, event_id)))
+        .map_err(EventResolutionError::Failed)?
+        .map_err(|error| match error {
+            astrocyte_core::subscription::SubscriptionError::Pricing(
+                astrocyte_core::pricing::PricingError::Refused(
+                    astrocyte_core::pricing::PricingRefusal::NoMeasurementsToPrice,
+                ),
+            ) => EventResolutionError::NoMeasurementsToPrice,
+            error => EventResolutionError::Failed(format!("{}: {}", error.code(), error.message())),
+        })?;
     if deadline.is_some_and(|deadline| now() >= deadline) {
         return Ok(None);
     }
@@ -2837,7 +2849,9 @@ fn resolve_event<'a>(
         ),
         None => astrocyte_core::subscription::resolve_reprice_without_catalog(&plan),
     }
-    .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
+    .map_err(|error| {
+        EventResolutionError::Failed(format!("{}: {}", error.code(), error.message()))
+    })?;
     Ok(Some(ResolvedEvent {
         event_id,
         plan,
@@ -2883,9 +2897,14 @@ fn commit_in_savepoint(
     }
 }
 
+enum PricingOutcome {
+    Priced,
+    NothingToPrice,
+}
+
 struct PricedGroup {
     attempted: usize,
-    outcomes: Vec<(String, Result<(), String>)>,
+    outcomes: Vec<(String, Result<PricingOutcome, String>)>,
 }
 
 /// Price a group of events with one write transaction, and return each
@@ -2901,8 +2920,10 @@ struct PricedGroup {
 /// however many of its events are refused, and because it undoes exactly one
 /// event's writes even when an error comes after some of them were made.
 ///
-/// An event whose plan cannot be read or resolved writes nothing and stays
-/// queued. If the group's transaction itself fails to begin or commit, no
+/// A plan refusal of `NoMeasurementsToPrice` instead removes obsolete queue
+/// work in the write transaction, after rechecking that no billed measurement
+/// still needs a head. Other read or resolution errors leave the event queued.
+/// If the group's transaction itself fails to begin or commit, no
 /// event in it was written and each is reported with that error.
 /// A time-budget stop commits only the resolved prefix; the untouched suffix
 /// stays queued and is not included in the attempted count.
@@ -2917,6 +2938,7 @@ fn price_event_group(
 ) -> Option<PricedGroup> {
     let mut outcomes = Vec::with_capacity(event_ids.len());
     let mut resolved = Vec::with_capacity(event_ids.len());
+    let mut nothing_to_price = Vec::new();
     for event_id in event_ids {
         if stop.load(Ordering::Relaxed) {
             return None;
@@ -2927,37 +2949,55 @@ fn price_event_group(
         match resolve_event(state, catalog, event_id, deadline, now) {
             Ok(Some(event)) => resolved.push(event),
             Ok(None) => break,
-            Err(error) => outcomes.push((event_id.clone(), Err(error))),
+            Err(EventResolutionError::NoMeasurementsToPrice) => nothing_to_price.push(event_id),
+            Err(EventResolutionError::Failed(error)) => {
+                outcomes.push((event_id.clone(), Err(error)))
+            }
         }
     }
     if stop.load(Ordering::Relaxed) {
         return None;
     }
-    let attempted = outcomes.len() + resolved.len();
-    if resolved.is_empty() {
+    let attempted = outcomes.len() + resolved.len() + nothing_to_price.len();
+    if resolved.is_empty() && nothing_to_price.is_empty() {
         return Some(PricedGroup {
             attempted,
             outcomes,
         });
     }
     let committed = state.ordered_write(|tx| {
-        let mut results = Vec::with_capacity(resolved.len());
+        let mut results = Vec::with_capacity(resolved.len() + nothing_to_price.len());
         let mut any_committed = false;
         for event in &resolved {
             let result = commit_in_savepoint(tx, event, recorded_at_ms)?;
             any_committed |= result.is_ok();
-            results.push((event.event_id.to_string(), result));
+            results.push((
+                event.event_id.to_string(),
+                result.map(|()| PricingOutcome::Priced),
+            ));
+        }
+        for event_id in &nothing_to_price {
+            let removed = astrocyte_core::pricing::dequeue_if_fully_headed(tx, event_id)
+                .map_err(|error| format!("dequeue empty pricing event: {error}"))?;
+            any_committed |= removed != 0;
+            results.push(((*event_id).clone(), Ok(PricingOutcome::NothingToPrice)));
         }
         Ok((results, any_committed))
     });
     match committed {
         Ok(results) => outcomes.extend(results),
-        Err(error) => outcomes.extend(resolved.iter().map(|event| {
-            (
-                event.event_id.to_string(),
-                Err(format!("group commit failed: {error}")),
-            )
-        })),
+        Err(error) => outcomes.extend(
+            resolved
+                .iter()
+                .map(|event| event.event_id)
+                .chain(nothing_to_price.iter().map(|id| id.as_str()))
+                .map(|event_id| {
+                    (
+                        event_id.to_string(),
+                        Err(format!("group commit failed: {error}")),
+                    )
+                }),
+        ),
     }
     Some(PricedGroup {
         attempted,
@@ -3079,7 +3119,8 @@ fn run_pricing_walk_with_clock(
         };
         for (event_id, outcome) in outcomes {
             match outcome {
-                Ok(()) => pass.priced += 1,
+                Ok(PricingOutcome::Priced) => pass.priced += 1,
+                Ok(PricingOutcome::NothingToPrice) => {}
                 Err(error) => {
                     failures.push(format!("event {event_id}: {error}"));
                     failed.insert(event_id);
@@ -3204,7 +3245,8 @@ fn run_pricing_walk_with_clock(
             };
             for (event_id, outcome) in outcomes {
                 match outcome {
-                    Ok(()) => pass.priced += 1,
+                    Ok(PricingOutcome::Priced) => pass.priced += 1,
+                    Ok(PricingOutcome::NothingToPrice) => {}
                     Err(error) => {
                         // The event keeps its uncovered head, so it stays in
                         // the set and the next sweep retries it.
@@ -5066,6 +5108,93 @@ mod tests {
                     .map_err(|error| error.to_string())
             })
             .unwrap()
+    }
+
+    fn seed_media_pricing_event(state: &SharedState, record_id: &str, billed: bool) -> String {
+        let mut measurements = vec![serde_json::json!({
+            "role":"input", "unit":"credit", "quantity":"20",
+            "measure":"observed", "source":"vendor_reply"
+        })];
+        if billed {
+            measurements.push(serde_json::json!({
+                "role":"input", "unit":"token", "quantity":"1000000",
+                "measure":"billed", "source":"vendor_reply"
+            }));
+        }
+        let record = serde_json::from_value(serde_json::json!({
+            "record_id":record_id, "principal":"person-a", "job_id":"job-1",
+            "provider":"anthropic", "model":"claude", "charge_basis":"vendor",
+            "auth_method":"api_key", "started_at_ms":1_800_000_000_000_i64,
+            "finished_at_ms":1_800_000_000_100_i64, "status":"done",
+            "selectors":{}, "measurements":measurements
+        }))
+        .unwrap();
+        let (request, facts) = astrocyte_core::media::map_record(&record).unwrap().unwrap();
+        state
+            .ordered_write(|tx| {
+                let outcome = astrocyte_core::ingest::record_media_event_in_tx(
+                    tx,
+                    &request,
+                    &facts,
+                    1_800_000_000_200,
+                )
+                .map_err(|error| format!("{error:?}"))?;
+                Ok((outcome.event_id, true))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn observed_only_pricing_walk_removes_legacy_queue_row_without_charges() {
+        let state = test_state();
+        let id = seed_media_pricing_event(&state, "observed-only-walk", false);
+        // Older queue reconciliation included observed readings as headless work.
+        state.ordered_write(|tx| {
+            tx.execute("INSERT OR IGNORE INTO pricing_pending (event_key) SELECT event_key FROM usage_event WHERE event_id=?1", [&id])
+                .map_err(|error| error.to_string())?;
+            Ok(((), true))
+        }).unwrap();
+        assert_eq!(queued_event_ids(&state), vec![id]);
+        let pass = run_pricing_pass(&state, 1_800_000_000_300, &NEVER_STOP);
+        assert!(
+            pass.is_ok(),
+            "observed-only queue entry is not a pricing failure: {pass:?}"
+        );
+        assert_eq!(pass.unwrap().priced, 0);
+        assert!(queued_event_ids(&state).is_empty());
+        assert_eq!(priced_charge_rows(&state), 0);
+    }
+
+    #[test]
+    fn observed_mixed_pricing_walk_prices_billed_measurement_and_dequeues() {
+        let state = test_state();
+        let id = seed_media_pricing_event(&state, "mixed-observed-walk", true);
+        state
+            .install_catalog(Some(
+                CatalogClient::connect(Arc::new(LateCatalog::warming(0))).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(queued_event_ids(&state), vec![id.clone()]);
+        assert_eq!(priced_charge_rows(&state), 0);
+        let removed = state
+            .ordered_write(|tx| {
+                let removed = astrocyte_core::pricing::dequeue_if_fully_headed(tx, &id)
+                    .map_err(|error| error.to_string())?;
+                Ok((removed, removed != 0))
+            })
+            .unwrap();
+        assert_eq!(
+            removed, 0,
+            "cleanup must preserve a headless billed measurement"
+        );
+        assert_eq!(queued_event_ids(&state), vec![id.clone()]);
+        let pass = run_pricing_pass(&state, 1_800_000_000_300, &NEVER_STOP).unwrap();
+        assert_eq!(pass.priced, 1);
+        let charge = head(&state, &id);
+        assert_eq!(charge.outcome, "priced");
+        assert_eq!(charge.charge_nanos, Some(3_000));
+        assert_eq!(charge.rows, 1, "observed credits must not receive a charge");
+        assert!(queued_event_ids(&state).is_empty());
     }
 
     fn backfill_due(state: &SharedState) -> Option<i64> {

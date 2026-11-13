@@ -794,7 +794,7 @@ pub fn commit_reprice_in_tx(
         )?;
     }
     // Charge rows and queue removal share `tx`. An event leaves the queue only
-    // once every measurement has a current head (a row nothing supersedes),
+    // once every billed measurement has a current head (a row nothing supersedes),
     // which need not be true after pricing just the targets of this plan.
     dequeue_if_fully_headed(tx, &plan.event_id)?;
     Ok(RepriceOutcome {
@@ -915,12 +915,12 @@ fn insert_charge(
     )
 }
 
-/// True when the current `measurement` row has no charge row that nothing
-/// supersedes. This predicate has no parameters and works in both event and
-/// ledger-range queries, whose bounds have different parameter positions.
-macro_rules! measurement_has_no_head {
+/// True when the current `measurement` row is billed and has no charge row
+/// that nothing supersedes. This predicate has no parameters and works in both
+/// event and ledger-range queries, whose bounds have different parameter positions.
+macro_rules! billed_measurement_has_no_head {
     () => {
-        "NOT EXISTS (
+        "measurement.kind <> 'observed' AND NOT EXISTS (
           SELECT 1 FROM priced_charge
           WHERE priced_charge.event_key=measurement.event_key
             AND priced_charge.role = measurement.role
@@ -933,10 +933,10 @@ macro_rules! measurement_has_no_head {
     };
 }
 
-/// True when event `?1` has a measurement needing a current charge head.
-const EVENT_HAS_HEADLESS_MEASUREMENT: &str = concat!(
+/// True when event `?1` has a billed measurement needing a current charge head.
+const EVENT_HAS_HEADLESS_BILLED_MEASUREMENT: &str = concat!(
     "EXISTS (SELECT 1 FROM measurement WHERE measurement.event_key = (SELECT event_key FROM usage_event WHERE event_id=?1) AND ",
-    measurement_has_no_head!(),
+    billed_measurement_has_no_head!(),
     ")"
 );
 
@@ -945,23 +945,26 @@ const EVENT_HAS_HEADLESS_MEASUREMENT: &str = concat!(
 /// Must run in the transaction that wrote the event's measurements: a queue row
 /// written in a later transaction is lost if the process dies in between, and
 /// the event is then never priced. Enqueuing an event that is already queued or
-/// has no headless measurement changes nothing. Returns the number of rows
+/// has no headless billed measurement changes nothing. Returns the number of rows
 /// inserted (0 or 1).
 pub fn enqueue_if_unpriced_in_tx(conn: &Connection, event_id: &str) -> rusqlite::Result<usize> {
     conn.execute(
         &format!(
             "INSERT OR IGNORE INTO pricing_pending (event_key)
-             SELECT event_key FROM usage_event WHERE event_id=?1 AND {EVENT_HAS_HEADLESS_MEASUREMENT}"
+             SELECT event_key FROM usage_event WHERE event_id=?1 AND {EVENT_HAS_HEADLESS_BILLED_MEASUREMENT}"
         ),
         [event_id],
     )
 }
 
-fn dequeue_if_fully_headed(conn: &Connection, event_id: &str) -> rusqlite::Result<usize> {
+/// Remove a queued event only when no billed measurement still needs a head.
+/// Observed readings never need heads, so an observed-only event can leave too.
+/// Call inside the pricing write transaction to recheck the current measurements.
+pub fn dequeue_if_fully_headed(conn: &Connection, event_id: &str) -> rusqlite::Result<usize> {
     conn.execute(
         &format!(
             "DELETE FROM pricing_pending
-             WHERE event_key=(SELECT event_key FROM usage_event WHERE event_id=?1) AND NOT {EVENT_HAS_HEADLESS_MEASUREMENT}"
+             WHERE event_key=(SELECT event_key FROM usage_event WHERE event_id=?1) AND NOT {EVENT_HAS_HEADLESS_BILLED_MEASUREMENT}"
         ),
         [event_id],
     )
@@ -1049,7 +1052,7 @@ pub fn reconcile_pending_range_in_tx(
     } else {
         "AND ?2 IS NULL"
     };
-    let headless = measurement_has_no_head!();
+    let headless = billed_measurement_has_no_head!();
     conn.execute(
         &format!(
             "INSERT OR IGNORE INTO pricing_pending (event_key)
