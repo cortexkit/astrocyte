@@ -555,6 +555,9 @@ pub struct SummaryMaintenance {
     finish_audit: bool,
     retry_after_ms: i64,
     dirty_after: Option<Hour>,
+    stale_after: Option<Hour>,
+    #[cfg(test)]
+    max_publication_rows: Option<usize>,
 }
 #[derive(Debug, Default)]
 pub struct SummaryOutcome {
@@ -608,6 +611,35 @@ fn chunk_filter(hour: Hour, after: Option<i64>, last: i64) -> String {
         "({}){after} AND event_key<={last} ORDER BY event_key",
         hour.filter()
     )
+}
+fn stale_hour_sql(after: Option<Hour>) -> String {
+    // SQLite can use the partial index only when the format is a literal
+    // matching its predicate, not a bound parameter.
+    let after = after.map_or_else(String::new, |hour| {
+        format!(" AND (kind,hour_number)>({},{})", hour.kind, hour.number)
+    });
+    format!(
+        "SELECT kind,hour_number FROM summary_hour INDEXED BY summary_hour_stale
+         WHERE (built_revision IS NOT revision OR format_version IS NOT {FORMAT}){after}
+         ORDER BY kind,hour_number LIMIT 1"
+    )
+}
+fn next_stale(conn: &Connection, after: Option<Hour>) -> Result<Option<Hour>, ReportError> {
+    let read = |after| {
+        conn.query_row(&stale_hour_sql(after), [], |row| {
+            Ok(Hour {
+                kind: row.get(0)?,
+                number: row.get(1)?,
+            })
+        })
+        .optional()
+    };
+    let next = read(after)?;
+    Ok(if next.is_none() && after.is_some() {
+        read(None)?
+    } else {
+        next
+    })
 }
 fn next_audit(conn: &Connection) -> Result<Option<Hour>, ReportError> {
     let (kind, number): (Option<i64>, Option<i64>) = conn.query_row(
@@ -675,14 +707,24 @@ impl SummaryMaintenance {
             if dirty.is_none() {
                 dirty=conn.query_row("SELECT kind,hour_number FROM summary_dirty_hour ORDER BY kind,hour_number LIMIT 1",[],|row|Ok(Hour{kind:row.get(0)?,number:row.get(1)?})).optional()?;
             }
-            let audit = due && (self.prefer_audit || dirty.is_none());
-            let hour = if audit { next_audit(conn)? } else { dirty };
+            let next = match dirty {
+                Some(hour) => Some(hour),
+                None => next_stale(conn, self.stale_after)?,
+            };
+            let audit = due && (self.prefer_audit || next.is_none());
+            let hour = if audit { next_audit(conn)? } else { next };
             let Some(hour) = hour else {
                 self.finish_audit = audit;
                 return Ok(audit);
             };
             if !audit {
-                self.dirty_after = Some(hour);
+                if dirty.is_some() {
+                    self.dirty_after = Some(hour);
+                } else {
+                    // A deferred hour stays stale; rotate past it so later
+                    // hours can rebuild within the publication row budget.
+                    self.stale_after = Some(hour);
+                }
             }
             self.pending = Some(Build {
                 hour,
@@ -716,13 +758,16 @@ impl SummaryMaintenance {
             None => 0,
         };
         build.after = last;
+        let max_publication_rows = MAX_PUBLICATION_ROWS;
+        #[cfg(test)]
+        let max_publication_rows = self.max_publication_rows.unwrap_or(max_publication_rows);
         build.deferred = !build.audit
             && (build.data.cells.len()
                 + build.data.quantities.len()
                 + build.data.money.len()
                 + build.data.frequencies.len()
                 + build.data.runs.len()
-                > MAX_PUBLICATION_ROWS);
+                > max_publication_rows);
         build.ready = count < CHUNK || build.deferred;
         let spent =
             u64::try_from(started.elapsed().as_millis()).map_err(|_| ReportError::Arithmetic)?;
@@ -791,7 +836,12 @@ impl SummaryMaintenance {
             let cache_matches = metadata
                 == Some((Some(build.revision), Some(FORMAT), build.data.events))
                 && stored(tx, build.hour).is_ok_and(|cached| cached == build.data);
-            if !dirty && (build.revision == 0 || !cache_matches) {
+            // Known revision or format staleness is ordinary rebuild work,
+            // not evidence that a clean summary differs from base facts.
+            let known_stale = metadata.is_some_and(|(revision, format, _)| {
+                revision != Some(build.revision) || format != Some(FORMAT)
+            });
+            if !dirty && !known_stale && (build.revision == 0 || !cache_matches) {
                 tx.execute(
                     "INSERT INTO summary_hour(kind,hour_number,revision) VALUES(?1,?2,1)
                     ON CONFLICT(kind,hour_number) DO UPDATE SET revision=revision+1",
@@ -1975,13 +2025,27 @@ mod tests {
         conn.execute("UPDATE summary_cell SET payload=json_set(payload,'$.reasons',json('{\"not_yet_priced\":1}'),'$.zero_measurements',1)", []).unwrap();
         compare(&conn);
         conn.execute(
-            "UPDATE summary_audit_state SET next_due_ms=0,after_kind=NULL,after_hour=NULL",
-            [],
+            "UPDATE summary_audit_state SET next_due_ms=?1,after_kind=NULL,after_hour=NULL",
+            [i64::MAX],
         )
         .unwrap();
+        assert_eq!(dirty(&conn), 0);
+        let audit_before: (i64, i64) = conn
+            .query_row(
+                "SELECT hours,mismatches FROM summary_audit_state WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
         let mut maintenance = SummaryMaintenance::default();
-        for _ in 0..100 {
-            step(&mut conn, &mut maintenance);
+        for remaining in (0..stale).rev() {
+            let outcome = step(&mut conn, &mut maintenance);
+            assert!(
+                outcome.published,
+                "a stale hour must rebuild before the audit is due"
+            );
+            assert!(!outcome.audited);
+            assert!(!outcome.mismatch);
             compare(&conn);
             let stale: i64 = conn
                 .query_row(
@@ -1990,9 +2054,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            if stale == 0 {
-                break;
-            }
+            assert_eq!(stale, remaining);
         }
         let stale: i64 = conn
             .query_row(
@@ -2002,7 +2064,124 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stale, 0);
+        let audit_after: (i64, i64) = conn
+            .query_row(
+                "SELECT hours,mismatches FROM summary_audit_state WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(audit_after, audit_before);
         compare(&conn);
+    }
+
+    #[test]
+    fn dirty_hours_rebuild_before_unmarked_format_and_revision_stale_hours() {
+        let mut conn = conn();
+        for (id, time) in [("format", 0), ("dirty", HOUR_MS), ("revision", 2 * HOUR_MS)] {
+            let event = record(&mut conn, id, Some(time), ChargeBasis::MeteredApi, None);
+            priced(&mut conn, &event, "USD", 100);
+        }
+        catch_up(&mut conn);
+        conn.execute("UPDATE summary_audit_state SET next_due_ms=?1", [i64::MAX])
+            .unwrap();
+        conn.execute(
+            "UPDATE summary_hour SET format_version=?1 WHERE hour_number=0",
+            [FORMAT - 1],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE summary_hour SET built_revision=revision-1 WHERE hour_number=2",
+            [],
+        )
+        .unwrap();
+        let event: String = conn
+            .query_row(
+                "SELECT event_id FROM usage_event WHERE occurred_at_ms=?1",
+                [HOUR_MS],
+                |row| row.get(0),
+            )
+            .unwrap();
+        adjust(&mut conn, &event, "USD", 25, "dirty-adjustment");
+        assert_eq!(dirty(&conn), 1);
+        let mut maintenance = SummaryMaintenance::default();
+        for number in [1, 0, 2] {
+            let outcome = step(&mut conn, &mut maintenance);
+            assert!(outcome.published);
+            assert_eq!(outcome.hour, Some((0, number)));
+            assert!(!outcome.audited);
+            assert!(!outcome.mismatch);
+            let metadata: (i64, i64, i64) = conn.query_row("SELECT revision,built_revision,format_version FROM summary_hour WHERE kind=0 AND hour_number=?1", [number], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+            assert_eq!(metadata.0, metadata.1);
+            assert_eq!(metadata.2, FORMAT);
+            compare(&conn);
+        }
+        assert_eq!(dirty(&conn), 0);
+        assert_eq!(
+            stored(&conn, Hour { kind: 0, number: 1 })
+                .unwrap()
+                .cells
+                .values()
+                .next()
+                .unwrap()
+                .total,
+            125
+        );
+    }
+
+    #[test]
+    fn audit_does_not_count_known_format_or_revision_staleness_as_mismatches() {
+        for change in [
+            format!("format_version={}", FORMAT - 1),
+            format!("format_version={}", FORMAT + 1),
+            "format_version=NULL".into(),
+            "built_revision=revision-1".into(),
+            "built_revision=NULL".into(),
+        ] {
+            let mut conn = conn();
+            record(
+                &mut conn,
+                "stale",
+                Some(1000),
+                ChargeBasis::MeteredApi,
+                None,
+            );
+            catch_up(&mut conn);
+            conn.execute_batch(&format!("UPDATE summary_hour SET {change}; UPDATE summary_audit_state SET next_due_ms=0,after_kind=NULL,after_hour=NULL,mismatches=0;")).unwrap();
+            // A due audit can encounter an old summary before maintenance rebuilds it.
+            let mut maintenance = SummaryMaintenance {
+                prefer_audit: true,
+                ..SummaryMaintenance::default()
+            };
+            let audit = step(&mut conn, &mut maintenance);
+            assert!(audit.audited);
+            assert!(
+                !audit.mismatch,
+                "known staleness is not an audit mismatch: {change}"
+            );
+            let mismatches: i64 = conn
+                .query_row(
+                    "SELECT mismatches FROM summary_audit_state WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(mismatches, 0);
+            assert_eq!(dirty(&conn), 0);
+            let rebuild = step(&mut conn, &mut maintenance);
+            assert!(rebuild.published);
+            assert!(!rebuild.audited);
+            assert!(!rebuild.mismatch);
+            let metadata: (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT revision,built_revision,format_version FROM summary_hour",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(metadata.0, metadata.1);
+            assert_eq!(metadata.2, FORMAT);
+        }
     }
 
     #[test]
@@ -2660,6 +2839,131 @@ mod tests {
         text
     }
 
+    #[test]
+    fn stale_hour_lookup_uses_the_partial_index_and_current_stores_stay_idle() {
+        for hours in [200, 20_000] {
+            let mut conn = conn();
+            conn.execute_batch(&format!(
+                "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<{hours}-1)
+                 INSERT INTO summary_hour(kind,hour_number,revision,built_revision,format_version)
+                 SELECT 0,i,1,1,{FORMAT} FROM n;
+                 UPDATE summary_audit_state SET next_due_ms={};",
+                i64::MAX
+            ))
+            .unwrap();
+            for after in [
+                None,
+                Some(Hour {
+                    kind: 0,
+                    number: hours / 2,
+                }),
+            ] {
+                let plan = query_plan(&conn, &stale_hour_sql(after));
+                assert!(plan.contains("summary_hour_stale"), "{plan}");
+                assert!(
+                    !plan.lines().any(|line| line.trim() == "SCAN summary_hour"),
+                    "{plan}"
+                );
+                assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+                if after.is_some() {
+                    assert!(plan.contains("SEARCH summary_hour"), "{plan}");
+                }
+            }
+            let mut maintenance = SummaryMaintenance::default();
+            let counter = crate::store::VmCounter::start(&conn);
+            let outcome = step(&mut conn, &mut maintenance);
+            let steps = counter.steps();
+            assert!(
+                steps < 200,
+                "idle step used {steps} VM steps for {hours} current hours"
+            );
+            assert!(!outcome.published);
+            assert!(!outcome.audited);
+            assert!(!maintenance.has_pending());
+
+            conn.execute(
+                "UPDATE summary_hour SET format_version=NULL WHERE hour_number=?1",
+                [hours - 1],
+            )
+            .unwrap();
+            let counter = crate::store::VmCounter::start(&conn);
+            let stale: (i64, i64) = conn
+                .query_row(&stale_hour_sql(None), [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            let steps = counter.steps();
+            assert_eq!(stale, (0, hours - 1));
+            assert!(
+                steps < 100,
+                "stale lookup used {steps} VM steps for {hours} hours"
+            );
+            let outcome = step(&mut conn, &mut maintenance);
+            assert!(outcome.published);
+            assert_eq!(outcome.hour, Some(stale));
+            assert!(!outcome.mismatch);
+            let counter = crate::store::VmCounter::start(&conn);
+            assert!(!step(&mut conn, &mut maintenance).published);
+            let steps = counter.steps();
+            assert!(
+                steps < 200,
+                "idle wrapped step used {steps} VM steps for {hours} current hours"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_stale_hour_does_not_block_later_stale_hours() {
+        let mut conn = conn();
+        for (id, time, work) in [
+            ("large-one", 0, "coding"),
+            ("large-two", 0, "analysis"),
+            ("later-one", HOUR_MS, "coding"),
+            ("later-two", 2 * HOUR_MS, "coding"),
+        ] {
+            record(
+                &mut conn,
+                id,
+                Some(time),
+                ChargeBasis::MeteredApi,
+                Some(work),
+            );
+        }
+        catch_up(&mut conn);
+        conn.execute("UPDATE summary_hour SET format_version=?1", [FORMAT - 1])
+            .unwrap();
+        conn.execute("UPDATE summary_audit_state SET next_due_ms=?1", [i64::MAX])
+            .unwrap();
+        assert_eq!(dirty(&conn), 0);
+        // One cell and its two quantities fit; the two-cell hour must defer.
+        let mut maintenance = SummaryMaintenance {
+            max_publication_rows: Some(3),
+            ..SummaryMaintenance::default()
+        };
+        for number in 0..3 {
+            let outcome = step(&mut conn, &mut maintenance);
+            assert_eq!(outcome.hour, Some((0, number)));
+            assert_eq!(outcome.deferred, number == 0);
+            assert_eq!(outcome.published, number != 0);
+            assert!(!outcome.audited);
+            assert!(!outcome.mismatch);
+            compare(&conn);
+        }
+        let versions: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT hour_number,format_version FROM summary_hour ORDER BY kind,hour_number",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(versions, vec![(0, FORMAT - 1), (1, FORMAT), (2, FORMAT)]);
+        let retried = step(&mut conn, &mut maintenance);
+        assert_eq!(retried.hour, Some((0, 0)));
+        assert!(retried.deferred);
+    }
+
     /// Fills one old hour with more events than one chunk holds, then adds
     /// `later` events in a much later hour, all through plain inserts so the
     /// fixture is quick at any size.
@@ -2677,6 +2981,50 @@ mod tests {
         ))
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn format_stale_hours_rebuild_with_the_same_chunk_budget() {
+        let mut conn = busy_old_hour(10);
+        catch_up(&mut conn);
+        conn.execute("UPDATE summary_audit_state SET next_due_ms=?1", [i64::MAX])
+            .unwrap();
+        conn.execute(
+            "UPDATE summary_hour SET format_version=?1 WHERE hour_number=0",
+            [FORMAT - 1],
+        )
+        .unwrap();
+        assert_eq!(dirty(&conn), 0);
+        let mut maintenance = SummaryMaintenance::default();
+        assert!(!step(&mut conn, &mut maintenance).published);
+        let pending = maintenance.pending.as_ref().unwrap();
+        assert_eq!(pending.data.events, u64::try_from(CHUNK).unwrap());
+        assert!(!pending.audit);
+        let version: i64 = conn
+            .query_row(
+                "SELECT format_version FROM summary_hour WHERE hour_number=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, FORMAT - 1);
+        let outcome = step(&mut conn, &mut maintenance);
+        assert!(outcome.published);
+        assert_eq!(outcome.chunks, 2);
+        assert!(!outcome.audited);
+        assert!(!outcome.mismatch);
+        assert_eq!(
+            stored(&conn, Hour { kind: 0, number: 0 }).unwrap().events,
+            u64::try_from(CHUNK).unwrap() + 10
+        );
+        let version: i64 = conn
+            .query_row(
+                "SELECT format_version FROM summary_hour WHERE hour_number=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, FORMAT);
     }
 
     #[test]

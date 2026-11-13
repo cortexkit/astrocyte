@@ -432,6 +432,8 @@ The primary key on `event_id` makes the transition happen at most once.
 
 ## Hourly summaries
 
+Stale hours rebuild in the background without waiting for the daily audit.
+
 Migration 34 adds `summary_run_cell` at `(kind, hour_number, run_key, provider,
 model)`, with typed step/token/count columns and exact currency/reason maps.
 It shares the existing hour revisions, dirty triggers, reducer, publication row
