@@ -427,3 +427,146 @@ fn source_is_registered_and_old_config_shape_stays_enabled_and_can_exclude_it() 
     assert_eq!(f.count("usage_event"), 0);
     assert!(!f.ack.exists());
 }
+
+#[test]
+fn declared_pi_history_scaling_unchanged_and_grown_files_parse_only_new_bytes() {
+    use astrocyte_readers::sessions::pi::PI_PREFIX_WINDOW_BYTES;
+    use std::io::Write;
+    for done in [false, true] {
+        let f = Fixture::new();
+        let header = TRANSCRIPT.lines().next().unwrap();
+        let call = TRANSCRIPT.lines().nth(1).unwrap();
+        let mut transcript = format!("{header}\n");
+        for index in 0..1000 {
+            transcript.push_str(
+                &call
+                    .replace("entry-one", &format!("entry-{index}"))
+                    .replace("pi-synthetic-response", &format!("response-{index}")),
+            );
+            transcript.push('\n');
+        }
+        let file = f.folder.join("session.jsonl");
+        fs::write(&file, &transcript).unwrap();
+        // Start just after this file's daily phase so the short ticks cannot
+        // accidentally cross a scheduled full verification deadline.
+        let phase = crate::refresher::jsonl_schedule::phase(
+            &file,
+            crate::refresher::jsonl_schedule::DAILY_VERIFY_MS,
+        );
+        let at = phase + 1001;
+        let mut root = f.root();
+        root["session"] = json!("pi-synthetic-one");
+        if !done {
+            root["state"] = json!("active");
+            root["done_at_ms"] = Value::Null;
+        }
+        f.declare(vec![root.clone()]);
+        assert_eq!(f.tick(at), None);
+        assert_eq!(f.count("usage_event"), 1000);
+        assert_eq!(
+            f.source.cache.lock().unwrap().last_read.0,
+            u64::try_from(transcript.len()).unwrap()
+        );
+
+        assert_eq!(f.tick(at + 30_000), None);
+        let (read, hashed) = f.source.cache.lock().unwrap().last_read;
+        assert_eq!(read, 0, "unchanged history was parsed again");
+        assert!(
+            hashed <= PI_PREFIX_WINDOW_BYTES,
+            "unchanged history exceeded one tail check: {hashed}"
+        );
+
+        let appended = format!(
+            "{}\n",
+            call.replace("entry-one", "appended-entry")
+                .replace("pi-synthetic-response", "appended-response")
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(appended.as_bytes())
+            .unwrap();
+        assert_eq!(f.tick(at + 60_000), None);
+        let (read, hashed) = f.source.cache.lock().unwrap().last_read;
+        assert_eq!(
+            read,
+            u64::try_from(appended.len()).unwrap(),
+            "growing history was parsed again"
+        );
+        assert!(
+            hashed <= 2 * PI_PREFIX_WINDOW_BYTES + u64::try_from(appended.len()).unwrap(),
+            "growing history exceeded tail checks and appended bytes: {hashed}"
+        );
+        assert_eq!(f.count("usage_event"), 1001);
+
+        let due = phase + crate::refresher::jsonl_schedule::DAILY_VERIFY_MS;
+        assert_eq!(f.tick(due), None);
+        let (read, hashed) = f.source.cache.lock().unwrap().last_read;
+        assert_eq!(read, 0);
+        assert!(
+            hashed >= u64::try_from(transcript.len() + appended.len()).unwrap(),
+            "scheduled full verification was skipped"
+        );
+
+        root["session"] = json!("different-native-session");
+        f.declare(vec![root]);
+        assert!(f
+            .tick(due + 30_000)
+            .unwrap()
+            .contains("session header mismatch"));
+        assert_eq!(f.acks()["read_through"], json!([]));
+        assert_eq!(f.count("usage_event"), 1001);
+    }
+}
+
+#[test]
+fn resumed_declared_pi_owner_change_keeps_waiting_calls_unacknowledged() {
+    let f = Fixture::new();
+    f.call();
+    f.managed();
+    f.declare(vec![f.root()]);
+    f.tick(1001);
+    let mut root = f.root();
+    root["owner_session"] = json!("replacement-owner");
+    f.declare(vec![root]);
+    f.tick(1002);
+    assert_eq!(f.count("usage_event"), 0);
+    assert_eq!(f.acks()["read_through"], json!([]));
+    f.tick(601_000);
+    assert_eq!(f.count("usage_event"), 1);
+    f.state
+        .with_conn(|conn| {
+            assert_eq!(
+                conn.query_row("SELECT session FROM usage_event", [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "replacement-owner"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        f.acks()["read_through"],
+        json!([{"session":"replacement-owner","at_ms":601_000}])
+    );
+}
+
+#[test]
+fn resumed_declared_pi_refusal_stays_blocked_until_a_verified_rewrite() {
+    let f = Fixture::new();
+    let file = f.folder.join("session.jsonl");
+    fs::write(&file, format!("{TRANSCRIPT}not-json\n")).unwrap();
+    f.declare(vec![f.root()]);
+    assert!(f.tick(1001).is_some());
+    assert!(f.tick(31_001).is_some());
+    assert_eq!(f.count("usage_event"), 1);
+    assert_eq!(f.acks()["read_through"], json!([]));
+    fs::write(file, TRANSCRIPT).unwrap();
+    assert_eq!(f.tick(61_001), None);
+    assert_eq!(f.count("usage_event"), 1);
+    assert_eq!(
+        f.acks()["read_through"],
+        json!([{"session":"core-conversation","at_ms":61_001}])
+    );
+}

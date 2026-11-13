@@ -6,12 +6,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use astrocyte_readers::sessions::pi::{parse_pi_file_resumable, PiPrefixCheck};
 use serde::Deserialize;
 
 use super::declared_roots::{self, write_ack, Ack, Contained, ReadThrough, RootsFile};
 use super::harness_drain::{self, HarnessSource};
-use super::pi_source::{self, PiDrainOutcome};
+use super::pi_source::{self, PiDrainOutcome, PiFileState};
 use super::thalamus_payer_join::{WaitQueue, WaitingCall};
 use super::SourceDrainError;
 use crate::harness_paths::ClaudeSessionPaths;
@@ -42,6 +41,19 @@ struct Cache {
     roots: Vec<Root>,
     ack: Option<Ack>,
     payer_wait: WaitQueue,
+    files: HashMap<PathBuf, CachedFile>,
+    #[cfg(test)]
+    last_read: (u64, u64),
+}
+
+#[derive(Clone, Default)]
+struct CachedFile {
+    state: PiFileState,
+    owner_session: String,
+    // An empty resumed or deferred read must not clear an earlier refusal and
+    // tell THALAMUS to delete a folder containing unrecorded usage. A verified
+    // rewrite starts fresh parser state.
+    blocked: bool,
 }
 
 pub(crate) struct PiThalamusSource {
@@ -174,6 +186,8 @@ impl PiThalamusSource {
         let mut ready = HashSet::new();
         let mut accepted = HashSet::new();
         let mut set_aside = Vec::new();
+        let mut outcome = PiDrainOutcome::default();
+        let mut next_files = HashMap::new();
         for (root, canonical) in roots.iter().zip(resolved) {
             let refuse = if root.owner_session.is_empty() {
                 Some("empty owner_session")
@@ -218,70 +232,112 @@ impl PiThalamusSource {
             }
             let mut folder_calls = Vec::new();
             let mut folder_problems = Vec::new();
+            let mut folder_files = HashMap::new();
+            let mut header_mismatch = false;
             let files = harness_drain::jsonl_files(&canonical)
                 .map_err(|e| format!("read Pi folder {}: {e}", root.path.display()))?;
             for path in files {
                 if stop.load(Ordering::Relaxed) {
                     return Err(SourceDrainError::Stopped);
                 }
-                let parsed = parse_pi_file_resumable(&path, None, PiPrefixCheck::Full);
-                let header = parsed.resume.as_ref().and_then(|point| point.session_id());
+                // A changed owner must rediscover unrecorded calls under its
+                // new label instead of dropping waits past a consumed offset.
+                let previous = cache
+                    .files
+                    .get(&path)
+                    .filter(|file| file.owner_session == root.owner_session)
+                    .cloned()
+                    .unwrap_or_default();
+                let read = previous
+                    .state
+                    .read(&path, at, harness_drain::DrainMode::Full, true)?;
+                if let Some(parsed) = &read.parsed {
+                    outcome.read_bytes += parsed.read_bytes;
+                    outcome.hashed_bytes += parsed.hashed_bytes;
+                }
+                let header = read.state.session_id();
                 if root
                     .session
                     .as_deref()
                     .is_some_and(|id| header.is_some_and(|native| native != id))
                 {
                     folder_problems.push(format!("session header mismatch in {}", path.display()));
+                    header_mismatch = true;
                     continue;
                 }
-                if parsed.resume.is_none() || parsed.skipped_lines > 0 {
+                let mut blocked = previous.blocked;
+                if let Some(parsed) = read.parsed {
+                    blocked = (previous.blocked && parsed.resumed)
+                        || parsed.resume.is_none()
+                        || parsed.skipped_lines > 0;
+                    for (offset, reason) in parsed.set_aside {
+                        set_aside.push(super::SetAsideRecord {
+                            locator: format!("{path:?}:byte:{offset}"),
+                            reason,
+                        });
+                    }
+                    for record in parsed.messages {
+                        let completed_at_ms = record.occurred_at_ms;
+                        let native_session = record.message.session_id.clone();
+                        match pi_source::map_message(record) {
+                            Ok(mut request) => {
+                                request.session = Some(root.owner_session.clone());
+                                request.work_class = Some(root.owner_principal.clone());
+                                folder_calls.push(WaitingCall {
+                                    request,
+                                    completed_at_ms,
+                                    native_session: Some(native_session),
+                                });
+                            }
+                            Err(reason) => {
+                                blocked = true;
+                                folder_problems.push(reason);
+                            }
+                        }
+                    }
+                }
+                if blocked {
                     folder_problems.push(format!(
                         "unreadable or rejected Pi records in {}",
                         path.display()
                     ));
                 }
-                for (offset, reason) in parsed.set_aside {
-                    set_aside.push(super::SetAsideRecord {
-                        locator: format!("{path:?}:byte:{offset}"),
-                        reason,
-                    });
-                }
-                for record in parsed.messages {
-                    let completed_at_ms = record.occurred_at_ms;
-                    let native_session = record.message.session_id.clone();
-                    match pi_source::map_message(record) {
-                        Ok(mut request) => {
-                            request.session = Some(root.owner_session.clone());
-                            request.work_class = Some(root.owner_principal.clone());
-                            folder_calls.push(WaitingCall {
-                                request,
-                                completed_at_ms,
-                                native_session: Some(native_session),
-                            });
-                        }
-                        Err(reason) => folder_problems.push(reason),
-                    }
-                }
+                folder_files.insert(
+                    path,
+                    CachedFile {
+                        state: read.state,
+                        owner_session: root.owner_session.clone(),
+                        blocked,
+                    },
+                );
             }
             // A header disagreement refuses the entire folder, including files
             // parsed before the disagreement. Never guess which session paid.
             if !folder_problems.is_empty() {
                 problems.push(format!(
-                    "refuse Pi folder {}: {}",
+                    "Pi folder {}: {}",
                     root.path.display(),
                     folder_problems.join("; ")
                 ));
+            }
+            if header_mismatch {
                 continue;
             }
+            // Good records commit even if another line was refused, as in
+            // Pi's normal reader. Otherwise advancing their offsets would
+            // lose those calls when the refused file is repaired or removed.
+            next_files.extend(folder_files);
             accepted.insert(root.owner_session.clone());
-            if root.state == SessionState::Done && root.done_at_ms.is_some_and(|done| at >= done) {
+            if folder_problems.is_empty()
+                && root.state == SessionState::Done
+                && root.done_at_ms.is_some_and(|done| at >= done)
+            {
                 ready.insert(root.owner_session.clone());
             }
             calls.extend(folder_calls);
         }
         let mut queue = cache.payer_wait.clone();
         queue.retain_recorded_sessions(&accepted);
-        let mut outcome = PiDrainOutcome::default();
         let next = pi_source::record_calls(
             state,
             SOURCE_KEY,
@@ -294,6 +350,11 @@ impl PiThalamusSource {
             &queue,
         )?;
         cache.payer_wait = next;
+        cache.files = next_files;
+        #[cfg(test)]
+        {
+            cache.last_read = (outcome.read_bytes, outcome.hashed_bytes);
+        }
         state.set_payer_waiting(SOURCE_KEY, cache.payer_wait.len());
         if outcome.quarantined_redeliveries > 0 {
             problems.push("Pi session calls were quarantined".into());

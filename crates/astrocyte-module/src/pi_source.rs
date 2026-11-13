@@ -16,7 +16,7 @@ use astrocyte_core::ingest::{EventRecordRequest, StepDetail};
 #[cfg(test)]
 use astrocyte_readers::sessions::pi::{parse_pi_file, PI_PREFIX_WINDOW_BYTES};
 use astrocyte_readers::sessions::pi::{
-    parse_pi_file_resumable, PiPrefixCheck, PiResumePoint, PiUsageRecord,
+    parse_pi_file_resumable, PiPrefixCheck, PiResumableParse, PiResumePoint, PiUsageRecord,
 };
 use astrocyte_readers::sessions::UnifiedMessage;
 use chrono::DateTime;
@@ -144,6 +144,91 @@ struct CachedIdentity {
 /// 6-8% of one core, measured in production 2026-09-23), growing with the
 /// file forever.
 const PI_FULL_PREFIX_VERIFY_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// One file's bounded resume state. Both Pi roots stage this state until their
+/// ledger transaction commits; its verified header id travels with the offset.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PiFileState {
+    resume: Option<PiResumePoint>,
+    prefix_verified_ms: Option<i64>,
+    window: Option<WindowSchedule>,
+}
+
+pub(crate) struct PiFileRead {
+    pub(crate) state: PiFileState,
+    pub(crate) parsed: Option<PiResumableParse>,
+}
+
+impl PiFileState {
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        self.resume.as_ref().and_then(PiResumePoint::session_id)
+    }
+
+    /// Metadata may wake a quiet file, but only a due content check may extend
+    /// its verification deadlines. Grown files resume after a bounded tail
+    /// check; the staggered full-prefix check still catches older rewrites.
+    pub(crate) fn read(
+        &self,
+        path: &Path,
+        at: i64,
+        mode: DrainMode,
+        resumable: bool,
+    ) -> Result<PiFileRead, String> {
+        let stat = FileStat::read_in_lane(path, mode)
+            .map_err(|e| format!("open Pi session file {}: {e}", path.display()))?;
+        if !mode.is_full() && !stat.fast_changed(self.window.as_ref(), at) {
+            return Ok(PiFileRead {
+                state: self.clone(),
+                parsed: None,
+            });
+        }
+        let previous = resumable.then_some(self.resume.as_ref()).flatten();
+        let check = if previous.is_some()
+            && mode.is_full()
+            && full_due(
+                path,
+                self.prefix_verified_ms,
+                at,
+                PI_FULL_PREFIX_VERIFY_INTERVAL_MS,
+            ) {
+            PiPrefixCheck::Full
+        } else {
+            PiPrefixCheck::Window
+        };
+        let window = resumable.then_some(self.window.as_ref()).flatten();
+        if previous.is_some()
+            && window.is_some_and(|window| window.defer(&stat, at, check == PiPrefixCheck::Full))
+        {
+            return Ok(PiFileRead {
+                state: self.clone(),
+                parsed: None,
+            });
+        }
+        let parsed = parse_pi_file_resumable(path, previous, check);
+        let mut state = Self::default();
+        if resumable {
+            let offset = parsed.resume.as_ref().map(PiResumePoint::offset);
+            state.window = Some(WindowSchedule::after_read(
+                window,
+                stat.clone(),
+                at,
+                parsed.resumed && offset == previous.map(PiResumePoint::offset),
+                offset == Some(stat.len),
+            ));
+            state.resume = parsed.resume.clone();
+            state.prefix_verified_ms =
+                if mode.is_full() && (check == PiPrefixCheck::Full || !parsed.resumed) {
+                    Some(at)
+                } else {
+                    self.prefix_verified_ms
+                };
+        }
+        Ok(PiFileRead {
+            state,
+            parsed: Some(parsed),
+        })
+    }
+}
 
 #[derive(Debug, Default)]
 struct PiCache {
@@ -335,57 +420,33 @@ impl PiSource {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            // Stat every file, including deferred ones. Metadata can wake a
-            // quiet file but cannot extend either content-check deadline.
-            let stat = FileStat::read_in_lane(&path, mode)
-                .map_err(|error| format!("open Pi session file {}: {error}", path.display()))?;
-            if !mode.is_full() && !stat.fast_changed(cached_windows.get(&path), recorded_at_ms) {
+            let previous = PiFileState {
+                resume: cached_resume.get(&path).cloned(),
+                prefix_verified_ms: cached_verified.get(&path).copied(),
+                window: cached_windows.get(&path).cloned(),
+            };
+            let read = previous.read(&path, recorded_at_ms, mode, resumable)?;
+            let Some(parse) = read.parsed else {
+                if let Some(point) = read.state.resume {
+                    resume_points.insert(path.clone(), point);
+                }
+                if let Some(verified) = read.state.prefix_verified_ms {
+                    verified_ms.insert(path.clone(), verified);
+                }
+                if let Some(&scan) = cached_header_scans.get(&path) {
+                    header_scans.insert(path.clone(), scan);
+                }
+                if let Some(window) = read.state.window {
+                    windows.insert(path, window);
+                }
                 continue;
-            }
+            };
             resume_points.remove(&path);
             header_scans.remove(&path);
-            let previous = resumable.then(|| cached_resume.get(&path)).flatten();
-            let check = match previous {
-                Some(_)
-                    if mode.is_full()
-                        && full_due(
-                            &path,
-                            cached_verified.get(&path).copied(),
-                            recorded_at_ms,
-                            PI_FULL_PREFIX_VERIFY_INTERVAL_MS,
-                        ) =>
-                {
-                    PiPrefixCheck::Full
-                }
-                _ => PiPrefixCheck::Window,
-            };
-            let window = resumable.then(|| cached_windows.get(&path)).flatten();
-            if let (Some(point), Some(window)) = (previous, window) {
-                if window.defer(&stat, recorded_at_ms, check == PiPrefixCheck::Full) {
-                    resume_points.insert(path.clone(), point.clone());
-                    if let Some(&verified) = cached_verified.get(&path) {
-                        verified_ms.insert(path.clone(), verified);
-                    }
-                    if let Some(&scan) = cached_header_scans.get(&path) {
-                        header_scans.insert(path.clone(), scan);
-                    }
-                    windows.insert(path, window.clone());
-                    continue;
-                }
-            }
-            let parse = parse_pi_file_resumable(&path, previous, check);
             if resumable {
-                let offset = parse.resume.as_ref().map(PiResumePoint::offset);
-                windows.insert(
-                    path.clone(),
-                    WindowSchedule::after_read(
-                        window,
-                        stat.clone(),
-                        recorded_at_ms,
-                        parse.resumed && offset == previous.map(PiResumePoint::offset),
-                        offset == Some(stat.len),
-                    ),
-                );
+                if let Some(window) = read.state.window {
+                    windows.insert(path.clone(), window);
+                }
             }
             set_aside.extend(parse.set_aside.into_iter().map(|(offset, reason)| {
                 crate::refresher::SetAsideRecord {
@@ -409,16 +470,10 @@ impl PiSource {
                 .then(|| cached_header_scans.get(&path).copied())
                 .flatten();
             if resumable {
-                if let Some(point) = parse.resume {
+                if let Some(point) = read.state.resume {
                     resume_points.insert(path.clone(), point);
                 }
-                // A full read hashed every byte of the file this drain, and a
-                // due Full check re-verified the whole consumed prefix; both
-                // restart the cadence. A window-checked resume carries the
-                // previous verification time forward.
-                if mode.is_full() && (check == PiPrefixCheck::Full || !parse.resumed) {
-                    verified_ms.insert(path.clone(), recorded_at_ms);
-                } else if let Some(&verified) = cached_verified.get(&path) {
+                if let Some(verified) = read.state.prefix_verified_ms {
                     verified_ms.insert(path.clone(), verified);
                 }
             }

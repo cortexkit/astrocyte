@@ -70,6 +70,9 @@ With a null declaration session, the header id is used directly. With a non-null
 declaration session, every file's header must match; a disagreement refuses the
 entire folder by name, records none of its calls and issues no acknowledgement.
 Unreadable or rejected records also prevent the folder from being acknowledged.
+As in Pi's normal reader, readable calls can still commit while refused lines
+withhold acknowledgement; a header disagreement instead refuses all calls in
+the folder.
 
 Producer stays `pi`, with the existing `pi_step_ref` identity and no extra
 lineage. A copied call is not a second billable event, including a call already
@@ -109,13 +112,20 @@ A done empty folder or a file containing no calls can be acknowledged once the
 done marker is seen. Active declarations never receive a new acknowledgement.
 
 The acknowledgement is written only after the recording transaction commits.
-A failed transaction neither adopts a proposed payer queue nor acknowledges
-the folder; the next full read retries its calls. The writer and format are
+A failed transaction neither adopts proposed file offsets or a payer queue nor
+acknowledges the folder; the next read retries its calls. The writer and format are
 shared with Claude Code's acknowledgement, including atomic replacement and
 private Unix permissions. Existing timestamps survive ticks and restarts and
 cannot precede `done_at_ms`. Entries no longer eligible or declared are pruned.
 
-Full refresher ticks discover and read declarations. Fast cycles recheck only
+Full refresher ticks discover declarations and reuse Pi's per-file resume state,
+bounded tail checks and staggered daily full-prefix verification. An unchanged
+file parses no old lines; an appended file parses only its new lines. The native
+header id stays with the cached resume point, so even deferred or empty reads
+still check declarations against it. Refused records remain blocked across
+resumes until a verified rewrite removes the problem. A changed owner invalidates
+the affected file's offset so its unrecorded calls cannot be skipped.
+Fast cycles recheck only
 queued payer waits, opening neither roots files nor transcripts; an idle fast
 cycle does nothing. A wait released on the fast lane is acknowledged on the
 next eligible full tick.
@@ -133,6 +143,10 @@ Tests in `pi_thalamus_source_tests.rs` cover absent roots, containment and
 canonical aliases, duplicate owners, native-header payer joins, mismatched
 headers, ownership, transaction failure and retry, empty done folders, copied
 history, payer timeout, idle fast cycles, registration and config exclusion.
+Counter tests read 1,000 calls, then unchanged and one-line-appended files,
+asserting bounded hashed bytes and zero or append-only parsed bytes for active
+and done declarations. They also exercise the daily full check, cached-header
+refusal, blocked resumed records and owner changes during payer waits.
 The synthetic session and roots fixture are pinned under
 `crates/astrocyte-module/tests/vectors/pi-thalamus/`. No personal data is used;
 a real recorded sample can be added separately when THALAMUS supplies one.
