@@ -178,6 +178,71 @@ fn media_transcribe_prices_90_seconds_to_6750000_nanodollars_end_to_end() {
     );
 }
 
+/// A text-to-speech job whose vendor bills input characters but reports no
+/// billed count: the provider counts the text it sent and reports that count
+/// as `request_derived` (media contract 0.1.6). It prices like any billed
+/// quantity, while the vendor's own header, sent as an observed reading,
+/// stays stored and unpriced.
+#[test]
+fn media_request_derived_characters_price_and_observed_credits_do_not() {
+    let mut conn = conn();
+    let wire = json!({"record_id":"speech","principal":"person-a","job_id":"job-1","provider":"provider","model":"model","charge_basis":"vendor","auth_method":"api_key","started_at_ms":700,"finished_at_ms":800,"status":"done","selectors":{},"measurements":[
+        {"role":"input","unit":"character","quantity":"39","measure":"billed","source":"request_derived"},
+        {"role":"input","unit":"credit","quantity":"20","measure":"observed","source":"vendor_reply"}
+    ]});
+    let record = serde_json::from_value(wire).unwrap();
+    let (request, facts) = crate::media::map_record(&record).unwrap().unwrap();
+    let tx = conn.transaction().unwrap();
+    let id = crate::ingest::record_media_event_in_tx(&tx, &request, &facts, 900)
+        .unwrap()
+        .event_id;
+    tx.commit().unwrap();
+    // $0.04 per 1,000 characters.
+    let mut per_character = rate(40_000_000);
+    per_character["per"] = json!(1_000);
+    per_character["increment"] = json!({"kind":"none"});
+    per_character["minimum_quantity"] = json!({"kind":"none"});
+    let catalog = client(FakeCatalog::new(BTreeMap::from([(
+        "rate.input.per_character".into(),
+        per_character,
+    )])));
+    reprice_event(&mut conn, &id, &catalog, 1_000, PricingOrigin::PricingPass).unwrap();
+    let charges: Vec<(String, Option<i64>)> = conn
+        .prepare("SELECT unit,charge_nanos FROM priced_charge ORDER BY unit")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(charges, vec![("character".into(), Some(1_560_000))]);
+    let sources: Vec<(String, String, String)> = conn
+        .prepare("SELECT unit,kind,source FROM measurement ORDER BY unit")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        sources,
+        vec![
+            ("character".into(), "billed".into(), "request_derived".into()),
+            ("credit".into(), "observed".into(), "vendor_reply".into()),
+        ]
+    );
+}
+
+/// The contract bills a request-derived count only on a finished job, so a
+/// failed job that claims one is refused as a record, never priced.
+#[test]
+fn media_request_derived_billing_on_a_failed_job_is_refused() {
+    let wire = json!({"record_id":"speech","principal":"person-a","job_id":"job-1","provider":"provider","model":"model","charge_basis":"vendor","auth_method":"api_key","started_at_ms":700,"finished_at_ms":800,"status":"failed","failure":{"code":"engine_crashed","class":"transient","message":"stopped"},"selectors":{},"measurements":[
+        {"role":"input","unit":"character","quantity":"39","measure":"billed","source":"request_derived"}
+    ]});
+    let record = serde_json::from_value(wire).unwrap();
+    let error = crate::media::map_record(&record).unwrap_err();
+    assert!(error.contains("status"), "{error}");
+}
+
 #[test]
 fn media_observed_quantities_stay_stored_and_never_priced() {
     let mut conn = conn();

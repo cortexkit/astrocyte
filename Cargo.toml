@@ -53,7 +53,7 @@ cortexkit-claustrum-client = { version = "=0.9.0", default-features = false }
 # The `log-read-watermark/v1` wire types (`watermark` module) and the
 # `step.finished.v1` live step event (`step_events`, added in 0.7.5).
 cortexkit-role-llm-runner = "=0.8.37"
-cortexkit-role-media = "=0.1.2"
+cortexkit-role-media = "=0.1.6"
 cortexkit-usage-steps = "=0.2.6"
 
 serde = { version = "1", features = ["derive"] }

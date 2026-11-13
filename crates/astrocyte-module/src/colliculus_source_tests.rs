@@ -461,9 +461,9 @@ fn media_usage_vectors_drain_with_invalid_and_unrepresentable_evidence() {
         .collect();
     let peer = Peer::start(fixed_page(entries));
     tick(&state, &peer.source());
-    assert_eq!(cursor(&state).as_deref(), Some("12"));
-    assert_eq!(count(&state, "usage_event"), 5);
-    assert_eq!(count(&state, "measurement"), 4);
+    assert_eq!(cursor(&state).as_deref(), Some("13"));
+    assert_eq!(count(&state, "usage_event"), 6);
+    assert_eq!(count(&state, "measurement"), 5);
     assert_eq!(
         coverage(&state).skipped_local_by_source.get(SOURCE_KEY),
         Some(&1)
@@ -488,7 +488,7 @@ fn media_usage_vectors_drain_with_invalid_and_unrepresentable_evidence() {
     // Every refused vector is caught by the contract's own record check, so
     // none reaches astrocyte's representability guard.
     assert_eq!(evidence.len(), 6);
-    for (entry, seq) in evidence.iter().zip(7..=12) {
+    for (entry, seq) in evidence.iter().zip(8..=13) {
         assert_eq!(entry.0, format!("usage.read/seq/{seq}"));
         assert!(entry.1.contains("invalid_usage_record"), "{entry:?}");
         assert!(entry.1.contains("quantity"), "{entry:?}");
@@ -506,7 +506,7 @@ fn media_usage_vectors_drain_with_invalid_and_unrepresentable_evidence() {
             ("r-whole-edge".into(), i64::MAX, 0),
         ]
     );
-    assert_eq!(peer.calls("usage.ack")[0]["params"]["through_seq"], 12);
+    assert_eq!(peer.calls("usage.ack")[0]["params"]["through_seq"], 13);
     assert_eq!(state.producer_degraded_reason(SOURCE_KEY), None);
 }
 

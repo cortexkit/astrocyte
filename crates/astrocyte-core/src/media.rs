@@ -161,6 +161,13 @@ mod tests {
                     assert_eq!(event.measurements[0].quantity_exponent, Some(expected.1));
                 }
                 "r-local" => assert!(mapped.unwrap().is_none()),
+                "r-request-derived" => {
+                    let (event, _) = mapped.unwrap().unwrap();
+                    assert_eq!(event.measurements.len(), 1);
+                    assert_eq!(event.measurements[0].kind, "billed");
+                    assert_eq!(event.measurements[0].source, "request_derived");
+                    assert_eq!(event.measurements[0].quantity_units, Some(12));
+                }
                 "r-failed" | "r-cancelled" => {
                     let (event, facts) = mapped.unwrap().unwrap();
                     assert_eq!(event.producer, "colliculus");
