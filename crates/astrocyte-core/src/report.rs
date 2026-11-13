@@ -893,15 +893,10 @@ fn load_scoped_ledger(
     let mut oldest_resolved_at_ms: Option<i64> = None;
     {
         let mut lookup = EventLookup::new(&index);
-        let charge_filter = if child_filter.is_empty() {
-            " WHERE kind <> 'observed'".to_owned()
-        } else {
-            format!("{child_filter} AND kind <> 'observed'")
-        };
         let mut statement = conn.prepare(&format!(
             "SELECT event_key,role,unit,outcome,charge_nanos,unpriced_reason,resolved_at_ms,
                     charge_key
-             FROM priced_charge JOIN measurement USING(event_key,role,unit){charge_filter}"
+             FROM priced_charge{child_filter}"
         ))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
