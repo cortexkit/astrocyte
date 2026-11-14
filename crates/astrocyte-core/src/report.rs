@@ -27,9 +27,7 @@ use serde_json::Value;
 
 use crate::capacity::CapacityWindow;
 use crate::fact::{ChargeBasis, Measurement, UsageEvent};
-use crate::subscription::{
-    plan_lookup_key, recurring_cost_nanos, PlanLedger, SubscriptionPeriod,
-};
+use crate::subscription::{plan_lookup_key, recurring_cost_nanos, PlanLedger, SubscriptionPeriod};
 
 const INGEST_FRESHNESS_REASON: &str = "producer_relationship_state_unavailable";
 

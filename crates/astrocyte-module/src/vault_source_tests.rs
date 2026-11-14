@@ -960,7 +960,14 @@ fn head(state: &SharedState, event_id: &str) -> (String, Option<String>) {
         [event_id],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|e|e.to_string())).unwrap()
 }
 
-type ChargeRow = (i64, String, String, Option<String>, Option<i64>, Option<i64>);
+type ChargeRow = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
 
 /// Every charge row, in insertion order: key, event, outcome, reason, money, superseded key.
 fn charge_rows(state: &SharedState) -> Vec<ChargeRow> {
@@ -1010,7 +1017,11 @@ fn vault_key_only_plan_covers_past_calls_by_paying_credential() {
     refresher::run_pricing_pass(&state, 500, &AtomicBool::new(false)).unwrap();
 
     let covered = ("covered".to_string(), None);
-    assert_eq!(head(&state, &direct), covered, "auth_selection names the plan");
+    assert_eq!(
+        head(&state, &direct),
+        covered,
+        "auth_selection names the plan"
+    );
     assert_eq!(
         head(&state, &resolved),
         covered,
@@ -1021,7 +1032,11 @@ fn vault_key_only_plan_covers_past_calls_by_paying_credential() {
         uncovered,
         "resolved_credential wins over auth_selection"
     );
-    assert_eq!(head(&state, &anonymous), uncovered, "no credential, no plan");
+    assert_eq!(
+        head(&state, &anonymous),
+        uncovered,
+        "no credential, no plan"
+    );
     // The plan starts at the credential's first call and stays out of the
     // account ledger.
     assert_eq!(
@@ -1178,9 +1193,6 @@ fn vault_config_seed_counts_only_when_the_vault_states_the_same_tier() {
     assert_eq!(head(&state, &kimi), ("covered".into(), None));
     assert_eq!(
         head(&state, &opencode),
-        (
-            "unpriced".into(),
-            Some("no_subscription_in_force".into())
-        )
+        ("unpriced".into(), Some("no_subscription_in_force".into()))
     );
 }

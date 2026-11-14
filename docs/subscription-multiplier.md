@@ -211,6 +211,21 @@ records, ChatGPT credential/account mismatches and vault-read status. Existing
 coverage backfill covers waiting calls; the multiplier itself never changes
 recorded ledger money.
 
+A vault credential with no account id, such as an API key, gets the same kind
+of ledger plan keyed by `(provider, credential id)` in `credential_subscription`,
+with the same start rule, close-on-change, hand-plan protection and pricing.
+It covers subscription calls that record no account and whose paying
+credential, `resolved_credential` when recorded and otherwise
+`auth_selection`, equals the credential id exactly; past calls are re-covered
+by the coverage backfill. Calls with neither fact stay uncovered: a credential
+is never guessed from the provider. Config seeds stay skipped, with one
+exception. When the vault states a seeded credential's tier with no start
+date, the listing appends no history row because the plan key and start are
+unchanged, so the seed remains the newest row. If the vault's latest listing
+states the same plan key for that credential, reconciliation treats the seed as
+vault-backed and opens the credential's first ledger plan at its first recorded
+call. A seed the vault does not confirm creates nothing.
+
 For a producer whose event is one call, the multiplier sums that call's input,
 cache-read and cache-write tokens to test context thresholds. Each priced role
 selects its own highest `above_context` threshold strictly below that prompt

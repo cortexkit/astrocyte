@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 46. A schema change appends a migration; an applied
+currently version 47. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -32,6 +32,7 @@ copies that timeout without running the table-creating probes.
 | `pricing_pending` | Each row identifies an event with a measurement that has no current charge head. | queue |
 | `pricing_selection_state` | The row records the plan generation and the generation that coverage backfill has drained. | one row |
 | `account_subscription` | Each row declares an effective-dated subscription plan for a provider account. | insert; close once |
+| `credential_subscription` | Each row declares an effective-dated subscription plan for a vault credential that has no account id, recorded only by vault-plan reconciliation. | insert; close once |
 | `vault_plan_history` | Each row preserves a vault record's changed plan key, raw provider and tier, optional account, source, effective time and observation time. | insert only, including unknown-plan changes |
 | `vault_plan_seed` | The singleton marks completion of the committed config's one-time plan-history import. | insert once |
 | `statement` | Each row records a vendor statement identity. | insert only |
@@ -84,7 +85,7 @@ in the table above means both of these exist:
 - `match_attempt_no_update`, `match_attempt_no_delete`
 - `statement_import_no_update`, `statement_import_no_delete`
 - `multiplier_observation_no_update`, `multiplier_observation_no_delete`
-- `account_subscription_no_delete`
+- `account_subscription_no_delete`, `credential_subscription_no_delete`
 - `step_detail_no_update`, `step_detail_no_delete`
 
 Each of these tables also has a `BEFORE INSERT` trigger named
@@ -114,7 +115,8 @@ correction), and `currency` moves from null to one value once. Every
 producer field, including `auth_selection`, `resolved_credential`, `flow_ref` and BROCA's
 charge-basis provenance, is write-once. `statement_line_update_guard` keeps line content
 fixed while the match projection moves. `account_subscription_update_guard`
-allows one change: closing an open plan.
+and `credential_subscription_update_guard` allow one change: closing an open
+plan.
 
 A correction to any of these tables is a new row, never an edit. Tests:
 `usage_event_delete_is_refused_without_effect`,
@@ -286,7 +288,7 @@ when they are the only measurements on an event, or in runs' unpriced counts.
 | Basis | Meaning | Pricing |
 |---|---|---|
 | `metered_api` | Billed per token at list price | Catalog rate; `priced` or `unpriced` |
-| `subscription_included` | Covered by a subscription plan | `covered` at zero when a plan is in force at the event's instant; else `unpriced` with `no_subscription_in_force` |
+| `subscription_included` | Covered by a subscription plan | `covered` at zero when a plan is in force at the event's instant; else `unpriced` with `no_subscription_in_force`. An event with an account matches account plans by that account. An event whose `account_ref` is NULL matches credential plans on its provider by its paying credential, `resolved_credential` when recorded and otherwise `auth_selection`, compared exactly; an event with neither is never covered. |
 | `unknown` | The producer cannot say who paid | `unpriced` with `charge_basis_unknown` |
 
 Every harness reader records `unknown`, because no transcript says how the
@@ -472,6 +474,18 @@ migration replaces the `account_subscription_no_overlap` trigger with an
 equivalent condition split into an open-version test and a closed-version test,
 so that each test can use an index; it refuses exactly the intervals the
 previous trigger refused.
+
+Migration 47 adds `credential_subscription`, the plan ledger for vault
+credentials that have no account id, such as API keys. Its columns are those of
+`account_subscription` with `credential_ref` in place of `account_ref`, and it
+repeats every guard that table has for the new key: one open interval per
+`(provider, credential_ref)`, the overlap trigger split into open and closed
+version tests with its `credential_subscription_closed_end` index, insert-once,
+an update guard that allows only closing an open plan, and no delete. The
+overlap trigger is created after the insert-once trigger, so an overlapping
+plan is refused as an overlap.
+The migration leaves `account_subscription` and every stored row unchanged.
+Test: `schema_v47_adds_an_empty_guarded_credential_ledger_and_changes_no_rows`.
 
 
 Migration 24 adds derived summary tables beside the ledger; it does not delete

@@ -771,7 +771,12 @@ fn read_plan_in_tx(
 
     let identity = pricing.subscription_coverage_identity();
     let lookup = plan_lookup_key(identity.account_ref, identity.paying_credential);
-    let coverage = match (identity.provider, lookup, identity.instant_ms, identity.charge_basis) {
+    let coverage = match (
+        identity.provider,
+        lookup,
+        identity.instant_ms,
+        identity.charge_basis,
+    ) {
         (
             Some(provider),
             Some((ledger, plan_ref)),
@@ -2172,7 +2177,8 @@ mod tests {
             let in_force = plan(&in_force_sql(ledger));
             assert!(!in_force.contains("SCAN"), "{in_force}");
             assert!(
-                in_force.contains("effective_from_ms<?") || in_force.contains("effective_from_ms=?"),
+                in_force.contains("effective_from_ms<?")
+                    || in_force.contains("effective_from_ms=?"),
                 "{in_force}"
             );
         }
@@ -2275,7 +2281,13 @@ mod tests {
             PlanLedger::Credential,
             &SetSubscriptionRequest {
                 account_ref: credential.into(),
-                ..request("key-plan", "USD", 2, SubscriptionPeriod::Month, effective_from)
+                ..request(
+                    "key-plan",
+                    "USD",
+                    2,
+                    SubscriptionPeriod::Month,
+                    effective_from,
+                )
             },
             Some("vault"),
         )
@@ -2289,17 +2301,38 @@ mod tests {
         set_credential_plan(&mut conn, "apikey:plan", 100);
         for (event_id, at, account, auth, resolved) in [
             ("routed", 150, None, Some("apikey:plan"), None),
-            ("resolved-wins", 150, None, Some("apikey:routing"), Some("apikey:plan")),
-            ("resolved-differs", 150, None, Some("apikey:plan"), Some("apikey:other")),
+            (
+                "resolved-wins",
+                150,
+                None,
+                Some("apikey:routing"),
+                Some("apikey:plan"),
+            ),
+            (
+                "resolved-differs",
+                150,
+                None,
+                Some("apikey:plan"),
+                Some("apikey:other"),
+            ),
             ("no-credential", 150, None, None, None),
             ("other-credential", 150, None, Some("apikey:other"), None),
             ("case-differs", 150, None, Some("APIKEY:plan"), None),
-            ("has-account", 150, Some("account-a"), Some("apikey:plan"), None),
+            (
+                "has-account",
+                150,
+                Some("account-a"),
+                Some("apikey:plan"),
+                None,
+            ),
             ("before-plan", 50, None, Some("apikey:plan"), None),
         ] {
             record_credential_event(&conn, event_id, at, account, auth, resolved);
         }
-        let no_plan = ("unpriced".to_string(), Some("no_subscription_in_force".to_string()));
+        let no_plan = (
+            "unpriced".to_string(),
+            Some("no_subscription_in_force".to_string()),
+        );
         let covered = ("covered".to_string(), None);
         for (event_id, expected) in [
             ("routed", &covered),
@@ -2311,7 +2344,11 @@ mod tests {
             ("has-account", &no_plan),
             ("before-plan", &no_plan),
         ] {
-            assert_eq!(&reprice_outcome(&mut conn, event_id), expected, "{event_id}");
+            assert_eq!(
+                &reprice_outcome(&mut conn, event_id),
+                expected,
+                "{event_id}"
+            );
         }
         // A covered call is charged nothing, in the plan's currency.
         for event_id in ["routed", "resolved-wins"] {

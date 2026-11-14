@@ -4991,7 +4991,11 @@ mod tests {
         let position =
             expected.partition_point(|(name, _)| name.as_str() < "credential_subscription");
         expected.insert(position, ("credential_subscription".into(), Vec::new()));
-        assert_eq!(all_rows(&conn), expected, "only the new empty table appears");
+        assert_eq!(
+            all_rows(&conn),
+            expected,
+            "only the new empty table appears"
+        );
 
         let insert = |from: i64, to: &str| {
             format!(

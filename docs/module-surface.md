@@ -310,6 +310,18 @@ Reads never write. A refusal on a read is one of the codes below.
   Event exclusion reasons in spend, work-class and ledger coverage include
   `observed_only` when a producer reported readings but no billed quantity.
 - `spend.subscription.report` keeps `rows`, `coverage` and `ingest_freshness`.
+  `rows` lists account plans only. The additive `credential_rows` lists covered
+  usage of credential-keyed plans as `{provider, credential_ref,
+  period_start_ms, period_end_ms, plan_cost_nanos, covered_events,
+  covered_measurements, quantities}`, and the additive
+  `coverage.events_covered_by_credential` counts the account-less events those
+  plans cover. Such events are not counted in `coverage.events_unpriced`;
+  `coverage.events_without_account` still counts every dated event with no
+  account. Hours holding a fully priced account-less subscription call on a
+  provider with a credential plan in force are read from the ledger rather
+  than the hourly summary. Tests:
+  `vault_key_only_plan_covers_past_calls_by_paying_credential` and
+  `credential_plan_seams_only_hours_with_covered_account_less_calls`.
   It adds optional diagnostic members; the request remains `{}`, so the params
   schema stays at version 2. `unpriced_plans` lists `{plan_key, provider,
   plan_tier, accounts}` for exact vault keys without a usable sourced price.
