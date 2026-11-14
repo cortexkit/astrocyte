@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 47. A schema change appends a migration; an applied
+currently version 48. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -486,6 +486,23 @@ overlap trigger is created after the insert-once trigger, so an overlapping
 plan is refused as an overlap.
 The migration leaves `account_subscription` and every stored row unchanged.
 Test: `schema_v47_adds_an_empty_guarded_credential_ledger_and_changes_no_rows`.
+
+Migration 48 advances summaries to format 4 and adds the hidden
+`summary_cell.paying_credential` dimension to the cell's unique key. It interns
+`COALESCE(resolved_credential, auth_selection)` only for subscription-included
+events whose `account_ref` is NULL; every other event uses the dictionary's
+NULL value (id 0). Spend-report groupings do not change. Clean subscription
+cells can match credential plans exactly without reducing their hours from
+the ledger, unless a matching plan or billing-period boundary cuts the hour.
+The migration discards only `summary_cell`, `summary_quantity` and
+`summary_money` rows and recreates those tables with their keys, foreign keys
+and checks. It retains hour metadata and the ledger dirty-hour triggers, and
+recreates `summary_hour_stale` with
+`built_revision IS NOT revision OR format_version IS NOT 4`. Old-format hours
+stay on the ledger until the prioritized background rebuild publishes format 4.
+Tests: `schema_v48_discards_only_old_cells_and_preserves_stale_hours_and_dirty_triggers`,
+`format_three_payer_cells_are_never_served_before_rebuild`,
+`credential_covered_clean_hours_reduce_zero_ledger_hours`.
 
 
 Migration 24 adds derived summary tables beside the ledger; it does not delete

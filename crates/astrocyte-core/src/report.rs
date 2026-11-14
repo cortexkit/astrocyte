@@ -498,6 +498,9 @@ struct LedgerEvent {
     /// Interned in `Ledger::values`, indexed by `Grouping as usize`. Only the
     /// dimensions the caller asked `load_ledger` for are filled in.
     dimensions: [Option<u32>; GROUPING_DIMENSIONS],
+    /// Hidden summary dimension, interned in `Ledger::values` only for
+    /// NULL-account subscription calls; never a spend-report grouping.
+    paying_credential: Option<u32>,
     /// Only billed measurements participate in the pricing verdict.
     measurements: u32,
     observed_measurements: u32,
@@ -774,7 +777,9 @@ fn load_scoped_ledger(
     let mut statement = conn.prepare(&format!(
         "SELECT event_key,occurred_at_ms,currency,charge_basis,attempt_ordinal,
                  pricing_generation,provider,model,account_ref,auth_selection,
-                 work_class,project_root,producer
+                 work_class,project_root,producer,
+                 CASE WHEN account_ref IS NULL AND charge_basis='subscription_included'
+                      THEN COALESCE(resolved_credential,auth_selection) END
          FROM usage_event{event_filter}"
     ))?;
     let mut rows = statement.query([])?;
@@ -812,6 +817,9 @@ fn load_scoped_ledger(
                 .transpose()?,
             charge_basis,
             dimensions: event_dimensions,
+            paying_credential: text_column(row, 13)?
+                .map(|value| values.intern(value))
+                .transpose()?,
             measurements: 0,
             observed_measurements: 0,
             examined: 0,
@@ -1750,6 +1758,13 @@ impl SubscriptionEvent {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SUBSCRIPTION_LEDGER_HOURS: std::cell::RefCell<BTreeSet<Option<i64>>> = const {
+        std::cell::RefCell::new(BTreeSet::new())
+    };
+}
+
 /// Reads only the subscription-included events, with their measurements and
 /// current charge heads, in one statement. The report never looks at any
 /// other event, so the charge-basis filter runs in SQL.
@@ -1781,8 +1796,13 @@ fn load_subscription_events(
         let rowid: i64 = row.get(0)?;
         if last_rowid != Some(rowid) {
             last_rowid = Some(rowid);
+            let occurred_at_ms: Option<i64> = row.get(1)?;
+            #[cfg(test)]
+            SUBSCRIPTION_LEDGER_HOURS.with_borrow_mut(|hours| {
+                hours.insert(occurred_at_ms.map(|ms| ms.div_euclid(3_600_000)));
+            });
             events.push(SubscriptionEvent {
-                occurred_at_ms: row.get(1)?,
+                occurred_at_ms,
                 provider: row.get(2)?,
                 account_ref: row.get(3)?,
                 paying_credential: row.get(10)?,

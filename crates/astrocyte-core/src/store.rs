@@ -4428,6 +4428,57 @@ BEGIN
 END;
 "#,
     },
+    Migration {
+        version: 48,
+        statements: r#"
+-- Format 3 lacks the paying credential. Discard only its derived cells;
+-- retained hour metadata keeps reports on the ledger until the prioritized
+-- stale-format rebuild publishes format 4. Ledger dirty-hour triggers remain.
+DROP TABLE summary_quantity;
+DROP TABLE summary_money;
+DROP TABLE summary_cell;
+CREATE TABLE summary_cell (
+    cell_id INTEGER PRIMARY KEY,
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    producer INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(producer>0),
+    provider INTEGER NOT NULL REFERENCES summary_value(value_id),
+    model INTEGER NOT NULL REFERENCES summary_value(value_id),
+    account INTEGER NOT NULL REFERENCES summary_value(value_id),
+    auth_selection INTEGER NOT NULL REFERENCES summary_value(value_id),
+    charge_basis INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(charge_basis>0),
+    work_class INTEGER NOT NULL REFERENCES summary_value(value_id),
+    project INTEGER NOT NULL REFERENCES summary_value(value_id),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id),
+    payload TEXT NOT NULL CHECK(json_valid(payload)),
+    paying_credential INTEGER NOT NULL REFERENCES summary_value(value_id),
+    UNIQUE(kind,hour_number,producer,provider,model,account,auth_selection,charge_basis,work_class,project,currency,paying_credential),
+    FOREIGN KEY(kind,hour_number) REFERENCES summary_hour(kind,hour_number)
+);
+CREATE TABLE summary_quantity (
+    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
+    unit INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(unit>0),
+    role INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(role>0),
+    exponent INTEGER NOT NULL CHECK(exponent BETWEEN -9 AND 1),
+    units TEXT NOT NULL,
+    observations INTEGER NOT NULL CHECK(observations>=0),
+    covered_units TEXT NOT NULL,
+    covered_observations INTEGER NOT NULL CHECK(covered_observations>=0),
+    PRIMARY KEY(cell_id,unit,role,exponent)
+) WITHOUT ROWID;
+CREATE TABLE summary_money (
+    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
+    kind INTEGER NOT NULL CHECK(kind IN (0,1)),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(currency>0),
+    nanos TEXT NOT NULL,
+    contributions INTEGER NOT NULL CHECK(contributions>0),
+    PRIMARY KEY(cell_id,kind,currency)
+) WITHOUT ROWID;
+DROP INDEX summary_hour_stale;
+CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
+    WHERE built_revision IS NOT revision OR format_version IS NOT 4;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -4955,6 +5006,141 @@ mod tests {
                 charge_basis='subscription_included',currency='USD' WHERE event_id='paid'",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn schema_v48_discards_only_old_cells_and_preserves_stale_hours_and_dirty_triggers() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version < 48) {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        // Clean key-only Ollama and routed Kimi calls, with both plan ledgers
+        // and populated format-3 cache children, mirror an upgraded live store.
+        conn.execute_batch(
+            "INSERT INTO account_subscription VALUES
+                 ('acct','openai','openai/pro',20000,'USD',2,'month',10,NULL,'vault');
+             INSERT INTO credential_subscription VALUES
+                 ('apikey:ollama-cloud','ollama-cloud','ollama-cloud/free',0,'USD',0,'month',0,NULL,'vault'),
+                 ('apikey:kimi-for-coding','kimi-code-plan-global','kimi/allegro',2000,'USD',2,'month',0,NULL,'vault');
+             INSERT INTO usage_event (event_id,producer,producer_ref,provider,auth_selection,
+                 resolved_credential,occurred_at_ms,charge_basis,recorded_at_ms)
+             VALUES ('ollama','broca','ollama','ollama-cloud','apikey:ollama-cloud',NULL,20,'subscription_included',21),
+                    ('kimi','broca','kimi','kimi-code-plan-global','apikey:kimi-code-plan-global',
+                     'apikey:kimi-for-coding',3600030,'subscription_included',3600031);
+             INSERT INTO summary_value VALUES (1,'broca'),(2,'subscription_included'),(3,'USD'),(4,'token'),(5,'input');
+             UPDATE summary_hour SET built_revision=revision,format_version=3,events_total=1;
+             DELETE FROM summary_dirty_hour;
+             INSERT INTO summary_cell VALUES (1,0,0,1,0,0,0,0,2,0,0,3,'{}'),(2,0,1,1,0,0,0,0,2,0,0,3,'{}');
+             INSERT INTO summary_quantity VALUES (1,4,5,0,'12',1,'12',1),(2,4,5,0,'34',1,'34',1);
+             INSERT INTO summary_money VALUES (1,0,3,'100',1),(2,0,3,'200',1);",
+        ).unwrap();
+        let before = all_rows(&conn);
+        let schema_objects = || {
+            conn.prepare(
+                "SELECT type,name,sql FROM sqlite_schema WHERE type IN ('index','trigger')
+                AND sql IS NOT NULL AND name<>'summary_hour_stale' ORDER BY type,name",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let objects_before = schema_objects();
+        conn.execute_batch(MIGRATIONS[47].statements).unwrap();
+        assert_eq!(MIGRATIONS[47].version, 48);
+        let expected = before
+            .into_iter()
+            .map(|(name, rows)| {
+                let rows = if ["summary_cell", "summary_quantity", "summary_money"]
+                    .contains(&name.as_str())
+                {
+                    Vec::new()
+                } else {
+                    rows
+                };
+                (name, rows)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all_rows(&conn),
+            expected,
+            "ledger rows and stale hour metadata are untouched"
+        );
+        assert_eq!(
+            schema_objects(),
+            objects_before,
+            "all existing ledger dirty triggers and other indexes survive"
+        );
+        let stale_index: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='summary_hour_stale'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stale_index.contains("built_revision IS NOT revision OR format_version IS NOT 4"));
+        assert_eq!(conn.query_row(
+            "SELECT count(*) FROM summary_hour INDEXED BY summary_hour_stale WHERE built_revision IS NOT revision OR format_version IS NOT 4",
+            [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+
+        // Distinct payers may split a visible cell; an identical payer cannot.
+        let insert = "INSERT INTO summary_cell VALUES (1,0,0,1,0,0,0,0,2,0,0,3,'{}',1),
+                                                        (2,0,0,1,0,0,0,0,2,0,0,3,'{}',2)";
+        conn.execute_batch(insert).unwrap();
+        assert!(conn.execute_batch("INSERT INTO summary_cell SELECT 3,kind,hour_number,producer,provider,model,account,auth_selection,charge_basis,work_class,project,currency,payload,paying_credential FROM summary_cell WHERE cell_id=1").is_err());
+        conn.execute_batch(
+            "INSERT INTO summary_quantity VALUES (1,4,5,0,'12',1,'12',1);
+                            INSERT INTO summary_money VALUES (1,0,3,'100',1);
+                            DELETE FROM summary_cell WHERE cell_id=1;",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM summary_quantity", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM summary_money", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        conn.execute_batch("INSERT INTO usage_event (event_id,producer,producer_ref,occurred_at_ms,charge_basis,recorded_at_ms)
+                            VALUES ('later','broca','later',40,'subscription_included',41);").unwrap();
+        assert_eq!(
+            conn.query_row("SELECT hour_number FROM summary_dirty_hour", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        conn.execute_batch("DELETE FROM summary_dirty_hour;
+                            UPDATE usage_event SET pricing_generation=pricing_generation+1 WHERE event_id='kimi';").unwrap();
+        assert_eq!(
+            conn.query_row("SELECT hour_number FROM summary_dirty_hour", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            1
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::report::ReportError;
 
 // Version 3 rebuilds cached hourly spend reports and run costs so observed
 // readings are no longer counted as measurements awaiting pricing.
-pub(crate) const FORMAT: i64 = 3;
+pub(crate) const FORMAT: i64 = 4;
 const HOUR_MS: i64 = 3_600_000;
 const MAX_RANGE: i64 = 31 * 24 * HOUR_MS;
 const HARNESSES: &[&str] = &[

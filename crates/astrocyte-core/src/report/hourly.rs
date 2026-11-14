@@ -30,7 +30,9 @@ const DIMENSIONS: [Grouping; 8] = [
     Grouping::Producer,
 ];
 
-type Key = ([Option<String>; 8], Option<String>);
+// Report dimensions, currency, and the hidden subscription payer. Keeping the
+// payer separate means it cannot become a served spend-report grouping.
+type Key = ([Option<String>; 8], Option<String>, Option<String>);
 type QuantityKey = (String, String, i32);
 type FrequencyKey = (String, Option<String>, String, i64);
 
@@ -141,6 +143,7 @@ fn key(ledger: &Ledger, event: &LedgerEvent) -> Key {
             .dimensions
             .map(|value| ledger.values.optional_name(value)),
         ledger.values.optional_name(event.currency),
+        ledger.values.optional_name(event.paying_credential),
     )
 }
 fn is_subscription(key: &Key) -> bool {
@@ -369,7 +372,7 @@ fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
     let mut values = Values::new(conn);
     let mut data = Data::default();
     let mut keys = HashMap::new();
-    let mut statement=conn.prepare("SELECT cell_id,provider,model,account,auth_selection,charge_basis,work_class,project,producer,currency,payload
+    let mut statement=conn.prepare("SELECT cell_id,provider,model,account,auth_selection,charge_basis,work_class,project,producer,currency,payload,paying_credential
         FROM summary_cell WHERE kind=?1 AND hour_number=?2")?;
     let mut rows = statement.query(params![hour.kind, hour.number])?;
     while let Some(row) = rows.next()? {
@@ -377,7 +380,11 @@ fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
         for (column, dim) in dims.iter_mut().enumerate() {
             *dim = value(&mut values, row.get(column + 1)?)?;
         }
-        let key = (dims, value(&mut values, row.get(9)?)?);
+        let key = (
+            dims,
+            value(&mut values, row.get(9)?)?,
+            value(&mut values, row.get(11)?)?,
+        );
         let cell = decode(&row.get::<_, String>(10)?)?;
         add_count(&mut data.events, cell.events)?;
         keys.insert(row.get::<_, i64>(0)?, key.clone());
@@ -466,15 +473,12 @@ fn replace(
     )?;
     let mut cells = BTreeMap::new();
     for (key, cell) in &data.cells {
-        let mut ids = [0_i64; 9];
-        for (id, text) in ids
-            .iter_mut()
-            .zip(key.0.iter().chain(std::iter::once(&key.1)))
-        {
+        let mut ids = [0_i64; 10];
+        for (id, text) in ids.iter_mut().zip(key.0.iter().chain([&key.1, &key.2])) {
             *id = value_id(tx, &mut values, text)?;
         }
-        tx.execute("INSERT INTO summary_cell(kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,currency,payload)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![hour.kind,hour.number,ids[0],ids[1],ids[2],ids[3],ids[4],ids[5],ids[6],ids[7],ids[8],encode(cell)?])?;
+        tx.execute("INSERT INTO summary_cell(kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,currency,payload,paying_credential)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![hour.kind,hour.number,ids[0],ids[1],ids[2],ids[3],ids[4],ids[5],ids[6],ids[7],ids[8],encode(cell)?,ids[9]])?;
         cells.insert(key.clone(), tx.last_insert_rowid());
     }
     for ((key, (unit, role, exponent)), quantity) in &data.quantities {
@@ -987,7 +991,7 @@ fn frame<'c>(
     let mut cells = Vec::new();
     let mut observed = BTreeMap::new();
     let mut split = BTreeSet::new();
-    let mut statement=conn.prepare("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.currency,c.payload
+    let mut statement=conn.prepare("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.currency,c.payload,c.paying_credential
         FROM summary_cell c")?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
@@ -1002,7 +1006,11 @@ fn frame<'c>(
         for (column, dim) in dims.iter_mut().enumerate() {
             *dim = value(&mut values, row.get(column + 3)?)?;
         }
-        let key = (dims, value(&mut values, row.get(11)?)?);
+        let key = (
+            dims,
+            value(&mut values, row.get(11)?)?,
+            value(&mut values, row.get(13)?)?,
+        );
         let payload: String = row.get(12)?;
         let cell = decode(&payload)?;
         add_count(observed.entry(hour).or_default(), cell.events)?;
@@ -1459,20 +1467,16 @@ pub(super) fn spend(
 fn plan_key(plan: &SubscriptionView, time: i64) -> Result<SubscriptionBucketKey, ReportError> {
     subscription_bucket(plan, &plan.plan_ref, &plan.provider, time)
 }
-/// The summary frame the subscription report reads. Besides the hours the
-/// summary marks dirty, an hour is reduced from the ledger (a seam) when a
-/// plan boundary falls inside it for one of its account cells, or when it
-/// holds a no-account subscription cell with fully priced events on a
-/// provider that has a credential-keyed plan in force at some point in the
-/// hour. Summary cells carry `auth_selection` but not `resolved_credential`,
-/// so they can't tell which credential paid for those events; every other
-/// hour stays on the summary.
+/// The subscription report reads clean cells unless a matching plan or billing
+/// period boundary falls inside their hour. Such seam hours need event times
+/// from the ledger; credential identity itself is retained in summary cells.
 fn subscription_frame<'c>(
     conn: &'c Connection,
     plans: &[SubscriptionView],
     index: &SubscriptionIndex<'_>,
     credential_plans: &[SubscriptionView],
 ) -> Result<Option<Frame<'c>>, ReportError> {
+    let credential_index = SubscriptionIndex::new(credential_plans);
     let mut seams = BTreeMap::new();
     frame(
         conn,
@@ -1483,27 +1487,29 @@ fn subscription_frame<'c>(
             let Some(provider) = &key.0[Grouping::Provider as usize] else {
                 return Ok(false);
             };
-            let Some(account) = &key.0[Grouping::Account as usize] else {
-                // Only a fully priced event can be counted as covered, and a
-                // credential plan can only cover it while in force.
-                if cell.subscription_complete == 0 {
-                    return Ok(false);
-                }
-                let (start, end) = interval(hour)?;
-                return Ok(credential_plans.iter().any(|plan| {
-                    plan.provider == *provider
-                        && plan.effective_from_ms <= end
-                        && plan.effective_to_ms.is_none_or(|to| to > start)
-                }));
+            let Some((ledger, plan_ref)) = plan_lookup_key(
+                key.0[Grouping::Account as usize].as_deref(),
+                key.2.as_deref(),
+            ) else {
+                return Ok(false);
             };
-            let cache = (hour, provider.clone(), account.clone());
+            let credential = ledger == PlanLedger::Credential;
+            if credential && cell.subscription_complete == 0 {
+                return Ok(false);
+            }
+            let (plans, index) = if credential {
+                (credential_plans, &credential_index)
+            } else {
+                (plans, index)
+            };
+            let cache = (hour, credential, provider.clone(), plan_ref.to_owned());
             if let Some(seam) = seams.get(&cache) {
                 return Ok(*seam);
             }
             let (start, end) = interval(hour)?;
             let boundary = plans
                 .iter()
-                .filter(|plan| plan.provider == *provider && plan.plan_ref == *account)
+                .filter(|plan| plan.provider == *provider && plan.plan_ref == plan_ref)
                 .any(|plan| {
                     (plan.effective_from_ms > start && plan.effective_from_ms <= end)
                         || plan
@@ -1511,11 +1517,11 @@ fn subscription_frame<'c>(
                             .is_some_and(|to| to > start && to <= end)
                 });
             let from = index
-                .find(provider, account, start)
+                .find(provider, plan_ref, start)
                 .map(|plan| plan_key(plan, start))
                 .transpose()?;
             let to = index
-                .find(provider, account, end)
+                .find(provider, plan_ref, end)
                 .map(|plan| plan_key(plan, end))
                 .transpose()?;
             let seam = boundary || from != to;
@@ -1534,33 +1540,54 @@ pub(super) fn subscription(
     let plans = load_subscriptions(conn, PlanLedger::Account)?;
     let credential_plans = load_subscriptions(conn, PlanLedger::Credential)?;
     let index = SubscriptionIndex::new(&plans);
+    let credential_index = SubscriptionIndex::new(&credential_plans);
     let Some(mut frame) = subscription_frame(conn, &plans, &index, &credential_plans)? else {
         return Ok(None);
     };
     let base = subscription_report_base(conn, request, Some(&frame.dirty))?;
     let mut coverage = base.coverage;
     let mut rows: BTreeMap<SubscriptionBucketKey, SubscriptionAccumulator> = BTreeMap::new();
-    for row in base.rows {
-        let accumulator = rows
-            .entry(SubscriptionBucketKey {
-                provider: row.provider,
-                plan_ref: row.account_ref,
-                start_ms: row.period_start_ms,
-                end_ms: row.period_end_ms,
-                plan_cost_nanos: row.plan_cost_nanos,
-            })
-            .or_default();
-        add_count(&mut accumulator.covered_events, row.covered_events)?;
-        add_count(
-            &mut accumulator.covered_measurements,
-            row.covered_measurements,
-        )?;
-        for quantity in row.quantities {
-            accumulator
-                .quantities
-                .entry((quantity.unit, quantity.role))
-                .or_default()
-                .add(quantity.quantity_units, quantity.quantity_exponent)?;
+    let mut credential_rows = BTreeMap::new();
+    let base_credential_rows = base
+        .credential_rows
+        .into_iter()
+        .map(|row| SubscriptionRow {
+            provider: row.provider,
+            account_ref: row.credential_ref,
+            period_start_ms: row.period_start_ms,
+            period_end_ms: row.period_end_ms,
+            plan_cost_nanos: row.plan_cost_nanos,
+            covered_events: row.covered_events,
+            covered_measurements: row.covered_measurements,
+            quantities: row.quantities,
+        })
+        .collect::<Vec<_>>();
+    for (bucket_rows, base_rows) in [
+        (&mut rows, base.rows),
+        (&mut credential_rows, base_credential_rows),
+    ] {
+        for row in base_rows {
+            let accumulator = bucket_rows
+                .entry(SubscriptionBucketKey {
+                    provider: row.provider,
+                    plan_ref: row.account_ref,
+                    start_ms: row.period_start_ms,
+                    end_ms: row.period_end_ms,
+                    plan_cost_nanos: row.plan_cost_nanos,
+                })
+                .or_default();
+            add_count(&mut accumulator.covered_events, row.covered_events)?;
+            add_count(
+                &mut accumulator.covered_measurements,
+                row.covered_measurements,
+            )?;
+            for quantity in row.quantities {
+                accumulator
+                    .quantities
+                    .entry((quantity.unit, quantity.role))
+                    .or_default()
+                    .add(quantity.quantity_units, quantity.quantity_exponent)?;
+            }
         }
     }
     // Ordered by cell id so quantities are added in the same order a scan of
@@ -1592,14 +1619,20 @@ pub(super) fn subscription(
         if cell.subscription_complete == 0 {
             continue;
         }
-        // A clean hour's no-account cell has no credential plan in force
-        // (that would have made the hour a seam), so it finds no plan here,
-        // as the ledger reader finds none for its events.
-        let plan = match (
-            &key.0[Grouping::Provider as usize],
-            &key.0[Grouping::Account as usize],
-        ) {
-            (Some(provider), Some(account)) => index.find(provider, account, interval(hour)?.0),
+        let lookup = plan_lookup_key(
+            key.0[Grouping::Account as usize].as_deref(),
+            key.2.as_deref(),
+        );
+        let credential = lookup.is_some_and(|(ledger, _)| ledger == PlanLedger::Credential);
+        let plan_index = if credential {
+            &credential_index
+        } else {
+            &index
+        };
+        let plan = match (&key.0[Grouping::Provider as usize], lookup) {
+            (Some(provider), Some((_, plan_ref))) => {
+                plan_index.find(provider, plan_ref, interval(hour)?.0)
+            }
             _ => None,
         };
         let Some(plan) = plan else {
@@ -1607,18 +1640,27 @@ pub(super) fn subscription(
             continue;
         };
         let bucket = plan_key(plan, interval(hour)?.0)?;
-        let accumulator = rows.entry(bucket.clone()).or_default();
+        let bucket_rows = if credential {
+            add_count(
+                &mut coverage.events_covered_by_credential,
+                cell.subscription_complete,
+            )?;
+            &mut credential_rows
+        } else {
+            &mut rows
+        };
+        let accumulator = bucket_rows.entry(bucket.clone()).or_default();
         add_count(&mut accumulator.covered_events, cell.subscription_complete)?;
         add_count(
             &mut accumulator.covered_measurements,
             cell.covered_measurements,
         )?;
-        attribution.insert(id, bucket);
+        attribution.insert(id, (credential, bucket));
     }
     // Only the attributed cells' quantities are read, each by its primary key,
     // rather than every covered quantity ever summarised.
     let mut statement=conn.prepare("SELECT unit,role,exponent,covered_units FROM summary_quantity WHERE cell_id=?1 AND covered_observations>0 AND exponent<=0")?;
-    for (cell_id, bucket) in &attribution {
+    for (cell_id, (credential, bucket)) in &attribution {
         let mut quantities = statement.query([cell_id])?;
         while let Some(quantity) = quantities.next()? {
             let unit = value(&mut frame.values, quantity.get(0)?)?
@@ -1627,7 +1669,13 @@ pub(super) fn subscription(
                 .ok_or(ReportError::Integrity("summary role absent"))?;
             let units = i64::try_from(parse_exact(quantity.get(3)?)?)
                 .map_err(|_| ReportError::Arithmetic)?;
-            rows.get_mut(bucket)
+            let bucket_rows = if *credential {
+                &mut credential_rows
+            } else {
+                &mut rows
+            };
+            bucket_rows
+                .get_mut(bucket)
                 .ok_or(ReportError::Integrity("subscription bucket absent"))?
                 .quantities
                 .entry((unit, role))
@@ -1637,9 +1685,10 @@ pub(super) fn subscription(
     }
     Ok(Some(SubscriptionReport {
         rows: subscription_rows(rows)?,
-        // Every credential-covered event is in a seam or dirty hour, so the
-        // ledger reduction of those hours holds all of them.
-        credential_rows: base.credential_rows,
+        credential_rows: subscription_rows(credential_rows)?
+            .into_iter()
+            .map(credential_row)
+            .collect(),
         coverage,
         ingest_freshness: base.ingest_freshness,
     }))
@@ -2359,8 +2408,7 @@ mod tests {
         assert_eq!(actual.rows[0].covered_measurements, 4);
     }
 
-    #[test]
-    fn credential_plan_seams_only_hours_with_covered_account_less_calls() {
+    fn credential_fixture() -> Connection {
         let mut conn = conn();
         let tx = conn.transaction().unwrap();
         subscription::set_plan_in_tx(
@@ -2407,6 +2455,23 @@ mod tests {
             reprice(&mut conn, id);
         }
         catch_up(&mut conn);
+        conn
+    }
+
+    #[test]
+    fn credential_covered_clean_hours_reduce_zero_ledger_hours() {
+        let conn = credential_fixture();
+
+        SUBSCRIPTION_LEDGER_HOURS.with_borrow_mut(BTreeSet::clear);
+        let served = subscription_report(&conn, &SubscriptionReportRequest {}).unwrap();
+        SUBSCRIPTION_LEDGER_HOURS.with_borrow(|hours| {
+            assert_eq!(
+                hours.len(),
+                0,
+                "clean hours must not be reduced from the ledger"
+            );
+        });
+        assert_eq!(served.coverage.events_covered_by_credential, 1);
 
         let plans = load_subscriptions(&conn, PlanLedger::Account).unwrap();
         let credential_plans = load_subscriptions(&conn, PlanLedger::Credential).unwrap();
@@ -2417,8 +2482,8 @@ mod tests {
         let hour = |number| Hour { kind: 0, number };
         assert_eq!(
             frame.clean,
-            BTreeSet::from([hour(0), hour(3)]),
-            "only the hour with a covered account-less call is read from the ledger"
+            BTreeSet::from([hour(0), hour(3), hour(5)]),
+            "credential identity alone must not make a clean hour a seam"
         );
 
         let actual = subscription(&conn, &SubscriptionReportRequest {})
@@ -2434,6 +2499,135 @@ mod tests {
         assert_eq!(actual.credential_rows.len(), 1);
         assert_eq!(actual.credential_rows[0].credential_ref, "apikey:plan");
         assert_eq!(actual.credential_rows[0].covered_events, 1);
+        compare(&conn);
+    }
+
+    #[test]
+    fn format_three_payer_cells_are_never_served_before_rebuild() {
+        let mut conn = credential_fixture();
+        assert_eq!(FORMAT, 4);
+        conn.execute(
+            "UPDATE summary_hour SET format_version=3 WHERE hour_number=5",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE summary_cell SET paying_credential=0 WHERE hour_number=5",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE summary_audit_state SET next_due_ms=?1", [i64::MAX])
+            .unwrap();
+        assert_eq!(dirty(&conn), 0);
+        SUBSCRIPTION_LEDGER_HOURS.with_borrow_mut(BTreeSet::clear);
+        let actual = subscription_report(&conn, &SubscriptionReportRequest {}).unwrap();
+        assert_eq!(actual.coverage.events_covered_by_credential, 1);
+        SUBSCRIPTION_LEDGER_HOURS
+            .with_borrow(|hours| assert_eq!(*hours, BTreeSet::from([Some(5)])));
+        equal(
+            &actual,
+            &subscription_report_base(&conn, &SubscriptionReportRequest {}, None).unwrap(),
+        );
+        let outcome = step(&mut conn, &mut SummaryMaintenance::default());
+        assert!(outcome.published);
+        assert!(!outcome.audited);
+        assert_eq!(outcome.hour, Some((0, 5)));
+        let rebuilt: (i64, String) = conn.query_row(
+            "SELECT h.format_version,v.value FROM summary_hour h JOIN summary_cell c USING(kind,hour_number)
+             JOIN summary_value v ON v.value_id=c.paying_credential WHERE h.hour_number=5", [],
+            |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(rebuilt, (4, "apikey:plan".into()));
+        SUBSCRIPTION_LEDGER_HOURS.with_borrow_mut(BTreeSet::clear);
+        equal(
+            &subscription_report(&conn, &SubscriptionReportRequest {}).unwrap(),
+            &actual,
+        );
+        SUBSCRIPTION_LEDGER_HOURS.with_borrow(|hours| assert!(hours.is_empty()));
+        compare(&conn);
+    }
+
+    #[test]
+    fn credential_plan_boundaries_still_reduce_only_the_matching_seam_hours() {
+        let mut conn = credential_fixture();
+        let tx = conn.transaction().unwrap();
+        subscription::close_plan_in_tx(
+            &tx,
+            PlanLedger::Credential,
+            &subscription::CloseSubscriptionRequest {
+                provider: "provider".into(),
+                account_ref: "apikey:plan".into(),
+                effective_to: 5 * HOUR_MS + HOUR_MS / 2,
+            },
+        )
+        .unwrap();
+        subscription::set_plan_in_tx(
+            &tx,
+            PlanLedger::Credential,
+            &subscription::SetSubscriptionRequest {
+                provider: "provider".into(),
+                account_ref: "apikey:plan".into(),
+                plan_name: "successor".into(),
+                recurring_cost_minor: 200,
+                currency: "USD".into(),
+                amount_exponent: 2,
+                period: subscription::SubscriptionPeriod::Month,
+                effective_from: 6 * HOUR_MS + HOUR_MS / 2,
+            },
+            Some("vault"),
+        )
+        .unwrap();
+        // A different credential's boundary must not turn hour 3 into a seam.
+        subscription::set_plan_in_tx(
+            &tx,
+            PlanLedger::Credential,
+            &subscription::SetSubscriptionRequest {
+                provider: "provider".into(),
+                account_ref: "unrelated".into(),
+                plan_name: "unrelated".into(),
+                recurring_cost_minor: 100,
+                currency: "USD".into(),
+                amount_exponent: 2,
+                period: subscription::SubscriptionPeriod::Month,
+                effective_from: 3 * HOUR_MS + HOUR_MS / 2,
+            },
+            Some("vault"),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        for hour in [5, 6] {
+            let mut request: ingest::EventRecordRequest = serde_json::from_value(serde_json::json!({
+                "producer":"fixture","producer_ref":format!("boundary-{hour}"),
+                "provider":"provider","auth_selection":"routing",
+                "charge_basis":"subscription_included","occurred_at_ms":hour * HOUR_MS + 45 * 60_000,
+                "measurements":[{"role":"input","unit":"token","kind":"billed","source":"fixture",
+                    "quantity_units":12,"quantity_exponent":0}]
+            })).unwrap();
+            request.resolved_credential = Some("apikey:plan".into());
+            let id = ingest::record_event(&mut conn, &request, 1)
+                .unwrap()
+                .event_id;
+            reprice(&mut conn, &id);
+        }
+        catch_up(&mut conn);
+        SUBSCRIPTION_LEDGER_HOURS.with_borrow_mut(BTreeSet::clear);
+        let actual = subscription_report(&conn, &SubscriptionReportRequest {}).unwrap();
+        SUBSCRIPTION_LEDGER_HOURS
+            .with_borrow(|hours| assert_eq!(*hours, BTreeSet::from([Some(5), Some(6)])));
+        equal(
+            &actual,
+            &subscription_report_base(&conn, &SubscriptionReportRequest {}, None).unwrap(),
+        );
+        assert_eq!(actual.coverage.events_covered_by_credential, 2);
+        assert_eq!(actual.coverage.events_unpriced, 3);
+        assert_eq!(actual.credential_rows.len(), 2);
+        assert_eq!(
+            actual
+                .credential_rows
+                .iter()
+                .map(|row| row.covered_measurements)
+                .sum::<u64>(),
+            2
+        );
         compare(&conn);
     }
 
@@ -2805,6 +2999,52 @@ mod tests {
                 .timestamp_millis();
             observed_record(&mut conn, base + 3 * HOUR_MS);
             declare(&mut conn, base + 30 * 60_000);
+            let tx = conn.transaction().unwrap();
+            for credential in ["api-key", "payer-a", "payer-b"] {
+                subscription::set_plan_in_tx(
+                    &tx,
+                    PlanLedger::Credential,
+                    &subscription::SetSubscriptionRequest {
+                        provider: "provider".into(),
+                        account_ref: credential.into(),
+                        plan_name: "fixture".into(),
+                        recurring_cost_minor: 100,
+                        currency: "USD".into(),
+                        amount_exponent: 2,
+                        period: subscription::SubscriptionPeriod::Month,
+                        effective_from: base + 30 * 60_000,
+                    },
+                    Some("vault"),
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            // Same visible dimensions and hour, but different paying credentials:
+            // neither the routing credential nor the provider identifies the plan.
+            for (index, resolved) in [
+                Some("payer-a"),
+                Some("payer-b"),
+                None,
+                Some("uncovered"),
+                Some(""),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut request: ingest::EventRecordRequest =
+                    serde_json::from_value(serde_json::json!({
+                    "producer":"fixture","producer_ref":format!("payer-{index}"),
+                    "provider":"provider","auth_selection":"api-key",
+                    "charge_basis":"subscription_included","occurred_at_ms":base + HOUR_MS,
+                    "measurements":[{"role":"input","unit":"token","kind":"billed","source":"fixture",
+                        "quantity_units":12,"quantity_exponent":0}]
+                })).unwrap();
+                request.resolved_credential = resolved.map(str::to_owned);
+                let id = ingest::record_event(&mut conn, &request, 1)
+                    .unwrap()
+                    .event_id;
+                reprice(&mut conn, &id);
+            }
             let paid = record(
                 &mut conn,
                 "bootstrap-usd",
@@ -2850,11 +3090,20 @@ mod tests {
                         serde_json::json!({"role":"output","unit":"token","kind":"billed","source":"fixture","quantity_units":0,"quantity_exponent":0}),
                     ]
                 };
-                let request:ingest::EventRecordRequest=serde_json::from_value(serde_json::json!({"producer":random.pick(&["fixture","other-fixture"]),"producer_ref":format!("{seed}-{index}"),
+                let mut request:ingest::EventRecordRequest=serde_json::from_value(serde_json::json!({"producer":random.pick(&["fixture","other-fixture"]),"producer_ref":format!("{seed}-{index}"),
                     "provider":random.pick(&[Some("provider"),Some("other-provider"),None]),"model":random.pick(&[Some("model"),Some("other-model"),None]),
-                    "account_ref":random.pick(&[Some("account"),Some("other-account"),None]),"auth_selection":random.pick(&[Some("api-key"),Some(""),None]),
+                    "account_ref":random.pick(&[Some("account"),Some("other-account"),Some(""),None]),"auth_selection":random.pick(&[Some("api-key"),Some("payer-b"),Some(""),None]),
                     "project_root":random.pick(&[Some("/fixture/project"),Some("/fixture/other"),None]),"work_class":random.pick(&[Some("coding"),Some("review"),Some(""),None]),
                     "occurred_at_ms":time,"charge_basis":basis.as_str(),"measurements":measurements})).unwrap();
+                request.resolved_credential = random
+                    .pick(&[
+                        Some("payer-a"),
+                        Some("payer-b"),
+                        Some("uncovered"),
+                        Some(""),
+                        None,
+                    ])
+                    .map(str::to_owned);
                 let id = ingest::record_event(&mut conn, &request, 1)
                     .unwrap()
                     .event_id;
@@ -2881,6 +3130,21 @@ mod tests {
             }
             compare(&conn);
             catch_up(&mut conn);
+            let payers = conn.prepare(
+                "SELECT v.value FROM summary_cell c JOIN summary_value v ON v.value_id=c.paying_credential
+                 WHERE c.hour_number=?1 AND c.paying_credential<>0 ORDER BY v.value").unwrap().query_map(
+                    [(base + HOUR_MS).div_euclid(HOUR_MS)], |row| row.get::<_, String>(0)
+                ).unwrap().collect::<rusqlite::Result<BTreeSet<_>>>().unwrap();
+            assert_eq!(
+                payers,
+                BTreeSet::from(
+                    ["", "api-key", "payer-a", "payer-b", "uncovered"].map(str::to_owned)
+                )
+            );
+            assert_eq!(conn.query_row(
+                "SELECT count(*) FROM summary_cell c JOIN summary_value b ON b.value_id=c.charge_basis
+                 WHERE (c.account<>0 OR b.value<>'subscription_included') AND c.paying_credential<>0",
+                [], |row| row.get::<_, i64>(0)).unwrap(), 0);
             assert!(spend(
                 &conn,
                 &request("UTC", "month", &["provider", "model"]),
