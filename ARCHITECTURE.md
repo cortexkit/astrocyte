@@ -100,7 +100,7 @@ multiplier stage. Between full ticks it applies quota events every 250 ms and,
 every two seconds (`FAST_LANE_INTERVAL`), a fast lane: BROCA and the harness
 readers except Goose tail only what changed. Other sources
 wait for full ticks. Fast cycles commit nothing when idle and never count as a
-source's successful drain.
+source's successful drain. A summary backlog keeps rebuilding between ticks.
 
 The bus reader thread holds one ckbus credential, opened with the launch secret
 already given to the daemon. It reads insula's per-account quota notices from
