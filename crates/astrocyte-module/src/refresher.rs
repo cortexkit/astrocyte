@@ -1960,7 +1960,7 @@ fn run_loop_full(
             &mut reconciler,
             &stop,
         );
-        summary_tick(&state, &mut summaries, &stop);
+        let mut summaries_behind = summary_tick(&state, &mut summaries, &stop);
         if !stop.load(Ordering::Relaxed) {
             multiplier.tick(&state, pending_catalog.is_some(), current_time_ms());
         }
@@ -1979,6 +1979,14 @@ fn run_loop_full(
                 interval,
                 &mut next_fast,
             );
+            // A summary format change leaves every hour stale, and reports
+            // read the whole ledger until each hour is rebuilt. At one budget
+            // per full tick that takes most of an hour, so while hours are
+            // waiting the rebuild continues between ticks. With no backlog it
+            // costs nothing.
+            if summaries_behind && !stop.load(Ordering::Relaxed) {
+                summaries_behind = summary_tick(&state, &mut summaries, &stop);
+            }
             std::thread::sleep(
                 Duration::from_millis(250).min(interval.saturating_sub(started.elapsed())),
             );
@@ -2099,17 +2107,28 @@ fn run_fast_lane(
 
 /// Fresh summary work follows ingestion and pricing, with short snapshot chunks
 /// and a separate revision-checked writer transaction for publication.
+///
+/// Returns true when the budget ran out while hours still wait to be rebuilt,
+/// so the caller may give the rebuild more time before the next full tick.
 fn summary_tick(
     state: &SharedState,
     summaries: &mut astrocyte_core::report::SummaryMaintenance,
     stop: &AtomicBool,
-) {
-    let budget = Duration::from_millis(1_500);
+) -> bool {
+    summary_tick_within(state, summaries, stop, Duration::from_millis(1_500))
+}
+
+fn summary_tick_within(
+    state: &SharedState,
+    summaries: &mut astrocyte_core::report::SummaryMaintenance,
+    stop: &AtomicBool,
+    budget: Duration,
+) -> bool {
     let started = std::time::Instant::now();
     let mut slowest = Duration::ZERO;
     loop {
         if stop.load(Ordering::Relaxed) {
-            return;
+            return false;
         }
         let chunk = std::time::Instant::now();
         let now = current_time_ms();
@@ -2125,11 +2144,11 @@ fn summary_tick(
                     tracing::warn!(target: "summary", %error, "summary chunk failed; retry after one hour");
                     summaries.defer_after_error(now);
                 }
-                return;
+                return false;
             }
         };
         if stop.load(Ordering::Relaxed) {
-            return;
+            return false;
         }
         if ready {
             let result = state.ordered_write(|tx| {
@@ -2162,15 +2181,15 @@ fn summary_tick(
                         tracing::warn!(target: "summary", %error, "summary publication failed; retry after one hour");
                         summaries.defer_after_error(now);
                     }
-                    return;
+                    return false;
                 }
             }
         } else if !summaries.has_pending() {
-            return;
+            return false;
         }
         slowest = slowest.max(chunk.elapsed());
         if started.elapsed().saturating_add(slowest) > budget {
-            return;
+            return summaries.rebuild_backlog();
         }
     }
 }
@@ -7229,6 +7248,80 @@ mod loop_tests {
         assert_eq!(facts, 1);
         assert!(cells > 0);
         assert_eq!(dirty, 0);
+    }
+
+    /// After a summary format change every hour is stale. The tick reports
+    /// that backlog when its budget runs out, so the loop keeps rebuilding
+    /// between full ticks, and stops reporting it once every hour is current.
+    #[test]
+    fn a_stale_summary_backlog_is_reported_until_every_hour_is_rebuilt() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::state::leased_test_state(&directory);
+        for hour in 0..6_i64 {
+            crate::ops::dispatch(
+                &state,
+                "spend.event.ingest",
+                serde_json::json!({
+                "producer":"fixture","producer_ref":format!("backlog-{hour}"),"provider":"provider",
+                "model":"model","charge_basis":"metered_api","occurred_at_ms":hour*3_600_000+1,
+                "measurements":[{"role":"input","unit":"token","kind":"billed","source":"fixture",
+                    "quantity_units":12,"quantity_exponent":0}]}),
+            )
+            .unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let mut summaries = astrocyte_core::report::SummaryMaintenance::default();
+        while summary_tick_within(&state, &mut summaries, &stop, Duration::ZERO) {}
+        let query = |sql: &str| -> i64 {
+            state
+                .with_conn(|conn| {
+                    conn.query_row(sql, [], |row| row.get(0))
+                        .map_err(|error| error.to_string())
+                })
+                .unwrap()
+        };
+        // Every hour was just built, so its format is the current one.
+        let current = query("SELECT min(format_version) FROM summary_hour");
+        assert_eq!(
+            current,
+            query("SELECT max(format_version) FROM summary_hour")
+        );
+        let stale = || {
+            query(&format!(
+                "SELECT count(*) FROM summary_hour
+                 WHERE built_revision IS NOT revision OR format_version IS NOT {current}"
+            ))
+        };
+        assert_eq!(stale(), 0);
+        state
+            .ordered_write(|tx| {
+                tx.execute(
+                    "UPDATE summary_hour SET format_version=format_version-1",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(((), false))
+            })
+            .unwrap();
+        assert_eq!(stale(), 6);
+        let mut behind_ticks = 0;
+        while summary_tick_within(&state, &mut summaries, &stop, Duration::ZERO) {
+            behind_ticks += 1;
+            assert!(behind_ticks <= 30, "the rebuild must finish");
+        }
+        assert!(
+            behind_ticks >= 5,
+            "a zero budget stops after each hour: {behind_ticks}"
+        );
+        assert_eq!(stale(), 0);
+        // With nothing left to rebuild, a tick reports no backlog, even while
+        // the audit of a fresh store is still due.
+        assert!(!summary_tick_within(
+            &state,
+            &mut summaries,
+            &stop,
+            Duration::ZERO
+        ));
     }
 
     #[test]

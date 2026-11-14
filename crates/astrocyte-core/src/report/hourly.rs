@@ -558,6 +558,9 @@ pub struct SummaryMaintenance {
     prefer_audit: bool,
     finish_audit: bool,
     retry_after_ms: i64,
+    /// Whether a dirty or stale hour was waiting when the last hour was
+    /// chosen, even if the audit took that step.
+    rebuild_backlog: bool,
     dirty_after: Option<Hour>,
     stale_after: Option<Hour>,
     #[cfg(test)]
@@ -690,14 +693,23 @@ impl SummaryMaintenance {
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
+    /// True while hours wait to be rebuilt: dirty after ledger writes, or
+    /// stale after a summary format change. The daily audit alone never
+    /// counts, so a caller can spend extra time catching up without running
+    /// the audit's read of the whole ledger faster on an ordinary day.
+    pub fn rebuild_backlog(&self) -> bool {
+        self.rebuild_backlog
+    }
     pub fn defer_after_error(&mut self, now_ms: i64) {
         self.pending = None;
         self.finish_audit = false;
+        self.rebuild_backlog = false;
         self.retry_after_ms = now_ms.saturating_add(HOUR_MS);
     }
     /// The caller holds a read snapshot for this chunk, never across ticks.
     pub fn read_chunk(&mut self, conn: &Connection, now_ms: i64) -> Result<bool, ReportError> {
         if now_ms < self.retry_after_ms {
+            self.rebuild_backlog = false;
             return Ok(false);
         }
         let started = std::time::Instant::now();
@@ -715,6 +727,9 @@ impl SummaryMaintenance {
                 Some(hour) => Some(hour),
                 None => next_stale(conn, self.stale_after)?,
             };
+            // Counted whether or not this step goes to the audit instead,
+            // which alternates with rebuilds while the audit is due.
+            self.rebuild_backlog = next.is_some();
             let audit = due && (self.prefer_audit || next.is_none());
             let hour = if audit { next_audit(conn)? } else { next };
             let Some(hour) = hour else {
