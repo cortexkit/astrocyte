@@ -266,13 +266,12 @@ pub(crate) mod harness_drain {
                     let columns: Vec<usize> = (0..stmt.column_count())
                         .filter(|col| stmt.column_name(*col).unwrap() != "event_key")
                         .collect();
-                    // `flow_ref` and `media_facts` were added after these hashes
-                    // were pinned. Only BROCA batch facts set flow_ref, and only
-                    // media events set media_facts. NULLs in those columns are
-                    // left out so each pinned hash still proves every earlier
-                    // column is unchanged; non-NULL values are always hashed.
+                    // These columns were added after the hashes were pinned.
+                    // Missing flow, media and paying-credential facts stay NULL.
+                    // Leave only those NULLs out so each pinned hash still proves
+                    // every earlier column is unchanged; values are always hashed.
                     let added_columns: Vec<usize> = (0..stmt.column_count())
-                        .filter(|col| matches!(stmt.column_name(*col).unwrap(), "flow_ref" | "media_facts"))
+                        .filter(|col| matches!(stmt.column_name(*col).unwrap(), "flow_ref" | "media_facts" | "resolved_credential"))
                         .collect();
                     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
                     while let Some(row) = rows.next().map_err(|e| e.to_string())? {

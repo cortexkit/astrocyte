@@ -1,0 +1,31 @@
+{
+  "run_id": "borrowed",
+  "session": {
+    "project_root": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/broca-tests/69128-000000000000000018e7bf8c9059bd98/broca-vault-pool-borrowed-69128",
+    "harness": "test",
+    "session": "session"
+  },
+  "segment_ordinal": 0,
+  "fact_id": "886d6ff43025225a8a92fa6599f955af46636f736ba6124194093ca55a72ab98",
+  "provider": "anthropic",
+  "model": "claude-haiku-4-5",
+  "auth_selection": "apikey:anthropic-platform",
+  "resolved_credential_id": "apikey:anthropic:acct1",
+  "vault_request": {
+    "min_ttl_ms": 600000,
+    "op": "get_scoped"
+  },
+  "charge_basis": "metered_api",
+  "charge_basis_mapping_version": 5,
+  "charge_basis_overrides": "none",
+  "usage": {
+    "input_tokens": 1,
+    "output_tokens": 1
+  },
+  "retries_used": 0,
+  "pricing_at_ms": 1794613587124,
+  "pricing_at_precision": "exact",
+  "occurred_at_ms": 1794613587142,
+  "occurred_at_precision": "terminal",
+  "terminal_reason": "completed"
+}

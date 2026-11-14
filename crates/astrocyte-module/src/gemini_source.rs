@@ -476,6 +476,7 @@ fn map_call(call: GeminiCall) -> Result<EventRecordRequest, String> {
         model: call.model,
         account_ref: None,
         auth_selection: None,
+        resolved_credential: None,
         charge_basis_mapping_version: None,
         charge_basis_overrides: None,
         // No recording says how Gemini CLI authenticated.

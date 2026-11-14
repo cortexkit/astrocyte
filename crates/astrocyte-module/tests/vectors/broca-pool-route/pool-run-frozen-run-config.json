@@ -1,0 +1,108 @@
+{
+  "served_provider": "anthropic",
+  "account_limit_pause": true,
+  "model": {
+    "provider_module_id": "anthropic-platform",
+    "model_id": "claude-haiku-4-5"
+  },
+  "tools": [],
+  "tool_choice": {
+    "type": "auto"
+  },
+  "generation": {
+    "max_output_tokens": 1024
+  },
+  "response_format": {
+    "type": "text"
+  },
+  "context_epoch": 0,
+  "renderer_version": 2,
+  "frozen_render_config": {
+    "base_url": "http://127.0.0.1:65263/v1",
+    "cache": {
+      "class": "markers",
+      "lookback_blocks": 20,
+      "max_breakpoints": 4,
+      "omit_ttl": true,
+      "syntax": "anthropic_cache_control",
+      "ttl": "5m",
+      "version": 1
+    },
+    "family_id": "anthropic_messages",
+    "image_notice_labels": true,
+    "max_output_tokens": 1024,
+    "media": {
+      "aging": {
+        "byte_target": 8000000,
+        "byte_trigger": 16000000,
+        "token_target": 25000,
+        "token_trigger": 50000
+      },
+      "audio": {
+        "tool_result": "marker",
+        "user_message": "marker"
+      },
+      "context_tokens": 200000,
+      "dimension_limits": [
+        {
+          "above_count": 0,
+          "max_side_px": 8000
+        },
+        {
+          "above_count": 20,
+          "max_side_px": 2000
+        }
+      ],
+      "document": {
+        "tool_result": "native",
+        "user_message": "native"
+      },
+      "image": {
+        "max_count": 100,
+        "max_item_bytes": {
+          "encoded": 10000000
+        },
+        "tool_result": "native",
+        "user_message": "native"
+      },
+      "modalities": {
+        "audio": false,
+        "image": true,
+        "pdf": true,
+        "text": true,
+        "video": false
+      },
+      "profile": "anthropic",
+      "request_cap_bytes": 32000000,
+      "video": {
+        "tool_result": "marker",
+        "user_message": "marker"
+      }
+    },
+    "reasoning": {
+      "mode": "none"
+    },
+    "renderer_version": 2,
+    "repetition_after_input": true,
+    "system_prompt": {
+      "mode": "top_level_field"
+    },
+    "token_limit_field": "max_tokens",
+    "tool_id": "passthrough",
+    "usage": "anthropic_usage",
+    "wire_model_id": "claude-haiku-4-5"
+  },
+  "auth_selection": {
+    "credential_id": "apikey:anthropic-platform",
+    "resolved_credential_id": "apikey:anthropic:acct1",
+    "vault_request": {
+      "min_ttl_ms": 600000,
+      "op": "get_scoped"
+    }
+  },
+  "context_limit": 200000,
+  "context_management": "none",
+  "computed_tags": {
+    "checkpoint": 0
+  }
+}

@@ -535,6 +535,7 @@ fn map_call(call: CodexCall) -> Result<EventRecordRequest, String> {
         model: call.model,
         account_ref: None,
         auth_selection: None,
+        resolved_credential: None,
         charge_basis_mapping_version: None,
         charge_basis_overrides: None,
         // No rollout record says how Codex authenticated (ChatGPT sign-in or

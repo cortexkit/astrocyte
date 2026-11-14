@@ -133,6 +133,7 @@ pub(super) fn record(steps: &[Step<'_>], state: &SharedState) {
             model: step.model.map(str::to_string),
             account_ref: None,
             auth_selection: None,
+            resolved_credential: None,
             charge_basis: ChargeBasis::Unknown,
             charge_basis_mapping_version: None,
             charge_basis_overrides: None,

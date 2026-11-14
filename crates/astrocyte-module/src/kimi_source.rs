@@ -226,6 +226,7 @@ fn map_call(call: KimiCall) -> Result<EventRecordRequest, String> {
         model: None,
         account_ref: None,
         auth_selection: None,
+        resolved_credential: None,
         charge_basis_mapping_version: None,
         charge_basis_overrides: None,
         // No wire record says how Kimi CLI authenticated.

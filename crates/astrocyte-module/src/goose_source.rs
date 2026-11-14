@@ -363,6 +363,7 @@ fn map_session(session: GooseSession) -> Result<EventRecordRequest, String> {
         model: session.model,
         account_ref: None,
         auth_selection: None,
+        resolved_credential: None,
         charge_basis_mapping_version: None,
         charge_basis_overrides: None,
         // No column states how Goose authenticated; `provider_name` (for

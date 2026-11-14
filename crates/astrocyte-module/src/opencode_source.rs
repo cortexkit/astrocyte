@@ -1308,6 +1308,7 @@ fn map_message(message: OpenCodeMessage) -> Result<EventRecordRequest, String> {
         model: Some(message.model_id),
         account_ref: None,
         auth_selection: None,
+        resolved_credential: None,
         charge_basis_mapping_version: None,
         charge_basis_overrides: None,
         charge_basis: ChargeBasis::Unknown,

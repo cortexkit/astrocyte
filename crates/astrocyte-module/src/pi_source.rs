@@ -824,6 +824,7 @@ pub(crate) fn map_message(record: PiUsageRecord) -> Result<EventRecordRequest, S
         model: operation.map_or_else(|| Some(message.model_id), |operation| operation.model),
         account_ref: None,
         auth_selection: None,
+        resolved_credential: None,
         charge_basis_mapping_version: None,
         charge_basis_overrides: None,
         charge_basis: ChargeBasis::Unknown,
@@ -942,6 +943,7 @@ fn same_call(left: &EventRecordRequest, right: &EventRecordRequest) -> bool {
         model,
         account_ref,
         auth_selection,
+        resolved_credential,
         charge_basis_mapping_version,
         charge_basis_overrides,
         charge_basis,
@@ -967,6 +969,7 @@ fn same_call(left: &EventRecordRequest, right: &EventRecordRequest) -> bool {
         && model == &right.model
         && account_ref == &right.account_ref
         && auth_selection == &right.auth_selection
+        && resolved_credential == &right.resolved_credential
         && charge_basis_mapping_version == &right.charge_basis_mapping_version
         && charge_basis_overrides == &right.charge_basis_overrides
         && charge_basis == &right.charge_basis

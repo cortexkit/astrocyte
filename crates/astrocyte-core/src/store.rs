@@ -4271,6 +4271,62 @@ CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
     WHERE built_revision IS NOT revision OR format_version IS NOT 3;
 "#,
     },
+    Migration {
+        version: 46,
+        statements: r#"-- BROCA's routing credential can differ from the vault credential that paid.
+-- Preserve the paying credential verbatim from newly read facts. Existing rows
+-- stay NULL: adding the nullable column does not backfill the immutable ledger.
+ALTER TABLE usage_event ADD COLUMN resolved_credential TEXT;
+
+-- Retain the version 26 guard's conditions and guard the new fact beside the
+-- admission credential. The separate media_facts guard remains unchanged.
+DROP TRIGGER usage_event_update_guard;
+CREATE TRIGGER usage_event_update_guard
+BEFORE UPDATE ON usage_event
+WHEN NOT (
+    NEW.event_key IS OLD.event_key
+    AND NEW.event_id IS OLD.event_id
+    AND NEW.producer IS OLD.producer
+    AND NEW.producer_lineage IS OLD.producer_lineage
+    AND NEW.producer_ref IS OLD.producer_ref
+    AND NEW.prior_event_ref IS OLD.prior_event_ref
+    AND NEW.harness IS OLD.harness
+    AND NEW.project_root IS OLD.project_root
+    AND NEW.session IS OLD.session
+    AND NEW.run_ref IS OLD.run_ref
+    AND NEW.flow_ref IS OLD.flow_ref
+    AND NEW.work_class IS OLD.work_class
+    AND NEW.occurred_at_ms IS OLD.occurred_at_ms
+    AND NEW.emitted_at_ms IS OLD.emitted_at_ms
+    AND NEW.recorded_at_ms IS OLD.recorded_at_ms
+    AND NEW.terminal_status IS OLD.terminal_status
+    AND NEW.attempt_ordinal IS OLD.attempt_ordinal
+    AND NEW.vendor_request_id IS OLD.vendor_request_id
+    AND NEW.provider IS OLD.provider
+    AND NEW.model IS OLD.model
+    AND NEW.account_ref IS OLD.account_ref
+    AND NEW.auth_selection IS OLD.auth_selection
+    AND NEW.resolved_credential IS OLD.resolved_credential
+    AND NEW.charge_basis_mapping_version IS OLD.charge_basis_mapping_version
+    AND NEW.charge_basis_overrides IS OLD.charge_basis_overrides
+    AND (
+        NEW.charge_basis IS OLD.charge_basis
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.pricing_generation = OLD.pricing_generation
+        OR NEW.pricing_generation = OLD.pricing_generation + 1
+    )
+    AND (
+        NEW.currency IS OLD.currency
+        OR (OLD.currency IS NULL AND NEW.currency IS NOT NULL)
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'usage_event_update_guard');
+END;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -4727,6 +4783,75 @@ mod tests {
         // The guard still allows a pricing_generation step.
         conn.execute_batch(
             "UPDATE usage_event SET pricing_generation=pricing_generation+1 WHERE event_key=10",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn schema_v46_adds_a_null_resolved_credential_and_guards_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version < 46) {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO usage_event (event_id,producer,producer_ref,auth_selection,
+                                      charge_basis,recorded_at_ms)
+             VALUES ('legacy','broca','legacy','apikey:anthropic-platform','metered_api',1);",
+        )
+        .unwrap();
+        let before = all_rows(&conn);
+        conn.execute_batch(MIGRATIONS[45].statements).unwrap();
+        let expected: Vec<_> = before
+            .into_iter()
+            .map(|(table, rows)| {
+                let rows = if table == "usage_event" {
+                    rows.into_iter()
+                        .map(|mut row| {
+                            row.push(rusqlite::types::Value::Null);
+                            row
+                        })
+                        .collect()
+                } else {
+                    rows
+                };
+                (table, rows)
+            })
+            .collect();
+        assert_eq!(all_rows(&conn), expected);
+        let column: (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT type,\"notnull\",dflt_value FROM pragma_table_info('usage_event')
+                 WHERE name='resolved_credential'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(column, ("TEXT".into(), 0, None));
+        conn.execute_batch(
+            "INSERT INTO usage_event (event_id,producer,producer_ref,resolved_credential,
+                                      charge_basis,recorded_at_ms)
+             VALUES ('paid','broca','paid','apikey:anthropic:acct1','metered_api',1);",
+        )
+        .unwrap();
+        for sql in [
+            "UPDATE usage_event SET resolved_credential='key' WHERE event_id='legacy'",
+            "UPDATE usage_event SET resolved_credential='other' WHERE event_id='paid'",
+            "UPDATE usage_event SET resolved_credential=NULL WHERE event_id='paid'",
+            "UPDATE usage_event SET auth_selection='other' WHERE event_id='legacy'",
+            "UPDATE usage_event SET flow_ref='other' WHERE event_id='legacy'",
+            "UPDATE usage_event SET media_facts='{}' WHERE event_id='legacy'",
+        ] {
+            let guard = if sql.contains("media_facts") {
+                "usage_event_media_facts_update_guard"
+            } else {
+                "usage_event_update_guard"
+            };
+            refuse_without_effect(&conn, "usage_event", sql, guard);
+        }
+        conn.execute_batch(
+            "UPDATE usage_event SET pricing_generation=pricing_generation+1,
+                charge_basis='subscription_included',currency='USD' WHERE event_id='paid'",
         )
         .unwrap();
     }
@@ -5913,6 +6038,7 @@ mod tests {
             model: event.model,
             account_ref: event.account_ref,
             auth_selection: event.auth_selection,
+            resolved_credential: None,
             charge_basis: event.charge_basis,
             charge_basis_mapping_version: None,
             charge_basis_overrides: None,

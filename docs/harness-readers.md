@@ -413,6 +413,20 @@ Rules that affect what is recorded:
   captured from BROCA's real producer are pinned in
   `crates/astrocyte-module/tests/vectors/broca-system-one/` (test:
   `broca_captured_system_one_facts_are_recorded_with_their_provenance`).
+- A BROCA session fact's `auth_selection` names the credential selection frozen
+  at admission, which can be a routing name. Its optional
+  `resolved_credential_id` is stored verbatim as `usage_event.resolved_credential`,
+  the vault credential that paid. A pool call can therefore retain
+  `apikey:anthropic-platform` as its admission route and
+  `apikey:anthropic:acct1` as its paying credential, while pricing provider
+  `anthropic`. Absence stays null, never copied from `auth_selection`. Existing
+  rows are not backfilled: a re-read carrying a value over stored null is a
+  no-op, while a stored value contradicted by a different or absent one is
+  quarantined. Neither credential member participates in event identity.
+  The pinned System One batch facts have no `resolved_credential_id`, so batch
+  events leave the column null. The pool sample is pinned under
+  `crates/astrocyte-module/tests/vectors/broca-pool-route/` (test:
+  `broca_pool_route_records_the_paying_credential`).
 - A session fact whose `usage` carries both `cache_write_5m_tokens` and
   `cache_write_1h_tokens`, summing to `cache_write_tokens`, records one
   cache-write measurement per lifetime (units `token_cache_5m` and

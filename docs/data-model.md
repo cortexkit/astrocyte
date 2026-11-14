@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 44. A schema change appends a migration; an applied
+currently version 46. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -14,7 +14,7 @@ copies that timeout without running the table-creating probes.
 
 | Table | Holds | Writes |
 |---|---|---|
-| `usage_event` | Each row records one usage event per producer reference and lineage, together with its pricing projection. | insert; three projection columns, see below |
+| `usage_event` | Each row records one usage event per producer reference and lineage, its admission selection (`auth_selection`), the paying credential (`resolved_credential`) when reported, and its pricing projection. | insert; three projection columns, see below |
 | `measurement` | Each row records one immutable event quantity for a role and unit. | insert only |
 | `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
 | `step_message` | Each row records the host's own message id for a newly recorded event, for joining live feed rows within their harness and session. Old events are not backfilled. | insert only, once per event |
@@ -111,7 +111,7 @@ and after each refusal.
 projections the ledger maintains: `pricing_generation` advances by one per
 pricing act, `charge_basis` changes only together with that step (a basis
 correction), and `currency` moves from null to one value once. Every
-producer field, including `auth_selection`, `flow_ref` and BROCA's
+producer field, including `auth_selection`, `resolved_credential`, `flow_ref` and BROCA's
 charge-basis provenance, is write-once. `statement_line_update_guard` keeps line content
 fixed while the match projection moves. `account_subscription_update_guard`
 allows one change: closing an open plan.
@@ -124,7 +124,17 @@ A correction to any of these tables is a new row, never an edit. Tests:
 `statement_content_and_history_are_immutable_without_effect`,
 `storage_update_and_delete_guards_preserve_subscription_history`,
 `schema_v13_provenance_columns_start_null_and_are_immutable`,
-`schema_v26_adds_a_null_flow_ref_keeps_every_row_and_guards_it`.
+`schema_v26_adds_a_null_flow_ref_keeps_every_row_and_guards_it`,
+`schema_v46_adds_a_null_resolved_credential_and_guards_it`.
+
+`usage_event.resolved_credential` (schema 46) is nullable `TEXT`, carried
+verbatim from a BROCA session fact's `resolved_credential_id`: the vault
+credential that paid, which can differ from the admission routing name in
+`auth_selection`. Missing values remain null, never a copy of `auth_selection`.
+Other producers and existing rows remain null; no rows are backfilled. Like
+`auth_selection`, a stored null accepts a later value on redelivery without
+changing the row. A stored value contradicted by a different or absent value
+goes to `rejected_delivery`.
 
 `usage_event.flow_ref` (schema 26) names the BROCA flow a batch call was made
 in. A BROCA batch fact sets exactly one of `run_ref` and `flow_ref`: a call
@@ -231,7 +241,7 @@ optional and its absence is part of the key's shape: an absent lineage omits
 the field, so it never equals an empty-string lineage. A lineage separates
 reference spaces that restart (a rebuilt producer store); a producer whose
 references are already stable sends none. `producer_ref` is stored verbatim.
-`auth_selection` is not part of the identity.
+Neither `auth_selection` nor `resolved_credential` is part of the identity.
 
 Uniqueness is enforced through `event_id`: ingest's only writer stores the
 hash of the key and never an id supplied by its caller, so `UNIQUE(event_id)`

@@ -606,6 +606,7 @@ fn map_call(call: ClaudeCodeCall) -> Result<EventRecordRequest, String> {
         model: call.model,
         account_ref: None,
         auth_selection: None,
+        resolved_credential: None,
         charge_basis_mapping_version: None,
         charge_basis_overrides: None,
         // Nothing in a transcript says who paid for the call.
@@ -1363,6 +1364,7 @@ mod tests {
                         model: None,
                         account_ref: None,
                         auth_selection: None,
+                        resolved_credential: None,
                         charge_basis_mapping_version: None,
                         charge_basis_overrides: None,
                         charge_basis: ChargeBasis::Unknown,

@@ -466,6 +466,7 @@ mod tests {
             model: Some(format!("model-{}", index % 3)),
             account_ref: None,
             auth_selection: None,
+            resolved_credential: None,
             charge_basis: ChargeBasis::Unknown,
             charge_basis_mapping_version: None,
             charge_basis_overrides: None,

@@ -1352,6 +1352,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn broca_pool_route_records_the_paying_credential() {
+        let wire =
+            include_str!("../tests/vectors/broca-pool-route/pool-run-export-fact-segment.json");
+        let fact = "886d6ff43025225a8a92fa6599f955af46636f736ba6124194093ca55a72ab98";
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("run-index.db");
+        create_store(&path, "instance-a", 1);
+        add_segment(&path, 1, fact, wire.trim_end());
+        let state = test_state();
+        let outcome =
+            drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
+        assert_eq!(outcome.events_recorded, 1);
+        assert!(set_aside_rows(&state).is_empty());
+        assert_eq!(count(&state, "usage_event"), 1);
+        assert_eq!(count(&state, "pricing_pending"), 1);
+        state
+            .with_conn(|conn| {
+                let (provider, model, basis, admitted, resolved): (
+                    String,
+                    String,
+                    String,
+                    String,
+                    Option<String>,
+                ) = conn
+                    .query_row(
+                        "SELECT provider,model,charge_basis,auth_selection,resolved_credential
+                     FROM usage_event WHERE producer='broca' AND producer_ref=?1",
+                        [fact],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(provider, "anthropic");
+                assert_eq!(model, "claude-haiku-4-5");
+                assert_eq!(basis, "metered_api");
+                assert_eq!(admitted, "apikey:anthropic-platform");
+                assert_eq!(resolved.as_deref(), Some("apikey:anthropic:acct1"));
+                let pending: String = conn
+                    .query_row(
+                        "SELECT e.producer_ref FROM pricing_pending p
+                     JOIN usage_event e USING(event_key)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(pending, fact);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            stored_measurements(&state),
+            [
+                (
+                    fact.into(),
+                    "input".into(),
+                    "usage.input_tokens".into(),
+                    Some(1)
+                ),
+                (
+                    fact.into(),
+                    "output".into(),
+                    "usage.output_tokens".into(),
+                    Some(1)
+                ),
+            ]
+        );
+    }
+
     /// The two batch facts BROCA captured from its real producer path, as the
     /// exact `segment_json` bytes it stores (broca
     /// crates/broca-module-serve/tests/golden/, source 32a91294). They pin the

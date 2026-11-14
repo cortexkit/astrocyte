@@ -567,6 +567,7 @@ pub fn record_steps_for_test(
             model: Some("model".into()),
             account_ref: None,
             auth_selection: None,
+            resolved_credential: None,
             charge_basis: ChargeBasis::Unknown,
             charge_basis_mapping_version: None,
             charge_basis_overrides: None,

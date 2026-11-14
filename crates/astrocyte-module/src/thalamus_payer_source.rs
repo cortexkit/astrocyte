@@ -486,6 +486,7 @@ fn record_row(tx: &Transaction<'_>, record: &Record, at: i64) -> Result<Option<S
             model: Some(usage.model),
             account_ref: record.account_ref.clone(),
             auth_selection: Some(record.auth_selection.clone()),
+            resolved_credential: None,
             charge_basis: basis(record.charge_basis.as_deref()),
             charge_basis_mapping_version: None,
             charge_basis_overrides: None,

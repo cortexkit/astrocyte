@@ -24,14 +24,14 @@ pub struct WireSpendSegmentFact {
     pub provider: String,
     pub model: String,
     pub account_ref: Option<String>,
-    /// The producer's credential id, carried verbatim and never derived. BROCA
-    /// stamps this on every export segment (the pin the run was admitted under,
-    /// frozen at admission); for api-key credentials account_ref is absent by
-    /// construction, so this is the only per-account discriminator a PAYG fact
-    /// carries. We store the string the producer sent and infer nothing from its
-    /// shape.
+    /// The credential selection frozen at admission, possibly a routing name
+    /// rather than the vault credential that paid. Stored verbatim.
     #[serde(default)]
     pub auth_selection: Option<String>,
+    /// The vault credential that paid. An absent value remains absent even
+    /// when the admission credential is present.
+    #[serde(default)]
+    pub resolved_credential_id: Option<String>,
     pub charge_basis: ChargeBasis,
     pub usage: WireUsage,
     pub occurred_at_ms: Option<u64>,
@@ -307,6 +307,7 @@ pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String
         model: Some(wire.model),
         account_ref: wire.account_ref,
         auth_selection: wire.auth_selection,
+        resolved_credential: wire.resolved_credential_id,
         charge_basis: wire.charge_basis,
         charge_basis_mapping_version: wire.charge_basis_mapping_version,
         charge_basis_overrides: wire.charge_basis_overrides,
@@ -455,6 +456,7 @@ pub fn map_system_one_fact(wire: WireSystemOneFact) -> Result<EventRecordRequest
         model: Some(wire.model),
         account_ref: wire.account_ref,
         auth_selection: wire.auth_selection,
+        resolved_credential: None,
         charge_basis: wire.charge_basis,
         charge_basis_mapping_version: wire.charge_basis_mapping_version,
         charge_basis_overrides: wire.charge_basis_overrides,
@@ -1264,6 +1266,23 @@ mod tests {
         let fixture = wire_fixture();
         assert!(fixture.get("charge_basis_mapping_version").is_none());
         assert_eq!(stored_charge_basis_provenance(fixture), (None, None));
+    }
+
+    #[test]
+    fn resolved_credential_is_optional_and_never_copied_from_auth_selection() {
+        let absent = map_fact(serde_json::from_value(wire_fixture()).unwrap()).unwrap();
+        assert!(absent.auth_selection.is_some());
+        assert_eq!(absent.resolved_credential, None);
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("paying-key"),
+        ] {
+            let mut fixture = wire_fixture();
+            fixture["resolved_credential_id"] = value.clone();
+            let request = map_fact(serde_json::from_value(fixture).unwrap()).unwrap();
+            assert_eq!(request.resolved_credential.as_deref(), value.as_str());
+        }
     }
 
     #[test]

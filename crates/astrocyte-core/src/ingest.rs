@@ -131,14 +131,17 @@ pub struct EventRecordRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub account_ref: Option<String>,
-    /// The producer's credential id, carried verbatim and never derived. BROCA
-    /// stamps this on every export segment (the pin the run was admitted under,
-    /// frozen at admission); for api-key credentials account_ref is absent by
-    /// construction, so this is the only per-account discriminator a PAYG fact
-    /// carries. We store the string the producer sent and infer nothing from its
-    /// shape.
+    /// The credential selection the run was admitted under, carried verbatim.
+    /// BROCA freezes it at admission; it can name a route rather than the
+    /// vault credential that paid. Nothing is inferred from its spelling.
     #[serde(default)]
     pub auth_selection: Option<String>,
+    /// The vault credential that paid, carried verbatim from BROCA's
+    /// `resolved_credential_id`. Absence stays NULL, never the admission route.
+    /// Only the store reader sets it; skipping serde leaves the pushed ingest
+    /// surface unchanged.
+    #[serde(skip)]
+    pub resolved_credential: Option<String>,
     pub charge_basis: ChargeBasis,
     /// BROCA's charge-basis provenance, carried verbatim from its usage
     /// export: the shipped charge-basis table version, and which local
@@ -344,6 +347,7 @@ struct EventPayload {
     model: Option<String>,
     account_ref: Option<String>,
     auth_selection: Option<String>,
+    resolved_credential: Option<String>,
     charge_basis: ChargeBasis,
     charge_basis_mapping_version: Option<u32>,
     charge_basis_overrides: Option<String>,
@@ -353,12 +357,13 @@ struct EventPayload {
 impl EventPayload {
     /// Whether an incoming payload restates this stored one.
     ///
-    /// Every field must be equal, except that a stored NULL `auth_selection`
-    /// or charge-basis provenance field accepts any incoming value. Facts
+    /// Every field must be equal, except that a stored NULL `auth_selection`,
+    /// `resolved_credential` or charge-basis provenance accepts any incoming value. Facts
     /// ingested before astrocyte decoded those fields hold NULL although BROCA
     /// sent a value: `auth_selection` only became a column in migration 4
-    /// (2026-09-11), and every BROCA event recorded before then stores NULL
-    /// there. BROCA's facts are re-read from the start whenever the cursor is
+    /// (2026-09-11), and `resolved_credential` in migration 46. Every BROCA event
+    /// recorded before each column existed stores NULL there. BROCA's facts are
+    /// re-read from the start whenever the cursor is
     /// lost (a rebuilt store, or BROCA excluded and re-enabled), so a stored
     /// NULL there means "not recorded", not "the producer sent nothing".
     /// BROCA's stored segments are immutable, so a fact recorded with NULL
@@ -394,6 +399,8 @@ impl EventPayload {
             || self.account_ref != incoming.account_ref
             || self.charge_basis != incoming.charge_basis
             || (self.auth_selection.is_some() && self.auth_selection != incoming.auth_selection)
+            || (self.resolved_credential.is_some()
+                && self.resolved_credential != incoming.resolved_credential)
             || (self.charge_basis_mapping_version.is_some()
                 && self.charge_basis_mapping_version != incoming.charge_basis_mapping_version)
             || (self.charge_basis_overrides.is_some()
@@ -947,6 +954,11 @@ fn canonical_incoming_payload(
     if let (Some(flow_ref), Some(object)) = (&request.flow_ref, payload.as_object_mut()) {
         object.insert("flow_ref".into(), json!(flow_ref));
     }
+    if let (Some(credential), Some(object)) =
+        (&request.resolved_credential, payload.as_object_mut())
+    {
+        object.insert("resolved_credential".into(), json!(credential));
+    }
     if let (Some(media), Some(object)) = (media, payload.as_object_mut()) {
         object.insert("media_facts".into(), json!(media));
     }
@@ -964,7 +976,8 @@ fn load_event_payload(
             "SELECT prior_event_ref,harness,project_root,session,run_ref,work_class,
                 occurred_at_ms,emitted_at_ms,terminal_status,attempt_ordinal,
                 vendor_request_id,provider,model,account_ref,auth_selection,charge_basis,
-                charge_basis_mapping_version,charge_basis_overrides,event_id,flow_ref,media_facts
+                charge_basis_mapping_version,charge_basis_overrides,event_id,flow_ref,media_facts,
+                resolved_credential
          FROM usage_event
          WHERE producer=?1 AND producer_lineage IS ?2 AND producer_ref=?3",
         )?
@@ -1002,6 +1015,7 @@ fn load_event_payload(
                         model: row.get(12)?,
                         account_ref: row.get(13)?,
                         auth_selection: row.get(14)?,
+                        resolved_credential: row.get(21)?,
                         charge_basis: ChargeBasis::parse(&charge_basis).ok_or_else(|| {
                             stored_value_error(15, "usage_event.charge_basis", &charge_basis)
                         })?,
@@ -1057,7 +1071,7 @@ fn insert_event(
 ) -> Result<String, IngestError> {
     // Identity is {producer, producer_lineage, producer_ref} and must not
     // change: the same charge re-exported with the same pin must dedupe.
-    // auth_selection is deliberately excluded from the canonical hash.
+    // auth_selection and resolved_credential are excluded from the canonical hash.
     let event_id = event_id(
         &request.producer,
         request.producer_lineage.as_deref(),
@@ -1069,10 +1083,11 @@ fn insert_event(
              harness,project_root,session,run_ref,work_class,
              occurred_at_ms,emitted_at_ms,recorded_at_ms,terminal_status,attempt_ordinal,
              vendor_request_id,provider,model,account_ref,auth_selection,charge_basis,pricing_generation,
-              charge_basis_mapping_version,charge_basis_overrides,flow_ref,media_facts
+              charge_basis_mapping_version,charge_basis_overrides,flow_ref,media_facts,
+              resolved_credential
           ) VALUES (
               ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,
-              ?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,0,?22,?23,?24,?25
+              ?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,0,?22,?23,?24,?25,?26
           )",
         params![
             event_id,
@@ -1100,6 +1115,7 @@ fn insert_event(
             request.charge_basis_overrides,
             request.flow_ref,
             media.map(|facts| jcs_serialize(&json!(facts))).transpose()?,
+            request.resolved_credential,
         ],
     )?;
     Ok(event_id)
@@ -1353,6 +1369,7 @@ mod tests {
             model: Some("model-a".into()),
             account_ref: Some("account-a".into()),
             auth_selection: None,
+            resolved_credential: None,
             charge_basis: ChargeBasis::MeteredApi,
             charge_basis_mapping_version: None,
             charge_basis_overrides: None,
@@ -2332,6 +2349,76 @@ mod tests {
         assert_eq!(stored_auth_selection(&conn, &stored.event_id), None);
         assert_eq!(count(&conn, "rejected_delivery"), 0);
         assert_eq!(count(&conn, "usage_event"), 1);
+    }
+
+    #[test]
+    fn a_stored_null_resolved_credential_accepts_a_value_read_later_without_changing_the_row() {
+        let mut conn = conn();
+        let mut first = request("resolved", None, vec![measurement("input", Some(1))]);
+        first.auth_selection = Some("apikey:anthropic-platform".into());
+        assert_eq!(first.resolved_credential, None);
+        let stored = record_via(&mut conn, &first, 2_000, DeliveryPath::Read);
+        let mut later = first.clone();
+        later.resolved_credential = Some("apikey:anthropic:acct1".into());
+        let outcome = record_via(&mut conn, &later, 3_000, DeliveryPath::Read);
+        assert_eq!(outcome.disposition, RecordDisposition::ExactRedelivery);
+        assert_eq!(outcome.event_id, stored.event_id);
+        let credential: Option<String> = conn
+            .query_row(
+                "SELECT resolved_credential FROM usage_event WHERE event_id=?1",
+                [&stored.event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(credential, None);
+        assert_eq!(count(&conn, "usage_event"), 1);
+        assert_eq!(count(&conn, "measurement"), 1);
+        assert_eq!(count(&conn, "rejected_delivery"), 0);
+        assert_eq!(count(&conn, "redelivery_log"), 0);
+    }
+
+    #[test]
+    fn a_stored_resolved_credential_is_contradicted_by_a_different_or_absent_one() {
+        for incoming in [Some("apikey:anthropic:other".to_string()), None] {
+            let mut conn = conn();
+            let mut first = request("resolved", None, vec![measurement("input", Some(1))]);
+            first.resolved_credential = Some("apikey:anthropic:acct1".into());
+            let stored = record_via(&mut conn, &first, 2_000, DeliveryPath::Read);
+            let repeated = record_via(&mut conn, &first, 2_500, DeliveryPath::Read);
+            assert_eq!(repeated.disposition, RecordDisposition::ExactRedelivery);
+            let mut later = first.clone();
+            later.resolved_credential = incoming.clone();
+            let outcome = record_via(&mut conn, &later, 3_000, DeliveryPath::Read);
+            assert_eq!(
+                outcome.disposition,
+                RecordDisposition::QuarantinedRedelivery,
+                "{incoming:?}"
+            );
+            assert_eq!(outcome.event_id, stored.event_id);
+            let credential: Option<String> = conn
+                .query_row(
+                    "SELECT resolved_credential FROM usage_event WHERE event_id=?1",
+                    [&stored.event_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(credential.as_deref(), Some("apikey:anthropic:acct1"));
+            assert_eq!(count(&conn, "usage_event"), 1);
+            assert_eq!(count(&conn, "measurement"), 1);
+            assert_eq!(count(&conn, "rejected_delivery"), 1);
+            assert_eq!(count(&conn, "redelivery_log"), 0);
+            if let Some(value) = incoming {
+                let evidence: String = conn
+                    .query_row(
+                        "SELECT incoming_payload FROM rejected_delivery",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let payload: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+                assert_eq!(payload["resolved_credential"], value);
+            }
+        }
     }
 
     /// Only a stored NULL is lenient: a stored credential id contradicted by
