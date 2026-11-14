@@ -2577,11 +2577,27 @@ mod tests {
         let position = projection_position();
         let mut upgraded = Connection::open_in_memory().unwrap();
         initialize_connection(&upgraded).unwrap();
+        // The fixture is recorded by today's ingest code, which writes every
+        // usage_event column. Columns added after the projection migration
+        // (version 46's resolved_credential) must exist before recording, so
+        // that migration runs early here and is skipped in the later pass. It
+        // touches only usage_event's columns and update guard, never the
+        // projection, so the order does not change what this test compares.
+        const RECORDER_COLUMNS: &[u32] = &[46];
         for migration in &MIGRATIONS[..position] {
             upgraded.execute_batch(migration.statements).unwrap();
         }
+        for migration in MIGRATIONS[position..]
+            .iter()
+            .filter(|migration| RECORDER_COLUMNS.contains(&migration.version))
+        {
+            upgraded.execute_batch(migration.statements).unwrap();
+        }
         record_fixture(&mut upgraded, None);
-        for migration in &MIGRATIONS[position..] {
+        for migration in MIGRATIONS[position..]
+            .iter()
+            .filter(|migration| !RECORDER_COLUMNS.contains(&migration.version))
+        {
             upgraded.execute_batch(migration.statements).unwrap();
         }
         let mut maintained = conn();
