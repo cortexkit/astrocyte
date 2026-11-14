@@ -307,6 +307,10 @@ pub struct RepricePlan {
     provider: Option<String>,
     model: Option<String>,
     account_ref: Option<String>,
+    /// The credential that paid for the call: `resolved_credential` when the
+    /// producer recorded it, otherwise `auth_selection`. A call with no
+    /// account is matched to a credential-keyed plan by this value.
+    paying_credential: Option<String>,
     occurred_at_ms: Option<i64>,
     charge_basis: ChargeBasis,
     currency: Option<String>,
@@ -324,16 +328,24 @@ pub struct RepricePlan {
 
 impl RepricePlan {
     /// Reuses the event identity captured while pricing data was loaded.
-    pub(crate) fn subscription_coverage_identity(
-        &self,
-    ) -> (Option<&str>, Option<&str>, Option<i64>, ChargeBasis) {
-        (
-            self.provider.as_deref(),
-            self.account_ref.as_deref(),
-            self.occurred_at_ms,
-            self.charge_basis,
-        )
+    pub(crate) fn subscription_coverage_identity(&self) -> CoverageIdentity<'_> {
+        CoverageIdentity {
+            provider: self.provider.as_deref(),
+            account_ref: self.account_ref.as_deref(),
+            paying_credential: self.paying_credential.as_deref(),
+            instant_ms: self.occurred_at_ms,
+            charge_basis: self.charge_basis,
+        }
     }
+}
+
+/// The event facts subscription coverage is decided from.
+pub(crate) struct CoverageIdentity<'a> {
+    pub(crate) provider: Option<&'a str>,
+    pub(crate) account_ref: Option<&'a str>,
+    pub(crate) paying_credential: Option<&'a str>,
+    pub(crate) instant_ms: Option<i64>,
+    pub(crate) charge_basis: ChargeBasis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,7 +424,8 @@ fn read_plan_in_tx(
     let event = tx
         .query_row(
             "SELECT provider,model,account_ref,occurred_at_ms,charge_basis,currency,
-                    pricing_generation,producer,event_key,media_facts
+                    pricing_generation,producer,event_key,media_facts,
+                    COALESCE(resolved_credential,auth_selection)
              FROM usage_event WHERE event_id=?1",
             [event_id],
             |row| {
@@ -441,6 +454,7 @@ fn read_plan_in_tx(
                     row.get::<_, String>(7)?,
                     row.get::<_, i64>(8)?,
                     crate::media::read_facts(row, 9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             },
         )
@@ -536,6 +550,7 @@ fn read_plan_in_tx(
         provider: event.0,
         model: event.1,
         account_ref: event.2,
+        paying_credential: event.10,
         occurred_at_ms: event.3,
         charge_basis: corrected_basis.unwrap_or(event.4),
         currency: event.5,

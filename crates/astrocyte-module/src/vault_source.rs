@@ -1,6 +1,7 @@
 //! List-only vault access. Network work belongs to a separate reader, never
 //! startup or the ledger writer; the full refresher tick applies its snapshots.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -366,6 +367,12 @@ pub(crate) struct Stage {
     diagnostics: vault_plan::Diagnostics,
     price_available: bool,
     invalid_plan_tier_since: Vec<InvalidPlanTierSince>,
+    /// Credential id to the plan key the vault's latest listing states for it,
+    /// for records whose tier the vault itself sourced (not config seeds).
+    /// Reconciliation reads plan history, which keeps a config seed as the
+    /// newest row when the vault later states the same tier with no start
+    /// date; this map is how it sees that the vault confirms the seed.
+    vault_tiers: BTreeMap<String, String>,
 }
 
 impl Stage {
@@ -379,6 +386,7 @@ impl Stage {
             diagnostics: vault_plan::Diagnostics::default(),
             price_available: false,
             invalid_plan_tier_since: Vec::new(),
+            vault_tiers: BTreeMap::new(),
         }
     }
 
@@ -408,6 +416,14 @@ impl Stage {
                 Ok(listing) => {
                     let result = self.append_snapshot(state, &listing).and_then(|changed| {
                         self.invalid_plan_tier_since = listing.invalid_plan_tier_since;
+                        self.vault_tiers = listing
+                            .plans
+                            .iter()
+                            .filter(|plan| plan.source != "config")
+                            .filter_map(|plan| {
+                                Some((plan.credential_id.clone(), plan.plan_key.clone()?))
+                            })
+                            .collect();
                         self.available = true;
                         self.process(state, source, now, changed)?;
                         self.publish(state);
@@ -524,13 +540,16 @@ impl Stage {
             tier_vocabulary: String::new(),
             unit_policy: String::new(),
         });
-        let prepared = state
-            .with_conn(|conn| vault_plan::prepare_reconciliation(conn, plans, &prices, now))?;
+        let vault_tiers = &self.vault_tiers;
+        let prepared = state.with_conn(|conn| {
+            vault_plan::prepare_reconciliation(conn, plans, vault_tiers, &prices, now)
+        })?;
         let mut report = if prepared.has_changes() {
             // A hand-set plan can win after the preview. Recheck ownership in the
             // write transaction; if no changes remain, roll back rather than commit.
             state.ordered_tail_write(|tx| {
-                let prepared = vault_plan::prepare_reconciliation(tx, plans, &prices, now)?;
+                let prepared =
+                    vault_plan::prepare_reconciliation(tx, plans, vault_tiers, &prices, now)?;
                 let changed = prepared.has_changes();
                 Ok((prepared.apply_in_tx(tx)?, changed))
             })?

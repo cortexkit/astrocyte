@@ -18,6 +18,7 @@ fn stage() -> Stage {
         diagnostics: vault_plan::Diagnostics::default(),
         price_available: false,
         invalid_plan_tier_since: Vec::new(),
+        vault_tiers: BTreeMap::new(),
     }
 }
 
@@ -894,4 +895,292 @@ fn vault_annual_non_usd_and_zero_sourced_prices_use_existing_ledger_rules() {
         );
         assert_eq!(report(&state)["unpriced_plans"], json!([]));
     }
+}
+
+/// A listing of key-only credentials (no account id) on `openai`, each with an
+/// operator-set tier observed at `observed` and no start date.
+fn key_only_listing(credentials: &[(&str, &str)], observed: i64) -> Value {
+    let rows: Vec<Value> = credentials
+        .iter()
+        .map(|(id, tier)| {
+            json!({"id":id,"categories":["llm-provider"],"type":"oauth","serves":[],
+                "provider_ids":["openai"],"state":"active","record_version":1,"operations":["list"],
+                "account_id":null,"plan_tier":tier,"plan_tier_source":"operator",
+                "plan_tier_observed_at_ms":observed})
+        })
+        .collect();
+    json!({"result":{"credentials":rows,"grants":1,
+        "grant_tuples":[{"selector_kind":"category","selector":"llm-provider","operation":"list"}],
+        "view":"opaque"}})
+}
+
+/// Records an account-less subscription call with the stated credential facts,
+/// the way the BROCA store reader does: `resolved_credential` is not part of the
+/// pushed ingest operation's schema.
+fn ingest_key(
+    state: &SharedState,
+    reference: &str,
+    at: i64,
+    auth_selection: Option<&str>,
+    resolved_credential: Option<&str>,
+) -> String {
+    let mut request: astrocyte_core::ingest::EventRecordRequest = serde_json::from_value(json!({
+        "producer":"broca","producer_lineage":"lineage","producer_ref":reference,
+        "provider":"openai","auth_selection":auth_selection,
+        "occurred_at_ms":at,"charge_basis":"subscription_included","measurements":[{"role":"input",
+            "unit":"token","kind":"raw","source":"usage","quantity_units":10,"quantity_exponent":0}]
+    }))
+    .unwrap();
+    request.resolved_credential = resolved_credential.map(str::to_string);
+    state
+        .ordered_tail_write(|tx| {
+            let outcome = astrocyte_core::ingest::record_event_in_tx(
+                tx,
+                &request,
+                at,
+                astrocyte_core::ingest::DeliveryPath::Pushed,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+            Ok((outcome.event_id, true))
+        })
+        .unwrap()
+}
+
+type CredentialRow = (String, String, i64, Option<i64>, i64, Option<String>);
+
+fn credential_plans(state: &SharedState) -> Vec<CredentialRow> {
+    state.with_conn(|conn| conn.prepare("SELECT credential_ref,plan_name,effective_from_ms,effective_to_ms,recurring_cost_minor,operator FROM credential_subscription ORDER BY credential_ref,effective_from_ms")
+        .and_then(|mut stmt| stmt.query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))?.collect()).map_err(|e|e.to_string())).unwrap()
+}
+
+/// The outcome and unpriced reason of the event's current charge head.
+fn head(state: &SharedState, event_id: &str) -> (String, Option<String>) {
+    state.with_conn(|conn| conn.query_row(
+        "SELECT outcome,unpriced_reason FROM priced_charge h WHERE event_key=(SELECT event_key FROM usage_event WHERE event_id=?1) AND NOT EXISTS(SELECT 1 FROM priced_charge n WHERE n.supersedes=h.charge_key)",
+        [event_id],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|e|e.to_string())).unwrap()
+}
+
+type ChargeRow = (i64, String, String, Option<String>, Option<i64>, Option<i64>);
+
+/// Every charge row, in insertion order: key, event, outcome, reason, money, superseded key.
+fn charge_rows(state: &SharedState) -> Vec<ChargeRow> {
+    state.with_conn(|conn| conn.prepare("SELECT p.charge_key,e.event_id,p.outcome,p.unpriced_reason,p.charge_nanos,p.supersedes FROM priced_charge p JOIN usage_event e ON e.event_key=p.event_key ORDER BY p.charge_key")
+        .and_then(|mut stmt| stmt.query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))?.collect()).map_err(|e|e.to_string())).unwrap()
+}
+
+#[test]
+fn vault_key_only_plan_covers_past_calls_by_paying_credential() {
+    let state = test_state();
+    let direct = ingest_key(&state, "direct", 10, Some("apikey:ollama"), None);
+    let resolved = ingest_key(
+        &state,
+        "resolved",
+        20,
+        Some("apikey:routing"),
+        Some("apikey:ollama"),
+    );
+    let differs = ingest_key(
+        &state,
+        "differs",
+        30,
+        Some("apikey:ollama"),
+        Some("apikey:other"),
+    );
+    let anonymous = ingest_key(&state, "anonymous", 40, None, None);
+    refresher::run_pricing_pass(&state, 500, &AtomicBool::new(false)).unwrap();
+    let uncovered = (
+        "unpriced".to_string(),
+        Some("no_subscription_in_force".to_string()),
+    );
+    for id in [&direct, &resolved, &differs, &anonymous] {
+        assert_eq!(head(&state, id), uncovered, "{id} before the plan");
+    }
+    let before = charge_rows(&state);
+
+    let mut stage = stage();
+    stage.apply(
+        &state,
+        vec![decode_listing(
+            key_only_listing(&[("apikey:ollama", "go")], 100),
+            101,
+        )],
+        Some(&Prices(vec![("go", 1_000)])),
+        101,
+    );
+    refresher::run_pricing_pass(&state, 500, &AtomicBool::new(false)).unwrap();
+
+    let covered = ("covered".to_string(), None);
+    assert_eq!(head(&state, &direct), covered, "auth_selection names the plan");
+    assert_eq!(
+        head(&state, &resolved),
+        covered,
+        "resolved_credential names the plan"
+    );
+    assert_eq!(
+        head(&state, &differs),
+        uncovered,
+        "resolved_credential wins over auth_selection"
+    );
+    assert_eq!(head(&state, &anonymous), uncovered, "no credential, no plan");
+    // The plan starts at the credential's first call and stays out of the
+    // account ledger.
+    assert_eq!(
+        credential_plans(&state),
+        vec![(
+            "apikey:ollama".into(),
+            "openai/go".into(),
+            10,
+            None,
+            1_000,
+            Some("vault".into())
+        )]
+    );
+    assert!(rows(&state).is_empty());
+    // The backfill appended one new head per covered call; every earlier row
+    // is unchanged, and the new heads charge nothing.
+    let after = charge_rows(&state);
+    assert_eq!(&after[..before.len()], &before[..]);
+    let appended = &after[before.len()..];
+    assert_eq!(appended.len(), 2, "{appended:?}");
+    for row in appended {
+        assert!(row.1 == direct || row.1 == resolved, "{row:?}");
+        assert_eq!(row.2, "covered");
+        assert_eq!(row.4, Some(0));
+        let superseded = before.iter().find(|old| Some(old.0) == row.5).unwrap();
+        assert_eq!(superseded.1, row.1);
+    }
+    let money = |rows: &[ChargeRow]| rows.iter().filter_map(|row| row.4).sum::<i64>();
+    assert_eq!(money(&after), money(&before));
+
+    let report = report(&state);
+    assert_eq!(report["rows"], json!([]));
+    assert_eq!(report["credential_rows"].as_array().unwrap().len(), 1);
+    let row = &report["credential_rows"][0];
+    assert_eq!(row["provider"], "openai");
+    assert_eq!(row["credential_ref"], "apikey:ollama");
+    assert_eq!(row["covered_events"], 2);
+    assert_eq!(report["coverage"]["events_covered_by_credential"], 2);
+    assert_eq!(report["coverage"]["events_unpriced"], 2);
+    assert_eq!(report["coverage"]["events_without_account"], 4);
+}
+
+#[test]
+fn vault_key_only_tier_change_closes_and_opens_at_effective_time() {
+    let state = test_state();
+    ingest_key(&state, "call", 10, Some("apikey:ollama"), None);
+    let prices = Prices(vec![("go", 1_000), ("pro", 3_000)]);
+    let mut stage = stage();
+    for (tier, observed) in [("go", 100), ("pro", 200)] {
+        stage.apply(
+            &state,
+            vec![decode_listing(
+                key_only_listing(&[("apikey:ollama", tier)], observed),
+                observed + 1,
+            )],
+            Some(&prices),
+            observed + 1,
+        );
+    }
+    assert_eq!(
+        credential_plans(&state),
+        vec![
+            (
+                "apikey:ollama".into(),
+                "openai/go".into(),
+                10,
+                Some(200),
+                1_000,
+                Some("vault".into())
+            ),
+            (
+                "apikey:ollama".into(),
+                "openai/pro".into(),
+                200,
+                None,
+                3_000,
+                Some("vault".into())
+            ),
+        ]
+    );
+}
+
+#[test]
+fn vault_config_seed_counts_only_when_the_vault_states_the_same_tier() {
+    let state = test_state();
+    state
+        .with_conn(|conn| {
+            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            for credential in ["apikey:kimi", "apikey:opencode"] {
+                vault_plan::append_in_tx(
+                    &tx,
+                    &VaultPlan {
+                        credential_id: credential.into(),
+                        provider: Some("openai".into()),
+                        account_id: None,
+                        plan_tier: Some("go".into()),
+                        plan_key: Some("openai/go".into()),
+                        source: "config".into(),
+                        effective_from_ms: 0,
+                        observed_at_ms: 1,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())
+        })
+        .unwrap();
+    let kimi = ingest_key(
+        &state,
+        "kimi",
+        10,
+        Some("apikey:kimi-code-plan-global"),
+        Some("apikey:kimi"),
+    );
+    let opencode = ingest_key(&state, "opencode", 15, Some("apikey:opencode"), None);
+    refresher::run_pricing_pass(&state, 500, &AtomicBool::new(false)).unwrap();
+
+    // The vault states kimi's seeded tier with no start date; it does not
+    // list opencode, so nothing confirms that seed.
+    let mut stage = stage();
+    stage.apply(
+        &state,
+        vec![decode_listing(
+            key_only_listing(&[("apikey:kimi", "go")], 100),
+            101,
+        )],
+        Some(&Prices(vec![("go", 1_000)])),
+        101,
+    );
+    let history: Vec<String> = state
+        .with_conn(|conn| {
+            conn.prepare("SELECT source FROM vault_plan_history ORDER BY history_id")
+                .and_then(|mut stmt| stmt.query_map([], |row| row.get(0))?.collect())
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    assert_eq!(
+        history,
+        vec!["config", "config"],
+        "an unchanged tier with no start date appends no history row"
+    );
+    assert_eq!(
+        credential_plans(&state),
+        vec![(
+            "apikey:kimi".into(),
+            "openai/go".into(),
+            10,
+            None,
+            1_000,
+            Some("vault".into())
+        )]
+    );
+    refresher::run_pricing_pass(&state, 500, &AtomicBool::new(false)).unwrap();
+    assert_eq!(head(&state, &kimi), ("covered".into(), None));
+    assert_eq!(
+        head(&state, &opencode),
+        (
+            "unpriced".into(),
+            Some("no_subscription_in_force".into())
+        )
+    );
 }

@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::subscription::{
-    self, CloseSubscriptionRequest, SetSubscriptionRequest, SubscriptionPeriod,
+    self, CloseSubscriptionRequest, PlanLedger, SetSubscriptionRequest, SubscriptionPeriod,
 };
 
 pub const VAULT_OPERATOR: &str = "vault";
@@ -101,15 +101,38 @@ pub struct AccountMismatch {
 /// Build read-only ledger actions after prices are resolved. Only vault-owned
 /// plans are eligible to close; `spend.subscription.set` writes a NULL operator,
 /// which identifies a hand-recorded plan.
+///
+/// A record with an account id is reconciled into the account ledger, keyed by
+/// `(provider, account)`. A record with no account id (an API key, or a login
+/// whose vault record has no account) is reconciled into the credential
+/// ledger, keyed by `(provider, credential id)`, with the same start rule,
+/// hand-plan protection, close-on-change and pricing.
+///
+/// `vault_tiers` maps each credential in the vault's latest listing to the plan
+/// key the vault states for it now. Config seeds are skipped, except a seed of
+/// a credential with no account id whose plan key the vault currently states:
+/// the vault confirmed it, but appended no history row because its tier
+/// equalled the seed's. Such a plan starts at the credential's first recorded
+/// call, and is only opened when the credential has no ledger plan yet.
 pub fn prepare_reconciliation(
     conn: &Connection,
     plans: &[VaultPlan],
+    vault_tiers: &BTreeMap<String, String>,
     prices: &PlanPricesResponse,
     now: i64,
 ) -> Result<Reconciliation, String> {
+    let confirmed_seed = |plan: &VaultPlan| {
+        plan.source == "config"
+            && plan.account_id.is_none()
+            && plan.plan_key.is_some()
+            && vault_tiers.get(&plan.credential_id) == plan.plan_key.as_ref()
+    };
     let mut diagnostics = Diagnostics::default();
     let mut changes = Vec::new();
-    for plan in plans.iter().filter(|plan| plan.source != "config") {
+    for plan in plans
+        .iter()
+        .filter(|plan| plan.source != "config" || confirmed_seed(plan))
+    {
         if plan.plan_key.is_none() {
             diagnostics.unknown_plans.push(plan.clone());
             continue;
@@ -150,79 +173,160 @@ pub fn prepare_reconciliation(
         let Some(account) = &plan.account_id else {
             continue;
         };
-        let open: Option<(String, i64, Option<String>)> = conn
-            .query_row(
-                "SELECT plan_name,effective_from_ms,operator FROM account_subscription
-             WHERE provider=?1 AND account_ref=?2 AND effective_to_ms IS NULL",
-                params![provider, account],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some((ledger, _, operator)) = &open {
-            if operator.as_deref() != Some(VAULT_OPERATOR) {
-                if plan.plan_key.as_ref() != Some(ledger) {
-                    diagnostics.hand_vault_differences.push(HandDifference {
-                        provider: provider.clone(),
-                        account_id: account.clone(),
-                        ledger_plan: ledger.clone(),
-                        vault_plan: plan.plan_key.clone(),
-                    });
-                }
-                continue;
+        reconcile_key(
+            conn,
+            PlanLedger::Account,
+            provider,
+            account,
+            plan,
+            false,
+            prices,
+            now,
+            &mut diagnostics,
+            &mut changes,
+        )?;
+    }
+    // One history row per credential reaches here, so a credential with no
+    // account id is its own winner.
+    for plan in plans.iter().filter(|plan| plan.account_id.is_none()) {
+        let seed = confirmed_seed(plan);
+        if plan.source == "config" && !seed {
+            continue;
+        }
+        let Some(provider) = &plan.provider else {
+            continue;
+        };
+        reconcile_key(
+            conn,
+            PlanLedger::Credential,
+            provider,
+            &plan.credential_id,
+            plan,
+            seed,
+            prices,
+            now,
+            &mut diagnostics,
+            &mut changes,
+        )?;
+    }
+    Ok(Reconciliation {
+        diagnostics,
+        changes,
+    })
+}
+
+/// Reconcile one ledger key against its winning vault record. `confirmed_seed`
+/// marks a config seed the vault currently confirms; it may only open the
+/// key's first plan.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_key(
+    conn: &Connection,
+    ledger: PlanLedger,
+    provider: &str,
+    key: &str,
+    plan: &VaultPlan,
+    confirmed_seed: bool,
+    prices: &PlanPricesResponse,
+    now: i64,
+    diagnostics: &mut Diagnostics,
+    changes: &mut Vec<LedgerChange>,
+) -> Result<(), String> {
+    let (table, key_column) = match ledger {
+        PlanLedger::Account => ("account_subscription", "account_ref"),
+        PlanLedger::Credential => ("credential_subscription", "credential_ref"),
+    };
+    let open: Option<(String, i64, Option<String>)> = conn
+        .query_row(
+            &format!(
+                "SELECT plan_name,effective_from_ms,operator FROM {table}
+             WHERE provider=?1 AND {key_column}=?2 AND effective_to_ms IS NULL"
+            ),
+            params![provider, key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some((ledger_plan, _, operator)) = &open {
+        if operator.as_deref() != Some(VAULT_OPERATOR) {
+            if plan.plan_key.as_ref() != Some(ledger_plan) {
+                diagnostics.hand_vault_differences.push(HandDifference {
+                    provider: provider.to_string(),
+                    account_id: key.to_string(),
+                    ledger_plan: ledger_plan.clone(),
+                    vault_plan: plan.plan_key.clone(),
+                });
             }
+            return Ok(());
         }
-        let price = ledger_price(plan, prices, now);
-        if open
-            .as_ref()
-            .is_some_and(|(key, _, _)| plan.plan_key.as_ref() == Some(key))
-        {
-            continue;
-        }
-        if open.is_some() {
-            changes.push(LedgerChange::Close(CloseSubscriptionRequest {
-                provider: provider.clone(),
-                account_ref: account.clone(),
+    }
+    if open
+        .as_ref()
+        .is_some_and(|(open_key, _, _)| plan.plan_key.as_ref() == Some(open_key))
+    {
+        return Ok(());
+    }
+    let has_history: bool = conn
+        .query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE provider=?1 AND {key_column}=?2)"),
+            params![provider, key],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    // A confirmed seed carries no start of its own (its effective time is the
+    // seed's zero), so it can't date a successor to an existing plan.
+    if confirmed_seed && has_history {
+        return Ok(());
+    }
+    let price = ledger_price(plan, prices, now);
+    if open.is_some() {
+        changes.push(LedgerChange::Close(
+            ledger,
+            CloseSubscriptionRequest {
+                provider: provider.to_string(),
+                account_ref: key.to_string(),
                 effective_to: plan.effective_from_ms,
-            }));
+            },
+        ));
+    }
+    let Some(price) = price else {
+        return Ok(());
+    };
+    // A credential's calls are the account-less calls whose paying credential
+    // is the key, by the rule coverage matches them with.
+    let first_call_sql = match ledger {
+        PlanLedger::Account => {
+            "SELECT min(occurred_at_ms) FROM usage_event WHERE provider=?1 AND account_ref=?2"
         }
-        let Some(price) = price else {
-            continue;
-        };
-        let first_call: Option<i64> = conn
-            .query_row(
-                "SELECT min(occurred_at_ms) FROM usage_event WHERE provider=?1 AND account_ref=?2",
-                params![provider, account],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        let Some(first_call) = first_call else {
-            continue;
-        };
-        let has_history: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM account_subscription WHERE provider=?1 AND account_ref=?2)",
-            params![provider,account], |row| row.get(0),
-        ).map_err(|error| error.to_string())?;
-        let from = if has_history {
-            plan.effective_from_ms
-        } else {
-            first_call
-        };
-        changes.push(LedgerChange::Set(SetSubscriptionRequest {
-            provider: provider.clone(),
-            account_ref: account.clone(),
+        PlanLedger::Credential => {
+            "SELECT min(occurred_at_ms) FROM usage_event WHERE provider=?1 AND account_ref IS NULL
+               AND COALESCE(resolved_credential,auth_selection)=?2"
+        }
+    };
+    let first_call: Option<i64> = conn
+        .query_row(first_call_sql, params![provider, key], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    let Some(first_call) = first_call else {
+        return Ok(());
+    };
+    let from = if has_history {
+        plan.effective_from_ms
+    } else {
+        first_call
+    };
+    changes.push(LedgerChange::Set(
+        ledger,
+        SetSubscriptionRequest {
+            provider: provider.to_string(),
+            account_ref: key.to_string(),
             plan_name: plan.plan_key.clone().unwrap(),
             recurring_cost_minor: price.minor_units,
             currency: price.currency.into(),
             amount_exponent: price.exponent,
             period: price.period,
             effective_from: from,
-        }));
-    }
-    Ok(Reconciliation {
-        diagnostics,
-        changes,
-    })
+        },
+    ));
+    Ok(())
 }
 
 const CHATGPT_MISMATCH_SQL: &str = "
@@ -267,8 +371,8 @@ pub struct Reconciliation {
 }
 
 enum LedgerChange {
-    Close(CloseSubscriptionRequest),
-    Set(SetSubscriptionRequest),
+    Close(PlanLedger, CloseSubscriptionRequest),
+    Set(PlanLedger, SetSubscriptionRequest),
 }
 
 impl Reconciliation {
@@ -281,12 +385,12 @@ impl Reconciliation {
     pub fn apply_in_tx(self, tx: &Transaction<'_>) -> Result<Diagnostics, String> {
         for change in self.changes {
             match change {
-                LedgerChange::Close(request) => {
-                    subscription::close_subscription_in_tx(tx, &request)
+                LedgerChange::Close(ledger, request) => {
+                    subscription::close_plan_in_tx(tx, ledger, &request)
                         .map_err(|error| error.message())?;
                 }
-                LedgerChange::Set(request) => {
-                    subscription::set_subscription_in_tx(tx, &request, Some(VAULT_OPERATOR))
+                LedgerChange::Set(ledger, request) => {
+                    subscription::set_plan_in_tx(tx, ledger, &request, Some(VAULT_OPERATOR))
                         .map_err(|error| error.message())?;
                 }
             };

@@ -241,20 +241,62 @@ pub fn set_subscription_in_tx(
     request: &SetSubscriptionRequest,
     operator: Option<&str>,
 ) -> Result<AccountSubscription, SubscriptionError> {
+    set_plan_in_tx(tx, PlanLedger::Account, request, operator)
+}
+
+/// Which ledger table a plan is recorded in.
+///
+/// An account plan is keyed by the provider account a call reports
+/// (`usage_event.account_ref`). A credential plan is keyed by the vault
+/// credential that paid for a call reporting no account; only vault-plan
+/// reconciliation writes one. Both tables have the same columns and guards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanLedger {
+    Account,
+    Credential,
+}
+
+impl PlanLedger {
+    pub fn table(self) -> &'static str {
+        match self {
+            Self::Account => "account_subscription",
+            Self::Credential => "credential_subscription",
+        }
+    }
+
+    pub fn key_column(self) -> &'static str {
+        match self {
+            Self::Account => "account_ref",
+            Self::Credential => "credential_ref",
+        }
+    }
+}
+
+/// Record a plan in `ledger`, closing the key's open plan at the new start.
+/// For the credential ledger, `request.account_ref` carries the credential id.
+pub fn set_plan_in_tx(
+    tx: &Transaction<'_>,
+    ledger: PlanLedger,
+    request: &SetSubscriptionRequest,
+    operator: Option<&str>,
+) -> Result<AccountSubscription, SubscriptionError> {
     validate_request(request, operator)?;
     recurring_cost_nanos(request.recurring_cost_minor, request.amount_exponent)?;
+    let (table, key) = (ledger.table(), ledger.key_column());
 
     let open_from = tx
         .query_row(
-            "SELECT effective_from_ms FROM account_subscription
-             WHERE provider=?1 AND account_ref=?2 AND effective_to_ms IS NULL",
+            &format!(
+                "SELECT effective_from_ms FROM {table}
+             WHERE provider=?1 AND {key}=?2 AND effective_to_ms IS NULL"
+            ),
             params![request.provider, request.account_ref],
             |row| row.get::<_, i64>(0),
         )
         .optional()?;
     let closed_overlap = tx
         .query_row(
-            CLOSED_OVERLAP_SQL,
+            &closed_overlap_sql(ledger),
             params![
                 request.provider,
                 request.account_ref,
@@ -273,8 +315,10 @@ pub fn set_subscription_in_tx(
     }
 
     tx.execute(
-        "UPDATE account_subscription SET effective_to_ms=?3
-         WHERE provider=?1 AND account_ref=?2 AND effective_to_ms IS NULL",
+        &format!(
+            "UPDATE {table} SET effective_to_ms=?3
+         WHERE provider=?1 AND {key}=?2 AND effective_to_ms IS NULL"
+        ),
         params![
             request.provider,
             request.account_ref,
@@ -282,10 +326,12 @@ pub fn set_subscription_in_tx(
         ],
     )?;
     tx.execute(
-        "INSERT INTO account_subscription (
-             account_ref,provider,plan_name,recurring_cost_minor,currency,
+        &format!(
+            "INSERT INTO {table} (
+             {key},provider,plan_name,recurring_cost_minor,currency,
              amount_exponent,period,effective_from_ms,effective_to_ms,operator
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,?9)",
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,?9)"
+        ),
         params![
             request.account_ref,
             request.provider,
@@ -355,17 +401,30 @@ pub fn close_subscription_in_tx(
     tx: &Transaction<'_>,
     request: &CloseSubscriptionRequest,
 ) -> Result<ClosedSubscription, SubscriptionError> {
+    close_plan_in_tx(tx, PlanLedger::Account, request)
+}
+
+/// [`close_subscription_in_tx`] for either ledger. For the credential
+/// ledger, `request.account_ref` carries the credential id.
+pub fn close_plan_in_tx(
+    tx: &Transaction<'_>,
+    ledger: PlanLedger,
+    request: &CloseSubscriptionRequest,
+) -> Result<ClosedSubscription, SubscriptionError> {
     validate_close_request(request)?;
+    let (table, key) = (ledger.table(), ledger.key_column());
 
     // Refusing an absent plan rather than reporting a no-op: an operator who
     // closes the wrong key needs to be told nothing was closed, and a silent
     // success reads as "the plan is now bounded".
     let open = tx
         .query_row(
-            "SELECT account_ref,provider,plan_name,recurring_cost_minor,currency,
+            &format!(
+                "SELECT {key},provider,plan_name,recurring_cost_minor,currency,
                     amount_exponent,period,effective_from_ms,effective_to_ms,operator
-             FROM account_subscription
-             WHERE provider=?1 AND account_ref=?2 AND effective_to_ms IS NULL",
+             FROM {table}
+             WHERE provider=?1 AND {key}=?2 AND effective_to_ms IS NULL"
+            ),
             params![request.provider, request.account_ref],
             read_subscription,
         )
@@ -384,8 +443,10 @@ pub fn close_subscription_in_tx(
     }
 
     tx.execute(
-        "UPDATE account_subscription SET effective_to_ms=?3
-         WHERE provider=?1 AND account_ref=?2 AND effective_to_ms IS NULL",
+        &format!(
+            "UPDATE {table} SET effective_to_ms=?3
+         WHERE provider=?1 AND {key}=?2 AND effective_to_ms IS NULL"
+        ),
         params![request.provider, request.account_ref, request.effective_to],
     )?;
     advance_plan_generation_in_tx(tx)?;
@@ -407,25 +468,35 @@ fn validate_close_request(request: &CloseSubscriptionRequest) -> Result<(), Subs
     Ok(())
 }
 
-/// A closed plan version of the account that ends after `?3`. It seeks
-/// `account_subscription_closed_end` to the versions ending after that
-/// instant rather than walking every version the account ever had.
-const CLOSED_OVERLAP_SQL: &str = "SELECT 1 FROM account_subscription
-     WHERE provider=?1 AND account_ref=?2 AND effective_to_ms>?3
-     LIMIT 1";
+/// A closed plan version of the key that ends after `?3`. It seeks the
+/// ledger's `*_closed_end` index to the versions ending after that instant
+/// rather than walking every version the key ever had.
+fn closed_overlap_sql(ledger: PlanLedger) -> String {
+    let (table, key) = (ledger.table(), ledger.key_column());
+    format!(
+        "SELECT 1 FROM {table}
+     WHERE provider=?1 AND {key}=?2 AND effective_to_ms>?3
+     LIMIT 1"
+    )
+}
 
-/// Plans of one account never overlap (the insert trigger refuses it), so the
+/// Plans of one key never overlap (the insert trigger refuses it), so the
 /// only plan that can be in force at an instant is the one that started last
 /// at or before it. The subquery seeks that start through the primary key;
-/// testing every earlier start's end instead walks the account's whole plan
+/// testing every earlier start's end instead walks the key's whole plan
 /// history whenever the instant falls after the last plan ended.
-const IN_FORCE_SQL: &str = "SELECT account_ref,provider,plan_name,recurring_cost_minor,currency,
+fn in_force_sql(ledger: PlanLedger) -> String {
+    let (table, key) = (ledger.table(), ledger.key_column());
+    format!(
+        "SELECT {key},provider,plan_name,recurring_cost_minor,currency,
         amount_exponent,period,effective_from_ms,effective_to_ms,operator
-     FROM account_subscription
-     WHERE provider=?1 AND account_ref=?2
-       AND effective_from_ms=(SELECT MAX(effective_from_ms) FROM account_subscription
-           WHERE provider=?1 AND account_ref=?2 AND effective_from_ms<=?3)
-       AND (effective_to_ms IS NULL OR effective_to_ms>?3)";
+     FROM {table}
+     WHERE provider=?1 AND {key}=?2
+       AND effective_from_ms=(SELECT MAX(effective_from_ms) FROM {table}
+           WHERE provider=?1 AND {key}=?2 AND effective_from_ms<=?3)
+       AND (effective_to_ms IS NULL OR effective_to_ms>?3)"
+    )
+}
 
 pub fn subscription_in_force(
     conn: &Connection,
@@ -433,9 +504,21 @@ pub fn subscription_in_force(
     account_ref: &str,
     instant_ms: i64,
 ) -> Result<Option<AccountSubscription>, SubscriptionError> {
+    plan_in_force(conn, PlanLedger::Account, provider, account_ref, instant_ms)
+}
+
+/// The plan of `ledger` in force for `(provider, key)` at the instant. For
+/// the credential ledger the returned `account_ref` holds the credential id.
+pub fn plan_in_force(
+    conn: &Connection,
+    ledger: PlanLedger,
+    provider: &str,
+    key: &str,
+    instant_ms: i64,
+) -> Result<Option<AccountSubscription>, SubscriptionError> {
     conn.query_row(
-        IN_FORCE_SQL,
-        params![provider, account_ref, instant_ms],
+        &in_force_sql(ledger),
+        params![provider, key, instant_ms],
         read_subscription,
     )
     .optional()
@@ -443,7 +526,10 @@ pub fn subscription_in_force(
 }
 
 /// Events whose current charge head says `no_subscription_in_force` but whose
-/// instant does fall inside a declared plan's effective range.
+/// instant does fall inside a declared plan's effective range, by the same
+/// matching rule [`read_reprice`] uses: the event's account in the account
+/// ledger, or, for an event with no account, its paying credential in the
+/// credential ledger.
 ///
 /// Declaring a plan changes nothing that was already recorded, and the pricing
 /// pass looks only at measurements that have no charge head at all, so without
@@ -482,6 +568,10 @@ pub fn coverage_backfill_event_ids(
         Some(after) => (">", after),
         None => (">=", ""),
     };
+    // The first half finds account-keyed calls; the second finds calls with no
+    // account whose paying credential (`resolved_credential`, else
+    // `auth_selection`) names a credential plan, compared exactly. UNION
+    // removes an event both halves return.
     let mut statement = conn.prepare(&format!(
         "SELECT DISTINCT event.event_id
          FROM priced_charge AS head
@@ -499,7 +589,25 @@ pub fn coverage_backfill_event_ids(
                WHERE child.supersedes=head.charge_key
            )
            AND event.event_id {comparison} ?2
-         ORDER BY event.event_id
+         UNION
+         SELECT event.event_id
+         FROM priced_charge AS head
+         CROSS JOIN usage_event AS event ON event.event_key=head.event_key
+         CROSS JOIN credential_subscription AS plan
+           ON plan.provider=event.provider
+          AND plan.credential_ref=COALESCE(event.resolved_credential,event.auth_selection)
+          AND plan.effective_from_ms<=event.occurred_at_ms
+          AND (plan.effective_to_ms IS NULL
+               OR plan.effective_to_ms>event.occurred_at_ms)
+         WHERE head.outcome='unpriced'
+           AND head.unpriced_reason='no_subscription_in_force'
+           AND event.account_ref IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM priced_charge AS child
+               WHERE child.supersedes=head.charge_key
+           )
+           AND event.event_id {comparison} ?2
+         ORDER BY 1
          LIMIT ?1"
     ))?;
     let event_ids = statement
@@ -578,17 +686,38 @@ fn read_subscription(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountSubscri
 enum CoverageExpectation {
     NotApplicable,
     Missing {
+        ledger: PlanLedger,
         provider: String,
-        account_ref: String,
+        plan_ref: String,
         instant_ms: i64,
     },
     Covered {
+        ledger: PlanLedger,
         provider: String,
-        account_ref: String,
+        plan_ref: String,
         instant_ms: i64,
         effective_from: i64,
         currency: String,
     },
+}
+
+/// The ledger and key a subscription call's plan is looked up by. A call that
+/// reports an account matches account plans by that account, as it always
+/// has. A call with no account (NULL, not empty) matches credential plans by
+/// its paying credential: `resolved_credential` when recorded, otherwise
+/// `auth_selection`, compared exactly. Every place that decides or reports
+/// coverage uses this one rule.
+pub fn plan_lookup_key<'a>(
+    account_ref: Option<&'a str>,
+    paying_credential: Option<&'a str>,
+) -> Option<(PlanLedger, &'a str)> {
+    match (account_ref, paying_credential) {
+        (Some(account), _) if !account.is_empty() => Some((PlanLedger::Account, account)),
+        (None, Some(credential)) if !credential.is_empty() => {
+            Some((PlanLedger::Credential, credential))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -640,28 +769,30 @@ fn read_plan_in_tx(
         None => pricing::read_reprice_in_tx(tx, event_id)?,
     };
 
-    let (provider, account_ref, instant_ms, charge_basis) =
-        pricing.subscription_coverage_identity();
-    let coverage = match (provider, account_ref, instant_ms, charge_basis) {
+    let identity = pricing.subscription_coverage_identity();
+    let lookup = plan_lookup_key(identity.account_ref, identity.paying_credential);
+    let coverage = match (identity.provider, lookup, identity.instant_ms, identity.charge_basis) {
         (
             Some(provider),
-            Some(account_ref),
+            Some((ledger, plan_ref)),
             Some(instant_ms),
             ChargeBasis::SubscriptionIncluded,
-        ) if !provider.is_empty() && !account_ref.is_empty() => {
+        ) if !provider.is_empty() => {
             let provider = provider.to_string();
-            let account_ref = account_ref.to_string();
-            match subscription_in_force(tx, &provider, &account_ref, instant_ms)? {
+            let plan_ref = plan_ref.to_string();
+            match plan_in_force(tx, ledger, &provider, &plan_ref, instant_ms)? {
                 Some(subscription) => CoverageExpectation::Covered {
+                    ledger,
                     provider,
-                    account_ref,
+                    plan_ref,
                     instant_ms,
                     effective_from: subscription.effective_from,
                     currency: subscription.currency,
                 },
                 None => CoverageExpectation::Missing {
+                    ledger,
                     provider,
-                    account_ref,
+                    plan_ref,
                     instant_ms,
                 },
             }
@@ -741,21 +872,23 @@ fn coverage_expectation_still_holds(
     conn: &Connection,
     expectation: &CoverageExpectation,
 ) -> Result<bool, SubscriptionError> {
-    let (provider, account_ref, instant_ms) = match expectation {
+    let (ledger, provider, plan_ref, instant_ms) = match expectation {
         CoverageExpectation::NotApplicable => return Ok(true),
         CoverageExpectation::Missing {
+            ledger,
             provider,
-            account_ref,
+            plan_ref,
             instant_ms,
         }
         | CoverageExpectation::Covered {
+            ledger,
             provider,
-            account_ref,
+            plan_ref,
             instant_ms,
             ..
-        } => (provider, account_ref, *instant_ms),
+        } => (*ledger, provider, plan_ref, *instant_ms),
     };
-    let current = subscription_in_force(conn, provider, account_ref, instant_ms)?;
+    let current = plan_in_force(conn, ledger, provider, plan_ref, instant_ms)?;
     match (expectation, current) {
         (CoverageExpectation::Missing { .. }, None) => Ok(true),
         (
@@ -2027,17 +2160,22 @@ mod tests {
                 .unwrap();
             lines.join("\n")
         };
-        let overlap = plan(CLOSED_OVERLAP_SQL);
-        assert!(
-            overlap.contains("account_subscription_closed_end (provider=? AND account_ref=? AND effective_to_ms>?)"),
-            "{overlap}"
-        );
-        let in_force = plan(IN_FORCE_SQL);
-        assert!(!in_force.contains("SCAN"), "{in_force}");
-        assert!(
-            in_force.contains("effective_from_ms<?") || in_force.contains("effective_from_ms=?"),
-            "{in_force}"
-        );
+        for ledger in [PlanLedger::Account, PlanLedger::Credential] {
+            let (table, key) = (ledger.table(), ledger.key_column());
+            let overlap = plan(&closed_overlap_sql(ledger));
+            assert!(
+                overlap.contains(&format!(
+                    "{table}_closed_end (provider=? AND {key}=? AND effective_to_ms>?)"
+                )),
+                "{overlap}"
+            );
+            let in_force = plan(&in_force_sql(ledger));
+            assert!(!in_force.contains("SCAN"), "{in_force}");
+            assert!(
+                in_force.contains("effective_from_ms<?") || in_force.contains("effective_from_ms=?"),
+                "{in_force}"
+            );
+        }
     }
 
     /// The overlap guard was split into an open-version half and a
@@ -2093,5 +2231,149 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Records an account-less subscription call (unless `account_ref` is
+    /// given) on provider-a with the stated credential facts.
+    fn record_credential_event(
+        conn: &Connection,
+        event_id: &str,
+        occurred_at_ms: i64,
+        account_ref: Option<&str>,
+        auth_selection: Option<&str>,
+        resolved_credential: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO usage_event (
+                 event_id,producer,producer_lineage,producer_ref,occurred_at_ms,
+                 recorded_at_ms,provider,account_ref,auth_selection,resolved_credential,
+                 charge_basis,pricing_generation
+             ) VALUES (?1,'producer','lineage',?1,?2,900,'provider-a',?3,?4,?5,
+                       'subscription_included',0)",
+            params![
+                event_id,
+                occurred_at_ms,
+                account_ref,
+                auth_selection,
+                resolved_credential
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO measurement (
+                 event_key,role,unit,kind,source,quantity_units,quantity_exponent
+             ) VALUES ((SELECT event_key FROM usage_event WHERE event_id=?1),'input','token','billed','producer',100,0)",
+            [event_id],
+        )
+        .unwrap();
+    }
+
+    fn set_credential_plan(conn: &mut Connection, credential: &str, effective_from: i64) {
+        let tx = conn.transaction().unwrap();
+        set_plan_in_tx(
+            &tx,
+            PlanLedger::Credential,
+            &SetSubscriptionRequest {
+                account_ref: credential.into(),
+                ..request("key-plan", "USD", 2, SubscriptionPeriod::Month, effective_from)
+            },
+            Some("vault"),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn credential_plan_covers_account_less_calls_by_exact_paying_credential() {
+        let mut conn = conn();
+        set_credential_plan(&mut conn, "apikey:plan", 100);
+        for (event_id, at, account, auth, resolved) in [
+            ("routed", 150, None, Some("apikey:plan"), None),
+            ("resolved-wins", 150, None, Some("apikey:routing"), Some("apikey:plan")),
+            ("resolved-differs", 150, None, Some("apikey:plan"), Some("apikey:other")),
+            ("no-credential", 150, None, None, None),
+            ("other-credential", 150, None, Some("apikey:other"), None),
+            ("case-differs", 150, None, Some("APIKEY:plan"), None),
+            ("has-account", 150, Some("account-a"), Some("apikey:plan"), None),
+            ("before-plan", 50, None, Some("apikey:plan"), None),
+        ] {
+            record_credential_event(&conn, event_id, at, account, auth, resolved);
+        }
+        let no_plan = ("unpriced".to_string(), Some("no_subscription_in_force".to_string()));
+        let covered = ("covered".to_string(), None);
+        for (event_id, expected) in [
+            ("routed", &covered),
+            ("resolved-wins", &covered),
+            ("resolved-differs", &no_plan),
+            ("no-credential", &no_plan),
+            ("other-credential", &no_plan),
+            ("case-differs", &no_plan),
+            ("has-account", &no_plan),
+            ("before-plan", &no_plan),
+        ] {
+            assert_eq!(&reprice_outcome(&mut conn, event_id), expected, "{event_id}");
+        }
+        // A covered call is charged nothing, in the plan's currency.
+        for event_id in ["routed", "resolved-wins"] {
+            let charge: (String, i64, i64) = conn
+                .query_row(
+                    "SELECT currency,charge_nanos,basis_covered FROM priced_charge
+                     WHERE event_key=(SELECT event_key FROM usage_event WHERE event_id=?1)",
+                    [event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(charge, ("USD".into(), 0, 1), "{event_id}");
+        }
+        // The credential plan never reaches the account ledger.
+        assert_eq!(count_subscriptions(&conn), 0);
+    }
+
+    #[test]
+    fn credential_plan_coverage_is_rechecked_at_commit() {
+        let mut conn = conn();
+        record_credential_event(&conn, "call", 150, None, Some("apikey:plan"), None);
+        let plan = read_reprice(&conn, "call").unwrap();
+        let resolved = resolve_reprice_without_catalog(&plan).unwrap();
+        // A credential plan recorded between the read and the commit makes
+        // the uncovered answer stale.
+        set_credential_plan(&mut conn, "apikey:plan", 100);
+        let tx = conn.transaction().unwrap();
+        let error = commit_reprice_in_tx(
+            &tx,
+            &plan,
+            &resolved,
+            1_000,
+            pricing::PricingOrigin::PricingPass,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "subscription_coverage_superseded");
+        drop(tx);
+        let heads: i64 = conn
+            .query_row("SELECT COUNT(*) FROM priced_charge", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(heads, 0);
+    }
+
+    #[test]
+    fn credential_plan_write_reopens_the_backfill_for_its_window_only() {
+        let mut conn = conn();
+        for (event_id, at, auth) in [
+            ("inside", 150, Some("apikey:plan")),
+            ("before", 50, Some("apikey:plan")),
+            ("other", 150, Some("apikey:other")),
+            ("none", 150, None),
+        ] {
+            record_credential_event(&conn, event_id, at, None, auth, None);
+            reprice_outcome(&mut conn, event_id);
+        }
+        let drained = coverage_backfill_due(&conn).unwrap();
+        set_credential_plan(&mut conn, "apikey:plan", 100);
+        let due = coverage_backfill_due(&conn).unwrap();
+        assert!(due.is_some() && due != drained, "{drained:?} -> {due:?}");
+        assert_eq!(
+            coverage_backfill_event_ids(&conn, None, 100).unwrap(),
+            vec!["inside".to_string()]
+        );
     }
 }

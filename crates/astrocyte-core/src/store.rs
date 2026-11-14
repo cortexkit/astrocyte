@@ -4327,6 +4327,107 @@ BEGIN
 END;
 "#,
     },
+    Migration {
+        version: 47,
+        statements: r#"
+-- Ledger plans for vault credentials that carry no provider account id, such
+-- as an API key. A subscription call with no account_ref is covered by the
+-- plan whose credential_ref equals the call's paying credential. The columns
+-- mirror account_subscription with credential_ref in place of account_ref,
+-- and every guard account_subscription has is repeated for the new key: one
+-- open interval, no overlap, insert-once (no REPLACE), an update that may only
+-- close an open interval, and no delete. account_subscription is unchanged.
+CREATE TABLE credential_subscription (
+    credential_ref       TEXT NOT NULL CHECK (length(credential_ref) > 0),
+    provider             TEXT NOT NULL CHECK (length(provider) > 0),
+    plan_name            TEXT NOT NULL CHECK (length(plan_name) > 0),
+    recurring_cost_minor INTEGER NOT NULL
+        CHECK (typeof(recurring_cost_minor) = 'integer' AND recurring_cost_minor >= 0),
+    currency             TEXT NOT NULL
+        CHECK (length(currency) = 3 AND currency NOT GLOB '*[^A-Z]*'),
+    amount_exponent      INTEGER NOT NULL
+        CHECK (typeof(amount_exponent) = 'integer' AND amount_exponent BETWEEN 0 AND 9),
+    period               TEXT NOT NULL CHECK (period IN ('month', 'year')),
+    effective_from_ms    INTEGER NOT NULL
+        CHECK (typeof(effective_from_ms) = 'integer' AND effective_from_ms >= 0),
+    effective_to_ms      INTEGER CHECK (
+        effective_to_ms IS NULL
+        OR (typeof(effective_to_ms) = 'integer' AND effective_to_ms > effective_from_ms)
+    ),
+    operator             TEXT CHECK (operator IS NULL OR length(operator) > 0),
+
+    PRIMARY KEY (provider, credential_ref, effective_from_ms)
+);
+
+CREATE UNIQUE INDEX credential_subscription_one_open_interval
+    ON credential_subscription (provider, credential_ref)
+    WHERE effective_to_ms IS NULL;
+
+CREATE INDEX credential_subscription_closed_end
+    ON credential_subscription (provider, credential_ref, effective_to_ms)
+    WHERE effective_to_ms IS NOT NULL;
+
+CREATE TRIGGER credential_subscription_insert_once BEFORE INSERT ON credential_subscription
+WHEN EXISTS (SELECT 1 FROM credential_subscription WHERE rowid=NEW.rowid)
+  OR EXISTS (SELECT 1 FROM credential_subscription WHERE provider=NEW.provider
+    AND credential_ref=NEW.credential_ref AND effective_from_ms=NEW.effective_from_ms)
+  OR (NEW.effective_to_ms IS NULL AND EXISTS (SELECT 1 FROM credential_subscription
+      WHERE provider=NEW.provider AND credential_ref=NEW.credential_ref AND effective_to_ms IS NULL))
+BEGIN
+    SELECT RAISE(ABORT, 'credential_subscription_insert_once');
+END;
+
+-- SQLite fires the newest trigger first, so the overlap trigger is created
+-- after insert-once: an overlapping plan is refused as an overlap, as the
+-- account_subscription overlap trigger recreated in version 43 refuses it.
+CREATE TRIGGER credential_subscription_no_overlap
+BEFORE INSERT ON credential_subscription
+WHEN EXISTS (
+    SELECT 1 FROM credential_subscription AS existing
+    WHERE existing.provider = NEW.provider
+      AND existing.credential_ref = NEW.credential_ref
+      AND existing.effective_to_ms IS NULL
+      AND (NEW.effective_to_ms IS NULL
+           OR existing.effective_from_ms < NEW.effective_to_ms)
+) OR EXISTS (
+    SELECT 1 FROM credential_subscription AS existing
+    WHERE existing.provider = NEW.provider
+      AND existing.credential_ref = NEW.credential_ref
+      AND existing.effective_to_ms > NEW.effective_from_ms
+      AND (NEW.effective_to_ms IS NULL
+           OR existing.effective_from_ms < NEW.effective_to_ms)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'credential_subscription_no_overlap');
+END;
+
+CREATE TRIGGER credential_subscription_update_guard
+BEFORE UPDATE ON credential_subscription
+WHEN NOT (
+    NEW.credential_ref IS OLD.credential_ref
+    AND NEW.provider IS OLD.provider
+    AND NEW.plan_name IS OLD.plan_name
+    AND NEW.recurring_cost_minor IS OLD.recurring_cost_minor
+    AND NEW.currency IS OLD.currency
+    AND NEW.amount_exponent IS OLD.amount_exponent
+    AND NEW.period IS OLD.period
+    AND NEW.effective_from_ms IS OLD.effective_from_ms
+    AND NEW.operator IS OLD.operator
+    AND OLD.effective_to_ms IS NULL
+    AND NEW.effective_to_ms IS NOT NULL
+    AND NEW.effective_to_ms > OLD.effective_from_ms
+)
+BEGIN
+    SELECT RAISE(ABORT, 'credential_subscription_update_guard');
+END;
+
+CREATE TRIGGER credential_subscription_no_delete
+BEFORE DELETE ON credential_subscription
+BEGIN
+    SELECT RAISE(ABORT, 'credential_subscription_no_delete');
+END;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -4854,6 +4955,110 @@ mod tests {
                 charge_basis='subscription_included',currency='USD' WHERE event_id='paid'",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn schema_v47_adds_an_empty_guarded_credential_ledger_and_changes_no_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version < 47) {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        // Shaped like the live store: an account plan, account-less calls that
+        // name a vault credential, and key-only vault history with operator
+        // and config sources.
+        conn.execute_batch(
+            "INSERT INTO account_subscription VALUES
+                 ('acct','openai','openai/pro',20000,'USD',2,'month',10,NULL,'vault');
+             INSERT INTO usage_event (event_id,producer,producer_ref,provider,auth_selection,
+                                      resolved_credential,occurred_at_ms,charge_basis,recorded_at_ms)
+             VALUES ('ollama','broca','ollama','ollama-cloud','apikey:ollama-cloud',NULL,20,
+                     'subscription_included',21),
+                    ('kimi','broca','kimi','kimi-code-plan-global','apikey:kimi-code-plan-global',
+                     'apikey:kimi-for-coding',30,'subscription_included',31);
+             INSERT INTO vault_plan_history(credential_id,provider,account_id,plan_tier,plan_key,
+                                            source,effective_from_ms,observed_at_ms)
+             VALUES ('apikey:ollama-cloud','ollama-cloud',NULL,'free','ollama-cloud/free','operator',5,6),
+                    ('apikey:kimi-for-coding','kimi-code-plan-global',NULL,'allegro',
+                     'kimi-code-plan-global/allegro','config',0,1);",
+        )
+        .unwrap();
+        let before = all_rows(&conn);
+        conn.execute_batch(MIGRATIONS[46].statements).unwrap();
+        assert_eq!(MIGRATIONS[46].version, 47);
+        let mut expected = before;
+        // all_rows lists tables by name.
+        let position =
+            expected.partition_point(|(name, _)| name.as_str() < "credential_subscription");
+        expected.insert(position, ("credential_subscription".into(), Vec::new()));
+        assert_eq!(all_rows(&conn), expected, "only the new empty table appears");
+
+        let insert = |from: i64, to: &str| {
+            format!(
+                "INSERT INTO credential_subscription VALUES
+                     ('apikey:ollama-cloud','ollama-cloud','ollama-cloud/free',0,'USD',0,'month',{from},{to},'vault')"
+            )
+        };
+        conn.execute_batch(&insert(20, "NULL")).unwrap();
+        for (sql, rule) in [
+            (insert(30, "NULL"), "credential_subscription_no_overlap"),
+            (insert(5, "25"), "credential_subscription_no_overlap"),
+            (
+                "UPDATE credential_subscription SET plan_name='changed'".into(),
+                "credential_subscription_update_guard",
+            ),
+            (
+                "UPDATE credential_subscription SET effective_to_ms=20".into(),
+                "credential_subscription_update_guard",
+            ),
+            (
+                "DELETE FROM credential_subscription".into(),
+                "credential_subscription_no_delete",
+            ),
+            (
+                "INSERT INTO credential_subscription VALUES ('','p','plan',0,'USD',0,'month',1,NULL,NULL)"
+                    .into(),
+                "CHECK constraint failed",
+            ),
+        ] {
+            refuse_without_effect(&conn, "credential_subscription", &sql, rule);
+        }
+        // Closing the open interval once is the only allowed update, after
+        // which a successor may start at the close.
+        conn.execute_batch("UPDATE credential_subscription SET effective_to_ms=40")
+            .unwrap();
+        refuse_without_effect(
+            &conn,
+            "credential_subscription",
+            "UPDATE credential_subscription SET effective_to_ms=50",
+            "credential_subscription_update_guard",
+        );
+        conn.execute_batch(&insert(40, "NULL")).unwrap();
+        // The overlap trigger is removed so it cannot hide a missing
+        // insert-once guard, as the other REPLACE tests do.
+        conn.execute_batch(
+            "PRAGMA recursive_triggers=OFF; DROP TRIGGER credential_subscription_no_overlap;",
+        )
+        .unwrap();
+        refuse_replacements(
+            &conn,
+            "credential_subscription",
+            "",
+            &[("operator", "'changed'")],
+        );
+        refuse_replacements(
+            &conn,
+            "credential_subscription",
+            "",
+            &[("rowid", "rowid"), ("provider", "'other'")],
+        );
+        // account_subscription keeps its own guards untouched.
+        refuse_without_effect(
+            &conn,
+            "account_subscription",
+            "DELETE FROM account_subscription",
+            "account_subscription_no_delete",
+        );
     }
 
     #[test]

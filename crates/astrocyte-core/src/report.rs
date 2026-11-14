@@ -27,7 +27,9 @@ use serde_json::Value;
 
 use crate::capacity::CapacityWindow;
 use crate::fact::{ChargeBasis, Measurement, UsageEvent};
-use crate::subscription::{recurring_cost_nanos, SubscriptionPeriod};
+use crate::subscription::{
+    plan_lookup_key, recurring_cost_nanos, PlanLedger, SubscriptionPeriod,
+};
 
 const INGEST_FRESHNESS_REASON: &str = "producer_relationship_state_unavailable";
 
@@ -1370,30 +1372,52 @@ pub struct SubscriptionRow {
     pub quantities: Vec<CoveredQuantity>,
 }
 
+/// A [`SubscriptionRow`] for a credential-keyed plan: the plan covers calls
+/// that report no account and were paid for by `credential_ref`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CredentialSubscriptionRow {
+    pub provider: String,
+    pub credential_ref: String,
+    pub period_start_ms: i64,
+    pub period_end_ms: i64,
+    pub plan_cost_nanos: i64,
+    pub covered_events: u64,
+    pub covered_measurements: u64,
+    pub quantities: Vec<CoveredQuantity>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionCoverage {
     pub events_total: u64,
     pub events_unpriced: u64,
     pub events_undated: u64,
     pub zero_measurement_events: u64,
-    /// Dated events that record no account. Every one of them is also counted
-    /// in `events_unpriced`: a plan covers one provider account, so an event
-    /// with no account can never be covered, and the account is a producer
-    /// fact that is never inferred. Counted on its own so these read as usage
-    /// nobody attributed rather than as usage no plan was declared for.
+    /// Dated events that record no account. The account is a producer fact
+    /// that is never inferred. Such an event can only be covered by a
+    /// credential-keyed plan, matched by the credential that paid for it; one
+    /// that is not is also counted in `events_unpriced`. Counted on its own so
+    /// these read as usage nobody attributed to an account rather than as
+    /// usage no plan was declared for.
     pub events_without_account: u64,
+    /// Dated events with no account that a credential-keyed plan covers. They
+    /// are counted in `credential_rows`, not in `events_unpriced`.
+    pub events_covered_by_credential: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionReport {
     pub rows: Vec<SubscriptionRow>,
+    /// Covered usage of credential-keyed plans, in the same shape as `rows`.
+    pub credential_rows: Vec<CredentialSubscriptionRow>,
     pub coverage: SubscriptionCoverage,
     pub ingest_freshness: IngestFreshness,
 }
 
+/// One plan interval of either ledger; `plan_ref` is the account for an
+/// account plan and the credential id for a credential plan.
 #[derive(Debug, Clone)]
 struct SubscriptionView {
-    account_ref: String,
+    plan_ref: String,
     provider: String,
     recurring_cost_minor: i64,
     amount_exponent: u32,
@@ -1424,7 +1448,7 @@ impl<'a> SubscriptionIndex<'a> {
                 .accounts
                 .entry(&plan.provider)
                 .or_default()
-                .entry(&plan.account_ref)
+                .entry(&plan.plan_ref)
                 .or_default();
             let latest_end_ms = match entries.last() {
                 None => plan.effective_to_ms,
@@ -1452,7 +1476,7 @@ impl<'a> SubscriptionIndex<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SubscriptionBucketKey {
-    account_ref: String,
+    plan_ref: String,
     provider: String,
     start_ms: i64,
     end_ms: i64,
@@ -1511,15 +1535,20 @@ fn subscription_report_base(
     filter: Option<&str>,
 ) -> Result<SubscriptionReport, ReportError> {
     let events = load_subscription_events(conn, filter)?;
-    let subscriptions = load_subscriptions(conn)?;
-    let plans = SubscriptionIndex::new(&subscriptions);
+    let account_plans = load_subscriptions(conn, PlanLedger::Account)?;
+    let credential_plans = load_subscriptions(conn, PlanLedger::Credential)?;
+    let plans = SubscriptionIndex::new(&account_plans);
+    let credential_index = SubscriptionIndex::new(&credential_plans);
     let mut rows: BTreeMap<SubscriptionBucketKey, SubscriptionAccumulator> = BTreeMap::new();
+    let mut credential_rows: BTreeMap<SubscriptionBucketKey, SubscriptionAccumulator> =
+        BTreeMap::new();
     let mut coverage = SubscriptionCoverage {
         events_total: 0,
         events_unpriced: 0,
         events_undated: 0,
         zero_measurement_events: 0,
         events_without_account: 0,
+        events_covered_by_credential: 0,
     };
 
     for event in &events {
@@ -1558,28 +1587,29 @@ fn subscription_report_base(
             add_count(&mut coverage.events_unpriced, 1)?;
             continue;
         };
-        let Some(account_ref) = event.account_ref.as_deref() else {
+        // The same lookup rule repricing decides coverage with.
+        let lookup = plan_lookup_key(
+            event.account_ref.as_deref(),
+            event.paying_credential.as_deref(),
+        );
+        let found = match lookup {
+            Some((PlanLedger::Account, plan_ref)) => plans
+                .find(provider, plan_ref, occurred_at_ms)
+                .map(|plan| (plan, plan_ref, &mut rows)),
+            Some((PlanLedger::Credential, plan_ref)) => credential_index
+                .find(provider, plan_ref, occurred_at_ms)
+                .map(|plan| (plan, plan_ref, &mut credential_rows)),
+            None => None,
+        };
+        let Some((plan, plan_ref, bucket_rows)) = found else {
             add_count(&mut coverage.events_unpriced, 1)?;
             continue;
         };
-        let Some(plan) = plans.find(provider, account_ref, occurred_at_ms) else {
-            add_count(&mut coverage.events_unpriced, 1)?;
-            continue;
-        };
-        let (period_start_ms, natural_end_ms) = subscription_period_bounds(plan, occurred_at_ms)?;
-        let period_end_ms = plan.effective_to_ms.map_or(natural_end_ms, |effective_to| {
-            natural_end_ms.min(effective_to)
-        });
-        let plan_cost_nanos = recurring_cost_nanos(plan.recurring_cost_minor, plan.amount_exponent)
-            .map_err(|_| ReportError::Arithmetic)?;
-        let key = SubscriptionBucketKey {
-            account_ref: account_ref.into(),
-            provider: provider.into(),
-            start_ms: period_start_ms,
-            end_ms: period_end_ms,
-            plan_cost_nanos,
-        };
-        let accumulator = rows.entry(key).or_default();
+        if lookup.is_some_and(|(ledger, _)| ledger == PlanLedger::Credential) {
+            add_count(&mut coverage.events_covered_by_credential, 1)?;
+        }
+        let key = subscription_bucket(plan, plan_ref, provider, occurred_at_ms)?;
+        let accumulator = bucket_rows.entry(key).or_default();
         // The ordered loader yields each event once, and each event enters one bucket.
         add_count(&mut accumulator.covered_events, 1)?;
         for measurement in &event.measurements {
@@ -1602,8 +1632,44 @@ fn subscription_report_base(
         }
     }
 
-    let rows = rows
-        .into_iter()
+    Ok(SubscriptionReport {
+        rows: subscription_rows(rows)?,
+        credential_rows: subscription_rows(credential_rows)?
+            .into_iter()
+            .map(credential_row)
+            .collect(),
+        coverage,
+        ingest_freshness: load_ingest_freshness(conn)?,
+    })
+}
+
+/// The bucket an event covered by `plan` at `instant_ms` is counted in: the
+/// plan's billing period holding the instant, cut at the plan's end.
+fn subscription_bucket(
+    plan: &SubscriptionView,
+    plan_ref: &str,
+    provider: &str,
+    instant_ms: i64,
+) -> Result<SubscriptionBucketKey, ReportError> {
+    let (period_start_ms, natural_end_ms) = subscription_period_bounds(plan, instant_ms)?;
+    let period_end_ms = plan.effective_to_ms.map_or(natural_end_ms, |effective_to| {
+        natural_end_ms.min(effective_to)
+    });
+    let plan_cost_nanos = recurring_cost_nanos(plan.recurring_cost_minor, plan.amount_exponent)
+        .map_err(|_| ReportError::Arithmetic)?;
+    Ok(SubscriptionBucketKey {
+        plan_ref: plan_ref.into(),
+        provider: provider.into(),
+        start_ms: period_start_ms,
+        end_ms: period_end_ms,
+        plan_cost_nanos,
+    })
+}
+
+fn subscription_rows(
+    rows: BTreeMap<SubscriptionBucketKey, SubscriptionAccumulator>,
+) -> Result<Vec<SubscriptionRow>, ReportError> {
+    rows.into_iter()
         .map(|(key, accumulator)| {
             let quantities = accumulator
                 .quantities
@@ -1620,7 +1686,7 @@ fn subscription_report_base(
                 .collect::<Result<Vec<_>, ReportError>>()?;
             Ok(SubscriptionRow {
                 provider: key.provider,
-                account_ref: key.account_ref,
+                account_ref: key.plan_ref,
                 period_start_ms: key.start_ms,
                 period_end_ms: key.end_ms,
                 plan_cost_nanos: key.plan_cost_nanos,
@@ -1629,13 +1695,21 @@ fn subscription_report_base(
                 quantities,
             })
         })
-        .collect::<Result<Vec<_>, ReportError>>()?;
+        .collect()
+}
 
-    Ok(SubscriptionReport {
-        rows,
-        coverage,
-        ingest_freshness: load_ingest_freshness(conn)?,
-    })
+/// A credential plan's bucket, built as an account row, under its own name.
+fn credential_row(row: SubscriptionRow) -> CredentialSubscriptionRow {
+    CredentialSubscriptionRow {
+        provider: row.provider,
+        credential_ref: row.account_ref,
+        period_start_ms: row.period_start_ms,
+        period_end_ms: row.period_end_ms,
+        plan_cost_nanos: row.plan_cost_nanos,
+        covered_events: row.covered_events,
+        covered_measurements: row.covered_measurements,
+        quantities: row.quantities,
+    }
 }
 
 /// A subscription-included event with each measurement's current head outcome.
@@ -1644,6 +1718,8 @@ struct SubscriptionEvent {
     occurred_at_ms: Option<i64>,
     provider: Option<String>,
     account_ref: Option<String>,
+    /// `resolved_credential`, else `auth_selection`.
+    paying_credential: Option<String>,
     measurements: Vec<SubscriptionMeasurement>,
 }
 
@@ -1688,7 +1764,8 @@ fn load_subscription_events(
     let filter = filter.map_or_else(String::new, |filter| format!(" AND ({filter})"));
     let mut statement = conn.prepare(&format!(
         "SELECT e.rowid,e.occurred_at_ms,e.provider,e.account_ref,
-                m.role,m.unit,m.quantity_units,m.quantity_exponent,head.outcome,m.kind
+                m.role,m.unit,m.quantity_units,m.quantity_exponent,head.outcome,m.kind,
+                COALESCE(e.resolved_credential,e.auth_selection)
          FROM usage_event e
          LEFT JOIN measurement m ON m.event_key=e.event_key
          LEFT JOIN priced_charge head
@@ -1710,6 +1787,7 @@ fn load_subscription_events(
                 occurred_at_ms: row.get(1)?,
                 provider: row.get(2)?,
                 account_ref: row.get(3)?,
+                paying_credential: row.get(10)?,
                 measurements: Vec::new(),
             });
         }
@@ -1732,12 +1810,16 @@ fn load_subscription_events(
     Ok(events)
 }
 
-fn load_subscriptions(conn: &Connection) -> Result<Vec<SubscriptionView>, ReportError> {
-    let mut statement = conn.prepare(
-        "SELECT account_ref,provider,recurring_cost_minor,amount_exponent,period,
+fn load_subscriptions(
+    conn: &Connection,
+    ledger: PlanLedger,
+) -> Result<Vec<SubscriptionView>, ReportError> {
+    let (table, key) = (ledger.table(), ledger.key_column());
+    let mut statement = conn.prepare(&format!(
+        "SELECT {key},provider,recurring_cost_minor,amount_exponent,period,
                 effective_from_ms,effective_to_ms
-         FROM account_subscription ORDER BY provider,account_ref,effective_from_ms",
-    )?;
+         FROM {table} ORDER BY provider,{key},effective_from_ms"
+    ))?;
     let rows = statement.query_map([], |row| {
         let period = match row.get::<_, String>(4)?.as_str() {
             "month" => SubscriptionPeriod::Month,
@@ -1745,7 +1827,7 @@ fn load_subscriptions(conn: &Connection) -> Result<Vec<SubscriptionView>, Report
             _ => return Err(rusqlite::Error::InvalidQuery),
         };
         Ok(SubscriptionView {
-            account_ref: row.get(0)?,
+            plan_ref: row.get(0)?,
             provider: row.get(1)?,
             recurring_cost_minor: row.get(2)?,
             amount_exponent: u32::try_from(row.get::<_, i64>(3)?)
@@ -2880,7 +2962,7 @@ mod tests {
         ] {
             for period in [SubscriptionPeriod::Month, SubscriptionPeriod::Year] {
                 let plan = SubscriptionView {
-                    account_ref: "account".into(),
+                    plan_ref: "account".into(),
                     provider: "provider".into(),
                     recurring_cost_minor: 10,
                     amount_exponent: 0,
@@ -2993,7 +3075,7 @@ mod tests {
             [(10, Some(20)), (30, Some(50)), (40, Some(45)), (60, None)].map(|(from, to)| {
                 SubscriptionView {
                     provider: "provider".into(),
-                    account_ref: "account".into(),
+                    plan_ref: "account".into(),
                     recurring_cost_minor: from,
                     amount_exponent: 0,
                     period: SubscriptionPeriod::Month,
