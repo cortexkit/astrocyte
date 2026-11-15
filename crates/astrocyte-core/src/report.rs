@@ -2277,6 +2277,7 @@ pub struct ThalamusPayerCoverage {
     pub unmatched_main_rows: u64,
     pub set_aside_payer_rows: u64,
     pub owner_disagreements: u64,
+    pub cache_split_mismatches: u64,
     pub waiting_calls_by_reader: BTreeMap<String, usize>,
 }
 
@@ -2300,6 +2301,7 @@ fn load_thalamus_payer_coverage(
             "unmatched_main" => coverage.unmatched_main_rows = count,
             "set_aside" => coverage.set_aside_payer_rows = count,
             "owner_disagreement" => coverage.owner_disagreements = count,
+            "cache_split_mismatch" => coverage.cache_split_mismatches = count,
             _ => {}
         }
     }
@@ -2692,6 +2694,28 @@ mod tests {
     }
 
     #[test]
+    fn thalamus_payer_coverage_cache_split_mismatches_are_distinct() {
+        let conn = conn();
+        conn.execute_batch("INSERT OR IGNORE INTO thalamus_payer_coverage VALUES ('cache_split_mismatch','event-a');
+            INSERT OR IGNORE INTO thalamus_payer_coverage VALUES ('cache_split_mismatch','event-a');
+            INSERT OR IGNORE INTO thalamus_payer_coverage VALUES ('cache_split_mismatch','event-b');").unwrap();
+        for report in [
+            ledger_coverage(&conn, &LedgerCoverageRequest {}, 100).unwrap(),
+            ledger_coverage_base(&conn, &LedgerCoverageRequest {}, 100).unwrap(),
+        ] {
+            let wire = serde_json::to_value(report).unwrap();
+            assert_eq!(
+                wire["thalamus_payer"]["cache_split_mismatches"],
+                serde_json::json!(2)
+            );
+            assert_eq!(
+                wire["thalamus_payer"]["set_aside_payer_rows"],
+                serde_json::json!(0)
+            );
+        }
+    }
+
+    #[test]
     fn thalamus_payer_coverage_owner_disagreements_are_distinct_and_explicit_zero() {
         let conn = conn();
         conn.execute(
@@ -2707,6 +2731,7 @@ mod tests {
             "unmatched_main_rows",
             "set_aside_payer_rows",
             "owner_disagreements",
+            "cache_split_mismatches",
         ] {
             assert_eq!(wire["thalamus_payer"][counter], serde_json::json!(0));
         }

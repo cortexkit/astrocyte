@@ -119,7 +119,9 @@ CREATE TABLE payer_record (
 - `auth_selection`: the vault record id of the login used, as the vault names it.
 - `account_ref`: the provider account id, when known.
 - `outcome`, `provider_request_id`, `provider_response_id`: informational.
-- `usage_json`: required on every row-less kind, NULL on `main` rows. It is one
+- `usage_json`: required on every row-less kind; `main` rows follow the
+  [cache-write lifetime amendment](#amendment-2026-11-15-cache-write-lifetimes-on-main-rows).
+  For row-less kinds it is one
   JSON object in the shape of BROCA's `bill-attempts/v1` envelope usage:
   - `usage`: an object with any of `input_tokens`, `cached_input_tokens` (cache
     read), `cache_write_tokens`, `output_tokens` and `reasoning_tokens`, each a
@@ -159,7 +161,8 @@ and reading continues.
 - **A matched `main` row** gives its transcript call that charge basis,
   `auth_selection` and `account_ref`. A subscription call is then covered by
   its account's ledger plan, and a metered call is priced at list rates. The
-  transcript stays the source of the token counts.
+  transcript stays the source of the token counts, with the cache-write
+  lifetime refinement allowed by the amendment below.
 - **Waiting.** The payer row and the transcript row are written separately. A
   completed transcript call in a session listed in `payer_session` waits up to
   10 minutes, the readers' existing quiet window, for its payer row. Without
@@ -191,3 +194,46 @@ keeps itself. While the store doesn't exist, astrocyte counts each full pass
 as a complete read of nothing, so the watermark keeps moving: any row written
 later is newer than it. A `payer_session` row is deleted with the session's last
 `payer_record` row. The harness module never deletes an unread row on a timer.
+
+## Amendment 2026-11-15: cache-write lifetimes on main rows
+
+This additive amendment keeps schema version 1 and the existing row-less usage
+envelope unchanged. A `main` row's `usage_json` is either SQL NULL, as before, or
+exactly this JSON object:
+
+```json
+{"cache_write_5m_tokens": 4, "cache_write_1h_tokens": 7}
+```
+
+Both members are required non-negative integers; no other member is allowed.
+THALAMUS writes the object only when the plugin reported both lifetime counts
+for that same physical request. It never fills an absent part with zero and
+never infers either part. A reported zero is retained. Every row for a resent
+request carries that physical request's own counts.
+
+For a newly recorded transcript call, astrocyte uses a matched `main` split only
+when the two counts sum exactly to that call's own reported cache-write total.
+It replaces the plain cache-write measurement with two billed measurements,
+using units `token_cache_5m` and `token_cache_1h`, integer quantities and exponent
+0, including a measurement for a zero part. The rule is arithmetic, regardless
+of provider. Other measurements and payer attribution are unchanged.
+
+If multiple otherwise matching payer rows report a split, all reported splits
+must agree before one can be used. A row with no split does not contradict a
+sibling's split. Disagreeing splits, a sum that differs from the transcript's
+total, or a transcript without a cache-write total keep the transcript's original
+measurements and count the call once as `cache_split_mismatch`, exposed as
+`cache_split_mismatches` in THALAMUS payer coverage. They are not errors or
+set-aside records. With no split, the call is recorded exactly as before.
+
+Any other non-NULL `usage_json` on a `main` row is still a contract violation:
+astrocyte sets the row aside as evidence and excludes it from matching, exactly
+as before. This includes missing parts, extra members and malformed values;
+these rows count as set aside, not also as cache-split mismatches. The transcript
+retains its original measurements under the existing payer wait and timeout
+rules. Non-`main` rows do not refine transcript usage and keep their full existing
+usage envelope.
+
+Only first recording may apply a split. Already recorded calls are immutable,
+including calls recorded before a split was available; a payer row arriving
+after its call was recorded is counted as late and ignored as before.

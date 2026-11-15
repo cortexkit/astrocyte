@@ -393,8 +393,8 @@ fn record_row(tx: &Transaction<'_>, record: &Record, at: i64) -> Result<Option<S
         return Ok(Some("unknown payer harness".into()));
     }
     if record.request_kind == "main" {
-        if record.usage_json.is_some() {
-            return Ok(Some("main row must not carry usage_json".into()));
+        if let Err(reason) = main_cache_split(record.usage_json.as_deref()) {
+            return Ok(Some(reason));
         }
         if let Some(step) = &record.step_ref {
             mark_conflicts(tx, &record.harness, step, at)?;
@@ -513,17 +513,66 @@ pub(crate) enum PayerMatch {
         basis: ChargeBasis,
         auth: String,
         account: Option<String>,
+        cache_split: CacheSplitMatch,
     },
 }
 
-type MirroredPayer = (String, Option<String>, String, Option<String>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CacheWriteSplit {
+    pub(crate) cache_write_5m_tokens: u64,
+    pub(crate) cache_write_1h_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheSplitMatch {
+    Missing,
+    Agreed(CacheWriteSplit),
+    Disagreement,
+}
+
+fn main_cache_split(json: Option<&str>) -> Result<Option<CacheWriteSplit>, String> {
+    json.map(|json| {
+        // Serde also accepts a struct as an array, but main usage must be an object.
+        if !json.trim_start().starts_with('{') {
+            return Err("main row must not carry usage_json".to_string());
+        }
+        serde_json::from_str(json).map_err(|_| "main row must not carry usage_json".to_string())
+    })
+    .transpose()
+}
+
+struct MirroredPayer {
+    attempt: String,
+    charge: Option<String>,
+    auth: String,
+    account: Option<String>,
+    cache_split: Option<CacheWriteSplit>,
+}
 
 fn payer_rows(
     tx: &Transaction<'_>,
     harness: &str,
     step: &str,
 ) -> Result<Vec<MirroredPayer>, String> {
-    tx.prepare("SELECT attempt_id,charge_basis,auth_selection,account_ref FROM thalamus_payer_record WHERE harness=?1 AND step_ref=?2 AND request_kind='main' AND usage_json IS NULL ORDER BY attempt_id").map_err(sql)?.query_map(params![harness,step],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(sql)?.collect::<rusqlite::Result<Vec<_>>>().map_err(sql)
+    let mut statement = tx.prepare("SELECT attempt_id,charge_basis,auth_selection,account_ref,usage_json FROM thalamus_payer_record WHERE harness=?1 AND step_ref=?2 AND request_kind='main' ORDER BY attempt_id").map_err(sql)?;
+    let mut query = statement.query(params![harness, step]).map_err(sql)?;
+    let mut rows = Vec::new();
+    while let Some(row) = query.next().map_err(sql)? {
+        let usage: Option<String> = row.get(4).map_err(sql)?;
+        // Invalid main usage remains mirrored as evidence, never as payer facts.
+        let Ok(cache_split) = main_cache_split(usage.as_deref()) else {
+            continue;
+        };
+        rows.push(MirroredPayer {
+            attempt: row.get(0).map_err(sql)?,
+            charge: row.get(1).map_err(sql)?,
+            auth: row.get(2).map_err(sql)?,
+            account: row.get(3).map_err(sql)?,
+            cache_split,
+        });
+    }
+    Ok(rows)
 }
 
 pub(crate) fn payer_match(
@@ -532,21 +581,27 @@ pub(crate) fn payer_match(
     step: &str,
 ) -> Result<PayerMatch, String> {
     let rows = payer_rows(tx, harness, step)?;
-    let Some((_, charge, auth, account)) = rows.first() else {
+    let Some(first) = rows.first() else {
         return Ok(PayerMatch::Missing);
     };
-    if rows
-        .iter()
-        .any(|(_, other_charge, other_auth, other_account)| {
-            (other_charge, other_auth, other_account) != (charge, auth, account)
-        })
-    {
+    if rows.iter().any(|row| {
+        (&row.charge, &row.auth, &row.account) != (&first.charge, &first.auth, &first.account)
+    }) {
         return Ok(PayerMatch::Conflict);
     }
+    // A request with no reported parts cannot contradict a sibling's split,
+    // but differing reported parts cannot safely identify one physical request.
+    let mut splits = rows.iter().filter_map(|row| row.cache_split);
+    let cache_split = match splits.next() {
+        None => CacheSplitMatch::Missing,
+        Some(split) if splits.all(|other| other == split) => CacheSplitMatch::Agreed(split),
+        Some(_) => CacheSplitMatch::Disagreement,
+    };
     Ok(PayerMatch::Found {
-        basis: basis(charge.as_deref()),
-        auth: auth.clone(),
-        account: account.clone(),
+        basis: basis(first.charge.as_deref()),
+        auth: first.auth.clone(),
+        account: first.account.clone(),
+        cache_split,
     })
 }
 
@@ -559,7 +614,8 @@ pub(crate) fn mark_conflicts(
     if payer_match(tx, harness, step)? != PayerMatch::Conflict {
         return Ok(());
     }
-    for (attempt, _, _, _) in payer_rows(tx, harness, step)? {
+    for row in payer_rows(tx, harness, step)? {
+        let attempt = row.attempt;
         harness_drain::record_set_aside_in_tx(
             tx,
             SOURCE_KEY,

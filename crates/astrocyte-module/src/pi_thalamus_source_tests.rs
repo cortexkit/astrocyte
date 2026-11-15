@@ -109,6 +109,32 @@ fn missing_roots_is_absent_and_health_unchanged() {
 }
 
 #[test]
+fn pi_payer_cache_split_resolves_a_wait_with_lifetime_measurements() {
+    let f = Fixture::new();
+    f.call();
+    f.managed();
+    f.declare(vec![f.root()]);
+    f.tick(1001);
+    assert_eq!(f.count("usage_event"), 0);
+    f.state.ordered_write(|tx| {
+        tx.execute("INSERT INTO thalamus_payer_record(attempt_id,seq,incarnation,harness,session,request_kind,step_ref,recorded_at_ms,provider,model,charge_basis,auth_selection,usage_json) VALUES ('attempt',1,'first','pi','pi-synthetic-one','main','pi:response:pi-synthetic-response',1002,'anthropic','claude-sonnet-4','metered_api','synthetic-login',?1)", [r#"{"cache_write_5m_tokens":5,"cache_write_1h_tokens":12}"#]).unwrap();
+        Ok(((),true))
+    }).unwrap();
+    f.tick(1002);
+    f.state.with_conn(|conn| {
+        let writes = conn.prepare("SELECT unit,quantity_units,quantity_exponent FROM measurement WHERE role='cache_write' ORDER BY unit").unwrap()
+            .query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(writes, vec![("token_cache_1h".into(),12,0),("token_cache_5m".into(),5,0)]);
+        Ok(())
+    }).unwrap();
+    assert_eq!(f.count("usage_event"), 1);
+    assert_eq!(
+        f.acks()["read_through"],
+        json!([{"session":"core-conversation","at_ms":1002}])
+    );
+}
+
+#[test]
 fn null_session_uses_header_for_payer_and_records_owner_and_work_class() {
     let f = Fixture::new();
     f.call();

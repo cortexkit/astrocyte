@@ -431,8 +431,10 @@ Reads never write. A refusal on a read is one of the codes below.
   Test: `media_skipped_local_coverage_is_live_on_base_and_hourly_paths`.
   Optional `thalamus_payer` reports lifetime counts of distinct identities:
   `transcript_calls_without_payer` (timeout or queue overflow), `late_payer_rows`,
-  `unmatched_main_rows`, `set_aside_payer_rows` and `owner_disagreements` (a roots
-  owner differing from the payer session owner). These counters include explicit
+  `unmatched_main_rows`, `set_aside_payer_rows`, `owner_disagreements` (a roots
+  owner differing from the payer session owner) and `cache_split_mismatches`
+  (well-formed main cache-write splits that disagree with one another or do not
+  match a transcript cache-write total). These counters include explicit
   zeroes when payer coverage is present. Replays do not increase them.
   Its additive `waiting_calls_by_reader` map reports current process-local queue
   lengths by reader source key, including explicit zero after a queue drains.

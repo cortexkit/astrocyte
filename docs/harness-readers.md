@@ -597,6 +597,7 @@ when the entry has no `requestId`, which THALAMUS then stores as `step_ref`),
 OpenCode's message id or Pi's shared `pi_step_ref`. Only `subscription_included` and `metered_api`
 are known bases; other values and NULL stay unknown. A matching row supplies
 `auth_selection` and `account_ref` without guessing from the login's type.
+On first recording, an exact two-part `main` cache-write split replaces the transcript's total with 5-minute and 1-hour measurements only when their sum matches that total; otherwise the original measurements remain, with mismatches counted in payer coverage (see the [contract amendment](thalamus-payer-records-contract.md#amendment-2026-11-15-cache-write-lifetimes-on-main-rows)).
 Without a matching row, the parsed call waits in the reader's bounded queue
 until ten minutes after completion. If completion is undated, its first observed
 time is persisted so a restart does not reset the wait. Queues are checked before

@@ -8,7 +8,9 @@ use astrocyte_core::{
 };
 use rusqlite::{params, OptionalExtension, Transaction};
 
-use super::thalamus_payer_source::{count_coverage, mark_conflicts, payer_match, PayerMatch};
+use super::thalamus_payer_source::{
+    count_coverage, mark_conflicts, payer_match, CacheSplitMatch, PayerMatch,
+};
 
 pub(crate) const PAYER_WAIT_MS: i64 = 600_000;
 pub(crate) const MAX_WAITING_CALLS: usize = 10_000;
@@ -188,10 +190,14 @@ impl WaitQueue {
                     basis,
                     auth,
                     account,
+                    cache_split,
                 } => {
                     ready.charge_basis = basis;
                     ready.auth_selection = Some(auth);
                     ready.account_ref = account;
+                    if !apply_cache_split(&mut ready, cache_split)? {
+                        count_coverage(tx, "cache_split_mismatch", &id)?;
+                    }
                 }
                 PayerMatch::Conflict => {
                     mark_conflicts(tx, harness, &request.producer_ref, now_ms)?;
@@ -228,6 +234,60 @@ impl WaitQueue {
         }
         Ok(result)
     }
+}
+
+fn apply_cache_split(
+    request: &mut EventRecordRequest,
+    split: CacheSplitMatch,
+) -> Result<bool, String> {
+    let split = match split {
+        CacheSplitMatch::Missing => return Ok(true),
+        CacheSplitMatch::Disagreement => return Ok(false),
+        CacheSplitMatch::Agreed(split) => split,
+    };
+    let mut writes = request
+        .measurements
+        .iter()
+        .filter(|m| m.role == "cache_write");
+    let Some(total) = writes.next() else {
+        return Ok(false);
+    };
+    // The transcript must supply one exact total. Already split, unknown or
+    // fractional measurements cannot authorize replacing its cache-write facts.
+    if writes.next().is_some()
+        || total.unit != "token"
+        || total.kind != "billed"
+        || total.quantity_exponent != Some(0)
+    {
+        return Ok(false);
+    }
+    let total = total.quantity_units.and_then(|n| u64::try_from(n).ok());
+    let sum = split
+        .cache_write_5m_tokens
+        .checked_add(split.cache_write_1h_tokens);
+    if sum.is_none() || sum != total {
+        return Ok(false);
+    }
+    let measurements = [
+        (
+            "token_cache_5m",
+            "thalamus-payer.cache_write_5m_tokens",
+            split.cache_write_5m_tokens,
+        ),
+        (
+            "token_cache_1h",
+            "thalamus-payer.cache_write_1h_tokens",
+            split.cache_write_1h_tokens,
+        ),
+    ]
+    .into_iter()
+    .map(|(unit, source, quantity)| {
+        super::harness_drain::measurement_with_unit("cache_write", unit, source, Some(quantity))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    request.measurements.retain(|m| m.role != "cache_write");
+    request.measurements.extend(measurements);
+    Ok(true)
 }
 
 fn unknown(request: &mut EventRecordRequest) {
