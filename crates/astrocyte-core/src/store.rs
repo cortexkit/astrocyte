@@ -9063,14 +9063,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "astrocyte-wal-limit-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.db");
         let conn = Connection::open(&path).unwrap();
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
         initialize_connection(&conn).unwrap();
-        conn.execute_batch("CREATE TABLE filler(body BLOB NOT NULL)").unwrap();
+        conn.execute_batch("CREATE TABLE filler(body BLOB NOT NULL)")
+            .unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         for _ in 0..4_000 {
             tx.execute("INSERT INTO filler(body) VALUES (zeroblob(65536))", [])
@@ -9079,10 +9083,16 @@ mod tests {
         tx.commit().unwrap();
         let wal = path.with_extension("db-wal");
         let grown = std::fs::metadata(&wal).unwrap().len();
-        assert!(grown > 2 * STORE_WAL_SIZE_LIMIT_BYTES, "the large write grew the WAL to {grown}");
-        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(())).unwrap();
-        conn.execute("INSERT INTO filler(body) VALUES (x'00')", []).unwrap();
-        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(())).unwrap();
+        assert!(
+            grown > 2 * STORE_WAL_SIZE_LIMIT_BYTES,
+            "the large write grew the WAL to {grown}"
+        );
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+            .unwrap();
+        conn.execute("INSERT INTO filler(body) VALUES (x'00')", [])
+            .unwrap();
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+            .unwrap();
         let after = std::fs::metadata(&wal).unwrap().len();
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
