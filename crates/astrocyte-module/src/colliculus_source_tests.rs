@@ -2,11 +2,13 @@ use super::*;
 use crate::refresher::harness_drain::HarnessSource;
 use crate::state::test_state;
 use crate::test_support::Background;
+use astrocyte_core::catalog_client::{CatalogCallError, CatalogClient, CatalogConnection};
 use std::sync::{Arc, Mutex};
 use subc_protocol::FrameType;
 use subc_protocol::{Flags, Frame, Priority};
 
 type Reply = Arc<dyn Fn(&Value) -> (FrameType, Value) + Send + Sync>;
+type ByteReply = Arc<dyn Fn(&Value) -> (FrameType, Vec<u8>) + Send + Sync>;
 
 struct Peer {
     path: PathBuf,
@@ -16,6 +18,18 @@ struct Peer {
 
 impl Peer {
     fn start(reply: Reply) -> Self {
+        Self::start_bytes(Arc::new(move |value| {
+            let (kind, mut value) = reply(value);
+            // Error frames require a message even when a fixture cares only
+            // about the structural code.
+            if kind == FrameType::Error && value.get("message").is_none() {
+                value["message"] = json!("fixture refusal");
+            }
+            (kind, serde_json::to_vec(&value).unwrap())
+        }))
+    }
+
+    fn start_bytes(reply: ByteReply) -> Self {
         let (listener, path, mut connection) =
             crate::test_support::fake_daemon("media-feed", 41, 42);
         connection.daemon_ver = "0.39.0".into();
@@ -39,13 +53,8 @@ impl Peer {
                                 while let Ok(Some(request)) = read_frame(&mut stream).await {
                                     let value: Value = serde_json::from_slice(&request.body).unwrap();
                                     capture.lock().unwrap().push(value.clone());
-                                    let (kind, mut value) = reply(&value);
-                                    // Error frames require a message even when a
-                                    // fixture cares only about the structural code.
-                                    if kind == FrameType::Error && value.get("message").is_none() {
-                                        value["message"] = json!("fixture refusal");
-                                    }
-                                    let response = Frame::build(kind, Flags::new(false, Priority::Passive, false), request.header.channel, request.header.epoch, request.header.corr, serde_json::to_vec(&value).unwrap()).unwrap();
+                                    let (kind, body) = reply(&value);
+                                    let response = Frame::build(kind, Flags::new(false, Priority::Passive, false), request.header.channel, request.header.epoch, request.header.corr, body).unwrap();
                                     if write_frame(&mut stream, &response).await.is_err() || stream.flush().await.is_err() { return; }
                                 }
                             });
@@ -170,6 +179,90 @@ fn fixed_page(entries: Vec<Value>) -> Reply {
                 .collect(),
         ))
     })
+}
+
+fn voice_call_v1_reply() -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
+    let directory =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/colliculus-voice-call-v1");
+    let manifest = std::fs::read(directory.join("SHA256SUMS")).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&manifest)),
+        "417f1c5329ade4bf9105585479842432dea9105358066fb03258b1a5ca8c01e2"
+    );
+    let mut listed = Vec::new();
+    for line in std::str::from_utf8(&manifest).unwrap().lines() {
+        let (expected, file) = line.split_once("  ").unwrap();
+        let bytes = std::fs::read(directory.join(file)).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            expected,
+            "{file} differs from the upstream sample"
+        );
+        listed.push(file);
+    }
+    assert_eq!(
+        listed,
+        [
+            "README.md",
+            "usage_read.request.json",
+            "usage_read.response.json"
+        ]
+    );
+    std::fs::read(directory.join("usage_read.response.json")).unwrap()
+}
+
+struct VoiceCallCatalog;
+
+impl CatalogConnection for VoiceCallCatalog {
+    fn catalog_status(
+        &self,
+        _: fusiform_protocol::StatusRequest,
+    ) -> Result<fusiform_protocol::StatusResponse, CatalogCallError> {
+        Ok(serde_json::from_value(json!({
+            "source":"voice-call-fixture", "catalog_version":1,
+            "model_count":2, "era_count":2, "recent_polls":[]
+        }))
+        .unwrap())
+    }
+
+    fn catalog_get(
+        &self,
+        request: fusiform_protocol::CatalogGetRequest,
+    ) -> Result<fusiform_protocol::CatalogGetResponse, CatalogCallError> {
+        if request.at_ms == Some(0) {
+            return Err(CatalogCallError {
+                code: "no_coverage".into(),
+                message: "fusiform's history begins at 1".into(),
+            });
+        }
+        // Supply every model-specific rate so a missing rate cannot explain why
+        // the producer's unknown charge basis leaves these measurements unpriced.
+        let rate = |units: i64, per: u64| {
+            json!({"state":"priced", "units":units, "exponent":9,
+                "currency":"USD", "per":per, "unit_provenance":{"kind":"stated"}})
+        };
+        Ok(serde_json::from_value(json!({
+            "source":"voice-call-fixture", "resolved_at_ms":request.at_ms,
+            "catalog_version":1,
+            "models":{
+                "openai/gpt-realtime-2.1":{
+                    "rate.input":rate(1_000_000, 1_000_000),
+                    "rate.input_audio":rate(2_000_000, 1_000_000),
+                    "rate.cache_read":rate(3_000_000, 1_000_000),
+                    "rate.cached_input_audio":rate(4_000_000, 1_000_000),
+                    "rate.output":rate(5_000_000, 1_000_000),
+                    "rate.output_audio":rate(6_000_000, 1_000_000)
+                },
+                "openai/gpt-live-transcribe":{
+                    "rate.input_audio.per_second":rate(8_000_000, 1)
+                }
+            },
+            "withheld":[], "uncertain":[], "overridden":[]
+        }))
+        .unwrap())
+    }
 }
 
 #[test]
@@ -509,6 +602,91 @@ fn media_usage_vectors_drain_with_invalid_and_unrepresentable_evidence() {
     );
     assert_eq!(peer.calls("usage.ack")[0]["params"]["through_seq"], 13);
     assert_eq!(state.producer_degraded_reason(SOURCE_KEY), None);
+}
+
+#[test]
+fn media_voice_call_v1_pinned_reply_preserves_records_and_unknown_basis() {
+    let bytes = voice_call_v1_reply();
+    let peer = Peer::start_bytes(Arc::new(move |value| {
+        let (kind, reply) = if value["op"] == "route.open" {
+            opened()
+        } else if value["method"] == "usage.ack" {
+            assert_eq!(value["params"]["through_seq"], 2);
+            result(json!({"acked_through_seq":2}))
+        } else {
+            assert_eq!(value["method"], "usage.read");
+            assert_eq!(value["params"]["limit"], 1_000);
+            if value["params"]["after_seq"] == 0 {
+                // Serve the pinned body verbatim so decoding sees the producer's
+                // bytes, not a reply reconstructed from Astrocyte's own types.
+                return (FrameType::Response, bytes.clone());
+            }
+            assert_eq!(value["params"]["after_seq"], 2);
+            result(page(vec![]))
+        };
+        (kind, serde_json::to_vec(&reply).unwrap())
+    }));
+    let state = test_state();
+    tick(&state, &peer.source());
+    assert_eq!(cursor(&state).as_deref(), Some("2"));
+    assert_eq!(count(&state, "usage_event"), 2);
+    assert_eq!(count(&state, "set_aside_record"), 0);
+    assert_eq!(count(&state, "rejected_delivery"), 0);
+    assert_eq!(state.producer_degraded_reason(SOURCE_KEY), None);
+    assert_eq!(peer.calls("usage.ack").len(), 1);
+    state.with_conn(|conn| {
+        let calls = conn.prepare("SELECT producer_ref,provider,model,run_ref,charge_basis FROM usage_event ORDER BY model").unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(calls, [
+            ("call:5b862f5e26ceb512ad86ec71468187693e4ab86ae5d2d3a509cba679fe292d81".into(), "openai".into(), "gpt-live-transcribe".into(), "invented-call".into(), "unknown".into()),
+            ("call:60c0f4816f92552125ad59d1f3443a69036c4cb928336dcf9936c7dd120eefd6".into(), "openai".into(), "gpt-realtime-2.1".into(), "invented-call".into(), "unknown".into()),
+        ]);
+        let measurements = conn.prepare("SELECT e.model,m.role,m.unit,m.kind,m.source,m.quantity_units,m.quantity_exponent FROM usage_event e JOIN measurement m USING(event_key) ORDER BY e.model,m.role").unwrap()
+            .query_map([], |row| Ok(json!([
+                row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?, row.get::<_, i32>(6)?
+            ]))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(json!(measurements), json!([
+            ["gpt-live-transcribe", "input_audio", "second", "billed", "vendor_reply", 3125, -3],
+            ["gpt-realtime-2.1", "cache_read", "token", "billed", "vendor_reply", 2, 0],
+            ["gpt-realtime-2.1", "cached_input_audio", "token", "billed", "vendor_reply", 1, 0],
+            ["gpt-realtime-2.1", "input", "token", "billed", "vendor_reply", 0, 0],
+            ["gpt-realtime-2.1", "input_audio", "token", "billed", "vendor_reply", 3, 0],
+            ["gpt-realtime-2.1", "output", "token", "billed", "vendor_reply", 0, 0],
+            ["gpt-realtime-2.1", "output_audio", "token", "billed", "vendor_reply", 5, 0]
+        ]));
+        Ok(())
+    }).unwrap();
+
+    state
+        .install_catalog(Some(
+            CatalogClient::connect(Arc::new(VoiceCallCatalog)).unwrap(),
+        ))
+        .unwrap();
+    let pass = crate::refresher::run_pricing_pass(&state, 2_000, &AtomicBool::new(false)).unwrap();
+    assert_eq!(pass.priced, 2);
+    assert_eq!(count(&state, "priced_charge"), 7);
+    state.with_conn(|conn| {
+        let charges = conn.prepare("SELECT e.model,m.role,m.unit,c.outcome,c.unpriced_reason,c.charge_nanos,c.currency,c.rate_units,c.rate_exponent FROM usage_event e JOIN measurement m USING(event_key) JOIN priced_charge c ON c.event_key=m.event_key AND c.role=m.role AND c.unit=m.unit WHERE NOT EXISTS (SELECT 1 FROM priced_charge child WHERE child.supersedes=c.charge_key) ORDER BY e.model,m.role").unwrap()
+            .query_map([], |row| Ok(json!([
+                row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, Option<i32>>(8)?
+            ]))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        // The producer omitted auth_method. Rates alone cannot establish a charge
+        // basis, so even zero-quantity measurements stay unpriced without a rate.
+        assert_eq!(json!(charges), json!([
+            ["gpt-live-transcribe", "input_audio", "second", "unpriced", "charge_basis_unknown", null, null, null, null],
+            ["gpt-realtime-2.1", "cache_read", "token", "unpriced", "charge_basis_unknown", null, null, null, null],
+            ["gpt-realtime-2.1", "cached_input_audio", "token", "unpriced", "charge_basis_unknown", null, null, null, null],
+            ["gpt-realtime-2.1", "input", "token", "unpriced", "charge_basis_unknown", null, null, null, null],
+            ["gpt-realtime-2.1", "input_audio", "token", "unpriced", "charge_basis_unknown", null, null, null, null],
+            ["gpt-realtime-2.1", "output", "token", "unpriced", "charge_basis_unknown", null, null, null, null],
+            ["gpt-realtime-2.1", "output_audio", "token", "unpriced", "charge_basis_unknown", null, null, null, null]
+        ]));
+        Ok(())
+    }).unwrap();
 }
 
 #[test]
