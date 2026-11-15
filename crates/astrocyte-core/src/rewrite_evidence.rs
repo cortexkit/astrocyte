@@ -73,6 +73,7 @@ pub(crate) fn save(
         "INSERT INTO step_evidence(harness,step_ref,runner,recorded_at_ms,facts_json,tools_key,system_key)
          VALUES (?1,?2,?3,?4,?5,?6,?7)
          ON CONFLICT(harness,step_ref) DO UPDATE SET runner=excluded.runner,
+             order_ms=COALESCE(json_extract(excluded.facts_json,'$.started_at_ms'),occurred_at_ms),
              facts_json=excluded.facts_json,tools_key=excluded.tools_key,system_key=excluded.system_key
          WHERE runner IS NOT excluded.runner OR facts_json IS NOT excluded.facts_json
              OR tools_key IS NOT excluded.tools_key OR system_key IS NOT excluded.system_key",
@@ -227,22 +228,59 @@ pub(crate) fn position(
     harness: &str,
     step_ref: &str,
 ) -> rusqlite::Result<Option<Position>> {
-    let stored = conn.query_row(
-        "SELECT row_json,COALESCE((SELECT first_feed_cursor FROM step_evidence WHERE harness=?1 AND step_ref=?2),
-             (SELECT MIN(feed_cursor) FROM step_feed WHERE harness=?1 AND step_ref=?2))
-         FROM step_feed WHERE harness=?1 AND step_ref=?2 ORDER BY feed_cursor DESC LIMIT 1",
-        params![harness,step_ref], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?))).optional()?;
+    conn.prepare_cached(
+        "SELECT runner,order_ms,first_feed_cursor FROM step_evidence
+        WHERE harness=?1 AND step_ref=?2 AND latest_feed_cursor IS NOT NULL",
+    )?
+    .query_row(params![harness, step_ref], |row| {
+        Ok(Position {
+            runner: row.get(0)?,
+            order: (row.get(1)?, row.get(2)?),
+        })
+    })
+    .optional()
+}
+
+const PREVIOUS_SQL: &str = "SELECT f.row_json,e.first_feed_cursor FROM step_evidence e
+    JOIN step_feed f ON f.feed_cursor=e.latest_feed_cursor
+    WHERE e.harness=?1 AND e.session=?2 AND e.runner IS ?3 AND e.step_ref<>?4
+      AND e.latest_feed_cursor IS NOT NULL AND (e.order_ms,e.first_feed_cursor)<(?5,?6)
+    ORDER BY e.order_ms DESC,e.first_feed_cursor DESC LIMIT 1";
+const NEXT_SQL: &str = "SELECT f.row_json,e.first_feed_cursor FROM step_evidence e
+    JOIN step_feed f ON f.feed_cursor=e.latest_feed_cursor
+    WHERE e.harness=?1 AND e.session=?2 AND e.runner IS ?3 AND e.step_ref<>?4
+      AND e.latest_feed_cursor IS NOT NULL AND (e.order_ms,e.first_feed_cursor)>(?5,?6)
+    ORDER BY e.order_ms,e.first_feed_cursor LIMIT 1";
+
+fn neighbour(
+    conn: &Connection,
+    sql: &str,
+    harness: &str,
+    session: &str,
+    excluded: &str,
+    position: &Position,
+) -> rusqlite::Result<Option<ComparedRow>> {
+    let stored = conn
+        .prepare_cached(sql)?
+        .query_row(
+            params![
+                harness,
+                session,
+                position.runner,
+                excluded,
+                position.order.0,
+                position.order.1
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get(1)?)),
+        )
+        .optional()?;
     stored
         .map(|(json, cursor)| {
-            let row = compared(
+            compared(
                 conn,
                 serde_json::from_str(&json).map_err(json_error)?,
                 cursor,
-            )?;
-            Ok(Position {
-                order: order(&row),
-                runner: row.runner,
-            })
+            )
         })
         .transpose()
 }
@@ -263,48 +301,29 @@ pub(crate) fn compute(
         "SELECT COALESCE((SELECT first_feed_cursor FROM step_evidence WHERE harness=?1 AND step_ref=?2),
             (SELECT MIN(feed_cursor) FROM step_feed WHERE harness=?1 AND step_ref=?2),
             (SELECT COALESCE(MAX(feed_cursor),0)+1 FROM step_feed))", params![harness, step_ref], |row| row.get(0))?;
-    // Preserve the tie-break through replacement emissions and feed pruning.
-    // File-only rows have unknown runner identity and no invented event facts.
-    conn.execute(
-        "INSERT INTO step_evidence(harness,step_ref,recorded_at_ms,facts_json,first_feed_cursor)
-        VALUES (?1,?2,?3,'{}',?4) ON CONFLICT(harness,step_ref) DO UPDATE
-        SET first_feed_cursor=excluded.first_feed_cursor WHERE first_feed_cursor IS NULL",
-        params![harness, step_ref, now_ms, first_cursor],
-    )?;
     let current = compared(conn, body.clone(), first_cursor)?;
-    let stored = conn.prepare_cached(
-        "SELECT f.row_json,COALESCE((SELECT first_feed_cursor FROM step_evidence e
-             WHERE e.harness=f.harness AND e.step_ref=f.step_ref),
-             (SELECT MIN(x.feed_cursor) FROM step_feed x WHERE x.harness=f.harness AND x.step_ref=f.step_ref))
-         FROM step_feed f WHERE f.session=?1 AND f.harness=?2 AND f.step_ref<>?3
-           AND NOT EXISTS (SELECT 1 FROM step_feed n WHERE n.harness=f.harness
-             AND n.step_ref=f.step_ref AND n.feed_cursor>f.feed_cursor)",
-    )?.query_map(params![session, harness, step_ref], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut others = Vec::new();
-    for (json, cursor) in stored {
-        let other = compared(
-            conn,
-            serde_json::from_str(&json).map_err(json_error)?,
-            cursor,
-        )?;
-        others.push(other);
-    }
-    others.sort_by_key(order);
-    let prev = others
-        .iter()
-        .rev()
-        .find(|other| other.runner == current.runner && order(other) < order(&current));
-    let computed = rewrite_cause(prev.map(|other| &other.row), &current.row);
-    record_cause(conn, &current.row, computed.clone())?;
-    body.remove("cause");
-    if let Some(cause) = computed {
-        body.insert("cause".into(), Value::from(cause.as_str()));
-    }
+    // Preserve the tie-break through replacements. File-only placeholders also
+    // need ordering keys, without inventing any runner-event facts.
+    conn.execute(
+        "INSERT INTO step_evidence(harness,step_ref,recorded_at_ms,facts_json,first_feed_cursor,session,order_ms)
+        VALUES (?1,?2,?3,'{}',?4,?5,?6) ON CONFLICT(harness,step_ref) DO UPDATE
+        SET first_feed_cursor=excluded.first_feed_cursor,session=excluded.session,order_ms=excluded.order_ms",
+        params![harness, step_ref, now_ms, first_cursor,session,order(&current).0],
+    )?;
     let new_position = Position {
         runner: current.runner.clone(),
         order: order(&current),
     };
+    let prev = neighbour(
+        conn,
+        PREVIOUS_SQL,
+        harness,
+        session,
+        step_ref,
+        &new_position,
+    )?;
+    let computed = rewrite_cause(prev.as_ref().map(|other| &other.row), &current.row);
+    record_cause(conn, &current.row, computed.clone())?;
     let mut positions = vec![new_position.clone()];
     if let Some(old) = old_position.filter(|old| *old != new_position) {
         positions.push(old);
@@ -312,20 +331,33 @@ pub(crate) fn compute(
     let mut corrections = Vec::new();
     let mut visited = Vec::new();
     for position in positions {
-        let Some(next) = others
-            .iter()
-            .find(|other| other.runner == position.runner && order(other) > position.order)
-        else {
+        let Some(next) = neighbour(conn, NEXT_SQL, harness, session, step_ref, &position)? else {
             continue;
         };
-        if visited.contains(&next.row.identity()) {
+        let identity = (next.row.harness.clone(), next.row.step_ref.clone());
+        if visited.contains(&identity) {
             continue;
         }
-        visited.push(next.row.identity());
-        let prev = others
-            .iter()
+        visited.push(identity);
+        let next_position = Position {
+            runner: next.runner.clone(),
+            order: order(&next),
+        };
+        let previous = neighbour(
+            conn,
+            PREVIOUS_SQL,
+            harness,
+            session,
+            step_ref,
+            &next_position,
+        )?;
+        // The current emission has not been inserted yet. Its new facts must
+        // win over an older feed body when it is the successor's predecessor.
+        let prev = previous
+            .as_ref()
+            .into_iter()
             .chain(std::iter::once(&current))
-            .filter(|other| other.runner == next.runner && order(other) < order(next))
+            .filter(|other| other.runner == next.runner && order(other) < order(&next))
             .max_by_key(|other| order(other));
         let computed = rewrite_cause(prev.map(|other| &other.row), &next.row);
         if cause(conn, &next.row.harness, &next.row.step_ref)? == computed {
@@ -345,6 +377,10 @@ pub(crate) fn compute(
             next.row.step_ref.clone(),
             Value::Object(next_body).to_string(),
         ));
+    }
+    body.remove("cause");
+    if let Some(cause) = computed {
+        body.insert("cause".into(), Value::from(cause.as_str()));
     }
     Ok(corrections)
 }
@@ -370,6 +406,42 @@ pub(crate) fn prune(conn: &Connection, now_ms: i64) -> rusqlite::Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::conn;
+
+    #[test]
+    fn rewrite_neighbour_queries_seek_the_order_index() {
+        let conn = conn();
+        for sql in [PREVIOUS_SQL, NEXT_SQL] {
+            for runner in [None, Some("broca")] {
+                let plan = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap()
+                    .query_map(
+                        params!["pi", "session", runner, "excluded", 100, 1],
+                        |row| row.get::<_, String>(3),
+                    )
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert!(
+                    plan.iter().any(|line| line
+                        .contains("SEARCH e USING INDEX step_evidence_neighbours")
+                        && line.contains("order_ms")),
+                    "{plan:?}"
+                );
+                assert!(
+                    plan.iter()
+                        .any(|line| line.contains("SEARCH f USING INTEGER PRIMARY KEY")),
+                    "{plan:?}"
+                );
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|line| line.contains("SCAN") || line.contains("TEMP B-TREE")),
+                    "{plan:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn rewrite_evidence_pruning_is_bounded_at_two_history_sizes() {

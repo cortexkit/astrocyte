@@ -4708,6 +4708,88 @@ WHEN EXISTS (SELECT 1 FROM step_cause WHERE cause_key=NEW.cause_key)
 BEGIN SELECT RAISE(ABORT, 'step_cause_insert_once'); END;
 "#,
     },
+    Migration {
+        version: 52,
+        statements: r#"-- Keep comparison keys separate from immutable feed JSON. A null latest
+-- cursor excludes evidence whose one-day feed rows have already expired.
+ALTER TABLE step_evidence ADD COLUMN session TEXT;
+ALTER TABLE step_evidence ADD COLUMN order_ms INTEGER;
+ALTER TABLE step_evidence ADD COLUMN feed_source TEXT;
+ALTER TABLE step_evidence ADD COLUMN occurred_at_ms INTEGER;
+ALTER TABLE step_evidence ADD COLUMN reports_cache INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE step_evidence ADD COLUMN positive_read INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE step_evidence ADD COLUMN latest_feed_cursor INTEGER;
+
+-- Older stores can have feed rows without evidence placeholders. Preserve
+-- their first retained emission, but never invent runner-event facts.
+INSERT INTO step_evidence(harness,step_ref,recorded_at_ms,facts_json,first_feed_cursor)
+SELECT harness,step_ref,MIN(committed_at_ms),'{}',MIN(feed_cursor)
+FROM step_feed GROUP BY harness,step_ref
+ON CONFLICT(harness,step_ref) DO UPDATE SET
+    first_feed_cursor=COALESCE(step_evidence.first_feed_cursor,excluded.first_feed_cursor);
+UPDATE step_evidence SET order_ms=json_extract(facts_json,'$.started_at_ms'),
+    latest_feed_cursor=(SELECT MAX(feed_cursor) FROM step_feed f
+    WHERE f.harness=step_evidence.harness AND f.step_ref=step_evidence.step_ref);
+UPDATE step_evidence SET
+    session=f.session,feed_source=f.source,
+    occurred_at_ms=json_extract(f.row_json,'$.occurred_at_ms'),
+    order_ms=COALESCE(json_extract(facts_json,'$.started_at_ms'),json_extract(f.row_json,'$.occurred_at_ms')),
+    reports_cache=COALESCE(json_type(f.row_json,'$.cache_read')='integer',0),
+    positive_read=COALESCE(json_extract(f.row_json,'$.cache_read')>0,0)
+FROM step_feed f WHERE f.feed_cursor=step_evidence.latest_feed_cursor;
+
+CREATE INDEX step_evidence_neighbours ON step_evidence(harness,session,runner,order_ms,first_feed_cursor)
+    WHERE latest_feed_cursor IS NOT NULL;
+CREATE INDEX step_evidence_runner_previous ON step_evidence(harness,session,occurred_at_ms,latest_feed_cursor)
+    WHERE feed_source='runner' AND latest_feed_cursor IS NOT NULL;
+CREATE INDEX step_evidence_runner_cache ON step_evidence(harness,session,occurred_at_ms,latest_feed_cursor)
+    WHERE feed_source='runner' AND latest_feed_cursor IS NOT NULL AND reports_cache=1;
+CREATE INDEX step_evidence_runner_positive ON step_evidence(harness,session,latest_feed_cursor)
+    WHERE feed_source='runner' AND latest_feed_cursor IS NOT NULL AND positive_read=1;
+
+-- Corrections and file replacements are emissions too. Maintaining the live
+-- projection here keeps every emission path, including successor corrections,
+-- in the same transaction as its indexed facts.
+CREATE TRIGGER step_feed_index_evidence AFTER INSERT ON step_feed
+BEGIN
+    INSERT INTO step_evidence(harness,step_ref,recorded_at_ms,facts_json,first_feed_cursor,
+        session,order_ms,feed_source,occurred_at_ms,reports_cache,positive_read,latest_feed_cursor)
+    VALUES (NEW.harness,NEW.step_ref,NEW.committed_at_ms,'{}',NEW.feed_cursor,
+        NEW.session,json_extract(NEW.row_json,'$.occurred_at_ms'),NEW.source,
+        json_extract(NEW.row_json,'$.occurred_at_ms'),
+        COALESCE(json_type(NEW.row_json,'$.cache_read')='integer',0),
+        COALESCE(json_extract(NEW.row_json,'$.cache_read')>0,0),NEW.feed_cursor)
+    ON CONFLICT(harness,step_ref) DO UPDATE SET
+        first_feed_cursor=COALESCE(first_feed_cursor,NEW.feed_cursor),
+        session=NEW.session,feed_source=NEW.source,latest_feed_cursor=NEW.feed_cursor,
+        occurred_at_ms=excluded.occurred_at_ms,reports_cache=excluded.reports_cache,
+        positive_read=excluded.positive_read,
+        order_ms=COALESCE(json_extract(facts_json,'$.started_at_ms'),excluded.occurred_at_ms);
+END;
+CREATE TRIGGER step_feed_unindex_evidence AFTER DELETE ON step_feed
+BEGIN
+    UPDATE step_evidence SET latest_feed_cursor=NULL
+    WHERE harness=OLD.harness AND step_ref=OLD.step_ref AND latest_feed_cursor=OLD.feed_cursor;
+END;
+-- Evidence expires from its first emission, but a recent replacement can
+-- still be in the feed. Drop the event facts on time and retain only a live,
+-- unknown-runner placeholder, just as a feed row without evidence compares.
+-- Each bounded evidence deletion performs identity seeks, never a feed scan.
+CREATE TRIGGER step_evidence_restore_live_placeholder AFTER DELETE ON step_evidence
+BEGIN
+    INSERT INTO step_evidence(harness,step_ref,recorded_at_ms,facts_json,first_feed_cursor,
+        session,order_ms,feed_source,occurred_at_ms,reports_cache,positive_read,latest_feed_cursor)
+    SELECT f.harness,f.step_ref,f.committed_at_ms,'{}',
+        (SELECT MIN(feed_cursor) FROM step_feed WHERE harness=OLD.harness AND step_ref=OLD.step_ref),
+        f.session,json_extract(f.row_json,'$.occurred_at_ms'),f.source,
+        json_extract(f.row_json,'$.occurred_at_ms'),
+        COALESCE(json_type(f.row_json,'$.cache_read')='integer',0),
+        COALESCE(json_extract(f.row_json,'$.cache_read')>0,0),f.feed_cursor
+    FROM step_feed f WHERE f.feed_cursor=(SELECT MAX(feed_cursor) FROM step_feed
+        WHERE harness=OLD.harness AND step_ref=OLD.step_ref);
+END;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -8229,6 +8311,112 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn schema_v52_rewrite_order_backfills_evidence_and_feed_only_steps() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version < 52) {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        conn.execute_batch(r#"INSERT INTO step_evidence(harness,step_ref,runner,first_feed_cursor,recorded_at_ms,facts_json)
+            VALUES ('pi','known','broca',2,100,'{"started_at_ms":900}'),
+                   ('pi','expired','broca',1,50,'{"started_at_ms":1}');
+            INSERT INTO step_feed(feed_cursor,harness,step_ref,source,session,committed_at_ms,row_json)
+            VALUES (10,'pi','known','runner','old-session',100,'{"occurred_at_ms":1000,"cache_read":20}'),
+                   (11,'pi','file-only','file','session',110,'{"occurred_at_ms":1100}'),
+                   (12,'pi','known','file','new-session',120,'{"occurred_at_ms":1200,"cache_read":0}');"#).unwrap();
+        let feed_before = table_rows(&conn, "step_feed");
+        let evidence_before = table_rows(&conn, "step_evidence");
+        conn.execute_batch(MIGRATIONS[51].statements).unwrap();
+        assert_eq!(table_rows(&conn, "step_feed"), feed_before);
+        for (before, after) in evidence_before
+            .iter()
+            .zip(table_rows(&conn, "step_evidence"))
+        {
+            assert_eq!(before, &after[..before.len()]);
+        }
+        let projected: Vec<String> = conn
+            .prepare(
+                "SELECT json_array(step_ref,session,runner,first_feed_cursor,order_ms,
+            feed_source,occurred_at_ms,reports_cache,positive_read,latest_feed_cursor)
+            FROM step_evidence ORDER BY step_ref",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            projected,
+            [
+                r#"["expired",null,"broca",1,1,null,null,0,0,null]"#,
+                r#"["file-only","session",null,11,1100,"file",1100,0,0,11]"#,
+                r#"["known","new-session","broca",2,900,"file",1200,1,0,12]"#,
+            ]
+        );
+        crate::rewrite_evidence::save(
+            &conn,
+            200,
+            "pi",
+            "known",
+            "thalamus",
+            &crate::rewrite_evidence::Evidence {
+                started_at_ms: Some(800),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT runner,order_ms FROM step_evidence WHERE step_ref='known'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+            ("thalamus".into(), 800)
+        );
+        conn.execute_batch(r#"INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
+            VALUES ('pi','known','runner','new-session',200,'{"occurred_at_ms":1300,"cache_read":3}');
+            DELETE FROM step_feed WHERE feed_cursor IN (10,12);"#).unwrap();
+        assert_eq!(conn.query_row("SELECT latest_feed_cursor,order_ms,positive_read FROM step_evidence WHERE step_ref='known'",[],
+            |row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?))).unwrap(),(13,800,1));
+        conn.execute("DELETE FROM step_feed WHERE feed_cursor=13", [])
+            .unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM step_evidence WHERE step_ref='known' AND latest_feed_cursor IS NULL",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn schema_v52_rewrite_order_backfill_timing() {
+        for steps in [1_000, 10_000] {
+            let conn = Connection::open_in_memory().unwrap();
+            initialize_connection(&conn).unwrap();
+            for migration in MIGRATIONS.iter().filter(|m| m.version < 52) {
+                conn.execute_batch(migration.statements).unwrap();
+            }
+            conn.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                INSERT INTO step_evidence(harness,step_ref,runner,recorded_at_ms,facts_json,first_feed_cursor)
+                SELECT 'pi','step-'||i,'broca',1,json_object('started_at_ms',i),i FROM n",[steps*3]).unwrap();
+            for source in ["runner", "file"] {
+                conn.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                    INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
+                    SELECT 'pi','step-'||i,?2,'head-session',1,json_object('occurred_at_ms',i,'cache_read',i%10) FROM n",
+                    params![steps,source]).unwrap();
+            }
+            let started = std::time::Instant::now();
+            conn.execute_batch(MIGRATIONS[51].statements).unwrap();
+            eprintln!("migration 52: {steps} session steps, {} feed rows, {} evidence rows, in-memory SQLite: {:?}",steps*2,steps*3,started.elapsed());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM step_evidence WHERE latest_feed_cursor IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                steps
+            );
+        }
     }
 
     #[test]

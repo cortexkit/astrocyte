@@ -238,51 +238,74 @@ fn newest_row(
     .optional()
 }
 
-/// The session's steps known only from runner rows the feed still serves
-/// (rows no later row for their identity has replaced), other than
-/// `step_ref`'s own.
+const RUNNER_PREVIOUS_SQL: &str = "SELECT e.latest_feed_cursor,f.row_json FROM step_evidence e
+    JOIN step_feed f ON f.feed_cursor=e.latest_feed_cursor
+    WHERE e.harness=?1 AND e.session=?2 AND e.step_ref<>?3 AND e.feed_source='runner'
+      AND e.latest_feed_cursor IS NOT NULL AND e.occurred_at_ms<?4
+    ORDER BY e.occurred_at_ms DESC,e.latest_feed_cursor DESC LIMIT 1";
+const RUNNER_CACHE_SQL: &str = "SELECT e.latest_feed_cursor,f.row_json FROM step_evidence e
+    JOIN step_feed f ON f.feed_cursor=e.latest_feed_cursor
+    WHERE e.harness=?1 AND e.session=?2 AND e.step_ref<>?3 AND e.feed_source='runner'
+      AND e.latest_feed_cursor IS NOT NULL AND e.reports_cache=1 AND e.occurred_at_ms<?4
+    ORDER BY e.occurred_at_ms DESC,e.latest_feed_cursor DESC LIMIT 1";
+const RUNNER_POSITIVE_SQL: &str = "SELECT e.latest_feed_cursor,f.row_json FROM step_evidence e
+    JOIN step_feed f ON f.feed_cursor=e.latest_feed_cursor
+    WHERE e.harness=?1 AND e.session=?2 AND e.step_ref<>?3 AND e.feed_source='runner'
+      AND e.latest_feed_cursor IS NOT NULL AND e.positive_read=1
+    ORDER BY e.latest_feed_cursor DESC LIMIT 1";
+
+fn unrecorded_body(body: &str) -> rusqlite::Result<cache::UnrecordedStep> {
+    let row: Value = serde_json::from_str(body).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let count = |name: &str| row.get(name).and_then(Value::as_u64);
+    Ok(cache::UnrecordedStep {
+        occurred_at_ms: row
+            .get("occurred_at_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        counts: cache::StepCounts {
+            input: count("input"),
+            cache_read: count("cache_read"),
+            cache_write: count("cache_write"),
+        },
+        request_body_len: count("request_body_len"),
+    })
+}
+
+/// The verdict needs three witnesses: the latest earlier step, the latest
+/// earlier cache report, and any positive cache read (even a later one).
+/// These chains span runners, unlike the runner-scoped rewrite comparison.
 fn runner_only_steps(
     conn: &Connection,
     harness: &str,
     session: &str,
     step_ref: &str,
+    at: i64,
 ) -> rusqlite::Result<Vec<cache::UnrecordedStep>> {
-    let bodies = conn
-        .prepare_cached(
-            "SELECT f.row_json FROM step_feed f
-             WHERE f.harness=?1 AND f.session=?2 AND f.source='runner' AND f.step_ref<>?3
-               AND NOT EXISTS (SELECT 1 FROM step_feed n WHERE n.harness=f.harness
-                   AND n.step_ref=f.step_ref AND n.feed_cursor>f.feed_cursor)",
-        )?
-        .query_map(params![harness, session, step_ref], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let count = |row: &Value, name: &str| row.get(name).and_then(Value::as_u64);
-    bodies
-        .iter()
-        .map(|body| {
-            let row: Value = serde_json::from_str(body).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-            Ok(cache::UnrecordedStep {
-                occurred_at_ms: row
-                    .get("occurred_at_ms")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0),
-                counts: cache::StepCounts {
-                    input: count(&row, "input"),
-                    cache_read: count(&row, "cache_read"),
-                    cache_write: count(&row, "cache_write"),
-                },
-                request_body_len: count(&row, "request_body_len"),
-            })
-        })
-        .collect()
+    let mut bodies = std::collections::BTreeMap::new();
+    for sql in [RUNNER_PREVIOUS_SQL, RUNNER_CACHE_SQL, RUNNER_POSITIVE_SQL] {
+        let mut statement = conn.prepare_cached(sql)?;
+        let stored = if sql == RUNNER_POSITIVE_SQL {
+            statement
+                .query_row(params![harness, session, step_ref], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .optional()?
+        } else {
+            statement
+                .query_row(params![harness, session, step_ref, at], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .optional()?
+        };
+        if let Some((cursor, body)) = stored {
+            bodies.insert(cursor, body);
+        }
+    }
+    // max_by_key keeps the last equal-time row. Preserve the old list's feed
+    // cursor order when two different witnesses share an occurrence time.
+    bodies.values().map(|body| unrecorded_body(body)).collect()
 }
 
 /// Add a step a runner announced to the feed as a `runner` row, unless the
@@ -332,7 +355,7 @@ pub fn append_runner_step(
         }
         return Ok(RunnerAppend::Superseded);
     }
-    let unrecorded = runner_only_steps(conn, harness, session, step_ref)?;
+    let unrecorded = runner_only_steps(conn, harness, session, step_ref, step.step.occurred_at_ms)?;
     let served = cache::unrecorded_step(conn, harness, session, step.step.clone(), &unrecorded)?;
     let to_sql = |error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
     let body = row_body(harness, session, FeedSource::Runner, &served, None).map_err(to_sql)?;
@@ -453,7 +476,8 @@ pub fn rejudge_runner_steps(conn: &Connection, now_ms: i64) -> rusqlite::Result<
             context_limit: None,
             request_body_len: count("request_body_len"),
         };
-        let unrecorded = runner_only_steps(conn, &harness, &session, &step_ref)?;
+        let unrecorded =
+            runner_only_steps(conn, &harness, &session, &step_ref, row.occurred_at_ms)?;
         let served = cache::unrecorded_step(conn, &harness, &session, row, &unrecorded)?;
         let served = serde_json::to_value(served).map_err(to_sql)?;
         let fields = body
@@ -473,9 +497,8 @@ pub fn rejudge_runner_steps(conn: &Connection, now_ms: i64) -> rusqlite::Result<
             }
         }
         // A row whose verdict fields are unchanged needs nothing: its cause
-        // was computed when it was appended. Skipping it keeps the cost to
-        // the rows a correction touches, since each append computes a cause
-        // from the step's whole session.
+        // was computed when it was appended. Skipping it avoids recording or
+        // comparing a step whose diagnostic fields have not changed.
         if body == original {
             continue;
         }
@@ -694,6 +717,375 @@ pub fn read(conn: &Connection, request: FeedReadRequest) -> Result<FeedPage, Fee
 mod tests {
     use super::*;
     use crate::test_support::conn;
+
+    fn runner_step(step_ref: &str, at: i64) -> RunnerStep {
+        RunnerStep {
+            runner: "broca".into(),
+            evidence: Evidence {
+                started_at_ms: Some(u64::try_from(at).unwrap()),
+                ..Evidence::default()
+            },
+            harness: "pi".into(),
+            session: "session".into(),
+            run_id: "run".into(),
+            step: cache::StepRow {
+                cursor: 0,
+                step_ref: step_ref.into(),
+                occurred_at_ms: at,
+                input: Some(100),
+                cache_read: Some(50),
+                cache_write: None,
+                output: Some(10),
+                reasoning: None,
+                provider: Some("anthropic".into()),
+                model: Some("model".into()),
+                finish: None,
+                context_limit: None,
+                request_body_len: Some(1000),
+            },
+            cache_write_5m: None,
+            cache_write_1h: None,
+            message_id: None,
+        }
+    }
+
+    #[test]
+    fn rewrite_order_seeks_keep_start_time_ties_warmups_and_chain_moves() {
+        let conn = conn();
+        let mut first = runner_step("first", 100);
+        first.evidence.started_at_ms = Some(300);
+        first.evidence.warm_up = Some(true);
+        append_runner_step(&conn, 1_000, &first).unwrap();
+        let first_cursor: i64 = conn
+            .query_row(
+                "SELECT first_feed_cursor FROM step_evidence WHERE step_ref='first'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut earlier = runner_step("earlier", 200);
+        earlier.evidence.started_at_ms = Some(100);
+        earlier.step.model = Some("other-model".into());
+        append_runner_step(&conn, 1_000, &earlier).unwrap();
+        let mut last = runner_step("last", 300);
+        last.step.cache_read = Some(0);
+        append_runner_step(&conn, 1_000, &last).unwrap();
+        assert_eq!(
+            evidence::cause(&conn, "pi", "last").unwrap(),
+            Some(cortexkit_usage_steps::Cause::Unexplained)
+        );
+        first.evidence.started_at_ms = Some(500);
+        append_runner_step(&conn, 1_000, &first).unwrap();
+        assert_eq!(
+            evidence::cause(&conn, "pi", "last")
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "account_or_model_changed"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT first_feed_cursor FROM step_evidence WHERE step_ref='first'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            first_cursor
+        );
+        let last: Value =
+            serde_json::from_str(&newest_body(&conn, "pi", "last").unwrap().unwrap()).unwrap();
+        assert_eq!(last["cause"], "account_or_model_changed");
+    }
+
+    #[test]
+    fn rewrite_expired_evidence_keeps_live_steps_as_unknown_neighbours() {
+        let conn = conn();
+        let mut first = runner_step("first", 100);
+        first.step.model = Some("other-model".into());
+        append_runner_step(&conn, 1_000, &first).unwrap();
+        let mut last = runner_step("last", 200);
+        last.step.cache_read = Some(0);
+        let earlier = runner_only_steps(&conn, "pi", "session", "last", 200).unwrap();
+        let served = cache::unrecorded_step(&conn, "pi", "session", last.step, &earlier).unwrap();
+        let body = row_body("pi", "session", FeedSource::File, &served, None).unwrap();
+        append_body(&conn, 1_000, &body, true, None).unwrap();
+        assert_eq!(
+            evidence::cause(&conn, "pi", "last")
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "unexplained"
+        );
+        conn.execute(
+            "UPDATE step_evidence SET recorded_at_ms=?1 WHERE step_ref='first'",
+            [1_000 - evidence::EVIDENCE_WINDOW_MS - 1],
+        )
+        .unwrap();
+        evidence::prune(&conn, 1_000).unwrap();
+        append_body(&conn, 1_000, &body, true, None).unwrap();
+        assert_eq!(
+            evidence::cause(&conn, "pi", "last")
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "account_or_model_changed"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT runner,facts_json,recorded_at_ms FROM step_evidence WHERE step_ref='first'",
+                [],
+                |row| Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?
+                ))
+            )
+            .unwrap(),
+            (None, "{}".into(), 1_000)
+        );
+    }
+
+    #[test]
+    fn rewrite_runner_append_work_is_independent_of_session_history() {
+        let mut costs = Vec::new();
+        for count in [1_000, 10_000] {
+            let conn = conn();
+            let step = runner_step("seed", 1);
+            append_runner_step(&conn, 20_000, &step).unwrap();
+            let mut body: Value =
+                serde_json::from_str(&newest_body(&conn, "pi", "seed").unwrap().unwrap()).unwrap();
+            // Seed immutable emissions directly so fixture construction does not
+            // hide the cost of the one real append measured below.
+            for index in 1..count {
+                body["step_ref"] = format!("seed-{index}").into();
+                body["occurred_at_ms"] = index.into();
+                evidence::save(
+                    &conn,
+                    20_000,
+                    "pi",
+                    body["step_ref"].as_str().unwrap(),
+                    "broca",
+                    &Evidence::default(),
+                )
+                .unwrap();
+                conn.execute("INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
+                    VALUES ('pi',?1,'runner','session',20000,?2)",
+                    params![body["step_ref"].as_str(), body.to_string()]).unwrap();
+            }
+            let counter = crate::store::VmCounter::start(&conn);
+            assert_eq!(
+                append_runner_step(&conn, 20_000, &runner_step("new", 15_000)).unwrap(),
+                RunnerAppend::Appended
+            );
+            costs.push(counter.steps());
+            let stored: Value =
+                serde_json::from_str(&newest_body(&conn, "pi", "new").unwrap().unwrap()).unwrap();
+            assert_eq!(stored["cache_read"], 50);
+            assert_eq!(stored["cause"], "unexplained");
+        }
+        eprintln!("runner append VM instructions at 1,000 / 10,000 steps: {costs:?}");
+        assert!(
+            costs[1] < costs[0] + 200,
+            "runner append scanned session history: {costs:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_runner_witness_queries_seek_their_indexes() {
+        let conn = conn();
+        for (sql, index) in [
+            (RUNNER_PREVIOUS_SQL, "step_evidence_runner_previous"),
+            (RUNNER_CACHE_SQL, "step_evidence_runner_cache"),
+            (RUNNER_POSITIVE_SQL, "step_evidence_runner_positive"),
+        ] {
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let values: Vec<&dyn rusqlite::ToSql> = if sql == RUNNER_POSITIVE_SQL {
+                vec![&"pi", &"session", &"excluded"]
+            } else {
+                vec![&"pi", &"session", &"excluded", &100]
+            };
+            let plan = statement
+                .query_map(values.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains(&format!("SEARCH e USING INDEX {index}"))),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("SEARCH f USING INTEGER PRIMARY KEY")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|line| line.contains("SCAN") || line.contains("TEMP B-TREE")),
+                "{plan:?}"
+            );
+        }
+    }
+
+    fn full_runner_only_steps(
+        conn: &Connection,
+        harness: &str,
+        session: &str,
+        step_ref: &str,
+    ) -> Vec<cache::UnrecordedStep> {
+        // Retain the original full-list query as an independent retrieval oracle.
+        conn.prepare(
+            "SELECT f.row_json FROM step_feed f
+             WHERE f.harness=?1 AND f.session=?2 AND f.source='runner' AND f.step_ref<>?3
+               AND NOT EXISTS (SELECT 1 FROM step_feed n WHERE n.harness=f.harness
+                   AND n.step_ref=f.step_ref AND n.feed_cursor>f.feed_cursor)",
+        )
+        .unwrap()
+        .query_map(params![harness, session, step_ref], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap()
+        .map(|body| unrecorded_body(&body.unwrap()).unwrap())
+        .collect()
+    }
+
+    fn witness_signature(
+        rows: &[cache::UnrecordedStep],
+        at: i64,
+    ) -> (
+        Option<cache::UnrecordedStep>,
+        Option<cache::UnrecordedStep>,
+        bool,
+    ) {
+        let earlier = || rows.iter().copied().filter(|row| row.occurred_at_ms < at);
+        (
+            earlier().max_by_key(|row| row.occurred_at_ms),
+            earlier()
+                .filter(|row| row.counts.reports_cache())
+                .max_by_key(|row| row.occurred_at_ms),
+            rows.iter()
+                .any(|row| row.counts.cache_read.is_some_and(|read| read > 0)),
+        )
+    }
+
+    #[test]
+    fn rewrite_runner_witnesses_match_full_lists_in_randomized_sessions() {
+        let conn = conn();
+        let mut random = 0x51a7_332du64;
+        let mut next = || {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            random >> 32
+        };
+        let mut later_positive = 0;
+        let mut equal_times = 0;
+        let mut replacements = 0;
+        for emission in 0..400 {
+            let mut step = runner_step(
+                &format!("step-{}", next() % 48),
+                i64::try_from(next() % 16 + 1).unwrap(),
+            );
+            step.session = format!("session-{}", next() % 2);
+            step.harness = if next() % 2 == 0 { "pi" } else { "broca" }.into();
+            step.runner = if next() % 2 == 0 { "broca" } else { "thalamus" }.into();
+            step.step.cache_read = match next() % 3 {
+                0 => None,
+                1 => Some(0),
+                _ => Some(10 + next() % 100),
+            };
+            step.step.request_body_len = Some(next() % 10_000);
+            let full =
+                full_runner_only_steps(&conn, &step.harness, &step.session, &step.step.step_ref);
+            let sought = runner_only_steps(
+                &conn,
+                &step.harness,
+                &step.session,
+                &step.step.step_ref,
+                step.step.occurred_at_ms,
+            )
+            .unwrap();
+            assert_eq!(
+                witness_signature(&sought, step.step.occurred_at_ms),
+                witness_signature(&full, step.step.occurred_at_ms),
+                "emission {emission}"
+            );
+            let expected = cache::unrecorded_step(
+                &conn,
+                &step.harness,
+                &step.session,
+                step.step.clone(),
+                &full,
+            )
+            .unwrap();
+            assert_eq!(
+                cache::unrecorded_step(
+                    &conn,
+                    &step.harness,
+                    &step.session,
+                    step.step.clone(),
+                    &sought
+                )
+                .unwrap(),
+                expected,
+                "emission {emission}"
+            );
+            later_positive += usize::from(full.iter().any(|row| {
+                row.occurred_at_ms > step.step.occurred_at_ms
+                    && row.counts.cache_read.is_some_and(|read| read > 0)
+            }));
+            equal_times += usize::from(
+                full.iter()
+                    .any(|row| row.occurred_at_ms == step.step.occurred_at_ms),
+            );
+            replacements += usize::from(
+                newest_body(&conn, &step.harness, &step.step.step_ref)
+                    .unwrap()
+                    .is_some(),
+            );
+            if next() % 3 == 0 {
+                let body = row_body(
+                    &step.harness,
+                    &step.session,
+                    FeedSource::File,
+                    &expected,
+                    None,
+                )
+                .unwrap();
+                append_body(&conn, 20_000, &body, true, None).unwrap();
+            } else {
+                append_runner_step(&conn, 20_000, &step).unwrap();
+            }
+            if emission % 37 == 0 {
+                // A replacement can keep the feed row alive after its original
+                // event facts expire. The old list still includes that row.
+                conn.execute(
+                    "UPDATE step_evidence SET recorded_at_ms=?3 WHERE harness=?1 AND step_ref=?2",
+                    params![
+                        step.harness,
+                        step.step.step_ref,
+                        20_000 - evidence::EVIDENCE_WINDOW_MS - 1
+                    ],
+                )
+                .unwrap();
+                evidence::prune(&conn, 20_000).unwrap();
+                assert_eq!(conn.query_row("SELECT runner,facts_json FROM step_evidence WHERE harness=?1 AND step_ref=?2",
+                    params![step.harness,step.step.step_ref],|row|Ok((row.get::<_,Option<String>>(0)?,row.get::<_,String>(1)?))).unwrap(),(None,"{}".into()));
+                for at in [step.step.occurred_at_ms, step.step.occurred_at_ms + 1, 30] {
+                    let full = full_runner_only_steps(&conn, &step.harness, &step.session, "probe");
+                    let sought =
+                        runner_only_steps(&conn, &step.harness, &step.session, "probe", at)
+                            .unwrap();
+                    assert_eq!(
+                        witness_signature(&sought, at),
+                        witness_signature(&full, at),
+                        "expired evidence at emission {emission}"
+                    );
+                }
+            }
+        }
+        assert!(later_positive>0 && equal_times>0 && replacements>0,
+            "fixture missed later reads, ties or replacements: {later_positive}/{equal_times}/{replacements}");
+    }
 
     fn feed_rows(conn: &Connection, committed_at_ms: i64, count: usize) {
         for _ in 0..count {

@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 51. A schema change appends a migration; an applied
+currently version 52. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -23,7 +23,7 @@ copies that timeout without running the table-creating probes.
 | `cache_read_step` | Each row locates one dated step of a session that carries a plain cache-read measurement, zero reads included. | derived; a measurement trigger inserts it |
 | `step_feed` | Each row is one emission of a served cache step for `usage.steps.read`; the newest row for a harness and step wins. | insert; rows older than 24 hours are deleted |
 | `step_feed_state` | The row records the cache cursor the feed has caught up to and the newest feed cursor retention deleted. | one row |
-| `step_evidence` | Each row retains a step's runner identity, first feed cursor and optional event-only rewrite facts under `(harness, step_ref)`. | upsert; bounded 30-day retention |
+| `step_evidence` | Each row retains a step's runner identity, first feed cursor, indexed live ordering and cache witnesses, and optional event-only rewrite facts under `(harness, step_ref)`. | upsert; bounded 30-day retention |
 | `step_digest` | Each row interns one distinct tool or system digest used by retained evidence. | insert; delete after its last reference expires or changes |
 | `step_cause` | Each row records a changed explanation for one step identity; the newest key wins, including a null correction to no cause. | append only; kept forever |
 | `chargeability_transition` | Each row records the one terminal settlement of an event's chargeability. | insert only |
@@ -242,6 +242,24 @@ triggers reclaim only the old row's tool/system digest keys when their last
 reference is gone. Digests are not copied into feed JSON. File-only rows keep
 an empty evidence object and an unknown runner identity, preserving their first
 feed cursor without inventing facts.
+
+Migration 52 backfills ordering keys from retained evidence and each identity's
+latest feed row, creating empty placeholders for feed-only identities. Rewrite
+neighbours seek the `(harness, session, runner, order_ms, first_feed_cursor)`
+index, where `order_ms` is request start when known and occurrence time otherwise.
+Null runners compare only with other null runners; warm-ups remain in the chain.
+Separate indexes locate the latest earlier runner-only step, the latest earlier
+cache report, and any positive cache read for the session's cache verdict.
+These three witnesses span runners and use occurrence time, with equal times
+resolved by the latest emission cursor. Feed insert triggers maintain the
+source, occurrence time, cache flags and latest cursor even for corrections or
+file replacements. Deleting the latest feed row clears its live cursor, removing
+the identity from all live comparison indexes without deleting its retained
+evidence. Evidence and its ordering keys share the bounded 30-day prune. If a
+recent feed replacement outlives the original event evidence, that bounded
+deletion restores only an empty, unknown-runner placeholder from the retained
+feed rows, anchored to the latest feed commit. Its first cursor falls back to
+the minimum retained feed cursor, as for a row without event evidence.
 
 The shared `cortexkit-usage-steps` function computes rewrite causes at feed
 append or replacement. It compares distinct steps in the same harness/session
