@@ -85,31 +85,30 @@ transaction as the good calls and the cursor, and coverage counts them.
 
 `start_refresher` runs one OS thread. A full tick, every `poll_interval_secs`:
 
-1. Read Fusiform's history boundary from `catalog.status`. Pricing waits until
-   the boundary is known.
-2. Drain allowed `harness_ingest` sources and delete excluded sources'
-   `source_runtime` rows without reading them.
-3. Commit insula quota events and call `usage.get` when freshness or event
-   continuity requires it.
+1. Connect a configured fusiform catalog and learn its history boundary from
+   `catalog.status`. Until then, pricing waits and calls stay queued.
+2. Drain every source that `harness_ingest` allows. An excluded source is not read
+   and loses its `source_runtime` row, like an absent one.
+3. Read insula quota: commit queued quota events, and call `usage.get` when the
+   event stream cannot be trusted or the freshness horizon is near (see below).
 4. Price queued calls (`run_pricing_walk`), bounded per tick by time and count.
-5. Reconcile the pricing queue daily for up to two seconds
-   (`QUEUE_RECONCILE_INTERVAL`).
+5. Spend up to two seconds on the daily check that every unpriced call is queued
+   for pricing (`QUEUE_RECONCILE_INTERVAL`).
 
-The loop then budgets 1.5 seconds each for summary rebuilds and served rate
-refreshes before running the multiplier. `rate_era` supplies per-call dated rates
-for new multiplier days without changing stored observations. Fetches run outside
-transactions; catalog advances refresh aliases and plan providers' public API-card targets too.
-Between ticks, quota events apply every 250 ms. Every two seconds
-(`FAST_LANE_INTERVAL`), BROCA and harness readers except Goose tail changes.
-Other sources wait for full ticks. Idle fast cycles commit nothing and never
-count as successful drains. Summary backlogs also rebuild between ticks.
+Then the loop rebuilds dirty summary hours for up to 1.5 seconds and runs the
+multiplier stage. Between full ticks it applies quota events every 250 ms and,
+every two seconds (`FAST_LANE_INTERVAL`), a fast lane: BROCA and the harness
+readers except Goose tail only what changed. Other sources
+wait for full ticks. Fast cycles commit nothing when idle and never count as a
+source's successful drain. A summary backlog keeps rebuilding between ticks.
 
-The bus reader uses one ckbus credential opened with the daemon's launch secret.
-It reads insula's per-account quota notices from astrocyte's durable bus subscription, retrieves
-bodies through `events_get`, checks digests and acknowledges after commit.
-A gap, new epoch, bad digest or missing body requests `usage.get`, as does each
-tick without event flow and at least every ten minutes. The reader also sends
-runners' live `step.finished.v1` events to the step feed, never the ledger.
+The bus reader thread holds one ckbus credential, opened with the launch secret
+already given to the daemon. It reads insula's per-account quota notices from
+astrocyte's durable, fetches each body through `events_get`, checks its digest
+and acknowledges only after commit. A gap, new epoch, bad digest or missing body
+asks for a full `usage.get`, which also runs at least every ten minutes, and on
+every tick while events are not flowing. The same reader follows runners' live
+`step.finished.v1` events into the step feed, never into the ledger.
 
 ## Pricing
 
@@ -117,13 +116,13 @@ Each measurement uses the catalog entry in force at the call.
 `parse_rate_key` in `catalog_client.rs` is the one rate-key grammar,
 shared with the multiplier. Token keys are `rate.<role>` per million tokens,
 optionally conditioned on prompt size (`above_context`), `mode` or `ttl`. Unit
-keys add a denominator after the role, such as `per_second` or `per_image`, and
-may carry selectors such as image size. Unknown roles and units are refused.
+keys add a denominator after the role, such as `per_second`, and may carry
+selectors. Unknown roles and units are refused.
 Providers in `reasoning_billed_as_output` price reasoning at the output rate;
 otherwise reasoning needs its own rate.
 
-A charge records which catalog fact priced it, or why the measurement is unpriced
-(for example `no_catalog_coverage` or `no_subscription_in_force`). Repricing
+A charge records which catalog fact priced it, or why the measurement is
+unpriced. Repricing
 (`spend.event.reprice`) and basis correction (`spend.basis.correct`) append new
 heads. The [data model](docs/data-model.md#money) covers units, rounding and the
 charge chain.
@@ -133,17 +132,18 @@ charge chain.
 Reports combine clean hourly summaries with base rows for dirty or split hours
 in one snapshot, so answers equal a full scan. Triggers mark changed hours
 dirty; rebuilds publish only unchanged hours. Per-call rows stay authoritative.
-Run totals use the same method. A daily audit requeues differing hours.
+A daily audit requeues differing hours.
 Details: [data model](docs/data-model.md#hourly-summaries).
 
 ## Subscription multiplier
 
 The multiplier records clean account-hour API list value per quota point, once
 per UTC day, quota provider and plan over a trailing week. It joins day-end vault
-tier history by account or credential ID, seeded once from old config; scope and
-windows remain configured. `routing_eligible` carries sample-size and stability
-results. It retries missing days for a week and appends recomputations without
-changing the ledger. The [subscription multiplier](docs/subscription-multiplier.md)
+tier history by account or credential ID. `routing_eligible` carries sample-size
+and stability results. It retries missing days for a week and appends
+recomputations without changing the ledger. New days take each call's dated
+rates from `rate_era.rs`, a cache of Fusiform's served `catalog.history` that
+the refresher fills outside transactions and re-reads when the catalog moves. The [subscription multiplier](docs/subscription-multiplier.md)
 explains the thresholds and public API-twin valuation.
 
 ## Cache diagnostics and the step feed
