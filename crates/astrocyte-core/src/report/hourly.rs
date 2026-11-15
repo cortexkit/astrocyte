@@ -98,6 +98,7 @@ struct Cell {
 struct Quantity {
     units: i128,
     observations: u64,
+    stated_observations: u64,
     covered_units: i128,
     covered_observations: u64,
 }
@@ -270,19 +271,25 @@ impl Data {
                 .quantities
                 .entry((
                     key.clone(),
-                    (row.get(1)?, row.get(2)?, exponent.unwrap_or(1)),
+                    // Unknown quantities count in the scale-zero cell without
+                    // entering its sum; stated_observations keeps them distinct
+                    // from producer-reported zeros at that same scale.
+                    (row.get(1)?, row.get(2)?, exponent.unwrap_or(0)),
                 ))
                 .or_default();
             add_count(&mut quantity.observations, 1)?;
             if let Some(units) = units {
+                add_count(&mut quantity.stated_observations, 1)?;
                 sum(&mut quantity.units, i128::from(units))?;
             }
             if *complete
                 && is_subscription(key)
                 && row.get::<_, Option<String>>(5)?.as_deref() == Some("covered")
             {
-                add_count(&mut quantity.covered_observations, 1)?;
                 if let Some(units) = units {
+                    // Subscription quantity presence still means a stated
+                    // quantity, not a covered measurement with unknown usage.
+                    add_count(&mut quantity.covered_observations, 1)?;
                     sum(&mut quantity.covered_units, i128::from(units))?;
                 }
             }
@@ -401,7 +408,7 @@ fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
         data.first = first;
         data.last = last;
     }
-    let mut statement=conn.prepare("SELECT q.cell_id,u.value,r.value,q.exponent,q.units,q.observations,q.covered_units,q.covered_observations
+    let mut statement=conn.prepare("SELECT q.cell_id,u.value,r.value,q.exponent,q.units,q.observations,q.covered_units,q.covered_observations,q.stated_observations
         FROM summary_quantity q JOIN summary_cell c USING(cell_id) JOIN summary_value u ON u.value_id=q.unit JOIN summary_value r ON r.value_id=q.role
         WHERE c.kind=?1 AND c.hour_number=?2")?;
     let mut rows = statement.query(params![hour.kind, hour.number])?;
@@ -415,6 +422,7 @@ fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
             Quantity {
                 units: parse_exact(row.get(4)?)?,
                 observations: row.get(5)?,
+                stated_observations: row.get(8)?,
                 covered_units: parse_exact(row.get(6)?)?,
                 covered_observations: row.get(7)?,
             },
@@ -485,7 +493,7 @@ fn replace(
         let unit = value_id(tx, &mut values, &Some(unit.clone()))?;
         let role = value_id(tx, &mut values, &Some(role.clone()))?;
         tx.execute(
-            "INSERT INTO summary_quantity VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO summary_quantity VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 cells[key],
                 unit,
@@ -494,7 +502,8 @@ fn replace(
                 quantity.units.to_string(),
                 quantity.observations,
                 quantity.covered_units.to_string(),
-                quantity.covered_observations
+                quantity.covered_observations,
+                quantity.stated_observations
             ],
         )?;
     }
@@ -963,14 +972,23 @@ fn disjunction(parts: &[String]) -> String {
 /// an unknown dictionary id or cell events that don't add up to the hour's
 /// `events_total` mean the summary was changed outside `replace`, and such an
 /// hour is reduced from the ledger instead (or the whole read errors and the
-/// caller falls back to the ledger). No report request carries a time range,
-/// so the check covers every hour; skipping hours without a selected cell
-/// would miss a selected cell that was deleted out of band.
+/// caller falls back to the ledger). Every cell in the selected time range
+/// is checked; skipping hours without a selected cell would miss a selected
+/// cell that was deleted out of band.
 fn frame<'c>(
+    conn: &'c Connection,
+    seam: impl FnMut(Hour, &Key, &Cell) -> Result<bool, ReportError>,
+    live_data: bool,
+    select: impl Fn(&Key) -> bool,
+) -> Result<Option<Frame<'c>>, ReportError> {
+    scoped_frame(conn, seam, live_data, select, None)
+}
+fn scoped_frame<'c>(
     conn: &'c Connection,
     mut seam: impl FnMut(Hour, &Key, &Cell) -> Result<bool, ReportError>,
     live_data: bool,
     select: impl Fn(&Key) -> bool,
+    range: Option<(i64, i64)>,
 ) -> Result<Option<Frame<'c>>, ReportError> {
     if !conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='summary_hour')",
@@ -981,9 +999,15 @@ fn frame<'c>(
     }
     let mut hours = BTreeMap::new();
     let mut clean = BTreeSet::new();
-    let mut statement=conn.prepare("SELECT h.kind,h.hour_number,h.events_total,h.revision,h.built_revision,h.format_version,d.kind
-        FROM summary_hour h LEFT JOIN summary_dirty_hour d USING(kind,hour_number)")?;
-    let mut rows = statement.query([])?;
+    let scope = range.map_or(String::new(), |_| {
+        " WHERE h.kind=0 AND h.hour_number BETWEEN ?1 AND ?2".into()
+    });
+    let parameters: Vec<i64> = range.map_or_else(Vec::new, |(from, to)| {
+        vec![from.div_euclid(HOUR_MS), (to - 1).div_euclid(HOUR_MS)]
+    });
+    let mut statement=conn.prepare(&format!("SELECT h.kind,h.hour_number,h.events_total,h.revision,h.built_revision,h.format_version,d.kind
+        FROM summary_hour h LEFT JOIN summary_dirty_hour d USING(kind,hour_number){scope}"))?;
+    let mut rows = statement.query(rusqlite::params_from_iter(&parameters))?;
     while let Some(row) = rows.next()? {
         let hour = Hour {
             kind: row.get(0)?,
@@ -1006,9 +1030,10 @@ fn frame<'c>(
     let mut cells = Vec::new();
     let mut observed = BTreeMap::new();
     let mut split = BTreeSet::new();
-    let mut statement=conn.prepare("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.currency,c.payload,c.paying_credential
-        FROM summary_cell c")?;
-    let mut rows = statement.query([])?;
+    let scope = scope.replace("h.", "c.");
+    let mut statement=conn.prepare(&format!("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.currency,c.payload,c.paying_credential
+        FROM summary_cell c{scope}"))?;
+    let mut rows = statement.query(rusqlite::params_from_iter(&parameters))?;
     while let Some(row) = rows.next()? {
         let hour = Hour {
             kind: row.get(1)?,
@@ -1294,10 +1319,11 @@ fn interval(hour: Hour) -> Result<(i64, i64), ReportError> {
     ))
 }
 fn calendar_bucket(ms: i64, timezone: Tz, grain: Grain) -> Result<(i64, i64), ReportError> {
-    bucket_bounds_for_date(local_date(ms, timezone)?, timezone, grain)
+    bucket_bounds(ms, timezone, grain)
 }
 #[derive(Default)]
 struct SpendBucket {
+    quantities: Quantities,
     population: Cell,
     total: i128,
     metered: i128,
@@ -1308,14 +1334,12 @@ pub(super) fn spend(
     now_ms: i64,
 ) -> Result<Option<SpendReport>, ReportError> {
     use chrono::Offset;
-    let grain = Grain::parse(&request.grain)
-        .ok_or_else(|| ReportError::Refused(ReportRefusal::UnknownGrain(request.grain.clone())))?;
-    let timezone: Tz = request.timezone.parse().map_err(|_| {
-        ReportError::Refused(ReportRefusal::UnknownTimezone(request.timezone.clone()))
-    })?;
-    let grouping = parse_grouping(&request.grouping)?;
+    let parsed = ParsedReport::new(request)?;
+    let grain = parsed.grain;
+    let timezone = parsed.timezone;
+    let grouping = &parsed.grouping;
     let mut seams = BTreeMap::new();
-    let Some(frame) = frame(
+    let Some(mut frame) = scoped_frame(
         conn,
         |hour, _, _| {
             if hour.kind == 1 {
@@ -1338,7 +1362,8 @@ pub(super) fn spend(
             Ok(seam)
         },
         false,
-        |_| true,
+        |key| parsed.selects(&key.0),
+        parsed.range,
     )?
     else {
         return Ok(None);
@@ -1361,6 +1386,7 @@ pub(super) fn spend(
             currency: row.currency,
         };
         let bucket = buckets.entry(key).or_default();
+        bucket.quantities.merge(&row.quantities)?;
         sum(&mut bucket.total, i128::from(row.total_nanos))?;
         sum(&mut bucket.metered, i128::from(row.metered_nanos))?;
         let cell = Cell {
@@ -1382,7 +1408,8 @@ pub(super) fn spend(
         oldest: base.rate_staleness.oldest_resolved_at_ms,
         ..Cell::default()
     };
-    for (_, hour, key, cell) in frame.cells {
+    let mut quantity_statement=conn.prepare("SELECT unit,role,exponent,units,observations,stated_observations FROM summary_quantity WHERE cell_id=?1")?;
+    for (cell_id, hour, key, cell) in frame.cells {
         add_count(&mut events, cell.events)?;
         add_count(&mut staleness.measurements, cell.measurements)?;
         add_count(&mut staleness.priced_measurements, cell.priced_measurements)?;
@@ -1408,6 +1435,30 @@ pub(super) fn spend(
                 currency: key.1,
             })
             .or_default();
+        let mut quantities = quantity_statement.query([cell_id])?;
+        while let Some(quantity) = quantities.next()? {
+            let unit = value(&mut frame.values, quantity.get(0)?)?
+                .ok_or(ReportError::Integrity("summary quantity unit absent"))?;
+            let role = value(&mut frame.values, quantity.get(1)?)?
+                .ok_or(ReportError::Integrity("summary quantity role absent"))?;
+            let observations: u64 = quantity.get(4)?;
+            let stated: u64 = quantity.get(5)?;
+            let unknown = observations
+                .checked_sub(stated)
+                .ok_or(ReportError::Integrity(
+                    "summary stated count exceeds observations",
+                ))?;
+            bucket.quantities.observe(
+                &role,
+                &unit,
+                if stated == 0 {
+                    None
+                } else {
+                    Some((parse_exact(quantity.get(3)?)?, quantity.get(2)?))
+                },
+                unknown,
+            )?;
+        }
         sum(&mut bucket.total, cell.total)?;
         if key.0[Grouping::ChargeBasis as usize].as_deref() == Some("metered_api") {
             sum(&mut bucket.metered, cell.total)?;
@@ -1416,9 +1467,16 @@ pub(super) fn spend(
     }
     let mut rows = Vec::new();
     let mut headline: BTreeMap<Option<String>, SpendTotal> = BTreeMap::new();
+    let mut headline_quantities: BTreeMap<Option<String>, Quantities> = BTreeMap::new();
     for (key, bucket) in buckets {
+        headline_quantities
+            .entry(key.currency.clone())
+            .or_default()
+            .merge(&bucket.quantities)?;
         let cell = bucket.population;
         let row = SpendRow {
+            usage: bucket.quantities.render()?,
+            quantities: bucket.quantities,
             bucket_start_ms: key.start_ms,
             bucket_end_ms: key.end_ms,
             grouping: key.grouping.into_iter().collect(),
@@ -1440,6 +1498,7 @@ pub(super) fn spend(
         let total = headline
             .entry(row.currency.clone())
             .or_insert_with(|| SpendTotal {
+                usage: UsageQuantities::default(),
                 currency: row.currency.clone(),
                 total_nanos: 0,
                 metered_nanos: 0,
@@ -1460,6 +1519,12 @@ pub(super) fn spend(
             row.zero_measurement_events,
         )?;
         rows.push(row);
+    }
+    for (currency, quantities) in headline_quantities {
+        headline
+            .get_mut(&currency)
+            .ok_or(ReportError::Integrity("headline currency absent"))?
+            .usage = quantities.render()?;
     }
     let mut reasons = BTreeMap::new();
     if undated > 0 {
@@ -1961,6 +2026,7 @@ mod tests {
             timezone: timezone.into(),
             grain: grain.into(),
             grouping: grouping.iter().map(|value| (*value).into()).collect(),
+            ..ReportRequest::default()
         }
     }
     fn equal<T: Serialize>(actual: &T, expected: &T) {
@@ -1987,6 +2053,8 @@ mod tests {
                     &["charge_basis"][..],
                     &["work_class"][..],
                     &["project"][..],
+                    &["producer"][..],
+                    &["producer", "model"][..],
                     &[
                         "provider",
                         "model",
@@ -2018,6 +2086,49 @@ mod tests {
             &subscription_report(conn, &SubscriptionReportRequest {}).unwrap(),
             &subscription_report_base(conn, &SubscriptionReportRequest {}, None).unwrap(),
         );
+        for dimension in DIMENSIONS {
+            for values in [
+                vec![None],
+                vec![Some("absent".into())],
+                vec![
+                    None,
+                    Some("provider".into()),
+                    Some("model".into()),
+                    Some("producer".into()),
+                ],
+            ] {
+                let mut request = request("UTC", "day", &["producer", "model"]);
+                request.filters.insert(dimension.name().into(), values);
+                equal(
+                    &spend_report(conn, &request, 10_000).unwrap(),
+                    &spend_report_base(conn, &request, 10_000, None).unwrap(),
+                );
+            }
+        }
+        let first:Option<i64>=conn.query_row("SELECT MIN(occurred_at_ms) FROM usage_event WHERE occurred_at_ms BETWEEN 0 AND 4000000000000",[],|row|row.get(0)).unwrap();
+        if let Some(first) = first {
+            for (grain, timezone) in [
+                ("hour", "UTC"),
+                ("day", "Asia/Kolkata"),
+                ("week", "America/New_York"),
+                ("month", "Europe/Istanbul"),
+            ] {
+                let mut request = request(timezone, grain, &["producer", "model"]);
+                request.from_ms = Some(first + 1);
+                request.to_ms = Some(first + HOUR_MS);
+                for filtered in [false, true] {
+                    if filtered {
+                        request
+                            .filters
+                            .insert("work_class".into(), vec![None, Some("coding".into())]);
+                    }
+                    equal(
+                        &spend_report(conn, &request, 10_000).unwrap(),
+                        &spend_report_base(conn, &request, 10_000, None).unwrap(),
+                    );
+                }
+            }
+        }
         equal(
             &work_class_report(conn, &WorkClassReportRequest {}).unwrap(),
             &work_class_report_base(conn, &WorkClassReportRequest {}).unwrap(),
@@ -2520,7 +2631,7 @@ mod tests {
     #[test]
     fn format_three_payer_cells_are_never_served_before_rebuild() {
         let mut conn = credential_fixture();
-        assert_eq!(FORMAT, 4);
+        assert_eq!(FORMAT, 5);
         conn.execute(
             "UPDATE summary_hour SET format_version=3 WHERE hour_number=5",
             [],
@@ -2551,7 +2662,7 @@ mod tests {
             "SELECT h.format_version,v.value FROM summary_hour h JOIN summary_cell c USING(kind,hour_number)
              JOIN summary_value v ON v.value_id=c.paying_credential WHERE h.hour_number=5", [],
             |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
-        assert_eq!(rebuilt, (4, "apikey:plan".into()));
+        assert_eq!(rebuilt, (FORMAT, "apikey:plan".into()));
         SUBSCRIPTION_LEDGER_HOURS.with_borrow_mut(BTreeSet::clear);
         equal(
             &subscription_report(&conn, &SubscriptionReportRequest {}).unwrap(),
@@ -3498,7 +3609,7 @@ mod tests {
             "INSERT INTO summary_money SELECT c.cell_id,0,v.value_id,'0',1
                FROM summary_cell c JOIN summary_value p ON p.value_id=c.project, summary_value v
               WHERE p.value='/fixture/other' AND v.value LIKE 'unused-%';
-             INSERT INTO summary_quantity SELECT c.cell_id,v.value_id,v.value_id,0,'1',1,'1',1
+             INSERT INTO summary_quantity SELECT c.cell_id,v.value_id,v.value_id,0,'1',1,'1',1,1
                FROM summary_cell c JOIN summary_value p ON p.value_id=c.project, summary_value v
               WHERE p.value='/fixture/other' AND v.value LIKE 'unused-%';",
         )

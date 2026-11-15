@@ -4479,6 +4479,58 @@ CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
     WHERE built_revision IS NOT revision OR format_version IS NOT 4;
 "#,
     },
+    Migration {
+        version: 49,
+        statements: r#"
+-- Old quantity sums cannot distinguish missing quantities from stated zero.
+-- Discard derived cells only; retained hours rebuild at format 5, together
+-- with their run cells, while readers use the ledger for stale hours.
+DROP TABLE summary_quantity;
+DROP TABLE summary_money;
+DROP TABLE summary_cell;
+CREATE TABLE summary_cell (
+    cell_id INTEGER PRIMARY KEY,
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    producer INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(producer>0),
+    provider INTEGER NOT NULL REFERENCES summary_value(value_id),
+    model INTEGER NOT NULL REFERENCES summary_value(value_id),
+    account INTEGER NOT NULL REFERENCES summary_value(value_id),
+    auth_selection INTEGER NOT NULL REFERENCES summary_value(value_id),
+    charge_basis INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(charge_basis>0),
+    work_class INTEGER NOT NULL REFERENCES summary_value(value_id),
+    project INTEGER NOT NULL REFERENCES summary_value(value_id),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id),
+    payload TEXT NOT NULL CHECK(json_valid(payload)),
+    paying_credential INTEGER NOT NULL REFERENCES summary_value(value_id),
+    UNIQUE(kind,hour_number,producer,provider,model,account,auth_selection,charge_basis,work_class,project,currency,paying_credential),
+    FOREIGN KEY(kind,hour_number) REFERENCES summary_hour(kind,hour_number)
+);
+CREATE TABLE summary_quantity (
+    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
+    unit INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(unit>0),
+    role INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(role>0),
+    exponent INTEGER NOT NULL CHECK(exponent BETWEEN -9 AND 1),
+    units TEXT NOT NULL,
+    observations INTEGER NOT NULL CHECK(observations>=0),
+    covered_units TEXT NOT NULL,
+    covered_observations INTEGER NOT NULL CHECK(covered_observations>=0),
+    stated_observations INTEGER NOT NULL CHECK(stated_observations>=0 AND stated_observations<=observations),
+    PRIMARY KEY(cell_id,unit,role,exponent)
+) WITHOUT ROWID;
+CREATE TABLE summary_money (
+    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
+    kind INTEGER NOT NULL CHECK(kind IN (0,1)),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(currency>0),
+    nanos TEXT NOT NULL,
+    contributions INTEGER NOT NULL CHECK(contributions>0),
+    PRIMARY KEY(cell_id,kind,currency)
+) WITHOUT ROWID;
+DROP INDEX summary_hour_stale;
+CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
+    WHERE built_revision IS NOT revision OR format_version IS NOT 5;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -7936,6 +7988,69 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn schema_v49_discards_ambiguous_quantity_cache_not_ledger_or_hour_metadata() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version < 49) {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO usage_event(event_id,producer,producer_ref,occurred_at_ms,recorded_at_ms,charge_basis)
+             VALUES('unknown','fixture','unknown',1,1,'metered_api');
+             INSERT INTO measurement(event_key,role,unit,kind,source)
+             VALUES((SELECT event_key FROM usage_event WHERE event_id='unknown'),'input','token','billed','fixture');
+             INSERT INTO summary_value VALUES(1,'fixture'),(2,'metered_api'),(3,'token'),(4,'input');
+             UPDATE summary_hour SET built_revision=revision,format_version=4,events_total=1;
+             DELETE FROM summary_dirty_hour;
+             INSERT INTO summary_cell VALUES(1,0,0,1,0,0,0,0,2,0,0,0,'{}',0);
+             INSERT INTO summary_quantity VALUES(1,3,4,1,'0',1,'0',0);",
+        ).unwrap();
+        let before = all_rows(&conn);
+        conn.execute_batch(MIGRATIONS[48].statements).unwrap();
+        assert_eq!(MIGRATIONS[48].version, 49);
+        let expected = before
+            .into_iter()
+            .map(|(table, rows)| {
+                let rows = if ["summary_cell", "summary_quantity", "summary_money"]
+                    .contains(&table.as_str())
+                {
+                    Vec::new()
+                } else {
+                    rows
+                };
+                (table, rows)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(all_rows(&conn), expected);
+        assert_eq!(conn.query_row("SELECT count(*) FROM summary_hour INDEXED BY summary_hour_stale WHERE built_revision IS NOT revision OR format_version IS NOT 5",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        conn.execute_batch("INSERT INTO summary_cell VALUES(1,0,0,1,0,0,0,0,2,0,0,0,'{}',0);
+                            INSERT INTO summary_quantity VALUES(1,3,4,0,'0',1,'0',0,0);
+                            INSERT INTO summary_quantity VALUES(1,3,4,1,'0',1,'0',0,1);
+                            DELETE FROM summary_cell WHERE cell_id=1;
+                            UPDATE usage_event SET pricing_generation=pricing_generation+1 WHERE event_id='unknown';").unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM summary_quantity", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM summary_dirty_hour", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
     }
 
     /// The chain restarts at v1 and is contiguous; the runner records every

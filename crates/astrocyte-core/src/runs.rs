@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::ReportError;
 
-// Version 3 rebuilds cached hourly spend reports and run costs so observed
-// readings are no longer counted as measurements awaiting pricing.
-pub(crate) const FORMAT: i64 = 4;
+// Format 5 distinguishes unstated quantities from measured zeros in hourly
+// cells. Run cells are republished with the same hour so both reads agree.
+pub(crate) const FORMAT: i64 = 5;
 const HOUR_MS: i64 = 3_600_000;
 const MAX_RANGE: i64 = 31 * 24 * HOUR_MS;
 const HARNESSES: &[&str] = &[

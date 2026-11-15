@@ -5,6 +5,9 @@
 //! as a source change instead of allowing two independently maintained counts.
 
 use astrocyte_core::report::{ReportError, ReportRequest};
+#[cfg(test)]
+#[path = "../tests/support/analytics_vectors.rs"]
+mod analytics_vectors;
 use astrocyte_core::verdict::VerdictRequest;
 use cortexkit_role_llm_runner::watermark::{
     WatermarkReply, WatermarkRequest, NOT_A_READ_SOURCE, WATERMARK_GET,
@@ -195,6 +198,9 @@ fn operation_params_schema(name: &str) -> Value {
                 "grouping": {"type": "array", "items": string},
                 "grain": string,
                 "timezone": string,
+                "from_ms": optional_i64,
+                "to_ms": optional_i64,
+                "where": {"type":"object","additionalProperties":{"type":"array","items":{"type":["string","null"]}}},
             }),
         ),
         OP_EVENT_INGEST => closed_object(
@@ -1607,6 +1613,8 @@ mod tests {
                 vec![
                     json!({"grouping": [], "grain": "day", "timezone": "UTC"}),
                     json!({"grouping": ["provider", "model"], "grain": "day", "timezone": "UTC"}),
+                    json!({"grouping": ["producer", "model"], "grain": "hour", "timezone": "UTC", "from_ms": 0, "to_ms": 1, "where": {"work_class": [null, "review"]}}),
+                    json!({"grouping": [], "grain": "day", "timezone": "UTC", "from_ms": null, "to_ms": null}),
                 ],
                 json!({"grouping": "provider", "grain": "day", "timezone": "UTC"}),
             ),
@@ -1944,6 +1952,10 @@ mod tests {
                             return Err(format!("{member} is not a listed member"))
                         }
                         None | Some(Value::Bool(true)) => {}
+                        Some(additional @ Value::Object(_)) => {
+                            schema_accepts(additional, member_value)
+                                .map_err(|error| format!("{member}: {error}"))?
+                        }
                         Some(other) => panic!("additionalProperties {other} is not supported"),
                     },
                 }
@@ -1955,6 +1967,20 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn report_filter_schema_requires_lists_of_strings_or_null() {
+        let schema = operation_params_schema(OP_REPORT);
+        for filter in [
+            json!({"model":"alpha"}),
+            json!({"model":[1]}),
+            json!({"model":[{}]}),
+        ] {
+            let request = json!({"grouping":[],"grain":"day","timezone":"UTC","where":filter});
+            assert!(schema_accepts(&schema, &request).is_err(), "{request}");
+            assert!(serde_json::from_value::<ReportRequest>(request).is_err());
+        }
     }
 
     /// Dispatches `params` and reports whether the operation's request decoder

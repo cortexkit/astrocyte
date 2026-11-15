@@ -12,6 +12,122 @@ use std::{
 };
 
 const NOW: i64 = 1_790_000_000_000;
+
+/// Opt-in report/read measurements. Rebuild mode mutates only the explicitly
+/// supplied disposable copy; ordinary mode opens it read-only throughout.
+#[test]
+#[ignore = "requires ASTROCYTE_MEASURE_STORE pointing at a disposable store copy"]
+fn analytics_report_copy_measurement() {
+    let path = PathBuf::from(
+        std::env::var("ASTROCYTE_MEASURE_STORE")
+            .expect("supply a store copy, never the live store"),
+    );
+    let rebuild = std::env::var("ASTROCYTE_MEASURE_REBUILD").as_deref() == Ok("1");
+    let measure = |conn: &Connection, label: &str| {
+        let latest: i64 = conn
+            .query_row("SELECT MAX(occurred_at_ms) FROM usage_event", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let to = (latest.div_euclid(86_400_000) + 1)
+            .checked_mul(86_400_000)
+            .unwrap();
+        let from = to - 7 * 86_400_000;
+        let producer: String = conn
+            .query_row(
+                "SELECT producer FROM usage_event WHERE occurred_at_ms=?1 LIMIT 1",
+                [latest],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut request = ReportRequest {
+            grouping: vec!["producer".into(), "model".into()],
+            grain: "day".into(),
+            timezone: "UTC".into(),
+            from_ms: Some(from),
+            to_ms: Some(to),
+            ..ReportRequest::default()
+        };
+        for filtered in [false, true] {
+            if filtered {
+                request
+                    .filters
+                    .insert("producer".into(), vec![Some(producer.clone())]);
+            }
+            let tx = conn.unchecked_transaction().unwrap();
+            let started = Instant::now();
+            let summary = spend(&tx, &request, to);
+            let available = matches!(&summary, Ok(Some(_)));
+            let summary_seconds = started.elapsed().as_secs_f64();
+            let started = Instant::now();
+            let base = spend_report_base(&tx, &request, to, None).unwrap();
+            let ledger_seconds = started.elapsed().as_secs_f64();
+            if let Ok(Some(summary)) = summary {
+                assert_eq!(json(&summary), json(&base));
+            }
+            let started = Instant::now();
+            let served = spend_report(&tx, &request, to).unwrap();
+            let served_seconds = started.elapsed().as_secs_f64();
+            assert_eq!(json(&served), json(&base));
+            emit(
+                serde_json::json!({"mode":"analytics_report","state":label,"filtered":filtered,"from_ms":from,"to_ms":to,"summary_available":available,"summary_seconds":summary_seconds,"ledger_seconds":ledger_seconds,"served_seconds":served_seconds,"rows":served.rows.len()}),
+            );
+            tx.commit().unwrap();
+        }
+        let started = Instant::now();
+        let list = crate::runs::list(
+            conn,
+            &crate::runs::ListRequest {
+                from_ms: from,
+                to_ms: to,
+                harness: None,
+                limit: None,
+                after: None,
+            },
+        )
+        .unwrap();
+        emit(
+            serde_json::json!({"mode":"analytics_runs_list","state":label,"seconds":started.elapsed().as_secs_f64(),"rows":list.rows.len()}),
+        );
+        json(&list)
+    };
+    if !rebuild {
+        measure(&reader(&path), "supplied");
+        return;
+    }
+    let store = writer(&path);
+    store::migrate_store(&store).unwrap();
+    store.with_conn(|conn|conn.execute_batch("UPDATE summary_hour SET format_version=4; UPDATE summary_audit_state SET next_due_ms=9223372036854775807")).unwrap();
+    let conn = reader(&path);
+    let stale = measure(&conn, "all_stale");
+    let stale_count = || {
+        conn.query_row(&format!("SELECT COUNT(*) FROM summary_hour WHERE built_revision IS NOT revision OR format_version IS NOT {FORMAT} OR EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=summary_hour.kind AND d.hour_number=summary_hour.hour_number)"),[],|r|r.get::<_,u64>(0)).unwrap()
+    };
+    let started = Instant::now();
+    let deadline = started + std::time::Duration::from_secs(30 * 60);
+    let mut maintenance = SummaryMaintenance::default();
+    let mut hours = 0_u64;
+    while stale_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "rebuild exceeded 30-minute deadline"
+        );
+        let outcome = advance(&store, &conn, &mut maintenance);
+        assert!(!outcome.deferred, "summary hour exceeds publication budget");
+        if outcome.published {
+            hours += 1;
+        }
+    }
+    emit(
+        serde_json::json!({"mode":"analytics_full_rebuild","seconds":started.elapsed().as_secs_f64(),"hours":hours,"format":FORMAT}),
+    );
+    assert_eq!(
+        stale,
+        measure(&conn, "clean"),
+        "Runs must survive the shared-format rebuild unchanged"
+    );
+}
+
 fn emit(value: serde_json::Value) {
     let line = serde_json::to_string(&value).unwrap();
     println!("{line}");
@@ -308,6 +424,7 @@ fn requests() -> Vec<ReportRequest> {
                     timezone: timezone.into(),
                     grain: grain.into(),
                     grouping: grouping.iter().map(|name| (*name).into()).collect(),
+                    ..ReportRequest::default()
                 });
             }
         }
@@ -592,6 +709,7 @@ fn timings(path: &Path) {
         timezone: timezone.into(),
         grain: grain.into(),
         grouping: grouping.iter().map(|value| (*value).into()).collect(),
+        ..ReportRequest::default()
     };
     let mut cases = vec![
         Case::Spend("spend_month_utc", make("UTC", "month", &[])),

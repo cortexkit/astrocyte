@@ -67,7 +67,7 @@ Test: `every_operation_name_reaches_its_own_handler`.
 | Operation | Kind | Request fields (required unless marked `?`) |
 |---|---|---|
 | `budget.verdict` | read | `project_root?`, `provider?`, `model?`, `est_cost_nanos?` |
-| `spend.report` | read | `grouping` (string array), `grain`, `timezone` |
+| `spend.report` | read | `grouping` (string array), `grain`, `timezone`; optional paired `from_ms`/`to_ms`, `where` |
 | `spend.subscription.report` | read | none |
 | `spend.workclass.report` | read | none |
 | `spend.ledger.coverage` | read | none |
@@ -304,12 +304,71 @@ Reads never write. A refusal on a read is one of the codes below.
 - `spend.report`: `totals`, `rows`, `undated`, `ingest_freshness`,
   `rate_staleness`, and `hierarchy_resolution` (`unavailable`) when grouped by
   `project`. `grouping` names are `provider`, `model`, `account`,
-  `auth_selection`, `charge_basis`, `work_class`, `project`; `grain` is
-  `day`, `week` or `month`; `timezone` is an IANA name. Refusals:
+  `auth_selection`, `charge_basis`, `work_class`, `project`, `producer`; `grain` is
+  `hour`, `day`, `week` or `month`; `timezone` is an IANA name. Refusals:
   `invalid_grouping` (unknown or repeated), `invalid_grain`,
   `invalid_timezone`. Test: `spend_report_refusal_keeps_its_code`.
   Event exclusion reasons in spend, work-class and ledger coverage include
   `observed_only` when a producer reported readings but no billed quantity.
+  The work-class report's populations and producer labels are unchanged.
+
+  Optional `from_ms` and `to_ms` must be supplied together, with `from_ms < to_ms`,
+  or the read refuses `invalid_range`. They select a half-open interval widened
+  outward to whole buckets. Without them, day/week/month cover all history as
+  before. Day buckets begin at the first existing instant of the local date;
+  weeks begin Monday, and months begin on the first local date of the month.
+  Day ranges are limited to 400 days after widening. Week/month requests are
+  limited to 400 days before widening, with widening permitted to add less than
+  one week/month bucket on each side. A supplied span over 400 days is always
+  `range_too_large`. These limits use elapsed 24-hour days, not local-date counts.
+  Hour buckets are UTC hours regardless of timezone, including across daylight
+  saving transitions. Hour requires an explicit range and allows at most 744
+  UTC buckets after widening; otherwise it refuses `range_too_large`. A 31-day
+  interval with non-hour-aligned edges therefore needs shortening or alignment.
+  Hour refuses `hour_timezone_unsupported` if the timezone has any offset that
+  is not an integral number of UTC hours anywhere in the widened range, including
+  historical second offsets and fractional-hour daylight saving offsets.
+
+  `where` is an optional object mapping any supported grouping name to a
+  nonempty list of strings or JSON null. Values are ORed within each dimension,
+  dimensions are ANDed, and null matches an absent dimension, not an empty
+  string. Filters need not be grouping dimensions. An unknown key refuses
+  `invalid_grouping`, just like an unknown grouping; an empty list refuses
+  `invalid_filter`. Recognized but unavailable dimensions `alfonso`, `workload`,
+  `workspace` and `parent_alfonso` refuse `dimension_unavailable` in grouping
+  and where. `plan` is not supported. Unknown request members remain `malformed`.
+  `undated` and `rate_staleness` describe the selected population, so a ranged
+  report's zero undated count does not claim the ledger has no undated events;
+  `ingest_freshness` remains global because it describes the sources.
+
+  Each row and each currency total additionally carries `tokens` and `units`.
+  Tokens have optional `input`, `output`, `reasoning`, `cache_read`,
+  `cache_write`, `cache_write_5m` and `cache_write_1h` integer counts. Output
+  includes reasoning using the Runs served-token rule: stored output plus stored
+  reasoning, but output stays omitted when only reasoning was stated in that
+  row or total. Reasoning is also a breakdown inside output. Cache write is all
+  lifetimes together; the 5-minute and 1-hour fields are parts of that total.
+  A role with no stated quantity is omitted, never invented as zero; a stated
+  zero remains present. Exact fractional token sums are served only when they
+  represent whole tokens, as on Runs reads. Counts include measurements
+  regardless of pricing state or charge basis, including observed readings.
+  Non-token units are a list of `{role, unit, quantity: {units, exponent}}`,
+  with exact base-10 quantities and no floating-point conversion. Token-role
+  measurements missing quantity are counted in optional
+  `unknown_quantities: {role: count}` on the row/total. For non-token units the
+  count is an optional `unknown_quantities` member on the corresponding
+  `{role, unit}` entry, whose `quantity` is omitted if none was stated. A count
+  with unknown measurements is a lower bound. Totals aggregate stored roles
+  before applying inclusive output, so they can include reasoning whose row
+  omitted output. All new figures use hourly summary quantities for clean
+  hours; dirty hours and UTC hours crossed by a local bucket boundary or UTC
+  offset transition use the existing ledger fallback.
+  Tests: `analytics_unknown_quantities_are_not_measured_zero_on_either_path`,
+  `analytics_tokens_and_exact_media_units_are_additive`,
+  `analytics_widened_range_caps_and_calendar_edges`,
+  `analytics_refusals_are_specific_and_read_only`. Tagged handler samples are
+  in `crates/astrocyte-module/test-vectors/analytics-reads-v1`, pinned by
+  `analytics_vectors_match_real_dispatch_and_sha256sums`.
 - `spend.subscription.report` keeps `rows`, `coverage` and `ingest_freshness`.
   `rows` lists account plans only. The additive `credential_rows` lists covered
   usage of credential-keyed plans as `{provider, credential_ref,

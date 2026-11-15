@@ -13,7 +13,10 @@ use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 use rusqlite::{params, Connection, OptionalExtension};
 
+mod analytics;
 mod hourly;
+use analytics::{ParsedReport, Quantities};
+pub use analytics::{ReportTokens, UnitQuantity, UsageQuantities};
 pub use hourly::{SummaryMaintenance, SummaryOutcome};
 
 pub(crate) fn summary_verdict(
@@ -63,12 +66,16 @@ pub fn configure_report_reader(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReportRequest {
     pub grouping: Vec<String>,
     pub grain: String,
     pub timezone: String,
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+    #[serde(default, rename = "where")]
+    pub filters: BTreeMap<String, Vec<Option<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,8 +87,6 @@ enum Grouping {
     ChargeBasis,
     WorkClass,
     Project,
-    /// Read by the work-class report only. `parse` never yields it, so a
-    /// spend report cannot be grouped by producer.
     Producer,
 }
 
@@ -95,6 +100,7 @@ impl Grouping {
             "charge_basis" => Some(Self::ChargeBasis),
             "work_class" => Some(Self::WorkClass),
             "project" => Some(Self::Project),
+            "producer" => Some(Self::Producer),
             _ => None,
         }
     }
@@ -115,6 +121,7 @@ impl Grouping {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Grain {
+    Hour,
     Day,
     Week,
     Month,
@@ -123,6 +130,7 @@ enum Grain {
 impl Grain {
     fn parse(value: &str) -> Option<Self> {
         match value {
+            "hour" => Some(Self::Hour),
             "day" => Some(Self::Day),
             "week" => Some(Self::Week),
             "month" => Some(Self::Month),
@@ -246,6 +254,10 @@ pub struct UndatedCoverage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SpendRow {
+    #[serde(skip)]
+    quantities: Quantities,
+    #[serde(flatten)]
+    pub usage: UsageQuantities,
     pub bucket_start_ms: i64,
     pub bucket_end_ms: i64,
     #[serde(flatten)]
@@ -287,6 +299,8 @@ pub struct SpendRow {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SpendTotal {
+    #[serde(flatten)]
+    pub usage: UsageQuantities,
     pub currency: Option<String>,
     /// Catalog value after signed event adjustments; subscription-covered
     /// usage contributes its recorded zero. This equals money charged only
@@ -320,6 +334,11 @@ pub struct SpendReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportRefusal {
+    InvalidRange,
+    RangeTooLarge,
+    InvalidFilter(String),
+    DimensionUnavailable(String),
+    HourTimezoneUnsupported,
     UnknownGrouping(String),
     DuplicateGrouping(String),
     UnknownGrain(String),
@@ -331,6 +350,11 @@ pub enum ReportRefusal {
 impl ReportRefusal {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::InvalidRange => "invalid_range",
+            Self::RangeTooLarge => "range_too_large",
+            Self::InvalidFilter(_) => "invalid_filter",
+            Self::DimensionUnavailable(_) => "dimension_unavailable",
+            Self::HourTimezoneUnsupported => "hour_timezone_unsupported",
             Self::UnknownGrouping(_) | Self::DuplicateGrouping(_) => "invalid_grouping",
             Self::UnknownGrain(_) => "invalid_grain",
             Self::UnknownTimezone(_) => "invalid_timezone",
@@ -341,6 +365,11 @@ impl ReportRefusal {
 
     pub fn message(&self) -> String {
         match self {
+            Self::InvalidRange => "from_ms and to_ms must be supplied together, with from_ms < to_ms".into(),
+            Self::RangeTooLarge => "reports are limited to 400 days (week/month may widen by one bucket on each side); hour reports require at most 744 UTC hours after widening: align the range or shorten it".into(),
+            Self::InvalidFilter(value) => format!("filter '{value}' must contain at least one value"),
+            Self::DimensionUnavailable(value) => format!("dimension '{value}' is not available"),
+            Self::HourTimezoneUnsupported => "hour grain requires whole-hour UTC offsets throughout the range".into(),
             Self::UnknownGrouping(value) => format!("unknown grouping dimension '{value}'"),
             Self::DuplicateGrouping(value) => format!("duplicate grouping dimension '{value}'"),
             Self::UnknownGrain(value) => format!("unknown report grain '{value}'"),
@@ -490,6 +519,7 @@ impl Interner {
 /// measurements and current charge heads already folded in.
 #[derive(Debug)]
 struct LedgerEvent {
+    quantities: Quantities,
     key: i64,
     occurred_at_ms: Option<i64>,
     /// Interned in `Ledger::values`.
@@ -765,6 +795,16 @@ fn load_scoped_ledger(
     dimensions: &[Grouping],
     filter: Option<&str>,
 ) -> Result<Ledger, ReportError> {
+    load_scoped_ledger_bound(conn, dimensions, filter, &[], false)
+}
+
+fn load_scoped_ledger_bound(
+    conn: &Connection,
+    dimensions: &[Grouping],
+    filter: Option<&str>,
+    parameters: &[rusqlite::types::Value],
+    quantities: bool,
+) -> Result<Ledger, ReportError> {
     let mut values = Interner::default();
     let mut reasons = Interner::default();
     let mut index: FastMap<i64, u32> = FastMap::default();
@@ -782,7 +822,7 @@ fn load_scoped_ledger(
                       THEN COALESCE(resolved_credential,auth_selection) END
          FROM usage_event{event_filter}"
     ))?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
     while let Some(row) = rows.next()? {
         let charge_basis = parse_charge_basis(required_text_column(row, 3)?, 3)?;
         // Decoded only to refuse the same malformed rows reading a full
@@ -810,6 +850,7 @@ fn load_scoped_ledger(
         let position = u32::try_from(events.len()).map_err(|_| ReportError::Arithmetic)?;
         index.insert(row.get(0)?, position);
         events.push(LedgerEvent {
+            quantities: Quantities::default(),
             key: row.get(0)?,
             occurred_at_ms: row.get(1)?,
             currency: text_column(row, 2)?
@@ -845,12 +886,23 @@ fn load_scoped_ledger(
     {
         let mut lookup = EventLookup::new(&index);
         let mut statement = conn.prepare(&format!(
-            "SELECT event_key,role,unit,quantity_units,kind FROM measurement{child_filter}"
+            "SELECT event_key,role,unit,quantity_units,kind,quantity_exponent FROM measurement{child_filter}"
         ))?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
         while let Some(row) = rows.next()? {
             let position = lookup.find(row.get(0)?)?;
             let event = &mut events[position];
+            let quantity = row
+                .get::<_, Option<i64>>(3)?
+                .zip(row.get::<_, Option<i32>>(5)?);
+            if quantities {
+                event.quantities.observe(
+                    required_text_column(row, 1)?,
+                    required_text_column(row, 2)?,
+                    quantity.map(|(units, exponent)| (i128::from(units), exponent)),
+                    u64::from(quantity.is_none()),
+                )?;
+            }
             measurements_total = measurements_total
                 .checked_add(1)
                 .ok_or(ReportError::Arithmetic)?;
@@ -890,7 +942,7 @@ fn load_scoped_ledger(
         let mut statement = conn.prepare(&format!(
             "SELECT supersedes FROM priced_charge WHERE supersedes IS NOT NULL{superseded_filter}"
         ))?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
         let mut superseded = FastSet::default();
         while let Some(row) = rows.next()? {
             superseded.insert(row.get::<_, i64>(0)?);
@@ -906,7 +958,7 @@ fn load_scoped_ledger(
                     charge_key
              FROM priced_charge{child_filter}"
         ))?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
         while let Some(row) = rows.next()? {
             if superseded.contains(&row.get::<_, i64>(7)?) {
                 continue;
@@ -990,7 +1042,7 @@ fn load_scoped_ledger(
         let mut statement = conn.prepare(&format!(
             "SELECT event_key,amount_nanos FROM adjustment{child_filter}"
         ))?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
         while let Some(row) = rows.next()? {
             let position = lookup.find(row.get(0)?)?;
             let event = &mut events[position];
@@ -1033,6 +1085,7 @@ type CompactBucketKey = (i64, i64, [Option<u32>; GROUPING_DIMENSIONS], Option<u3
 
 #[derive(Debug, Default)]
 struct SpendAccumulator {
+    quantities: Quantities,
     total_nanos: i128,
     metered_nanos: i128,
     population: EventPopulation,
@@ -1099,14 +1152,18 @@ fn spend_report_base(
     now_ms: i64,
     filter: Option<&str>,
 ) -> Result<SpendReport, ReportError> {
-    let grain = Grain::parse(&request.grain)
-        .ok_or_else(|| ReportError::Refused(ReportRefusal::UnknownGrain(request.grain.clone())))?;
-    let timezone: Tz = request.timezone.parse().map_err(|_| {
-        ReportError::Refused(ReportRefusal::UnknownTimezone(request.timezone.clone()))
-    })?;
-    let grouping = parse_grouping(&request.grouping)?;
-    let ledger = load_scoped_ledger(conn, &grouping, filter)?;
-    spend_report_from_ledger(conn, &ledger, &grouping, grain, timezone, now_ms)
+    let parsed = ParsedReport::new(request)?;
+    let (filter, parameters) = parsed.sql(filter);
+    let ledger =
+        load_scoped_ledger_bound(conn, &parsed.grouping, Some(&filter), &parameters, true)?;
+    spend_report_from_ledger(
+        conn,
+        &ledger,
+        &parsed.grouping,
+        parsed.grain,
+        parsed.timezone,
+        now_ms,
+    )
 }
 
 fn spend_report_from_ledger(
@@ -1130,6 +1187,7 @@ fn spend_report_from_ledger(
         };
         let date = local_date(occurred_at_ms, timezone)?;
         let (start_ms, end_ms) = match last_bounds {
+            _ if grain == Grain::Hour => analytics::bounds(occurred_at_ms, timezone, grain)?,
             Some((last_date, bounds)) if last_date == date => bounds,
             _ => {
                 let bounds = bucket_bounds_for_date(date, timezone, grain)?;
@@ -1145,6 +1203,7 @@ fn spend_report_from_ledger(
             .entry((start_ms, end_ms, grouping_values, event.currency))
             .or_default();
         accumulator.population.observe(event)?;
+        accumulator.quantities.merge(&event.quantities)?;
         let event_total = event.report_total()?;
         accumulator.total_nanos = accumulator
             .total_nanos
@@ -1182,15 +1241,22 @@ fn spend_report_from_ledger(
         )
         .collect::<Vec<_>>();
     keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut headline_quantities: BTreeMap<Option<String>, Quantities> = BTreeMap::new();
     let rows = keyed
         .into_iter()
         .map(|(key, accumulator)| {
+            headline_quantities
+                .entry(key.currency.clone())
+                .or_default()
+                .merge(&accumulator.quantities)?;
             let population = accumulator.population;
             let events_unpriced = population
                 .events_total
                 .checked_sub(population.events_priced)
                 .ok_or(ReportError::Arithmetic)?;
             Ok(SpendRow {
+                usage: accumulator.quantities.render()?,
+                quantities: accumulator.quantities,
                 bucket_start_ms: key.start_ms,
                 bucket_end_ms: key.end_ms,
                 grouping: key.grouping.into_iter().collect(),
@@ -1220,6 +1286,7 @@ fn spend_report_from_ledger(
     let mut headline: BTreeMap<Option<String>, SpendTotal> = BTreeMap::new();
     for row in &rows {
         let total = headline.entry(row.currency.clone()).or_insert(SpendTotal {
+            usage: UsageQuantities::default(),
             currency: row.currency.clone(),
             total_nanos: 0,
             metered_nanos: 0,
@@ -1252,6 +1319,12 @@ fn spend_report_from_ledger(
             .checked_add(row.zero_measurement_events)
             .ok_or(ReportError::Arithmetic)?;
     }
+    for (currency, quantities) in headline_quantities {
+        headline
+            .get_mut(&currency)
+            .ok_or(ReportError::Integrity("headline currency absent"))?
+            .usage = quantities.render()?;
+    }
     let mut undated_reasons = BTreeMap::new();
     if undated > 0 {
         undated_reasons.insert("missing_occurred_at".into(), undated);
@@ -1276,8 +1349,7 @@ fn parse_grouping(values: &[String]) -> Result<Vec<Grouping>, ReportError> {
     let mut parsed = Vec::with_capacity(values.len());
     let mut seen = BTreeSet::new();
     for value in values {
-        let dimension = Grouping::parse(value)
-            .ok_or_else(|| ReportError::Refused(ReportRefusal::UnknownGrouping(value.clone())))?;
+        let dimension = analytics::dimension(value)?;
         if !seen.insert(dimension) {
             return Err(ReportError::Refused(ReportRefusal::DuplicateGrouping(
                 value.clone(),
@@ -1290,9 +1362,8 @@ fn parse_grouping(values: &[String]) -> Result<Vec<Grouping>, ReportError> {
 
 /// The calendar bucket holding instant `ms`, in `timezone`. Spend reports
 /// compute the same bounds in two steps so they can reuse them per local date.
-#[cfg(test)]
 fn bucket_bounds(ms: i64, timezone: Tz, grain: Grain) -> Result<(i64, i64), ReportError> {
-    bucket_bounds_for_date(local_date(ms, timezone)?, timezone, grain)
+    analytics::bounds(ms, timezone, grain)
 }
 
 /// The wall-clock date instant `ms` falls on in `timezone`.
@@ -1314,6 +1385,7 @@ fn bucket_bounds_for_date(
     grain: Grain,
 ) -> Result<(i64, i64), ReportError> {
     let start_date = match grain {
+        Grain::Hour => return Err(ReportError::Calendar),
         Grain::Day => date,
         Grain::Week => date
             .checked_sub_signed(Duration::days(i64::from(
@@ -1325,6 +1397,7 @@ fn bucket_bounds_for_date(
         }
     };
     let end_date = match grain {
+        Grain::Hour => return Err(ReportError::Calendar),
         Grain::Day => start_date.succ_opt().ok_or(ReportError::Calendar)?,
         Grain::Week => start_date
             .checked_add_signed(Duration::days(7))
@@ -1496,7 +1569,7 @@ struct SubscriptionAccumulator {
     quantities: BTreeMap<(String, String), DecimalSum>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DecimalSum {
     units: i128,
     exponent: i32,
@@ -1505,8 +1578,11 @@ struct DecimalSum {
 
 impl DecimalSum {
     fn add(&mut self, units: i64, exponent: i32) -> Result<(), ReportError> {
+        self.add_exact(i128::from(units), exponent)
+    }
+    fn add_exact(&mut self, units: i128, exponent: i32) -> Result<(), ReportError> {
         if !self.initialized {
-            self.units = i128::from(units);
+            self.units = units;
             self.exponent = exponent;
             self.initialized = true;
             return Ok(());
@@ -1517,7 +1593,7 @@ impl DecimalSum {
         self.units = self
             .units
             .checked_mul(left_scale)
-            .and_then(|value| value.checked_add(i128::from(units).checked_mul(right_scale)?))
+            .and_then(|value| value.checked_add(units.checked_mul(right_scale)?))
             .ok_or(ReportError::Arithmetic)?;
         self.exponent = target;
         Ok(())
@@ -2601,6 +2677,10 @@ fn pow10_i128(exponent: u32) -> Result<i128, ReportError> {
 mod tests {
     use super::*;
     use crate::test_support::conn;
+    mod analytics {
+        use super::*;
+        include!("report/analytics_tests.rs");
+    }
 
     #[test]
     fn thalamus_payer_coverage_owner_disagreements_are_distinct_and_explicit_zero() {
@@ -2689,6 +2769,7 @@ mod tests {
                 timezone: "UTC".into(),
                 grain: "day".into(),
                 grouping: vec![],
+                ..ReportRequest::default()
             },
             100,
         )
@@ -2922,6 +3003,7 @@ mod tests {
             grouping: Vec::new(),
             grain: "day".into(),
             timezone: timezone.into(),
+            ..ReportRequest::default()
         }
     }
 
@@ -3937,7 +4019,7 @@ mod tests {
             spend_report(
                 &conn,
                 &ReportRequest {
-                    grain: "hour".into(),
+                    grain: "fortnight".into(),
                     ..request("UTC")
                 },
                 10
@@ -4784,6 +4866,7 @@ mod tests {
                 grouping: vec!["provider".into(), "account".into()],
                 grain: "day".into(),
                 timezone: "UTC".into(),
+                ..ReportRequest::default()
             },
             2_000,
         )
@@ -5139,6 +5222,7 @@ mod tests {
                 grouping: grouping.iter().map(|value| (*value).to_string()).collect(),
                 grain: grain.into(),
                 timezone: timezone.into(),
+                ..ReportRequest::default()
             };
             let started = Instant::now();
             let report = spend_report(&conn, &request, now_ms).unwrap();

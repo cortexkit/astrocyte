@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 48. A schema change appends a migration; an applied
+currently version 49. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -61,7 +61,7 @@ copies that timeout without running the table-creating probes.
 | `summary_hour` | Each row records an hour's persistent revision, published revision, format, event count and time extrema. | Triggers advance revisions, and publication records a completed build. |
 | `summary_dirty_hour` | Each row identifies an hour that needs a fresh reduction from base rows. | Triggers insert dirty keys, and successful publication removes them. |
 | `summary_cell` | Each row holds dimension-keyed event and measurement counters, exact money sums and reason maps for one hour. | Rebuilds replace these rows. |
-| `summary_quantity` | Each row holds exact quantities for a cell, role, unit and exponent, including the covered population and presence counts. | Rebuilds replace these rows. |
+| `summary_quantity` | Each row holds exact quantities for a cell, role, unit and exponent, including covered population, observation counts and stated-quantity counts. | Rebuilds replace these rows. |
 | `summary_money` | Each row holds current-head or adjustment contributions in their actual currency, together with a presence count. | Rebuilds replace these rows. |
 | `summary_cost_frequency` | Each row counts an exact current-head value in the dated, complete, currency-known work-class sample. | Rebuilds replace these rows. |
 | `summary_run_cell` | Each row stores step counts, token totals and presence, and current-charge cost maps for one run key, provider and model, and hour. | The existing hourly rebuild and audit replace these rows. |
@@ -487,6 +487,20 @@ overlap trigger is created after the insert-once trigger, so an overlapping
 plan is refused as an overlap.
 The migration leaves `account_subscription` and every stored row unchanged.
 Test: `schema_v47_adds_an_empty_guarded_credential_ledger_and_changes_no_rows`.
+
+Migration 49 advances the shared spend/Run summary format to 5. It adds
+`summary_quantity.stated_observations`, counting only measurements with a stated
+quantity, beside `observations`, which still counts every measurement. Unknown
+quantities contribute no units, and their observations are kept in the
+scale-zero cell; the stated count distinguishes them from a measured zero.
+The migration recreates only `summary_cell`, `summary_quantity` and
+`summary_money`, and rebuilds the stale-hour index for format 5. It retains
+hour revisions, ledger rows, dirty triggers and run cells. Old-format hours,
+including their run cells, remain unreadable as summaries until the prioritized
+background rebuild republishes the whole hour at format 5. The report can
+therefore serve stated lower bounds and unknown-quantity counts without a new
+ledger scan for clean hours. Test:
+`schema_v49_discards_ambiguous_quantity_cache_not_ledger_or_hour_metadata`.
 
 Migration 48 advances summaries to format 4 and adds the hidden
 `summary_cell.paying_credential` dimension to the cell's unique key. It interns
