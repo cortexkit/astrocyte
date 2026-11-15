@@ -9,6 +9,8 @@ use cortexkit_store::{Migration, MigrationOutcome, SqliteStore, StoreError};
 use rusqlite::Connection;
 
 const STORE_BUSY_TIMEOUT_MS: u64 = 5_000;
+/// The size the write-ahead log is cut back to after a checkpoint.
+const STORE_WAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum StoreInitError {
@@ -44,9 +46,17 @@ impl From<rusqlite::Error> for StoreInitError {
 /// the store and WAL, and MEMORY raised peak memory by 4.4 MiB. A statement
 /// journal holds only the pages one statement or savepoint changes, so its
 /// size follows a single event's writes, not the transaction's.
+///
+/// `journal_size_limit` cuts the write-ahead log back to 64 MiB after a
+/// checkpoint. SQLite otherwise keeps the log at the largest size it ever
+/// reached and only reuses it from the start, so one catch-up tick or summary
+/// rebuild could hold hundreds of megabytes of disk until the store closes
+/// (measured: 823 MB after a full summary rebuild). Steady ticks write far
+/// less than the limit, so the cut costs nothing there.
 pub fn initialize_connection(conn: &Connection) -> Result<(), StoreInitError> {
     conn.busy_timeout(Duration::from_millis(STORE_BUSY_TIMEOUT_MS))?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "journal_size_limit", STORE_WAL_SIZE_LIMIT_BYTES)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     let foreign_keys: i64 = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
     if foreign_keys != 1 {
@@ -9042,6 +9052,44 @@ mod tests {
             .pragma_query_value(None, "temp_store", |row| row.get(0))
             .unwrap();
         assert_eq!(temp_store, 2, "temp_store must be MEMORY");
+    }
+
+    #[test]
+    fn the_write_ahead_log_shrinks_back_after_a_large_write() {
+        // A catch-up tick or a summary rebuild can grow the WAL to hundreds
+        // of megabytes. Without a size limit SQLite reuses that file from its
+        // start after a checkpoint but never shortens it, so the disk stays
+        // used until the store is closed.
+        let dir = std::env::temp_dir().join(format!(
+            "astrocyte-wal-limit-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        initialize_connection(&conn).unwrap();
+        conn.execute_batch("CREATE TABLE filler(body BLOB NOT NULL)").unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        for _ in 0..4_000 {
+            tx.execute("INSERT INTO filler(body) VALUES (zeroblob(65536))", [])
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let wal = path.with_extension("db-wal");
+        let grown = std::fs::metadata(&wal).unwrap().len();
+        assert!(grown > 2 * STORE_WAL_SIZE_LIMIT_BYTES, "the large write grew the WAL to {grown}");
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(())).unwrap();
+        conn.execute("INSERT INTO filler(body) VALUES (x'00')", []).unwrap();
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(())).unwrap();
+        let after = std::fs::metadata(&wal).unwrap().len();
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            after <= STORE_WAL_SIZE_LIMIT_BYTES,
+            "the WAL stayed at {after} bytes after a checkpoint, above the {STORE_WAL_SIZE_LIMIT_BYTES}-byte limit"
+        );
     }
 
     #[test]
