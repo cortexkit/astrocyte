@@ -377,7 +377,8 @@ Without a stored mode, multiplier rows count `mode_unrecorded_tokens` and
 coverage and whole-event `rate_tiered` refusals precede selection.
 
 Unit rates use `rate.<role>.per_<unit>` followed by zero or more selector/value
-pairs. The closed unit list is `second`, `character`, `image`, and `request`.
+pairs. The closed unit list is `second`, `character`, `image`, `request`, and `result`
+(a search engine's results, as in `rate.output.per_result`).
 Request billing uses only `rate.request.per_request`. Selector names cannot repeat.
 A unit measurement matches both role and unit, and every stated selector must
 match the served selector set regardless of pair order. An unserved selector

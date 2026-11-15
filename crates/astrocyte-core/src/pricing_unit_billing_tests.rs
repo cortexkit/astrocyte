@@ -422,6 +422,56 @@ fn unit_billing_matches_role_and_unit_and_keeps_token_amounts() {
     );
 }
 
+/// A search engine bills per 1,000 requests and per 1,000 results, with no
+/// published rounding or minimum. Each measurement prices at its own key:
+/// 3 requests at $5 per 1,000 is $0.015, 37 results at $1 per 1,000 is
+/// $0.037.
+#[test]
+fn search_requests_and_results_price_per_thousand() {
+    let mut conn = conn();
+    let id = record(
+        &mut conn,
+        "search",
+        ChargeBasis::MeteredApi,
+        Some(700),
+        vec![
+            unit_billing_measurement("request", "request", 3),
+            unit_billing_measurement("output", "result", 37),
+        ],
+    );
+    let per_thousand = |units: i64| {
+        let mut value =
+            unit_billing_rate(Some(1000), json!({"kind":"unknown"}), json!({"kind":"unknown"}));
+        value["units"] = json!(units);
+        value
+    };
+    reprice_event(
+        &mut conn,
+        &id,
+        &client(FakeCatalog::new(BTreeMap::from([
+            ("rate.request.per_request".into(), per_thousand(5_000_000_000)),
+            ("rate.output.per_result".into(), per_thousand(1_000_000_000)),
+        ]))),
+        1_000,
+        PricingOrigin::PricingPass,
+    )
+    .unwrap();
+    let charges: Vec<(String, String, Option<i64>)> = conn
+        .prepare("SELECT role,unit,charge_nanos FROM priced_charge ORDER BY role")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        charges,
+        [
+            ("output".into(), "result".into(), Some(37_000_000)),
+            ("request".into(), "request".into(), Some(15_000_000)),
+        ]
+    );
+}
+
 #[test]
 fn unit_billing_fractional_nanos_use_half_even_once() {
     for (per, quantity, expected) in [(2, 1, 0), (2, 3, 2), (2, 5, 2), (3, 1, 0), (3, 2, 1)] {

@@ -363,7 +363,7 @@ pub const RATE_ROLES: [&str; 11] = [
 ];
 
 /// Non-token units have explicit denominators rather than an implied million.
-pub const RATE_UNITS: [&str; 4] = ["second", "character", "image", "request"];
+pub const RATE_UNITS: [&str; 5] = ["second", "character", "image", "request", "result"];
 
 /// Mode names a request record uses for ordinary (non-premium) service. A
 /// request stated in one of these prices at the unconditional `rate.<role>`.
@@ -985,6 +985,7 @@ mod tests {
             "rate.input.per_character",
             "rate.output.per_image.size.1024x1024.quality.high",
             "rate.request.per_request",
+            "rate.output.per_result",
         ] {
             assert!(parse_rate_key(key).is_ok(), "{key}");
         }
@@ -998,6 +999,8 @@ mod tests {
             "rate.request",
             "rate.request.per_second",
             "rate.input.per_request",
+            "rate.request.per_result",
+            "rate.output.per_results",
             "rate.input.per_second.size.large.size.small",
             "rate.input.per_second.mode",
             "rate.input.per_second..large",
