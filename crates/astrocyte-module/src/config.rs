@@ -756,6 +756,9 @@ mod tests {
         credential["accounts"] = serde_json::json!({});
         credential["credentials"] =
             serde_json::json!({"vault-key":{"plan":"opencode-go/go","price_override":null}});
+        // Its own provider's calls, as in production: configuration refuses
+        // two quota providers whose scope rules claim the same calls.
+        credential["scope"] = serde_json::json!([{"producer":"opencode","provider":"opencode-go","charge_basis":null,"model_prefix":null}]);
         old["quota_providers"]["opencodego"] = credential;
         store.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
