@@ -75,7 +75,7 @@ copies that timeout without running the table-creating probes.
 | `rate_dirty_hour` | Each row queues a summary-backed hour holding a model whose timeline or reference changed. | Rate publication inserts keys for the model and its referrers; valuation maintenance consumes them. |
 | `valuation_state` | The singleton records synchronized rate, valuation-config and plan-record generations. | Valuation maintenance and plan-record triggers update it. |
 | `valuation_hour` | Each row records an hour's revision, three built generations and independent valuation state. | Ledger and plan triggers invalidate hours; valuation publication completes them. |
-| `valuation_cell` | Each row splits a summary key by plan member and subscription ledger record, retaining recorded counters, quantities and currency sums alongside an exact list-value numerator and unvalued reasons. | Valuation rebuilds replace these rows without changing spend summaries. |
+| `valuation_cell` | Each row splits a summary key by plan member and subscription ledger record, retaining recorded counters, quantities and currency sums alongside the cell's list value and unvalued reasons. The list value is stored unrounded, in the valuer's numerator units (`ListValue` in `valuation.rs`), and is rounded to whole nanodollars only when a report serves it. | Valuation rebuilds replace these rows without changing spend summaries. |
 
 The payer store's incarnation identifies one database history. THALAMUS changes
 it when the database is replaced or restored, so a reader starts again at the
