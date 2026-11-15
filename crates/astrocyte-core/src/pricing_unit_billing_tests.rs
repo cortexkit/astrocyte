@@ -600,6 +600,65 @@ fn cache_lifetime_golden_tiered_openai_reply_decodes_and_refuses_as_tiered() {
     );
 }
 
+/// The ledger prices a metered call with a catalog read dated at the call, so
+/// lifetime prices must arrive on dated reads too. Fusiform's dated reply for
+/// Claude Opus 5.5 at 2026-11-12 13:00Z carries the 1-hour price, and each
+/// write prices at its own lifetime, exactly as on a current read.
+#[test]
+fn dated_cache_lifetime_golden_prices_each_anthropic_write_at_its_lifetime() {
+    let response = cache_lifetime_vector(
+        "claude-opus-5-5 dated",
+        include_bytes!("../test-vectors/fusiform-38b940f/claude-opus-5-5-cache-lifetimes-dated.json"),
+        "8ec2efa56b77326e55af4bf78a1070bdfc14882cf47f67380770f01e06f44019",
+    );
+    let mut conn = conn();
+    let id = record_cache_writes(
+        &mut conn,
+        "anthropic",
+        "claude-opus-5-5",
+        &["token", "token_cache_5m", "token_cache_1h"],
+    );
+    let fake = FakeCatalog::new(BTreeMap::new());
+    *fake.response.lock().unwrap() = response;
+    reprice_event(&mut conn, &id, &client(fake), 1_000, PricingOrigin::PricingPass).unwrap();
+    assert_eq!(
+        charges_by_unit(&conn),
+        vec![
+            ("token".into(), Some(5_000_000_000), None),
+            ("token_cache_1h".into(), Some(8_000_000_000), None),
+            ("token_cache_5m".into(), Some(5_000_000_000), None),
+        ]
+    );
+}
+
+/// GPT-6.1 Sol's dated reply carries its lifetime prices, including the
+/// above-272k tier's, and the ledger still refuses the tiered model whole.
+#[test]
+fn dated_cache_lifetime_golden_tiered_openai_reply_decodes_and_refuses_as_tiered() {
+    let response = cache_lifetime_vector(
+        "gpt-6.1-sol dated",
+        include_bytes!("../test-vectors/fusiform-38b940f/gpt-6.1-sol-cache-lifetimes-dated.json"),
+        "b7ecb257fab84f646a219dbde6fb1598fe35162bff762290b3e97ddc2006930a",
+    );
+    let mut conn = conn();
+    let id = record_cache_writes(
+        &mut conn,
+        "openai",
+        "gpt-6.1-sol",
+        &["token_cache_30m", "token_cache_12h"],
+    );
+    let fake = FakeCatalog::new(BTreeMap::new());
+    *fake.response.lock().unwrap() = response;
+    reprice_event(&mut conn, &id, &client(fake), 1_000, PricingOrigin::PricingPass).unwrap();
+    assert_eq!(
+        charges_by_unit(&conn),
+        vec![
+            ("token_cache_12h".into(), None, Some("rate_tiered".into())),
+            ("token_cache_30m".into(), None, Some("rate_tiered".into())),
+        ]
+    );
+}
+
 /// Every cache-write lifetime is part of the prompt a context tier is tested
 /// against. A request with 200k input tokens and a 100k-token 12-hour cache
 /// write sends a 300k prompt, so it crosses a 272k tier.
