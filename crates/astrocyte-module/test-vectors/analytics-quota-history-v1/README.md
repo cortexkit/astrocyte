@@ -25,7 +25,8 @@ by the handler. To regenerate, run on the build server:
 ASTROCYTE_EXPORT_QUOTA_HISTORY_VECTORS=1 cargo test --workspace --locked quota_history_vectors
 ```
 
-The export writes the JSON bodies and `SHA256SUMS` into this directory. Request
-those files as returned paths when running remotely. Run the test again without
-the export variable to verify the pinned files. `SHA256SUMS` covers each JSON
+The export writes the JSON bodies and `SHA256SUMS` into this directory. A build
+machine writes them into its own checkout, so copy this directory back from it
+before committing. Run the test again without the export variable to verify the
+pinned files. `SHA256SUMS` covers each JSON
 body and this README, not itself. Published version tags must not move.

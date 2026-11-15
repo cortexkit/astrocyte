@@ -905,7 +905,7 @@ through the real dispatch and the serving path's shared permission refusal.
 
 A history of the insula quota readings astrocyte has recorded, read on the
 read-only connection. It makes no provider request and estimates neither usage
-nor spend. Flow routes may not call it.
+nor spend. A route opened by an approved flow (§1) may not call it.
 
 **Request:** `{from_ms, to_ms, grain, quota_providers?}`, for example
 `{"from_ms":0,"to_ms":3600000,"grain":"hour","quota_providers":["claude"]}`.
