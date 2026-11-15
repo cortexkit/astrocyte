@@ -4538,17 +4538,23 @@ ALTER TABLE usage_event ADD COLUMN runner TEXT
     CHECK(runner IN ('broca','thalamus','colliculus'));
 DROP TRIGGER usage_event_update_guard;
 -- Historical runner evidence is frozen before the write-once guard returns.
--- Materialize session membership once: the payer session columns are unindexed.
+-- Uncorrelated membership avoids repeated scans of unindexed payer sessions.
+-- Claude Code's stored owner session can differ from its native payer session,
+-- so a payer's step reference is also evidence. Harness qualifies both keys.
 UPDATE usage_event SET runner = CASE
     WHEN producer='broca' THEN 'broca'
     WHEN producer='thalamus-harness' THEN 'thalamus'
     WHEN producer='colliculus' THEN 'colliculus'
-    WHEN session IN (SELECT session FROM thalamus_payer_session
-                     UNION SELECT session FROM thalamus_payer_record) THEN 'thalamus'
+    WHEN (producer, session) IN (SELECT harness, session FROM thalamus_payer_session
+                                 UNION SELECT harness, session FROM thalamus_payer_record)
+      OR (producer, producer_ref) IN (SELECT harness, step_ref FROM thalamus_payer_record
+                                      WHERE step_ref IS NOT NULL) THEN 'thalamus'
     ELSE NULL END
 WHERE producer IN ('broca','thalamus-harness','colliculus')
-   OR session IN (SELECT session FROM thalamus_payer_session
-                  UNION SELECT session FROM thalamus_payer_record);
+   OR (producer, session) IN (SELECT harness, session FROM thalamus_payer_session
+                              UNION SELECT harness, session FROM thalamus_payer_record)
+   OR (producer, producer_ref) IN (SELECT harness, step_ref FROM thalamus_payer_record
+                                   WHERE step_ref IS NOT NULL);
 CREATE TRIGGER usage_event_update_guard
 BEFORE UPDATE ON usage_event
 WHEN NOT (
@@ -8170,6 +8176,8 @@ mod tests {
         }
         for (id, producer, session) in [
             ("broca", "broca", "no-evidence"),
+            ("claude-step", "claude-code", "owner-session"),
+            ("cross-harness", "pi", "declared"),
             ("payer", "thalamus-harness", "no-evidence"),
             ("media", "colliculus", "declared"),
             ("declared", "opencode", "declared"),
@@ -8179,16 +8187,17 @@ mod tests {
             conn.execute("INSERT INTO usage_event(event_id,producer,producer_ref,session,occurred_at_ms,recorded_at_ms,charge_basis) VALUES(?1,?2,?1,?3,1,1,'unknown')", params![id,producer,session]).unwrap();
         }
         conn.execute_batch("INSERT INTO thalamus_payer_session VALUES('opencode','declared',NULL,0);
+            INSERT INTO thalamus_payer_record(attempt_id,seq,incarnation,harness,session,request_kind,step_ref,recorded_at_ms,provider,model,auth_selection) VALUES('claude-attempt',2,'one','claude-code','native-session','main','claude-step',1,'p','m','auth');
             INSERT INTO thalamus_payer_record(attempt_id,seq,incarnation,harness,session,request_kind,recorded_at_ms,provider,model,auth_selection) VALUES('a',1,'one','pi','record-only','main',1,'p','m','auth');
             INSERT INTO summary_value VALUES(1,'opencode'),(2,'unknown');
-            UPDATE summary_hour SET built_revision=revision,format_version=5,events_total=6;
+            UPDATE summary_hour SET built_revision=revision,format_version=5,events_total=8;
             DELETE FROM summary_dirty_hour;
             INSERT INTO summary_cell VALUES(1,0,0,1,0,0,0,0,2,0,0,0,'{}',0);").unwrap();
         let before = all_rows(&conn);
         let started = std::time::Instant::now();
         conn.execute_batch(MIGRATIONS[49].statements).unwrap();
         eprintln!(
-            "migration 50 six-row backfill and cache reset: {:?}",
+            "migration 50 eight-row backfill and cache reset: {:?}",
             started.elapsed()
         );
         let rows: Vec<(String, Option<String>)> = conn
@@ -8202,6 +8211,8 @@ mod tests {
             rows,
             vec![
                 ("broca".into(), Some("broca".into())),
+                ("claude-step".into(), Some("thalamus".into())),
+                ("cross-harness".into(), None),
                 ("declared".into(), Some("thalamus".into())),
                 ("local".into(), None),
                 ("media".into(), Some("colliculus".into())),

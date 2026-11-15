@@ -136,10 +136,14 @@ session declared by Thalamus. Push ingest leaves it null. The value is
 write-once, including null: later declarations or redeliveries never change
 it, and a different computed runner on redelivery is not a contradiction.
 Migration 50 labels historical BROCA, Thalamus-harness and Colliculus producer
-rows directly. Other producers receive `thalamus` only when their session
-appears in `thalamus_payer_session` or `thalamus_payer_record`; all other
-historical calls remain null. Deleting payer history cannot erase a recorded
-label.
+rows directly. Other producers receive `thalamus` only when their producer and
+session match a harness and session in `thalamus_payer_session` or
+`thalamus_payer_record`, or their producer and producer reference match a
+harness and non-null `step_ref` in `thalamus_payer_record`. The reference match
+also covers Claude Code calls stored under an owner session instead of the
+payer's native session. Matching the harness prevents a session id shared by
+different harnesses from mislabelling a call. All other historical calls remain
+null. Deleting payer history cannot erase a recorded label.
 
 `usage_event.resolved_credential` (schema 46) is nullable `TEXT`, carried
 verbatim from a BROCA session fact's `resolved_credential_id`: the vault
