@@ -25,6 +25,7 @@ pub mod statement_import;
 pub mod step_feed;
 pub mod store;
 pub mod subscription;
+pub mod valuation;
 pub mod vault_plan;
 pub mod verdict;
 

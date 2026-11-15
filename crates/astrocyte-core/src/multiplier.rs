@@ -34,25 +34,22 @@ use rusqlite::{
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
+#[cfg(test)]
+use crate::catalog_client::{cache_write_ttl, stated_mode_condition, RATE_ROLES};
 use crate::catalog_client::{
-    cache_write_ttl, parse_rate_key, stated_mode_condition, token_rate_key, CatalogCallError,
-    CatalogClient, CatalogClientError, CatalogLookup, CatalogModel, CatalogSnapshot,
-    RATE_FACT_PREFIX, RATE_ROLES,
+    parse_rate_key, token_rate_key, CatalogCallError, CatalogClient, CatalogClientError,
+    CatalogLookup, CatalogModel, CatalogSnapshot, RATE_FACT_PREFIX,
 };
 use crate::fact::ChargeBasis;
 use crate::money::{round_nano_num, round_nano_ratio, MoneyError};
-use crate::pricing::{effective_output, prompt_size, EffectiveOutput, PromptSize};
+use crate::pricing::PromptSize;
+#[cfg(test)]
+use crate::pricing::{effective_output, prompt_size, EffectiveOutput};
+use crate::valuation::{event_quantities, EventTokens, MeasuredRole, ValuationRules};
 
 mod calibration;
 pub(crate) mod clean;
 pub use clean::compute_plan_observations;
-
-/// Producers whose usage event is exactly one model call, so a tiered rate
-/// (`.above_context.<size>`) can be decided from the event's own prompt. Every
-/// other producer (BROCA) may bundle many calls into one event -- BROCA events
-/// reach prompts of 10.7M tokens, ten times any context limit -- so its events
-/// are priced at the base rate and their tokens are counted as flagged.
-const PER_REQUEST_PRODUCERS: [&str; 4] = ["opencode", "pi", "claude-code", "codex"];
 
 /// Minutes in the 30-day month plan prices are quoted over.
 const MINUTES_PER_MONTH: i64 = 43_200;
@@ -937,7 +934,7 @@ pub struct ModelRates {
 }
 
 impl ModelRates {
-    fn context_tier_for_role(&self, role: &str, prompt: PromptSize) -> Option<u64> {
+    pub(crate) fn context_tier_for_role(&self, role: &str, prompt: PromptSize) -> Option<u64> {
         self.tiers
             .iter()
             .filter_map(|(threshold, rates)| rates.contains_key(role).then_some(*threshold))
@@ -1007,27 +1004,6 @@ impl<'a> ModelLookup<'a> {
 
     fn get(&self, provider: &str, model: &str) -> Option<&'a ModelResolution> {
         self.providers.get(provider)?.get(model).copied()
-    }
-}
-
-struct ValuationRules<'a> {
-    api_twins: &'a BTreeMap<String, String>,
-    reasoning_billed_as_output: &'a [String],
-}
-
-impl<'a> ValuationRules<'a> {
-    fn from_config(config: &'a MultiplierConfig, reasoning_billed_as_output: &'a [String]) -> Self {
-        Self {
-            api_twins: &config.api_twins,
-            reasoning_billed_as_output,
-        }
-    }
-
-    fn catalog_provider<'b>(&'b self, event_provider: &'b str) -> &'b str {
-        self.api_twins
-            .get(event_provider)
-            .map(String::as_str)
-            .unwrap_or(event_provider)
     }
 }
 
@@ -1520,7 +1496,7 @@ pub struct RoleTokens {
 }
 
 impl RoleTokens {
-    fn add(&mut self, role: &str, quantity: i64) -> Result<(), MoneyError> {
+    pub(crate) fn add(&mut self, role: &str, quantity: i64) -> Result<(), MoneyError> {
         let slot = match role {
             "input" => &mut self.input,
             "cache_read" => &mut self.cache_read,
@@ -1531,6 +1507,14 @@ impl RoleTokens {
         };
         *slot = slot.checked_add(quantity).ok_or(MoneyError::OutOfRange)?;
         Ok(())
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<(), MoneyError> {
+        self.add("input", other.input)?;
+        self.add("cache_read", other.cache_read)?;
+        self.add("cache_write", other.cache_write)?;
+        self.add("output", other.output)?;
+        self.add("reasoning", other.reasoning)
     }
 }
 
@@ -1652,21 +1636,6 @@ pub fn utc_day(ms: i64) -> Result<String, MultiplierError> {
             code: "invalid_range",
             message: format!("instant {ms} ms is outside the representable UTC calendar"),
         })
-}
-
-/// `(role, unit, source, quantity units, quantity exponent)` of one measurement.
-type MeasuredRole = (String, String, String, Option<i64>, Option<i32>);
-
-#[derive(Debug, Clone, PartialEq)]
-struct EventTokens {
-    producer: String,
-    provider: String,
-    model: Option<String>,
-    /// The mode the request's record states it ran in, `None` when it states
-    /// none. The ledger stores no request mode yet, so events read from the
-    /// store carry `None`.
-    mode: Option<String>,
-    roles: Vec<MeasuredRole>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1936,7 +1905,7 @@ pub fn compute_observation(
                 &event.tokens,
                 &mut RoleTokens::default(),
                 &mut 0,
-                &mut |_, _, _| Ok(()),
+                &mut |_, _, _, _| Ok(()),
             )?;
             for quantity in roles.values() {
                 tokens_outside_quota_coverage = tokens_outside_quota_coverage
@@ -2115,94 +2084,6 @@ pub fn compute_observation(
     })
 }
 
-type TokenQuantities<'a> = BTreeMap<(&'a str, Option<&'static str>), i64>;
-
-fn event_quantities<'a>(
-    event: &'a EventTokens,
-    measured: &mut RoleTokens,
-    inclusive_output_adjustment: &mut i64,
-    count_unpriced: &mut impl FnMut(&str, &str, i64) -> Result<(), MultiplierError>,
-) -> Result<TokenQuantities<'a>, MultiplierError> {
-    // Quantities retain role and lifetime so split writes cannot overwrite
-    // one another. A quantity that is not a whole token count
-    // cannot be valued and is counted by reason.
-    let mut quantities = TokenQuantities::new();
-    let mut output_source = None;
-    for (role, unit, source, units, exponent) in &event.roles {
-        // Missing quantities exclude the hour even for an unsupported unit;
-        // absence is unknown usage, not evidence of a zero-sized measurement.
-        if units.is_none() || exponent.is_none() {
-            count_unpriced("missing_quantity", role, units.unwrap_or(0))?;
-            continue;
-        }
-        let ttl = (role == "cache_write")
-            .then(|| cache_write_ttl(unit))
-            .flatten();
-        if unit != "token" && ttl.is_none() {
-            count_unpriced(
-                "unit_not_priced",
-                &format!("{role}/{unit}"),
-                units.unwrap_or(0),
-            )?;
-            continue;
-        }
-        match (units, exponent) {
-            (Some(units), Some(0)) => {
-                measured.add(role, *units)?;
-                if role == "output" {
-                    output_source = Some(source.as_str());
-                }
-                if RATE_ROLES.contains(&role.as_str()) {
-                    quantities.insert((role.as_str(), ttl), *units);
-                } else {
-                    count_unpriced("unrecognized_role", role, *units)?;
-                }
-            }
-            (None, _) => count_unpriced("missing_quantity", role, 0)?,
-            (Some(units), Some(_)) => count_unpriced("fractional_quantity", role, *units)?,
-            (Some(units), None) => count_unpriced("missing_quantity", role, *units)?,
-        }
-    }
-    // Some BROCA output counts include reasoning tokens. Remove that overlap
-    // once, using the ledger's rule, for both valuation and token counts on
-    // either side of quota coverage.
-    if let (Some(output), Some(source)) =
-        (quantities.get(&("output", None)).copied(), output_source)
-    {
-        let reasoning = quantities.get(&("reasoning", None)).copied();
-        match effective_output(
-            &event.producer,
-            Some(&event.provider),
-            source,
-            output,
-            reasoning,
-        ) {
-            EffectiveOutput::AsStored => {}
-            EffectiveOutput::ReasoningRemoved(effective) => {
-                quantities.insert(("output", None), effective);
-                let removed = output
-                    .checked_sub(effective)
-                    .ok_or(MoneyError::OutOfRange)?;
-                *inclusive_output_adjustment = inclusive_output_adjustment
-                    .checked_add(removed)
-                    .ok_or(MoneyError::OutOfRange)?;
-            }
-            EffectiveOutput::ReasoningExceedsOutput => {
-                // Output below its own reasoning cannot be made disjoint.
-                count_unpriced("inclusive_output_below_reasoning", "output", output)?;
-                count_unpriced(
-                    "inclusive_output_below_reasoning",
-                    "reasoning",
-                    reasoning.unwrap_or(0),
-                )?;
-                quantities.remove(&("output", None));
-                quantities.remove(&("reasoning", None));
-            }
-        }
-    }
-    Ok(quantities)
-}
-
 fn value_event(
     rules: &ValuationRules<'_>,
     resolution: Option<&ModelResolution>,
@@ -2211,7 +2092,7 @@ fn value_event(
     unpriced: &mut BTreeMap<(String, String, String), (i64, u64)>,
     totals: &mut RoleTokens,
 ) -> Result<(), MultiplierError> {
-    let mut model_label = None;
+    let value = crate::valuation::value_event(rules, resolution, event)?;
     let line = lines
         .entry((
             event.producer.clone(),
@@ -2225,180 +2106,35 @@ fn value_event(
             ..ModelLine::default()
         });
     line.events += 1;
-    let mut count_unpriced = |reason: &str, role: &str, tokens: i64| {
-        let model_label = model_label.get_or_insert_with(|| {
-            format!(
-                "{}/{}/{}",
-                event.producer,
-                event.provider,
-                event.model.as_deref().unwrap_or("<none>")
-            )
-        });
+    line.measured_tokens.merge(&value.measured_tokens)?;
+    totals.merge(&value.tokens)?;
+    macro_rules! add {
+        ($($field:ident),+ $(,)?) => {$(
+            line.$field = line.$field.checked_add(value.$field).ok_or(MoneyError::OutOfRange)?;
+        )+};
+    }
+    add!(
+        numerator,
+        inclusive_output_adjustment,
+        tiered_tokens,
+        base_rate_tier_untested_tokens,
+        mode_unrecorded_tokens
+    );
+    for diagnostic in value.unpriced {
+        let model_label = format!(
+            "{}/{}/{}",
+            event.producer,
+            event.provider,
+            event.model.as_deref().unwrap_or("<none>")
+        );
         let entry = unpriced
-            .entry((reason.to_string(), model_label.clone(), role.to_string()))
-            .or_insert((0, 0));
-        entry.0 = entry.0.checked_add(tokens).ok_or(MoneyError::OutOfRange)?;
+            .entry((diagnostic.reason, model_label, diagnostic.role))
+            .or_insert((0_i64, 0_u64));
+        entry.0 = entry
+            .0
+            .checked_add(diagnostic.quantity)
+            .ok_or(MoneyError::OutOfRange)?;
         entry.1 = entry.1.checked_add(1).ok_or(MoneyError::OutOfRange)?;
-        Ok::<_, MultiplierError>(())
-    };
-
-    let quantities = event_quantities(
-        event,
-        &mut line.measured_tokens,
-        &mut line.inclusive_output_adjustment,
-        &mut count_unpriced,
-    )?;
-    for ((role, _), quantity) in &quantities {
-        totals.add(role, *quantity)?;
-    }
-    let event_total = quantities.values().try_fold(0_i64, |sum, quantity| {
-        sum.checked_add(*quantity).ok_or(MoneyError::OutOfRange)
-    })?;
-
-    if event.model.is_none() {
-        for ((role, _), quantity) in &quantities {
-            count_unpriced("missing_model", role, *quantity)?;
-        }
-        return Ok(());
-    }
-    let api_provider = rules.catalog_provider(&event.provider);
-    let model_rates = match resolution {
-        Some(ModelResolution::Rates(model_rates)) => model_rates,
-        Some(ModelResolution::Unpriceable { reason }) => {
-            for ((role, _), quantity) in &quantities {
-                count_unpriced(reason, role, *quantity)?;
-            }
-            return Ok(());
-        }
-        None => {
-            for ((role, _), quantity) in &quantities {
-                count_unpriced("rate_not_resolved", role, *quantity)?;
-            }
-            return Ok(());
-        }
-    };
-
-    // Tier: decided from this event's own prompt, and only where one event is
-    // one call. Each role uses its own largest exceeded threshold.
-    // The prompt is read from the event's measurements as stored, including
-    // lifetime-split cache writes, using the ledger's prompt-size function.
-    let per_request = PER_REQUEST_PRODUCERS.contains(&event.producer.as_str());
-    let prompt =
-        prompt_size(event.roles.iter().map(|(role, unit, _, units, exponent)| {
-            (role.as_str(), unit.as_str(), *units, *exponent)
-        }));
-    if per_request && !model_rates.tiers.is_empty() && prompt.is_none() {
-        // A prompt measurement with no usable quantity leaves the prompt's
-        // size unknown, so neither the base nor a tier rate can be chosen.
-        // Ledger pricing refuses the same request as `rate_tiered`.
-        for ((role, _), quantity) in &quantities {
-            count_unpriced("rate_tiered", role, *quantity)?;
-        }
-        return Ok(());
-    }
-    let event_tier = if per_request {
-        prompt.and_then(|prompt| {
-            model_rates
-                .tiers
-                .iter()
-                .rev()
-                .find(|(threshold, _)| prompt.exceeds(**threshold))
-        })
-    } else {
-        if !model_rates.tiers.is_empty() {
-            line.base_rate_tier_untested_tokens = line
-                .base_rate_tier_untested_tokens
-                .checked_add(event_total)
-                .ok_or(MoneyError::OutOfRange)?;
-        }
-        None
-    };
-    if event_tier.is_some() {
-        // Count the whole event when its prompt crosses any model threshold.
-        line.tiered_tokens = line
-            .tiered_tokens
-            .checked_add(event_total)
-            .ok_or(MoneyError::OutOfRange)?;
-    }
-    // Mode: a request recorded in a non-standard mode prices at that mode's
-    // rates only. One recorded as standard, or with no recorded mode, prices
-    // at the base; the unrecorded ones are counted where a mode rate existed
-    // that they might have owed.
-    let stated_mode = stated_mode_condition(event.mode.as_deref());
-    if event.mode.is_none() && !model_rates.modes.is_empty() {
-        line.mode_unrecorded_tokens = line
-            .mode_unrecorded_tokens
-            .checked_add(event_total)
-            .ok_or(MoneyError::OutOfRange)?;
-    }
-    let mode_rates = stated_mode.map(|mode| model_rates.modes.get(mode));
-    let reasoning_as_output = rules
-        .reasoning_billed_as_output
-        .iter()
-        .any(|provider| provider == api_provider);
-    for ((role, ttl), quantity) in quantities {
-        if quantity == 0 {
-            continue;
-        }
-        let rate_role = if role == "reasoning" && reasoning_as_output {
-            "output"
-        } else {
-            role
-        };
-        let tier = if per_request {
-            prompt.and_then(|prompt| model_rates.context_tier_for_role(rate_role, prompt))
-        } else {
-            None
-        };
-        let mut selectors = BTreeMap::new();
-        if let Some(ttl) = ttl {
-            selectors.insert("ttl".into(), ttl.into());
-        }
-        if let Some(mode) = stated_mode {
-            selectors.insert("mode".into(), mode.into());
-        }
-        if let Some(threshold) = tier {
-            selectors.insert("above_context".into(), threshold.to_string());
-        }
-        let exact = model_rates
-            .conditional
-            .get(&token_rate_key(rate_role, &selectors));
-        let state = if ttl.is_some() {
-            // A lifetime is a measurement dimension, never a hint to use the
-            // vendor's default write price or a less-specific condition set.
-            exact
-        } else {
-            match mode_rates {
-                // Without a complete mode/tier rate, neither condition's
-                // price alone describes the recorded request.
-                Some(_) if tier.is_some() && exact.is_none() => {
-                    count_unpriced("mode_rate_above_tier", role, quantity)?;
-                    continue;
-                }
-                // A stated mode is priced at its own rate or not at all.
-                Some(_) if tier.is_some() => exact,
-                Some(rates) => rates.and_then(|rates| rates.get(rate_role)),
-                // A role without a crossed tier uses its base rate. Conditional
-                // tiers alone do not supply an unconditional tier price.
-                None => tier
-                    .and_then(|threshold| model_rates.tiers.get(&threshold))
-                    .and_then(|tier_rates| tier_rates.get(rate_role))
-                    .or_else(|| model_rates.base.get(rate_role)),
-            }
-        };
-        match state {
-            Some(RateState::Priced { units_per_million }) => {
-                let product = i128::from(*units_per_million)
-                    .checked_mul(i128::from(quantity))
-                    .ok_or(MoneyError::OutOfRange)?;
-                line.numerator = line
-                    .numerator
-                    .checked_add(product)
-                    .ok_or(MoneyError::OutOfRange)?;
-            }
-            Some(RateState::Unpriced { reason }) => count_unpriced(reason, role, quantity)?,
-            None => count_unpriced("no_rate", role, quantity)?,
-        }
     }
     Ok(())
 }
@@ -3107,6 +2843,8 @@ fn observation_rows(
 
 #[cfg(test)]
 mod tests {
+    include!("multiplier/legacy_valuer_tests.rs");
+    include!("multiplier/shared_valuer_tests.rs");
     include!("fusiform_plan_price_tests.rs");
     include!("multiplier/v2_tests.rs");
     include!("multiplier/context_tier_tests.rs");
