@@ -2581,11 +2581,12 @@ mod tests {
         initialize_connection(&upgraded).unwrap();
         // The fixture is recorded by today's ingest code, which writes every
         // usage_event column. Columns added after the projection migration
-        // (version 46's resolved_credential) must exist before recording, so
-        // that migration runs early here and is skipped in the later pass. It
-        // touches only usage_event's columns and update guard, never the
-        // projection, so the order does not change what this test compares.
-        const RECORDER_COLUMNS: &[u32] = &[46];
+        // (version 46's resolved_credential, version 50's runner) must exist
+        // before recording, so those migrations run early here and are skipped
+        // in the later pass. They touch usage_event's columns and update guard
+        // and the summary cache, never the projection, so the order does not
+        // change what this test compares.
+        const RECORDER_COLUMNS: &[u32] = &[46, 50];
         for migration in &MIGRATIONS[..position] {
             upgraded.execute_batch(migration.statements).unwrap();
         }

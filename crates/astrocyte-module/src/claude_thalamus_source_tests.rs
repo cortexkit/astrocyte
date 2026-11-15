@@ -364,7 +364,7 @@ fn claude_payer_mirrored_facts_are_stated_and_other_call_facts_stay_unchanged() 
                         let mut statement = conn
                             .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
                             .unwrap();
-                        // Declared roots now record their runner even without a
+                        // Thalamus-declared sessions now record their runner even without a
                         // payer row. All earlier call facts must still agree.
                         let columns: Vec<_> = (0..statement.column_count())
                             .filter(|column| statement.column_name(*column).unwrap() != "runner")
