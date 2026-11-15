@@ -189,7 +189,7 @@ fn voice_call_v1_reply() -> Vec<u8> {
     let manifest = std::fs::read(directory.join("SHA256SUMS")).unwrap();
     assert_eq!(
         format!("{:x}", Sha256::digest(&manifest)),
-        "417f1c5329ade4bf9105585479842432dea9105358066fb03258b1a5ca8c01e2"
+        "b60aeceee0bdfd6d15815c0efa6580b101bcbe57482c738494857f128d71a9ab"
     );
     let mut listed = Vec::new();
     for line in std::str::from_utf8(&manifest).unwrap().lines() {
@@ -237,26 +237,30 @@ impl CatalogConnection for VoiceCallCatalog {
                 message: "fusiform's history begins at 1".into(),
             });
         }
-        // Supply every model-specific rate so a missing rate cannot explain why
-        // the producer's unknown charge basis leaves these measurements unpriced.
-        let rate = |units: i64, per: u64| {
+        // Distinct role rates and a separate per-second model rate expose any
+        // accidental reuse of one model's rates for both records in a call.
+        let rate = |units: i64| {
             json!({"state":"priced", "units":units, "exponent":9,
-                "currency":"USD", "per":per, "unit_provenance":{"kind":"stated"}})
+                "currency":"USD", "unit_provenance":{"kind":"stated"}})
         };
+        let mut per_second = rate(8_000_000);
+        per_second["per"] = json!(1);
+        per_second["increment"] = json!({"kind":"none"});
+        per_second["minimum_quantity"] = json!({"kind":"none"});
         Ok(serde_json::from_value(json!({
             "source":"voice-call-fixture", "resolved_at_ms":request.at_ms,
             "catalog_version":1,
             "models":{
                 "openai/gpt-realtime-2.1":{
-                    "rate.input":rate(1_000_000, 1_000_000),
-                    "rate.input_audio":rate(2_000_000, 1_000_000),
-                    "rate.cache_read":rate(3_000_000, 1_000_000),
-                    "rate.cached_input_audio":rate(4_000_000, 1_000_000),
-                    "rate.output":rate(5_000_000, 1_000_000),
-                    "rate.output_audio":rate(6_000_000, 1_000_000)
+                    "rate.input":rate(1_000_000),
+                    "rate.input_audio":rate(2_000_000),
+                    "rate.cache_read":rate(3_000_000),
+                    "rate.cached_input_audio":rate(4_000_000),
+                    "rate.output":rate(5_000_000),
+                    "rate.output_audio":rate(6_000_000)
                 },
                 "openai/gpt-live-transcribe":{
-                    "rate.input_audio.per_second":rate(8_000_000, 1)
+                    "rate.input_audio.per_second":per_second
                 }
             },
             "withheld":[], "uncertain":[], "overridden":[]
@@ -605,7 +609,7 @@ fn media_usage_vectors_drain_with_invalid_and_unrepresentable_evidence() {
 }
 
 #[test]
-fn media_voice_call_v1_pinned_reply_preserves_records_and_unknown_basis() {
+fn media_voice_call_v1_pinned_reply_prices_each_record_at_its_model_rates() {
     let bytes = voice_call_v1_reply();
     let peer = Peer::start_bytes(Arc::new(move |value| {
         let (kind, reply) = if value["op"] == "route.open" {
@@ -639,8 +643,8 @@ fn media_voice_call_v1_pinned_reply_preserves_records_and_unknown_basis() {
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)))
             .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         assert_eq!(calls, [
-            ("call:5b862f5e26ceb512ad86ec71468187693e4ab86ae5d2d3a509cba679fe292d81".into(), "openai".into(), "gpt-live-transcribe".into(), "invented-call".into(), "unknown".into()),
-            ("call:60c0f4816f92552125ad59d1f3443a69036c4cb928336dcf9936c7dd120eefd6".into(), "openai".into(), "gpt-realtime-2.1".into(), "invented-call".into(), "unknown".into()),
+            ("call:5b862f5e26ceb512ad86ec71468187693e4ab86ae5d2d3a509cba679fe292d81".into(), "openai".into(), "gpt-live-transcribe".into(), "invented-call".into(), "metered_api".into()),
+            ("call:60c0f4816f92552125ad59d1f3443a69036c4cb928336dcf9936c7dd120eefd6".into(), "openai".into(), "gpt-realtime-2.1".into(), "invented-call".into(), "metered_api".into()),
         ]);
         let measurements = conn.prepare("SELECT e.model,m.role,m.unit,m.kind,m.source,m.quantity_units,m.quantity_exponent FROM usage_event e JOIN measurement m USING(event_key) ORDER BY e.model,m.role").unwrap()
             .query_map([], |row| Ok(json!([
@@ -671,19 +675,17 @@ fn media_voice_call_v1_pinned_reply_preserves_records_and_unknown_basis() {
         let charges = conn.prepare("SELECT e.model,m.role,m.unit,c.outcome,c.unpriced_reason,c.charge_nanos,c.currency,c.rate_units,c.rate_exponent FROM usage_event e JOIN measurement m USING(event_key) JOIN priced_charge c ON c.event_key=m.event_key AND c.role=m.role AND c.unit=m.unit WHERE NOT EXISTS (SELECT 1 FROM priced_charge child WHERE child.supersedes=c.charge_key) ORDER BY e.model,m.role").unwrap()
             .query_map([], |row| Ok(json!([
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<i64>>(5)?,
+                row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<i64>>(5)?,
                 row.get::<_, Option<String>>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, Option<i32>>(8)?
             ]))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        // The producer omitted auth_method. Rates alone cannot establish a charge
-        // basis, so even zero-quantity measurements stay unpriced without a rate.
         assert_eq!(json!(charges), json!([
-            ["gpt-live-transcribe", "input_audio", "second", "unpriced", "charge_basis_unknown", null, null, null, null],
-            ["gpt-realtime-2.1", "cache_read", "token", "unpriced", "charge_basis_unknown", null, null, null, null],
-            ["gpt-realtime-2.1", "cached_input_audio", "token", "unpriced", "charge_basis_unknown", null, null, null, null],
-            ["gpt-realtime-2.1", "input", "token", "unpriced", "charge_basis_unknown", null, null, null, null],
-            ["gpt-realtime-2.1", "input_audio", "token", "unpriced", "charge_basis_unknown", null, null, null, null],
-            ["gpt-realtime-2.1", "output", "token", "unpriced", "charge_basis_unknown", null, null, null, null],
-            ["gpt-realtime-2.1", "output_audio", "token", "unpriced", "charge_basis_unknown", null, null, null, null]
+            ["gpt-live-transcribe", "input_audio", "second", "priced", null, 25_000_000, "USD", 8_000_000, 9],
+            ["gpt-realtime-2.1", "cache_read", "token", "priced", null, 6, "USD", 3_000_000, 9],
+            ["gpt-realtime-2.1", "cached_input_audio", "token", "priced", null, 4, "USD", 4_000_000, 9],
+            ["gpt-realtime-2.1", "input", "token", "priced", null, 0, "USD", 1_000_000, 9],
+            ["gpt-realtime-2.1", "input_audio", "token", "priced", null, 6, "USD", 2_000_000, 9],
+            ["gpt-realtime-2.1", "output", "token", "priced", null, 0, "USD", 5_000_000, 9],
+            ["gpt-realtime-2.1", "output_audio", "token", "priced", null, 30, "USD", 6_000_000, 9]
         ]));
         Ok(())
     }).unwrap();

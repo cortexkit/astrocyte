@@ -7,7 +7,7 @@ path). No upstream source revision accompanied the bundle; the upstream
 `README.md` describes its generator. That README, request, response and
 `SHA256SUMS` are preserved here unchanged.
 The manifest's SHA-256 is
-`417f1c5329ade4bf9105585479842432dea9105358066fb03258b1a5ca8c01e2`.
+`b60aeceee0bdfd6d15815c0efa6580b101bcbe57482c738494857f128d71a9ab`.
 
 The served `usage.read` response contains two records for one voice call:
 `openai/gpt-realtime-2.1` reports all six billed token roles, and
@@ -16,14 +16,15 @@ seconds. Both records share a `call_id`, but have distinct `record_id`s.
 Astrocyte preserves them as separate calls, with the shared `call_id` stored
 as `run_ref`, and keeps the quantities exact.
 
-Neither record includes `auth_method`. The reader therefore records both
-with charge basis `unknown`. Even with a catalog serving rates for all seven
-measurements, every charge stays unpriced with reason `charge_basis_unknown`;
-no rate or amount is applied. These bytes do not demonstrate successful
-model-specific pricing.
+Both records include `auth_method: api_key`. The reader therefore records both
+with charge basis `metered_api`. A test catalog serves distinct rates for all
+six realtime token roles and a per-second rate for the transcription model;
+each record prices at its own model's rates, with no unpriced charge.
 
-`media_voice_call_v1_pinned_reply_preserves_records_and_unknown_basis` verifies
+`media_voice_call_v1_pinned_reply_prices_each_record_at_its_model_rates` verifies
 the upstream manifest and every file it names before draining the unchanged
 response through the real Colliculus reader. It checks both calls, all stored
-measurements and the unpriced charge rows without changing the sample or
-inferring an authentication method.
+measurements and exact charges, including `25,000,000` nano-USD for `3.125`
+transcription seconds. The realtime charges in nano-USD are `0` for `input`,
+`6` for `input_audio`, `6` for `cache_read`, `4` for `cached_input_audio`,
+`0` for `output` and `30` for `output_audio`.
