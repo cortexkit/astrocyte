@@ -11,7 +11,7 @@ const AT: i64 = 4_000_000_000_000;
 const SESSION: &str = "synthetic-rewrite-causes";
 const DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/test-vectors/usage-cache-causes-v1"
+    "/test-vectors/usage-cache-causes-v1.1"
 );
 
 fn event(
@@ -73,6 +73,82 @@ fn row(state: &SharedState, step: &str) -> Value {
         .into_iter()
         .find(|row| row["step_ref"] == step)
         .unwrap()
+}
+
+const EVIDENCE_MEMBERS: [&str; 10] = [
+    "account_ref",
+    "warm_up",
+    "view_version",
+    "tools_digest",
+    "system_digest",
+    "signed_floor",
+    "started_at_ms",
+    "finished_at_ms",
+    "cache_ttl_ms",
+    "cache_implicit",
+];
+
+#[test]
+fn rewrite_cache_steps_serve_kept_evidence_on_memory_and_store_pages() {
+    for from_memory in [true, false] {
+        let state = test_state();
+        state.set_recent_steps_now_for_test(if from_memory {
+            AT
+        } else {
+            AT + 2 * astrocyte_core::step_feed::FEED_WINDOW_MS
+        });
+        event(&state, "broca", "before", AT, 100, |_| {});
+        event(&state, "broca", "changed", AT + 100, 0, |body| {
+            body["view_version"] = json!(2);
+            body["warm_up"] = json!(false);
+            body["cache"]["implicit"] = json!(false);
+        });
+        record(&state, "before", AT, 100);
+        record(&state, "changed", AT + 100, 0);
+        record(&state, "file-only", AT + 200, 0);
+        state.rebuild_recent_steps();
+        let query = astrocyte_core::cache_diagnostics::StepsQuery {
+            producer: "pi".into(),
+            session: SESSION.into(),
+            limit: 200,
+            after_cursor: None,
+        };
+        assert_eq!(state.recent_steps_answer(&query).is_some(), from_memory);
+        let params = json!({"harness":"pi", "session":SESSION});
+        let cache =
+            crate::ops::dispatch(&state, crate::ops::OP_CACHE_STEPS, params.clone()).unwrap();
+        let feed = row(&state, "changed");
+        assert_eq!(cache["steps"][1]["cause"], "view_changed");
+        assert_eq!(cache["steps"][1]["view_version"], 2);
+        assert_eq!(cache["steps"][1]["warm_up"], false);
+        assert_eq!(cache["steps"][1]["cache_implicit"], false);
+        assert!(cache["steps"][0].get("cache_implicit").is_none());
+        for member in EVIDENCE_MEMBERS {
+            assert!(feed.get(member).is_some(), "{member}");
+            assert_eq!(cache["steps"][1].get(member), feed.get(member), "{member}");
+            assert!(cache["steps"][2].get(member).is_none(), "{member}");
+        }
+        state
+            .with_conn(|conn| {
+                let stored = astrocyte_core::cache_diagnostics::steps_from_store(conn, &query)
+                    .unwrap();
+                assert_eq!(serde_json::to_value(stored).unwrap(), cache);
+                // Retention is enforced on reads even before the writer's bounded prune
+                // reaches an expired row; its permanent explanation still applies.
+                conn.execute(
+                    "UPDATE step_evidence SET recorded_at_ms=?1 WHERE harness='pi' AND step_ref='changed'",
+                    [crate::state::now_ms()
+                        - astrocyte_core::rewrite_evidence::EVIDENCE_WINDOW_MS - 1],
+                ).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let expired = crate::ops::dispatch(&state, crate::ops::OP_CACHE_STEPS, params).unwrap();
+        assert_eq!(expired["steps"][1]["cause"], "view_changed");
+        for member in EVIDENCE_MEMBERS {
+            assert!(expired["steps"][1].get(member).is_none(), "{member}");
+        }
+    }
 }
 
 #[test]
@@ -283,6 +359,16 @@ fn rewrite_cause_corrections_append_and_can_clear_the_explanation() {
             Ok(())
         })
         .unwrap();
+    record(&state, "before", AT, 100);
+    record(&state, "changed", AT + 100, 200);
+    let cache = crate::ops::dispatch(
+        &state,
+        crate::ops::OP_CACHE_STEPS,
+        json!({"harness":"pi", "session":SESSION}),
+    )
+    .unwrap();
+    assert!(cache["steps"][1].get("cause").is_none());
+    assert_eq!(cache["steps"][1]["view_version"], 2);
 }
 
 #[test]
@@ -361,7 +447,10 @@ fn rewrite_causes_published_vectors_match_real_handlers() {
         event(&state, "broca", &step, at, read, |body| match *expected {
             "account_or_model_changed" => body["account_ref"] = json!("b".repeat(64)),
             "tools_or_system_changed" => body["tools_digest"] = json!("tools-v2"),
-            "view_changed" => body["view_version"] = json!(2),
+            "view_changed" => {
+                body["view_version"] = json!(2);
+                body["cache"]["implicit"] = json!(false);
+            }
             "signed_floor_moved" => body["signed_floor"] = json!("floor-2"),
             _ => {}
         });
@@ -379,6 +468,27 @@ fn rewrite_causes_published_vectors_match_real_handlers() {
             assert_eq!(served["cause"], *expected);
         }
     }
+    event(
+        &state,
+        "thalamus",
+        "expired-evidence",
+        AT + 70_000,
+        0,
+        |body| {
+            body["cache"]["implicit"] = json!(false);
+        },
+    );
+    record(&state, "expired-evidence", AT + 70_000, 0);
+    state
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE step_evidence SET recorded_at_ms=0 WHERE harness='pi' AND step_ref='expired-evidence'",
+                [],
+            ).unwrap();
+            astrocyte_core::step_feed::append_changes(conn, crate::state::now_ms(), &[]).unwrap();
+            Ok(())
+        })
+        .unwrap();
     let params = json!({"harness":"pi", "session":SESSION});
     let cache = crate::ops::dispatch(&state, crate::ops::OP_CACHE_STEPS, params.clone()).unwrap();
     for expected in &causes {
@@ -394,6 +504,16 @@ fn rewrite_causes_published_vectors_match_real_handlers() {
         } else {
             assert_eq!(served["cause"], *expected);
         }
+        assert_eq!(
+            served["view_version"],
+            if *expected == "view_changed" { 2 } else { 1 }
+        );
+    }
+    let expired = cache["steps"].as_array().unwrap().last().unwrap();
+    assert_eq!(expired["step_ref"], "expired-evidence");
+    assert_eq!(expired["cause"], "unexplained");
+    for member in EVIDENCE_MEMBERS {
+        assert!(expired.get(member).is_none(), "{member}");
     }
     let feed =
         crate::step_feed::read(&state, params).unwrap_or_else(|_| panic!("feed read refused"));
@@ -426,13 +546,14 @@ fn rewrite_causes_published_vectors_match_real_handlers() {
         }
     }
     let readme = format!(
-        "# Usage cache causes v1\n\n\
+        "# Usage cache causes v1.1\n\n\
 Synthetic, content-free samples from astrocyte's real `usage.cache.steps` and\n\
 `usage.steps.read` handlers using llm-runner 0.8.55 and usage-steps 0.2.8.\n\
-The set is tagged `usage-cache-causes-v1`; published bytes are immutable.\n\
+This set supersedes `usage-cache-causes-v1`, whose tag keeps its original bytes.\n\
+Version 1.1 adds retained evidence to cache steps and a row with expired evidence but a kept cause.\n\
 Each reply covers account/model change, cache expiry, tools/system change,\n\
-applied view change, signed-floor movement, unexplained, and no cause.\n\
-Warm-ups are included; file rows have replaced their runner hints.\n\
+applied view change, a changed `signed_floor` identifier, unexplained, and no cause.\n\
+Warm-ups are included. Durable file-read rows replace the same steps' earlier live runner-event rows.\n\
 All identities, timestamps, digests and counts are invented. No store or user\n\
 data is included. Feed cursors and cache cursors are separate opaque sequences.\n\n\
 Regenerate an unpublished set with `ASTROCYTE_REGENERATE_CACHE_CAUSES=1 cargo test\n\

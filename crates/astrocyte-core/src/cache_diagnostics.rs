@@ -843,6 +843,8 @@ impl CacheStepsRequest {
 pub struct CacheStep {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<cortexkit_usage_steps::Cause>,
+    #[serde(flatten)]
+    pub evidence: crate::rewrite_evidence::Evidence,
     pub cursor: i64,
     pub step_ref: String,
     pub occurred_at_ms: i64,
@@ -919,6 +921,7 @@ pub fn steps_reply(
             previous_body_len = row.request_body_len;
             CacheStep {
                 cause: None,
+                evidence: crate::rewrite_evidence::Evidence::default(),
                 cursor: row.cursor,
                 step_ref: row.step_ref,
                 occurred_at_ms: row.occurred_at_ms,
@@ -1094,9 +1097,12 @@ pub fn steps_from_store(conn: &Connection, query: &StepsQuery) -> rusqlite::Resu
         loaded.reads_cache,
         loaded.undated,
     );
-    for step in &mut reply.steps {
-        step.cause = crate::rewrite_evidence::cause(conn, &query.producer, &step.step_ref)?;
-    }
+    crate::rewrite_evidence::hydrate_cache_steps(
+        conn,
+        &query.producer,
+        &mut reply.steps,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
     Ok(reply)
 }
 

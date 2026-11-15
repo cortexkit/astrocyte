@@ -127,6 +127,50 @@ pub fn cause(conn: &Connection, harness: &str, step_ref: &str) -> rusqlite::Resu
     Ok(cause.as_deref().map(Cause::from_wire))
 }
 
+/// Join a page's step identities to permanent causes and unexpired event facts.
+/// Reads enforce retention even when the writer's bounded prune has not yet
+/// reached an expired row. A JSON array keeps the page within SQLite's bind limit.
+pub fn hydrate_cache_steps(
+    conn: &Connection,
+    harness: &str,
+    steps: &mut [crate::cache_diagnostics::CacheStep],
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    if steps.is_empty() {
+        return Ok(());
+    }
+    let identities =
+        serde_json::to_string(&steps.iter().map(|step| &step.step_ref).collect::<Vec<_>>())
+            .map_err(json_error)?;
+    let mut statement = conn.prepare_cached(
+        "SELECT p.key,c.cause,e.facts_json,t.value,s.value FROM json_each(?1) p
+         LEFT JOIN step_cause c ON c.cause_key=(SELECT cause_key FROM step_cause
+             WHERE harness=?2 AND step_ref=p.value ORDER BY cause_key DESC LIMIT 1)
+         LEFT JOIN step_evidence e ON e.harness=?2 AND e.step_ref=p.value AND e.recorded_at_ms>=?3
+         LEFT JOIN step_digest t ON t.digest_key=e.tools_key
+         LEFT JOIN step_digest s ON s.digest_key=e.system_key",
+    )?;
+    let mut rows = statement.query(params![
+        identities,
+        harness,
+        now_ms.saturating_sub(EVIDENCE_WINDOW_MS)
+    ])?;
+    while let Some(row) = rows.next()? {
+        let index: usize = row.get(0)?;
+        let cause: Option<String> = row.get(1)?;
+        let facts: Option<String> = row.get(2)?;
+        let mut evidence = match facts {
+            Some(facts) => serde_json::from_str::<Evidence>(&facts).map_err(json_error)?,
+            None => Evidence::default(),
+        };
+        evidence.tools_digest = row.get(3)?;
+        evidence.system_digest = row.get(4)?;
+        steps[index].cause = cause.as_deref().map(Cause::from_wire);
+        steps[index].evidence = evidence;
+    }
+    Ok(())
+}
+
 fn record_cause(conn: &Connection, row: &StepRow, computed: Option<Cause>) -> rusqlite::Result<()> {
     if cause(conn, &row.harness, &row.step_ref)? != computed {
         conn.execute(

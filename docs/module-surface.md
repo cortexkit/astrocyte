@@ -535,9 +535,16 @@ not placed on the timeline). Each step has these fields:
   reads more cache than expected.
 - `cause`, omitted when there is no stored explanation. This is the feed's
   persisted rewrite cause, looked up by `(harness, step_ref)`, not a guess
-  computed from ledger rows. Event-only evidence lasts 30 days from when the
-  step first reached the feed; the cause is
-  kept forever, including after its evidence and live feed row expire.
+  computed from ledger rows. The cause is kept forever, including after its
+  evidence and live feed row expire.
+- `account_ref`, `warm_up`, `view_version`, `tools_digest`, `system_digest`,
+  `signed_floor`, `started_at_ms`, `finished_at_ms`, `cache_ttl_ms` and
+  `cache_implicit` are the feed's event-only rewrite evidence, with the same
+  meanings as in section 4.2. They are read by `(harness, step_ref)` for 30 days
+  from when the step first reached the feed, independently of the live feed's
+  one-day window. Each member is omitted when unknown or expired, never
+  defaulted. A retained `view_changed` cause therefore includes `view_version`
+  while that evidence is kept, but can outlive it.
 
 The verdict is one of `cold_start`, `stable`, `warning`, `bust`, `full_bust`
 and `unknown`. It is computed over the whole session in time order, so a
