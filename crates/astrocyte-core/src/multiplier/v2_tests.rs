@@ -10,6 +10,84 @@ fn reset_reading(conn: &Connection, account: &str, at: i64, used: f64, reset_ms:
     .unwrap();
 }
 
+/// Decode the whole served reply before resolving every listed plan, so one
+/// incompatible row cannot silently remove the other providers' plan prices.
+#[test]
+fn plan_prices_from_fusiform_90a0531_decode_and_price_every_plan() {
+    use sha2::{Digest, Sha256};
+    let bytes =
+        include_bytes!("../../test-vectors/fusiform-90a0531/plan-prices-every-curated-row.json");
+    assert_eq!(
+        hex::encode(Sha256::digest(bytes)),
+        "f18fc68554a0a98a4be2104938cdd15795081ecb1f463831f982b75d62b9dc5c"
+    );
+    let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    let response: PlanPricesResponse = serde_json::from_value(fixture["response"].clone()).unwrap();
+    let kimi = response
+        .prices
+        .iter()
+        .find(|row| row.provider_id == "kimi-code-plan-global" && row.tier == "allegro")
+        .unwrap();
+    assert!(kimi.service_tiers.is_none());
+
+    // State the money independently of the fixture's numeric representation.
+    // The free plan has no positive monthly fee; the ambiguous Pro key is
+    // explicitly refused rather than guessed from the priced Pro tiers.
+    let expected = [
+        ("anthropic/max_20x", Some(200_000_000_000_i64), None),
+        ("anthropic/max_5x", Some(100_000_000_000), None),
+        ("anthropic/pro", Some(20_000_000_000), None),
+        ("google/ultra_5x", Some(99_990_000_000), None),
+        ("kimi-code-plan-global/allegro", Some(99_000_000_000), None),
+        ("meta/power_usage", Some(50_000_000_000), None),
+        ("ollama-cloud/free", None, Some("plan_price_out_of_range")),
+        ("openai/plus", Some(20_000_000_000), None),
+        ("openai/pro", None, Some("plan_price_refused")),
+        ("openai/pro_100", Some(100_000_000_000), None),
+        ("openai/pro_200", Some(200_000_000_000), None),
+        ("openai/pro_500", Some(500_000_000_000), None),
+        ("opencode-go/go", Some(10_000_000_000), None),
+    ];
+    assert_eq!(response.prices.len(), expected.len());
+    for row in &response.prices {
+        let key = format!("{}/{}", row.provider_id, row.tier);
+        assert!(expected.iter().any(|(plan, _, _)| *plan == key), "{key}");
+    }
+    let mut config = config(vec![rule("opencode", "anthropic", None)]);
+    config.quota_providers.get_mut("codex").unwrap().accounts = expected
+        .iter()
+        .map(|(plan, _, _)| {
+            (
+                plan.to_string(),
+                AccountPlan {
+                    plan: plan.to_string(),
+                },
+            )
+        })
+        .collect();
+    let source = Served(response);
+    let plans = resolve_plans(
+        Some(&source),
+        &config,
+        &config.quota_providers["codex"],
+        1_794_700_800_000,
+    )
+    .unwrap();
+    assert_eq!(plans.len(), expected.len());
+    for (plan, nanos, reason) in expected {
+        let used = &plans[plan];
+        assert_eq!(used.monthly_nanos, nanos, "{plan}");
+        assert_eq!(used.unpriceable_reason.as_deref(), reason, "{plan}");
+        assert_eq!(used.source.as_deref(), nanos.map(|_| "fusiform"), "{plan}");
+        assert!(!used.plan_price_overdue, "{plan}");
+    }
+    assert!(plans["openai/pro"]
+        .refusal_text
+        .as_deref()
+        .unwrap()
+        .starts_with("\"pro\" is an API plan string, not a vendor tier name."));
+}
+
 fn v2_event(
     conn: &Connection,
     id: &str,

@@ -812,3 +812,146 @@ fn media_rows_from_fusiform_066f43e_decode_and_price_each_role() {
         [row("output_video", "token", 12_000_000_000)]
     );
 }
+
+/// Keep the speed-twin replies intact: the new metadata must not hide either
+/// the selected rate key or the ledger's refusal to charge a borrowed rate.
+fn speed_twin_from_fusiform_90a0531(
+    name: &str,
+    bytes: &[u8],
+    sha256: &str,
+    model: &str,
+    apikey: bool,
+    expected_input: i64,
+    expected_output: i64,
+) {
+    let response = cache_lifetime_vector(name, bytes, sha256);
+    let mut conn = conn();
+    // Use a catalog instant before the catalog's
+    // apikey quota-proxy review (1797552000000) and speed-twin review
+    // (1799884800000), so these replies are not past their review deadlines.
+    let at_ms = 1_794_700_800_000_i64;
+    let request = serde_json::from_value::<EventRecordRequest>(json!({
+        "producer":"producer", "producer_lineage":"lineage", "producer_ref":name,
+        "provider":"kimi-code-plan-global", "model":model, "charge_basis":"metered_api",
+        "occurred_at_ms":at_ms, "measurements":[
+            {"role":"input", "unit":"token", "kind":"billed", "source":"test",
+             "quantity_units":1_000_000, "quantity_exponent":0},
+            {"role":"output", "unit":"token", "kind":"billed", "source":"test",
+             "quantity_units":1_000_000, "quantity_exponent":0}
+        ]
+    }))
+    .unwrap();
+    let id = record_event(&mut conn, &request, at_ms + 1)
+        .unwrap()
+        .event_id;
+    let fake = FakeCatalog::new(BTreeMap::new());
+    *fake.response.lock().unwrap() = response;
+    reprice_event(
+        &mut conn,
+        &id,
+        &client(fake),
+        at_ms + 2,
+        PricingOrigin::PricingPass,
+    )
+    .unwrap();
+
+    let mut statement = conn
+        .prepare(
+            "SELECT role, unit, charge_nanos, unpriced_reason, catalog_entry
+         FROM priced_charge ORDER BY role",
+        )
+        .unwrap();
+    let charges = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(charges.len(), 2, "{name}");
+    for (((role, unit, charge, reason, entry), expected_role), expected_rate) in charges
+        .iter()
+        .zip(["input", "output"])
+        .zip([expected_input, expected_output])
+    {
+        assert_eq!(role, expected_role, "{name}");
+        assert_eq!(unit, "token", "{name}");
+        assert_eq!(*charge, None, "{name}/{role}");
+        let expected_reason = if apikey {
+            "rate_inherited"
+        } else {
+            "stated_zero_requires_policy"
+        };
+        assert_eq!(reason.as_deref(), Some(expected_reason), "{name}/{role}");
+        let entry: Value = serde_json::from_str(entry).unwrap();
+        assert_eq!(entry["fact_key"], format!("rate.{role}"), "{name}");
+        if apikey {
+            assert_eq!(entry["value"]["units"], expected_rate, "{name}/{role}");
+            assert_eq!(entry["value"]["exponent"], 9, "{name}/{role}");
+            assert_eq!(
+                entry["value"]["inherited_from"]["basis"], "quota_proxy",
+                "{name}/{role}"
+            );
+        } else {
+            assert_eq!(entry["value"]["state"], "stated_zero", "{name}/{role}");
+        }
+    }
+}
+
+#[test]
+fn speed_twin_from_fusiform_90a0531_base_plain() {
+    speed_twin_from_fusiform_90a0531(
+        "k3.1-pro-plain",
+        include_bytes!("../test-vectors/fusiform-90a0531/k3.1-pro-plain.json"),
+        "6af8703d485e3af7a4a23bb966ae7803c6fe4d46cc78220e6eeed5e95e0e63df",
+        "k3.1-pro",
+        false,
+        0,
+        0,
+    );
+}
+
+#[test]
+fn speed_twin_from_fusiform_90a0531_base_apikey() {
+    speed_twin_from_fusiform_90a0531(
+        "k3.1-pro-apikey",
+        include_bytes!("../test-vectors/fusiform-90a0531/k3.1-pro-apikey.json"),
+        "c6bb965c28bff9dc2f5581493d9aca31fe375e3194eb5dc217279dd94693b223",
+        "k3.1-pro",
+        true,
+        2_000_000_000,
+        10_000_000_000,
+    );
+}
+
+#[test]
+fn speed_twin_from_fusiform_90a0531_highspeed_plain() {
+    speed_twin_from_fusiform_90a0531(
+        "k3.1-pro-highspeed-plain",
+        include_bytes!("../test-vectors/fusiform-90a0531/k3.1-pro-highspeed-plain.json"),
+        "719efb10f945bcc228434321a87aaae42834e473ba9384f5930f806717ecc1a2",
+        "k3.1-pro-highspeed",
+        false,
+        0,
+        0,
+    );
+}
+
+#[test]
+fn speed_twin_from_fusiform_90a0531_highspeed_apikey() {
+    speed_twin_from_fusiform_90a0531(
+        "k3.1-pro-highspeed-apikey",
+        include_bytes!("../test-vectors/fusiform-90a0531/k3.1-pro-highspeed-apikey.json"),
+        "e23ef0ef64383896c662ceec40e0dea91b335924d0d1e3a8a47f917de0a3872c",
+        "k3.1-pro-highspeed",
+        true,
+        4_000_000_000,
+        20_000_000_000,
+    );
+}

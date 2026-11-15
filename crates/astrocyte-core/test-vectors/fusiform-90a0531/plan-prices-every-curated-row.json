@@ -1,0 +1,366 @@
+{
+    "request": {
+      "arguments": {},
+      "name": "plan.prices"
+    },
+    "response": {
+      "prices": [
+        {
+          "boundary_at_ms": 1789689600000,
+          "established_at_ms": 1789776000000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 20000,
+            "period": "month"
+          },
+          "provider_id": "anthropic",
+          "quota_value": {
+            "refusal_reason": "Not measurable since 2026-10-27. Most Claude calls are recorded without their account, so a call can be valued only in hours when every pooled account's quota counter is unsaturated, and no day since then has passed that check. The earlier 57.4-60.8x reading came from a method that also counted saturated hours and could read up to 2x low, so it is withdrawn rather than kept.",
+            "review_by_ms": 1796774400000,
+            "state": "not_established"
+          },
+          "review_by_ms": 1797552000000,
+          "source_ref": "https://support.claude.com/en/articles/11049741-what-is-the-max-plan",
+          "tier": "max_20x"
+        },
+        {
+          "boundary_at_ms": 1789689600000,
+          "established_at_ms": 1789776000000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 10000,
+            "period": "month"
+          },
+          "provider_id": "anthropic",
+          "quota_value": {
+            "refusal_reason": "No Max 5x account is held, so astrocyte has measured none; the operator can state a figure.",
+            "review_by_ms": 1797552000000,
+            "state": "not_established"
+          },
+          "review_by_ms": 1797552000000,
+          "source_ref": "https://support.claude.com/en/articles/11049741-what-is-the-max-plan",
+          "tier": "max_5x"
+        },
+        {
+          "boundary_at_ms": 1789689600000,
+          "established_at_ms": 1789776000000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 2000,
+            "period": "month"
+          },
+          "provider_id": "anthropic",
+          "quota_value": {
+            "refusal_reason": "No Pro account is measured.",
+            "review_by_ms": 1797552000000,
+            "state": "not_established"
+          },
+          "review_by_ms": 1797552000000,
+          "source_ref": "https://www.anthropic.com/pricing",
+          "tier": "pro"
+        },
+        {
+          "boundary_at_ms": 1792886400000,
+          "established_at_ms": 1792886400000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 9999,
+            "period": "month"
+          },
+          "provider_id": "google",
+          "quota_value": {
+            "refusal_reason": "No AI Ultra 5x account is measured yet; astrocyte has no Antigravity multiplier readings. The operator can state a figure.",
+            "review_by_ms": 1798070400000,
+            "state": "not_established"
+          },
+          "review_by_ms": 1798070400000,
+          "source_ref": "https://one.google.com/about/google-ai-plans/",
+          "tier": "ultra_5x"
+        },
+        {
+          "boundary_at_ms": 1793145600000,
+          "established_at_ms": 1793145600000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 9900,
+            "period": "month"
+          },
+          "provider_id": "kimi-code-plan-global",
+          "quota_value": {
+            "refusal_reason": "No Kimi Code account is measured yet; astrocyte has no Kimi readings. The operator can state a figure.",
+            "review_by_ms": 1798329600000,
+            "state": "not_established"
+          },
+          "review_by_ms": 1798329600000,
+          "source_ref": "https://www.kimi.com/zh-hans/resources/kimi-k2-7-code-pricing",
+          "tier": "allegro"
+        },
+        {
+          "boundary_at_ms": 1791849600000,
+          "established_at_ms": 1791849600000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 5000,
+            "period": "month"
+          },
+          "provider_id": "meta",
+          "quota_value": {
+            "refusal_reason": "No Muse Code account is measured yet; the operator's login is new and astrocyte has no Meta readings. The operator can state a figure.",
+            "review_by_ms": 1797033600000,
+            "state": "not_established"
+          },
+          "review_by_ms": 1797033600000,
+          "source_ref": "https://dev.meta.ai/products/muse-code",
+          "tier": "power_usage"
+        },
+        {
+          "boundary_at_ms": 1794614400000,
+          "established_at_ms": 1794614400000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 0,
+            "period": "month"
+          },
+          "provider_id": "ollama-cloud",
+          "quota_value": {
+            "refusal_reason": "A free plan has no fee to value usage against, and no Ollama Cloud account is measured. The operator can state a figure.",
+            "review_by_ms": 1799798400000,
+            "state": "not_established"
+          },
+          "review_by_ms": 1799798400000,
+          "source_ref": "https://ollama.com/blog/transparent-pricing",
+          "tier": "free"
+        },
+        {
+          "boundary_at_ms": 1791504000000,
+          "established_at_ms": 1791504000000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 2000,
+            "period": "month"
+          },
+          "provider_id": "openai",
+          "quota_value": {
+            "refusal_reason": "No Plus account is measured.",
+            "review_by_ms": 1797552000000,
+            "state": "not_established"
+          },
+          "review_by_ms": 1797552000000,
+          "service_tiers": {
+            "established_at_ms": 1793404800000,
+            "established_by": "fusiform",
+            "review_by_ms": 1795996800000,
+            "source_ref": "https://developers.openai.com/codex/pricing: 'Fast mode' is 'Available' for ChatGPT Plus and ChatGPT Pro; 'Ultrafast (Pro $500 and eligible Enterprise/Edu plans)'. https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers: 'Ultrafast is available only on Pro 500.' https://developers.openai.com/codex/agent-configuration/speed: 'For supported models, Fast mode uses included subscription limits at 2.5x the Standard rate. Purchased credits and Enterprise pay-as-you-go usage are billed at 2x the Standard rate.'",
+            "state": "established",
+            "tiers": [
+              {
+                "credit_rate": {
+                  "exponent": 0,
+                  "units": 2
+                },
+                "included_usage_rate": {
+                  "exponent": 1,
+                  "units": 25
+                },
+                "tier": "fast"
+              }
+            ]
+          },
+          "source_ref": "https://help.openai.com/en/articles/6950777-what-is-chatgpt-plus",
+          "tier": "plus"
+        },
+        {
+          "boundary_at_ms": 1791504000000,
+          "established_at_ms": 1791504000000,
+          "established_by": "fusiform",
+          "provider_id": "openai",
+          "refusal_reason": "\"pro\" is an API plan string, not a vendor tier name. OpenAI publishes Pro 100 ($100), Pro 200 ($200) and Pro 500 ($500); the API plan string does not establish which an account holds, so this key cannot carry one price. The tier rows are openai/pro_100, openai/pro_200 and openai/pro_500; the account's tier is a fact about the account.",
+          "review_by_ms": 1797552000000,
+          "source_ref": "https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers",
+          "tier": "pro"
+        },
+        {
+          "boundary_at_ms": 1791504000000,
+          "established_at_ms": 1791504000000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 10000,
+            "period": "month"
+          },
+          "provider_id": "openai",
+          "quota_value": {
+            "refusal_reason": "Pro 100 is unmeasured: the one account possibly on it is not configured in astrocyte and its tier is unconfirmed.",
+            "review_by_ms": 1797552000000,
+            "state": "not_established"
+          },
+          "review_by_ms": 1797552000000,
+          "service_tiers": {
+            "established_at_ms": 1793404800000,
+            "established_by": "fusiform",
+            "review_by_ms": 1795996800000,
+            "source_ref": "https://developers.openai.com/codex/pricing: 'Fast mode' is 'Available' for ChatGPT Plus and ChatGPT Pro. https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers: 'Pro 100 | $100 | Not included' (Ultrafast); 'Ultrafast is available only on Pro 500.' https://developers.openai.com/codex/agent-configuration/speed: 'For supported models, Fast mode uses included subscription limits at 2.5x the Standard rate. Purchased credits and Enterprise pay-as-you-go usage are billed at 2x the Standard rate.'",
+            "state": "established",
+            "tiers": [
+              {
+                "credit_rate": {
+                  "exponent": 0,
+                  "units": 2
+                },
+                "included_usage_rate": {
+                  "exponent": 1,
+                  "units": 25
+                },
+                "tier": "fast"
+              }
+            ]
+          },
+          "source_ref": "https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers",
+          "tier": "pro_100"
+        },
+        {
+          "boundary_at_ms": 1791504000000,
+          "established_at_ms": 1791504000000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 20000,
+            "period": "month"
+          },
+          "provider_id": "openai",
+          "quota_value": {
+            "as_of_ms": 1793491200000,
+            "basis": "List-price value of in-scope tokens divided by (weekly-window quota points used x fee per point), fee per point = monthly price x 7/30 / 100. Codex weekly ('primary') window, two Pro 200 accounts pooled; the Pro 100 account is measured separately and is not included. Daily rows 2026-10-27..11-01, each covering the trailing 7 days: the six days that pass astrocyte's routing-eligibility checks. Rows from 11-02 on are excluded, because both quota counters sat at 100% for 36-69% of the time, and a saturated counter hides real usage. Reads 1-2% high, because usage between the last reading and a reset is lost.",
+            "established_by": "astrocyte daily multiplier rows, routing-eligible days",
+            "high": {
+              "exponent": 1,
+              "units": 220
+            },
+            "low": {
+              "exponent": 1,
+              "units": 215
+            },
+            "review_by_ms": 1796083200000,
+            "source_ref": "astrocyte daily multiplier rows marked routing_eligible, read 2026-11-09",
+            "state": "measured",
+            "token_mix": "Agentic coding, 95.3-95.9% cache read, 3.5-4.3% input, 0.5-0.6% output including reasoning."
+          },
+          "review_by_ms": 1797552000000,
+          "service_tiers": {
+            "established_at_ms": 1793404800000,
+            "established_by": "fusiform",
+            "review_by_ms": 1795996800000,
+            "source_ref": "https://developers.openai.com/codex/pricing: 'Fast mode' is 'Available' for ChatGPT Plus and ChatGPT Pro. https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers: 'Pro 200 | $200 | Not included' (Ultrafast); 'Ultrafast is available only on Pro 500.' https://developers.openai.com/codex/agent-configuration/speed: 'For supported models, Fast mode uses included subscription limits at 2.5x the Standard rate. Purchased credits and Enterprise pay-as-you-go usage are billed at 2x the Standard rate.'",
+            "state": "established",
+            "tiers": [
+              {
+                "credit_rate": {
+                  "exponent": 0,
+                  "units": 2
+                },
+                "included_usage_rate": {
+                  "exponent": 1,
+                  "units": 25
+                },
+                "tier": "fast"
+              }
+            ]
+          },
+          "source_ref": "https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers",
+          "tier": "pro_200"
+        },
+        {
+          "boundary_at_ms": 1791504000000,
+          "established_at_ms": 1791504000000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 50000,
+            "period": "month"
+          },
+          "provider_id": "openai",
+          "quota_value": {
+            "refusal_reason": "No Pro 500 account is measured.",
+            "review_by_ms": 1797552000000,
+            "state": "not_established"
+          },
+          "review_by_ms": 1797552000000,
+          "service_tiers": {
+            "established_at_ms": 1793404800000,
+            "established_by": "fusiform",
+            "review_by_ms": 1795996800000,
+            "source_ref": "https://developers.openai.com/codex/pricing: 'Fast mode' is 'Available' for ChatGPT Plus and ChatGPT Pro; 'Ultrafast (Pro $500 and eligible Enterprise/Edu plans)'. https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers: 'Pro 500 | $500 | Included' (Ultrafast). https://developers.openai.com/codex/agent-configuration/speed: 'For supported models, Fast mode uses included subscription limits at 2.5x the Standard rate. Purchased credits and Enterprise pay-as-you-go usage are billed at 2x the Standard rate.' 'Ultrafast mode bills purchased credits and Enterprise pay-as-you-go usage at 6x the Standard rate. Ultrafast uses included subscription limits at 8x the Standard rate.'",
+            "state": "established",
+            "tiers": [
+              {
+                "credit_rate": {
+                  "exponent": 0,
+                  "units": 2
+                },
+                "included_usage_rate": {
+                  "exponent": 1,
+                  "units": 25
+                },
+                "tier": "fast"
+              },
+              {
+                "credit_rate": {
+                  "exponent": 0,
+                  "units": 6
+                },
+                "included_usage_rate": {
+                  "exponent": 0,
+                  "units": 8
+                },
+                "tier": "ultrafast"
+              }
+            ]
+          },
+          "source_ref": "https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers",
+          "tier": "pro_500"
+        },
+        {
+          "boundary_at_ms": 1792627200000,
+          "established_at_ms": 1792627200000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 1000,
+            "period": "month"
+          },
+          "provider_id": "opencode-go",
+          "quota_value": {
+            "refusal_reason": "No OpenCode Go account is measured yet; astrocyte has no Go readings. The operator can state a figure.",
+            "review_by_ms": 1797811200000,
+            "state": "not_established"
+          },
+          "review_by_ms": 1797811200000,
+          "source_ref": "https://opencode.ai/v2/docs/console/go/",
+          "tier": "go"
+        }
+      ],
+      "resolved_at_ms": -1,
+      "tier_vocabulary": "The tier is the VENDOR'S OWN TIER NAME, never an API plan string. OpenAI's Pro 100, Pro 200 and Pro 500 are pro_100, pro_200 and pro_500 here. A consumer holding an API string must map it to a tier itself, with knowledge of the account.",
+      "unit_policy": "US list price, monthly-billed, web subscription. An operator on an annual term, in another country, or subscribed through an app store pays something else, and this plane cannot see which."
+    }
+  }
