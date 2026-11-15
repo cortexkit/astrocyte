@@ -1,6 +1,96 @@
 // Payer-join regressions share the fixtures in opencode_thalamus_source.
 
+fn recorded_cache_split_row(name: &str) -> Value {
+    use sha2::{Digest, Sha256};
+
+    const MANIFEST: &[u8] =
+        include_bytes!("../tests/vectors/thalamus-payer-cache-split-v1/SHA256SUMS");
+    let rows: [(&str, &[u8]); 3] = [
+        (
+            "split.json",
+            include_bytes!("../tests/vectors/thalamus-payer-cache-split-v1/split.json"),
+        ),
+        (
+            "total-only.json",
+            include_bytes!("../tests/vectors/thalamus-payer-cache-split-v1/total-only.json"),
+        ),
+        (
+            "one-part-only.json",
+            include_bytes!("../tests/vectors/thalamus-payer-cache-split-v1/one-part-only.json"),
+        ),
+    ];
+    assert_eq!(
+        format!("{:x}", Sha256::digest(MANIFEST)),
+        "0da88caaed8de7c821f3b8ca7ac13d05b43cadcd6afc0688afcd393cd9b153e5"
+    );
+    let hashes: String = rows
+        .iter()
+        .map(|(file, bytes)| format!("{:x}  {file}\n", Sha256::digest(bytes)))
+        .collect();
+    assert_eq!(hashes.as_bytes(), MANIFEST);
+    let (_, bytes) = rows.iter().find(|(file, _)| *file == name).unwrap();
+    serde_json::from_slice(bytes).unwrap()
+}
+
 impl Fixture {
+    fn recorded_cache_split_payer(&self, row: &Value) {
+        const COLUMNS: [&str; 16] = [
+            "seq",
+            "attempt_id",
+            "harness",
+            "session",
+            "request_kind",
+            "step_ref",
+            "recorded_at_ms",
+            "provider",
+            "model",
+            "charge_basis",
+            "auth_selection",
+            "account_ref",
+            "outcome",
+            "provider_request_id",
+            "provider_response_id",
+            "usage_json",
+        ];
+        assert_eq!(row.as_object().unwrap().len(), COLUMNS.len());
+        // Preserve every stored column, including SQL NULL and the original
+        // usage_json text, so the reader sees the recorded row rather than a reconstruction.
+        let values = COLUMNS.map(|column| match &row[column] {
+            Value::Null => rusqlite::types::Value::Null,
+            Value::Number(number) => rusqlite::types::Value::Integer(number.as_i64().unwrap()),
+            Value::String(text) => rusqlite::types::Value::Text(text.clone()),
+            other => panic!("unexpected payer column {column}: {other}"),
+        });
+        let home = fs::canonicalize(self.temp.path()).unwrap();
+        let path = home.join("cortexkit/thalamus-harness/payer/payer.db");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = Connection::open(path).unwrap();
+        store.execute_batch("CREATE TABLE payer_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            INSERT INTO payer_meta VALUES ('schema_version','1'),('incarnation','first');
+            CREATE TABLE payer_session(harness TEXT,session TEXT,owner_principal TEXT,declared_at_ms INTEGER,PRIMARY KEY(harness,session));
+            CREATE TABLE payer_record(seq INTEGER PRIMARY KEY AUTOINCREMENT,attempt_id TEXT UNIQUE,harness TEXT,session TEXT,request_kind TEXT,step_ref TEXT,recorded_at_ms INTEGER,provider TEXT,model TEXT,charge_basis TEXT,auth_selection TEXT,account_ref TEXT,outcome TEXT,provider_request_id TEXT,provider_response_id TEXT,usage_json TEXT);").unwrap();
+        store
+            .execute(
+                "INSERT INTO payer_session VALUES (?1,?2,?3,0)",
+                params![
+                    row["harness"].as_str().unwrap(),
+                    row["session"].as_str().unwrap(),
+                    OWNER
+                ],
+            )
+            .unwrap();
+        store.execute(
+            &format!("INSERT INTO payer_record ({}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)", COLUMNS.join(",")),
+            rusqlite::params_from_iter(values),
+        ).unwrap();
+        assert_eq!(
+            crate::refresher::thalamus_payer_source::ThalamusPayerSource::from_data_home(home)
+                .drain_for_health(&self.state, T0, &AtomicBool::new(false))
+                .unwrap(),
+            None
+        );
+    }
+
     fn cache_split_payer(&self, attempt: &str, step: &str, usage: Option<&str>) {
         let home = fs::canonicalize(self.temp.path()).unwrap();
         let path = home.join("cortexkit/thalamus-harness/payer/payer.db");
@@ -194,6 +284,90 @@ fn split_writes(five: i64, hour: i64) -> Vec<(String, String, i64, i64, String)>
             "billed".into(),
         ),
     ]
+}
+
+fn assert_recorded_cache_split_matches(
+    name: &str,
+    expected: Vec<(String, String, i64, i64, String)>,
+) {
+    let row = recorded_cache_split_row(name);
+    assert_eq!(row["harness"], "opencode");
+    let session = row["session"].as_str().unwrap();
+    let step = row["step_ref"].as_str().unwrap();
+    for layout in LAYOUTS {
+        let f = Fixture::new();
+        let mut data = payload(layout, true);
+        data["time"]["completed"] = json!(T0);
+        data["tokens"]["cache"]["write"] = json!(24_576);
+        match layout {
+            Layout::V1 => data["modelID"] = row["model"].clone(),
+            Layout::V2 => data["model"]["id"] = row["model"].clone(),
+        }
+        let transcript = store(&f.database(session), layout);
+        match layout {
+            Layout::V1 => transcript.execute(
+                "INSERT INTO message VALUES (?1,?2,?3,?3,?4)",
+                params![step, session, CREATED, data.to_string()],
+            ),
+            Layout::V2 => transcript.execute(
+                "INSERT INTO session_message VALUES (?1,?2,'assistant',1,?3,?3,?4)",
+                params![step, session, CREATED, data.to_string()],
+            ),
+        }
+        .unwrap();
+        drop(transcript);
+        f.declare(vec![f.entry(session, false)]);
+        f.recorded_cache_split_payer(&row);
+        f.tick(T0);
+        assert_eq!(f.refs(), vec![step], "{name}: {layout:?}");
+        assert_eq!(f.cache_writes(), expected, "{name}: {layout:?}");
+        assert_eq!(
+            f.payer_facts(step),
+            (
+                "subscription_included".into(),
+                Some("synthetic-vault-anthropic-subscription".into()),
+                Some("synthetic-anthropic-account".into()),
+            ),
+            "{name}: {layout:?}"
+        );
+        assert_eq!(f.payer_coverage_count("cache_split_mismatch"), 0);
+        assert_eq!(f.payer_coverage_count("set_aside"), 0);
+        assert_eq!(f.payer_coverage_count("without_payer"), 0);
+        assert_eq!(f.degraded(), None);
+    }
+}
+
+#[test]
+fn opencode_payer_cache_split_recorded_split_replaces_plain_total() {
+    assert_recorded_cache_split_matches("split.json", split_writes(8_192, 16_384));
+}
+
+#[test]
+fn opencode_payer_cache_split_recorded_total_only_keeps_plain_total() {
+    assert_recorded_cache_split_matches(
+        "total-only.json",
+        vec![(
+            "token".into(),
+            "usage.cacheWrite".into(),
+            24_576,
+            0,
+            "billed".into(),
+        )],
+    );
+}
+
+#[test]
+fn opencode_payer_cache_split_recorded_one_part_only_keeps_plain_total() {
+    assert_recorded_cache_split_matches(
+        "one-part-only.json",
+        vec![(
+            "token".into(),
+            "usage.cacheWrite".into(),
+            24_576,
+            0,
+            "billed".into(),
+        )],
+    );
 }
 
 #[test]

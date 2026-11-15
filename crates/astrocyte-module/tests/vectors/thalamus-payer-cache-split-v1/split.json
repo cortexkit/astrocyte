@@ -1,0 +1,18 @@
+{
+  "account_ref": "synthetic-anthropic-account",
+  "attempt_id": "synthetic-attempt-split",
+  "auth_selection": "synthetic-vault-anthropic-subscription",
+  "charge_basis": "subscription_included",
+  "harness": "opencode",
+  "model": "claude-opus-5-5",
+  "outcome": "completed",
+  "provider": "anthropic",
+  "provider_request_id": "req_synthetic-attempt-split",
+  "provider_response_id": "msg_synthetic-attempt-split",
+  "recorded_at_ms": 1000,
+  "request_kind": "main",
+  "seq": 1,
+  "session": "ses_synthetic_split",
+  "step_ref": "msg_synthetic_split",
+  "usage_json": "{\"cache_write_1h_tokens\":16384,\"cache_write_5m_tokens\":8192}"
+}
