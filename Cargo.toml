@@ -66,6 +66,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 chrono-tz = "0.10"
+num-bigint = { version = "=0.4.6", default-features = false }
+num-rational = { version = "=0.4.2", default-features = false, features = ["num-bigint"] }
+num-traits = { version = "=0.2.19", default-features = false }
 
 # The version test hashes the debug executable; optimize SHA-256, not the whole dev build.
 [profile.dev.package.sha2]

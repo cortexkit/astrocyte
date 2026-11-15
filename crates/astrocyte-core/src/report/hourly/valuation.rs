@@ -4,10 +4,22 @@ use crate::multiplier::{MultiplierConfig, ScopeRule};
 use crate::subscription::plan_lookup_key;
 use crate::valuation::{list_value_event, EventTokens, Unvalued, ValuationRules};
 
+pub mod fees;
+
+/// The immutable primary key of a record in either subscription ledger.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlanRecordId {
+    pub ledger: crate::subscription::PlanLedger,
+    pub provider: String,
+    pub identity: String,
+    pub effective_from_ms: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PlanMember {
     pub plan: String,
     pub plan_account: Option<String>,
+    pub record: Option<PlanRecordId>,
 }
 
 impl PlanMember {
@@ -15,6 +27,7 @@ impl PlanMember {
         Self {
             plan: plan.into(),
             plan_account: None,
+            record: None,
         }
     }
 }
@@ -70,15 +83,21 @@ pub fn plan_member(
     if let (Some((ledger, identity)), Some(at)) =
         (plan_lookup_key(account, paying_credential), at_ms)
     {
-        let mut stmt = conn.prepare(&format!("SELECT provider FROM {} WHERE {}=?1 AND effective_from_ms<=?2 AND (effective_to_ms IS NULL OR effective_to_ms>?2) AND provider=?3", ledger.table(), ledger.key_column()))?;
+        let mut stmt = conn.prepare(&format!("SELECT provider,effective_from_ms FROM {} WHERE {}=?1 AND effective_from_ms<=?2 AND (effective_to_ms IS NULL OR effective_to_ms>?2) AND provider=?3", ledger.table(), ledger.key_column()))?;
         for provider in stmt.query_map(params![identity, at, event.provider], |row| {
-            row.get::<_, String>(0)
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })? {
-            let provider = provider?;
+            let (provider, effective_from_ms) = provider?;
             for pool in pools_for_provider(&provider, config) {
                 records.insert(PlanMember {
                     plan: pool,
                     plan_account: Some(identity.into()),
+                    record: Some(PlanRecordId {
+                        ledger,
+                        provider: provider.clone(),
+                        identity: identity.into(),
+                        effective_from_ms,
+                    }),
                 });
             }
         }
@@ -104,6 +123,7 @@ pub fn plan_member(
         [pool] => PlanMember {
             plan: pool.clone(),
             plan_account: Some("account_unknown".into()),
+            record: None,
         },
         _ => PlanMember::non_pool("pool_conflict"),
     })
@@ -461,7 +481,7 @@ impl ValuationMaintenance {
         if pending.fetched {
             for ((key, member), cell) in pending.cells {
                 tx.execute(
-                    "INSERT INTO valuation_cell VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    "INSERT INTO valuation_cell VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                     params![
                         h.kind,
                         h.number,
@@ -469,6 +489,7 @@ impl ValuationMaintenance {
                         encode(&key)?,
                         member.plan,
                         member.plan_account,
+                        member.record.as_ref().map(encode).transpose()?,
                         encode(&cell.recorded)?,
                         cell.numerator.to_string(),
                         encode(&cell.unvalued)?

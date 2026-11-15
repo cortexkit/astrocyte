@@ -4923,6 +4923,28 @@ CREATE TRIGGER valuation_credential_close AFTER UPDATE OF effective_to_ms ON cre
 END;
 "#,
     },
+    Migration {
+        version: 56,
+        statements: r#"-- This table is a rebuildable cache. Retain the ledger record identity
+-- so sequential plans and equal account/credential strings never share weights.
+DROP TABLE valuation_cell;
+CREATE TABLE valuation_cell (
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    cell_key TEXT NOT NULL CHECK(json_valid(cell_key)),
+    summary_key TEXT NOT NULL CHECK(json_valid(summary_key)),
+    plan TEXT NOT NULL,
+    plan_account TEXT,
+    plan_record TEXT CHECK(plan_record IS NULL OR json_valid(plan_record)),
+    recorded TEXT NOT NULL CHECK(json_valid(recorded)),
+    list_numerator TEXT NOT NULL,
+    unvalued TEXT NOT NULL CHECK(json_valid(unvalued)),
+    PRIMARY KEY(kind,hour_number,cell_key),
+    FOREIGN KEY(kind,hour_number) REFERENCES valuation_hour(kind,hour_number)
+) WITHOUT ROWID;
+UPDATE valuation_hour SET state='dirty',revision=revision+1;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -8703,6 +8725,15 @@ mod tests {
         drop(store);
 
         let conn = Connection::open(path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('valuation_cell') WHERE name='plan_record'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
         for table in [
             "rate_era",
             "rate_model",
@@ -8752,6 +8783,42 @@ mod tests {
                 .iter()
                 .map(|v| ("astrocyte".to_string(), i64::from(*v)))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fee_record_migration_discards_only_rebuildable_cells_and_dirties_hours() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in &MIGRATIONS[..55] {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        conn.execute_batch("INSERT INTO valuation_hour(kind,hour_number,state) VALUES(0,0,'built');
+            INSERT INTO valuation_cell VALUES(0,0,'[]','[]','pool','same','{}','42','{}');
+            INSERT INTO account_subscription(account_ref,provider,plan_name,recurring_cost_minor,currency,amount_exponent,period,effective_from_ms)
+                VALUES('same','provider','plan',17,'USD',9,'month',0);
+            UPDATE valuation_hour SET state='built';").unwrap();
+        conn.execute_batch(MIGRATIONS[55].statements).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM valuation_cell", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT state FROM valuation_hour", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "dirty"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT recurring_cost_minor FROM account_subscription",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            17
         );
     }
 

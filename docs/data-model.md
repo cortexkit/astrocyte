@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 55. A schema change appends a migration; an applied
+currently version 56. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -75,7 +75,7 @@ copies that timeout without running the table-creating probes.
 | `rate_dirty_hour` | Each row queues a summary-backed hour holding a model whose timeline or reference changed. | Rate publication inserts keys for the model and its referrers; valuation maintenance consumes them. |
 | `valuation_state` | The singleton records synchronized rate, valuation-config and plan-record generations. | Valuation maintenance and plan-record triggers update it. |
 | `valuation_hour` | Each row records an hour's revision, three built generations and independent valuation state. | Ledger and plan triggers invalidate hours; valuation publication completes them. |
-| `valuation_cell` | Each row splits a summary key by plan member, retaining recorded counters, quantities and currency sums alongside an exact list-value numerator and unvalued reasons. | Valuation rebuilds replace these rows without changing spend summaries. |
+| `valuation_cell` | Each row splits a summary key by plan member and subscription ledger record, retaining recorded counters, quantities and currency sums alongside an exact list-value numerator and unvalued reasons. | Valuation rebuilds replace these rows without changing spend summaries. |
 
 The payer store's incarnation identifies one database history. THALAMUS changes
 it when the database is replaced or restored, so a reader starts again at the

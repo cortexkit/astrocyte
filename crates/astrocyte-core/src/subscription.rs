@@ -250,7 +250,7 @@ pub fn set_subscription_in_tx(
 /// (`usage_event.account_ref`). A credential plan is keyed by the vault
 /// credential that paid for a call reporting no account; only vault-plan
 /// reconciliation writes one. Both tables have the same columns and guards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PlanLedger {
     Account,
     Credential,

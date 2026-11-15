@@ -28,6 +28,15 @@ fn config() -> MultiplierConfig {
     }
 }
 
+fn record_id(ledger: PlanLedger, identity: &str, effective_from_ms: i64) -> PlanRecordId {
+    PlanRecordId {
+        ledger,
+        provider: "provider".into(),
+        identity: identity.into(),
+        effective_from_ms,
+    }
+}
+
 fn rate(conn: &Connection, model: &str, units: i64) {
     let history = serde_json::from_value(json!({
         "source":"synthetic", "provider_id":"provider", "model_id":model,
@@ -132,7 +141,7 @@ fn summaries(conn: &mut Connection) {
 }
 
 fn stored_cells(conn: &Connection, hour: i64) -> Cells {
-    let mut stmt = conn.prepare("SELECT summary_key,plan,plan_account,recorded,list_numerator,unvalued FROM valuation_cell WHERE kind=0 AND hour_number=?1").unwrap();
+    let mut stmt = conn.prepare("SELECT summary_key,plan,plan_account,recorded,list_numerator,unvalued,plan_record FROM valuation_cell WHERE kind=0 AND hour_number=?1").unwrap();
     stmt.query_map([hour], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -141,15 +150,20 @@ fn stored_cells(conn: &Connection, hour: i64) -> Cells {
             r.get::<_, String>(3)?,
             r.get::<_, String>(4)?,
             r.get::<_, String>(5)?,
+            r.get::<_, Option<String>>(6)?,
         ))
     })
     .unwrap()
     .map(|row| {
-        let (key, plan, plan_account, recorded, numerator, unvalued) = row.unwrap();
+        let (key, plan, plan_account, recorded, numerator, unvalued, record) = row.unwrap();
         (
             (
                 serde_json::from_str(&key).unwrap(),
-                PlanMember { plan, plan_account },
+                PlanMember {
+                    plan,
+                    plan_account,
+                    record: record.map(|record| serde_json::from_str(&record).unwrap()),
+                },
             ),
             ValuedCell {
                 recorded: serde_json::from_str(&recorded).unwrap(),
@@ -386,14 +400,16 @@ fn valuation_pool_membership_matches_coverage_and_handles_unique_ambiguous_unmap
         ),
         PlanMember {
             plan: "pool".into(),
-            plan_account: Some("account".into())
+            plan_account: Some("account".into()),
+            record: Some(record_id(PlanLedger::Account, "account", 0)),
         }
     );
     assert_eq!(
         member(&config, None, Some("credential"), "unknown"),
         PlanMember {
             plan: "pool".into(),
-            plan_account: Some("credential".into())
+            plan_account: Some("credential".into()),
+            record: Some(record_id(PlanLedger::Credential, "credential", 0)),
         }
     );
     assert_eq!(
@@ -420,7 +436,8 @@ fn valuation_pool_membership_matches_coverage_and_handles_unique_ambiguous_unmap
         member(&empty, Some("account"), None, "unknown"),
         PlanMember {
             plan: "provider".into(),
-            plan_account: Some("account".into())
+            plan_account: Some("account".into()),
+            record: Some(record_id(PlanLedger::Account, "account", 0)),
         }
     );
     assert_eq!(
@@ -595,26 +612,40 @@ fn valuation_randomized_cells_equal_per_call_ledger_and_split_recorded_spend() {
     let mut seed = 7129_u64;
     let mut next = || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        seed
+        seed >> 32
     };
     let mut oracle: BTreeMap<(i64, Key, PlanMember), (i128, i128)> = BTreeMap::new();
     let mut calls = Vec::new();
     for index in 0..360 {
         let hour = i64::try_from(next() % 72).unwrap();
-        let at = hour * HOUR_MS + i64::try_from(next() % 3_599_999).unwrap();
+        let at = if index < 4 {
+            18 * HOUR_MS
+                + if index % 2 == 0 {
+                    HOUR_MS / 4
+                } else {
+                    3 * HOUR_MS / 4
+                }
+        } else {
+            hour * HOUR_MS + i64::try_from(next() % 3_599_999).unwrap()
+        };
+        let hour = at / HOUR_MS;
         let quantity = i64::try_from(next() % 1000).unwrap();
-        let model = if next() % 2 == 0 { "A" } else { "B" };
-        let basis = if next() % 3 == 0 {
+        let model = if index < 4 || next() % 2 == 0 {
+            "A"
+        } else {
+            "B"
+        };
+        let basis = if index >= 4 && next() % 3 == 0 {
             "metered_api"
         } else {
             "subscription_included"
         };
-        let account = if next() % 2 == 0 {
-            Some("account")
+        let account = if index < 2 || (index >= 4 && next() % 2 == 0) {
+            Some("shared")
         } else {
             None
         };
-        let credential = Some("credential");
+        let credential = Some("shared");
         let key = event(
             &mut conn,
             &format!("random-{index}"),
@@ -636,12 +667,29 @@ fn valuation_randomized_cells_equal_per_call_ledger_and_split_recorded_spend() {
                 plan: "pool".into(),
                 plan_account: Some(
                     if (HOUR_MS / 2..36 * HOUR_MS + HOUR_MS / 2).contains(&at) {
-                        account.unwrap_or("credential")
+                        "shared"
                     } else {
                         "account_unknown"
                     }
                     .into(),
                 ),
+                record: (HOUR_MS / 2..36 * HOUR_MS + HOUR_MS / 2)
+                    .contains(&at)
+                    .then(|| {
+                        record_id(
+                            if account.is_some() {
+                                PlanLedger::Account
+                            } else {
+                                PlanLedger::Credential
+                            },
+                            "shared",
+                            if at < 18 * HOUR_MS + HOUR_MS / 2 {
+                                HOUR_MS / 2
+                            } else {
+                                18 * HOUR_MS + HOUR_MS / 2
+                            },
+                        )
+                    }),
             }
         };
         let unit_rate = if model == "A" { 3_i128 } else { 7 };
@@ -656,22 +704,24 @@ fn valuation_randomized_cells_equal_per_call_ledger_and_split_recorded_spend() {
         sums.1 += i128::from(spend);
         calls.push((at, summary_key, member, numerator, i128::from(spend)));
     }
-    plan(
-        &conn,
-        PlanLedger::Account,
-        "provider",
-        "account",
-        HOUR_MS / 2,
-        Some(36 * HOUR_MS + HOUR_MS / 2),
-    );
-    plan(
-        &conn,
-        PlanLedger::Credential,
-        "provider",
-        "credential",
-        HOUR_MS / 2,
-        Some(36 * HOUR_MS + HOUR_MS / 2),
-    );
+    for ledger in [PlanLedger::Account, PlanLedger::Credential] {
+        plan(
+            &conn,
+            ledger,
+            "provider",
+            "shared",
+            HOUR_MS / 2,
+            Some(18 * HOUR_MS + HOUR_MS / 2),
+        );
+        plan(
+            &conn,
+            ledger,
+            "provider",
+            "shared",
+            18 * HOUR_MS + HOUR_MS / 2,
+            Some(36 * HOUR_MS + HOUR_MS / 2),
+        );
+    }
     rate(&conn, "A", 3);
     rate(&conn, "B", 7);
     summaries(&mut conn);
@@ -734,6 +784,15 @@ fn valuation_randomized_cells_equal_per_call_ledger_and_split_recorded_spend() {
     assert!(
         split,
         "fixture must actually split a summary key across plan members"
+    );
+    let records: BTreeSet<_> = stored_cells(&conn, 18)
+        .into_keys()
+        .filter_map(|(_, member)| member.record)
+        .collect();
+    assert_eq!(
+        records.len(),
+        4,
+        "both namespaces and same-hour sequential records remain distinct"
     );
     // Non-integral UTC offsets put local-day boundaries inside UTC hours. The
     // reducer selects those partial hours by call time, then groups independent
@@ -875,3 +934,6 @@ fn valuation_waits_for_summary_then_uses_second_rate_change_and_fences_rate_publ
         532
     );
 }
+
+#[path = "fee_tests.rs"]
+mod fee_tests;
