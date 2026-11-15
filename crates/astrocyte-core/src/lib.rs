@@ -15,6 +15,7 @@ pub mod media;
 pub mod money;
 pub mod multiplier;
 pub mod pricing;
+pub mod quota_history;
 pub mod reconcile;
 pub mod report;
 pub mod runs;
