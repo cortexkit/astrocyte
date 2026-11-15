@@ -73,6 +73,9 @@ copies that timeout without running the table-creating probes.
 | `rate_model` | Each row records a fetched catalog version and current alias target or a plan provider's public API-card target (its API twin); an index finds referring models. | The refresher discovers new models incrementally and re-reads them on catalog advances. |
 | `rate_cache_state` | The singleton records the catalog version, cache generation, call-discovery cursor and twin configuration. | The refresher updates this row. |
 | `rate_dirty_hour` | Each row queues a summary-backed hour holding a model whose timeline or reference changed. | Rate publication inserts keys for the model and its referrers; valuation maintenance consumes them. |
+| `valuation_state` | The singleton records synchronized rate, valuation-config and plan-record generations. | Valuation maintenance and plan-record triggers update it. |
+| `valuation_hour` | Each row records an hour's revision, three built generations and independent valuation state. | Ledger and plan triggers invalidate hours; valuation publication completes them. |
+| `valuation_cell` | Each row splits a summary key by plan member, retaining recorded counters, quantities and currency sums alongside an exact list-value numerator and unvalued reasons. | Valuation rebuilds replace these rows without changing spend summaries. |
 
 The payer store's incarnation identifies one database history. THALAMUS changes
 it when the database is replaced or restored, so a reader starts again at the

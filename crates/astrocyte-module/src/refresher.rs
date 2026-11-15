@@ -43,6 +43,9 @@ pub(crate) mod opencode_v2_source;
 mod pi_source;
 #[path = "pi_thalamus_source.rs"]
 mod pi_thalamus_source;
+#[cfg(test)]
+#[path = "refresher_valuation_tests.rs"]
+mod refresher_valuation_tests;
 #[path = "thalamus_payer_join.rs"]
 pub(crate) mod thalamus_payer_join;
 #[path = "thalamus_payer_source.rs"]
@@ -1947,6 +1950,7 @@ fn run_loop_full(
     let mut reconciler = QueueReconciler::new(QUEUE_RECONCILE_CHUNK, QUEUE_RECONCILE_TICK_BUDGET);
     let mut pricing = PricingWalk::new(PricingBudget::PER_TICK);
     let mut summaries = astrocyte_core::report::SummaryMaintenance::default();
+    let mut valuations = astrocyte_core::report::valuation::ValuationMaintenance::default();
     let mut vault = crate::vault_source::Stage::new(Arc::clone(&stop));
     while !stop.load(Ordering::Relaxed) {
         vault.tick(&state, multiplier.plan_prices.as_deref(), current_time_ms());
@@ -1961,6 +1965,7 @@ fn run_loop_full(
             &stop,
         );
         let mut summaries_behind = summary_tick(&state, &mut summaries, &stop);
+        valuation_tick(&state, &mut valuations, &stop, Duration::from_millis(1_500));
         if !stop.load(Ordering::Relaxed) {
             multiplier.tick(&state, pending_catalog.is_some(), current_time_ms());
         }
@@ -1987,6 +1992,7 @@ fn run_loop_full(
             if summaries_behind && !stop.load(Ordering::Relaxed) {
                 summaries_behind = summary_tick(&state, &mut summaries, &stop);
             }
+            valuation_tick(&state, &mut valuations, &stop, Duration::from_millis(1_500));
             std::thread::sleep(
                 Duration::from_millis(250).min(interval.saturating_sub(started.elapsed())),
             );
@@ -1996,6 +2002,84 @@ fn run_loop_full(
 }
 
 const FAST_LANE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Valuation owns a separate budget, so a stale list value never delays the
+/// summary maintenance that serves existing recorded-spend reports.
+fn valuation_tick(
+    state: &SharedState,
+    valuations: &mut astrocyte_core::report::valuation::ValuationMaintenance,
+    stop: &AtomicBool,
+    budget: Duration,
+) {
+    use astrocyte_core::report::valuation::ValuationMaintenance;
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
+    let desired = state.desired_config();
+    let config::MultiplierSetting::Recorded(config) = &desired.subscription_multiplier else {
+        return;
+    };
+    let needed = state.with_read_op(|conn| {
+        ValuationMaintenance::needs_prepare(conn, config, &desired.reasoning_billed_as_output)
+            .map_err(|error| {
+                (
+                    "internal".into(),
+                    format!("valuation prepare check: {error:?}"),
+                )
+            })
+    });
+    let needed = match needed {
+        Ok(needed) => needed,
+        Err((_, error)) => {
+            tracing::warn!(%error,"valuation preparation check failed");
+            return;
+        }
+    };
+    let result = if needed {
+        state.ordered_write(|tx| {
+            ValuationMaintenance::prepare(tx, config, &desired.reasoning_billed_as_output)
+                .map_err(|error| format!("valuation prepare: {error:?}"))?;
+            Ok(((), false))
+        })
+    } else {
+        Ok(())
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, "valuation preparation failed");
+        return;
+    }
+    let started = std::time::Instant::now();
+    while !stop.load(Ordering::Relaxed) && started.elapsed() < budget {
+        let result = state.with_read_op(|conn| {
+            interrupt_on_stop(conn, stop, || {
+                Ok(valuations.read_chunk(conn, config, &desired.reasoning_billed_as_output))
+            })
+            .map_err(|error| ("internal".into(), error.to_string()))?
+            .map_err(|error| ("internal".into(), format!("valuation read: {error:?}")))
+        });
+        let ready = match result {
+            Ok(ready) => ready,
+            Err((_, error)) => {
+                tracing::warn!(%error, "valuation chunk failed");
+                return;
+            }
+        };
+        if ready && !stop.load(Ordering::Relaxed) {
+            if let Err(error) = state.ordered_write(|tx| {
+                valuations
+                    .publish(tx)
+                    .map(|published| (published, false))
+                    .map_err(|error| format!("valuation publish: {error:?}"))
+            }) {
+                tracing::warn!(%error, "valuation publication failed");
+                return;
+            }
+        }
+        if !valuations.has_pending() && !ready {
+            break;
+        }
+    }
+}
 
 /// The elapsed-time argument lets tests advance the same scheduler without wall-clock sleeps.
 fn fast_lane_if_due(

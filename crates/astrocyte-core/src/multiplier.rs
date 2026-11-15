@@ -320,6 +320,28 @@ impl MultiplierConfig {
                 }
             }
         }
+        let pools: Vec<_> = self.quota_providers.iter().collect();
+        for (index, (left_name, left)) in pools.iter().enumerate() {
+            for (right_name, right) in &pools[index + 1..] {
+                if left.scope.iter().any(|a| {
+                    right.scope.iter().any(|b| {
+                        a.producer == b.producer
+                            && a.provider == b.provider
+                            && (a.charge_basis.is_none()
+                                || b.charge_basis.is_none()
+                                || a.charge_basis == b.charge_basis)
+                            && (a.model_prefix.is_none()
+                                || b.model_prefix.is_none()
+                                || a.model_prefix
+                                    .as_ref()
+                                    .zip(b.model_prefix.as_ref())
+                                    .is_some_and(|(a, b)| a.starts_with(b) || b.starts_with(a)))
+                    })
+                }) {
+                    return Err(format!("subscription_multiplier.quota_providers: overlapping scope rules across '{left_name}' and '{right_name}'"));
+                }
+            }
+        }
         Ok(())
     }
 }

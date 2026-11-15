@@ -1,6 +1,7 @@
 //! Rebuildable hour partitions; source facts remain authoritative.
 #[cfg(test)]
 mod copy_bench;
+pub mod valuation;
 use super::*;
 use rusqlite::Transaction;
 use serde::Deserialize;
@@ -100,16 +101,19 @@ struct Cell {
     subscription_missing_account: u64,
     covered_measurements: u64,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Quantity {
+    #[serde(with = "exact")]
     units: i128,
     observations: u64,
     stated_observations: u64,
+    #[serde(with = "exact")]
     covered_units: i128,
     covered_observations: u64,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Money {
+    #[serde(with = "exact")]
     nanos: i128,
     contributions: u64,
 }

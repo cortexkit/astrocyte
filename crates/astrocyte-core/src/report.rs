@@ -17,7 +17,7 @@ mod analytics;
 mod hourly;
 use analytics::{ParsedReport, Quantities};
 pub use analytics::{ReportTokens, UnitQuantity, UsageQuantities};
-pub use hourly::{SummaryMaintenance, SummaryOutcome};
+pub use hourly::{valuation, SummaryMaintenance, SummaryOutcome};
 
 pub(crate) fn summary_verdict(
     conn: &Connection,

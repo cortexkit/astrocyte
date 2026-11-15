@@ -4838,6 +4838,91 @@ CREATE TABLE rate_dirty_hour (
 );
 "#,
     },
+    Migration {
+        version: 55,
+        statements: r#"-- Valuations are independently rebuildable; ledger charges are untouched.
+CREATE TABLE valuation_state (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    rate_generation INTEGER NOT NULL DEFAULT 0,
+    config_generation INTEGER NOT NULL DEFAULT 0,
+    plan_generation INTEGER NOT NULL DEFAULT 0,
+    config TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO valuation_state(id) VALUES(1);
+CREATE TABLE valuation_hour (
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    rate_generation INTEGER,
+    config_generation INTEGER,
+    plan_generation INTEGER,
+    state TEXT NOT NULL DEFAULT 'dirty' CHECK(state IN ('dirty','built','not_yet_valued')),
+    PRIMARY KEY(kind,hour_number)
+) WITHOUT ROWID;
+CREATE INDEX valuation_hour_dirty ON valuation_hour(kind,hour_number) WHERE state='dirty';
+CREATE TABLE valuation_cell (
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    cell_key TEXT NOT NULL CHECK(json_valid(cell_key)),
+    summary_key TEXT NOT NULL CHECK(json_valid(summary_key)),
+    plan TEXT NOT NULL,
+    plan_account TEXT,
+    recorded TEXT NOT NULL CHECK(json_valid(recorded)),
+    list_numerator TEXT NOT NULL,
+    unvalued TEXT NOT NULL CHECK(json_valid(unvalued)),
+    PRIMARY KEY(kind,hour_number,cell_key),
+    FOREIGN KEY(kind,hour_number) REFERENCES valuation_hour(kind,hour_number)
+) WITHOUT ROWID;
+CREATE TRIGGER valuation_summary_insert AFTER INSERT ON summary_hour BEGIN
+    INSERT INTO valuation_hour(kind,hour_number,revision) VALUES(NEW.kind,NEW.hour_number,1)
+    ON CONFLICT(kind,hour_number) DO UPDATE SET revision=revision+1,state='dirty';
+END;
+CREATE TRIGGER valuation_summary_update AFTER UPDATE OF revision ON summary_hour BEGIN
+    INSERT INTO valuation_hour(kind,hour_number,revision) VALUES(NEW.kind,NEW.hour_number,1)
+    ON CONFLICT(kind,hour_number) DO UPDATE SET revision=revision+1,state='dirty';
+END;
+INSERT INTO valuation_hour(kind,hour_number) SELECT kind,hour_number FROM summary_hour;
+CREATE TRIGGER valuation_account_insert AFTER INSERT ON account_subscription BEGIN
+    UPDATE valuation_hour SET state='dirty',revision=revision+1 WHERE kind=0
+      AND hour_number>=NEW.effective_from_ms/3600000
+      AND (NEW.effective_to_ms IS NULL OR hour_number<NEW.effective_to_ms/3600000+(NEW.effective_to_ms%3600000>0));
+    UPDATE valuation_hour SET plan_generation=plan_generation+1 WHERE state='built'
+      AND rate_generation=(SELECT rate_generation FROM valuation_state WHERE id=1)
+      AND config_generation=(SELECT config_generation FROM valuation_state WHERE id=1)
+      AND plan_generation=(SELECT plan_generation FROM valuation_state WHERE id=1);
+    UPDATE valuation_state SET plan_generation=plan_generation+1 WHERE id=1;
+END;
+CREATE TRIGGER valuation_credential_insert AFTER INSERT ON credential_subscription BEGIN
+    UPDATE valuation_hour SET state='dirty',revision=revision+1 WHERE kind=0
+      AND hour_number>=NEW.effective_from_ms/3600000
+      AND (NEW.effective_to_ms IS NULL OR hour_number<NEW.effective_to_ms/3600000+(NEW.effective_to_ms%3600000>0));
+    UPDATE valuation_hour SET plan_generation=plan_generation+1 WHERE state='built'
+      AND rate_generation=(SELECT rate_generation FROM valuation_state WHERE id=1)
+      AND config_generation=(SELECT config_generation FROM valuation_state WHERE id=1)
+      AND plan_generation=(SELECT plan_generation FROM valuation_state WHERE id=1);
+    UPDATE valuation_state SET plan_generation=plan_generation+1 WHERE id=1;
+END;
+-- Closing a plan changes membership from its new end onward, not before it.
+CREATE TRIGGER valuation_account_close AFTER UPDATE OF effective_to_ms ON account_subscription BEGIN
+    UPDATE valuation_hour SET state='dirty',revision=revision+1 WHERE kind=0
+      AND hour_number>=NEW.effective_to_ms/3600000;
+    UPDATE valuation_hour SET plan_generation=plan_generation+1 WHERE state='built'
+      AND rate_generation=(SELECT rate_generation FROM valuation_state WHERE id=1)
+      AND config_generation=(SELECT config_generation FROM valuation_state WHERE id=1)
+      AND plan_generation=(SELECT plan_generation FROM valuation_state WHERE id=1);
+    UPDATE valuation_state SET plan_generation=plan_generation+1 WHERE id=1;
+END;
+CREATE TRIGGER valuation_credential_close AFTER UPDATE OF effective_to_ms ON credential_subscription BEGIN
+    UPDATE valuation_hour SET state='dirty',revision=revision+1 WHERE kind=0
+      AND hour_number>=NEW.effective_to_ms/3600000;
+    UPDATE valuation_hour SET plan_generation=plan_generation+1 WHERE state='built'
+      AND rate_generation=(SELECT rate_generation FROM valuation_state WHERE id=1)
+      AND config_generation=(SELECT config_generation FROM valuation_state WHERE id=1)
+      AND plan_generation=(SELECT plan_generation FROM valuation_state WHERE id=1);
+    UPDATE valuation_state SET plan_generation=plan_generation+1 WHERE id=1;
+END;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -8623,6 +8708,9 @@ mod tests {
             "rate_model",
             "rate_cache_state",
             "rate_dirty_hour",
+            "valuation_state",
+            "valuation_hour",
+            "valuation_cell",
         ] {
             assert_eq!(
                 conn.query_row(

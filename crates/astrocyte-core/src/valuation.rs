@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::catalog_client::{cache_write_ttl, stated_mode_condition, token_rate_key, RATE_ROLES};
 use crate::money::MoneyError;
@@ -81,7 +81,7 @@ pub struct UnpricedQuantity {
 }
 
 /// The closed report vocabulary; multiplier diagnostics keep their original reasons.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnvaluedReason {
     NoRate,
@@ -107,7 +107,7 @@ impl UnvaluedReason {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unvalued {
     pub measurements: u64,
     pub tokens: i64,
