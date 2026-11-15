@@ -1,1 +1,1 @@
-{"error":{"code":"range_too_large","message":"quota history range exceeds the grain's limit"}}
+{"error":{"code":"range_too_large","message":"quota history range, widened to whole UTC buckets, exceeds 31 days for hour grain or 400 days for day grain; align the range to the grain or shorten it"}}

@@ -76,7 +76,7 @@ impl HistoryError {
     pub fn message(&self) -> String {
         match self {
             Self::InvalidRange => "from_ms must be less than to_ms".into(),
-            Self::RangeTooLarge => "quota history range exceeds the grain's limit".into(),
+            Self::RangeTooLarge => "quota history range, widened to whole UTC buckets, exceeds 31 days for hour grain or 400 days for day grain; align the range to the grain or shorten it".into(),
             Self::InvalidFilter => "quota_providers must not be empty".into(),
             Self::Store(error) => format!("quota history: {error}"),
         }
@@ -97,12 +97,8 @@ pub fn quota_history(
         Grain::Hour => (HOUR_MS, 31),
         Grain::Day => (DAY_MS, 400),
     };
-    let duration = i128::from(request.to_ms) - i128::from(request.from_ms);
-    if duration <= 0 {
+    if i128::from(request.to_ms) <= i128::from(request.from_ms) {
         return Err(HistoryError::InvalidRange);
-    }
-    if duration > i128::from(days * DAY_MS) {
-        return Err(HistoryError::RangeTooLarge);
     }
     if request.quota_providers.as_ref().is_some_and(Vec::is_empty) {
         return Err(HistoryError::InvalidFilter);
@@ -110,9 +106,16 @@ pub fn quota_history(
     // Use wider arithmetic before clamping to the store's nanosecond domain:
     // valid millisecond ranges can lie wholly outside that domain.
     let grain = i128::from(grain_ms);
-    let from = i128::from(request.from_ms).div_euclid(grain) * grain * i128::from(NANOS_PER_MS);
-    let to = (i128::from(request.to_ms) - 1).div_euclid(grain) * grain + grain;
-    let to = to * i128::from(NANOS_PER_MS);
+    let from_ms = i128::from(request.from_ms).div_euclid(grain) * grain;
+    let to_ms = (i128::from(request.to_ms) - 1).div_euclid(grain) * grain + grain;
+    // The cap applies to the widened range, which is the work the read does:
+    // a 31-day hourly range that doesn't start on the hour widens to 745 hours
+    // and is refused, so an hourly reply never exceeds 744 buckets.
+    if to_ms - from_ms > i128::from(days * DAY_MS) {
+        return Err(HistoryError::RangeTooLarge);
+    }
+    let from = from_ms * i128::from(NANOS_PER_MS);
+    let to = to_ms * i128::from(NANOS_PER_MS);
     let intersects = from <= i128::from(i64::MAX) && to > i128::from(i64::MIN);
     let start = clamp_instant(from);
     // An inclusive upper bound retains the final representable nanosecond
@@ -418,6 +421,10 @@ mod tests {
             (i64::MIN, i64::MAX, "day", "range_too_large"),
             (0, 31 * DAY_MS + 1, "hour", "range_too_large"),
             (0, 400 * DAY_MS + 1, "day", "range_too_large"),
+            // Exactly the cap as asked, but off the hour or day: widening
+            // adds a bucket, and the widened range is what is capped.
+            (1, 31 * DAY_MS + 1, "hour", "range_too_large"),
+            (1, 400 * DAY_MS + 1, "day", "range_too_large"),
         ] {
             assert_eq!(
                 quota_history(&conn, &request(from, to, grain))

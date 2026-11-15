@@ -79,6 +79,7 @@ Test: `every_operation_name_reaches_its_own_handler`.
 | `usage.cache.steps` | read | `harness`, `session`, `limit?`, `after_cursor?` |
 | `usage.runs.list` | read | `from_ms`, `to_ms`, `harness?`, `limit?`, `after?` |
 | `usage.runs.detail` | read | `key`, `limit?`, `after?` |
+| `spend.quota.history` | read | `from_ms`, `to_ms`, `grain`, `quota_providers?` |
 | `usage.steps.subscribe` | read, watch | `harness?`, `session?` |
 | `usage.steps.read` | read | `after?`, `limit?`, `harness?`, `session?` |
 | `watermark.get` | read | none |
@@ -899,6 +900,69 @@ whole-key totals combine clean cells and dirty-hour base reductions.
 Synthetic vectors and SHA-256 checksums are published under
 `crates/astrocyte-module/test-vectors/usage-runs-v1/`. Tests regenerate frame bodies
 through the real dispatch and the serving path's shared permission refusal.
+
+### 4.5 Quota history (`spend.quota.history`)
+
+A history of the insula quota readings astrocyte has recorded, read on the
+read-only connection. It makes no provider request and estimates neither usage
+nor spend. Flow routes may not call it.
+
+**Request:** `{from_ms, to_ms, grain, quota_providers?}`, for example
+`{"from_ms":0,"to_ms":3600000,"grain":"hour","quota_providers":["claude"]}`.
+`grain` is `hour` or `day`, in UTC. The range is widened outward to whole UTC
+buckets, and readings are selected in that widened half-open range. The
+widened range may span at most 31 days for `hour` (744 buckets) and 400 days
+for `day`; a longer one, including an exactly-31-day hourly range that doesn't
+start on the hour, refuses `range_too_large`. `from_ms >= to_ms` refuses
+`invalid_range`. `quota_providers` selects quota-provider names: omitted or
+`null` selects all, an unknown name selects nothing, and an empty list refuses
+`invalid_filter`. Decoding is closed: a missing required member, an unknown
+member, a wrong type or another grain refuses `malformed`.
+
+**Reply:**
+
+```json
+{
+  "windows": [
+    {
+      "quota_provider": "claude",
+      "account": "synthetic-account",
+      "credential": null,
+      "pool": "primary",
+      "window_minutes": 300,
+      "buckets": [{"start_ms": 0, "used_percent_max": 142.0, "samples": 2}],
+      "resets": [{"at_ms": 0, "from_percent": 197.0, "to_percent": 103.0}]
+    }
+  ],
+  "earliest_sample_ms": -1
+}
+```
+
+- One window per quota provider, account or credential, and pool that has
+  readings in the selected range. An account reading has `account` set and
+  `credential: null`; an account-less reading has `account: null` and its
+  recorded `credential`. Windows sort by quota provider, accounts before
+  credentials, then identity and pool; buckets and resets are in time order.
+- `window_minutes` is the window length on the last selected reading, or
+  `null` if it wasn't recorded. It can differ from earlier readings in the
+  range.
+- Each bucket has a UTC-aligned `start_ms`, the highest percent read in it
+  (the raw percent when insula gave one, otherwise the normalized one, as the
+  subscription multiplier reads them) and the number of readings. Percents can
+  exceed 100. Buckets with no reading are omitted.
+- A reset is any drop in that percent between consecutive readings, stamped at
+  the later reading. The last reading before the range is used only to detect
+  a reset at the range's first reading; it adds to no bucket. Provider reset
+  times are not used, because they jitter between reads.
+- `earliest_sample_ms` is the first recorded reading among the selected
+  providers, from either table and regardless of the range, or `null` if none.
+  A provider with no reading in the range can set it without appearing in
+  `windows`.
+
+Samples, generated through the real handler and pinned by test, are in
+`crates/astrocyte-module/test-vectors/analytics-quota-history-v1/`. Tests:
+`quota_history_buckets_raw_percent_predecessor_resets_and_credentials`,
+`quota_history_refuses_invalid_ranges_and_empty_filters`.
 
 ## 5. Calls astrocyte makes
 

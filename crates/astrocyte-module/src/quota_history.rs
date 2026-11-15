@@ -4,8 +4,6 @@ use crate::{ops::OpResult, state::SharedState};
 use astrocyte_core::quota_history::{quota_history, QuotaHistoryRequest};
 use serde_json::Value;
 
-// The public operation registry is wired separately from this handler.
-#[allow(dead_code)]
 pub(crate) fn read(state: &SharedState, params: Value) -> OpResult {
     let request: QuotaHistoryRequest = serde_json::from_value(params)
         .map_err(|error| ("malformed".into(), format!("quota history params: {error}")))?;

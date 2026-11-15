@@ -2249,6 +2249,7 @@ mod tests {
                 "usage.cache.steps",
                 "usage.runs.list",
                 "usage.runs.detail",
+                "spend.quota.history",
                 "usage.steps.read",
                 "usage.steps.subscribe",
                 "watermark.get",

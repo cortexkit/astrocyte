@@ -39,6 +39,7 @@ Internal records live in the ignored `.cortexkit/` folder, which tracks only
 - `report.rs`: the read model behind the spend reports, coverage and explain.
   `report/hourly.rs` builds, reads and audits the hourly summaries.
 - `runs.rs`: session, run and flow cost reads, with their hourly totals.
+- `quota_history.rs`: recorded quota readings, bucketed.
 - `cache_diagnostics.rs`: harness steps per session and their cache verdicts.
 - `step_feed.rs`: the live step feed table, retention and paged read.
 - `capacity.rs`: insula quota windows, readings and freshness.

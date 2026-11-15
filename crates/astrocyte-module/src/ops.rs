@@ -38,6 +38,9 @@ pub const OP_CACHE_SESSIONS: &str = "usage.cache.sessions";
 pub const OP_CACHE_STEPS: &str = "usage.cache.steps";
 pub const OP_RUNS_LIST: &str = "usage.runs.list";
 pub const OP_RUNS_DETAIL: &str = "usage.runs.detail";
+/// Recorded insula quota readings per account and window, bucketed by UTC
+/// hour or day, with the resets seen between readings.
+pub const OP_QUOTA_HISTORY: &str = "spend.quota.history";
 /// The live step feed (`step_feed`). The subscription is a watch, served as a
 /// stream of notices by the serving handler, not through `dispatch`. Both
 /// are served only to the principals `step_feed::may_read_feed` admits; the
@@ -85,7 +88,7 @@ const fn same_str(left: &str, right: &str) -> bool {
 
 /// The closed public surface consumed by dispatch, the manifest, and the schema
 /// artifact. Exact name-set parity prevents a same-sized but incorrect surface.
-pub const PUBLIC_OPERATION_NAMES: [&str; 25] = [
+pub const PUBLIC_OPERATION_NAMES: [&str; 26] = [
     OP_VERDICT,
     OP_REPORT,
     OP_EVENT_INGEST,
@@ -108,6 +111,7 @@ pub const PUBLIC_OPERATION_NAMES: [&str; 25] = [
     OP_CACHE_STEPS,
     OP_RUNS_LIST,
     OP_RUNS_DETAIL,
+    OP_QUOTA_HISTORY,
     OP_STEPS_SUBSCRIBE,
     OP_STEPS_READ,
     OP_WATERMARK_GET,
@@ -369,6 +373,15 @@ fn operation_params_schema(name: &str) -> Value {
             closed_object(&["kind","harness","flow_id"],json!({"kind":{"enum":["flow"]},"harness":string,"flow_id":string}))
         ]},"limit":optional_u32,"after":optional_string}),
         ),
+        OP_QUOTA_HISTORY => closed_object(
+            &["from_ms", "to_ms", "grain"],
+            json!({
+                "from_ms": i64_value,
+                "to_ms": i64_value,
+                "grain": {"enum": ["hour", "day"]},
+                "quota_providers": {"type": ["array", "null"], "items": string},
+            }),
+        ),
         OP_WATERMARK_GET => closed_object(&[], json!({})),
         other => unreachable!("operation {other} is served without a params schema"),
     }
@@ -455,6 +468,7 @@ pub fn dispatch(state: &SharedState, method: &str, params: Value) -> OpResult {
         OP_CACHE_STEPS => op_cache_steps(state, params),
         OP_RUNS_LIST => op_runs_list(state, params),
         OP_RUNS_DETAIL => op_runs_detail(state, params),
+        OP_QUOTA_HISTORY => crate::quota_history::read(state, params),
         OP_STEPS_SUBSCRIBE => op_steps_subscribe(params),
         OP_STEPS_READ => crate::step_feed::read(state, params)
             .map(|page| json!(page))
@@ -1430,6 +1444,7 @@ mod tests {
             "usage.cache.steps",
             "usage.runs.list",
             "usage.runs.detail",
+            "spend.quota.history",
             "usage.steps.read",
             "usage.steps.subscribe",
             "watermark.get",
@@ -1458,7 +1473,7 @@ mod tests {
     #[test]
     fn every_operation_name_reaches_its_own_handler() {
         // Each operation is paired with the marker its own handler writes.
-        const ROUTES: [(&str, &str); 25] = HANDLER_MARKERS;
+        const ROUTES: [(&str, &str); 26] = HANDLER_MARKERS;
 
         // The markers only discriminate while none of them is a prefix of
         // another: three of these begin with the word "subscription", and if
@@ -1521,7 +1536,7 @@ mod tests {
     /// request-decoding error. A refusal with code `malformed` and a message
     /// starting with that literal came from the decoder; any other answer
     /// means the decoder accepted the params.
-    const HANDLER_MARKERS: [(&str, &str); 25] = [
+    const HANDLER_MARKERS: [(&str, &str); 26] = [
         (OP_VERDICT, "verdict params: "),
         (OP_REPORT, "report params: "),
         (OP_EVENT_INGEST, "event params: "),
@@ -1544,6 +1559,7 @@ mod tests {
         (OP_CACHE_STEPS, "cache steps params: "),
         (OP_RUNS_LIST, "runs list params: "),
         (OP_RUNS_DETAIL, "runs detail params: "),
+        (OP_QUOTA_HISTORY, "quota history params: "),
         (OP_STEPS_SUBSCRIBE, "steps subscribe params: "),
         (OP_STEPS_READ, "steps read params: "),
         (OP_WATERMARK_GET, "watermark params: "),
@@ -1784,6 +1800,15 @@ mod tests {
                     json!({"from_ms":0,"to_ms":1,"harness":null,"limit":50,"after":null}),
                 ],
                 json!({"from_ms":"bad","to_ms":1}),
+            ),
+            sample(
+                OP_QUOTA_HISTORY,
+                vec![
+                    json!({"from_ms":0,"to_ms":1,"grain":"hour"}),
+                    json!({"from_ms":0,"to_ms":1,"grain":"day","quota_providers":["claude"]}),
+                    json!({"from_ms":0,"to_ms":1,"grain":"day","quota_providers":null}),
+                ],
+                json!({"from_ms":0,"to_ms":1,"grain":"week"}),
             ),
             sample(
                 OP_RUNS_DETAIL,

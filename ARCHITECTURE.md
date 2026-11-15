@@ -181,8 +181,8 @@ The closed JSONC config has six required members, detailed in
 unknown or missing members fail decoding. Accepted files become stored
 generations. An invalid first file refuses startup; later failures retain the
 committed generation and degrade health. `ck-astrocyte --check-config <path>`
-validates a file offline. Live multiplier account maps are removed; old stored
-maps seed plan history before hydration discards their null-override declarations.
+validates a file offline. Account maps stored from older configs only seed
+plan history.
 
 ## Served operations
 
@@ -213,6 +213,7 @@ Dispatch and the manifest share `PUBLIC_OPERATION_NAMES` in
 | `usage.cache.steps` | read |
 | `usage.runs.list` | read, session, run and flow totals |
 | `usage.runs.detail` | read, one run's items |
+| `spend.quota.history` | read, quota readings |
 | `usage.steps.subscribe` | read, watch |
 | `usage.steps.read` | read, live step feed |
 | `watermark.get` | read, THALAMUS read watermark |
