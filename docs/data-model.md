@@ -247,7 +247,9 @@ Migration 52 backfills ordering keys from retained evidence and each identity's
 latest feed row, creating empty placeholders for feed-only identities. Rewrite
 neighbours seek the `(harness, session, runner, order_ms, first_feed_cursor)`
 index, where `order_ms` is request start when known and occurrence time otherwise.
-Null runners compare only with other null runners; warm-ups remain in the chain.
+Null runners compare only with other null runners. Steps a runner marks
+`warm_up` (keep-warm requests it sent itself) stay in the chain like any other
+step, because they refresh the cache the next step reads.
 Separate indexes locate the latest earlier runner-only step, the latest earlier
 cache report, and any positive cache read for the session's cache verdict.
 These three witnesses span runners and use occurrence time, with equal times
