@@ -1,9 +1,11 @@
 # Optional purchased-credit rate plan-price vector
 
 `plan-prices.json` is the exact `response` object value of the case
-`plan.prices — every curated row` in the captured Fusiform
-`served-payloads.json` for `fusiform-protocol-v0.71.0` (commit `90a0531`).
-The source artifact has SHA-256
+`plan.prices — every curated row` in `crates/fusiform-module/fixtures/served-payloads.json`
+of the fusiform repository (cortexkit/fusiform) at commit `08af2b0`. That build
+served the protocol 0.71.0 shape with a Kimi Allegro `fast` tier entry that has
+no `credit_rate`. It was withdrawn before placement, so the entry is absent at
+the later commit that published 0.71.0. The source artifact has SHA-256
 `f8e20727ad654d987a9168a74c3fb85e984fadbec0e374687d8c5d0501c231ed`.
 The enclosing case and request are not included. Whitespace within the response
 object is unchanged, and there is no added final newline. `SHA256SUMS` pins the

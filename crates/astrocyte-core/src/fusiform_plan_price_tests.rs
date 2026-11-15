@@ -51,8 +51,9 @@ fn fusiform_071_curated_plan_prices_keep_allegro_fee_without_credit_rate() {
     config.config = config.declarations();
     let start = 1_795_000_000_000;
     let end = start + DAY;
-    // Keep the day covered: the counter deliberately excludes a burn increase
-    // across a long gap, even when the plan fee is known.
+    // A reading every ten minutes keeps the whole day covered: the multiplier
+    // drops quota used across a long gap between readings, even when the plan
+    // fee is known, and this test needs the day measured.
     for step in 0_i64..=144 {
         let at_ms = start + step * 600_000;
         let used = if at_ms == end { 10 } else { 0 };
