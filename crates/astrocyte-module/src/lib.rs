@@ -9,6 +9,8 @@ mod capacity_map;
 pub mod config;
 mod fusiform_client;
 mod harness_paths;
+#[cfg(test)]
+mod multiplier_report_vectors_tests;
 pub mod ops;
 #[doc(hidden)]
 pub mod peer_exchange;
