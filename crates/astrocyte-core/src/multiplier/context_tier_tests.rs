@@ -24,6 +24,7 @@ fn context_tier_rates(entries: &[(&str, i64)]) -> ResolvedRates {
     ResolvedRates {
         resolved_at_ms: 42,
         models: BTreeMap::from([(("openai".into(), "m".into()), stored)]),
+        eras: BTreeMap::new(),
     }
 }
 

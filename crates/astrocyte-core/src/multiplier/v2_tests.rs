@@ -1413,6 +1413,7 @@ fn observations_on_clone(conn: &Connection, config: &FixtureConfig) -> Vec<Obser
     let mut rates = ResolvedRates {
         resolved_at_ms: utc_day_start_ms("2026-10-28").unwrap(),
         models: BTreeMap::new(),
+        eras: BTreeMap::new(),
     };
     let mut statement = conn.prepare("SELECT api_nanos_by_model FROM multiplier_observation ORDER BY snapshot_at_ms,observation_id").unwrap();
     for json in statement

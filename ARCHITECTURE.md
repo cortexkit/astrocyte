@@ -46,7 +46,7 @@ against fusiform. It serves spend and usage diagnostics over subc.
 ## Durable state
 
 The leased SQLite store uses WAL, FULL synchronization and foreign keys, with a
-5000 ms busy timeout. `store.rs` owns `MIGRATIONS`, now at version 53; an older
+5000 ms busy timeout. `store.rs` owns `MIGRATIONS`, now at version 54; an older
 binary refuses a newer store. Immutable-table triggers reject rewrites even
 through `INSERT OR REPLACE`. Integer keys are never served. The
 [data model](docs/data-model.md#tables) describes the tables.
@@ -85,30 +85,31 @@ transaction as the good calls and the cursor, and coverage counts them.
 
 `start_refresher` runs one OS thread. A full tick, every `poll_interval_secs`:
 
-1. Connect a configured fusiform catalog and learn its history boundary from
-   `catalog.status`. Until then, pricing waits and calls stay queued.
-2. Drain every source that `harness_ingest` allows. An excluded source is not read
-   and loses its `source_runtime` row, like an absent one.
-3. Read insula quota: commit queued quota events, and call `usage.get` when the
-   event stream cannot be trusted or the freshness horizon is near (see below).
+1. Read Fusiform's history boundary from `catalog.status`. Pricing waits until
+   the boundary is known.
+2. Drain allowed `harness_ingest` sources and delete excluded sources'
+   `source_runtime` rows without reading them.
+3. Commit insula quota events and call `usage.get` when freshness or event
+   continuity requires it.
 4. Price queued calls (`run_pricing_walk`), bounded per tick by time and count.
-5. Spend up to two seconds on the daily check that every unpriced call is queued
-   for pricing (`QUEUE_RECONCILE_INTERVAL`).
+5. Reconcile the pricing queue daily for up to two seconds
+   (`QUEUE_RECONCILE_INTERVAL`).
 
-Then the loop rebuilds dirty summary hours for up to 1.5 seconds and runs the
-multiplier stage. Between full ticks it applies quota events every 250 ms and,
-every two seconds (`FAST_LANE_INTERVAL`), a fast lane: BROCA and the harness
-readers except Goose tail only what changed. Other sources
-wait for full ticks. Fast cycles commit nothing when idle and never count as a
-source's successful drain. A summary backlog keeps rebuilding between ticks.
+The loop then budgets 1.5 seconds each for summary rebuilds and served rate
+refreshes before running the multiplier. `rate_era` supplies per-call dated rates
+for new multiplier days without changing stored observations. Fetches run outside
+transactions; catalog advances refresh aliases and plan providers' public API-card targets too.
+Between ticks, quota events apply every 250 ms. Every two seconds
+(`FAST_LANE_INTERVAL`), BROCA and harness readers except Goose tail changes.
+Other sources wait for full ticks. Idle fast cycles commit nothing and never
+count as successful drains. Summary backlogs also rebuild between ticks.
 
-The bus reader thread holds one ckbus credential, opened with the launch secret
-already given to the daemon. It reads insula's per-account quota notices from
-astrocyte's durable, fetches each body through `events_get`, checks its digest
-and acknowledges only after commit. A gap, new epoch, bad digest or missing body
-asks for a full `usage.get`, which also runs at least every ten minutes, and on
-every tick while events are not flowing. The same reader follows runners' live
-`step.finished.v1` events into the step feed, never into the ledger.
+The bus reader uses one ckbus credential opened with the daemon's launch secret.
+It reads insula's per-account quota notices from astrocyte's durable bus subscription, retrieves
+bodies through `events_get`, checks digests and acknowledges after commit.
+A gap, new epoch, bad digest or missing body requests `usage.get`, as does each
+tick without event flow and at least every ten minutes. The reader also sends
+runners' live `step.finished.v1` events to the step feed, never the ledger.
 
 ## Pricing
 

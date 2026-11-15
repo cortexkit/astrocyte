@@ -4799,6 +4799,45 @@ ALTER TABLE pricing_selection_state ADD COLUMN last_queue_reconcile_completed_ms
            (typeof(last_queue_reconcile_completed_ms) = 'integer' AND last_queue_reconcile_completed_ms >= 0));
 "#,
     },
+    Migration {
+        version: 54,
+        statements: r#"-- Served timelines are derived caches, never ledger prices.
+CREATE TABLE rate_cache_state (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    catalog_version INTEGER NOT NULL DEFAULT -1,
+    generation INTEGER NOT NULL DEFAULT 0,
+    after_event_key INTEGER NOT NULL DEFAULT 0,
+    twins TEXT NOT NULL DEFAULT '{}'
+);
+INSERT INTO rate_cache_state(id) VALUES(1);
+CREATE TABLE rate_model (
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    catalog_version INTEGER,
+    reference_provider TEXT,
+    reference_model TEXT,
+    last_error TEXT,
+    last_attempt INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(provider,model),
+    CHECK((reference_provider IS NULL)=(reference_model IS NULL))
+) WITHOUT ROWID;
+CREATE INDEX rate_model_reference ON rate_model(reference_provider,reference_model);
+CREATE TABLE rate_era (
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    fact_key TEXT NOT NULL,
+    from_ms INTEGER NOT NULL,
+    until_ms INTEGER,
+    segment TEXT NOT NULL CHECK(json_valid(segment)),
+    PRIMARY KEY(provider,model,fact_key,from_ms),
+    FOREIGN KEY(provider,model) REFERENCES rate_model(provider,model),
+    CHECK(until_ms IS NULL OR until_ms>from_ms)
+) WITHOUT ROWID;
+CREATE TABLE rate_dirty_hour (
+    hour_number INTEGER PRIMARY KEY
+);
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -8579,6 +8618,23 @@ mod tests {
         drop(store);
 
         let conn = Connection::open(path).unwrap();
+        for table in [
+            "rate_era",
+            "rate_model",
+            "rate_cache_state",
+            "rate_dirty_hour",
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1,
+                "missing cache table {table}"
+            );
+        }
         let stale_index: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='index' AND name='summary_hour_stale'",

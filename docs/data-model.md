@@ -69,6 +69,10 @@ copies that timeout without running the table-creating probes.
 | `summary_cost_frequency` | Each row counts an exact current-head value in the dated, complete, currency-known work-class sample. | Rebuilds replace these rows. |
 | `summary_run_cell` | Each row stores step counts, token totals and presence, and current-charge cost maps for one run key, provider and model, and hour. | The existing hourly rebuild and audit replace these rows. |
 | `summary_audit_state` | The row records the independent audit's cursor, next start time and progress statistics. | The audit updates this row. |
+| `rate_era` | Each row caches one served rate-key segment, including absent and refused intervals, separately from ledger prices. | Refresher publication replaces changed timelines. |
+| `rate_model` | Each row records a fetched catalog version and current alias target or a plan provider's public API-card target (its API twin); an index finds referring models. | The refresher discovers new models incrementally and re-reads them on catalog advances. |
+| `rate_cache_state` | The singleton records the catalog version, cache generation, call-discovery cursor and twin configuration. | The refresher updates this row. |
+| `rate_dirty_hour` | Each row queues a summary-backed hour holding a model whose timeline or reference changed. | Rate publication inserts keys for the model and its referrers; valuation maintenance consumes them. |
 
 The payer store's incarnation identifies one database history. THALAMUS changes
 it when the database is replaced or restored, so a reader starts again at the

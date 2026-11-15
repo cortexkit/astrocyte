@@ -1,0 +1,251 @@
+{
+  "eras": [],
+  "fact_keys": [
+    "rate.cache_read",
+    "rate.cache_read.mode.fast",
+    "rate.cache_write",
+    "rate.cache_write.mode.fast",
+    "rate.cache_write.ttl.1h",
+    "rate.cache_write.ttl.5m",
+    "rate.input",
+    "rate.input.mode.fast",
+    "rate.output",
+    "rate.output.mode.fast"
+  ],
+  "fact_prefix": "rate.",
+  "model_id": "claude-opus-5-5",
+  "provider_id": "anthropic",
+  "served_by_key": {
+    "rate.cache_read": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790096033635
+      },
+      {
+        "from_ms": 1790096033635,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 200000000
+        }
+      }
+    ],
+    "rate.cache_read.mode.fast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790367995300
+      },
+      {
+        "from_ms": 1790367995300,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 400000000
+        }
+      }
+    ],
+    "rate.cache_write": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790096033635
+      },
+      {
+        "from_ms": 1790096033635,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 5000000000
+        }
+      }
+    ],
+    "rate.cache_write.mode.fast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790367995300
+      },
+      {
+        "from_ms": 1790367995300,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 10000000000
+        }
+      }
+    ],
+    "rate.cache_write.ttl.1h": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1794089713000
+      },
+      {
+        "from_ms": 1794089713000,
+        "source": "cache_lifetime",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 8000000000
+        }
+      }
+    ],
+    "rate.cache_write.ttl.5m": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1794089713000
+      },
+      {
+        "from_ms": 1794089713000,
+        "source": "cache_lifetime",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 5000000000
+        }
+      }
+    ],
+    "rate.input": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790096033635
+      },
+      {
+        "from_ms": 1790096033635,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 4000000000
+        }
+      }
+    ],
+    "rate.input.mode.fast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790367995300
+      },
+      {
+        "from_ms": 1790367995300,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 8000000000
+        }
+      }
+    ],
+    "rate.output": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790096033635
+      },
+      {
+        "from_ms": 1790096033635,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 20000000000
+        }
+      }
+    ],
+    "rate.output.mode.fast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790367995300
+      },
+      {
+        "from_ms": 1790367995300,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 40000000000
+        }
+      }
+    ]
+  },
+  "source": "models.dev"
+}

@@ -6,9 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use fusiform_protocol::{
-    CatalogGetRequest, CatalogGetResponse, RateValue, RefusalKind, StatusRequest, StatusResponse,
+    CatalogGetRequest, CatalogGetResponse, HistoryRequest, HistoryResponse, RateValue, RefusalKind,
+    StatusRequest, StatusResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,6 +33,33 @@ pub trait CatalogConnection: Send + Sync {
         &self,
         request: CatalogGetRequest,
     ) -> Result<CatalogGetResponse, CatalogCallError>;
+
+    fn catalog_history(
+        &self,
+        _request: HistoryRequest,
+        _timeout: Duration,
+    ) -> Result<HistoryResponse, CatalogCallError> {
+        Err(CatalogCallError {
+            code: "unsupported".into(),
+            message: "catalog.history is unavailable".into(),
+        })
+    }
+
+    fn catalog_get_with_timeout(
+        &self,
+        request: CatalogGetRequest,
+        _timeout: Duration,
+    ) -> Result<CatalogGetResponse, CatalogCallError> {
+        self.catalog_get(request)
+    }
+
+    fn catalog_status_with_timeout(
+        &self,
+        request: StatusRequest,
+        _timeout: Duration,
+    ) -> Result<StatusResponse, CatalogCallError> {
+        self.catalog_status(request)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +117,7 @@ pub enum CatalogLookup {
 pub struct CatalogClient {
     connection: Arc<dyn CatalogConnection>,
     history_start_ms: i64,
+    deadline: Option<Instant>,
 }
 
 impl CatalogClientError {
@@ -111,11 +141,61 @@ impl CatalogClient {
         Self {
             connection,
             history_start_ms,
+            deadline: None,
         }
     }
 
     pub fn history_start_ms(&self) -> i64 {
         self.history_start_ms
+    }
+
+    /// All calls through this clone share one deadline, including retries.
+    pub fn with_budget(&self, budget: Duration) -> Self {
+        Self {
+            deadline: Some(Instant::now() + budget),
+            ..self.clone()
+        }
+    }
+
+    fn remaining(&self) -> Result<Duration, CatalogClientError> {
+        match self.deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    CatalogClientError::Call(CatalogCallError {
+                        code: "timeout".into(),
+                        message: "rate-cache tick budget exhausted".into(),
+                    })
+                }),
+            None => Ok(Duration::from_secs(10)),
+        }
+    }
+
+    pub fn catalog_version(&self) -> Result<i64, CatalogClientError> {
+        self.connection
+            .catalog_status_with_timeout(StatusRequest::default(), self.remaining()?)
+            .map(|status| status.catalog_version)
+            .map_err(CatalogClientError::Call)
+    }
+
+    pub fn history(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<HistoryResponse, CatalogClientError> {
+        self.connection
+            .catalog_history(
+                HistoryRequest {
+                    source: None,
+                    provider_id: provider.into(),
+                    model_id: model.into(),
+                    fact_key: None,
+                    fact_prefix: Some(RATE_FACT_PREFIX.into()),
+                    served: Some(true),
+                },
+                self.remaining()?,
+            )
+            .map_err(CatalogClientError::Call)
     }
 
     /// Uses the typed status boundary when available. Older producers omit it,
@@ -234,17 +314,20 @@ impl CatalogClient {
         at_ms: Option<i64>,
         auth_method: Option<&str>,
     ) -> Result<CatalogLookup, CatalogClientError> {
-        let response = match self.connection.catalog_get(CatalogGetRequest {
-            paged: false,
-            page_token: None,
-            source: None,
-            at_ms,
-            fact_prefixes: Some(vec![RATE_FACT_PREFIX.to_string()]),
-            include_retired: true,
-            model_id: Some(model_id.to_string()),
-            provider_id: Some(provider_id.to_string()),
-            auth_method: auth_method.map(str::to_string),
-        }) {
+        let response = match self.connection.catalog_get_with_timeout(
+            CatalogGetRequest {
+                paged: false,
+                page_token: None,
+                source: None,
+                at_ms,
+                fact_prefixes: Some(vec![RATE_FACT_PREFIX.to_string()]),
+                include_retired: true,
+                model_id: Some(model_id.to_string()),
+                provider_id: Some(provider_id.to_string()),
+                auth_method: auth_method.map(str::to_string),
+            },
+            self.remaining()?,
+        ) {
             Ok(response) => response,
             // A historical read refused as outside coverage is an answer, not
             // a failure: the request was fine and the catalog has no row for

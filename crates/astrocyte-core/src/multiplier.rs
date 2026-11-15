@@ -983,11 +983,14 @@ pub struct ResolvedRates {
     pub resolved_at_ms: i64,
     /// Keyed by catalog `(provider, model)`.
     pub models: BTreeMap<(String, String), ModelResolution>,
+    /// Dated resolutions for cache-backed observations; legacy inputs leave this empty.
+    pub eras: BTreeMap<(String, String), Vec<crate::rate_era::ResolvedEra>>,
 }
 
 /// Borrowed index for repeated lookups without allocating a tuple of Strings.
 struct ModelLookup<'a> {
     providers: BTreeMap<&'a str, BTreeMap<&'a str, &'a ModelResolution>>,
+    eras: BTreeMap<&'a str, BTreeMap<&'a str, &'a [crate::rate_era::ResolvedEra]>>,
 }
 
 impl<'a> ModelLookup<'a> {
@@ -999,11 +1002,26 @@ impl<'a> ModelLookup<'a> {
                 .or_default()
                 .insert(model, resolution);
         }
-        Self { providers }
+        let mut eras: BTreeMap<&str, BTreeMap<&str, &[crate::rate_era::ResolvedEra]>> =
+            BTreeMap::new();
+        for ((provider, model), timeline) in &rates.eras {
+            eras.entry(provider).or_default().insert(model, timeline);
+        }
+        Self { providers, eras }
     }
 
     fn get(&self, provider: &str, model: &str) -> Option<&'a ModelResolution> {
         self.providers.get(provider)?.get(model).copied()
+    }
+
+    fn get_at(&self, provider: &str, model: &str, at_ms: i64) -> Option<&'a ModelResolution> {
+        match self.eras.get(provider).and_then(|models| models.get(model)) {
+            Some(eras) => eras
+                .iter()
+                .find(|era| era.from_ms <= at_ms && era.until_ms.is_none_or(|until| at_ms < until))
+                .map(|era| &era.resolution),
+            None => self.get(provider, model),
+        }
     }
 }
 
@@ -1029,6 +1047,7 @@ pub fn resolve_rates(
     let mut resolved = ResolvedRates {
         resolved_at_ms: at_ms,
         models: BTreeMap::new(),
+        eras: BTreeMap::new(),
     };
     for (provider, model) in models {
         // Reasoning levels on the wire are not catalog identities. Prefer an
@@ -1139,7 +1158,7 @@ pub fn resolve_rates(
     Ok(resolved)
 }
 
-fn lookup_without_prices(lookup: &Result<CatalogLookup, CatalogClientError>) -> bool {
+pub(crate) fn lookup_without_prices(lookup: &Result<CatalogLookup, CatalogClientError>) -> bool {
     let Ok(CatalogLookup::Resolved(snapshot)) = lookup else {
         return false;
     };
@@ -1171,7 +1190,7 @@ fn lookup_without_prices(lookup: &Result<CatalogLookup, CatalogClientError>) -> 
 // Keep quota proxies beside, not inside, alias discovery: an alias is a model
 // identity, while a quota proxy is only a list-price reference for valuation.
 // Ledger pricing must not treat a plan's reference prices as amounts billed.
-fn quota_proxy_target(snapshot: &CatalogSnapshot) -> Option<CatalogModel> {
+pub(crate) fn quota_proxy_target(snapshot: &CatalogSnapshot) -> Option<CatalogModel> {
     snapshot.facts.iter().find_map(|(key, value)| {
         if !key.starts_with(RATE_FACT_PREFIX) {
             return None;
@@ -1189,7 +1208,7 @@ fn quota_proxy_target(snapshot: &CatalogSnapshot) -> Option<CatalogModel> {
     })
 }
 
-fn lookup_missing(lookup: &Result<CatalogLookup, CatalogClientError>) -> bool {
+pub(crate) fn lookup_missing(lookup: &Result<CatalogLookup, CatalogClientError>) -> bool {
     match lookup {
         Ok(CatalogLookup::Resolved(snapshot)) => {
             snapshot.facts.is_empty()
@@ -1209,7 +1228,7 @@ fn lookup_missing(lookup: &Result<CatalogLookup, CatalogClientError>) -> bool {
 
 /// Every `rate.*` fact the catalog served for one model, decoded to a rate or
 /// to the reason it cannot price.
-fn rates_from_snapshot(snapshot: &CatalogSnapshot) -> ModelResolution {
+pub(crate) fn rates_from_snapshot(snapshot: &CatalogSnapshot) -> ModelResolution {
     let keys: BTreeSet<&String> = snapshot
         .facts
         .keys()
@@ -1305,6 +1324,13 @@ fn rate_state(snapshot: &CatalogSnapshot, key: &str) -> RateState {
     let Some(entry) = snapshot.facts.get(key) else {
         return unpriced("no_rate");
     };
+    if entry
+        .get("currency")
+        .and_then(Value::as_str)
+        .is_some_and(|currency| currency != "USD")
+    {
+        return unpriced("non_usd");
+    }
     if snapshot.uncertain_facts.contains_key(key) {
         return unpriced("rate_uncertain");
     }
@@ -1881,10 +1907,13 @@ pub fn compute_observation(
             .filter(|event| event.occurred_at_ms >= from && event.occurred_at_ms < to)
         {
             let event = &scoped.tokens;
-            let resolution = event
-                .model
-                .as_deref()
-                .and_then(|model| lookup.get(rules.catalog_provider(&event.provider), model));
+            let resolution = event.model.as_deref().and_then(|model| {
+                lookup.get_at(
+                    rules.catalog_provider(&event.provider),
+                    model,
+                    scoped.occurred_at_ms,
+                )
+            });
             value_event(
                 &rules,
                 resolution,
@@ -2845,6 +2874,7 @@ fn observation_rows(
 mod tests {
     include!("multiplier/legacy_valuer_tests.rs");
     include!("multiplier/shared_valuer_tests.rs");
+    include!("multiplier/rate_era_tests.rs");
     include!("fusiform_plan_price_tests.rs");
     include!("multiplier/v2_tests.rs");
     include!("multiplier/context_tier_tests.rs");
@@ -3161,6 +3191,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            eras: BTreeMap::new(),
         }
     }
 
@@ -4432,6 +4463,7 @@ mod tests {
                 ("openai".to_string(), model.to_string()),
                 rates_from_snapshot(&snapshot),
             )]),
+            eras: BTreeMap::new(),
         }
     }
 
@@ -4640,6 +4672,7 @@ mod tests {
         let rates = ResolvedRates {
             resolved_at_ms: 42,
             models: BTreeMap::from([(("openai".to_string(), "m".to_string()), resolution)]),
+            eras: BTreeMap::new(),
         };
         for mode in [None, Some("standard")] {
             let (line, reasons) = value_one(&rates, mode);

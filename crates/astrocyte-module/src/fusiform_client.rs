@@ -12,8 +12,8 @@ use std::time::Duration;
 use astrocyte_core::catalog_client::{CatalogCallError, CatalogConnection};
 use astrocyte_core::multiplier::PlanPriceSource;
 use fusiform_protocol::{
-    CatalogGetRequest, CatalogGetResponse, PlanPricesRequest, PlanPricesResponse, StatusRequest,
-    StatusResponse,
+    CatalogGetRequest, CatalogGetResponse, HistoryRequest, HistoryResponse, PlanPricesRequest,
+    PlanPricesResponse, StatusRequest, StatusResponse,
 };
 use serde_json::{json, Value};
 use subc_protocol::ErrorBody as WireError;
@@ -161,6 +161,7 @@ impl FusiformClient {
     fn call_catalog(
         &self,
         request: CatalogGetRequest,
+        timeout: Duration,
     ) -> Result<CatalogGetResponse, CatalogCallError> {
         // fusiform-protocol's request type is Deserialize-only at the pinned
         // revision, so encode its public fields as the arguments object
@@ -178,7 +179,7 @@ impl FusiformClient {
         if let Some(auth_method) = request.auth_method {
             arguments["auth_method"] = auth_method.into();
         }
-        let payload = self.call_tool(OP_CATALOG_GET, arguments, "models")?;
+        let payload = self.call_tool_with_timeout(OP_CATALOG_GET, arguments, "models", timeout)?;
         serde_json::from_value(payload).map_err(|error| CatalogCallError {
             code: "undecodable".into(),
             message: format!("fusiform catalog.get result: {error}"),
@@ -209,6 +210,16 @@ impl FusiformClient {
         arguments: Value,
         payload_key: &str,
     ) -> Result<Value, CatalogCallError> {
+        self.call_tool_with_timeout(name, arguments, payload_key, self.request_timeout)
+    }
+
+    fn call_tool_with_timeout(
+        &self,
+        name: &str,
+        arguments: Value,
+        payload_key: &str,
+        timeout: Duration,
+    ) -> Result<Value, CatalogCallError> {
         // Fusiform decodes the canonical subc tool-call envelope
         // `{"name", "arguments"}`; a `method`/`params` body is refused as
         // bad_request. `tool_call_id` is omitted: no model asked for this call
@@ -221,14 +232,29 @@ impl FusiformClient {
             code: "encode".into(),
             message: error.to_string(),
         })?;
-        let mut guard = self
-            .live
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let deadline = tokio::time::Instant::now() + timeout.min(self.request_timeout);
+        // A concurrent plan-price or recompute call may own the route. Waiting
+        // for it must consume the same budget as connection setup and I/O.
+        let mut guard = loop {
+            match self.live.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let Some(remaining) =
+                        deadline.checked_duration_since(tokio::time::Instant::now())
+                    else {
+                        return Err(CatalogCallError {
+                            code: "unavailable".into(),
+                            message: "fusiform response timeout waiting for route lock".into(),
+                        });
+                    };
+                    std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
+            }
+        };
         self.runtime.block_on(async {
             // Setup, writes, Pongs and both attempts share one deadline. A
             // peer sending unrelated frames must not extend the call's life.
-            let deadline = tokio::time::Instant::now() + self.request_timeout;
             let mut last_error: Option<CatalogCallError> = None;
             let result = tokio::time::timeout_at(deadline, async {
                 for _attempt in 0..2 {
@@ -350,10 +376,19 @@ impl FusiformClient {
 
 impl CatalogConnection for FusiformClient {
     fn catalog_status(&self, request: StatusRequest) -> Result<StatusResponse, CatalogCallError> {
-        let payload = self.call_tool(
+        self.catalog_status_with_timeout(request, self.request_timeout)
+    }
+
+    fn catalog_status_with_timeout(
+        &self,
+        request: StatusRequest,
+        timeout: Duration,
+    ) -> Result<StatusResponse, CatalogCallError> {
+        let payload = self.call_tool_with_timeout(
             OP_CATALOG_STATUS,
             json!({"source": request.source, "polls": request.polls}),
             "catalog_version",
+            timeout,
         )?;
         serde_json::from_value(payload).map_err(|error| CatalogCallError {
             code: "undecodable".into(),
@@ -365,7 +400,39 @@ impl CatalogConnection for FusiformClient {
         &self,
         request: CatalogGetRequest,
     ) -> Result<CatalogGetResponse, CatalogCallError> {
-        self.call_catalog(request)
+        self.call_catalog(request, self.request_timeout)
+    }
+
+    fn catalog_get_with_timeout(
+        &self,
+        request: CatalogGetRequest,
+        timeout: Duration,
+    ) -> Result<CatalogGetResponse, CatalogCallError> {
+        self.call_catalog(request, timeout)
+    }
+
+    fn catalog_history(
+        &self,
+        request: HistoryRequest,
+        timeout: Duration,
+    ) -> Result<HistoryResponse, CatalogCallError> {
+        let payload = self.call_tool_with_timeout(
+            "catalog.history",
+            json!({
+                "source": request.source,
+                "provider_id": request.provider_id,
+                "model_id": request.model_id,
+                "fact_key": request.fact_key,
+                "fact_prefix": request.fact_prefix,
+                "served": request.served,
+            }),
+            "served_by_key",
+            timeout,
+        )?;
+        serde_json::from_value(payload).map_err(|error| CatalogCallError {
+            code: "undecodable".into(),
+            message: format!("fusiform catalog.history result: {error}"),
+        })
     }
 }
 
@@ -618,16 +685,23 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(stored, (5, "catalog_pre_history".into()));
         refresher.stop_and_join().unwrap();
-        // Only status and the refused time-zero read reached the peer: the event predates the
-        // boundary, so no resolution for it may be asked of fusiform.
+        // Timeline maintenance may make current identity and history reads, but
+        // ledger pricing must never ask for a dated pre-history resolution.
         let requests = peer.finish();
         assert_eq!(requests[0]["name"], OP_CATALOG_STATUS);
-        assert_eq!(requests.len(), 2, "only discovery may reach the peer");
-        assert!(
-            requests
-                .iter()
-                .skip(1)
-                .all(|request| request["arguments"]["at_ms"] == 0),
+        let dated: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request["name"] == OP_CATALOG_GET && !request["arguments"]["at_ms"].is_null()
+            })
+            .collect();
+        assert_eq!(
+            dated.len(),
+            1,
+            "only discovery may make a dated read: {requests:?}"
+        );
+        assert_eq!(
+            dated[0]["arguments"]["at_ms"], 0,
             "only the pre-history probe (at_ms 0) may reach the peer: {requests:?}"
         );
     }
@@ -647,6 +721,67 @@ pub(crate) mod tests {
             "typed status must not send a text probe: {requests:?}"
         );
         assert_eq!(requests[0]["name"], OP_CATALOG_STATUS);
+    }
+
+    #[test]
+    fn rate_era_wire_history_decodes_the_pinned_live_reply() {
+        let peer = CatalogPeer::start_with_status(1, 9, 66_666, fixtures::StatusMode::Present);
+        let client = FusiformClient::new(&peer.path).unwrap();
+        let history = client
+            .catalog_history(
+                HistoryRequest {
+                    source: None,
+                    provider_id: "anthropic".into(),
+                    model_id: "claude-opus-5-5".into(),
+                    fact_key: None,
+                    fact_prefix: Some("rate.".into()),
+                    served: Some(true),
+                },
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(history.provider_id, "anthropic");
+        assert!(history
+            .served_by_key
+            .unwrap()
+            .contains_key("rate.cache_write.ttl.1h"));
+        let requests = peer.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["name"], "catalog.history");
+        assert_eq!(requests[0]["arguments"]["served"], true);
+        assert_eq!(requests[0]["arguments"]["fact_prefix"], "rate.");
+    }
+
+    #[test]
+    fn rate_era_budget_includes_waiting_for_the_shared_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = Arc::new(FusiformClient::new(directory.path().join("absent.json")).unwrap());
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let held = Arc::clone(&client);
+        let owner = std::thread::spawn(move || {
+            let _guard = held.live.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let error = client
+            .catalog_history(
+                HistoryRequest {
+                    source: None,
+                    provider_id: "p".into(),
+                    model_id: "m".into(),
+                    fact_key: None,
+                    fact_prefix: Some("rate.".into()),
+                    served: Some(true),
+                },
+                Duration::ZERO,
+            )
+            .unwrap_err();
+        let _ = release_tx.send(());
+        owner.join().unwrap();
+        assert_eq!(error.code, "unavailable");
+        assert!(error.message.contains("route lock"), "{error:?}");
     }
 
     #[test]
@@ -1228,9 +1363,18 @@ pub(crate) mod fixtures {
             }
             let requests = self.requests.lock().unwrap().clone();
             for body in &requests {
-                assert!(body["name"] == OP_CATALOG_GET || body["name"] == OP_CATALOG_STATUS);
+                assert!(
+                    body["name"] == OP_CATALOG_GET
+                        || body["name"] == OP_CATALOG_STATUS
+                        || body["name"] == "catalog.history"
+                );
                 if body["name"] == OP_CATALOG_STATUS {
                     serde_json::from_value::<StatusRequest>(body["arguments"].clone()).unwrap();
+                } else if body["name"] == "catalog.history" {
+                    let request: HistoryRequest =
+                        serde_json::from_value(body["arguments"].clone()).unwrap();
+                    assert_eq!(request.served, Some(true));
+                    assert_eq!(request.fact_prefix.as_deref(), Some("rate."));
                 } else {
                     serde_json::from_value::<CatalogGetRequest>(body["arguments"].clone()).unwrap();
                     assert!(
@@ -1328,6 +1472,18 @@ pub(crate) mod fixtures {
 
         fn answer(&self, body: &Value) -> (FrameType, Value) {
             let boundary = self.boundary;
+            if body["name"] == "catalog.history" {
+                if body["arguments"]["provider_id"] == "anthropic"
+                    && body["arguments"]["model_id"] == "claude-opus-5-5"
+                {
+                    return (FrameType::Response, serde_json::from_slice(include_bytes!("../../astrocyte-core/test-vectors/fusiform-served-history-v1/anthropic--claude-opus-5-5.json")).unwrap());
+                }
+                return (
+                    FrameType::Response,
+                    json!({"source":"synthetic","provider_id":body["arguments"]["provider_id"],"model_id":body["arguments"]["model_id"],
+                    "fact_prefix":"rate.","served_by_key":{},"eras":[]}),
+                );
+            }
             if body["name"] == OP_CATALOG_STATUS {
                 let call = self
                     .status_calls

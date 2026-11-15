@@ -1,0 +1,587 @@
+{
+  "eras": [],
+  "fact_keys": [
+    "rate.cache_read",
+    "rate.cache_read.above_context.272000",
+    "rate.cache_read.mode.fast",
+    "rate.cache_read.mode.flex",
+    "rate.cache_read.mode.ultrafast",
+    "rate.cache_write",
+    "rate.cache_write.above_context.272000",
+    "rate.cache_write.above_context.272000.ttl.12h",
+    "rate.cache_write.above_context.272000.ttl.30m",
+    "rate.cache_write.mode.fast",
+    "rate.cache_write.mode.flex",
+    "rate.cache_write.mode.ultrafast",
+    "rate.cache_write.ttl.12h",
+    "rate.cache_write.ttl.30m",
+    "rate.input",
+    "rate.input.above_context.272000",
+    "rate.input.mode.fast",
+    "rate.input.mode.flex",
+    "rate.input.mode.ultrafast",
+    "rate.output",
+    "rate.output.above_context.272000",
+    "rate.output.mode.fast",
+    "rate.output.mode.flex",
+    "rate.output.mode.ultrafast"
+  ],
+  "fact_prefix": "rate.",
+  "model_id": "gpt-6.1-sol",
+  "provider_id": "openai",
+  "served_by_key": {
+    "rate.cache_read": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 100000000
+        }
+      }
+    ],
+    "rate.cache_read.above_context.272000": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 200000000
+        }
+      }
+    ],
+    "rate.cache_read.mode.fast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 200000000
+        }
+      }
+    ],
+    "rate.cache_read.mode.flex": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1794690917890
+      },
+      {
+        "from_ms": 1794690917890,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 50000000
+        }
+      }
+    ],
+    "rate.cache_read.mode.ultrafast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1791493744441
+      },
+      {
+        "from_ms": 1791493744441,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 600000000
+        }
+      }
+    ],
+    "rate.cache_write": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 2500000000
+        }
+      }
+    ],
+    "rate.cache_write.above_context.272000": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 5000000000
+        }
+      }
+    ],
+    "rate.cache_write.above_context.272000.ttl.12h": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1794089713000
+      },
+      {
+        "from_ms": 1794089713000,
+        "source": "cache_lifetime",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 10000000000
+        }
+      }
+    ],
+    "rate.cache_write.above_context.272000.ttl.30m": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1794089713000
+      },
+      {
+        "from_ms": 1794089713000,
+        "source": "cache_lifetime",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 5000000000
+        }
+      }
+    ],
+    "rate.cache_write.mode.fast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 5000000000
+        }
+      }
+    ],
+    "rate.cache_write.mode.flex": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1794690917890
+      },
+      {
+        "from_ms": 1794690917890,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 1250000000
+        }
+      }
+    ],
+    "rate.cache_write.mode.ultrafast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1791493744441
+      },
+      {
+        "from_ms": 1791493744441,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 15000000000
+        }
+      }
+    ],
+    "rate.cache_write.ttl.12h": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1794089713000
+      },
+      {
+        "from_ms": 1794089713000,
+        "source": "cache_lifetime",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 5000000000
+        }
+      }
+    ],
+    "rate.cache_write.ttl.30m": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1794089713000
+      },
+      {
+        "from_ms": 1794089713000,
+        "source": "cache_lifetime",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 2500000000
+        }
+      }
+    ],
+    "rate.input": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 2000000000
+        }
+      }
+    ],
+    "rate.input.above_context.272000": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 4000000000
+        }
+      }
+    ],
+    "rate.input.mode.fast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 4000000000
+        }
+      }
+    ],
+    "rate.input.mode.flex": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1794690917890
+      },
+      {
+        "from_ms": 1794690917890,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 1000000000
+        }
+      }
+    ],
+    "rate.input.mode.ultrafast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1791493744441
+      },
+      {
+        "from_ms": 1791493744441,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 12000000000
+        }
+      }
+    ],
+    "rate.output": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 10000000000
+        }
+      }
+    ],
+    "rate.output.above_context.272000": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 15000000000
+        }
+      }
+    ],
+    "rate.output.mode.fast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1790707116155
+      },
+      {
+        "from_ms": 1790707116155,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 20000000000
+        }
+      }
+    ],
+    "rate.output.mode.flex": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1794690917890
+      },
+      {
+        "from_ms": 1794690917890,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 5000000000
+        }
+      }
+    ],
+    "rate.output.mode.ultrafast": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1791493744441
+      },
+      {
+        "from_ms": 1791493744441,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "currency": "USD",
+          "exponent": 9,
+          "state": "priced",
+          "unit_provenance": {
+            "kind": "assumed_by_policy",
+            "policy": "models-dev-usd-v1"
+          },
+          "units": 60000000000
+        }
+      }
+    ]
+  },
+  "source": "models.dev"
+}

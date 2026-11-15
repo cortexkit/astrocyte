@@ -2306,6 +2306,7 @@ mod tests {
             let mut plan = multiplier::plan_observation(tx, &config, "claude", 0, 86400000).map_err(|error| error.message())?;
             plan.token_interval_ms = Some((0, 86400000));
             let rates = multiplier::ResolvedRates {
+                eras: Default::default(),
                 resolved_at_ms: 86400000,
                 models: std::collections::BTreeMap::from([(("anthropic".into(), "model".into()),
                     serde_json::from_value(json!({"state": "rates", "base": {"input": {"state": "priced", "units_per_million": 10000000000_i64}}, "tiers": {}})).unwrap())]),

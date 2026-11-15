@@ -330,10 +330,13 @@ pub fn compute_plan_observations(
     let mut event_numerators = BTreeMap::new();
     for event in &plan.events {
         let mut unpriced = BTreeMap::new();
-        let resolution =
-            event.tokens.model.as_deref().and_then(|model| {
-                lookup.get(rules.catalog_provider(&event.tokens.provider), model)
-            });
+        let resolution = event.tokens.model.as_deref().and_then(|model| {
+            lookup.get_at(
+                rules.catalog_provider(&event.tokens.provider),
+                model,
+                event.occurred_at_ms,
+            )
+        });
         let mut event_lines = BTreeMap::new();
         value_event(
             &rules,
@@ -606,7 +609,11 @@ pub fn compute_plan_observations(
                     .any(|(_, _, _, quantity, exponent)| quantity.is_none() || exponent.is_none()),
             );
             let resolution = event.tokens.model.as_deref().and_then(|model| {
-                lookup.get(rules.catalog_provider(&event.tokens.provider), model)
+                lookup.get_at(
+                    rules.catalog_provider(&event.tokens.provider),
+                    model,
+                    event.occurred_at_ms,
+                )
             });
             value_event(
                 &rules,

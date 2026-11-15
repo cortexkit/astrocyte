@@ -137,6 +137,7 @@ fn seed(state: &SharedState, case: Case) {
                         ..ModelRates::default()
                     }),
                 )]),
+                eras: BTreeMap::new(),
             };
             let prices = BTreeMap::from([(
                 ACCOUNT.into(),

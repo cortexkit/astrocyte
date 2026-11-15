@@ -16,6 +16,7 @@ pub mod money;
 pub mod multiplier;
 pub mod pricing;
 pub mod quota_history;
+pub mod rate_era;
 pub mod reconcile;
 pub mod report;
 pub mod rewrite_evidence;

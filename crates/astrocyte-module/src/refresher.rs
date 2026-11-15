@@ -3779,6 +3779,9 @@ impl MultiplierStage {
     /// not yet discovered, so rates cannot be read yet. The day waits for it
     /// rather than failing.
     pub(crate) fn tick(&mut self, state: &SharedState, catalog_pending: bool, now_ms: i64) {
+        if let Err(error) = rate_era_tick(state) {
+            tracing::warn!(target: "valuation", %error, "rate timeline refresh deferred");
+        }
         let interval_end_ms = now_ms - now_ms.rem_euclid(DAY_MS);
         // The seven days the look-back covers, oldest first, each with the
         // end of its interval. A clock so far out that one of them has no
@@ -4083,6 +4086,62 @@ fn disclose_stale_sources(observation: &mut multiplier::Observation, sources: &[
     }
 }
 
+/// Refresh served timelines before multiplier work. Each transport call shares
+/// the tick's deadline; the writer is held only for discovery and publication.
+fn rate_era_tick(state: &SharedState) -> Result<(), String> {
+    use astrocyte_core::rate_era;
+    const BUDGET: Duration = Duration::from_millis(1500);
+    let started = std::time::Instant::now();
+    let Some(catalog) = state.catalog_client() else {
+        return Ok(());
+    };
+    let catalog = catalog.with_budget(BUDGET);
+    let version = catalog
+        .catalog_version()
+        .map_err(|error| format!("{error:?}"))?;
+    let config = state.desired_config();
+    let empty_twins = std::collections::BTreeMap::new();
+    let twins = match &config.subscription_multiplier {
+        config::MultiplierSetting::Recorded(config) => &config.api_twins,
+        config::MultiplierSetting::NotRecorded => &empty_twins,
+    };
+    state.ordered_write(|tx| {
+        rate_era::discover(tx, 2000).map_err(|error| error.message())?;
+        rate_era::prepare(tx, version, twins).map_err(|error| error.message())?;
+        Ok(((), true))
+    })?;
+    let mut attempted = std::collections::BTreeSet::new();
+    while started.elapsed() < BUDGET {
+        let pending = state
+            .with_read_op(|conn| {
+                rate_era::pending(conn, 256).map_err(|error| (error.code().into(), error.message()))
+            })
+            .map_err(|(_, message)| message)?;
+        let Some((provider, model)) = pending.into_iter().find(|model| !attempted.contains(model))
+        else {
+            break;
+        };
+        attempted.insert((provider.clone(), model.clone()));
+        let fetched = match rate_era::fetch(&catalog, &provider, &model, twins) {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                tracing::warn!(target: "valuation", %provider, %model, error = %error.message(), "served timeline fetch deferred");
+                state.ordered_write(|tx| {
+                    rate_era::record_failure(tx, &provider, &model, &error)
+                        .map_err(|error| error.message())?;
+                    Ok(((), true))
+                })?;
+                continue;
+            }
+        };
+        state.ordered_write(|tx| {
+            rate_era::publish(tx, &fetched, version).map_err(|error| error.message())?;
+            Ok(((), true))
+        })?;
+    }
+    Ok(())
+}
+
 /// Computes one day and appends it as the day's original row.
 fn record_multiplier_day(
     state: &SharedState,
@@ -4107,6 +4166,7 @@ fn record_multiplier_day(
         quota_provider,
         interval_end_ms,
         snapshot_at_ms,
+        true,
     )?;
     for observation in &mut observations {
         disclose_stale_sources(observation, &stale_sources);
@@ -4136,11 +4196,10 @@ fn record_multiplier_day(
     Ok(observations)
 }
 
-/// Resolve plan prices, read, resolve rates, then compute; nothing is written.
-/// Plan prices come first because they need no store read, so an unreachable
-/// fusiform fails the day before the store is scanned. The store reads run in
-/// read transactions on the reader connection and no fusiform call happens
-/// inside a transaction, so the caller's append can be its own short write.
+/// Read an owned plan, resolve fees, then value it without writing. Automatic
+/// days use cached timelines; explicit operator recomputes retain catalog reads.
+/// No network call holds a store transaction, and appending is a separate write.
+#[allow(clippy::too_many_arguments)]
 fn compute_multiplier_day(
     state: &SharedState,
     catalog: &CatalogClient,
@@ -4149,6 +4208,7 @@ fn compute_multiplier_day(
     quota_provider: &str,
     interval_end_ms: i64,
     snapshot_at_ms: i64,
+    cached: bool,
 ) -> Result<Vec<multiplier::Observation>, DayError> {
     let failed = |error: multiplier::MultiplierError| DayError {
         code: error.code().to_string(),
@@ -4180,7 +4240,16 @@ fn compute_multiplier_day(
             },
         )?;
     let models = multiplier::catalog_models(config, &plan);
-    let rates = multiplier::resolve_rates(catalog, &models, snapshot_at_ms).map_err(failed)?;
+    let rates = if cached {
+        state
+            .with_read_op(|conn| {
+                astrocyte_core::rate_era::resolved_rates(conn, &models, snapshot_at_ms)
+                    .map_err(|error| (error.code().to_string(), error.message()))
+            })
+            .map_err(read_failed)?
+    } else {
+        multiplier::resolve_rates(catalog, &models, snapshot_at_ms).map_err(failed)?
+    };
     let observation = state
         .with_read_op(|conn| {
             multiplier::compute_plan_observations(
@@ -4293,6 +4362,7 @@ pub(crate) fn recompute_multiplier_day(
             quota_provider,
             interval_end_ms,
             now_ms,
+            false,
         )
         .map_err(|error| (error.code, error.message))?;
         for observation in &mut rows {
@@ -8050,6 +8120,7 @@ pub fn log_pricing_failed(error: &str) {
 #[cfg(test)]
 mod multiplier_stage_tests {
     include!("refresher_multiplier_v2_tests.rs");
+    include!("refresher_rate_era_tests.rs");
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicUsize;
 
@@ -8081,6 +8152,8 @@ mod multiplier_stage_tests {
         unit_billing: std::sync::atomic::AtomicBool,
         cache_write_ttl: std::sync::atomic::AtomicBool,
         uncovered: std::sync::atomic::AtomicBool,
+        history_fingerprint: std::sync::atomic::AtomicI64,
+        history_version: std::sync::atomic::AtomicI64,
     }
 
     impl FakeFusiform {
@@ -8094,17 +8167,61 @@ mod multiplier_stage_tests {
                 unit_billing: std::sync::atomic::AtomicBool::new(false),
                 cache_write_ttl: std::sync::atomic::AtomicBool::new(false),
                 uncovered: std::sync::atomic::AtomicBool::new(false),
+                history_fingerprint: std::sync::atomic::AtomicI64::new(320_000_000_000),
+                history_version: std::sync::atomic::AtomicI64::new(1),
             })
         }
     }
 
     impl CatalogConnection for FakeFusiform {
+        fn catalog_history(
+            &self,
+            request: fusiform_protocol::HistoryRequest,
+            _: Duration,
+        ) -> Result<fusiform_protocol::HistoryResponse, CatalogCallError> {
+            assert_eq!(request.served, Some(true));
+            assert_eq!(request.fact_prefix.as_deref(), Some("rate."));
+            let response = self.catalog_get(CatalogGetRequest {
+                paged: false,
+                page_token: None,
+                source: None,
+                at_ms: Some(1),
+                fact_prefixes: Some(vec!["rate.".into()]),
+                include_retired: true,
+                provider_id: Some(request.provider_id.clone()),
+                model_id: Some(request.model_id.clone()),
+                auth_method: None,
+            })?;
+            let facts = response.models.values().next().unwrap();
+            let served: BTreeMap<_, _> = facts
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        json!([{
+                            "from_ms":1,"until_ms":null,"state":"value","value":value
+                        }]),
+                    )
+                })
+                .collect();
+            Ok(serde_json::from_value(json!({"source":"fake", "provider_id":request.provider_id, "model_id":request.model_id,
+                "fact_prefix":"rate.","served_by_key":served,"eras":[]})).unwrap())
+        }
+
         fn catalog_status(
             &self,
             _: fusiform_protocol::StatusRequest,
         ) -> Result<fusiform_protocol::StatusResponse, CatalogCallError> {
+            let fingerprint = self.input_rate_units.load(Ordering::SeqCst) * 32
+                + i64::from(self.unrecognized_key.load(Ordering::SeqCst))
+                + 2 * i64::from(self.unit_billing.load(Ordering::SeqCst))
+                + 4 * i64::from(self.cache_write_ttl.load(Ordering::SeqCst))
+                + 8 * i64::from(self.uncovered.load(Ordering::SeqCst));
+            if self.history_fingerprint.swap(fingerprint, Ordering::SeqCst) != fingerprint {
+                self.history_version.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(
-                serde_json::from_value(serde_json::json!({"source": "fake", "catalog_version": 0,
+                serde_json::from_value(serde_json::json!({"source": "fake", "catalog_version": self.history_version.load(Ordering::SeqCst),
                 "model_count": 0, "era_count": 0, "recent_polls": []}))
                 .unwrap(),
             )
@@ -8171,7 +8288,7 @@ mod multiplier_stage_tests {
             }
             Ok(CatalogGetResponse {
                 source: "models.dev".into(),
-                resolved_at_ms: request.at_ms.unwrap(),
+                resolved_at_ms: request.at_ms.unwrap_or(1),
                 catalog_version: 1,
                 models: BTreeMap::from([(key, facts)]),
                 withheld: vec![],

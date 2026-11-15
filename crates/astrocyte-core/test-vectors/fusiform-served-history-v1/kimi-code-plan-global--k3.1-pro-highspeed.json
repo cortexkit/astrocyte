@@ -1,0 +1,79 @@
+{
+  "eras": [],
+  "fact_keys": [
+    "rate.cache_read",
+    "rate.cache_write",
+    "rate.input",
+    "rate.output"
+  ],
+  "fact_prefix": "rate.",
+  "model_id": "k3.1-pro-highspeed",
+  "provider_id": "kimi-code-plan-global",
+  "served_by_key": {
+    "rate.cache_read": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1792782357567
+      },
+      {
+        "from_ms": 1792782357567,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "state": "stated_zero"
+        }
+      }
+    ],
+    "rate.cache_write": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1792782357567
+      },
+      {
+        "from_ms": 1792782357567,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "state": "stated_zero"
+        }
+      }
+    ],
+    "rate.input": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1792782357567
+      },
+      {
+        "from_ms": 1792782357567,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "state": "stated_zero"
+        }
+      }
+    ],
+    "rate.output": [
+      {
+        "from_ms": 1786529249396,
+        "state": "absent",
+        "until_ms": 1792782357567
+      },
+      {
+        "from_ms": 1792782357567,
+        "source": "upstream",
+        "state": "value",
+        "until_ms": null,
+        "value": {
+          "state": "stated_zero"
+        }
+      }
+    ]
+  },
+  "source": "models.dev"
+}
