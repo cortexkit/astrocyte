@@ -841,6 +841,8 @@ impl CacheStepsRequest {
 /// omitted, never zero.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CacheStep {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<cortexkit_usage_steps::Cause>,
     pub cursor: i64,
     pub step_ref: String,
     pub occurred_at_ms: i64,
@@ -916,6 +918,7 @@ pub fn steps_reply(
             };
             previous_body_len = row.request_body_len;
             CacheStep {
+                cause: None,
                 cursor: row.cursor,
                 step_ref: row.step_ref,
                 occurred_at_ms: row.occurred_at_ms,
@@ -1084,13 +1087,17 @@ pub fn served_output(output: Option<u64>, reasoning: Option<u64>) -> Option<u64>
 /// `usage.cache.steps` answered from the store.
 pub fn steps_from_store(conn: &Connection, query: &StepsQuery) -> rusqlite::Result<StepsReply> {
     let loaded = load_session(conn, &query.producer, &query.session, query.limit)?;
-    Ok(steps_reply(
+    let mut reply = steps_reply(
         query,
         loaded.rows,
         loaded.lead,
         loaded.reads_cache,
         loaded.undated,
-    ))
+    );
+    for step in &mut reply.steps {
+        step.cause = crate::rewrite_evidence::cause(conn, &query.producer, &step.step_ref)?;
+    }
+    Ok(reply)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

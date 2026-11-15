@@ -1324,7 +1324,7 @@ mod tests {
             .await
             .expect("the correction was not announced")
             .unwrap();
-        assert_eq!(notice, br#"{"through":"c6"}"#);
+        assert_eq!(notice, br#"{"through":"c7"}"#);
         assert!(other.try_recv().is_err());
         let page = read_page(&state, json!({"after":"c4"}));
         assert_eq!(page["rows"].as_array().unwrap().len(), 2);
@@ -1335,8 +1335,8 @@ mod tests {
         assert_eq!(page["rows"][1]["retention"], json!(1.0));
         assert_eq!(
             feed_rows(&state),
-            6,
-            "only the two in-window identities change"
+            7,
+            "two diagnostic corrections and a successor cause correction stay within the window"
         );
         stop.send(true).unwrap();
         for task in serving {

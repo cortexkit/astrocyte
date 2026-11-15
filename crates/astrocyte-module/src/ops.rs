@@ -904,13 +904,18 @@ fn op_cache_steps(state: &SharedState, params: Value) -> OpResult {
     let query = request
         .validate()
         .map_err(|refusal| (refusal.code().into(), refusal.message()))?;
-    if let Some(reply) = state.recent_steps_answer(&query) {
-        return Ok(json!(reply));
-    }
     read_value(state, |conn| {
-        astrocyte_core::cache_diagnostics::steps_from_store(conn, &query)
-            .map(|reply| json!(reply))
-            .map_err(|error| ("internal".into(), format!("cache steps: {error}")))
+        let mut reply = match state.recent_steps_answer(&query) {
+            Some(reply) => reply,
+            None => astrocyte_core::cache_diagnostics::steps_from_store(conn, &query)
+                .map_err(|error| ("internal".into(), format!("cache steps: {error}")))?,
+        };
+        for step in &mut reply.steps {
+            step.cause =
+                astrocyte_core::rewrite_evidence::cause(conn, &query.producer, &step.step_ref)
+                    .map_err(|error| ("internal".into(), format!("cache step cause: {error}")))?;
+        }
+        Ok(json!(reply))
     })
 }
 

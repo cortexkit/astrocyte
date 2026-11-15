@@ -4644,6 +4644,60 @@ CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
     WHERE built_revision IS NOT revision OR format_version IS NOT 6;
 "#,
     },
+    Migration {
+        version: 51,
+        statements: r#"-- Runner events are not replayed. Keep their content-free evidence for
+-- 30 days independently of the feed, and intern runner-local digests once.
+CREATE TABLE step_digest (
+    digest_key INTEGER PRIMARY KEY,
+    value TEXT NOT NULL UNIQUE
+);
+CREATE TABLE step_evidence (
+    evidence_key INTEGER PRIMARY KEY AUTOINCREMENT,
+    harness TEXT NOT NULL,
+    step_ref TEXT NOT NULL,
+    runner TEXT,
+    first_feed_cursor INTEGER,
+    recorded_at_ms INTEGER NOT NULL,
+    facts_json TEXT NOT NULL,
+    tools_key INTEGER REFERENCES step_digest(digest_key),
+    system_key INTEGER REFERENCES step_digest(digest_key),
+    UNIQUE(harness,step_ref)
+);
+CREATE INDEX step_evidence_tools ON step_evidence(tools_key);
+CREATE INDEX step_evidence_system ON step_evidence(system_key);
+-- Each expired or changed evidence row can orphan only its two digest keys.
+-- Indexed references avoid a full-table orphan scan during retention.
+CREATE TRIGGER step_evidence_delete_digests AFTER DELETE ON step_evidence
+BEGIN
+    DELETE FROM step_digest WHERE digest_key IN (OLD.tools_key,OLD.system_key)
+      AND NOT EXISTS (SELECT 1 FROM step_evidence WHERE tools_key=digest_key)
+      AND NOT EXISTS (SELECT 1 FROM step_evidence WHERE system_key=digest_key);
+END;
+CREATE TRIGGER step_evidence_update_digests AFTER UPDATE ON step_evidence
+BEGIN
+    DELETE FROM step_digest WHERE digest_key IN (OLD.tools_key,OLD.system_key)
+      AND NOT EXISTS (SELECT 1 FROM step_evidence WHERE tools_key=digest_key)
+      AND NOT EXISTS (SELECT 1 FROM step_evidence WHERE system_key=digest_key);
+END;
+-- Explanations outlive their evidence. NULL is an appended correction to no
+-- cause, not a deletion of history; newest cause_key wins for a step identity.
+CREATE TABLE step_cause (
+    cause_key INTEGER PRIMARY KEY AUTOINCREMENT,
+    harness TEXT NOT NULL,
+    step_ref TEXT NOT NULL,
+    cause TEXT
+);
+CREATE INDEX step_cause_identity ON step_cause(harness,step_ref,cause_key);
+CREATE TRIGGER step_cause_no_update BEFORE UPDATE ON step_cause
+BEGIN SELECT RAISE(ABORT, 'step_cause_no_update'); END;
+CREATE TRIGGER step_cause_no_delete BEFORE DELETE ON step_cause
+BEGIN SELECT RAISE(ABORT, 'step_cause_no_delete'); END;
+CREATE TRIGGER step_cause_insert_once BEFORE INSERT ON step_cause
+WHEN EXISTS (SELECT 1 FROM step_cause WHERE cause_key=NEW.cause_key)
+BEGIN SELECT RAISE(ABORT, 'step_cause_insert_once'); END;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between

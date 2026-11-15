@@ -533,6 +533,11 @@ not placed on the timeline). Each step has these fields:
 - `retention`, `verdict` and `prompt_dropped`. `retention` is served
   unrounded and unclamped: a non-negative number that may exceed 1 when a step
   reads more cache than expected.
+- `cause`, omitted when there is no stored explanation. This is the feed's
+  persisted rewrite cause, looked up by `(harness, step_ref)`, not a guess
+  computed from ledger rows. Event-only evidence lasts 30 days from when the
+  step first reached the feed; the cause is
+  kept forever, including after its evidence and live feed row expire.
 
 The verdict is one of `cold_start`, `stable`, `warning`, `bust`, `full_bust`
 and `unknown`. It is computed over the whole session in time order, so a
@@ -733,7 +738,49 @@ log. A step with no durable record stays a live-only row with
 - Optional, omitted when unknown and never zero for unknown: `message_id`,
   `run_id` (runner steps), `provider`, `model`, `input`, `cache_read`, `cache_write`,
   `cache_write_5m`, `cache_write_1h`, `output`, `reasoning`, `finish`,
-  `context_limit`, `request_body_len`, `retention`, `request_size`.
+  `context_limit`, `request_body_len`, `retention`, `request_size`,
+  `started_at_ms`, `finished_at_ms`, `account_ref`, `cache_ttl_ms`,
+  `cache_implicit`, `warm_up`, `view_version`, `tools_digest`, `system_digest`,
+  `signed_floor`, `cause`.
+- `started_at_ms` and `finished_at_ms` are the event's request start and
+  completion timestamps, not a reinterpretation of `occurred_at_ms`.
+  `account_ref` is the runner contract's domain-separated SHA-256 reference to
+  routing's admitted account and credential, never their raw ids.
+  `cache_ttl_ms` is the shortest cache-breakpoint lifetime; `cache_implicit`
+  is true for a cache whose lifetime cannot be proved and is never emitted
+  false. `warm_up` marks a keep-warm request. Unknown is always omitted.
+- `view_version` is the applied compaction view (`last_prompt_view`), where
+  zero means no applied view. `tools_digest` and `system_digest` are opaque
+  runner-local visible-ASCII digests of provider inputs, ignoring cache
+  markers. `signed_floor` is the stable entry id of the newest boundary before
+  which the runner invalidates earlier signed reasoning after a prompt-prefix
+  change, such as a changed tool definition.
+  Event evidence is retained for 30 days from when the step first reached the
+  feed and remains on the file row when a
+  durable read replaces a runner row. It is never reconstructed from ledger
+  rows, and repeated digests are interned rather than copied per feed emission.
+- `cause` is computed once by `cortexkit-usage-steps` 0.2.8 for `warning`,
+  `bust` and `full_bust`, in precedence order: `account_or_model_changed`,
+  `cache_expired` (busts only), `tools_or_system_changed`, `view_changed`,
+  `signed_floor_moved`, then `unexplained`. Missing facts skip comparisons.
+  The predecessor is the same harness/session's previous distinct step from
+  the same runner, warm-ups included, ordered by request start (occurrence
+  time when unknown), with first feed cursor breaking ties. Steps with no
+  runner identity compare only with other such steps. Late steps and
+  replacements also recompute the following step's cause. If late evidence
+  changes a step's comparison runner or request start, the successor at its
+  old position is rejudged as well. Changed explanations
+  append a new feed row and notify subscribers through the existing cursor
+  notices; subscriptions carry no row payload. Cause history is append-only
+  and kept forever, independently of its evidence. `usage.cache.steps` serves
+  the newest stored cause even after live feed retention expires; no cause
+  means the member is omitted, not `unexplained` by default.
+
+Synthetic samples for `usage.cache.steps` and `usage.steps.read` are pinned in
+`crates/astrocyte-module/test-vectors/usage-cache-causes-v1/` with SHA256SUMS.
+They cover every cause and a row without one. The strict step-event decoder
+accepts llm-runner 0.8.55 events both with and without the new optional facts;
+older pinned runner events remain valid.
 - `message_id` is a content-free message identifier: on a file row the host's
   own, on a runner row the one the runner serves for that message. It is
   present only when the host or runner has one and is never invented. Consumers join on `harness` plus

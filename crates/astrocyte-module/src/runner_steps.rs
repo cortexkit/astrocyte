@@ -88,6 +88,19 @@ pub(crate) fn feed_step(event: StepFinished) -> Option<RunnerStep> {
         counts => counts,
     };
     Some(RunnerStep {
+        runner: event.runner,
+        evidence: astrocyte_core::rewrite_evidence::Evidence {
+            started_at_ms: Some(event.started_at_ms),
+            finished_at_ms: Some(event.finished_at_ms),
+            account_ref: event.account_ref,
+            warm_up: event.warm_up,
+            view_version: event.view_version,
+            tools_digest: event.tools_digest,
+            system_digest: event.system_digest,
+            signed_floor: event.signed_floor,
+            cache_ttl_ms: event.cache.as_ref().and_then(|cache| cache.ttl_ms),
+            cache_implicit: event.cache.as_ref().and_then(|cache| cache.implicit),
+        },
         harness,
         session: event.session,
         run_id: event.run_id,
@@ -222,6 +235,54 @@ mod tests {
 
     const RUNNERS: [&str; 3] = ["broca", "thalamus-harness", "thalamus"];
 
+    #[test]
+    fn rewrite_facts_0855_decode_with_every_new_member_and_without_them() {
+        for with_facts in [false, true] {
+            let (subject, body) = event("minimal", "broca", |body| {
+                if with_facts {
+                    body["account_ref"] = json!("a".repeat(64));
+                    body["warm_up"] = json!(true);
+                    body["view_version"] = json!(0);
+                    body["tools_digest"] = json!("tools-v1");
+                    body["system_digest"] = json!("system-v1");
+                    body["signed_floor"] = json!("entry-1");
+                    body["cache"] = json!({"implicit":true});
+                }
+            });
+            let state = test_state();
+            admit(&state, &subject, &body);
+            assert_eq!(
+                state.step_feed().runner_counts().appended,
+                1,
+                "with_facts={with_facts}"
+            );
+            let served = rows(&state, json!({}));
+            assert_eq!(served.len(), 1);
+            let sent: Value = serde_json::from_slice(&body).unwrap();
+            for member in [
+                "account_ref",
+                "warm_up",
+                "view_version",
+                "tools_digest",
+                "system_digest",
+                "signed_floor",
+            ] {
+                assert_eq!(served[0].get(member), sent.get(member), "{member}");
+            }
+            assert_eq!(served[0].get("started_at_ms"), sent.get("started_at_ms"));
+            assert_eq!(served[0].get("finished_at_ms"), sent.get("finished_at_ms"));
+            assert_eq!(
+                served[0].get("cache_implicit"),
+                if with_facts {
+                    Some(&Value::Bool(true))
+                } else {
+                    None
+                }
+            );
+            assert!(served[0].get("cache_ttl_ms").is_none());
+        }
+    }
+
     fn names() -> AccountNames {
         AccountNames::derive("box_feed").unwrap()
     }
@@ -339,7 +400,8 @@ mod tests {
                 "cache_write_5m": 10, "cache_write_1h": 20, "output": 20, "reasoning": 7,
                 "finish": "future_finish_reason", "context_limit": 200_000,
                 "request_body_len": 4096, "prompt": 180, "verdict": "cold_start",
-                "prompt_dropped": false
+                "prompt_dropped": false,
+                "started_at_ms": sent["started_at_ms"], "finished_at_ms": sent["finished_at_ms"]
             })
         );
         assert_eq!(
@@ -375,9 +437,8 @@ mod tests {
         assert_eq!(feed_rows(&state), 2);
     }
 
-    /// A runner event for a step the feed already serves from a durable read
-    /// is counted as superseded and leaves the file row newest; the same
-    /// runner event twice appends once.
+    /// A late runner event enriches the durable row with event-only evidence,
+    /// without replacing its authoritative counts. Redeliveries append nothing.
     #[test]
     fn a_runner_event_after_the_file_row_leaves_the_file_row_newest() {
         let state = test_state();
@@ -391,15 +452,18 @@ mod tests {
         let served = rows(&state, json!({}));
         assert_eq!(served.len(), 1);
         assert_eq!(served[0]["source"], "file");
-        assert_eq!(feed_rows(&state), 1);
+        assert_eq!(feed_rows(&state), 2);
+        assert!(served[0].get("finished_at_ms").is_some());
+        admit_event(&state, &late);
+        assert_eq!(feed_rows(&state), 2);
         let repeated = event("minimal", "broca", |_| {});
         admit_event(&state, &repeated);
         admit_event(&state, &repeated);
-        assert_eq!(feed_rows(&state), 2);
+        assert_eq!(feed_rows(&state), 3);
         assert_eq!(
             state.step_feed().runner_counts(),
             RunnerCounts {
-                appended: 1,
+                appended: 2,
                 unchanged: 1,
                 superseded: 1,
                 ..RunnerCounts::default()

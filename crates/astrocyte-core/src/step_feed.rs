@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::cache_diagnostics::{self as cache, CacheStep};
+use crate::rewrite_evidence::{self as evidence, Evidence};
 
 /// How long the feed keeps a row after it was committed, and how old a step
 /// may be when it is committed and still enter the feed.
@@ -57,6 +58,9 @@ impl FeedSource {
 /// never written to the ledger.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunnerStep {
+    /// The event's runner identity, separate from the feed identity in `harness`.
+    pub runner: String,
+    pub evidence: Evidence,
     /// The identity's `harness`: the hosting harness when the event names the
     /// host's record, otherwise the runner's module id.
     pub harness: String,
@@ -298,11 +302,34 @@ pub fn append_runner_step(
     }
     let (harness, session) = (step.harness.as_str(), step.session.as_str());
     let step_ref = step.step.step_ref.as_str();
+    let old_position = evidence::position(conn, harness, step_ref)?;
+    let facts_changed = evidence::save(
+        conn,
+        now_ms,
+        harness,
+        step_ref,
+        &step.runner,
+        &step.evidence,
+    )?;
     let newest = newest_row(conn, harness, step_ref)?;
     if newest
         .as_ref()
         .is_some_and(|(source, _)| source != FeedSource::Runner.wire_name())
     {
+        // The durable read can beat the bus event. Its counts remain authoritative,
+        // but the non-replayed event is still the only source of rewrite facts.
+        if facts_changed {
+            append_body(
+                conn,
+                now_ms,
+                &newest.as_ref().unwrap().1,
+                true,
+                old_position,
+            )?;
+            prune(conn, window_start)?;
+            evidence::prune(conn, now_ms)?;
+            return Ok(RunnerAppend::Appended);
+        }
         return Ok(RunnerAppend::Superseded);
     }
     let unrecorded = runner_only_steps(conn, harness, session, step_ref)?;
@@ -325,23 +352,55 @@ pub fn append_runner_step(
         }
     }
     let body = serde_json::to_string(&Value::Object(row)).map_err(to_sql)?;
-    if newest.is_some_and(|(_, newest)| newest == body) {
-        return Ok(RunnerAppend::Unchanged);
-    }
-    conn.prepare_cached(
-        "INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
-         VALUES (?1,?2,?3,?4,?5,?6)",
-    )?
-    .execute(params![
-        harness,
-        step_ref,
-        FeedSource::Runner.wire_name(),
-        session,
-        now_ms,
-        body
-    ])?;
+    let appended = append_body(conn, now_ms, &body, facts_changed, old_position)?;
     prune(conn, window_start)?;
-    Ok(RunnerAppend::Appended)
+    evidence::prune(conn, now_ms)?;
+    Ok(if appended {
+        RunnerAppend::Appended
+    } else {
+        RunnerAppend::Unchanged
+    })
+}
+
+/// Append a changed row and corrections to its old and new successors' explanations.
+/// Evidence is joined when serving, never duplicated in immutable feed JSON.
+fn append_body(
+    conn: &Connection,
+    now_ms: i64,
+    body: &str,
+    force: bool,
+    old_position: Option<evidence::Position>,
+) -> rusqlite::Result<bool> {
+    let to_sql = |error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
+    let mut row: Map<String, Value> = serde_json::from_str(body).map_err(to_sql)?;
+    let next = evidence::compute(conn, now_ms, &mut row, old_position)?;
+    let body = Value::Object(row.clone()).to_string();
+    let harness = row["harness"].as_str().unwrap();
+    let step_ref = row["step_ref"].as_str().unwrap();
+    let changed = force || newest_body(conn, harness, step_ref)?.as_deref() != Some(&body);
+    let insert = |harness: &str, step_ref: &str, row: &Value, body: &str| {
+        conn.prepare_cached(
+            "INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+        )?
+        .execute(params![
+            harness,
+            step_ref,
+            row["source"].as_str(),
+            row["session"].as_str(),
+            now_ms,
+            body
+        ])
+    };
+    if changed {
+        insert(harness, step_ref, &Value::Object(row.clone()), &body)?;
+    }
+    let corrected = !next.is_empty();
+    for (harness, step_ref, body) in next {
+        let row: Value = serde_json::from_str(&body).map_err(to_sql)?;
+        insert(&harness, &step_ref, &row, &body)?;
+    }
+    Ok(changed || corrected)
 }
 
 /// Re-judge retained runner-only steps from producers whose ledger events
@@ -413,21 +472,9 @@ pub fn rejudge_runner_steps(conn: &Connection, now_ms: i64) -> rusqlite::Result<
                 fields.remove(field);
             }
         }
-        if body == original {
-            continue;
+        if append_body(conn, now_ms, &body.to_string(), body != original, None)? {
+            appended += 1;
         }
-        conn.prepare_cached(
-            "INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
-             VALUES (?1,?2,'runner',?3,?4,?5)",
-        )?
-        .execute(params![
-            harness,
-            step_ref,
-            session,
-            now_ms,
-            body.to_string()
-        ])?;
-        appended += 1;
     }
     Ok(appended)
 }
@@ -490,22 +537,9 @@ pub fn append_changes(
                 message_id.as_deref(),
             )
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-            if newest_body(conn, producer, &step.step_ref)?.as_deref() == Some(body.as_str()) {
-                continue;
+            if append_body(conn, now_ms, &body, false, None)? {
+                appended += 1;
             }
-            conn.prepare_cached(
-                "INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
-            )?
-            .execute(params![
-                producer,
-                step.step_ref,
-                FeedSource::File.wire_name(),
-                session,
-                now_ms,
-                body
-            ])?;
-            appended += 1;
         }
     }
     conn.execute(
@@ -513,6 +547,7 @@ pub fn append_changes(
         [newest],
     )?;
     prune(conn, window_start)?;
+    evidence::prune(conn, now_ms)?;
     Ok(appended)
 }
 
@@ -629,6 +664,15 @@ pub fn read(conn: &Connection, request: FeedReadRequest) -> Result<FeedPage, Fee
                 )
             })?;
             row.insert("cursor".into(), Value::from(encode_cursor(cursor)));
+            evidence::hydrate(conn, &mut row)?;
+            row.remove("cause");
+            if let Some(cause) = evidence::cause(
+                conn,
+                row["harness"].as_str().unwrap(),
+                row["step_ref"].as_str().unwrap(),
+            )? {
+                row.insert("cause".into(), Value::from(cause.as_str()));
+            }
             Ok(Value::Object(row))
         })
         .collect::<rusqlite::Result<Vec<_>>>()?;

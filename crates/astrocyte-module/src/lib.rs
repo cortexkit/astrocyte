@@ -20,6 +20,8 @@ mod quota_events;
 mod quota_history;
 mod recent_steps;
 mod refresher;
+#[cfg(test)]
+mod rewrite_causes_vectors;
 mod runner_steps;
 #[cfg(test)]
 mod runs_vectors;

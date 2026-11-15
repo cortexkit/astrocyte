@@ -18,6 +18,7 @@ pub mod pricing;
 pub mod quota_history;
 pub mod reconcile;
 pub mod report;
+pub mod rewrite_evidence;
 pub mod runs;
 pub mod statement;
 pub mod statement_import;

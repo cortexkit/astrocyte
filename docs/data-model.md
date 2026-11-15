@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 50. A schema change appends a migration; an applied
+currently version 51. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -23,6 +23,9 @@ copies that timeout without running the table-creating probes.
 | `cache_read_step` | Each row locates one dated step of a session that carries a plain cache-read measurement, zero reads included. | derived; a measurement trigger inserts it |
 | `step_feed` | Each row is one emission of a served cache step for `usage.steps.read`; the newest row for a harness and step wins. | insert; rows older than 24 hours are deleted |
 | `step_feed_state` | The row records the cache cursor the feed has caught up to and the newest feed cursor retention deleted. | one row |
+| `step_evidence` | Each row retains a step's runner identity, first feed cursor and optional event-only rewrite facts under `(harness, step_ref)`. | upsert; bounded 30-day retention |
+| `step_digest` | Each row interns one distinct tool or system digest used by retained evidence. | insert; delete after its last reference expires or changes |
+| `step_cause` | Each row records a changed explanation for one step identity; the newest key wins, including a null correction to no cause. | append only; kept forever |
 | `chargeability_transition` | Each row records the one terminal settlement of an event's chargeability. | insert only |
 | `quarantine_evidence` | Each row preserves a referring event's quantities that contradict its target. | insert |
 | `rejected_delivery` | Each row preserves a redelivery whose payload differs from the stored event. | insert |
@@ -216,7 +219,8 @@ recomputes the served rows of each session that gained or changed steps and
 appends the rows whose served fields differ from the newest row stored for
 the same `(harness, step_ref)`, in a transaction of its own. `feed_cursor` is
 an `AUTOINCREMENT` key, so cursors grow in commit order, survive restarts and
-are never reused. `row_json` is the served row without its cursor.
+are never reused. `row_json` is the row without its cursor and event-only
+evidence; reads join the retained evidence and newest stored cause.
 `step_feed_no_update` refuses updates; rows committed more than 24 hours ago
 are deleted, at most 1,000 per append. `step_feed_state` holds the cache
 cursor the feed has caught up to, so a crash between a commit and its feed
@@ -226,6 +230,37 @@ Migration 29 starts the feed at the store's current cache cursor, so an
 upgraded store does not replay its history.
 Migration 32 adds the `(harness, session, feed_cursor)` index so filtered live
 reads seek directly to a session's rows rather than scanning the feed.
+
+Migration 51 adds `step_evidence`, `step_digest` and `step_cause` without a
+backfill. Step events are not replayed, so their facts must survive the feed's
+one-day window and a durable row replacing a runner hint. Evidence expires
+30 days from when the step first reached the feed, even if the event evidence
+arrives after a file-only row. Each append considers only the oldest
+1,000 evidence keys and deletes expired rows in that batch, never scanning
+all retained evidence to discover that nothing expired. Indexed delete/update
+triggers reclaim only the old row's tool/system digest keys when their last
+reference is gone. Digests are not copied into feed JSON. File-only rows keep
+an empty evidence object and an unknown runner identity, preserving their first
+feed cursor without inventing facts.
+
+The shared `cortexkit-usage-steps` function computes rewrite causes at feed
+append or replacement. It compares distinct steps in the same harness/session
+and runner, warm-ups included, by request start (occurrence time when unknown),
+then first feed cursor. Unknown runner identities compare only with other
+unknown runner identities. A late insertion or replacement also rejudges the
+following step. When late evidence changes a step's runner or request start,
+the successor at its old comparison position is rejudged too. `step_cause`
+appends only when the computed cause changes;
+null records a correction to no cause. Its `no_update`, `no_delete` and
+`insert_once` guards refuse editing, deletion and replacement by either the
+integer primary key or its rowid alias, even with recursive triggers disabled.
+Causes are kept forever after evidence and feed rows expire. Cache-history
+reads join causes by `(harness, step_ref)` and never infer them from the ledger.
+Tests: `rewrite_recorded_replacement_keeps_evidence_and_cause`,
+`rewrite_cause_survives_evidence_and_feed_pruning`,
+`rewrite_evidence_pruning_is_bounded_at_two_history_sizes`,
+`rewrite_previous_step_is_scoped_to_runner_even_with_shared_host_session`,
+`rewrite_late_step_recomputes_its_successor`.
 
 `declared_store_cursor` and `read_watermark` (schema 30) serve harness stores
 that another module declares, which today are the private OpenCode data
