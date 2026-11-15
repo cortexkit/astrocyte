@@ -52,5 +52,5 @@ environment variable to verify the pinned files. `SHA256SUMS` covers every JSON
 body and this README, not itself. Published version tags must not move; changed
 published fixtures require a new version and tag.
 
-These files were exported on the Linux build server and copied back with the
-build tool's `return_paths`; the read-only-checkout fallback was not needed.
+These files were exported on the Linux build server and copied back to the
+checkout; the read-only-checkout fallback was not needed.
