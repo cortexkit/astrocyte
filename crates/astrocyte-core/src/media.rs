@@ -83,7 +83,7 @@ pub fn map_record(
     let started = i64::try_from(record.started_at_ms).map_err(|_| "started_at_ms out of range")?;
     let finished =
         i64::try_from(record.finished_at_ms).map_err(|_| "finished_at_ms out of range")?;
-    let request = serde_json::from_value(json!({
+    let mut request: EventRecordRequest = serde_json::from_value(json!({
         "producer": "colliculus",
         "producer_ref": record.record_id,
         "run_ref": record.job_id.as_ref().or(record.stream_id.as_ref()).or(record.call_id.as_ref()),
@@ -99,6 +99,7 @@ pub fn map_record(
         "measurements": measurements,
     }))
     .map_err(|error| format!("media event mapping: {error}"))?;
+    request.runner = Some("colliculus".into());
     Ok(Some((
         request,
         MediaFacts {

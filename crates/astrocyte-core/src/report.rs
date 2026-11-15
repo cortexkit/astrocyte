@@ -88,6 +88,8 @@ enum Grouping {
     WorkClass,
     Project,
     Producer,
+    Runner,
+    Harness,
 }
 
 impl Grouping {
@@ -101,6 +103,8 @@ impl Grouping {
             "work_class" => Some(Self::WorkClass),
             "project" => Some(Self::Project),
             "producer" => Some(Self::Producer),
+            "runner" => Some(Self::Runner),
+            "harness" => Some(Self::Harness),
             _ => None,
         }
     }
@@ -115,6 +119,8 @@ impl Grouping {
             Self::WorkClass => "work_class",
             Self::Project => "project",
             Self::Producer => "producer",
+            Self::Runner => "runner",
+            Self::Harness => "harness",
         }
     }
 }
@@ -432,9 +438,9 @@ fn declined_reason(unpriced_reason: Option<&str>) -> &str {
     unpriced_reason.unwrap_or("unpriced")
 }
 
-/// Number of `Grouping` dimensions, including the producer dimension only the
-/// work-class report reads; `Grouping` values index arrays of this length.
-const GROUPING_DIMENSIONS: usize = Grouping::Producer as usize + 1;
+/// Number of supported report dimensions; `Grouping` values index arrays of
+/// this length.
+const GROUPING_DIMENSIONS: usize = Grouping::Harness as usize + 1;
 
 /// A fast non-cryptographic hasher for the in-memory joins of the ledger-wide
 /// pass, which hash every charge and event id in the store. The keys are the
@@ -819,7 +825,8 @@ fn load_scoped_ledger_bound(
                  pricing_generation,provider,model,account_ref,auth_selection,
                  work_class,project_root,producer,
                  CASE WHEN account_ref IS NULL AND charge_basis='subscription_included'
-                      THEN COALESCE(resolved_credential,auth_selection) END
+                       THEN COALESCE(resolved_credential,auth_selection) END,
+                 runner,CASE WHEN producer='thalamus-harness' THEN harness ELSE producer END
          FROM usage_event{event_filter}"
     ))?;
     let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
@@ -843,6 +850,8 @@ fn load_scoped_ledger_bound(
                 Grouping::WorkClass => text_column(row, 10)?,
                 Grouping::Project => text_column(row, 11)?,
                 Grouping::Producer => text_column(row, 12)?,
+                Grouping::Runner => text_column(row, 14)?,
+                Grouping::Harness => text_column(row, 15)?,
             };
             event_dimensions[*dimension as usize] =
                 value.map(|value| values.intern(value)).transpose()?;

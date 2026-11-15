@@ -274,6 +274,7 @@ impl ClaudeThalamusSource {
                     .collect::<HashSet<_>>(),
             );
             requests.extend(read.requests.into_iter().map(|mut request| {
+                request.runner = Some("thalamus".into());
                 let native_session = if let Some(owner_session) = &root.owner_session {
                     request.session = Some(owner_session.clone());
                     Some(root.session.clone())

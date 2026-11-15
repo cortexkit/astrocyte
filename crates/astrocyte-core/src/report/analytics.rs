@@ -126,6 +126,9 @@ impl ParsedReport {
             let column = match dimension {
                 Grouping::Account => "account_ref",
                 Grouping::Project => "project_root",
+                Grouping::Harness => {
+                    "(CASE WHEN producer='thalamus-harness' THEN harness ELSE producer END)"
+                }
                 _ => dimension.name(),
             };
             let mut alternatives = Vec::new();

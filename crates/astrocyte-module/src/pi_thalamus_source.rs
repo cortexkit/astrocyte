@@ -283,6 +283,7 @@ impl PiThalamusSource {
                             Ok(mut request) => {
                                 request.session = Some(root.owner_session.clone());
                                 request.work_class = Some(root.owner_principal.clone());
+                                request.runner = Some("thalamus".into());
                                 folder_calls.push(WaitingCall {
                                     request,
                                     completed_at_ms,

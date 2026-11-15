@@ -176,6 +176,10 @@ impl WaitQueue {
                 continue;
             }
             let mut ready = request.clone();
+            // Only Claude Code, Pi and OpenCode have Thalamus declarations
+            // today. Other local harnesses remain unmanaged until their host
+            // coordinates declaration support with this reader.
+            ready.runner = Some("thalamus".into());
             if ready.work_class.is_none() {
                 ready.work_class = owner;
             }
@@ -357,6 +361,20 @@ mod tests {
         ];
         let mut queue = WaitQueue::default();
         assert_eq!(pass(&state, &mut queue, &calls, 101).0, 3);
+        state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT count(*) FROM usage_event WHERE runner='thalamus'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    3
+                );
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(
             stored(&state),
             vec![

@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 49. A schema change appends a migration; an applied
+currently version 50. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -112,7 +112,7 @@ and after each refusal.
 projections the ledger maintains: `pricing_generation` advances by one per
 pricing act, `charge_basis` changes only together with that step (a basis
 correction), and `currency` moves from null to one value once. Every
-producer field, including `auth_selection`, `resolved_credential`, `flow_ref` and BROCA's
+producer field, including `runner`, `auth_selection`, `resolved_credential`, `flow_ref` and BROCA's
 charge-basis provenance, is write-once. `statement_line_update_guard` keeps line content
 fixed while the match projection moves. `account_subscription_update_guard`
 and `credential_subscription_update_guard` allow one change: closing an open
@@ -128,6 +128,18 @@ A correction to any of these tables is a new row, never an edit. Tests:
 `schema_v13_provenance_columns_start_null_and_are_immutable`,
 `schema_v26_adds_a_null_flow_ref_keeps_every_row_and_guards_it`,
 `schema_v46_adds_a_null_resolved_credential_and_guards_it`.
+
+`usage_event.runner` (schema 50) is nullable `TEXT`: `broca`, `thalamus` or
+`colliculus` identifies the runner that ran the call; null means unmanaged.
+The recording reader sets the label, including `thalamus` for a local harness
+session declared by Thalamus. Push ingest leaves it null. The value is
+write-once, including null: later declarations or redeliveries never change
+it, and a different computed runner on redelivery is not a contradiction.
+Migration 50 labels historical BROCA, Thalamus-harness and Colliculus producer
+rows directly. Other producers receive `thalamus` only when their session
+appears in `thalamus_payer_session` or `thalamus_payer_record`; all other
+historical calls remain null. Deleting payer history cannot erase a recorded
+label.
 
 `usage_event.resolved_credential` (schema 46) is nullable `TEXT`, carried
 verbatim from a BROCA session fact's `resolved_credential_id`: the vault
@@ -487,6 +499,14 @@ overlap trigger is created after the insert-once trigger, so an overlapping
 plan is refused as an overlap.
 The migration leaves `account_subscription` and every stored row unchanged.
 Test: `schema_v47_adds_an_empty_guarded_credential_ledger_and_changes_no_rows`.
+
+Migration 50 advances the shared spend/Run summary format to 6 and adds
+`runner` and the derived host `harness` to the spend summary cell key. Host
+harness is the event's harness for `thalamus-harness` rows and its producer
+otherwise; it is not another ledger column. The migration recreates only `summary_cell`,
+`summary_quantity` and `summary_money`, and the stale-hour index. Hour
+revisions, ledger rows, dirty triggers and run cells remain intact; old-format
+hours use the ledger until the background rebuild republishes format 6.
 
 Migration 49 advances the shared spend/Run summary format to 5. It adds
 `summary_quantity.stated_observations`, counting only measurements with a stated

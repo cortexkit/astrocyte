@@ -4531,6 +4531,113 @@ CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
     WHERE built_revision IS NOT revision OR format_version IS NOT 5;
 "#,
     },
+    Migration {
+        version: 50,
+        statements: r#"
+ALTER TABLE usage_event ADD COLUMN runner TEXT
+    CHECK(runner IN ('broca','thalamus','colliculus'));
+DROP TRIGGER usage_event_update_guard;
+-- Historical runner evidence is frozen before the write-once guard returns.
+-- Materialize session membership once: the payer session columns are unindexed.
+UPDATE usage_event SET runner = CASE
+    WHEN producer='broca' THEN 'broca'
+    WHEN producer='thalamus-harness' THEN 'thalamus'
+    WHEN producer='colliculus' THEN 'colliculus'
+    WHEN session IN (SELECT session FROM thalamus_payer_session
+                     UNION SELECT session FROM thalamus_payer_record) THEN 'thalamus'
+    ELSE NULL END
+WHERE producer IN ('broca','thalamus-harness','colliculus')
+   OR session IN (SELECT session FROM thalamus_payer_session
+                  UNION SELECT session FROM thalamus_payer_record);
+CREATE TRIGGER usage_event_update_guard
+BEFORE UPDATE ON usage_event
+WHEN NOT (
+    NEW.event_key IS OLD.event_key
+    AND NEW.event_id IS OLD.event_id
+    AND NEW.producer IS OLD.producer
+    AND NEW.producer_lineage IS OLD.producer_lineage
+    AND NEW.producer_ref IS OLD.producer_ref
+    AND NEW.prior_event_ref IS OLD.prior_event_ref
+    AND NEW.harness IS OLD.harness
+    AND NEW.project_root IS OLD.project_root
+    AND NEW.session IS OLD.session
+    AND NEW.run_ref IS OLD.run_ref
+    AND NEW.flow_ref IS OLD.flow_ref
+    AND NEW.runner IS OLD.runner
+    AND NEW.work_class IS OLD.work_class
+    AND NEW.occurred_at_ms IS OLD.occurred_at_ms
+    AND NEW.emitted_at_ms IS OLD.emitted_at_ms
+    AND NEW.recorded_at_ms IS OLD.recorded_at_ms
+    AND NEW.terminal_status IS OLD.terminal_status
+    AND NEW.attempt_ordinal IS OLD.attempt_ordinal
+    AND NEW.vendor_request_id IS OLD.vendor_request_id
+    AND NEW.provider IS OLD.provider
+    AND NEW.model IS OLD.model
+    AND NEW.account_ref IS OLD.account_ref
+    AND NEW.auth_selection IS OLD.auth_selection
+    AND NEW.resolved_credential IS OLD.resolved_credential
+    AND NEW.charge_basis_mapping_version IS OLD.charge_basis_mapping_version
+    AND NEW.charge_basis_overrides IS OLD.charge_basis_overrides
+    AND (NEW.charge_basis IS OLD.charge_basis
+         OR NEW.pricing_generation = OLD.pricing_generation + 1)
+    AND (NEW.pricing_generation = OLD.pricing_generation
+         OR NEW.pricing_generation = OLD.pricing_generation + 1)
+    AND (NEW.currency IS OLD.currency
+         OR (OLD.currency IS NULL AND NEW.currency IS NOT NULL))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'usage_event_update_guard');
+END;
+-- The existing insert-once guard also prevents REPLACE from changing runner.
+-- Only derived cells are discarded; old hours use the ledger until rebuilt.
+DROP TABLE summary_quantity;
+DROP TABLE summary_money;
+DROP TABLE summary_cell;
+CREATE TABLE summary_cell (
+    cell_id INTEGER PRIMARY KEY,
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    producer INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(producer>0),
+    provider INTEGER NOT NULL REFERENCES summary_value(value_id),
+    model INTEGER NOT NULL REFERENCES summary_value(value_id),
+    account INTEGER NOT NULL REFERENCES summary_value(value_id),
+    auth_selection INTEGER NOT NULL REFERENCES summary_value(value_id),
+    charge_basis INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(charge_basis>0),
+    work_class INTEGER NOT NULL REFERENCES summary_value(value_id),
+    project INTEGER NOT NULL REFERENCES summary_value(value_id),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id),
+    payload TEXT NOT NULL CHECK(json_valid(payload)),
+    paying_credential INTEGER NOT NULL REFERENCES summary_value(value_id),
+    runner INTEGER NOT NULL REFERENCES summary_value(value_id),
+    harness INTEGER NOT NULL REFERENCES summary_value(value_id),
+    UNIQUE(kind,hour_number,producer,provider,model,account,auth_selection,charge_basis,work_class,project,currency,paying_credential,runner,harness),
+    FOREIGN KEY(kind,hour_number) REFERENCES summary_hour(kind,hour_number)
+);
+CREATE TABLE summary_quantity (
+    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
+    unit INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(unit>0),
+    role INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(role>0),
+    exponent INTEGER NOT NULL CHECK(exponent BETWEEN -9 AND 1),
+    units TEXT NOT NULL,
+    observations INTEGER NOT NULL CHECK(observations>=0),
+    covered_units TEXT NOT NULL,
+    covered_observations INTEGER NOT NULL CHECK(covered_observations>=0),
+    stated_observations INTEGER NOT NULL CHECK(stated_observations>=0 AND stated_observations<=observations),
+    PRIMARY KEY(cell_id,unit,role,exponent)
+) WITHOUT ROWID;
+CREATE TABLE summary_money (
+    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
+    kind INTEGER NOT NULL CHECK(kind IN (0,1)),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(currency>0),
+    nanos TEXT NOT NULL,
+    contributions INTEGER NOT NULL CHECK(contributions>0),
+    PRIMARY KEY(cell_id,kind,currency)
+) WITHOUT ROWID;
+DROP INDEX summary_hour_stale;
+CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
+    WHERE built_revision IS NOT revision OR format_version IS NOT 6;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -6475,6 +6582,7 @@ mod tests {
             session: event.session,
             run_ref: event.run_ref,
             flow_ref: None,
+            runner: None,
             work_class: event.work_class,
             occurred_at_ms: event.occurred_at_ms,
             emitted_at_ms: event.emitted_at_ms,
@@ -8050,6 +8158,121 @@ mod tests {
             ))
             .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn schema_v50_runner_backfill_guards_and_cache_preserve_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version < 50) {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        for (id, producer, session) in [
+            ("broca", "broca", "no-evidence"),
+            ("payer", "thalamus-harness", "no-evidence"),
+            ("media", "colliculus", "declared"),
+            ("declared", "opencode", "declared"),
+            ("record", "pi", "record-only"),
+            ("local", "opencode", "local"),
+        ] {
+            conn.execute("INSERT INTO usage_event(event_id,producer,producer_ref,session,occurred_at_ms,recorded_at_ms,charge_basis) VALUES(?1,?2,?1,?3,1,1,'unknown')", params![id,producer,session]).unwrap();
+        }
+        conn.execute_batch("INSERT INTO thalamus_payer_session VALUES('opencode','declared',NULL,0);
+            INSERT INTO thalamus_payer_record(attempt_id,seq,incarnation,harness,session,request_kind,recorded_at_ms,provider,model,auth_selection) VALUES('a',1,'one','pi','record-only','main',1,'p','m','auth');
+            INSERT INTO summary_value VALUES(1,'opencode'),(2,'unknown');
+            UPDATE summary_hour SET built_revision=revision,format_version=5,events_total=6;
+            DELETE FROM summary_dirty_hour;
+            INSERT INTO summary_cell VALUES(1,0,0,1,0,0,0,0,2,0,0,0,'{}',0);").unwrap();
+        let before = all_rows(&conn);
+        let started = std::time::Instant::now();
+        conn.execute_batch(MIGRATIONS[49].statements).unwrap();
+        eprintln!(
+            "migration 50 six-row backfill and cache reset: {:?}",
+            started.elapsed()
+        );
+        let rows: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT event_id,runner FROM usage_event ORDER BY event_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("broca".into(), Some("broca".into())),
+                ("declared".into(), Some("thalamus".into())),
+                ("local".into(), None),
+                ("media".into(), Some("colliculus".into())),
+                ("payer".into(), Some("thalamus".into())),
+                ("record".into(), Some("thalamus".into()))
+            ]
+        );
+        let after = all_rows(&conn);
+        for ((table, previous), (after_table, current)) in before.iter().zip(&after) {
+            assert_eq!(table, after_table);
+            if table == "usage_event" {
+                for (old, new) in previous.iter().zip(current) {
+                    assert_eq!(old, &new[..new.len() - 1]);
+                }
+            } else if ["summary_cell", "summary_quantity", "summary_money"]
+                .contains(&table.as_str())
+            {
+                assert!(current.is_empty());
+            } else {
+                assert_eq!(previous, current, "{table}");
+            }
+        }
+        for sql in [
+            "UPDATE usage_event SET runner='thalamus' WHERE event_id='local'",
+            "UPDATE usage_event SET runner=NULL WHERE event_id='broca'",
+            "UPDATE usage_event SET runner='thalamus' WHERE event_id='broca'",
+        ] {
+            refuse_without_effect(&conn, "usage_event", sql, "usage_event_update_guard");
+        }
+        for verb in ["REPLACE", "INSERT OR REPLACE"] {
+            refuse_without_effect(&conn, "usage_event", &format!("{verb} INTO usage_event(event_id,producer,producer_ref,recorded_at_ms,charge_basis,runner) VALUES('local','opencode','local',1,'unknown','thalamus')"), "usage_event_insert_once");
+        }
+        assert!(conn.execute("INSERT INTO usage_event(event_id,producer,producer_ref,recorded_at_ms,charge_basis,runner) VALUES('invalid','fixture','invalid',1,'unknown','other')", []).is_err());
+        assert_eq!(conn.query_row("SELECT count(*) FROM summary_hour INDEXED BY summary_hour_stale WHERE built_revision IS NOT revision OR format_version IS NOT 6",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    #[ignore = "synthetic migration timing; live stores must be rehearsed on a copy"]
+    fn schema_v50_runner_backfill_timing() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version < 50) {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        conn.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000)
+            INSERT INTO usage_event(event_id,producer,producer_ref,session,recorded_at_ms,charge_basis)
+            SELECT 'event-'||i,CASE i%4 WHEN 0 THEN 'broca' WHEN 1 THEN 'thalamus-harness' WHEN 2 THEN 'colliculus' ELSE 'opencode' END,'ref-'||i,'session-'||(i%20000),1,'unknown' FROM n;
+            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<10000)
+            INSERT INTO thalamus_payer_session SELECT 'opencode','session-'||i,NULL,0 FROM n;").unwrap();
+        let started = std::time::Instant::now();
+        conn.execute_batch(MIGRATIONS[49].statements).unwrap();
+        eprintln!(
+            "migration 50: 100000 events, 10000 declared sessions, in-memory SQLite: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM usage_event WHERE runner IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            87500
         );
     }
 

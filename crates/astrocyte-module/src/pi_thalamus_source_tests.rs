@@ -126,6 +126,7 @@ fn null_session_uses_header_for_payer_and_records_owner_and_work_class() {
         let row = conn.query_row("SELECT producer_ref,session,work_class,charge_basis,auth_selection,account_ref FROM usage_event", [], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?))).unwrap();
         assert_eq!(row, ("pi:response:pi-synthetic-response".into(),"core-conversation".into(),"synthetic-owner".into(),"metered_api".into(),"synthetic-login".into(),"synthetic-account".into()));
         assert_eq!(conn.query_row("SELECT quantity_units FROM measurement WHERE role='input'", [], |r| r.get::<_,i64>(0)).unwrap(), 11);
+        assert_eq!(conn.query_row("SELECT runner FROM usage_event", [], |r| r.get::<_,String>(0)).unwrap(), "thalamus");
         Ok(())
     }).unwrap();
     assert_eq!(

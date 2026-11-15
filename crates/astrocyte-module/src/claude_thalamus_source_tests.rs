@@ -106,6 +106,17 @@ fn claude_owner_session_appearing_later_preserves_recorded_calls() {
         let at = crate::state::now_ms();
         f.tick(at);
         assert_eq!(f.event_sessions(), vec![("old".into(), SESSION.into())]);
+        f.state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT runner FROM usage_event", [], |r| r
+                        .get::<_, String>(0))
+                        .unwrap(),
+                    "thalamus"
+                );
+                Ok(())
+            })
+            .unwrap();
         f.declare(vec![f.owned_root(true)]);
         f.live_call("new");
         // A fresh reader must redeliver the old call, not skip it via file offsets.
@@ -280,7 +291,7 @@ impl Fixture {
 }
 
 #[test]
-fn claude_payer_mirrored_facts_are_stated_and_unmanaged_calls_stay_unchanged() {
+fn claude_payer_mirrored_facts_are_stated_and_other_call_facts_stay_unchanged() {
     let f = Fixture::new();
     f.manage_payer_session();
     f.call(SESSION, "subscription", true);
@@ -306,19 +317,19 @@ fn claude_payer_mirrored_facts_are_stated_and_unmanaged_calls_stay_unchanged() {
             ),
         ]
     );
-    let unmanaged = Fixture::new();
-    unmanaged.call(SESSION, "unmanaged", true);
-    unmanaged.declare(vec![unmanaged.root(SESSION, true)]);
-    unmanaged.tick(PAYER_COMPLETION_MS);
+    let without_payer = Fixture::new();
+    without_payer.call(SESSION, "unmanaged", true);
+    without_payer.declare(vec![without_payer.root(SESSION, true)]);
+    without_payer.tick(PAYER_COMPLETION_MS);
     assert_eq!(
-        unmanaged.payer_facts(),
+        without_payer.payer_facts(),
         vec![("unmanaged".into(), "unknown".into(), None, None)]
     );
-    assert_eq!(unmanaged.acks()["read_through"][0]["session"], SESSION);
+    assert_eq!(without_payer.acks()["read_through"][0]["session"], SESSION);
     let legacy = test_state();
     harness_drain::ensure_runtime_row(&legacy, SOURCE_KEY).unwrap();
     let read = claude_code_source::read_projects(
-        &unmanaged.config(SESSION).join("projects"),
+        &without_payer.config(SESSION).join("projects"),
         &ClaudeCodeCache::default(),
         PAYER_COMPLETION_MS,
         600_000,
@@ -353,10 +364,14 @@ fn claude_payer_mirrored_facts_are_stated_and_unmanaged_calls_stay_unchanged() {
                         let mut statement = conn
                             .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
                             .unwrap();
-                        let columns = statement.column_count();
+                        // Declared roots now record their runner even without a
+                        // payer row. All earlier call facts must still agree.
+                        let columns: Vec<_> = (0..statement.column_count())
+                            .filter(|column| statement.column_name(*column).unwrap() != "runner")
+                            .collect();
                         statement
                             .query_map([], |row| {
-                                (0..columns).map(|column| row.get(column)).collect()
+                                columns.iter().map(|column| row.get(*column)).collect()
                             })
                             .unwrap()
                             .collect::<rusqlite::Result<Vec<Vec<rusqlite::types::Value>>>>()
@@ -366,7 +381,24 @@ fn claude_payer_mirrored_facts_are_stated_and_unmanaged_calls_stay_unchanged() {
             })
             .unwrap()
     }
-    assert_eq!(snapshot(&unmanaged.state), snapshot(&legacy));
+    for (state, runner) in [
+        (without_payer.state.as_ref(), Some("thalamus")),
+        (&legacy, None),
+    ] {
+        state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT runner FROM usage_event", [], |r| r
+                        .get::<_, Option<String>>(0))
+                        .unwrap()
+                        .as_deref(),
+                    runner
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    assert_eq!(snapshot(&without_payer.state), snapshot(&legacy));
 }
 
 #[test]

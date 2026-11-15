@@ -557,6 +557,7 @@ pub fn record_steps_for_test(
             session: Some(step.session.into()),
             run_ref: None,
             flow_ref: None,
+            runner: None,
             work_class: None,
             occurred_at_ms: Some(step.occurred_at_ms),
             emitted_at_ms: None,

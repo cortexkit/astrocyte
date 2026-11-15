@@ -19,7 +19,7 @@ const HOUR_MS: i64 = 3_600_000;
 /// mismatch means a write path that bypassed them. Daily keeps such a miss
 /// bounded to about a day without re-reading the store every hour.
 const AUDIT_INTERVAL_MS: i64 = 24 * HOUR_MS;
-const DIMENSIONS: [Grouping; 8] = [
+const DIMENSIONS: [Grouping; GROUPING_DIMENSIONS] = [
     Grouping::Provider,
     Grouping::Model,
     Grouping::Account,
@@ -28,11 +28,17 @@ const DIMENSIONS: [Grouping; 8] = [
     Grouping::WorkClass,
     Grouping::Project,
     Grouping::Producer,
+    Grouping::Runner,
+    Grouping::Harness,
 ];
 
 // Report dimensions, currency, and the hidden subscription payer. Keeping the
 // payer separate means it cannot become a served spend-report grouping.
-type Key = ([Option<String>; 8], Option<String>, Option<String>);
+type Key = (
+    [Option<String>; GROUPING_DIMENSIONS],
+    Option<String>,
+    Option<String>,
+);
 type QuantityKey = (String, String, i32);
 type FrequencyKey = (String, Option<String>, String, i64);
 
@@ -379,20 +385,20 @@ fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
     let mut values = Values::new(conn);
     let mut data = Data::default();
     let mut keys = HashMap::new();
-    let mut statement=conn.prepare("SELECT cell_id,provider,model,account,auth_selection,charge_basis,work_class,project,producer,currency,payload,paying_credential
+    let mut statement=conn.prepare("SELECT cell_id,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential
         FROM summary_cell WHERE kind=?1 AND hour_number=?2")?;
     let mut rows = statement.query(params![hour.kind, hour.number])?;
     while let Some(row) = rows.next()? {
-        let mut dims = [const { None }; 8];
+        let mut dims = [const { None }; GROUPING_DIMENSIONS];
         for (column, dim) in dims.iter_mut().enumerate() {
             *dim = value(&mut values, row.get(column + 1)?)?;
         }
         let key = (
             dims,
-            value(&mut values, row.get(9)?)?,
             value(&mut values, row.get(11)?)?,
+            value(&mut values, row.get(13)?)?,
         );
-        let cell = decode(&row.get::<_, String>(10)?)?;
+        let cell = decode(&row.get::<_, String>(12)?)?;
         add_count(&mut data.events, cell.events)?;
         keys.insert(row.get::<_, i64>(0)?, key.clone());
         data.cells.insert(key, cell);
@@ -481,12 +487,12 @@ fn replace(
     )?;
     let mut cells = BTreeMap::new();
     for (key, cell) in &data.cells {
-        let mut ids = [0_i64; 10];
+        let mut ids = [0_i64; GROUPING_DIMENSIONS + 2];
         for (id, text) in ids.iter_mut().zip(key.0.iter().chain([&key.1, &key.2])) {
             *id = value_id(tx, &mut values, text)?;
         }
-        tx.execute("INSERT INTO summary_cell(kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,currency,payload,paying_credential)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![hour.kind,hour.number,ids[0],ids[1],ids[2],ids[3],ids[4],ids[5],ids[6],ids[7],ids[8],encode(cell)?,ids[9]])?;
+        tx.execute("INSERT INTO summary_cell(kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![hour.kind,hour.number,ids[0],ids[1],ids[2],ids[3],ids[4],ids[5],ids[6],ids[7],ids[8],ids[9],ids[10],encode(cell)?,ids[11]])?;
         cells.insert(key.clone(), tx.last_insert_rowid());
     }
     for ((key, (unit, role, exponent)), quantity) in &data.quantities {
@@ -1031,7 +1037,7 @@ fn scoped_frame<'c>(
     let mut observed = BTreeMap::new();
     let mut split = BTreeSet::new();
     let scope = scope.replace("h.", "c.");
-    let mut statement=conn.prepare(&format!("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.currency,c.payload,c.paying_credential
+    let mut statement=conn.prepare(&format!("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.runner,c.harness,c.currency,c.payload,c.paying_credential
         FROM summary_cell c{scope}"))?;
     let mut rows = statement.query(rusqlite::params_from_iter(&parameters))?;
     while let Some(row) = rows.next()? {
@@ -1042,16 +1048,16 @@ fn scoped_frame<'c>(
         if !clean.contains(&hour) {
             continue;
         }
-        let mut dims = [const { None }; 8];
+        let mut dims = [const { None }; GROUPING_DIMENSIONS];
         for (column, dim) in dims.iter_mut().enumerate() {
             *dim = value(&mut values, row.get(column + 3)?)?;
         }
         let key = (
             dims,
-            value(&mut values, row.get(11)?)?,
             value(&mut values, row.get(13)?)?,
+            value(&mut values, row.get(15)?)?,
         );
-        let payload: String = row.get(12)?;
+        let payload: String = row.get(14)?;
         let cell = decode(&payload)?;
         add_count(observed.entry(hour).or_default(), cell.events)?;
         if seam(hour, &key, &cell)? {
@@ -2029,6 +2035,73 @@ mod tests {
             ..ReportRequest::default()
         }
     }
+    #[test]
+    fn runner_and_harness_summary_matches_ledger_for_grouping_and_where() {
+        let mut conn = crate::test_support::conn();
+        for (id, producer, harness, runner, nanos) in [
+            ("local", "opencode", None, None, 11),
+            ("managed", "opencode", None, Some("thalamus"), 23),
+            (
+                "payer-open",
+                "thalamus-harness",
+                Some("opencode"),
+                Some("thalamus"),
+                37,
+            ),
+            (
+                "payer-pi",
+                "thalamus-harness",
+                Some("pi"),
+                Some("thalamus"),
+                41,
+            ),
+            ("broca", "broca", Some("opencode"), Some("broca"), 53),
+            ("media", "colliculus", None, Some("colliculus"), 67),
+        ] {
+            let mut event: ingest::EventRecordRequest = serde_json::from_value(serde_json::json!({
+                "producer":producer,"producer_ref":id,"harness":harness,"charge_basis":"metered_api","occurred_at_ms":1,
+                "measurements":[{"role":"input","unit":"token","kind":"billed","source":"fixture","quantity_units":12,"quantity_exponent":0},
+                    {"role":"output","unit":"token","kind":"billed","source":"fixture","quantity_units":0,"quantity_exponent":0}]
+            })).unwrap();
+            event.runner = runner.map(str::to_owned);
+            let id = ingest::record_event(&mut conn, &event, 1).unwrap().event_id;
+            priced(&mut conn, &id, "USD", nanos);
+        }
+        catch_up(&mut conn);
+        for grouping in [
+            &["runner"][..],
+            &["harness"][..],
+            &["runner", "harness"][..],
+        ] {
+            for (runner, harness, count, nanos) in [
+                (None, "opencode", 1, 11),
+                (Some("thalamus"), "opencode", 2, 60),
+                (Some("thalamus"), "pi", 1, 41),
+                (Some("broca"), "broca", 1, 53),
+                (Some("colliculus"), "colliculus", 1, 67),
+            ] {
+                let mut request = request("UTC", "hour", grouping);
+                request.from_ms = Some(0);
+                request.to_ms = Some(HOUR_MS);
+                request
+                    .filters
+                    .insert("runner".into(), vec![runner.map(str::to_owned)]);
+                request
+                    .filters
+                    .insert("harness".into(), vec![Some(harness.into())]);
+                let summary = spend(&conn, &request, 10_000)
+                    .unwrap()
+                    .expect("clean summaries must serve these dimensions");
+                equal(
+                    &summary,
+                    &spend_report_base(&conn, &request, 10_000, None).unwrap(),
+                );
+                assert_eq!(summary.totals[0].events_total, count);
+                assert_eq!(summary.totals[0].total_nanos, nanos);
+            }
+        }
+        compare(&conn);
+    }
     fn equal<T: Serialize>(actual: &T, expected: &T) {
         assert_eq!(
             serde_json::to_vec(actual).unwrap(),
@@ -2054,6 +2127,9 @@ mod tests {
                     &["work_class"][..],
                     &["project"][..],
                     &["producer"][..],
+                    &["runner"][..],
+                    &["harness"][..],
+                    &["runner", "harness"][..],
                     &["producer", "model"][..],
                     &[
                         "provider",
@@ -2631,7 +2707,7 @@ mod tests {
     #[test]
     fn format_three_payer_cells_are_never_served_before_rebuild() {
         let mut conn = credential_fixture();
-        assert_eq!(FORMAT, 5);
+        assert_eq!(FORMAT, 6);
         conn.execute(
             "UPDATE summary_hour SET format_version=3 WHERE hour_number=5",
             [],

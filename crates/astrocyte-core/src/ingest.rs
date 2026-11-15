@@ -113,6 +113,10 @@ pub struct EventRecordRequest {
     /// and the pushed surface is unchanged.
     #[serde(skip)]
     pub flow_ref: Option<String>,
+    /// The recording reader's runner label. A push cannot claim a runner,
+    /// and later session declarations cannot change the value already stored.
+    #[serde(skip)]
+    pub runner: Option<String>,
     #[serde(default)]
     pub work_class: Option<String>,
     #[serde(default)]
@@ -355,6 +359,8 @@ struct EventPayload {
 }
 
 impl EventPayload {
+    // Runner is deliberately absent from this payload comparison: it records
+    // the first reader's evidence, not a claim every later replay must repeat.
     /// Whether an incoming payload restates this stored one.
     ///
     /// Every field must be equal, except that a stored NULL `auth_selection`,
@@ -1084,10 +1090,10 @@ fn insert_event(
              occurred_at_ms,emitted_at_ms,recorded_at_ms,terminal_status,attempt_ordinal,
              vendor_request_id,provider,model,account_ref,auth_selection,charge_basis,pricing_generation,
               charge_basis_mapping_version,charge_basis_overrides,flow_ref,media_facts,
-              resolved_credential
+              resolved_credential,runner
           ) VALUES (
               ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,
-              ?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,0,?22,?23,?24,?25,?26
+              ?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,0,?22,?23,?24,?25,?26,?27
           )",
         params![
             event_id,
@@ -1116,6 +1122,7 @@ fn insert_event(
             request.flow_ref,
             media.map(|facts| jcs_serialize(&json!(facts))).transpose()?,
             request.resolved_credential,
+            request.runner,
         ],
     )?;
     Ok(event_id)
@@ -1359,6 +1366,7 @@ mod tests {
             session: Some("session-a".into()),
             run_ref: Some("run-a".into()),
             flow_ref: None,
+            runner: None,
             work_class: Some("generation".into()),
             occurred_at_ms: Some(1_000),
             emitted_at_ms: Some(1_010),
@@ -1376,6 +1384,41 @@ mod tests {
             measurements,
             step_detail: Default::default(),
         }
+    }
+
+    #[test]
+    fn runner_is_write_once_on_both_directions_of_redelivery() {
+        let mut conn = conn();
+        for (reference, first, replay) in [
+            ("unmanaged-first", None, Some("thalamus")),
+            ("managed-first", Some("thalamus"), None),
+            ("different-runner", Some("broca"), Some("colliculus")),
+        ] {
+            let mut request = request(reference, None, vec![]);
+            request.runner = first.map(str::to_owned);
+            let initial = record_event(&mut conn, &request, 1).unwrap();
+            request.runner = replay.map(str::to_owned);
+            let repeated = record_event(&mut conn, &request, 2).unwrap();
+            assert_eq!(repeated.disposition, RecordDisposition::ExactRedelivery);
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT runner FROM usage_event WHERE event_id=?1",
+                    [&initial.event_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored.as_deref(), first);
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM rejected_delivery", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(serde_json::from_value::<EventRecordRequest>(json!({
+            "producer":"push", "producer_ref":"a", "charge_basis":"unknown", "runner":"broca"
+        }))
+        .is_err());
     }
 
     #[test]

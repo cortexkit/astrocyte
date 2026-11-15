@@ -237,6 +237,9 @@ impl ReadOptions<'_> {
 
     pub(crate) fn stamp(self, mut request: EventRecordRequest) -> EventRecordRequest {
         if let Some(sessions) = self.sessions {
+            // A declared shared store belongs to Thalamus's server. The
+            // session listing names owners, not which calls are managed.
+            request.runner = Some("thalamus".into());
             request.work_class = request
                 .session
                 .as_deref()
@@ -1068,6 +1071,7 @@ pub(crate) fn stamp_work_class(
 ) -> EventRecordRequest {
     if let Some(work_class) = work_class {
         request.work_class = Some(work_class.to_owned());
+        request.runner = Some("thalamus".into());
     }
     request
 }
@@ -1296,6 +1300,7 @@ fn map_message(message: OpenCodeMessage) -> Result<EventRecordRequest, String> {
         session: Some(message.session_id),
         run_ref: None,
         flow_ref: None,
+        runner: None,
         // Preserve producer spelling byte-for-byte, including U+200B prefixes:
         // visually identical labels with different bytes are distinct work classes.
         work_class: message.agent,

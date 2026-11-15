@@ -264,6 +264,7 @@ fn media_feed_pages_commit_before_ack_and_retry_failed_ack() {
     tick(&state, &source);
     assert_eq!(cursor(&state).as_deref(), Some("2"));
     assert_eq!(count(&state, "usage_event"), 2);
+    assert_eq!(count(&state, "usage_event WHERE runner='colliculus'"), 2);
     assert_eq!(count(&state, "rejected_delivery"), 0);
     assert_eq!(state.producer_degraded_reason(SOURCE_KEY), None);
     assert_eq!(peer.calls("usage.ack").len(), 3);

@@ -7,14 +7,14 @@ use sha2::{Digest, Sha256};
 
 const DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/test-vectors/analytics-reads-v1"
+    "/test-vectors/analytics-reads-v2"
 );
 
 fn fixture() -> SharedState {
     let state = test_state();
     state.with_conn(|conn| {
         for (id,producer,model,class,time) in [("first","broca","alpha",None,1),("second","opencode","beta",Some("review"),3_600_001),("third","broca","alpha",None,86_400_001)] {
-            conn.execute("INSERT INTO usage_event(event_id,producer,producer_ref,model,work_class,occurred_at_ms,recorded_at_ms,charge_basis) VALUES(?1,?2,?1,?3,?4,?5,1,'metered_api')",rusqlite::params![id,producer,model,class,time]).unwrap();
+            conn.execute("INSERT INTO usage_event(event_id,producer,producer_ref,model,work_class,occurred_at_ms,recorded_at_ms,charge_basis,runner) VALUES(?1,?2,?1,?3,?4,?5,1,'metered_api',?6)",rusqlite::params![id,producer,model,class,time,if producer == "broca" { "broca" } else { "thalamus" }]).unwrap();
             for (role,unit,quantity) in [("input","token",Some(100)),("output","token",Some(30)),("reasoning","token",Some(12)),("cache_write","token_cache_5m",Some(3)),("cache_write","token_cache_1h",Some(5)),("duration","second",Some(2))] {
                 conn.execute("INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent) VALUES((SELECT event_key FROM usage_event WHERE event_id=?1),?2,?3,'billed','synthetic',?4,0)",rusqlite::params![id,role,unit,quantity]).unwrap();
             }
@@ -48,6 +48,7 @@ fn vectors() -> Vec<(String, Value)> {
     let mut cases=vec![
         ("one-grouping",json!({"grouping":["producer"]})),
         ("two-groupings",json!({"grouping":["producer","model"]})),
+        ("runner-harness",json!({"grouping":["runner","harness"]})),
         ("hour",json!({"grain":"hour","from_ms":0,"to_ms":7_200_000})),
         ("where-null",json!({"grouping":["producer"],"where":{"work_class":[null],"producer":["broca","pi"]}})),
         ("range",json!({"from_ms":1,"to_ms":2})),

@@ -624,6 +624,7 @@ fn map_message(message: OpenCodeMessage) -> Result<EventRecordRequest, String> {
         session: Some(message.session_id),
         run_ref: None,
         flow_ref: None,
+        runner: None,
         work_class: message.agent,
         occurred_at_ms: Some(message.occurred_at_ms),
         emitted_at_ms: None,

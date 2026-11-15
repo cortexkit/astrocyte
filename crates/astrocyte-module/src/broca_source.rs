@@ -607,7 +607,7 @@ mod tests {
         crate::refresher::harness_drain::assert_good_snapshot(
             &state,
             "broca",
-            "f699ba842c11f2f7a694b4aa9acdd7e8fc439bcca4cf7fd65ff9ebbe0eeacda4",
+            "18d861b79abc1b7260f15cbd18702ffd231b5d5011880153024d02fb626a721e",
         );
         assert_eq!(count(&state, "usage_event"), 2);
         assert_eq!(count(&state, "usage_event WHERE flow_ref IS NOT NULL"), 0);
@@ -1050,6 +1050,7 @@ mod tests {
             drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
 
         assert_eq!(outcome.events_recorded, 4);
+        assert_eq!(count(&state, "usage_event WHERE runner='broca'"), 4);
         assert_eq!(
             runtime(&state),
             Some((Some("instance-a:1".into()), Some(5), Some(100), 0))

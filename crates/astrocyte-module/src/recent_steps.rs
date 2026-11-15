@@ -456,6 +456,7 @@ mod tests {
             session: Some(session.into()),
             run_ref: None,
             flow_ref: None,
+            runner: None,
             work_class: None,
             occurred_at_ms: Some(at),
             emitted_at_ms: None,

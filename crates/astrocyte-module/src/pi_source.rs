@@ -809,6 +809,7 @@ pub(crate) fn map_message(record: PiUsageRecord) -> Result<EventRecordRequest, S
         session: Some(message.session_id),
         run_ref: None,
         flow_ref: None,
+        runner: None,
         work_class: None,
         // `None` when the record carries no timestamp: the ledger keeps it
         // undated rather than dated by a guess.
@@ -922,10 +923,12 @@ fn select_requests(
 /// the call happened N times. Every fact coordinate must still agree.
 fn same_call(left: &EventRecordRequest, right: &EventRecordRequest) -> bool {
     // Destructure exhaustively so a new fact coordinate cannot be silently
-    // omitted from this comparison. Only the two observation coordinates differ.
+    // omitted from this comparison. Observation coordinates and the reader's
+    // runner label can differ without making a copied call a different fact.
     let EventRecordRequest {
         project_root: _,
         session: _,
+        runner: _,
         producer,
         producer_lineage,
         producer_ref,
@@ -1756,6 +1759,7 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
         );
         let before = ledger_dump(&state);
         payer_tick(&payer, &state, PI_COMPLETED + 2);
+        assert_eq!(table_count(&state, "usage_event WHERE runner IS NULL"), 1);
         // Windowed reads do not resume, so even an unchanged file is replayed.
         let replay = source
             .drain_in_window(&state, PI_COMPLETED + 3, PI_COMPLETED, PI_COMPLETED)

@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::ReportError;
 
-// Format 5 distinguishes unstated quantities from measured zeros in hourly
-// cells. Run cells are republished with the same hour so both reads agree.
-pub(crate) const FORMAT: i64 = 5;
+// Format 6 separates runner and host harness in spend cells. Run cells are
+// republished with the same hour so both reads agree.
+pub(crate) const FORMAT: i64 = 6;
 const HOUR_MS: i64 = 3_600_000;
 const MAX_RANGE: i64 = 31 * 24 * HOUR_MS;
 const HARNESSES: &[&str] = &[

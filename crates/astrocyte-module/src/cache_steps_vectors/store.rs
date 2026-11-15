@@ -123,6 +123,7 @@ pub(super) fn record(steps: &[Step<'_>], state: &SharedState) {
             session: Some(step.session.into()),
             run_ref: None,
             flow_ref: None,
+            runner: None,
             work_class: None,
             occurred_at_ms: step.at,
             emitted_at_ms: None,

@@ -304,7 +304,8 @@ Reads never write. A refusal on a read is one of the codes below.
 - `spend.report`: `totals`, `rows`, `undated`, `ingest_freshness`,
   `rate_staleness`, and `hierarchy_resolution` (`unavailable`) when grouped by
   `project`. `grouping` names are `provider`, `model`, `account`,
-  `auth_selection`, `charge_basis`, `work_class`, `project`, `producer`; `grain` is
+  `auth_selection`, `charge_basis`, `work_class`, `project`, `producer`, `runner`,
+  `harness`; `grain` is
   `hour`, `day`, `week` or `month`; `timezone` is an IANA name. Refusals:
   `invalid_grouping` (unknown or repeated), `invalid_grain`,
   `invalid_timezone`. Test: `spend_report_refusal_keeps_its_code`.
@@ -328,6 +329,14 @@ Reads never write. A refusal on a read is one of the codes below.
   Hour refuses `hour_timezone_unsupported` if the timezone has any offset that
   is not an integral number of UTC hours anywhere in the widened range, including
   historical second offsets and fractional-hour daylight saving offsets.
+
+  `runner` groups calls by the recorded runner (`broca`, `thalamus` or
+  `colliculus`); null identifies unmanaged calls. The label is recorded once,
+  not derived from current session declarations.
+  `harness` names the host loop: the event's harness for `thalamus-harness`
+  payer rows, and its producer otherwise. A BROCA call therefore has harness
+  `broca`, regardless of its event's harness field. Both dimensions support
+  `where`; `{"runner":[null]}` selects unmanaged calls.
 
   `where` is an optional object mapping any supported grouping name to a
   nonempty list of strings or JSON null. Values are ORed within each dimension,
@@ -367,7 +376,7 @@ Reads never write. A refusal on a read is one of the codes below.
   `analytics_tokens_and_exact_media_units_are_additive`,
   `analytics_widened_range_caps_and_calendar_edges`,
   `analytics_refusals_are_specific_and_read_only`. Tagged handler samples are
-  in `crates/astrocyte-module/test-vectors/analytics-reads-v1`, pinned by
+  in `crates/astrocyte-module/test-vectors/analytics-reads-v2`, pinned by
   `analytics_vectors_match_real_dispatch_and_sha256sums`.
 - `spend.subscription.report` keeps `rows`, `coverage` and `ingest_freshness`.
   `rows` lists account plans only. The additive `credential_rows` lists covered

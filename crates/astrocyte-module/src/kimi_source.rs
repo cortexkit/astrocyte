@@ -213,6 +213,7 @@ fn map_call(call: KimiCall) -> Result<EventRecordRequest, String> {
         session: Some(call.session_id),
         run_ref: None,
         flow_ref: None,
+        runner: None,
         work_class: None,
         occurred_at_ms: call.occurred_at_ms,
         emitted_at_ms: None,

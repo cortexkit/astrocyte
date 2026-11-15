@@ -476,6 +476,7 @@ fn record_row(tx: &Transaction<'_>, record: &Record, at: i64) -> Result<Option<S
             session: Some(record.session.clone()),
             run_ref: None,
             flow_ref: None,
+            runner: Some("thalamus".into()),
             work_class: owner.clone(),
             occurred_at_ms: Some(record.recorded_at),
             emitted_at_ms: None,
@@ -850,6 +851,7 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
         state.with_conn(|conn| {
             let row = conn.query_row("SELECT producer,producer_lineage,producer_ref,session,work_class,charge_basis,auth_selection,account_ref,model FROM usage_event", [], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,String>(8)?))).unwrap();
             assert_eq!(row,("thalamus-harness".into(),"session-a".into(),"attempt-a".into(),"session-a".into(),"owner-a".into(),"metered_api".into(),"login-a".into(),"account-a".into(),"model-a".into()));
+            assert_eq!(conn.query_row("SELECT runner FROM usage_event", [], |r| r.get::<_,String>(0)).unwrap(), "thalamus");
             let measurements = conn.prepare("SELECT role,unit,quantity_units FROM measurement ORDER BY role,unit").unwrap().query_map([],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
             assert_eq!(measurements,vec![("cache_write".into(),"token_cache_1h".into(),7),("cache_write".into(),"token_cache_5m".into(),5),("input".into(),"token".into(),17),("output".into(),"token".into(),7),("reasoning".into(),"token".into(),4)]);
             assert_eq!(conn.query_row("SELECT COUNT(*) FROM usage_event",[],|r|r.get::<_,i64>(0)).unwrap(),1);

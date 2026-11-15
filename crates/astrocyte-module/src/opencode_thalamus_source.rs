@@ -1039,6 +1039,20 @@ mod tests {
             f.shared_entry(vec![Fixture::shared_session("listed", false)])
         ]);
         f.tick(T0);
+        f.state
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT count(*) FROM usage_event WHERE runner='thalamus'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(
             f.events(),
             vec![
@@ -1644,6 +1658,17 @@ mod tests {
             entry["path"] = json!(head);
             f.declare(vec![entry]);
             f.tick(T0);
+            f.state
+                .with_conn(|conn| {
+                    assert_eq!(
+                        conn.query_row("SELECT runner FROM usage_event", [], |r| r
+                            .get::<_, String>(0))
+                            .unwrap(),
+                        "thalamus"
+                    );
+                    Ok(())
+                })
+                .unwrap();
             assert_eq!(
                 f.events(),
                 vec![("head-call".into(), "opencode".into(), Some(OWNER.into()))],
