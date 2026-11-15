@@ -189,6 +189,12 @@ fn analytics_refusals_are_specific_and_read_only() {
             json!({"grain":"hour","timezone":"Asia/Kolkata","from_ms":0,"to_ms":1}),
             "hour_timezone_unsupported",
         ),
+        // Caracas moved from -4:00 to -4:30 at 07:00Z on 9 Dec 2007. A range
+        // whose only fractional-offset instant is its last hour is refused.
+        (
+            json!({"grain":"hour","timezone":"America/Caracas","from_ms":1_197_072_000_000_i64,"to_ms":1_197_183_600_001_i64}),
+            "hour_timezone_unsupported",
+        ),
     ];
     for dimension in ["alfonso", "workload", "workspace", "parent_alfonso"] {
         cases.push((json!({"grouping":[dimension]}), "dimension_unavailable"));
@@ -206,6 +212,10 @@ fn analytics_refusals_are_specific_and_read_only() {
             other => panic!("expected {expected} for {extra}: {other:?}"),
         }
     }
+    // The same zone before the change has a whole-hour offset, so hourly
+    // buckets are local hours there.
+    let before: ReportRequest = serde_json::from_value(json!({"grouping":[],"grain":"hour","timezone":"America/Caracas","from_ms":1_197_072_000_000_i64,"to_ms":1_197_183_600_000_i64})).unwrap();
+    assert!(spend_report(&conn, &before, 100).is_ok());
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM usage_event", [], |r| r
             .get::<_, i64>(0))

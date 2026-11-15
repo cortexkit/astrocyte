@@ -65,10 +65,16 @@ impl ParsedReport {
                     return Err(ReportError::Refused(ReportRefusal::RangeTooLarge));
                 }
                 if grain == Grain::Hour {
-                    // Check every second: IANA historical offsets and transitions
-                    // have second precision, including short-lived fractional offsets.
-                    let mut at = from;
-                    while at < to {
+                    // Hour buckets are UTC hours, so they are local hours only
+                    // where the zone's offset is a whole number of hours. A zone
+                    // keeps a fractional offset (India's +5:30, Nepal's +5:45) for
+                    // years, never for minutes, so sampling the offset every 15
+                    // minutes, plus the range's last instant, finds one anywhere in
+                    // the range: 2,977 checks for 31 days, where checking every
+                    // second would take 2.7 million.
+                    let step = 15 * 60 * 1000;
+                    let samples = (from..to).step_by(step).chain(std::iter::once(to - 1));
+                    for at in samples {
                         let instant = Utc
                             .timestamp_millis_opt(at)
                             .single()
@@ -85,7 +91,6 @@ impl ParsedReport {
                                 ReportRefusal::HourTimezoneUnsupported,
                             ));
                         }
-                        at = at.checked_add(1000).ok_or(ReportError::Calendar)?;
                     }
                 }
                 Some((from, to))
