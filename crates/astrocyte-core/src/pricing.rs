@@ -1045,6 +1045,28 @@ pub fn reconcile_chunk_end(
     .optional()
 }
 
+/// Last completed whole-ledger queue check, retained across module restarts.
+pub fn last_queue_reconcile_completed_ms(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT last_queue_reconcile_completed_ms FROM pricing_selection_state WHERE id=1",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// Record completion in the final chunk's transaction so a rolled-back chunk
+/// cannot postpone the next check after a restart.
+pub fn mark_queue_reconcile_completed_in_tx(
+    conn: &Connection,
+    completed_ms: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE pricing_selection_state SET last_queue_reconcile_completed_ms=?1 WHERE id=1",
+        [completed_ms],
+    )?;
+    Ok(())
+}
+
 /// Enqueue every event in the id range `(after, through]` that needs pricing
 /// and is not already queued; either bound may be absent. Returns how many
 /// were enqueued.

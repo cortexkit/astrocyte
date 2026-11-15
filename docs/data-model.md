@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 52. A schema change appends a migration; an applied
+currently version 53. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -33,7 +33,7 @@ copies that timeout without running the table-creating probes.
 | `adjustment` | Each row records a signed write-off, restatement, repricing, refund or goodwill adjustment. | insert |
 | `priced_charge` | Each row records a charge-chain entry for a measurement and the origin of the pricing act. | insert only |
 | `pricing_pending` | Each row identifies an event with a measurement that has no current charge head. | queue |
-| `pricing_selection_state` | The row records the plan generation and the generation that coverage backfill has drained. | one row |
+| `pricing_selection_state` | The row tracks subscription-plan generations, the last generation whose history has been repriced, and the last completed pricing queue check. | one row |
 | `account_subscription` | Each row declares an effective-dated subscription plan for a provider account. | insert; close once |
 | `credential_subscription` | Each row declares an effective-dated subscription plan for a vault credential that has no account id, recorded only by vault-plan reconciliation. | insert; close once |
 | `vault_plan_history` | Each row preserves a vault record's changed plan key, raw provider and tier, optional account, source, effective time and observation time. | insert only, including unknown-plan changes |
@@ -403,7 +403,12 @@ report, the verdict and pricing read heads with `NOT EXISTS`. Tests:
 `pricing_pending` holds every event with a measurement that has no head. An
 event is queued in the transaction that records it and dequeued in the
 transaction that heads its last measurement. A periodic reconciliation
-re-checks the queue against the full ledger.
+re-checks the queue against the full ledger. Its final chunk commits
+`pricing_selection_state.last_queue_reconcile_completed_ms` in the same
+transaction as its queue changes. Startup waits until 24 hours after that
+completion; no completion, an overdue completion or a future completion starts
+the check immediately. An interrupted pass leaves the last completion unchanged
+and starts again from the beginning after a restart.
 
 `multiplier_observation` uses the same rule: a day's head is the row no other
 row supersedes, and `multiplier_observation_one_original_per_day` allows one

@@ -4790,6 +4790,15 @@ BEGIN
 END;
 "#,
     },
+    Migration {
+        version: 53,
+        statements: r#"-- A completed whole-ledger queue check remains fresh across restarts.
+-- An absent completion leaves the check due, including after an interrupted pass.
+ALTER TABLE pricing_selection_state ADD COLUMN last_queue_reconcile_completed_ms INTEGER
+    CHECK (last_queue_reconcile_completed_ms IS NULL OR
+           (typeof(last_queue_reconcile_completed_ms) = 'integer' AND last_queue_reconcile_completed_ms >= 0));
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between

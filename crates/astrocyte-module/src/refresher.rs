@@ -3338,7 +3338,7 @@ fn finish_pricing_pass(pass: PricingPass, failures: Vec<String>) -> Result<Prici
 }
 
 /// How long after one pricing queue check finishes the next one starts. The
-/// first check starts on the first tick after startup.
+/// last completion is durable, so restarting does not repeat a recent check.
 ///
 /// The check re-runs the old whole-ledger selection. It is expensive: on the
 /// production store (1.26 million events, 6.3 million measurements, 251
@@ -3473,6 +3473,12 @@ fn reconcile_chunk(
                     usize::try_from(count).unwrap_or(0)
                 }
             };
+            if through.is_none() {
+                astrocyte_core::pricing::mark_queue_reconcile_completed_in_tx(
+                    tx,
+                    current_time_ms(),
+                )?;
+            }
             Ok((through, added, examined))
         });
         match result {
@@ -3580,9 +3586,8 @@ impl ReconcileWalk {
 /// Schedules the pricing queue check and carries a pass across loop ticks.
 struct QueueReconciler {
     walk: Option<ReconcileWalk>,
-    /// When the next pass may start. Due at once, so every start checks the
-    /// queue before settling into the interval.
-    next_due: std::time::Instant,
+    /// When the next pass may start; loaded from the store on the first tick.
+    next_due: Option<std::time::Instant>,
     chunk_events: NonZeroUsize,
     tick_budget: Duration,
 }
@@ -3591,7 +3596,7 @@ impl QueueReconciler {
     fn new(chunk_events: NonZeroUsize, tick_budget: Duration) -> Self {
         Self {
             walk: None,
-            next_due: std::time::Instant::now(),
+            next_due: None,
             chunk_events,
             tick_budget,
         }
@@ -3613,9 +3618,30 @@ impl QueueReconciler {
         if stop.load(Ordering::Relaxed) {
             return;
         }
+        let next_due = *self.next_due.get_or_insert_with(|| {
+            let completed_ms = state
+                .with_conn(|conn| {
+                    astrocyte_core::pricing::last_queue_reconcile_completed_ms(conn)
+                        .map_err(|error| error.to_string())
+                })
+                .unwrap_or_else(|error| {
+                    tracing::error!(target: "pricing", %error,
+                        "cannot read pricing queue check completion; starting a full check");
+                    None
+                });
+            // A future completion means the wall clock moved backwards. Treat
+            // it like no completion rather than postponing the backstop.
+            let delay = completed_ms
+                .and_then(|completed| current_time_ms().checked_sub(completed))
+                .and_then(|age| u64::try_from(age).ok())
+                .map(Duration::from_millis)
+                .map(|age| QUEUE_RECONCILE_INTERVAL.saturating_sub(age))
+                .unwrap_or(Duration::ZERO);
+            std::time::Instant::now() + delay
+        });
         let mut walk = match self.walk.take() {
             Some(walk) => walk,
-            None if std::time::Instant::now() >= self.next_due => ReconcileWalk::default(),
+            None if std::time::Instant::now() >= next_due => ReconcileWalk::default(),
             None => return,
         };
         match walk.advance(state, stop, self.chunk_events, self.tick_budget) {
@@ -3657,7 +3683,7 @@ impl QueueReconciler {
                 );
             }
         }
-        self.next_due = std::time::Instant::now() + QUEUE_RECONCILE_INTERVAL;
+        self.next_due = Some(std::time::Instant::now() + QUEUE_RECONCILE_INTERVAL);
     }
 }
 
@@ -5755,6 +5781,149 @@ mod tests {
             ReconcileOutcome::Stopped { enqueued: 0 }
         );
         assert!(queued_event_ids(&state).is_empty());
+    }
+
+    fn set_queue_check_completion(state: &SharedState, completed_ms: Option<i64>) {
+        state
+            .ordered_write(|tx| {
+                tx.execute(
+                    "UPDATE pricing_selection_state SET last_queue_reconcile_completed_ms=?1 WHERE id=1",
+                    [completed_ms],
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(((), false))
+            })
+            .unwrap();
+    }
+
+    fn queue_check_completion(state: &SharedState) -> Option<i64> {
+        state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT last_queue_reconcile_completed_ms FROM pricing_selection_state WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .unwrap()
+    }
+
+    fn seed_queue_check_miss(state: &SharedState, event_id: &str) {
+        state
+            .ordered_write(|tx| {
+                insert_event_unqueued(
+                    tx,
+                    event_id,
+                    PROVIDER,
+                    ACCOUNT,
+                    1_800_000_000_000,
+                    "unknown",
+                    "claude",
+                )?;
+                Ok(((), true))
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn queue_check_restart_skips_a_recent_completed_pass() {
+        let state = test_state();
+        let completed_ms = current_time_ms() - 23 * 60 * 60 * 1_000;
+        set_queue_check_completion(&state, Some(completed_ms));
+        seed_queue_check_miss(&state, "ev-missed");
+
+        let mut restarted = QueueReconciler::new(QUEUE_RECONCILE_CHUNK, Duration::MAX);
+        restarted.tick(&state, &NEVER_STOP);
+
+        assert!(queued_event_ids(&state).is_empty());
+        assert!(!restarted.in_progress());
+        assert_eq!(queue_check_completion(&state), Some(completed_ms));
+    }
+
+    #[test]
+    fn queue_check_restart_runs_an_overdue_pass() {
+        let state = test_state();
+        let started_ms = current_time_ms();
+        set_queue_check_completion(&state, Some(started_ms - 25 * 60 * 60 * 1_000));
+        seed_queue_check_miss(&state, "ev-missed");
+
+        let mut restarted = QueueReconciler::new(QUEUE_RECONCILE_CHUNK, Duration::MAX);
+        restarted.tick(&state, &NEVER_STOP);
+
+        assert_eq!(queued_event_ids(&state), vec!["ev-missed"]);
+        assert!(!restarted.in_progress());
+        assert!(queue_check_completion(&state).unwrap() >= started_ms);
+    }
+
+    #[test]
+    fn queue_check_restart_runs_without_a_completed_pass() {
+        let state = test_state();
+        let started_ms = current_time_ms();
+        assert_eq!(queue_check_completion(&state), None);
+        seed_queue_check_miss(&state, "ev-missed");
+
+        let mut first = QueueReconciler::new(QUEUE_RECONCILE_CHUNK, Duration::MAX);
+        first.tick(&state, &NEVER_STOP);
+
+        assert_eq!(queued_event_ids(&state), vec!["ev-missed"]);
+        assert!(!first.in_progress());
+        let completed_ms = queue_check_completion(&state).unwrap();
+        assert!(completed_ms >= started_ms);
+
+        // A new scheduler must use the committed completion, not its constructor's time.
+        seed_queue_check_miss(&state, "ev-next-missed");
+        let mut restarted = QueueReconciler::new(QUEUE_RECONCILE_CHUNK, Duration::MAX);
+        restarted.tick(&state, &NEVER_STOP);
+        assert_eq!(queued_event_ids(&state), vec!["ev-missed"]);
+        assert_eq!(queue_check_completion(&state), Some(completed_ms));
+    }
+
+    #[test]
+    fn queue_check_restart_restarts_an_interrupted_pass() {
+        let state = test_state();
+        let started_ms = current_time_ms();
+        let old_completion = started_ms - 25 * 60 * 60 * 1_000;
+        set_queue_check_completion(&state, Some(old_completion));
+        for event_id in ["ev-10-missed", "ev-20-missed"] {
+            seed_queue_check_miss(&state, event_id);
+        }
+        let mut interrupted = QueueReconciler::new(NonZeroUsize::new(1).unwrap(), Duration::ZERO);
+        interrupted.tick(&state, &NEVER_STOP);
+        assert!(interrupted.in_progress());
+        assert_eq!(queued_event_ids(&state), vec!["ev-10-missed"]);
+        assert_eq!(queue_check_completion(&state), Some(old_completion));
+        drop(interrupted);
+
+        // A miss behind the discarded cursor proves that a restart walks from the start.
+        seed_queue_check_miss(&state, "ev-00-missed");
+        let mut restarted = QueueReconciler::new(QUEUE_RECONCILE_CHUNK, Duration::MAX);
+        restarted.tick(&state, &NEVER_STOP);
+
+        assert_eq!(
+            queued_event_ids(&state),
+            vec!["ev-00-missed", "ev-10-missed", "ev-20-missed"]
+        );
+        assert!(!restarted.in_progress());
+        assert!(queue_check_completion(&state).unwrap() >= started_ms);
+    }
+
+    #[test]
+    fn queue_check_restart_runs_when_completion_is_in_the_future() {
+        let state = test_state();
+        let started_ms = current_time_ms();
+        let future_ms = started_ms + 60 * 60 * 1_000;
+        set_queue_check_completion(&state, Some(future_ms));
+        seed_queue_check_miss(&state, "ev-missed");
+
+        let mut restarted = QueueReconciler::new(QUEUE_RECONCILE_CHUNK, Duration::MAX);
+        restarted.tick(&state, &NEVER_STOP);
+
+        assert_eq!(queued_event_ids(&state), vec!["ev-missed"]);
+        assert!(!restarted.in_progress());
+        let completed_ms = queue_check_completion(&state).unwrap();
+        assert!(completed_ms >= started_ms);
+        assert!(completed_ms < future_ms);
     }
 
     /// A producer that is always caught up and counts how often it is pulled,
