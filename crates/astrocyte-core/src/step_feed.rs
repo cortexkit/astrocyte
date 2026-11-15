@@ -472,7 +472,14 @@ pub fn rejudge_runner_steps(conn: &Connection, now_ms: i64) -> rusqlite::Result<
                 fields.remove(field);
             }
         }
-        if append_body(conn, now_ms, &body.to_string(), body != original, None)? {
+        // A row whose verdict fields are unchanged needs nothing: its cause
+        // was computed when it was appended. Skipping it keeps the cost to
+        // the rows a correction touches, since each append computes a cause
+        // from the step's whole session.
+        if body == original {
+            continue;
+        }
+        if append_body(conn, now_ms, &body.to_string(), true, None)? {
             appended += 1;
         }
     }

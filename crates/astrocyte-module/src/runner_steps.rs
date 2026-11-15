@@ -777,8 +777,19 @@ mod tests {
             .unwrap();
     }
 
+    fn rejudge(state: &crate::state::SharedState, at: i64) {
+        state
+            .with_conn(|conn| {
+                state
+                    .step_feed()
+                    .rejudge_runner_steps(conn, at)
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+    }
+
     #[test]
-    fn startup_rejudges_stored_runner_rows_once_without_touching_protected_rows() {
+    fn rejudge_corrects_stored_runner_rows_once_without_touching_protected_rows() {
         let directory = tempfile::tempdir().unwrap();
         let state = crate::state::leased_test_state(&directory);
         let at = now_ms();
@@ -830,8 +841,16 @@ mod tests {
         let before = feed_rows(&state);
         drop(state);
 
+        // Startup no longer re-judges: reopening the store leaves the feed
+        // exactly as it was.
         let state = crate::state::leased_test_state(&directory);
-        assert_eq!(feed_rows(&state), before + 1, "one correction at startup");
+        assert_eq!(
+            feed_rows(&state),
+            before,
+            "startup must not re-judge the feed"
+        );
+        rejudge(&state, at);
+        assert_eq!(feed_rows(&state), before + 1, "one correction");
         let served = rows(&state, json!({}));
         let corrected = served.last().unwrap();
         let mut expected = wrong.clone();
@@ -859,16 +878,18 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        drop(state);
-
-        let state = crate::state::leased_test_state(&directory);
-        assert_eq!(feed_rows(&state), before + 1, "a second startup is a no-op");
+        rejudge(&state, at);
+        assert_eq!(
+            feed_rows(&state),
+            before + 1,
+            "a second re-judge is a no-op"
+        );
     }
 
-    /// The startup correction of a runner row changes only its cache
-    /// diagnostics: the `message_id` the runner sent stays on the new row.
+    /// Re-judging a runner row changes only its cache diagnostics: the
+    /// `message_id` the runner sent stays on the new row.
     #[test]
-    fn startup_rejudge_keeps_a_runner_rows_message_id() {
+    fn rejudge_keeps_a_runner_rows_message_id() {
         let directory = tempfile::tempdir().unwrap();
         let state = crate::state::leased_test_state(&directory);
         let at = now_ms();
@@ -906,10 +927,8 @@ mod tests {
         });
         insert_feed_row(&state, at, &wrong);
         let before = feed_rows(&state);
-        drop(state);
-
-        let state = crate::state::leased_test_state(&directory);
-        assert_eq!(feed_rows(&state), before + 1, "one correction at startup");
+        rejudge(&state, at);
+        assert_eq!(feed_rows(&state), before + 1, "one correction");
         let served = rows(&state, json!({}));
         let corrected = served.last().unwrap();
         assert_eq!(corrected["step_ref"], "attempt-2");

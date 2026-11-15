@@ -205,8 +205,13 @@ impl FeedHub {
         self.append_and_notify(conn, || feed::append_changes(conn, now_ms, late))
     }
 
-    /// Correct retained aggregate-producer runner verdicts at startup, using
-    /// the same committed-row notices as ordinary feed appends.
+    /// Correct retained aggregate-producer runner verdicts, using the same
+    /// committed-row notices as ordinary feed appends. Startup no longer runs
+    /// it: it repaired rows judged before live verdicts compared only with
+    /// earlier live steps, and those rows have aged out of the feed. Run on
+    /// every start it read each retained runner step's whole session and held
+    /// registration past the daemon's two-minute deadline.
+    #[cfg(test)]
     pub(crate) fn rejudge_runner_steps(
         &self,
         conn: &Connection,
