@@ -3107,6 +3107,7 @@ fn observation_rows(
 
 #[cfg(test)]
 mod tests {
+    include!("fusiform_plan_price_tests.rs");
     include!("multiplier/v2_tests.rs");
     include!("multiplier/context_tier_tests.rs");
     include!("multiplier/history_scaling_tests.rs");
@@ -5016,6 +5017,7 @@ mod tests {
             }),
             quota_value: None,
             service_tiers: None,
+            concurrency: None,
             refusal_reason: refusal.map(str::to_string),
             boundary_at_ms: 0,
             established_by: "fusiform".into(),
@@ -5720,6 +5722,8 @@ mod tests {
                     aliased: vec![],
                     plane: None,
                     billing_rules: vec![],
+                    login_methods: vec![],
+                    speed_twins: vec![],
                 })
             }
         }
@@ -5973,6 +5977,8 @@ mod tests {
                     aliased: vec![],
                     plane: None,
                     billing_rules: vec![],
+                    login_methods: vec![],
+                    speed_twins: vec![],
                 })
             }
         }
@@ -6082,6 +6088,8 @@ mod tests {
                 aliased: self.aliased.clone(),
                 plane: None,
                 billing_rules: vec![],
+                login_methods: vec![],
+                speed_twins: vec![],
             })
         }
     }
@@ -6163,6 +6171,8 @@ mod tests {
                 aliased: vec![],
                 plane: None,
                 billing_rules: vec![],
+                login_methods: vec![],
+                speed_twins: vec![],
             })
         }
     }
@@ -6840,6 +6850,8 @@ mod tests {
                     aliased: vec![],
                     plane: None,
                     billing_rules: vec![],
+                    login_methods: vec![],
+                    speed_twins: vec![],
                 })
             }
         }

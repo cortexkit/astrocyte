@@ -2431,6 +2431,8 @@ mod tests {
                     aliased: vec![],
                     plane: None,
                     billing_rules: vec![],
+                    login_methods: vec![],
+                    speed_twins: vec![],
                 }),
                 calls: AtomicUsize::new(0),
                 requests: Mutex::new(Vec::new()),

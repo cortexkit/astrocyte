@@ -234,6 +234,7 @@ impl PlanPriceSource for Prices {
                     }),
                     quota_value: None,
                     service_tiers: None,
+                    concurrency: None,
                     refusal_reason: None,
                     boundary_at_ms: 0,
                     established_by: "fusiform".into(),

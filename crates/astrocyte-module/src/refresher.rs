@@ -8186,6 +8186,8 @@ mod multiplier_stage_tests {
                 aliased: vec![],
                 plane: None,
                 billing_rules: vec![],
+                login_methods: vec![],
+                speed_twins: vec![],
             })
         }
     }
@@ -8214,6 +8216,7 @@ mod multiplier_stage_tests {
                     }),
                     quota_value: None,
                     service_tiers: None,
+                    concurrency: None,
                     refusal_reason: None,
                     boundary_at_ms: 0,
                     established_by: "fusiform".into(),
