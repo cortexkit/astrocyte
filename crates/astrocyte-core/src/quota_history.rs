@@ -1,6 +1,8 @@
 //! Recorded quota readings, grouped into UTC buckets without estimating usage.
 
 use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::multiplier::clean::{reset_tolerance_ms, RESET_TOLERANCE_MS};
 use serde::{Deserialize, Serialize};
 
 const HOUR_MS: i64 = 3_600_000;
@@ -248,10 +250,17 @@ fn first_sample_sql(credential: bool) -> String {
     )
 }
 
+/// A recorded reset time (RFC 3339 text) in epoch milliseconds; unreadable
+/// text counts as unknown, as in the multiplier.
+fn reset_ms(text: Option<String>) -> Option<i64> {
+    text.and_then(|text| chrono::DateTime::parse_from_rfc3339(&text).ok())
+        .map(|at| at.timestamp_millis())
+}
+
 fn predecessor_sql(credential: bool) -> String {
     let (table, field) = sample_table(credential);
     format!(
-        "SELECT COALESCE(raw_used_percent,used_percent) FROM {table}
+        "SELECT COALESCE(raw_used_percent,used_percent),resets_at FROM {table}
              WHERE provider=?1 AND {field}=?2 AND pool_key=?3 AND fetched_at_instant<?4
              ORDER BY fetched_at_instant DESC LIMIT 1"
     )
@@ -260,7 +269,7 @@ fn predecessor_sql(credential: bool) -> String {
 fn samples_sql(credential: bool) -> String {
     let (table, field) = sample_table(credential);
     format!(
-        "SELECT fetched_at_instant,COALESCE(raw_used_percent,used_percent),window_minutes
+        "SELECT fetched_at_instant,COALESCE(raw_used_percent,used_percent),window_minutes,resets_at
              FROM {table} WHERE provider=?1 AND {field}=?2 AND pool_key=?3
              AND fetched_at_instant>=?4 AND fetched_at_instant<=?5
              ORDER BY fetched_at_instant"
@@ -276,10 +285,15 @@ fn read_window(
     (start, end): (i64, i64),
     grain_ms: i64,
 ) -> rusqlite::Result<Window> {
-    let mut previous: Option<f64> = conn
+    let predecessor: Option<(f64, Option<String>)> = conn
         .prepare_cached(&predecessor_sql(credential))?
-        .query_row(params![provider, identity, pool, start], |row| row.get(0))
+        .query_row(params![provider, identity, pool, start], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .optional()?;
+    let mut previous = predecessor.as_ref().map(|(used, _)| *used);
+    // The latest reset time seen so far: the current allowance period's end.
+    let mut horizon = predecessor.and_then(|(_, reset)| reset_ms(reset));
     let mut statement = conn.prepare_cached(&samples_sql(credential))?;
     let mut rows = statement.query(params![provider, identity, pool, start, end])?;
     let mut window = Window {
@@ -296,7 +310,19 @@ fn read_window(
         let used: f64 = row.get(1)?;
         let at_ms = at_ns.div_euclid(NANOS_PER_MS);
         let start_ms = at_ms.div_euclid(grain_ms) * grain_ms;
-        window.window_minutes = row.get(2)?;
+        let minutes: Option<i64> = row.get(2)?;
+        let reset = reset_ms(row.get(3)?);
+        let tolerance = minutes.map_or(RESET_TOLERANCE_MS, reset_tolerance_ms);
+        // A reading whose reset time is older than the current period's is a
+        // provider's cached answer from the previous allowance. The subscription
+        // multiplier skips it, and so does this history, so it can't draw a
+        // spike back to the old period's usage.
+        if let (Some(latest), Some(reset)) = (horizon, reset) {
+            if latest.saturating_sub(reset) > tolerance {
+                continue;
+            }
+        }
+        window.window_minutes = minutes;
         if let Some(bucket) = window
             .buckets
             .last_mut()
@@ -311,14 +337,25 @@ fn read_window(
                 samples: 1,
             });
         }
-        // Every observed drop is reported; provider reset timestamps can
-        // jitter without a real drop.
-        if let Some(from_percent) = previous.filter(|old| used < *old) {
-            window.resets.push(Reset {
-                at_ms,
-                from_percent,
-                to_percent: used,
-            });
+        // A reset is the window's reset time moving forward into a new
+        // allowance period, the boundary the subscription multiplier uses. A
+        // drop in the percent alone is not one: readings from two sources can
+        // differ by a point and alternate, and providers re-state the same reset
+        // time with seconds of jitter, which the tolerance absorbs. A reading
+        // with no reset time can't start a period.
+        if let (Some(old), Some(new)) = (horizon, reset) {
+            if new.saturating_sub(old) > tolerance {
+                if let Some(from_percent) = previous {
+                    window.resets.push(Reset {
+                        at_ms,
+                        from_percent,
+                        to_percent: used,
+                    });
+                }
+            }
+        }
+        if let Some(reset) = reset {
+            horizon = Some(horizon.map_or(reset, |latest| latest.max(reset)));
         }
         previous = Some(used);
     }

@@ -44,7 +44,7 @@ use crate::money::{round_nano_num, round_nano_ratio, MoneyError};
 use crate::pricing::{effective_output, prompt_size, EffectiveOutput, PromptSize};
 
 mod calibration;
-mod clean;
+pub(crate) mod clean;
 pub use clean::compute_plan_observations;
 
 /// Producers whose usage event is exactly one model call, so a tiered rate

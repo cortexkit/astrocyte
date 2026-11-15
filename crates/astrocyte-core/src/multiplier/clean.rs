@@ -10,7 +10,7 @@ pub(super) const ANTIGRAVITY_WRONG_VAULT_CUTOFF_NS: i64 = 1_792_523_280_000_000_
 // On one development store in October 2026, within-period reset times varied
 // by up to 312 seconds; separate periods were at least 85,737 seconds apart.
 // Ten minutes admits that jitter without inventing a rollover or stale cache.
-const RESET_TOLERANCE_MS: i64 = 10 * 60_000;
+pub(crate) const RESET_TOLERANCE_MS: i64 = 10 * 60_000;
 // A full day of matched account-hours and twenty points are the minimum sample;
 // excluded exposure is reported, not used as an unsupported share floor.
 const MIN_CLEAN_HOURS: usize = 24;
@@ -49,9 +49,16 @@ fn quiet_pair(previous: &Sample, current: &Sample, tolerance: i64) -> bool {
 }
 
 fn reset_tolerance(window: &WindowSelector) -> i64 {
+    reset_tolerance_ms(window.window_minutes)
+}
+
+/// How far a window's reset time must move forward before the readings belong
+/// to a new allowance period. Quota history uses the same rule, so a chart's
+/// reset marks agree with the periods the multiplier measures.
+pub(crate) fn reset_tolerance_ms(window_minutes: i64) -> i64 {
     // A genuinely short window still needs distinct periods: the tolerance
     // cannot merge a rollover of a one-minute pool, for example.
-    RESET_TOLERANCE_MS.min(window.window_minutes.saturating_mul(60_000) / 2)
+    RESET_TOLERANCE_MS.min(window_minutes.saturating_mul(60_000) / 2)
 }
 
 // Six-hour bins reduce sensitivity to integer-point rounding and the mismatch
