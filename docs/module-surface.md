@@ -989,7 +989,7 @@ member, a wrong type or another grain refuses `malformed`.
       "credential": null,
       "pool": "primary",
       "window_minutes": 300,
-      "buckets": [{"start_ms": 0, "used_percent_max": 142.0, "samples": 2}],
+      "buckets": [{"start_ms": 0, "used_percent_max": 142.0, "samples": 3}],
       "resets": [{"at_ms": 0, "from_percent": 197.0, "to_percent": 103.0}]
     }
   ],
@@ -1009,17 +1009,21 @@ member, a wrong type or another grain refuses `malformed`.
   (the raw percent when insula gave one, otherwise the normalized one, as the
   subscription multiplier reads them) and the number of readings. Percents can
   exceed 100. Buckets with no reading are omitted.
-- A reset is any drop in that percent between consecutive readings, stamped at
-  the later reading. The last reading before the range is used only to detect
-  a reset at the range's first reading; it adds to no bucket. Provider reset
-  times are not used, because they jitter between reads.
+- A reset is the recorded reset time moving forward past the latest reset time
+  seen so far by more than ten minutes, or half the window length if shorter,
+  stamped at the later reading with the previous and current percents. A percent
+  drop alone is not a reset, and a reading with no reset time cannot start a
+  period. A cached reading whose reset time is older than the current period's
+  by more than that tolerance is excluded from both buckets and resets. The
+  last reading before the range supplies the starting reset time and percent
+  to detect a reset at the range's first reading; it adds to no bucket.
 - `earliest_sample_ms` is the first recorded reading among the selected
   providers, from either table and regardless of the range, or `null` if none.
   A provider with no reading in the range can set it without appearing in
   `windows`.
 
 Samples, generated through the real handler and pinned by test, are in
-`crates/astrocyte-module/test-vectors/analytics-quota-history-v1/`. Tests:
+`crates/astrocyte-module/test-vectors/analytics-quota-history-v2/`. Tests:
 `quota_history_buckets_raw_percent_predecessor_resets_and_credentials`,
 `quota_history_refuses_invalid_ranges_and_empty_filters`.
 

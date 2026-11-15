@@ -23,22 +23,23 @@ mod tests {
 
     const DIR: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/test-vectors/analytics-quota-history-v1"
+        "/test-vectors/analytics-quota-history-v2"
     );
     const HOUR: i64 = 3_600_000;
     const DAY: i64 = 24 * HOUR;
 
     fn seed(state: &SharedState) {
         state.with_conn(|conn| {
-            for (pool, at, used, raw, minutes) in [
-                ("primary", -1, 97.0, Some(197.0), 300),
-                ("primary", 0, 3.0, Some(103.0), 300),
-                ("primary", HOUR / 2, 42.0, Some(142.0), 300),
-                ("secondary", 0, 65.0, None, 10080),
+            for (pool, at, used, raw, minutes, reset) in [
+                ("primary", -1, 97.0, Some(197.0), 300, "2026-11-01T00:00:00Z"),
+                ("primary", 0, 3.0, Some(103.0), 300, "2026-11-01T05:00:00Z"),
+                ("primary", HOUR / 2, 42.0, Some(142.0), 300, "2026-11-01T05:00:00Z"),
+                ("primary", 3 * HOUR / 4, 41.0, Some(141.0), 300, "2026-11-01T05:00:00Z"),
+                ("secondary", 0, 65.0, None, 10080, "2026-11-08T00:00:00Z"),
             ] {
-                conn.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes) VALUES('claude','synthetic-account',?1,?2,?3,?4,?5)", params![pool,at * 1_000_000,used,raw,minutes]).map_err(|e| e.to_string())?;
+                conn.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes,resets_at) VALUES('claude','synthetic-account',?1,?2,?3,?4,?5,?6)", params![pool,at * 1_000_000,used,raw,minutes,reset]).map_err(|e| e.to_string())?;
             }
-            conn.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent,window_minutes) VALUES('codex','synthetic-credential','primary',0,12,300)", []).map_err(|e| e.to_string())?;
+            conn.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at) VALUES('codex','synthetic-credential','primary',0,12,300,'2026-11-01T05:00:00Z')", []).map_err(|e| e.to_string())?;
             Ok(())
         }).unwrap();
     }
@@ -110,7 +111,7 @@ mod tests {
         let hour = &vectors[0].1["result"];
         assert_eq!(hour["windows"].as_array().unwrap().len(), 3);
         assert_eq!(hour["windows"][0]["buckets"][0]["used_percent_max"], 142.0);
-        assert_eq!(hour["windows"][0]["buckets"][0]["samples"], 2);
+        assert_eq!(hour["windows"][0]["buckets"][0]["samples"], 3);
         assert_eq!(
             hour["windows"][0]["resets"],
             json!([{"at_ms":0,"from_percent":197.0,"to_percent":103.0}])

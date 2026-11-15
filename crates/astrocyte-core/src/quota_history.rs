@@ -368,6 +368,10 @@ mod tests {
     use rusqlite::params;
     use serde_json::json;
 
+    const PERIOD_ONE: Option<&str> = Some("2026-11-01T00:00:00Z");
+    const PERIOD_TWO: Option<&str> = Some("2026-11-01T05:00:00Z");
+    const PERIOD_THREE: Option<&str> = Some("2026-11-01T10:00:00Z");
+
     fn conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::initialize_connection(&conn).unwrap();
@@ -384,6 +388,7 @@ mod tests {
         at_ms: i64,
         used: f64,
         raw: Option<f64>,
+        resets_at: Option<&str>,
     ) {
         let (table, field) = if credential {
             ("credential_window_sample", "credential_ref")
@@ -391,8 +396,8 @@ mod tests {
             ("window_sample", "account_ref")
         };
         conn.execute(
-            &format!("INSERT INTO {table} (provider,{field},pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes,resets_at) VALUES ('claude',?1,'primary',?2,?3,?4,300,'2026-11-01T00:00:00Z')"),
-            params![identity, at_ms * NANOS_PER_MS, used, raw],
+            &format!("INSERT INTO {table} (provider,{field},pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes,resets_at) VALUES ('claude',?1,'primary',?2,?3,?4,300,?5)"),
+            params![identity, at_ms * NANOS_PER_MS, used, raw, resets_at],
         ).unwrap();
     }
 
@@ -403,12 +408,28 @@ mod tests {
     #[test]
     fn quota_history_buckets_raw_percent_predecessor_resets_and_credentials() {
         let conn = conn();
-        sample(&conn, false, "account", -1, 97.0, Some(197.0));
-        sample(&conn, false, "account", 0, 3.0, Some(103.0));
-        sample(&conn, false, "account", HOUR_MS / 2, 8.0, Some(108.0));
-        sample(&conn, false, "account", HOUR_MS, 8.0, None);
-        sample(&conn, false, "account", 2 * HOUR_MS, 99.0, None);
-        sample(&conn, true, "account", 0, 42.0, None);
+        sample(&conn, false, "account", -1, 97.0, Some(197.0), PERIOD_ONE);
+        sample(&conn, false, "account", 0, 3.0, Some(103.0), PERIOD_TWO);
+        sample(
+            &conn,
+            false,
+            "account",
+            HOUR_MS / 2,
+            8.0,
+            Some(108.0),
+            PERIOD_TWO,
+        );
+        sample(&conn, false, "account", HOUR_MS, 8.0, None, PERIOD_THREE);
+        sample(
+            &conn,
+            false,
+            "account",
+            2 * HOUR_MS,
+            99.0,
+            None,
+            PERIOD_THREE,
+        );
+        sample(&conn, true, "account", 0, 42.0, None, PERIOD_ONE);
         let report = quota_history(&conn, &request(1, HOUR_MS + 1, "hour")).unwrap();
         assert_eq!(
             serde_json::to_value(report).unwrap(),
@@ -428,8 +449,8 @@ mod tests {
     #[test]
     fn quota_history_day_rounding_filter_and_earliest_outside_range() {
         let conn = conn();
-        sample(&conn, false, "old", -2 * DAY_MS, 40.0, None);
-        sample(&conn, false, "old", -1, 30.0, None);
+        sample(&conn, false, "old", -2 * DAY_MS, 40.0, None, PERIOD_ONE);
+        sample(&conn, false, "old", -1, 30.0, None, PERIOD_TWO);
         conn.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent) VALUES('codex','key','secondary',?1,25)", [(-3 * DAY_MS) * NANOS_PER_MS]).unwrap();
         let report = quota_history(&conn, &request(-1, 1, "day")).unwrap();
         assert_eq!(report.windows.len(), 1);
@@ -447,6 +468,187 @@ mod tests {
             quota_history(&conn, &filtered).unwrap().earliest_sample_ms,
             None
         );
+    }
+
+    #[test]
+    fn quota_history_reset_rule_same_time_one_point_drop_is_not_reset() {
+        for credential in [false, true] {
+            let conn = conn();
+            sample(&conn, credential, "id", 0, 42.0, None, PERIOD_ONE);
+            sample(&conn, credential, "id", HOUR_MS / 2, 41.0, None, PERIOD_ONE);
+            let report = quota_history(&conn, &request(0, HOUR_MS, "hour")).unwrap();
+            let window = &report.windows[0];
+            assert!(window.resets.is_empty(), "{:?}", window.resets);
+            assert_eq!(
+                window.buckets,
+                vec![Bucket {
+                    start_ms: 0,
+                    used_percent_max: 42.0,
+                    samples: 2,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn quota_history_reset_rule_forward_time_stamps_later_reading() {
+        for credential in [false, true] {
+            let conn = conn();
+            for (at, used, reset) in [
+                (0, 42.0, PERIOD_ONE),
+                (HOUR_MS / 4, 41.0, Some("2026-11-01T00:10:00Z")),
+                (HOUR_MS / 2, 43.0, Some("2026-11-01T00:20:00.001Z")),
+                (3 * HOUR_MS / 4, 44.0, Some("2026-11-01T00:20:00.001Z")),
+            ] {
+                sample(&conn, credential, "id", at, used, None, reset);
+            }
+            let report = quota_history(&conn, &request(0, HOUR_MS, "hour")).unwrap();
+            let window = &report.windows[0];
+            assert_eq!(
+                window.resets,
+                vec![Reset {
+                    at_ms: HOUR_MS / 2,
+                    from_percent: 41.0,
+                    to_percent: 43.0,
+                }]
+            );
+            assert_eq!(
+                window.buckets,
+                vec![Bucket {
+                    start_ms: 0,
+                    used_percent_max: 44.0,
+                    samples: 4,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn quota_history_reset_rule_jitter_keeps_latest_period_time() {
+        for credential in [false, true] {
+            let conn = conn();
+            for (at, used, reset) in [
+                (0, 43.0, PERIOD_ONE),
+                (HOUR_MS / 4, 42.0, Some("2026-11-01T00:04:00Z")),
+                (HOUR_MS / 2, 41.0, Some("2026-10-31T23:56:00Z")),
+                (3 * HOUR_MS / 4, 40.0, Some("2026-11-01T00:07:00Z")),
+            ] {
+                sample(&conn, credential, "id", at, used, None, reset);
+            }
+            let report = quota_history(&conn, &request(0, HOUR_MS, "hour")).unwrap();
+            let window = &report.windows[0];
+            assert!(window.resets.is_empty(), "{:?}", window.resets);
+            assert_eq!(
+                window.buckets,
+                vec![Bucket {
+                    start_ms: 0,
+                    used_percent_max: 43.0,
+                    samples: 4,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn quota_history_reset_rule_cached_previous_period_is_excluded() {
+        for credential in [false, true] {
+            let conn = conn();
+            for (at, used, reset) in [
+                (0, 90.0, PERIOD_ONE),
+                (HOUR_MS / 4, 4.0, PERIOD_TWO),
+                (HOUR_MS, 99.0, PERIOD_ONE),
+                (2 * HOUR_MS, 5.0, PERIOD_TWO),
+            ] {
+                sample(&conn, credential, "id", at, used, None, reset);
+            }
+            let report = quota_history(&conn, &request(0, 3 * HOUR_MS, "hour")).unwrap();
+            let window = &report.windows[0];
+            assert_eq!(
+                window.buckets,
+                vec![
+                    Bucket {
+                        start_ms: 0,
+                        used_percent_max: 90.0,
+                        samples: 2
+                    },
+                    Bucket {
+                        start_ms: 2 * HOUR_MS,
+                        used_percent_max: 5.0,
+                        samples: 1
+                    },
+                ]
+            );
+            assert_eq!(
+                window.resets,
+                vec![Reset {
+                    at_ms: HOUR_MS / 4,
+                    from_percent: 90.0,
+                    to_percent: 4.0,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn quota_history_reset_rule_unknown_time_never_starts_period() {
+        for credential in [false, true] {
+            let conn = conn();
+            for (at, used, reset) in [
+                (0, 99.0, None),
+                (HOUR_MS / 4, 5.0, PERIOD_ONE),
+                (HOUR_MS / 2, 4.0, None),
+                (3 * HOUR_MS / 4, 6.0, PERIOD_TWO),
+            ] {
+                sample(&conn, credential, "id", at, used, None, reset);
+            }
+            let report = quota_history(&conn, &request(0, HOUR_MS, "hour")).unwrap();
+            let window = &report.windows[0];
+            assert_eq!(
+                window.resets,
+                vec![Reset {
+                    at_ms: 3 * HOUR_MS / 4,
+                    from_percent: 4.0,
+                    to_percent: 6.0,
+                }]
+            );
+            assert_eq!(
+                window.buckets,
+                vec![Bucket {
+                    start_ms: 0,
+                    used_percent_max: 99.0,
+                    samples: 4,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn quota_history_reset_rule_predecessor_supplies_starting_period() {
+        for credential in [false, true] {
+            let conn = conn();
+            sample(&conn, credential, "id", -1, 40.0, None, PERIOD_ONE);
+            sample(&conn, credential, "id", 0, 41.0, None, PERIOD_TWO);
+            sample(&conn, credential, "id", HOUR_MS / 2, 42.0, None, PERIOD_TWO);
+            let report = quota_history(&conn, &request(0, HOUR_MS, "hour")).unwrap();
+            let window = &report.windows[0];
+            assert_eq!(
+                window.resets,
+                vec![Reset {
+                    at_ms: 0,
+                    from_percent: 40.0,
+                    to_percent: 41.0,
+                }]
+            );
+            assert_eq!(
+                window.buckets,
+                vec![Bucket {
+                    start_ms: 0,
+                    used_percent_max: 42.0,
+                    samples: 2,
+                }]
+            );
+            assert_eq!(report.earliest_sample_ms, Some(-1));
+        }
     }
 
     #[test]
@@ -531,13 +733,21 @@ mod tests {
         let measure = |history| {
             let conn = conn();
             for credential in [false, true] {
-                sample(&conn, credential, "id", -2 * DAY_MS, 95.0, None);
+                sample(&conn, credential, "id", -2 * DAY_MS, 95.0, None, PERIOD_ONE);
                 for n in 1..=history {
-                    sample(&conn, credential, "id", -DAY_MS + n, 95.0, None);
-                    sample(&conn, credential, "id", DAY_MS + n, 99.0, None);
+                    sample(&conn, credential, "id", -DAY_MS + n, 95.0, None, PERIOD_ONE);
+                    sample(
+                        &conn,
+                        credential,
+                        "id",
+                        DAY_MS + n,
+                        99.0,
+                        None,
+                        PERIOD_THREE,
+                    );
                 }
-                sample(&conn, credential, "id", 0, 5.0, None);
-                sample(&conn, credential, "id", HOUR_MS / 2, 10.0, None);
+                sample(&conn, credential, "id", 0, 5.0, None, PERIOD_TWO);
+                sample(&conn, credential, "id", HOUR_MS / 2, 10.0, None, PERIOD_TWO);
             }
             crate::multiplier::vm_steps(&conn, || {
                 quota_history(&conn, &request(0, HOUR_MS, "hour")).unwrap()
@@ -558,8 +768,8 @@ mod tests {
     #[test]
     fn quota_history_extreme_millisecond_ranges_and_submillisecond_edges() {
         let conn = conn();
-        sample(&conn, false, "id", 0, 3.0, None);
-        conn.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent) VALUES('claude','id','primary',-1,90)", []).unwrap();
+        sample(&conn, false, "id", 0, 3.0, None, PERIOD_TWO);
+        conn.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,resets_at) VALUES('claude','id','primary',-1,90,?1)", [PERIOD_ONE]).unwrap();
         conn.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent) VALUES('claude','id','primary',?1,99)", [HOUR_MS * NANOS_PER_MS]).unwrap();
         let report = quota_history(&conn, &request(0, HOUR_MS, "hour")).unwrap();
         assert_eq!(report.earliest_sample_ms, Some(-1));
@@ -570,6 +780,13 @@ mod tests {
             assert!(report.windows.is_empty());
             assert_eq!(report.earliest_sample_ms, Some(-1));
         }
+    }
+
+    struct ReferenceSample {
+        at: i64,
+        used: f64,
+        minutes: Option<i64>,
+        reset: Option<i64>,
     }
 
     // The deliberately unbounded reader is a test oracle only. It compares
@@ -583,14 +800,14 @@ mod tests {
         };
         let from = request.from_ms - request.from_ms.rem_euclid(grain);
         let to = request.to_ms + (grain - request.to_ms.rem_euclid(grain)) % grain;
-        let mut groups = BTreeMap::<_, Vec<(i64, f64, Option<i64>)>>::new();
+        let mut groups = BTreeMap::<_, Vec<ReferenceSample>>::new();
         for credential in [false, true] {
             let (table, field) = if credential {
                 ("credential_window_sample", "credential_ref")
             } else {
                 ("window_sample", "account_ref")
             };
-            let mut statement = conn.prepare(&format!("SELECT provider,{field},pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes FROM {table} ORDER BY fetched_at_instant")).unwrap();
+            let mut statement = conn.prepare(&format!("SELECT provider,{field},pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes,resets_at FROM {table} ORDER BY fetched_at_instant")).unwrap();
             let mut rows = statement.query([]).unwrap();
             while let Some(row) = rows.next().unwrap() {
                 let provider: String = row.get(0).unwrap();
@@ -606,53 +823,83 @@ mod tests {
                 let at: i64 = row.get(3).unwrap();
                 let used: f64 = row.get(4).unwrap();
                 let raw: Option<f64> = row.get(5).unwrap();
+                let reset: Option<String> = row.get(7).unwrap();
                 groups
                     .entry((provider, credential, identity, pool))
                     .or_default()
-                    .push((
-                        at.div_euclid(NANOS_PER_MS),
-                        raw.unwrap_or(used),
-                        row.get(6).unwrap(),
-                    ));
+                    .push(ReferenceSample {
+                        at: at.div_euclid(NANOS_PER_MS),
+                        used: raw.unwrap_or(used),
+                        minutes: row.get(6).unwrap(),
+                        reset: reset.and_then(|text| {
+                            chrono::DateTime::parse_from_rfc3339(&text)
+                                .ok()
+                                .map(|time| time.timestamp_millis())
+                        }),
+                    });
             }
         }
         let mut report = QuotaHistory {
             windows: vec![],
             earliest_sample_ms: groups
                 .values()
-                .filter_map(|samples| samples.first().map(|sample| sample.0))
+                .filter_map(|samples| samples.first().map(|sample| sample.at))
                 .min(),
         };
         for ((provider, credential, identity, pool), samples) in groups {
             let selected: Vec<_> = samples
                 .iter()
-                .filter(|sample| sample.0 >= from && sample.0 < to)
+                .filter(|sample| sample.at >= from && sample.at < to)
                 .collect();
             if selected.is_empty() {
                 continue;
             }
-            let mut buckets = BTreeMap::<_, Vec<f64>>::new();
-            for (at, used, _) in &selected {
-                buckets
-                    .entry(at - at.rem_euclid(grain))
-                    .or_default()
-                    .push(*used);
-            }
-            let resets = samples
-                .windows(2)
-                .filter(|pair| pair[1].0 >= from && pair[1].0 < to && pair[1].1 < pair[0].1)
-                .map(|pair| Reset {
-                    at_ms: pair[1].0,
-                    from_percent: pair[0].1,
-                    to_percent: pair[1].1,
-                })
+            let predecessor = samples.iter().rev().find(|sample| sample.at < from);
+            let mut period_ends: Vec<_> = predecessor
+                .and_then(|sample| sample.reset)
+                .into_iter()
                 .collect();
+            let mut accepted: Vec<&ReferenceSample> = Vec::new();
+            let mut resets = Vec::new();
+            for sample in selected {
+                // Compare against every accepted period end rather than sharing
+                // the indexed reader's running horizon or tolerance helper.
+                let tolerance = sample.minutes.map_or(600_000, |minutes| {
+                    (i128::from(minutes) * 30_000).min(600_000)
+                });
+                if let (Some(latest), Some(reset)) = (period_ends.iter().max(), sample.reset) {
+                    let shift = i128::from(reset) - i128::from(*latest);
+                    if shift < -tolerance {
+                        continue;
+                    }
+                    if shift > tolerance {
+                        if let Some(previous) = accepted.last().copied().or(predecessor) {
+                            resets.push(Reset {
+                                at_ms: sample.at,
+                                from_percent: previous.used,
+                                to_percent: sample.used,
+                            });
+                        }
+                    }
+                }
+                if let Some(reset) = sample.reset {
+                    period_ends.push(reset);
+                }
+                accepted.push(sample);
+            }
+            let mut buckets = BTreeMap::<_, Vec<f64>>::new();
+            for sample in &accepted {
+                buckets
+                    .entry(sample.at - sample.at.rem_euclid(grain))
+                    .or_default()
+                    .push(sample.used);
+            }
             report.windows.push(Window {
                 quota_provider: provider,
                 account: (!credential).then(|| identity.clone()),
                 credential: credential.then_some(identity),
                 pool,
-                window_minutes: selected.last().unwrap().2,
+                window_minutes: accepted.last().and_then(|sample| sample.minutes),
                 buckets: buckets
                     .into_iter()
                     .map(|(start_ms, values)| Bucket {
@@ -674,16 +921,24 @@ mod tests {
             let (table, field) = sample_table(credential);
             for provider in ["claude", "codex"] {
                 for identity in ["account-a", "account-b"] {
-                    for (pool, minutes) in [("primary", Some(300)), ("secondary", None)] {
-                        for (at, used, raw) in [
-                            (-DAY_MS - 1, 90.0, None),
-                            (-1, 97.0, Some(197.0)),
-                            (0, 3.0, Some(103.0)),
-                            (HOUR_MS, 10.0, None),
-                            (DAY_MS, 20.0, None),
-                            (2 * DAY_MS, 2.0, None),
+                    for (pool, minutes) in [
+                        ("primary", Some(300)),
+                        ("secondary", None),
+                        ("short", Some(1)),
+                    ] {
+                        for (at, used, raw, reset) in [
+                            (-DAY_MS - 1, 90.0, None, None),
+                            (-1, 97.0, Some(197.0), PERIOD_ONE),
+                            (0, 3.0, Some(103.0), PERIOD_TWO),
+                            (HOUR_MS / 4, 2.0, Some(102.0), PERIOD_TWO),
+                            (HOUR_MS / 2, 99.0, Some(199.0), PERIOD_ONE),
+                            (HOUR_MS, 10.0, None, Some("2026-11-01T05:02:00Z")),
+                            (HOUR_MS + 1, 9.0, None, PERIOD_TWO),
+                            (DAY_MS, 20.0, None, Some("not a timestamp")),
+                            (DAY_MS + HOUR_MS, 21.0, None, None),
+                            (2 * DAY_MS, 2.0, None, PERIOD_THREE),
                         ] {
-                            conn.execute(&format!("INSERT INTO {table}(provider,{field},pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes) VALUES(?1,?2,?3,?4,?5,?6,?7)"), params![provider,identity,pool,at*NANOS_PER_MS,used,raw,minutes]).unwrap();
+                            conn.execute(&format!("INSERT INTO {table}(provider,{field},pool_key,fetched_at_instant,used_percent,raw_used_percent,window_minutes,resets_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)"), params![provider,identity,pool,at*NANOS_PER_MS,used,raw,minutes,reset]).unwrap();
                         }
                     }
                 }
