@@ -1057,6 +1057,70 @@ mod tests {
         assert!(rows(&state, json!({"harness": "broca", "session": "head"})).is_empty());
     }
 
+    /// Agent Runner's step bodies with the rewrite-cause facts, as its
+    /// publisher wrote them for each host (`tests/vectors/thalamus-step-cause`,
+    /// 16 Nov 2026). Each fact the body carries reaches the cause evidence
+    /// unchanged, and a fact the body leaves out stays unknown. Claude Code
+    /// sends only the account for now.
+    #[test]
+    fn agent_runner_step_cause_facts_decode_into_evidence() {
+        const VECTORS: [(&str, &[u8]); 3] = [
+            (
+                "opencode2",
+                include_bytes!("../tests/vectors/thalamus-step-cause/opencode2.json"),
+            ),
+            (
+                "pi",
+                include_bytes!("../tests/vectors/thalamus-step-cause/pi.json"),
+            ),
+            (
+                "claude-code",
+                include_bytes!("../tests/vectors/thalamus-step-cause/claude-code.json"),
+            ),
+        ];
+        let subject = names()
+            .live_subject("thalamus-harness", STEP_EVENT, 1)
+            .unwrap();
+        for (name, bytes) in VECTORS {
+            let sent: Value = serde_json::from_slice(bytes).unwrap();
+            let event = decode_step_finished(&subject, bytes)
+                .unwrap_or_else(|error| panic!("{name} does not decode: {error:?}"));
+            let step = feed_step(event).unwrap_or_else(|| panic!("{name} has no row identity"));
+            let evidence = &step.evidence;
+            assert_eq!(
+                evidence.account_ref.as_deref(),
+                sent["account_ref"].as_str(),
+                "{name}"
+            );
+            assert!(evidence.account_ref.is_some(), "{name} carries its account");
+            assert_eq!(
+                evidence.view_version,
+                sent["view_version"].as_u64(),
+                "{name}"
+            );
+            assert_eq!(
+                evidence.tools_digest.as_deref(),
+                sent["tools_digest"].as_str(),
+                "{name}"
+            );
+            assert_eq!(
+                evidence.system_digest.as_deref(),
+                sent["system_digest"].as_str(),
+                "{name}"
+            );
+            assert_eq!(
+                evidence.signed_floor.as_deref(),
+                sent["signed_floor"].as_str(),
+                "{name}"
+            );
+            if name == "claude-code" {
+                assert!(evidence.tools_digest.is_none() && evidence.view_version.is_none());
+            } else {
+                assert!(evidence.tools_digest.is_some() && evidence.system_digest.is_some());
+            }
+        }
+    }
+
     /// Every pinned broca body decodes on broca's live subject exactly as
     /// sent, keyed by runner and attempt id since broca sends no host record.
     /// Moved into the feed's window, each is served as its own runner row:
