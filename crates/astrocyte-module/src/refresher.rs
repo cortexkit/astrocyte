@@ -16,7 +16,7 @@ mod claude_thalamus_source;
 #[path = "codex_source.rs"]
 mod codex_source;
 #[path = "colliculus_source.rs"]
-mod colliculus_source;
+pub(crate) mod colliculus_source;
 #[path = "declared_roots.rs"]
 mod declared_roots;
 #[cfg(test)]

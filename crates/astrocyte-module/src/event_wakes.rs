@@ -65,6 +65,27 @@ impl Control {
         }
     }
 
+    /// How long a source with this `source_runtime` key may go without a
+    /// successful drain before health calls it stale, when that differs from
+    /// the ordinary four poll intervals. While its durable is attached, a
+    /// wake-driven source is read only on a wake or at its backstop, so a quiet
+    /// feed is current for up to two backstops: one missed backstop still
+    /// reads as fresh, two in a row do not.
+    pub(crate) fn freshness_horizon_ms(&self, source_key: &str) -> Option<i64> {
+        let source = match source_key {
+            crate::refresher::colliculus_source::SOURCE_KEY => Source::Media,
+            _ => return None,
+        };
+        let lanes = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lanes
+            .get(&source)
+            .filter(|lane| lane.attached)
+            .map(|_| source.backstop().saturating_mul(2))
+    }
+
     pub(crate) fn wake(&self, source: Source) -> oneshot::Receiver<bool> {
         let (send, receive) = oneshot::channel();
         self.0

@@ -90,7 +90,7 @@ transaction as the good calls and the cursor, and coverage counts them.
 2. Drain every source that `harness_ingest` allows. An excluded source is not read
    and loses its `source_runtime` row, like an absent one.
 3. Read insula quota: commit queued quota events, and call `usage.get` when the
-   event stream cannot be trusted or the freshness horizon is near (see below).
+   event stream cannot be trusted or the freshness horizon is near.
 4. Price queued calls (`run_pricing_walk`), bounded per tick by time and count.
 5. Spend up to two seconds on the daily check that every unpriced call is queued
    for pricing (`QUEUE_RECONCILE_INTERVAL`).
@@ -98,9 +98,8 @@ transaction as the good calls and the cursor, and coverage counts them.
 Then the loop rebuilds dirty summary hours for up to 1.5 seconds and runs the
 multiplier stage. Between full ticks it applies quota events every 250 ms and,
 every two seconds (`FAST_LANE_INTERVAL`), a fast lane: BROCA and the harness
-readers except Goose tail only what changed. Other sources
-wait for full ticks. Fast cycles commit nothing when idle and never count as a
-source's successful drain. A summary backlog keeps rebuilding between ticks.
+readers except Goose tail only what changed. Fast cycles commit nothing when
+idle and never count as a drain. A summary backlog keeps rebuilding between ticks.
 
 The bus reader thread holds one ckbus credential, opened with the launch secret
 already given to the daemon. It reads insula's per-account quota notices from
@@ -222,5 +221,5 @@ contract.
 `PublicProjection::health` reads only the in-memory projection, never the store.
 It degrades when the configuration is degraded, the last projection refresh
 failed, a source's last drain failed, or any source has had no successful drain
-within four poll intervals. Quota freshness
-is reported beside it and does not change the status.
+within four poll intervals (Colliculus, read on bus wakes, gets two 10-minute
+backstops). Quota freshness is reported beside it and does not change status.

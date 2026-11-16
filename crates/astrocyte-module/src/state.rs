@@ -37,6 +37,7 @@ enum StateStore {
 
 #[derive(Clone)]
 struct SourceRuntime {
+    source_key: String,
     last_success_ms: Option<i64>,
 }
 
@@ -851,12 +852,15 @@ impl SharedState {
     fn refresh_projection(&self) -> Result<(), String> {
         let (source_runtime, capacity_runtime) = self.with_conn(|conn| {
             let mut statement = conn
-                .prepare("SELECT last_success_ms FROM source_runtime ORDER BY source_key")
+                .prepare(
+                    "SELECT source_key,last_success_ms FROM source_runtime ORDER BY source_key",
+                )
                 .map_err(|error| error.to_string())?;
             let source_runtime = statement
                 .query_map([], |row| {
                     Ok(SourceRuntime {
-                        last_success_ms: row.get(0)?,
+                        source_key: row.get(0)?,
+                        last_success_ms: row.get(1)?,
                     })
                 })
                 .map_err(|error| error.to_string())?
@@ -1126,7 +1130,11 @@ impl PublicProjection {
             .unwrap_or(i64::MAX)
             .saturating_mul(1_000)
             .saturating_mul(4);
+        let wakes = &self.0 .0.event_wakes;
         let cold = projection.source_runtime.iter().any(|source| {
+            let horizon_ms = wakes
+                .freshness_horizon_ms(&source.source_key)
+                .unwrap_or(horizon_ms);
             source
                 .last_success_ms
                 .is_none_or(|last_success_ms| now_ms.saturating_sub(last_success_ms) > horizon_ms)
@@ -1537,6 +1545,45 @@ mod health_tests {
             state.public_projection().health(horizon_ms + 1).status,
             "degraded"
         );
+    }
+
+    /// While Colliculus's durable is attached, its feed is read only on a bus
+    /// wake or at the 10-minute backstop, so the ordinary four-interval horizon
+    /// would call a quiet, healthy feed stale. Attached, it gets two backstops
+    /// (20 minutes); detached, it is polled every tick and keeps the ordinary
+    /// horizon.
+    #[test]
+    fn attached_wake_driven_source_is_fresh_for_two_backstops() {
+        use crate::event_wakes::Source;
+        let state = test_state();
+        // Keep every other source fresh at all the instants checked below.
+        drain_broca(&state, 2_200_000, 5, 5);
+        state
+            .ordered_write(|tx| {
+                tx.execute(
+                    "INSERT INTO source_runtime(source_key,source_module,desired_generation,
+                     last_success_ms,pending_known,pending_unknown)
+                     SELECT 'colliculus','colliculus',desired_generation,1000000,0,0
+                     FROM source_runtime WHERE source_key='broca'",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(((), true))
+            })
+            .unwrap();
+        let at = 1_000_000 + 300_000;
+        assert_eq!(state.public_projection().health(at).status, "degraded");
+        state.event_wakes().attached(&[Source::Media], true);
+        assert_eq!(state.public_projection().health(at).status, "ok");
+        assert_eq!(
+            state
+                .public_projection()
+                .health(1_000_000 + 1_200_001)
+                .status,
+            "degraded"
+        );
+        state.event_wakes().attached(&[Source::Media], false);
+        assert_eq!(state.public_projection().health(at).status, "degraded");
     }
 }
 
