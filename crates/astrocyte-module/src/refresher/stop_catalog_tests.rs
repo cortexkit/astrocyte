@@ -65,6 +65,7 @@ fn stop_during_catalog_discovery_leaves_it_pending_for_retry() {
                     &FileSources::default(),
                     None,
                     &mut pending,
+                    &mut MultiplierStage::new(None),
                     &mut PricingWalk::new(PricingBudget::WHOLE_QUEUE),
                     &mut QueueReconciler::new(QUEUE_RECONCILE_CHUNK, QUEUE_RECONCILE_TICK_BUDGET),
                     &worker_stop,

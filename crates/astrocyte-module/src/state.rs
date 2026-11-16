@@ -66,6 +66,8 @@ struct Inner {
     source_discovery: Mutex<HashMap<String, bool>>,
     payer_waiting: Mutex<BTreeMap<String, usize>>,
     quota_bus: crate::quota_events::Control,
+    event_wakes: crate::event_wakes::Control,
+    runs_feed: crate::runs_feed::Hub,
     vault_report: RwLock<serde_json::Value>,
     /// Recent harness steps kept for `usage.cache.steps`. Lock order: this
     /// mutex before either store connection, never the other way round.
@@ -333,6 +335,8 @@ impl SharedState {
             source_discovery: Mutex::new(HashMap::new()),
             payer_waiting: Mutex::new(BTreeMap::new()),
             quota_bus: crate::quota_events::Control::default(),
+            event_wakes: crate::event_wakes::Control::default(),
+            runs_feed: crate::runs_feed::Hub::default(),
             vault_report: RwLock::new(
                 serde_json::json!({"vault_read_status":{"status":"not_read"}}),
             ),
@@ -539,6 +543,9 @@ impl SharedState {
                 store
                     .with_conn(|conn| {
                         let committed = run_ordered_transaction(conn, operation, skip_unchanged);
+                        if committed.is_ok() {
+                            self.0.runs_feed.committed(conn);
+                        }
                         if matches!(&committed, Ok((_, true))) {
                             crate::bus_publications::publish_watermark_on_connection(self, conn);
                         }
@@ -558,6 +565,7 @@ impl SharedState {
                     .lock()
                     .map_err(|_| StoreFailure::Store("store mutex poisoned".into()))?;
                 let committed = run_ordered_transaction(&guard, operation, skip_unchanged)?;
+                self.0.runs_feed.committed(&guard);
                 if committed.1 {
                     crate::bus_publications::publish_watermark_on_connection(self, &guard);
                 }
@@ -921,6 +929,28 @@ impl SharedState {
     /// The live step feed's subscriptions.
     pub fn step_feed(&self) -> &crate::step_feed::FeedHub {
         &self.0.step_feed
+    }
+
+    pub(crate) fn event_wakes(&self) -> &crate::event_wakes::Control {
+        &self.0.event_wakes
+    }
+
+    pub(crate) fn open_runs_watch(&self) -> Result<tokio::sync::watch::Receiver<String>, String> {
+        self.with_conn(|conn| self.0.runs_feed.open(conn))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn runs_subscriptions_for_test(&self) -> usize {
+        self.0.runs_feed.subscribers()
+    }
+
+    pub(crate) fn runs_summary_committed(&self) {
+        if let Err(error) = self.with_conn(|conn| {
+            self.0.runs_feed.summary_committed(conn);
+            Ok(())
+        }) {
+            tracing::warn!(%error, "runs summary notice unavailable");
+        }
     }
 
     pub(crate) fn bus_publications(&self) -> &crate::bus_publications::Control {

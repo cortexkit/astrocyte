@@ -778,8 +778,20 @@ fn bus_reader_without_insula_serves_runner_step_events() {
 }
 
 #[test]
-fn quota_real_durable_acknowledges_after_commit_and_never_creates_topology() {
-    let Some(server) = NatsServer::start() else {
+fn event_wakes_quota_real_durable_survives_refused_catalog_and_never_creates_topology() {
+    use cortexkit_bus_trait::PermissionViolationSource;
+    let Some(server) = NatsServer::start_with_config(
+        r#"
+        no_auth_user: admin
+        authorization { users: [
+            {user: admin, password: fixture},
+            {user: reader, password: fixture, permissions: {
+                publish: {allow: [">"], deny: ["$JS.API.CONSUMER.INFO.*.m_astrocyte_catalog"]}
+                subscribe: {allow: [">"]}
+            }}
+        ] }
+    "#,
+    ) else {
         return;
     };
     let (state, _) = seeded();
@@ -814,7 +826,7 @@ fn quota_real_durable_acknowledges_after_commit_and_never_creates_topology() {
         }).await.unwrap();
         let mut api = admin.subscribe("$JS.API.>").await.unwrap();
         admin.flush().await.unwrap();
-        let connection = NatsConnection::connect(&server.url, async_nats::ConnectOptions::new(),
+        let connection = NatsConnection::connect(&server.url, async_nats::ConnectOptions::new().user_and_password("reader".into(), "fixture".into()),
             cortexkit_bus_nats::ConnectConfig::new("quota_fixture").unwrap()).await.unwrap();
         assert!(bind(&connection, &empty.cached_info().config.name).await.is_err());
         let consumer = bind(&connection, &names.streams().event).await.unwrap();
@@ -830,13 +842,23 @@ fn quota_real_durable_acknowledges_after_commit_and_never_creates_topology() {
         let mut cursors = cursors();
         let session = run_session(state.quota_bus(), &insula, &credential, &consumer, &subject, &mut cursors);
         tokio::pin!(session);
+        let wakes = crate::event_wakes::follow(&state, &connection, &names);
+        tokio::pin!(wakes);
+        let mut violations = connection.permission_violations();
+        let mut refused_catalog = false;
         let mut committed = false;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 tokio::select! {
                     result = &mut session => panic!("reader ended before acknowledgement: {result:?}"),
+                    () = &mut wakes => panic!("wake followers ended after catalog refusal"),
+                    violation = violations.next_violation(), if !refused_catalog => {
+                        let violation = violation.unwrap().unwrap();
+                        assert!(violation.subject.ends_with(".m_astrocyte_catalog"));
+                        refused_catalog = true;
+                    }
                     _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                        if !state.quota_bus().0.lock().unwrap().pending.is_empty() {
+                        if refused_catalog && !state.quota_bus().0.lock().unwrap().pending.is_empty() {
                             assert_eq!(observer.info().await.unwrap().num_ack_pending, 1, "acknowledged before commit");
                             assert_eq!(rows(&state), before);
                             tick(&state, None);

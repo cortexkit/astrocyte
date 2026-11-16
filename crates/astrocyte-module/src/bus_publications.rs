@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use cortexkit_bus_naming::AccountNames;
 use cortexkit_bus_nats::NatsConnection;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
@@ -38,6 +38,8 @@ pub(crate) struct Control {
     attempted: Arc<Notify>,
     #[cfg(test)]
     processed_generation: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    fail_next_put: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Encode every component, including valid ASCII ones, to avoid escape collisions
@@ -150,15 +152,24 @@ impl Control {
     pub(crate) async fn follow(&self, connection: &NatsConnection, names: &AccountNames) {
         let mut multiplier = Mirror {
             warnings: self.warnings.clone(),
+            #[cfg(test)]
+            fail_next_put: self.fail_next_put.clone(),
             ..Mirror::default()
         };
         let mut read_marks = Mirror {
             warnings: self.warnings.clone(),
+            #[cfg(test)]
+            fail_next_put: self.fail_next_put.clone(),
             ..Mirror::default()
         };
         let mut sent_cursor = None;
+        let mut retry = Duration::from_secs(5);
         loop {
+            // A change already included in this snapshot must not consume the
+            // retry delay after a failure. Later changes still wake the follower.
+            let _ = self.changed.notified().now_or_never();
             let changed = self.changed.notified();
+            let mut failed = false;
             let desired = self
                 .desired
                 .lock()
@@ -167,6 +178,7 @@ impl Control {
             if desired.steps != sent_cursor {
                 if let Some(cursor) = &desired.steps {
                     let result = publish_steps(connection, names, cursor).await;
+                    failed |= result.is_err();
                     log_streak(&self.warnings, result.is_err(), "step hint");
                     if result.is_ok() {
                         sent_cursor = desired.steps;
@@ -174,7 +186,7 @@ impl Control {
                 }
             }
             if let Some(values) = desired.multiplier {
-                multiplier
+                failed |= !multiplier
                     .apply(
                         connection,
                         names,
@@ -198,7 +210,7 @@ impl Control {
                 prefixes.push("thalamus.watermark".into());
             }
             if !values.is_empty() || !prefixes.is_empty() {
-                read_marks
+                failed |= !read_marks
                     .apply(
                         connection,
                         names,
@@ -217,7 +229,18 @@ impl Control {
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
                 self.attempted.notify_one();
             }
-            changed.await;
+            if failed {
+                // Mirrors can stay unchanged for a day. Repair the current
+                // desired state without waiting for the next ledger change.
+                tokio::select! {
+                    () = changed => {},
+                    () = tokio::time::sleep(retry) => {},
+                }
+                retry = (retry * 2).min(Duration::from_secs(300));
+            } else {
+                retry = Duration::from_secs(5);
+                changed.await;
+            }
         }
     }
 }
@@ -283,6 +306,8 @@ async fn publish_steps(
 struct Mirror {
     values: Option<Values>,
     warnings: Arc<Mutex<Warnings>>,
+    #[cfg(test)]
+    fail_next_put: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Mirror {
@@ -294,7 +319,7 @@ impl Mirror {
         desired: &Values,
         prefixes: Option<&[String]>,
         cap: usize,
-    ) {
+    ) -> bool {
         let mut oversized = BTreeSet::new();
         {
             let mut warnings = self.warnings.lock().unwrap_or_else(|p| p.into_inner());
@@ -323,6 +348,7 @@ impl Mirror {
             self.values = None;
         }
         log_streak(&self.warnings, failed, bucket);
+        !failed
     }
 
     async fn reconcile(
@@ -374,6 +400,13 @@ impl Mirror {
         }
         for (key, value) in desired {
             if values.get(key) != Some(value) {
+                #[cfg(test)]
+                if self
+                    .fail_next_put
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(());
+                }
                 store.put(key, value.clone().into()).await.map_err(|_| ())?;
                 values.insert(key.clone(), value.clone());
             }

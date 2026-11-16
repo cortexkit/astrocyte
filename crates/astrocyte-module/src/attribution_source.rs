@@ -110,7 +110,7 @@ async fn drain_pages<T: ReadTransport>(
     now: i64,
     stop: &AtomicBool,
     route: &mut T,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let stored = state.with_conn(|conn| {
         conn.query_row(
             "SELECT cursor FROM attribution_cursor WHERE publisher=?1",
@@ -130,7 +130,7 @@ async fn drain_pages<T: ReadTransport>(
     }
     loop {
         if stop.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(false);
         }
         let mut params = json!({"limit":LIMIT});
         if let Some(cursor) = &cursor {
@@ -139,10 +139,10 @@ async fn drain_pages<T: ReadTransport>(
         // SDK failures and served refusals say nothing about ledger health.
         // They are retried on the next scheduled refresh without a durable write.
         let Ok(bytes) = route.read(params).await else {
-            return Ok(());
+            return Ok(false);
         };
         if stop.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(false);
         }
         let reply = serde_json::from_slice::<Value>(&bytes);
         if reply
@@ -151,7 +151,7 @@ async fn drain_pages<T: ReadTransport>(
             .and_then(|reply| reply.get("error"))
             .is_some_and(|error| !error.is_null())
         {
-            return Ok(());
+            return Ok(false);
         }
         let parsed = reply
             .ok()
@@ -159,20 +159,20 @@ async fn drain_pages<T: ReadTransport>(
             .and_then(|result| serde_json::from_value::<Page>(result).ok());
         let Some(page) = parsed.filter(|page| page.facts.len() <= LIMIT) else {
             malformed_page(state, publisher, &bytes, "malformed_page", now)?;
-            return Ok(());
+            return Ok(false);
         };
         if page.facts.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         if page.next.as_ref().is_some_and(|next| seen.contains(next)) {
             malformed_page(state, publisher, &bytes, "cursor_not_advanced", now)?;
-            return Ok(());
+            return Ok(false);
         }
         let needs_commit =
             state.with_conn(|conn| attribution::page_needs_commit(conn, publisher, &page))?;
         if needs_commit {
             if stop.load(Ordering::Relaxed) {
-                return Ok(());
+                return Ok(false);
             }
             state.ordered_write(|tx| {
                 let changed = attribution::commit_page(tx, publisher, cursor.as_ref(), &page, now)?;
@@ -183,14 +183,14 @@ async fn drain_pages<T: ReadTransport>(
             })?;
         }
         let Some(next) = page.next else {
-            return Ok(());
+            return Ok(true);
         };
         seen.push(next.clone());
         cursor = Some(next);
     }
 }
 
-pub(super) fn drain_all(state: &SharedState, stop: &AtomicBool) {
+pub(super) fn drain_all(state: &SharedState, stop: &AtomicBool, full_tick: bool) {
     if !state.quota_bus().hello_acked() {
         return;
     }
@@ -200,28 +200,47 @@ pub(super) fn drain_all(state: &SharedState, stop: &AtomicBool) {
     else {
         return;
     };
-    runtime.block_on(async {
-        for publisher in Publisher::ALL {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
+    drain_selected(state, stop, full_tick, |publisher| {
+        runtime.block_on(async {
             // Absence and routing refusals are normal while publishers roll out.
             // Do not create source_runtime rows or change an existing health result.
             let Ok(mut route) = Route::open(state, publisher).await else {
-                continue;
+                return Ok(false);
             };
-            let now = crate::state::now_ms();
-            if let Err(error) = drain_pages(state, publisher, now, stop, &mut route).await {
-                if !stop.load(Ordering::Relaxed) {
-                    tracing::warn!(
-                        publisher = publisher.module(),
-                        %error,
-                        "attribution page was not committed"
-                    );
-                }
+            drain_pages(state, publisher, crate::state::now_ms(), stop, &mut route).await
+        })
+    });
+}
+
+fn drain_selected(
+    state: &SharedState,
+    stop: &AtomicBool,
+    full_tick: bool,
+    mut read: impl FnMut(Publisher) -> Result<bool, String>,
+) {
+    for publisher in Publisher::ALL {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(ticket) = state.event_wakes().begin(
+            crate::event_wakes::Source::Attribution(publisher.module()),
+            full_tick,
+            crate::state::now_ms(),
+        ) else {
+            continue;
+        };
+        let result = read(publisher);
+        ticket.finish(matches!(result, Ok(true)));
+        if let Err(error) = result {
+            if !stop.load(Ordering::Relaxed) {
+                tracing::warn!(
+                    publisher = publisher.module(),
+                    %error,
+                    "attribution page was not committed"
+                );
             }
         }
-    });
+    }
 }
 
 pub(super) fn append_roots(

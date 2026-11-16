@@ -384,16 +384,13 @@ impl ColliculusSource {
     }
 }
 
-impl harness_drain::HarnessSource for ColliculusSource {
-    fn source_key(&self) -> &'static str {
-        SOURCE_KEY
-    }
-
-    fn drain_for_health(
+impl ColliculusSource {
+    fn read_for_health(
         &self,
         state: &SharedState,
         now: i64,
         stop: &AtomicBool,
+        notice: bool,
     ) -> Result<Option<String>, SourceDrainError> {
         #[cfg(not(test))]
         let wait_for_hello = true;
@@ -406,7 +403,7 @@ impl harness_drain::HarnessSource for ColliculusSource {
             .absent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !absent.may_try(now) {
+        if !notice && !absent.may_try(now) {
             // Still waiting after colliculus was found absent: treat it as
             // absent again, which leaves health and runtime rows untouched.
             return Ok(None);
@@ -442,7 +439,11 @@ impl harness_drain::HarnessSource for ColliculusSource {
             Ok(reason) => Ok(reason),
             Err(FeedError::Absent) => {
                 harness_drain::remove_runtime_row(state, SOURCE_KEY)?;
-                Ok(None)
+                if notice {
+                    Err(SourceDrainError::Deferred)
+                } else {
+                    Ok(None)
+                }
             }
             Err(FeedError::Stopped) => Err(SourceDrainError::Stopped),
             Err(FeedError::Failed(reason)) => {
@@ -451,6 +452,30 @@ impl harness_drain::HarnessSource for ColliculusSource {
             }
             Err(FeedError::Transient(_)) => unreachable!("handled above"),
         }
+    }
+}
+
+impl harness_drain::HarnessSource for ColliculusSource {
+    fn source_key(&self) -> &'static str {
+        SOURCE_KEY
+    }
+
+    fn drain_for_health(
+        &self,
+        state: &SharedState,
+        now: i64,
+        stop: &AtomicBool,
+    ) -> Result<Option<String>, SourceDrainError> {
+        self.read_for_health(state, now, stop, false)
+    }
+
+    fn drain_after_notice(
+        &self,
+        state: &SharedState,
+        now: i64,
+        stop: &AtomicBool,
+    ) -> Result<Option<String>, SourceDrainError> {
+        self.read_for_health(state, now, stop, true)
     }
 }
 

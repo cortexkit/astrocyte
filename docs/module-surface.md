@@ -39,7 +39,7 @@ see [operations](operations.md).
   controls dispatch. Run reads retain their principal checks on flow routes.
 - Every other operation on a flow route is refused `flow_scopes_unsupported`
   before dispatch, including every write and the principal-checked reads
-  `usage.steps.subscribe`, `usage.steps.read` and `watermark.get`. Without a
+  `usage.steps.subscribe`, `usage.steps.read`, `usage.runs.subscribe` and `watermark.get`. Without a
   flow, the step feed admits only local apps and Callosum phones, and
   `watermark.get` admits only `thalamus-harness`. Tests:
   `manifest_provides_flow_scopes_and_exact_read_operations`,
@@ -79,6 +79,7 @@ Test: `every_operation_name_reaches_its_own_handler`.
 | `usage.cache.steps` | read | `harness`, `session`, `limit?`, `after_cursor?` |
 | `usage.runs.list` | read | `from_ms`, `to_ms`, `harness?`, `limit?`, `after?` |
 | `usage.runs.detail` | read | `key`, `limit?`, `after?` |
+| `usage.runs.subscribe` | read, watch | none |
 | `spend.quota.history` | read | `from_ms`, `to_ms`, `grain`, `quota_providers?` |
 | `usage.steps.subscribe` | read, watch | `harness?`, `session?` |
 | `usage.steps.read` | read | `after?`, `limit?`, `harness?`, `session?` |
@@ -784,8 +785,8 @@ notices are unchanged.
 | Error `lagged`, detail `{"through": "<last notified cursor>"}` | The subscriber fell behind its queue bound. Subscribe again and read from the last cursor it holds. |
 | Caller's Cancel | Ended by the caller. The caller may still receive Error `cancelled` (the daemon may drop it) and treats it as the normal end. |
 
-Opening refusals: `not_permitted`, `subscription_capacity` (more than 16 open
-subscriptions), `draining` (astrocyte is stopping), `malformed`, and
+Opening refusals: `not_permitted`, `subscription_capacity` (the shared limit of 16
+open step and Runs subscriptions), `draining` (astrocyte is stopping), `malformed`, and
 `invalid_request` (only one filter member was supplied).
 
 #### `usage.steps.read`
@@ -1133,9 +1134,8 @@ figures rather than adding historical charges. List money excludes adjustments.
 List refusals: `malformed`, `invalid_range`, `range_too_large`, `invalid_request`
 (bad limit, harness or cursor/request mismatch), `not_permitted`. Detail refusals:
 `malformed`, `invalid_request`, `not_found` (no fact has that key), `not_permitted`.
-Pricing can trail ingest by a pass; pending counts expose that lag. No new watch
-is added: reread on existing step-feed notices. Repricing alone does not produce
-a feed notice; clients needing to observe resolved prices must reread separately.
+Pricing may lag ingestion; pending counts expose that lag. Subscribe to
+`usage.runs.subscribe` to re-read when calls or their recorded prices change.
 
 List totals use rebuildable key/model/hour cells maintained by the existing
 hourly dirty triggers, revision fence, bounded reducer, atomic publication and
@@ -1146,6 +1146,27 @@ whole-key totals combine clean cells and dirty-hour base reductions.
 Synthetic vectors and SHA-256 checksums are published under
 `crates/astrocyte-module/test-vectors/usage-runs-v1/`. Tests regenerate frame bodies
 through the real dispatch and the serving path's shared permission refusal.
+
+#### `usage.runs.subscribe`
+
+The request is `{}`. Each StreamData body is only `{"cursor":"<opaque>"}`.
+The cursor advances within the process when a committed call, a new or superseding
+charge head (the current recorded price row for a measurement), or a rebuilt
+run-summary hour could change Runs reads. A replacement charge preserves the
+earlier row and becomes the new head. The cursor is a change
+token, not a paging or durable resume cursor; a process restart can repeat a value.
+On opening or reconnecting, read `usage.runs.list`, then re-read on each notice.
+Notices are coalesced to at most one per two seconds per subscriber, and an idle
+ledger sends nothing. No call or price evidence is carried by a notice.
+
+Admission is exactly the Runs reads' admission: local apps and Callosum phone
+routes, not flows. The watch shares the step watch's 16 subscription slots and
+held-request pool. Opening refusals are `not_permitted`, `subscription_capacity`,
+`draining`, and `malformed` (unknown parameters). Cancellation ends with the same
+`cancelled` error as the step watch; route closure and module shutdown end the
+stream. A slow subscriber receives the newest coalesced token rather than a
+queue of intermediate tokens. Synthetic request, notice and refusal vectors with
+checksums are in `crates/astrocyte-module/test-vectors/usage-runs-subscribe-v1/`.
 
 ### 4.5 Quota history (`spend.quota.history`)
 

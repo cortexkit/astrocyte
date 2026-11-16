@@ -97,7 +97,7 @@ struct HubState {
 pub struct FeedHub {
     pub(crate) publications: crate::bus_publications::Control,
     state: Mutex<HubState>,
-    slots: Arc<Semaphore>,
+    pub(crate) slots: Arc<Semaphore>,
     runner: Mutex<RunnerCounts>,
 }
 

@@ -19,6 +19,9 @@ mod codex_source;
 mod colliculus_source;
 #[path = "declared_roots.rs"]
 mod declared_roots;
+#[cfg(test)]
+#[path = "refresher_event_wakes_tests.rs"]
+mod event_wakes_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "fast_lane_measure.rs"]
 mod fast_lane_measure;
@@ -348,6 +351,16 @@ pub(crate) mod harness_drain {
             recorded_at_ms: i64,
             stop: &AtomicBool,
         ) -> Result<Option<String>, SourceDrainError>;
+
+        /// A durable notice requires an actual read, not an absence-backoff hit.
+        fn drain_after_notice(
+            &self,
+            state: &SharedState,
+            recorded_at_ms: i64,
+            stop: &AtomicBool,
+        ) -> Result<Option<String>, SourceDrainError> {
+            self.drain_for_health(state, recorded_at_ms, stop)
+        }
 
         /// Read only cheap tails. Sources without an incremental path stay on full ticks.
         fn drain_fast(
@@ -1968,6 +1981,7 @@ fn run_loop_full(
             &file_sources,
             capacity.as_deref(),
             &mut pending_catalog,
+            &mut multiplier,
             &mut pricing,
             &mut reconciler,
             &stop,
@@ -1975,12 +1989,7 @@ fn run_loop_full(
         let mut summaries_behind = summary_tick(&state, &mut summaries, &stop);
         valuation_tick(&state, &mut valuations, &stop, Duration::from_millis(1_500));
         if !stop.load(Ordering::Relaxed) {
-            multiplier.tick_until_stopped(
-                &state,
-                pending_catalog.is_some(),
-                current_time_ms(),
-                &stop,
-            );
+            multiplier.tick_days(&state, pending_catalog.is_some(), current_time_ms(), &stop);
         }
         let started = std::time::Instant::now();
         let mut next_fast = FAST_LANE_INTERVAL;
@@ -1988,6 +1997,18 @@ fn run_loop_full(
         state.note_interval_wait_for_test();
         while !stop.load(Ordering::Relaxed) && started.elapsed() < interval {
             crate::quota_events::drain(&state, &stop);
+            catalog_wake_tick(&state, &mut pending_catalog, &mut multiplier, &stop, false);
+            attribution_source::drain_all(&state, &stop, false);
+            for source in &file_sources.harnesses {
+                if source.source_key() == colliculus_source::SOURCE_KEY
+                    && state
+                        .desired_config()
+                        .harness_ingest
+                        .ingests(colliculus_source::SOURCE_KEY)
+                {
+                    drain_media_if_due(&state, source.as_ref(), &stop, false);
+                }
+            }
             fast_lane_if_due(
                 &state,
                 &producers,
@@ -2260,6 +2281,9 @@ fn summary_tick_within(
             });
             match result {
                 Ok(outcome) => {
+                    if outcome.published && !outcome.attribution_only {
+                        state.runs_summary_committed();
+                    }
                     if outcome.deferred {
                         tracing::warn!(target: "summary", hour=?outcome.hour,
                             "hour exceeds bounded summary publication; retaining live aggregation");
@@ -2302,19 +2326,14 @@ fn run_tick(
     file_sources: &FileSources,
     capacity: Option<&dyn CapacitySource>,
     pending_catalog: &mut Option<PendingCatalog>,
+    multiplier: &mut MultiplierStage,
     pricing: &mut PricingWalk,
     reconciler: &mut QueueReconciler,
     stop: &AtomicBool,
 ) {
     #[cfg(all(test, target_os = "linux"))]
     let _measurement = fast_lane_measure::cycle(false);
-    if let Some(pending) = pending_catalog.as_ref() {
-        match pending.try_connect(state, stop) {
-            Ok(true) => *pending_catalog = None,
-            Ok(false) => {}
-            Err(error) => tracing::error!(target: "pricing", %error, "install catalog failed"),
-        }
-    }
+    catalog_wake_tick(state, pending_catalog, multiplier, stop, true);
     run_iteration_all(
         state,
         producers,
@@ -2555,10 +2574,14 @@ fn run_iteration_all(
         if !ingesting(state, &ingest, key) {
             continue;
         }
-        drain_harness(state, *harness, stop);
+        if key == colliculus_source::SOURCE_KEY {
+            drain_media_if_due(state, *harness, stop, true);
+        } else {
+            drain_harness(state, *harness, stop);
+        }
     }
 
-    attribution_source::drain_all(state, stop);
+    attribution_source::drain_all(state, stop, true);
 
     for producer in producers {
         if stop.load(Ordering::Relaxed) {
@@ -2686,13 +2709,96 @@ fn drain_harness(
     harness: &dyn harness_drain::HarnessSource,
     stop: &AtomicBool,
 ) {
-    let key = harness.source_key();
-    match harness.drain_for_health(state, current_time_ms(), stop) {
+    finish_harness_drain(
+        state,
+        harness.source_key(),
+        harness.drain_for_health(state, current_time_ms(), stop),
+    );
+}
+
+fn drain_media_if_due(
+    state: &SharedState,
+    harness: &dyn harness_drain::HarnessSource,
+    stop: &AtomicBool,
+    full_tick: bool,
+) {
+    let Some(ticket) = state.event_wakes().begin(
+        crate::event_wakes::Source::Media,
+        full_tick,
+        current_time_ms(),
+    ) else {
+        return;
+    };
+    let result = if ticket.has_notice() {
+        harness.drain_after_notice(state, current_time_ms(), stop)
+    } else {
+        harness.drain_for_health(state, current_time_ms(), stop)
+    };
+    ticket.finish(result.is_ok());
+    finish_harness_drain(state, harness.source_key(), result);
+}
+
+fn finish_harness_drain(
+    state: &SharedState,
+    key: &str,
+    result: Result<Option<String>, SourceDrainError>,
+) {
+    match result {
         Ok(None) => state.clear_producer_degraded(key),
         // A stopped drain committed nothing and says nothing about health.
         Err(SourceDrainError::Stopped | SourceDrainError::Deferred) => {}
         Ok(Some(reason)) | Err(SourceDrainError::Failed(reason)) => {
             harness_drain::mark_drain_failed(state, key, reason)
+        }
+    }
+}
+
+fn catalog_wake_tick(
+    state: &SharedState,
+    pending: &mut Option<PendingCatalog>,
+    multiplier: &mut MultiplierStage,
+    stop: &AtomicBool,
+    full_tick: bool,
+) {
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(ticket) = state.event_wakes().begin(
+        crate::event_wakes::Source::Catalog,
+        full_tick,
+        current_time_ms(),
+    ) else {
+        return;
+    };
+    if let Some(discovery) = pending.as_ref() {
+        // Discovery reads the history boundary; rate-era refresh below reads
+        // the version. Keep both authoritative reads in this one coalesced
+        // cycle when discovery succeeds, as on the original full-tick path.
+        match discovery.try_connect(state, stop) {
+            Ok(true) => *pending = None,
+            Ok(false) => {
+                ticket.finish(false);
+                return;
+            }
+            Err(error) => {
+                tracing::error!(target: "pricing", %error, "install catalog failed");
+                ticket.finish(false);
+                return;
+            }
+        }
+    }
+    if state.catalog_client().is_none() || stop.load(Ordering::Relaxed) {
+        ticket.finish(false);
+        return;
+    }
+    match rate_era_tick(state, &mut multiplier.rate_backoff) {
+        Ok(pending) => {
+            multiplier.rates_pending = pending;
+            ticket.finish(true);
+        }
+        Err(error) => {
+            tracing::warn!(target: "valuation", %error, "rate timeline refresh deferred");
+            ticket.finish(false);
         }
     }
 }
@@ -3955,6 +4061,7 @@ impl MultiplierStage {
     /// `catalog_pending`: fusiform is configured but its history boundary is
     /// not yet discovered, so rates cannot be read yet. The day waits for it
     /// rather than failing.
+    #[cfg(test)]
     pub(crate) fn tick_until_stopped(
         &mut self,
         state: &SharedState,
@@ -3972,6 +4079,28 @@ impl MultiplierStage {
                 None
             }
         };
+        self.tick_days(state, catalog_pending, now_ms, stop);
+    }
+
+    fn tick_days(
+        &mut self,
+        state: &SharedState,
+        catalog_pending: bool,
+        now_ms: i64,
+        stop: &AtomicBool,
+    ) {
+        // A newly ingested model needs a timeline even when the catalog has
+        // not moved. Only status RPCs are wake/backstop-driven; local model
+        // discovery and unread timelines still advance on every full tick.
+        if let Some(version) = self.rate_backoff.catalog_version {
+            self.rates_pending = match rate_era_refresh(state, version, &mut self.rate_backoff) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::warn!(target: "valuation", %error, "rate timeline refresh deferred");
+                    None
+                }
+            };
+        }
         let interval_end_ms = now_ms - now_ms.rem_euclid(DAY_MS);
         // The seven days the look-back covers, oldest first, each with the
         // end of its interval. A clock so far out that one of them has no
@@ -4299,7 +4428,6 @@ const RATE_FETCH_MODEL_BUDGET: Duration = Duration::from_secs(5);
 /// discovery and publication. Returns the catalog version when models that may
 /// be tried now are still unread after the pass.
 fn rate_era_tick(state: &SharedState, backoff: &mut RateBackoff) -> Result<Option<i64>, String> {
-    use astrocyte_core::rate_era;
     let Some(catalog) = state.catalog_client() else {
         return Ok(None);
     };
@@ -4308,6 +4436,15 @@ fn rate_era_tick(state: &SharedState, backoff: &mut RateBackoff) -> Result<Optio
         .catalog_version()
         .map_err(|error| format!("{error:?}"))?;
     backoff.catalog_seen(version);
+    rate_era_refresh(state, version, backoff)
+}
+
+fn rate_era_refresh(
+    state: &SharedState,
+    version: i64,
+    backoff: &mut RateBackoff,
+) -> Result<Option<i64>, String> {
+    use astrocyte_core::rate_era;
     let config = state.desired_config();
     let empty_twins = std::collections::BTreeMap::new();
     let twins = match &config.subscription_multiplier {
@@ -5119,6 +5256,7 @@ mod tests {
             &FileSources::default(),
             None,
             &mut pending,
+            &mut MultiplierStage::new(None),
             &mut pricing,
             &mut reconciler,
             &NEVER_STOP,
@@ -5136,6 +5274,7 @@ mod tests {
             &FileSources::default(),
             None,
             &mut pending,
+            &mut MultiplierStage::new(None),
             &mut pricing,
             &mut reconciler,
             &NEVER_STOP,
@@ -5160,7 +5299,7 @@ mod tests {
                 .iter()
                 .filter(|request| request["name"] == "catalog.status")
                 .count(),
-            3
+            4
         );
         assert!(
             !requests
@@ -5190,6 +5329,7 @@ mod tests {
             &FileSources::default(),
             None,
             &mut pending,
+            &mut MultiplierStage::new(None),
             &mut PricingWalk::new(PricingBudget::WHOLE_QUEUE),
             &mut QueueReconciler::new(QUEUE_RECONCILE_CHUNK, QUEUE_RECONCILE_TICK_BUDGET),
             &NEVER_STOP,
@@ -6346,6 +6486,7 @@ mod tests {
                 &file_sources,
                 None,
                 &mut None,
+                &mut MultiplierStage::new(None),
                 &mut PricingWalk::new(PricingBudget::WHOLE_QUEUE),
                 &mut reconciler,
                 &NEVER_STOP,
@@ -6885,6 +7026,7 @@ mod tests {
                 &file_sources,
                 None,
                 &mut None,
+                &mut MultiplierStage::new(None),
                 &mut pricing,
                 &mut reconciler,
                 &NEVER_STOP,

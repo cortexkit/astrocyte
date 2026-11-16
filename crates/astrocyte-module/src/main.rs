@@ -784,7 +784,11 @@ impl ModuleHandler for AstrocyteHandler {
         }
         if matches!(
             request.method.as_str(),
-            ops::OP_STEPS_SUBSCRIBE | ops::OP_STEPS_READ | ops::OP_RUNS_LIST | ops::OP_RUNS_DETAIL
+            ops::OP_STEPS_SUBSCRIBE
+                | ops::OP_STEPS_READ
+                | ops::OP_RUNS_LIST
+                | ops::OP_RUNS_DETAIL
+                | ops::OP_RUNS_SUBSCRIBE
         ) {
             if let Err((code, message)) =
                 step_feed::require_read_permission(&request.method, route.may_read_feed)
@@ -792,6 +796,15 @@ impl ModuleHandler for AstrocyteHandler {
                 return refusal(&code, message);
             }
             // Flow admission does not replace the principal check on run reads.
+            if request.method == ops::OP_RUNS_SUBSCRIBE {
+                return astrocyte_module::runs_feed::subscribe(
+                    &self.state,
+                    request.params,
+                    &ctx,
+                    self.subscriptions_stopping.subscribe(),
+                )
+                .await;
+            }
             if request.method == ops::OP_STEPS_SUBSCRIBE {
                 return step_feed::subscribe(
                     &self.state,
@@ -1052,22 +1065,23 @@ fn refusal(code: &str, message: String) -> HandlerOutcome {
 }
 
 /// The serve helper's pool for a request, from a peek at its body: a
-/// `usage.steps.subscribe` request is long-held. Only the first bytes are
+/// step or Runs subscription request is long-held. Only the first bytes are
 /// read, because this runs on the task that reads every frame; a request
 /// that puts its method name further in uses the default pool, which only
 /// costs it the separate pool.
 fn classify_request(body: &[u8]) -> RequestClass {
     const PEEK: usize = 512;
-    let needle = format!("\"{}\"", ops::OP_STEPS_SUBSCRIBE);
     let head = &body[..body.len().min(PEEK)];
-    if head
-        .windows(needle.len())
-        .any(|window| window == needle.as_bytes())
-    {
-        RequestClass::long_held().with_op(ops::OP_STEPS_SUBSCRIBE)
-    } else {
-        RequestClass::default_pool()
+    for operation in [ops::OP_STEPS_SUBSCRIBE, ops::OP_RUNS_SUBSCRIBE] {
+        let needle = format!("\"{operation}\"");
+        if head
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+        {
+            return RequestClass::long_held().with_op(operation);
+        }
     }
+    RequestClass::default_pool()
 }
 
 fn decode_route_request(body: &[u8]) -> Result<RouteRequest, HandlerOutcome> {
@@ -1239,12 +1253,14 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
             observability: Vec::new(),
             identity_scope: Vec::new(),
         }])
-        // The one watch: `usage.steps.subscribe` streams notices until the
-        // subscriber cancels. Every other operation is a unary call.
-        .operation_delivery(std::collections::BTreeMap::from([(
-            ops::OP_STEPS_SUBSCRIBE.to_string(),
-            OperationDelivery::WATCH,
-        )]))
+        // Watches hold a request until cancellation; all other reads are unary.
+        .operation_delivery(std::collections::BTreeMap::from([
+            (
+                ops::OP_STEPS_SUBSCRIBE.to_string(),
+                OperationDelivery::WATCH,
+            ),
+            (ops::OP_RUNS_SUBSCRIBE.to_string(), OperationDelivery::WATCH),
+        ]))
         .consumes(declared_consumers(desired))
         // `watermark.get` is the one operation of `log-read-watermark/v1`.
         // `bind-no-project/v1` says no route's project is read at bind (only
@@ -3139,6 +3155,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn runs_subscribe_flow_is_refused_before_dispatch() {
+        assert_flow_read_refused(ops::OP_RUNS_SUBSCRIBE, Principal::Direct).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_flow_stamped_watermark_read_is_refused_before_dispatch() {
         assert_flow_read_refused(ops::OP_WATERMARK_GET, thalamus_harness()).await;
     }
@@ -3305,19 +3326,20 @@ mod tests {
         .expect("the subscriptions never opened");
     }
 
-    /// The manifest declares `usage.steps.subscribe`, and only it, as a
-    /// watch, which is what lets the daemon route a subscription to it.
+    /// The manifest declares both held subscriptions as watches, which lets
+    /// the daemon route subscriptions to them.
     /// The surface is module-managed rather than serial: a held watch on a
     /// serial surface would block every other call, and callosum refuses to
     /// relay a watch from a serial module.
     #[test]
-    fn manifest_declares_the_step_subscription_as_the_only_watch() {
+    fn manifest_declares_the_step_and_runs_subscriptions_as_watches() {
         let manifest = manifest("astrocyte", &config::intentional_empty().config);
         assert!(manifest.is_watch_operation(ops::OP_STEPS_SUBSCRIBE));
+        assert!(manifest.is_watch_operation(ops::OP_RUNS_SUBSCRIBE));
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire["operation_delivery"],
-            json!({"usage.steps.subscribe": "watch"})
+            json!({"usage.steps.subscribe": "watch", "usage.runs.subscribe":"watch"})
         );
         let concurrency = manifest
             .provides
@@ -3481,6 +3503,7 @@ mod tests {
                     ops::OP_RUNS_DETAIL,
                     json!({"key":{"kind":"session","harness":"opencode","session":"ses_synthetic"}}),
                 ),
+                request_frame(*channel, corr + 4, ops::OP_RUNS_SUBSCRIBE, json!({})),
             ] {
                 let corr = request.header.corr;
                 send(&mut stream, request).await;
@@ -3542,6 +3565,69 @@ mod tests {
         }
         drop(stream);
         let _ = served(serving, "serving did not end at EOF").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runs_subscribe_serves_direct_and_phone_and_releases_on_cancel() {
+        let state = Arc::new(test_state());
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        for (channel, principal, harness) in [
+            (8, Principal::Direct, "desktop"),
+            (
+                9,
+                Principal::Reserved {
+                    module_id: "callosum".into(),
+                },
+                "fed-phone:synthetic",
+            ),
+        ] {
+            bind_as(&mut stream, channel, u64::from(channel), principal, harness).await;
+            send(
+                &mut stream,
+                request_frame(channel, 100, ops::OP_RUNS_SUBSCRIBE, json!({})),
+            )
+            .await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.runs_subscriptions_for_test() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both runs watches registered");
+        step_feed::record_steps_for_test(
+            &state,
+            "pi",
+            &[step_feed::TestStep::now("runs", "served")],
+            false,
+        )
+        .unwrap();
+        let mut received = std::collections::BTreeSet::new();
+        while received.len() < 2 {
+            let notice = next_frame(&mut stream).await;
+            if notice.header.corr != 100 || ![8, 9].contains(&notice.header.channel) {
+                continue;
+            }
+            assert_eq!(notice.header.ty, FrameType::StreamData);
+            assert!(received.insert(notice.header.channel));
+            let value: Value = serde_json::from_slice(&notice.body).unwrap();
+            assert_eq!(value.as_object().unwrap().len(), 1);
+            assert!(value["cursor"].is_string());
+        }
+        send(
+            &mut stream,
+            route_frame(FrameType::Cancel, 8, 1, 100, Vec::new()),
+        )
+        .await;
+        let cancelled = frame_for(&mut stream, 8, 100).await;
+        let error: ErrorBody = serde_json::from_slice(&cancelled.body).unwrap();
+        assert_eq!(error.code, "cancelled");
+        drop(stream);
+        let _ = served(serving, "runs watch did not end at EOF").await;
+        assert_eq!(state.runs_subscriptions_for_test(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

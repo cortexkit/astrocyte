@@ -502,9 +502,10 @@ Pi operations and Kimi CLI keep missing model and provider fields absent.
 ## Colliculus media usage
 
 The `colliculus` source is enabled by default and can be excluded through
-`harness_ingest.exclude`. Each full refresher tick opens a management route and
-pages `usage.read` with a limit of 1,000. Each page commits events, set-aside
-evidence and the durable cursor in one ingest transaction before `usage.ack` is
+`harness_ingest.exclude`. A bus wake or scheduled backstop opens a management route
+and pages `usage.read` with a limit of 1,000. Each page commits events, evidence
+set aside because it could not be accepted as valid usage, and the durable cursor
+in one ingest transaction before `usage.ack` is
 called. A failed acknowledgement leaves committed facts intact; subsequent drains
 retry acknowledgement and accept identical redelivery without recording spend twice.
 The media feed and event-bus readers share a staged launch identity released only after
@@ -524,6 +525,12 @@ acknowledged, so a late first read loses nothing. Daemon warming, reloading
 and stale-route refusals defer the drain without changing health and log once per
 episode. Other failures keep progress and mark the source failed for retry;
 `feed_not_admitted` degrades immediately with that reason.
+
+The `m_astrocyte_media_usage` durable wakes this drain between full ticks. While
+attached and pulling, full ticks only run its ten-minute backstop; without that
+durable, full-tick polling and absence backoff remain unchanged. A wake bypasses
+absence backoff. The backstop also finds records too large for Colliculus's bus
+publication limit. Bus bodies are ignored: only `usage.read` supplies evidence.
 
 The reader decodes the published `cortexkit-role-media` 0.1.6 types. Each vendor
 record uses its `record_id` as the colliculus producer reference, without an instance
@@ -633,3 +640,31 @@ Tests include `thalamus_payer_rowless_records_and_mirrors_once_with_exact_payer_
 `thalamus_payer_watermark_never_passes_an_uncommitted_mirror`,
 `pi_payer_wait_at_restart_replays_once_with_the_payer`, and
 `payer_wait_queue_later_pass_records_once_and_timeout_uses_completion`.
+
+## Shared bus wake scheduling
+
+The quota reader owns the module's one credential and NATS connection. Three
+independently retried durable consumers share it with quota events, runner steps
+and the publishers. `m_astrocyte_media_usage` wakes the Colliculus reader;
+`m_astrocyte_catalog` wakes pending Fusiform discovery and rate-era catalog
+refresh; `m_astrocyte_attribution` wakes only the publisher named in the subject
+(prefrontal-core, magic-context, basal, or entorhinal). The payer durable is not
+used: the payer store remains the only payer source.
+
+While each durable is attached and pulling, full ticks backstop media and catalog
+reads every ten minutes and attribution reads every hour. Without a usable durable,
+that reader retains full-tick polling. Refusing one durable neither detaches the
+others nor interrupts runner steps, quota events or publication. Pricing's
+per-measurement catalog reads are unaffected.
+Local rate-era model discovery and timeline filling still run each full tick
+against the last authoritative catalog version, so a newly ingested model does
+not wait for the next status backstop.
+
+A batch of messages schedules one coalesced read cycle. It supplies no billing or
+fact evidence and proves no source complete. The attribution subject only selects
+which existing `attribution.read` or `placement.read` route to open. A batch is
+acknowledged only after its authoritative read, begun after that batch arrived,
+commits or finds nothing new. A failed read leaves the batch unacknowledged for
+redelivery. Messages arriving during a read wait for another cycle. Cursors,
+source acknowledgements, commits and health decisions remain owned by the
+existing readers.

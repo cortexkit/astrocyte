@@ -8,6 +8,7 @@ mod bus_publications;
 mod cache_steps_vectors;
 mod capacity_map;
 pub mod config;
+mod event_wakes;
 mod fusiform_client;
 mod harness_paths;
 #[cfg(test)]
@@ -24,6 +25,7 @@ mod refresher;
 #[cfg(test)]
 mod rewrite_causes_vectors;
 mod runner_steps;
+pub mod runs_feed;
 #[cfg(test)]
 mod runs_vectors;
 pub mod state;

@@ -251,6 +251,7 @@ fn measure_fast_lane_five_minutes() {
         &corpus.files,
         None,
         &mut None,
+        &mut MultiplierStage::new(None),
         &mut PricingWalk::new(PricingBudget::PER_TICK),
         &mut QueueReconciler::new(QUEUE_RECONCILE_CHUNK, QUEUE_RECONCILE_TICK_BUDGET),
         &corpus.stop,

@@ -110,6 +110,55 @@ fn opened() -> (FrameType, Value) {
 fn result(value: Value) -> (FrameType, Value) {
     (FrameType::Response, json!({"result":value}))
 }
+
+#[test]
+fn event_wakes_media_reads_once_per_burst_and_retries_failed_read() {
+    let fails = Arc::new(AtomicBool::new(true));
+    let failure = fails.clone();
+    let peer = Peer::start(Arc::new(move |request| {
+        if request["op"] == "route.open" {
+            return opened();
+        }
+        assert_eq!(request["method"], "usage.read");
+        if failure.load(Ordering::Relaxed) {
+            (FrameType::Error, json!({"code":"warming"}))
+        } else {
+            result(page(vec![]))
+        }
+    }));
+    let state = test_state();
+    let source = peer.source();
+    let media = crate::event_wakes::Source::Media;
+    state.event_wakes().attached(&[media], true);
+    let mut first = state.event_wakes().wake(media);
+    let mut second = state.event_wakes().wake(media);
+    super::super::drain_media_if_due(&state, &source, &AtomicBool::new(false), false);
+    assert_eq!(peer.calls("usage.read").len(), 1);
+    assert_eq!(first.try_recv(), Ok(false));
+    assert_eq!(second.try_recv(), Ok(false));
+    fails.store(false, Ordering::Relaxed);
+    let mut retry = state.event_wakes().wake(media);
+    super::super::drain_media_if_due(&state, &source, &AtomicBool::new(false), false);
+    assert_eq!(retry.try_recv(), Ok(true));
+    super::super::drain_media_if_due(&state, &source, &AtomicBool::new(false), true);
+    assert_eq!(
+        peer.calls("usage.read").len(),
+        2,
+        "attached idle full tick must not re-read"
+    );
+    let cursor: String = state
+        .with_conn(|conn| {
+            conn.query_row("SELECT through_seq FROM media_feed_cursor", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+    assert_eq!(
+        cursor, "0",
+        "empty authoritative read committed its cursor before bus acknowledgement"
+    );
+}
 fn page(entries: Vec<Value>) -> Value {
     if let Some(last) = entries.last() {
         json!({"last_seq":last["seq"],"entries":entries})

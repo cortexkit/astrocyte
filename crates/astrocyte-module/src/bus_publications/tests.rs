@@ -116,6 +116,44 @@ fn bus_publications_key_components_are_total_and_unambiguous() {
 }
 
 #[tokio::test]
+async fn bus_publications_failed_put_retries_without_another_change() {
+    let state = test_state();
+    let Some(bus) = TestBus::start(&state).await else {
+        return;
+    };
+    let before = bus.attempts();
+    bus.control.fail_next_put.store(true, Ordering::Relaxed);
+    let latest = json!({"quota_provider":"codex", "plan":"synthetic", "multiplier":3});
+    state
+        .bus_publications()
+        .multiplier(std::slice::from_ref(&latest));
+    bus.after(before).await;
+    assert!(
+        !bus.control.fail_next_put.load(Ordering::Relaxed),
+        "test must reach the injected failed put"
+    );
+    let key = pair_key("codex", "synthetic");
+    assert!(bus.multiplier.get(&key).await.unwrap().is_none());
+    let failed = bus.attempts();
+    let generation = bus.control.desired.lock().unwrap().generation;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::resume();
+    bus.after(failed).await;
+    let landed = bus.multiplier.get(&key).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&landed).unwrap(),
+        latest
+    );
+    assert_eq!(
+        bus.control.desired.lock().unwrap().generation,
+        generation,
+        "no new change may drive the repair"
+    );
+    bus.finish().await;
+}
+
+#[tokio::test]
 async fn bus_publications_denied_bucket_does_not_interrupt_runner_steps() {
     let Some(server) = NatsServer::start_with_config(
         r#"accounts {

@@ -41,6 +41,7 @@ pub const OP_CACHE_SESSIONS: &str = "usage.cache.sessions";
 pub const OP_CACHE_STEPS: &str = "usage.cache.steps";
 pub const OP_RUNS_LIST: &str = "usage.runs.list";
 pub const OP_RUNS_DETAIL: &str = "usage.runs.detail";
+pub const OP_RUNS_SUBSCRIBE: &str = "usage.runs.subscribe";
 /// Recorded insula quota readings per account and window, bucketed by UTC
 /// hour or day, with the resets seen between readings.
 pub const OP_QUOTA_HISTORY: &str = "spend.quota.history";
@@ -91,7 +92,7 @@ const fn same_str(left: &str, right: &str) -> bool {
 
 /// The closed public surface consumed by dispatch, the manifest, and the schema
 /// artifact. Exact name-set parity prevents a same-sized but incorrect surface.
-pub const PUBLIC_OPERATION_NAMES: [&str; 26] = [
+pub const PUBLIC_OPERATION_NAMES: [&str; 27] = [
     OP_VERDICT,
     OP_REPORT,
     OP_EVENT_INGEST,
@@ -114,6 +115,7 @@ pub const PUBLIC_OPERATION_NAMES: [&str; 26] = [
     OP_CACHE_STEPS,
     OP_RUNS_LIST,
     OP_RUNS_DETAIL,
+    OP_RUNS_SUBSCRIBE,
     OP_QUOTA_HISTORY,
     OP_STEPS_SUBSCRIBE,
     OP_STEPS_READ,
@@ -388,7 +390,7 @@ fn operation_params_schema(name: &str) -> Value {
                 "quota_providers": {"type": ["array", "null"], "items": string},
             }),
         ),
-        OP_WATERMARK_GET => closed_object(&[], json!({})),
+        OP_WATERMARK_GET | OP_RUNS_SUBSCRIBE => closed_object(&[], json!({})),
         other => unreachable!("operation {other} is served without a params schema"),
     }
 }
@@ -476,6 +478,7 @@ pub fn dispatch(state: &SharedState, method: &str, params: Value) -> OpResult {
         OP_RUNS_DETAIL => op_runs_detail(state, params),
         OP_QUOTA_HISTORY => crate::quota_history::read(state, params),
         OP_STEPS_SUBSCRIBE => op_steps_subscribe(params),
+        OP_RUNS_SUBSCRIBE => op_runs_subscribe(params),
         OP_STEPS_READ => crate::step_feed::read(state, params)
             .map(|page| json!(page))
             .map_err(|refusal| (refusal.code, refusal.message)),
@@ -937,6 +940,21 @@ fn op_steps_subscribe(params: Value) -> OpResult {
     Err((
         "invalid_request".into(),
         format!("{OP_STEPS_SUBSCRIBE} is a subscription and is served only as a stream"),
+    ))
+}
+
+// The serving handler owns the held request; unary dispatch can only validate
+// parameters and explain that a stream is required, as for the step watch.
+fn op_runs_subscribe(params: Value) -> OpResult {
+    let _: crate::runs_feed::Request = serde_json::from_value(params).map_err(|error| {
+        (
+            "malformed".into(),
+            format!("runs subscribe params: {error}"),
+        )
+    })?;
+    Err((
+        "invalid_request".into(),
+        format!("{OP_RUNS_SUBSCRIBE} is a subscription and is served only as a stream"),
     ))
 }
 
@@ -1480,6 +1498,7 @@ mod tests {
             "usage.cache.steps",
             "usage.runs.list",
             "usage.runs.detail",
+            "usage.runs.subscribe",
             "spend.quota.history",
             "usage.steps.read",
             "usage.steps.subscribe",
@@ -1509,7 +1528,7 @@ mod tests {
     #[test]
     fn every_operation_name_reaches_its_own_handler() {
         // Each operation is paired with the marker its own handler writes.
-        const ROUTES: [(&str, &str); 26] = HANDLER_MARKERS;
+        const ROUTES: [(&str, &str); 27] = HANDLER_MARKERS;
 
         // The markers only discriminate while none of them is a prefix of
         // another: three of these begin with the word "subscription", and if
@@ -1572,7 +1591,7 @@ mod tests {
     /// request-decoding error. A refusal with code `malformed` and a message
     /// starting with that literal came from the decoder; any other answer
     /// means the decoder accepted the params.
-    const HANDLER_MARKERS: [(&str, &str); 26] = [
+    const HANDLER_MARKERS: [(&str, &str); 27] = [
         (OP_VERDICT, "verdict params: "),
         (OP_REPORT, "report params: "),
         (OP_EVENT_INGEST, "event params: "),
@@ -1595,6 +1614,7 @@ mod tests {
         (OP_CACHE_STEPS, "cache steps params: "),
         (OP_RUNS_LIST, "runs list params: "),
         (OP_RUNS_DETAIL, "runs detail params: "),
+        (OP_RUNS_SUBSCRIBE, "runs subscribe params: "),
         (OP_QUOTA_HISTORY, "quota history params: "),
         (OP_STEPS_SUBSCRIBE, "steps subscribe params: "),
         (OP_STEPS_READ, "steps read params: "),
@@ -1819,6 +1839,7 @@ mod tests {
                 ],
                 json!({"after": "c0"}),
             ),
+            sample(OP_RUNS_SUBSCRIBE, vec![json!({})], json!({"after":"old"})),
             sample(
                 OP_STEPS_READ,
                 vec![

@@ -553,6 +553,7 @@ async fn reader_loop(state: &SharedState, insula: Option<&crate::qta_client::Qta
                 tokio::select! {
                     result = quota_session => result,
                     () = crate::runner_steps::follow(state, &connection, &names) => Ok(()),
+                    () = crate::event_wakes::follow(state, &connection, &names) => Ok(()),
                     () = state.bus_publications().follow(&connection, &names) => Ok(()),
                 }
             })

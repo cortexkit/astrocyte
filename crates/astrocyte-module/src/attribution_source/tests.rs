@@ -55,6 +55,69 @@ fn basal_pages() -> Vec<Value> {
         json!({"result":{"facts":[session,program],"next":null,"through":4}}),
     ]
 }
+
+#[test]
+fn event_wakes_attribution_idle_opens_no_routes_and_subject_selects_one_publisher() {
+    let state = test_state();
+    let stop = AtomicBool::new(false);
+    let sources =
+        Publisher::ALL.map(|publisher| crate::event_wakes::Source::Attribution(publisher.module()));
+    state.event_wakes().attached(&sources, true);
+    let now = crate::state::now_ms();
+    for source in sources {
+        state
+            .event_wakes()
+            .begin(source, true, now)
+            .unwrap()
+            .finish(true);
+    }
+    let mut opens = 0;
+    for _ in 0..10 {
+        drain_selected(&state, &stop, true, |_| {
+            opens += 1;
+            Ok(true)
+        });
+    }
+    assert_eq!(
+        opens, 0,
+        "an idle attached attribution durable must open no publisher routes"
+    );
+    let source = crate::event_wakes::Source::Attribution("basal");
+    let mut first = state.event_wakes().wake(source);
+    let mut second = state.event_wakes().wake(source);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    drain_selected(&state, &stop, false, |publisher| {
+        opens += 1;
+        assert_eq!(publisher, Publisher::Basal);
+        let mut peer = Peer::new(basal_pages());
+        runtime.block_on(drain_pages(&state, publisher, now, &stop, &mut peer))
+    });
+    assert_eq!(opens, 1);
+    assert_eq!(first.try_recv(), Ok(true));
+    assert_eq!(second.try_recv(), Ok(true));
+    let facts: i64 = state
+        .with_conn(|conn| {
+            conn.query_row("SELECT count(*) FROM attribution_fact", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+    assert_eq!(facts, 4);
+    let mut failed = state.event_wakes().wake(source);
+    drain_selected(&state, &stop, false, |publisher| {
+        let mut peer = Peer::new(vec![json!({"error":{"code":"not_permitted"}})]);
+        runtime.block_on(drain_pages(&state, publisher, now, &stop, &mut peer))
+    });
+    assert_eq!(
+        failed.try_recv(),
+        Ok(false),
+        "a read refusal is not an empty committed page"
+    );
+}
 #[test]
 fn attribution_reader_pages_from_durable_cursor_and_known_suffix_opens_no_transaction() {
     let state = test_state();
