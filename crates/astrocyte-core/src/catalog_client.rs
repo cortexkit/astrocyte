@@ -5,6 +5,7 @@
 //! pricing sees them.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -137,6 +138,18 @@ impl CatalogClient {
         Ok(Self::new(connection, history_start_ms))
     }
 
+    /// Discovers the boundary cooperatively, leaving installation to a later
+    /// attempt if shutdown arrives during a peer call. Each call keeps its
+    /// normal deadline; a stop prevents the next call, not the in-flight one.
+    pub fn connect_until_stopped(
+        connection: Arc<dyn CatalogConnection>,
+        stop: &AtomicBool,
+    ) -> Result<Option<Self>, CatalogClientError> {
+        let boundary =
+            Self::discover_history_start_ms_until_stopped(connection.as_ref(), Some(stop))?;
+        Ok(boundary.map(|history_start_ms| Self::new(connection, history_start_ms)))
+    }
+
     pub(crate) fn new(connection: Arc<dyn CatalogConnection>, history_start_ms: i64) -> Self {
         Self {
             connection,
@@ -207,7 +220,25 @@ impl CatalogClient {
     fn discover_history_start_ms(
         connection: &dyn CatalogConnection,
     ) -> Result<i64, CatalogClientError> {
-        match connection.catalog_status(StatusRequest::default()) {
+        Ok(
+            Self::discover_history_start_ms_until_stopped(connection, None)?
+                .expect("discovery without a stop flag cannot stop"),
+        )
+    }
+
+    fn discover_history_start_ms_until_stopped(
+        connection: &dyn CatalogConnection,
+        stop: Option<&AtomicBool>,
+    ) -> Result<Option<i64>, CatalogClientError> {
+        let stopped = || stop.is_some_and(|stop| stop.load(Ordering::Relaxed));
+        if stopped() {
+            return Ok(None);
+        }
+        let status = connection.catalog_status(StatusRequest::default());
+        if stopped() {
+            return Ok(None);
+        }
+        match status {
             Ok(status) => {
                 if let Some(boundary) = status.history_begins_at_ms {
                     tracing::info!(
@@ -215,7 +246,7 @@ impl CatalogClient {
                         path = "typed_status",
                         "discovered fusiform history boundary"
                     );
-                    return Ok(boundary);
+                    return Ok(Some(boundary));
                 }
             }
             Err(error) => {
@@ -236,7 +267,11 @@ impl CatalogClient {
             provider_id: None,
             auth_method: None,
         };
-        let boundary = match connection.catalog_get(request) {
+        let response = connection.catalog_get(request);
+        if stopped() {
+            return Ok(None);
+        }
+        let boundary = match response {
             Err(error) => match RefusalKind::of(&error.code) {
                 RefusalKind::OutsideCoverage => {
                     parse_history_start_ms(&error.message).ok_or_else(|| {
@@ -271,7 +306,7 @@ impl CatalogClient {
             path = "text_fallback",
             "discovered fusiform history boundary"
         );
-        Ok(boundary)
+        Ok(Some(boundary))
     }
 
     pub fn get(

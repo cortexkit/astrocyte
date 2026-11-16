@@ -128,7 +128,7 @@ struct Route {
 }
 
 impl Route {
-    async fn open(path: &Path) -> Result<Self, FeedError> {
+    async fn open(path: &Path, stop: &AtomicBool) -> Result<Self, FeedError> {
         let consumer = tokio::time::timeout(
             BUDGET,
             SubcConsumer::connect(path, ConsumerOptions::default()),
@@ -136,6 +136,9 @@ impl Route {
         .await
         .map_err(|_| "colliculus connection timeout".to_string())?
         .map_err(|_| "colliculus daemon connection unavailable".to_string())?;
+        if stop.load(Ordering::Relaxed) {
+            return Err(FeedError::Stopped);
+        }
         let identity =
             serde_json::from_value(json!({"harness":"ck-astrocyte","session":"media-usage"}))
                 .map_err(|_| "colliculus route identity invalid".to_string())?;
@@ -241,10 +244,10 @@ impl ColliculusSource {
         }
     }
 
-    async fn open(&self, state: &SharedState) -> Result<Route, FeedError> {
+    async fn open(&self, state: &SharedState, stop: &AtomicBool) -> Result<Route, FeedError> {
         #[cfg(test)]
         if let Some(path) = &self.fixture_connection {
-            return Route::open(path).await;
+            return Route::open(path, stop).await;
         }
         let access = state
             .quota_bus()
@@ -261,7 +264,7 @@ impl ColliculusSource {
                 "colliculus attested module identity unavailable".into(),
             ));
         }
-        Route::open(&access.path).await
+        Route::open(&access.path, stop).await
     }
 
     async fn drain(
@@ -287,7 +290,10 @@ impl ColliculusSource {
         if stop.load(Ordering::Relaxed) {
             return Err(FeedError::Stopped);
         }
-        let mut route = self.open(state).await?;
+        let mut route = self.open(state, stop).await?;
+        if stop.load(Ordering::Relaxed) {
+            return Err(FeedError::Stopped);
+        }
         // A prior acknowledgement can be lost after the page committed. Retrying
         // the durable watermark also releases retained records on a quiet feed.
         if cursor > 0 {
@@ -305,6 +311,9 @@ impl ColliculusSource {
                     json!(UsageReadRequest::new(LIMIT).with_after_seq(cursor)),
                 )
                 .await?;
+            if stop.load(Ordering::Relaxed) {
+                return Err(FeedError::Stopped);
+            }
             check_page_structure(&page)?;
             let next = page.last_seq.unwrap_or(cursor).max(cursor);
             if !page.entries.is_empty() && next == cursor {
@@ -343,6 +352,10 @@ impl ColliculusSource {
                         evidence.push(SetAsideRecord { locator, reason: format!("raw media entry: {}", serde_json::to_string(raw).map_err(|error| error.to_string())?) });
                     }
                 }
+                if stop.load(Ordering::Relaxed) {
+                    stopped = true;
+                    return Err("media ingest stopped".into());
+                }
                 let new = harness_drain::record_set_aside_in_tx(tx, SOURCE_KEY, &evidence, now)?;
                 tx.execute("INSERT INTO media_feed_cursor(source_key,through_seq,skipped_local) VALUES(?1,?2,?3) ON CONFLICT(source_key) DO UPDATE SET through_seq=excluded.through_seq,skipped_local=media_feed_cursor.skipped_local+excluded.skipped_local", params![SOURCE_KEY,next.to_string(),local]).map_err(|error| error.to_string())?;
                 harness_drain::ensure_runtime_row_in_tx(tx, SOURCE_KEY).map_err(|error| error.to_string())?;
@@ -362,6 +375,9 @@ impl ColliculusSource {
             }
             // ordered_write returns only after SQLite commits events, evidence,
             // coverage and the cursor. No acknowledgement can precede that act.
+            if stop.load(Ordering::Relaxed) {
+                return Err(FeedError::Stopped);
+            }
             route.ack(cursor).await?;
         }
         Ok(unhealthy.then(|| "colliculus deliveries were quarantined".into()))
@@ -402,6 +418,11 @@ impl harness_drain::HarnessSource for ColliculusSource {
             .build()
             .map_err(|error| error.to_string())?;
         let outcome = runtime.block_on(self.drain(state, now, stop));
+        // A peer may fail as shutdown starts. Do not turn that stopped attempt
+        // into an absence/backoff decision or a newly failed runtime row.
+        if stop.load(Ordering::Relaxed) {
+            return Err(SourceDrainError::Stopped);
+        }
         match &outcome {
             Err(FeedError::Absent) => absent.absent(now),
             Err(FeedError::Stopped) => {}
@@ -436,3 +457,7 @@ impl harness_drain::HarnessSource for ColliculusSource {
 #[cfg(test)]
 #[path = "colliculus_source_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "refresher/stop_colliculus_tests.rs"]
+mod stop_tests;

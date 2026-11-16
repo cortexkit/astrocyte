@@ -359,8 +359,11 @@ async fn run(config: ModuleConfig, state: Arc<SharedState>) -> Result<LoopEnd, M
 /// tokio keeps its handler installed for the life of the process, so once
 /// this future has fired (or been dropped) any further SIGTERM is recorded
 /// and ignored: a second signal while stopping neither kills the process
-/// nor starts a second join. The join is bounded on its own, and SIGKILL
-/// remains the supervisor's backstop.
+/// nor starts a second join. Refresher peer stages check stop between calls,
+/// so shutdown waits for at most one in-flight 10-second peer call per stage,
+/// not every provider or day in its backlog. This is a cooperative bound on
+/// peer waits, not on OS scheduling, filesystem I/O or SQLite work; SIGKILL
+/// remains the supervisor's 30-second backstop.
 #[cfg(unix)]
 fn sigterm_received() -> Result<impl std::future::Future<Output = ()>, ModuleError> {
     use tokio::signal::unix::{signal, SignalKind};

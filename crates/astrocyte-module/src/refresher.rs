@@ -63,7 +63,7 @@ use std::time::Duration;
 use astrocyte_core::ingest::EventRecordRequest;
 use astrocyte_core::{
     capacity::{apply_snapshot_in_tx, record_failed_attempt, CapacitySnapshot},
-    catalog_client::{CatalogClient, CatalogClientError, CatalogConnection},
+    catalog_client::{CatalogClient, CatalogConnection},
     multiplier::{self, MultiplierConfig, PlanPriceSource},
 };
 use rusqlite::{params, Transaction};
@@ -1071,11 +1071,12 @@ pub struct DrainOutcome {
     pub high_water_ordinal: Option<i64>,
 }
 
-/// Connect through the supplied fusiform transport and preserve the history
-/// boundary discovered by the startup probe. No local catalog file is read.
+/// Connect a test catalog without a shutdown flag, using the same discovery
+/// probe as the refresher. No local catalog file is read.
+#[cfg(test)]
 pub fn connect_catalog(
     connection: Arc<dyn CatalogConnection>,
-) -> Result<CatalogClient, CatalogClientError> {
+) -> Result<CatalogClient, astrocyte_core::catalog_client::CatalogClientError> {
     CatalogClient::connect(connection)
 }
 
@@ -1760,7 +1761,7 @@ fn spawn_refresher(
                     let claude_code_source = Arc::new(claude_code_source);
                     let codex_source = Arc::new(codex_source);
                     let capacity = configured_capacity(&state, &config)?;
-                    let (pending_catalog, plan_prices) = configure_catalog(&state, &config)?;
+                    let (pending_catalog, plan_prices) = configure_catalog(&state, &config, &stop)?;
                     Ok((
                         producers,
                         opencode_source,
@@ -1867,14 +1868,18 @@ impl PendingCatalog {
     /// it. The distinction the kind still buys is the log line: a retryable
     /// refusal is the peer warming, anything else is a contract question and
     /// is named as one on every tick until someone reads it.
-    pub fn try_connect(&self, state: &SharedState) -> Result<bool, String> {
-        match connect_catalog(Arc::clone(&self.connection)) {
-            Ok(catalog) => {
+    pub fn try_connect(&self, state: &SharedState, stop: &AtomicBool) -> Result<bool, String> {
+        match CatalogClient::connect_until_stopped(Arc::clone(&self.connection), stop) {
+            Ok(Some(catalog)) => {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(false);
+                }
                 let boundary = catalog_history_boundary(&catalog);
                 state.install_catalog(Some(catalog))?;
                 tracing::info!(target: "pricing", boundary, "fusiform history boundary discovered");
                 Ok(true)
             }
+            Ok(None) => Ok(false),
             Err(error) if error.is_retryable() => {
                 tracing::warn!(target: "pricing", ?error, "catalog not yet reachable, pricing deferred");
                 Ok(false)
@@ -1896,6 +1901,7 @@ type ConfiguredFusiform = (Option<PendingCatalog>, Option<Arc<dyn PlanPriceSourc
 fn configure_catalog(
     state: &SharedState,
     config: &config::AstrocyteConfig,
+    stop: &AtomicBool,
 ) -> Result<ConfiguredFusiform, String> {
     let Some(path) = &config.fusiform_connection_file else {
         state.install_catalog(None)?;
@@ -1908,7 +1914,7 @@ fn configure_catalog(
     let pending = PendingCatalog { connection };
     // First attempt now so a healthy fleet prices from the first tick; a
     // refusal here is the retry case, not a startup failure.
-    if pending.try_connect(state)? {
+    if pending.try_connect(state, stop)? {
         return Ok((None, Some(plan_prices)));
     }
     Ok((Some(pending), Some(plan_prices)))
@@ -1967,7 +1973,12 @@ fn run_loop_full(
         let mut summaries_behind = summary_tick(&state, &mut summaries, &stop);
         valuation_tick(&state, &mut valuations, &stop, Duration::from_millis(1_500));
         if !stop.load(Ordering::Relaxed) {
-            multiplier.tick(&state, pending_catalog.is_some(), current_time_ms());
+            multiplier.tick_until_stopped(
+                &state,
+                pending_catalog.is_some(),
+                current_time_ms(),
+                &stop,
+            );
         }
         let started = std::time::Instant::now();
         let mut next_fast = FAST_LANE_INTERVAL;
@@ -2296,7 +2307,7 @@ fn run_tick(
     #[cfg(all(test, target_os = "linux"))]
     let _measurement = fast_lane_measure::cycle(false);
     if let Some(pending) = pending_catalog.as_ref() {
-        match pending.try_connect(state) {
+        match pending.try_connect(state, stop) {
             Ok(true) => *pending_catalog = None,
             Ok(false) => {}
             Err(error) => tracing::error!(target: "pricing", %error, "install catalog failed"),
@@ -3932,10 +3943,24 @@ impl MultiplierStage {
         };
     }
 
+    #[cfg(test)]
+    pub(crate) fn tick(&mut self, state: &SharedState, catalog_pending: bool, now_ms: i64) {
+        self.tick_until_stopped(state, catalog_pending, now_ms, &AtomicBool::new(false));
+    }
+
     /// `catalog_pending`: fusiform is configured but its history boundary is
     /// not yet discovered, so rates cannot be read yet. The day waits for it
     /// rather than failing.
-    pub(crate) fn tick(&mut self, state: &SharedState, catalog_pending: bool, now_ms: i64) {
+    pub(crate) fn tick_until_stopped(
+        &mut self,
+        state: &SharedState,
+        catalog_pending: bool,
+        now_ms: i64,
+        stop: &AtomicBool,
+    ) {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         self.rates_pending = match rate_era_tick(state, &mut self.rate_backoff) {
             Ok(pending) => pending,
             Err(error) => {
@@ -3994,7 +4019,13 @@ impl MultiplierStage {
         self.failure_logged
             .retain(|(_, day, _)| day.as_ref().is_none_or(|day| day >= &oldest_day));
         for quota_provider in multiplier_config.quota_providers.keys() {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             for (interval_end_ms, day) in &days {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
                 let (interval_end_ms, day) = (*interval_end_ms, day.clone());
                 let recorded_key = (quota_provider.clone(), day.clone());
                 if self.recorded.contains(&recorded_key) {
@@ -4071,6 +4102,7 @@ impl MultiplierStage {
                         quota_provider,
                         interval_end_ms,
                         now_ms,
+                        stop,
                     ),
                     None => Err(DayFailure {
                         reason: "no fusiform catalog is configured, so no API rate can be read"
@@ -4083,7 +4115,8 @@ impl MultiplierStage {
                 // on every later tick; `log_failure` logs it once per day and reason
                 // so a failure that lasts all day is not repeated every minute.
                 match outcome {
-                    Ok(observations) => {
+                    Ok(None) => return,
+                    Ok(Some(observations)) => {
                         self.recorded.insert(recorded_key);
                         for observation in observations {
                             tracing::info!(
@@ -4353,6 +4386,7 @@ fn rate_era_fill(
 }
 
 /// Computes one day and appends it as the day's original row.
+#[allow(clippy::too_many_arguments)]
 fn record_multiplier_day(
     state: &SharedState,
     catalog: &CatalogClient,
@@ -4361,7 +4395,11 @@ fn record_multiplier_day(
     quota_provider: &str,
     interval_end_ms: i64,
     snapshot_at_ms: i64,
-) -> Result<Vec<multiplier::Observation>, DayFailure> {
+    stop: &AtomicBool,
+) -> Result<Option<Vec<multiplier::Observation>>, DayFailure> {
+    if stop.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     let stale_sources = multiplier_stale_sources(
         state,
         interval_end_ms,
@@ -4378,33 +4416,46 @@ fn record_multiplier_day(
         snapshot_at_ms,
         true,
     )?;
+    // Plan prices are read outside the writer transaction. If shutdown arrived
+    // during that call, leave the entire provider/day to the next refresher.
+    if stop.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     for observation in &mut observations {
         disclose_stale_sources(observation, &stale_sources);
     }
-    state
-        .ordered_write(|tx| {
-            for observation in &observations {
-                if multiplier::observation_plan_head(
-                    tx,
-                    &observation.quota_provider,
-                    &observation.observation_day,
-                    observation.plan.as_deref(),
-                )
-                .map_err(|error| error.to_string())?
-                .is_none()
-                {
-                    multiplier::insert_observation_in_tx(tx, observation)
-                        .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
-                }
+    let written = state.ordered_write(|tx| {
+        for observation in &observations {
+            if stop.load(Ordering::Relaxed) {
+                return Err("multiplier stopped".into());
             }
-            Ok(((), true))
-        })
-        .map_err(|reason| DayFailure {
-            reason,
-            needs_config: false,
-        })?;
+            if multiplier::observation_plan_head(
+                tx,
+                &observation.quota_provider,
+                &observation.observation_day,
+                observation.plan.as_deref(),
+            )
+            .map_err(|error| error.to_string())?
+            .is_none()
+            {
+                multiplier::insert_observation_in_tx(tx, observation)
+                    .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            return Err("multiplier stopped".into());
+        }
+        Ok(((), true))
+    });
+    if written.is_err() && stop.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    written.map_err(|reason| DayFailure {
+        reason,
+        needs_config: false,
+    })?;
     crate::bus_publications::publish_multiplier(state);
-    Ok(observations)
+    Ok(Some(observations))
 }
 
 /// Read an owned plan, resolve fees, then value it without writing. Automatic
@@ -4626,6 +4677,7 @@ pub(crate) fn recompute_multiplier_day(
 #[allow(clippy::cast_possible_wrap)]
 #[cfg(test)]
 mod tests {
+    include!("refresher/stop_catalog_tests.rs");
 
     fn sequence_less_runtime(state: &SharedState, key: &str) -> (Option<i64>, i64) {
         state
@@ -4987,7 +5039,7 @@ mod tests {
         // at all -- a `catalog_unconfigured` row here would be a lie that only a
         // manual reprice could correct.
         for _ in 0..2 {
-            assert!(!pending.try_connect(&state).unwrap());
+            assert!(!pending.try_connect(&state, &NEVER_STOP).unwrap());
             assert!(state.catalog_client().is_none());
             run_iteration_full(&state, &[], None, true, &stop);
             assert_eq!(
@@ -4999,7 +5051,7 @@ mod tests {
 
         // Tick 3: peer is live. Discovery installs the catalog and the same
         // tick prices the waiting event.
-        assert!(pending.try_connect(&state).unwrap());
+        assert!(pending.try_connect(&state, &NEVER_STOP).unwrap());
         assert_eq!(
             state.catalog_client().unwrap().history_start_ms(),
             1_786_529_249_396
@@ -5048,7 +5100,7 @@ mod tests {
         seed_unpriced_event(&state);
         let mut config = config::intentional_empty().config;
         config.fusiform_connection_file = Some(peer.path.to_string_lossy().into_owned());
-        let (mut pending, _) = configure_catalog(&state, &config).unwrap();
+        let (mut pending, _) = configure_catalog(&state, &config, &NEVER_STOP).unwrap();
         assert!(
             pending.is_some(),
             "boot must stay pending after status fails"
@@ -5125,7 +5177,7 @@ mod tests {
         seed_unpriced_event(&state);
         let mut config = config::intentional_empty().config;
         config.fusiform_connection_file = Some(peer.path.to_string_lossy().into_owned());
-        let (mut pending, _) = configure_catalog(&state, &config).unwrap();
+        let (mut pending, _) = configure_catalog(&state, &config, &NEVER_STOP).unwrap();
         assert!(pending.is_some());
         assert!(state.catalog_client().is_none());
         run_tick(
@@ -5172,7 +5224,7 @@ mod tests {
         });
         let pending = PendingCatalog { connection: peer };
         assert_eq!(
-            pending.try_connect(&state),
+            pending.try_connect(&state, &NEVER_STOP),
             Ok(false),
             "a non-retryable refusal defers; it is never an Err from try_connect"
         );
@@ -5210,8 +5262,8 @@ mod tests {
             },
         )
         .unwrap();
-        let (pending, plan_prices) =
-            configure_catalog(&state, &config).expect("unreachable peer is not a startup error");
+        let (pending, plan_prices) = configure_catalog(&state, &config, &NEVER_STOP)
+            .expect("unreachable peer is not a startup error");
         assert!(pending.is_some(), "discovery deferred, handle returned");
         assert!(
             plan_prices.is_some(),
@@ -8332,6 +8384,7 @@ pub fn log_pricing_failed(error: &str) {
 
 #[cfg(test)]
 mod multiplier_stage_tests {
+    include!("refresher/stop_multiplier_tests.rs");
     include!("refresher_bus_publications_tests.rs");
     include!("refresher_multiplier_v2_tests.rs");
     include!("refresher_rate_era_tests.rs");
