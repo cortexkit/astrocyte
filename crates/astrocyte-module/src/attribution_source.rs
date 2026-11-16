@@ -1,0 +1,247 @@
+//! Read attribution on scheduled refreshes, not the shorter pricing-only cycles.
+use crate::state::SharedState;
+use astrocyte_core::attribution::{self, Page, Publisher};
+use rusqlite::{params, OptionalExtension};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use subc_client_rs::{CallOptions, ConsumerOptions, RouteHandle, SubcConsumer};
+use subc_protocol::{RouteTarget, SUBC_MODULE_ID_ENV};
+
+const LIMIT: usize = 128;
+const BUDGET: Duration = Duration::from_secs(10);
+fn options() -> CallOptions {
+    CallOptions {
+        timeout: BUDGET,
+        route_retry_deadline: BUDGET,
+        ..Default::default()
+    }
+}
+trait ReadTransport {
+    async fn read(&mut self, params: Value) -> Result<Vec<u8>, ()>;
+}
+struct Route {
+    consumer: SubcConsumer,
+    handle: RouteHandle,
+    publisher: Publisher,
+}
+impl Route {
+    async fn open(state: &SharedState, publisher: Publisher) -> Result<Self, ()> {
+        let access = state.quota_bus().access().ok_or(())?;
+        let nonce = subc_os::launch_nonce().map_err(|_| ())?;
+        if std::env::var(SUBC_MODULE_ID_ENV).ok().as_deref() != Some(access.module_id.as_str())
+            || nonce.as_ref().map(|value| value.value()) != Some(access.nonce.as_str())
+        {
+            return Err(());
+        }
+        let consumer = tokio::time::timeout(
+            BUDGET,
+            SubcConsumer::connect(&access.path, ConsumerOptions::default()),
+        )
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())?;
+        let identity=serde_json::from_value(json!({"harness":"ck-astrocyte","session":format!("attribution/{}",publisher.module())})).map_err(|_|())?;
+        let handle = consumer
+            .open_route(
+                RouteTarget::ManagementSurface {
+                    module_id: publisher.module().into(),
+                },
+                identity,
+                options(),
+            )
+            .await
+            .map_err(|_| ())?;
+        Ok(Self {
+            consumer,
+            handle,
+            publisher,
+        })
+    }
+}
+impl ReadTransport for Route {
+    async fn read(&mut self, params: Value) -> Result<Vec<u8>, ()> {
+        let request =
+            serde_json::to_vec(&json!({"method":self.publisher.read_name(),"params":params}))
+                .map_err(|_| ())?;
+        self.consumer
+            .request(&self.handle, request, options())
+            .await
+            .map(|reply| reply.to_vec())
+            .map_err(|_| ())
+    }
+}
+
+fn malformed_page(
+    state: &SharedState,
+    publisher: Publisher,
+    bytes: &[u8],
+    reason: &str,
+    now: i64,
+) -> Result<(), String> {
+    let digest = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let locator = format!("{}/page/{digest}", publisher.read_name());
+    let new = state.with_conn(|conn| {
+        conn.query_row(
+            "SELECT 1 FROM set_aside_record WHERE source_key=?1 AND locator=?2",
+            params![publisher.source(), locator],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|known| known.is_none())
+        .map_err(|e| e.to_string())
+    })?;
+    if new {
+        state.ordered_write(|tx| {
+        let changed=tx.execute("INSERT OR IGNORE INTO set_aside_record(source_key,locator,reason,first_seen_ms,last_seen_ms) VALUES(?1,?2,?3,?4,?4)",params![publisher.source(),locator,reason,now]).map_err(|e|e.to_string())?!=0;
+        Ok(((),changed))
+    })?;
+    }
+    Ok(())
+}
+
+async fn drain_pages<T: ReadTransport>(
+    state: &SharedState,
+    publisher: Publisher,
+    now: i64,
+    stop: &AtomicBool,
+    route: &mut T,
+) -> Result<(), String> {
+    let stored = state.with_conn(|conn| {
+        conn.query_row(
+            "SELECT cursor FROM attribution_cursor WHERE publisher=?1",
+            [publisher.module()],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(|e| e.to_string())
+    })?;
+    let mut cursor = stored
+        .map(|cursor| serde_json::from_str::<Value>(&cursor).map_err(|e| e.to_string()))
+        .transpose()?;
+    let mut seen = Vec::new();
+    if let Some(cursor) = &cursor {
+        seen.push(cursor.clone());
+    }
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut params = json!({"limit":LIMIT});
+        if let Some(cursor) = &cursor {
+            params["after"] = cursor.clone();
+        }
+        // SDK failures and served refusals say nothing about ledger health.
+        // They are retried on the next scheduled refresh without a durable write.
+        let Ok(bytes) = route.read(params).await else {
+            return Ok(());
+        };
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let reply = serde_json::from_slice::<Value>(&bytes);
+        if reply
+            .as_ref()
+            .ok()
+            .and_then(|reply| reply.get("error"))
+            .is_some_and(|error| !error.is_null())
+        {
+            return Ok(());
+        }
+        let parsed = reply
+            .ok()
+            .and_then(|reply| reply.get("result").cloned())
+            .and_then(|result| serde_json::from_value::<Page>(result).ok());
+        let Some(page) = parsed.filter(|page| page.facts.len() <= LIMIT) else {
+            malformed_page(state, publisher, &bytes, "malformed_page", now)?;
+            return Ok(());
+        };
+        if page.facts.is_empty() {
+            return Ok(());
+        }
+        if page.next.as_ref().is_some_and(|next| seen.contains(next)) {
+            malformed_page(state, publisher, &bytes, "cursor_not_advanced", now)?;
+            return Ok(());
+        }
+        let needs_commit =
+            state.with_conn(|conn| attribution::page_needs_commit(conn, publisher, &page))?;
+        if needs_commit {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            state.ordered_write(|tx| {
+                let changed = attribution::commit_page(tx, publisher, cursor.as_ref(), &page, now)?;
+                if stop.load(Ordering::Relaxed) {
+                    return Err("attribution drain stopped".into());
+                }
+                Ok(((), changed))
+            })?;
+        }
+        let Some(next) = page.next else {
+            return Ok(());
+        };
+        seen.push(next.clone());
+        cursor = Some(next);
+    }
+}
+
+pub(super) fn drain_all(state: &SharedState, stop: &AtomicBool) {
+    if !state.quota_bus().hello_acked() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    runtime.block_on(async {
+        for publisher in Publisher::ALL {
+            if stop.load(Ordering::Relaxed) {break;}
+            // Absence and routing refusals are normal while publishers roll out.
+            // Do not create source_runtime rows or change an existing health result.
+            let Ok(mut route)=Route::open(state,publisher).await else {continue;};
+            if let Err(error)=drain_pages(state,publisher,crate::state::now_ms(),stop,&mut route).await {
+                if !stop.load(Ordering::Relaxed) {tracing::warn!(publisher=publisher.module(),%error,"attribution page was not committed");}
+            }
+        }
+    });
+}
+
+pub(super) fn append_roots(
+    state: &SharedState,
+    entries: &[attribution::SessionAliases],
+    stop: &AtomicBool,
+) -> Result<(), crate::refresher::SourceDrainError> {
+    use crate::refresher::SourceDrainError;
+    if stop.load(Ordering::Relaxed) {
+        return Err(SourceDrainError::Stopped);
+    }
+    if !state.with_conn(|conn| attribution::aliases_need_commit(conn, entries))? {
+        return Ok(());
+    }
+    state
+        .ordered_write(|tx| {
+            let changed = attribution::append_alias_batch(tx, entries)?;
+            if stop.load(Ordering::Relaxed) {
+                return Err("session alias drain stopped".into());
+            }
+            Ok(((), changed))
+        })
+        .map_err(|reason| {
+            if stop.load(Ordering::Relaxed) {
+                SourceDrainError::Stopped
+            } else {
+                reason.into()
+            }
+        })
+}
+
+#[cfg(test)]
+#[path = "attribution_source/tests.rs"]
+mod tests;

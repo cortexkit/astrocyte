@@ -5,6 +5,8 @@
 //! in one transaction, so a failed fact write cannot make the producer look
 //! current.
 
+#[path = "attribution_source.rs"]
+mod attribution_source;
 #[path = "broca_source.rs"]
 pub(crate) mod broca_source;
 #[path = "claude_code_source.rs"]
@@ -2555,6 +2557,8 @@ fn run_iteration_all(
         }
         drain_harness(state, *harness, stop);
     }
+
+    attribution_source::drain_all(state, stop);
 
     for producer in producers {
         if stop.load(Ordering::Relaxed) {

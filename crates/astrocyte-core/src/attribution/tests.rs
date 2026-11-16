@@ -251,6 +251,48 @@ fn attribution_join_broca_run_precedes_session_and_session_precedes_flow() {
 }
 
 #[test]
+fn attribution_join_computed_binding_ref_meets_a_roots_alias_without_a_raw_name_match() {
+    let mut conn = conn();
+    let bound = "ses_bound";
+    let reference =
+        cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+            runner: "thalamus-harness",
+            harness: "opencode2",
+            session: bound,
+        });
+    let tx = conn.transaction().unwrap();
+    append_aliases(
+        &tx,
+        "thalamus-harness",
+        "opencode",
+        "ses_host",
+        &[&reference],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    ingest(
+        &mut conn,
+        Publisher::Prefrontal,
+        vec![fact(
+            "bound",
+            session("thalamus-harness", "opencode2", bound),
+        )],
+    );
+    event(
+        &conn,
+        "call",
+        "thalamus",
+        "opencode",
+        Some("ses_host"),
+        None,
+        None,
+        100,
+    );
+    summaries(&mut conn);
+    assert_eq!(tuple(&conn).alfonso.as_deref(), Some("agent_owner"));
+}
+
+#[test]
 fn attribution_join_basal_pinned_flow_and_flow_session() {
     for by_session in [false, true] {
         let mut conn = conn();
@@ -513,4 +555,71 @@ fn attribution_report_combination_refusal_names_the_incompatible_pair() {
     };
     assert_eq!(reason.code(), "combination_unavailable");
     assert!(reason.message().contains("alfonso") && reason.message().contains("account"));
+}
+
+#[test]
+fn attribution_alias_dirtying_does_not_invent_a_reference_from_the_host_harness_label() {
+    let mut conn = conn();
+    let not_an_alias =
+        cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+            runner: "thalamus-harness",
+            harness: "opencode",
+            session: "ses_host",
+        });
+    event(
+        &conn,
+        "real",
+        "thalamus",
+        "opencode",
+        Some("ses_host"),
+        None,
+        None,
+        100,
+    );
+    event(
+        &conn,
+        "unrelated",
+        "thalamus",
+        "opencode",
+        Some(&not_an_alias),
+        None,
+        None,
+        3600100,
+    );
+    summaries(&mut conn);
+    let before: i64 = conn
+        .query_row(
+            "SELECT revision FROM attribution_hour WHERE kind=0 AND hour_number=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    append_aliases(
+        &tx,
+        "thalamus-harness",
+        "opencode",
+        "ses_host",
+        &["published-reference"],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT revision FROM attribution_hour WHERE kind=0 AND hour_number=1",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        before
+    );
+    assert!(
+        conn.query_row(
+            "SELECT revision FROM attribution_hour WHERE kind=0 AND hour_number=0",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap()
+            > 0
+    );
 }

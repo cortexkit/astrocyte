@@ -504,36 +504,63 @@ fn dirty_sql(column: &str, index: &str, has_runner: bool, has_from: bool) -> Str
     };
     format!("UPDATE attribution_hour SET revision=revision+1 WHERE (kind,hour_number) IN (SELECT CASE WHEN occurred_at_ms IS NULL THEN 1 ELSE 0 END,coalesce(occurred_at_ms/3600000-(occurred_at_ms<0 AND occurred_at_ms%3600000<>0),0) FROM usage_event INDEXED BY {index} WHERE {column}=?1{runner}{from})")
 }
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Context {
+    Session {
+        runner: String,
+        names: BTreeSet<String>,
+    },
+    Run(String),
+    Flow(String),
+}
+impl Context {
+    fn subject(aliases: &Aliases, subject: &Subject) -> Option<Self> {
+        Some(match subject {
+            Subject::Session {
+                runner: Some(runner),
+                ..
+            } => {
+                let mut names = BTreeSet::new();
+                for name in subject.names() {
+                    names.extend(aliases.names(runner, &name).map(str::to_owned));
+                }
+                Self::Session {
+                    runner: normalized_runner(runner).into(),
+                    names,
+                }
+            }
+            Subject::Session { runner: None, .. } => return None,
+            Subject::Run { run_id, .. } => Self::Run(run_id.clone()),
+            Subject::Flow { flow_id } => Self::Flow(flow_id.clone()),
+        })
+    }
+}
 fn dirty_subject(
     conn: &Connection,
     aliases: &Aliases,
     subject: &Subject,
     from: Option<i64>,
 ) -> Result<(), String> {
-    let (column, index, runner, names) = match subject {
-        Subject::Session {
-            runner: Some(runner),
-            ..
-        } => {
-            let mut names = BTreeSet::new();
-            for name in subject.names() {
-                names.extend(aliases.names(runner, &name).map(str::to_owned));
-            }
-            (
-                "session",
-                "usage_event_session_time",
-                Some(runner.as_str()),
-                names,
-            )
-        }
-        Subject::Session { runner: None, .. } => return Ok(()),
-        Subject::Run { run_id, .. } => (
+    if let Some(context) = Context::subject(aliases, subject) {
+        dirty_context(conn, &context, from)?;
+    }
+    Ok(())
+}
+fn dirty_context(conn: &Connection, context: &Context, from: Option<i64>) -> Result<(), String> {
+    let (column, index, runner, names) = match context {
+        Context::Session { runner, names } => (
+            "session",
+            "usage_event_session_time",
+            Some(runner.as_str()),
+            names.clone(),
+        ),
+        Context::Run(run_id) => (
             "run_ref",
             "usage_event_run_time",
             None,
             BTreeSet::from([run_id.clone()]),
         ),
-        Subject::Flow { flow_id } => (
+        Context::Flow(flow_id) => (
             "flow_ref",
             "usage_event_flow_time",
             None,
@@ -568,11 +595,21 @@ fn dirty_with_children(
     subject: &Subject,
     from: Option<i64>,
 ) -> Result<(), String> {
-    dirty_subject(conn, aliases, subject, from)?;
+    if let Some(context) = Context::subject(aliases, subject) {
+        dirty_context_with_children(conn, aliases, &context, from)?;
+    }
+    Ok(())
+}
+fn dirty_context_with_children(
+    conn: &Connection,
+    aliases: &Aliases,
+    context: &Context,
+    from: Option<i64>,
+) -> Result<(), String> {
+    dirty_context(conn, context, from)?;
     let mut children = BTreeSet::new();
-    let (query,parameters)=match subject {
-        Subject::Session{runner:Some(runner),..}=>{
-            let mut names=BTreeSet::new();for name in subject.names() {names.extend(aliases.names(runner,&name).map(str::to_owned));}
+    let (query,parameters)=match context {
+        Context::Session{runner,names}=>{
             let normalized=normalized_runner(runner);let other=if normalized=="thalamus" {"thalamus-harness"} else {normalized};
             let query="SELECT body FROM attribution_fact INDEXED BY attribution_parent_session WHERE parent_kind='session' AND parent_runner IN (?1,?2) AND parent_session=?3";
             let mut statement=sql(conn.prepare(query))?;
@@ -580,9 +617,8 @@ fn dirty_with_children(
             for child in children {dirty_subject(conn,aliases,&child,from)?;}
             return Ok(());
         },
-        Subject::Session{runner:None,..}=>return Ok(()),
-        Subject::Run{run_id,..}=>("SELECT body FROM attribution_fact INDEXED BY attribution_parent_run WHERE parent_kind='run' AND parent_run_id=?1",run_id),
-        Subject::Flow{flow_id}=>("SELECT body FROM attribution_fact INDEXED BY attribution_parent_flow WHERE parent_kind='flow' AND parent_flow_id=?1",flow_id),
+        Context::Run(run_id)=>("SELECT body FROM attribution_fact INDEXED BY attribution_parent_run WHERE parent_kind='run' AND parent_run_id=?1",run_id),
+        Context::Flow(flow_id)=>("SELECT body FROM attribution_fact INDEXED BY attribution_parent_flow WHERE parent_kind='flow' AND parent_flow_id=?1",flow_id),
     };
     let mut statement = sql(conn.prepare(query))?;
     let rows = sql(statement.query_map([parameters], |r| r.get::<_, String>(0)))?;
@@ -604,25 +640,76 @@ pub fn append_aliases(
     recorded: &str,
     names: &[&str],
 ) -> Result<bool, String> {
-    let mut changed = false;
-    for name in names {
-        if name.is_empty() || *name == recorded {
+    append_alias_batch(
+        tx,
+        &[SessionAliases {
+            runner: runner.into(),
+            harness: harness.into(),
+            recorded: recorded.into(),
+            names: names.iter().map(|name| (*name).into()).collect(),
+        }],
+    )
+}
+
+pub struct SessionAliases {
+    pub runner: String,
+    pub harness: String,
+    pub recorded: String,
+    pub names: Vec<String>,
+}
+pub fn aliases_need_commit(conn: &Connection, entries: &[SessionAliases]) -> Result<bool, String> {
+    for entry in entries {
+        if entry.runner.is_empty() || entry.harness.is_empty() || entry.recorded.is_empty() {
             continue;
         }
-        changed|=sql(tx.execute("INSERT INTO session_alias SELECT ?1,?2,?3,?4 WHERE NOT EXISTS(SELECT 1 FROM session_alias WHERE runner=?1 AND harness=?2 AND host_session=?3 AND bound_session=?4)",params![runner,harness,recorded,name]))?!=0;
+        for name in &entry.names {
+            if name.is_empty() || *name == entry.recorded {
+                continue;
+            }
+            if sql(conn.query_row("SELECT 1 FROM session_alias WHERE runner=?1 AND harness=?2 AND host_session=?3 AND bound_session=?4",params![entry.runner,entry.harness,entry.recorded,name],|_|Ok(())).optional())?.is_none() {return Ok(true);}
+        }
+    }
+    Ok(false)
+}
+pub fn append_alias_batch(
+    tx: &Transaction<'_>,
+    entries: &[SessionAliases],
+) -> Result<bool, String> {
+    let mut changed = false;
+    let mut affected = BTreeSet::new();
+    for entry in entries {
+        if entry.runner.is_empty() || entry.harness.is_empty() || entry.recorded.is_empty() {
+            continue;
+        }
+        for name in &entry.names {
+            if name.is_empty() || *name == entry.recorded {
+                continue;
+            }
+            let inserted=sql(tx.execute("INSERT INTO session_alias SELECT ?1,?2,?3,?4 WHERE NOT EXISTS(SELECT 1 FROM session_alias WHERE runner=?1 AND harness=?2 AND host_session=?3 AND bound_session=?4)",params![entry.runner,entry.harness,entry.recorded,name]))?!=0;
+            if inserted {
+                changed = true;
+                affected.insert((entry.runner.clone(), entry.recorded.clone()));
+            }
+        }
     }
     if changed {
         let aliases = Aliases::load(tx)?;
-        dirty_with_children(
-            tx,
-            &aliases,
-            &Subject::Session {
-                runner: Some(runner.into()),
-                harness: harness.into(),
-                session: recorded.into(),
-            },
-            None,
-        )?;
+        let mut contexts = BTreeSet::new();
+        for (runner, recorded) in affected {
+            // THALAMUS session-root items supply complete alias names. Their host label is not a
+            // binding identity, so it must never be hashed into another name.
+            let names = aliases
+                .names(&runner, &recorded)
+                .map(str::to_owned)
+                .collect();
+            contexts.insert(Context::Session {
+                runner: normalized_runner(&runner).into(),
+                names,
+            });
+        }
+        for context in contexts {
+            dirty_context_with_children(tx, &aliases, &context, None)?;
+        }
     }
     Ok(changed)
 }

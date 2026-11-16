@@ -23,8 +23,7 @@ pub(crate) const SOURCE_KEY: &str = "claude-code-thalamus";
 #[derive(Clone, Deserialize)]
 struct Root {
     session: String,
-    #[serde(rename = "session_ref")]
-    _session_ref: String,
+    session_ref: String,
     path: PathBuf,
     owner_principal: String,
     #[serde(default, deserialize_with = "deserialize_owner_session")]
@@ -161,6 +160,20 @@ impl ClaudeThalamusSource {
                     false
                 }
                 RootsFile::Declared(roots) => {
+                    let aliases = roots
+                        .iter()
+                        .filter_map(|root| {
+                            root.owner_session.as_ref().map(|owner| {
+                                astrocyte_core::attribution::SessionAliases {
+                                    runner: "thalamus-harness".into(),
+                                    harness: "claude-code".into(),
+                                    recorded: owner.clone(),
+                                    names: vec![root.session.clone(), root.session_ref.clone()],
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    super::attribution_source::append_roots(state, &aliases, stop)?;
                     cache.roots = roots;
                     true
                 }
@@ -461,6 +474,29 @@ mod tests {
         ack: PathBuf,
         source: ClaudeThalamusSource,
         state: Arc<SharedState>,
+    }
+
+    #[test]
+    fn attribution_claude_roots_append_owner_uuid_and_real_reference_pairs() {
+        let f = Fixture::new();
+        let case: Value = serde_json::from_str(include_str!(
+            "../../astrocyte-core/test-vectors/attribution-joins-v1/claude-roots.json"
+        ))
+        .unwrap();
+        let entry = &case["entry"];
+        let uuid = entry["session"].as_str().unwrap();
+        let mut root = f.root(uuid, false);
+        root["owner_session"] = entry["owner_session"].clone();
+        root["session_ref"] = entry["session_ref"].clone();
+        f.call(uuid, "request", true);
+        f.declare(vec![root]);
+        f.tick(100);
+        f.tick(101);
+        f.state.with_conn(|conn| {
+            let aliases=conn.prepare("SELECT host_session,bound_session FROM session_alias WHERE runner='thalamus-harness' AND harness='claude-code' ORDER BY bound_session").unwrap().query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            let owner=entry["owner_session"].as_str().unwrap().to_owned();
+            assert_eq!(aliases,[(owner.clone(),uuid.into()),(owner,entry["session_ref"].as_str().unwrap().into())]);Ok(())
+        }).unwrap();
     }
 
     impl Fixture {

@@ -1273,6 +1273,9 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
 /// BROCA never is: its usage is read from its store, not over subc.
 /// Claustrum is always called for subscription tiers with a list-only grant.
 /// Colliculus is called when its media source is ingested.
+/// Attribution publishers are polled on scheduled refreshes (not the shorter
+/// pricing-only cycles) in every configuration;
+/// an absent or refusing publisher does not degrade ledger health.
 fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
     let of: Vec<String> = [
         ("fusiform", desired.fusiform_connection_file.is_some()),
@@ -1280,6 +1283,10 @@ fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
         ("ckbus", true),
         ("claustrum", true),
         ("colliculus", desired.harness_ingest.ingests("colliculus")),
+        ("prefrontal-core", true),
+        ("basal", true),
+        ("magic-context", true),
+        ("entorhinal", true),
     ]
     .into_iter()
     .filter(|(_, configured)| *configured)
@@ -1464,6 +1471,15 @@ fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignal
                  before reading."
                     .to_string(),
             ),
+        });
+    }
+    for publisher in astrocyte_core::attribution::Publisher::ALL {
+        declarations.push(SelfSignalDeclaration{
+            name:format!("astrocyte-{}-{}",publisher.module(),publisher.read_name().replace('.',"-")),
+            kind:SelfSignalKind::Poller,effect:SelfSignalEffect::Observe,
+            anchored_to:SignalAnchor::FixedInterval,cadence:Some(tick_cadence()),
+            domain:Some(publisher.module().into()),
+            note:Some(format!("{} on each full refresher tick, paging from the durable cursor. Terminal suffixes replay without writes; refusals retry next tick without changing health.",publisher.read_name())),
         });
     }
     declarations
@@ -2409,6 +2425,60 @@ mod tests {
             .collect()
     }
 
+    fn expected_modules(base: &[&str]) -> Vec<String> {
+        base.iter()
+            .chain(["prefrontal-core", "basal", "magic-context", "entorhinal"].iter())
+            .map(|name| (*name).into())
+            .collect()
+    }
+    fn expected_signals(base: &[&str]) -> Vec<String> {
+        base.iter()
+            .chain(
+                [
+                    "astrocyte-prefrontal-core-attribution-read",
+                    "astrocyte-basal-attribution-read",
+                    "astrocyte-magic-context-attribution-read",
+                    "astrocyte-entorhinal-placement-read",
+                ]
+                .iter(),
+            )
+            .map(|name| (*name).into())
+            .collect()
+    }
+
+    #[test]
+    fn attribution_manifest_declares_four_unconditional_read_pollers() {
+        let manifest = manifest("astrocyte", &desired(false, false));
+        let wire = serde_json::to_value(&manifest).unwrap();
+        for (module, name) in [
+            (
+                "prefrontal-core",
+                "astrocyte-prefrontal-core-attribution-read",
+            ),
+            ("basal", "astrocyte-basal-attribution-read"),
+            ("magic-context", "astrocyte-magic-context-attribution-read"),
+            ("entorhinal", "astrocyte-entorhinal-placement-read"),
+        ] {
+            assert!(consumed_modules(&manifest)
+                .iter()
+                .any(|target| target == module));
+            let signal = wire["self_signals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|signal| signal["name"] == name)
+                .expect("publisher read must be declared");
+            assert_eq!(signal["domain"], module);
+            assert_eq!(signal["kind"], "poller");
+            assert_eq!(signal["effect"], "observe");
+            assert_eq!(signal["anchored_to"], "fixed_interval");
+            assert_eq!(
+                signal["cadence"],
+                json!({"derived":{"source":"desired_config.poll_interval_secs"}})
+            );
+        }
+    }
+
     /// The self-signal list is a completeness claim, so every call astrocyte
     /// makes against another module under this configuration must be in it
     /// by name, and the consumers must be exactly the modules it calls.
@@ -2418,7 +2488,7 @@ mod tests {
         assert_eq!(manifest.registration_channel, Some(true));
         assert_eq!(
             self_signal_names(&manifest),
-            [
+            expected_signals(&[
                 "astrocyte-insula-usage-poll",
                 "astrocyte-insula-quota-body",
                 "astrocyte-ckbus-credentials",
@@ -2426,11 +2496,11 @@ mod tests {
                 "astrocyte-fusiform-history-status",
                 "astrocyte-fusiform-history-probe",
                 "astrocyte-colliculus-usage-read",
-            ]
+            ])
         );
         assert_eq!(
             consumed_modules(&manifest),
-            ["fusiform", "insula", "ckbus", "claustrum", "colliculus"]
+            expected_modules(&["fusiform", "insula", "ckbus", "claustrum", "colliculus"])
         );
         let wire = serde_json::to_value(&manifest).unwrap();
         let signals = wire["self_signals"].as_array().unwrap();
@@ -2468,7 +2538,7 @@ mod tests {
         let manifest = manifest("astrocyte", &desired);
         assert_eq!(
             self_signal_names(&manifest),
-            [
+            expected_signals(&[
                 "astrocyte-ckbus-credentials",
                 "astrocyte-fusiform-catalog-lookup",
                 "astrocyte-fusiform-history-status",
@@ -2476,7 +2546,7 @@ mod tests {
                 "astrocyte-fusiform-plan-prices",
                 "astrocyte-fusiform-multiplier-rates",
                 "astrocyte-colliculus-usage-read",
-            ]
+            ])
         );
         let wire = serde_json::to_value(&manifest).unwrap();
         let plan_prices = wire["self_signals"]
@@ -2495,22 +2565,25 @@ mod tests {
         assert_eq!(plan_prices["domain"], "fusiform");
     }
 
-    /// With file-based peers unconfigured and the media feed excluded, only
-    /// ckbus is called to let the bus reader follow runners' step events.
+    /// Disabling insula, fusiform and colliculus does not suppress the four
+    /// attribution publishers, the bus reader or subscription-tier reads.
     #[test]
-    fn manifest_declares_only_the_bus_reader_when_no_peer_is_configured() {
+    fn manifest_keeps_attribution_readers_when_optional_peers_are_unconfigured() {
         let mut desired = desired(false, false);
         desired.harness_ingest.exclude.push("colliculus".into());
         let manifest = manifest("astrocyte", &desired);
         assert_eq!(
             self_signal_names(&manifest),
-            ["astrocyte-ckbus-credentials"]
+            expected_signals(&["astrocyte-ckbus-credentials"])
         );
-        assert_eq!(consumed_modules(&manifest), ["ckbus", "claustrum"]);
+        assert_eq!(
+            consumed_modules(&manifest),
+            expected_modules(&["ckbus", "claustrum"])
+        );
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire["consumes"],
-            json!([{"role": "service_client", "of": ["ckbus", "claustrum"]}])
+            json!([{"role": "service_client", "of": expected_modules(&["ckbus", "claustrum"])}])
         );
     }
 
@@ -2552,8 +2625,16 @@ mod tests {
                 signals.push("astrocyte-colliculus-usage-read");
                 modules.push("colliculus");
             }
-            assert_eq!(self_signal_names(&manifest), signals, "{ingest:?}");
-            assert_eq!(consumed_modules(&manifest), modules, "{ingest:?}");
+            assert_eq!(
+                self_signal_names(&manifest),
+                expected_signals(&signals),
+                "{ingest:?}"
+            );
+            assert_eq!(
+                consumed_modules(&manifest),
+                expected_modules(&modules),
+                "{ingest:?}"
+            );
         }
     }
 
@@ -2564,21 +2645,21 @@ mod tests {
         let manifest = manifest("astrocyte", &desired(true, false));
         assert_eq!(
             self_signal_names(&manifest),
-            [
+            expected_signals(&[
                 "astrocyte-insula-usage-poll",
                 "astrocyte-insula-quota-body",
                 "astrocyte-ckbus-credentials",
                 "astrocyte-colliculus-usage-read",
-            ]
+            ])
         );
         assert_eq!(
             consumed_modules(&manifest),
-            ["insula", "ckbus", "claustrum", "colliculus"]
+            expected_modules(&["insula", "ckbus", "claustrum", "colliculus"])
         );
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire["consumes"],
-            json!([{"role": "service_client", "of": ["insula", "ckbus", "claustrum", "colliculus"]}])
+            json!([{"role": "service_client", "of": expected_modules(&["insula", "ckbus", "claustrum", "colliculus"])}])
         );
         let poll = &wire["self_signals"][0];
         assert_eq!(poll["name"], "astrocyte-insula-usage-poll");
@@ -2627,8 +2708,16 @@ mod tests {
                 modules.push("colliculus");
                 signals.push("astrocyte-colliculus-usage-read");
             }
-            assert_eq!(consumed_modules(&manifest), modules, "{ingest:?}");
-            assert_eq!(self_signal_names(&manifest), signals, "{ingest:?}");
+            assert_eq!(
+                consumed_modules(&manifest),
+                expected_modules(&modules),
+                "{ingest:?}"
+            );
+            assert_eq!(
+                self_signal_names(&manifest),
+                expected_signals(&signals),
+                "{ingest:?}"
+            );
             if enabled {
                 let wire = serde_json::to_value(&manifest).unwrap();
                 let signal = wire["self_signals"]

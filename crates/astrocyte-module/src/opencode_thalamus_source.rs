@@ -249,6 +249,20 @@ impl OpenCodeThalamusSource {
                 }
                 RootsFile::Declared(entries) => match check_paths_unique(&entries) {
                     Ok(()) => {
+                        let mut aliases = Vec::new();
+                        for entry in &entries {
+                            if let Store::Shared { sessions } = &entry.store {
+                                for session in sessions {
+                                    aliases.push(astrocyte_core::attribution::SessionAliases {
+                                        runner: "thalamus-harness".into(),
+                                        harness: "opencode".into(),
+                                        recorded: session.session.clone(),
+                                        names: vec![session.metadata.session_ref.clone()],
+                                    });
+                                }
+                            }
+                        }
+                        super::attribution_source::append_roots(state, &aliases, stop)?;
                         cache.entries = entries;
                         true
                     }
@@ -715,6 +729,46 @@ mod tests {
         roots: PathBuf,
         source: OpenCodeThalamusSource,
         state: Arc<SharedState>,
+    }
+
+    #[test]
+    fn attribution_opencode_roots_append_native_session_reference_pair() {
+        let f = Fixture::new();
+        f.shared_call("ses_host", "call", true, CREATED);
+        f.declare(vec![
+            f.shared_entry(vec![Fixture::shared_session("ses_host", false)])
+        ]);
+        f.tick(T0);
+        f.tick(T0 + 1);
+        f.state
+            .with_conn(|conn| {
+                let aliases = conn
+                    .prepare("SELECT runner,harness,host_session,bound_session FROM session_alias")
+                    .unwrap()
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(
+                    aliases,
+                    [(
+                        "thalamus-harness".into(),
+                        "opencode".into(),
+                        "ses_host".into(),
+                        "ref-ses_host".into()
+                    )]
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(f.runtime(), Some((Some(T0 + 1), false)));
     }
 
     impl Fixture {
