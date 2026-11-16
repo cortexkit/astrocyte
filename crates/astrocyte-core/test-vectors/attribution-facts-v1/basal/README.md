@@ -11,8 +11,9 @@ body Astrocyte reads.
 - `flow.json`: first approved ordinary flow.
 - `instance.json`: template instance (package instances use the same fact shape).
 - `flow-session.json`: exact flow model-call session, with its parent flow.
-- `program-session.json`: exact program model-call session. The admitted bind
-  contains harness/session but no runner, so its parent is null.
+- `program-session.json`: exact program model-call session. The session
+  binding the program was admitted with names its harness and session but no
+  runner, so its parent is null.
 - `read-page.json`: the first two facts, with numeric `next` and `through`.
 - `bus-message.json`: an actual published message received from JetStream.
 

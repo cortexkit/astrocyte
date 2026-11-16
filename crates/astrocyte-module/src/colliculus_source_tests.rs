@@ -175,6 +175,15 @@ fn fixed_page(entries: Vec<Value>) -> Reply {
         if value["method"] == "usage.ack" {
             return result(json!({"acked_through_seq":value["params"]["through_seq"]}));
         }
+        // A full tick also asks the attribution publishers for facts through
+        // the same attested connection; this peer plays only Colliculus, so it
+        // refuses those reads as a module without the operation would.
+        if value["method"] == "attribution.read" || value["method"] == "placement.read" {
+            return (
+                FrameType::Error,
+                json!({"code":"unknown_operation","message":"not served here"}),
+            );
+        }
         assert_eq!(value["method"], "usage.read");
         assert_eq!(value["params"]["limit"], 1_000);
         let after = value["params"]["after_seq"].as_u64().unwrap();
@@ -982,7 +991,7 @@ fn media_sdk_uses_attested_launch_identity() {
     let requests = peer.requests.lock().unwrap();
     let opens: Vec<_> = requests
         .iter()
-        .filter(|value| value["op"] == "route.open")
+        .filter(|value| value["op"] == "route.open" && value["target"]["module_id"] == "colliculus")
         .collect();
     assert_eq!(opens.len(), 1);
     assert_eq!(

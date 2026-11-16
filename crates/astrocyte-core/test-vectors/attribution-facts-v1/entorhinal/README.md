@@ -5,7 +5,8 @@ open to a reserved reader. The cases, in order, are: before activation (empty),
 the first backfilled page with a next cursor, the final backfilled page, a new
 registration with null workspace, an assignment, the unchanged read after a
 same-workspace assignment (no new fact), and a project removal with null workspace.
-Both nullable fact fields are present and field order is part of the contract.
+The two nullable fact fields, `supersedes` and `workspace_id`, are always
+present (as `null` when empty), and field order is part of the contract.
 
 `event.json` captures the existing bus worker's publish calls for one backfilled
 fact and one live assignment. Each record has the subject (with `{acct}` left

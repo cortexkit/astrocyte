@@ -644,8 +644,10 @@ fn dirty_context(conn: &Connection, context: &Context, from: Option<i64>) -> Res
     Ok(())
 }
 
-// Only the direct parent is read: its owning agent determines the child's
-// parent_alfonso. Changes to grandparent ownership do not change that field.
+// An "Alfonso" is the agent a fact names as owning the work (`alfonso`), and a
+// child's `parent_alfonso` is the agent that owns its direct parent. Only the
+// direct parent is read, so a change to a grandparent's owner leaves the
+// child's `parent_alfonso` as it was and dirties nothing below the parent.
 fn dirty_with_children(
     conn: &Connection,
     aliases: &Aliases,

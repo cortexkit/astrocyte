@@ -202,12 +202,23 @@ pub(super) fn drain_all(state: &SharedState, stop: &AtomicBool) {
     };
     runtime.block_on(async {
         for publisher in Publisher::ALL {
-            if stop.load(Ordering::Relaxed) {break;}
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             // Absence and routing refusals are normal while publishers roll out.
             // Do not create source_runtime rows or change an existing health result.
-            let Ok(mut route)=Route::open(state,publisher).await else {continue;};
-            if let Err(error)=drain_pages(state,publisher,crate::state::now_ms(),stop,&mut route).await {
-                if !stop.load(Ordering::Relaxed) {tracing::warn!(publisher=publisher.module(),%error,"attribution page was not committed");}
+            let Ok(mut route) = Route::open(state, publisher).await else {
+                continue;
+            };
+            let now = crate::state::now_ms();
+            if let Err(error) = drain_pages(state, publisher, now, stop, &mut route).await {
+                if !stop.load(Ordering::Relaxed) {
+                    tracing::warn!(
+                        publisher = publisher.module(),
+                        %error,
+                        "attribution page was not committed"
+                    );
+                }
             }
         }
     });
