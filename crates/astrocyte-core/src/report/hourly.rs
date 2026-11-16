@@ -1,8 +1,10 @@
 //! Rebuildable hour partitions; source facts remain authoritative.
+mod attribution;
 #[cfg(test)]
 mod copy_bench;
 pub mod valuation;
 use super::*;
+use attribution::Attribution;
 use rusqlite::Transaction;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -33,12 +35,13 @@ const DIMENSIONS: [Grouping; GROUPING_DIMENSIONS] = [
     Grouping::Harness,
 ];
 
-// Report dimensions, currency, and the hidden subscription payer. Keeping the
-// payer separate means it cannot become a served spend-report grouping.
+// Hidden dimensions stay apart from the served grouping array: currency,
+// subscription payer and the attribution tuple have independent read semantics.
 type Key = (
     [Option<String>; GROUPING_DIMENSIONS],
     Option<String>,
     Option<String>,
+    Attribution,
 );
 type QuantityKey = (String, String, i32);
 type FrequencyKey = (String, Option<String>, String, i64);
@@ -155,6 +158,7 @@ fn key(ledger: &Ledger, event: &LedgerEvent) -> Key {
             .map(|value| ledger.values.optional_name(value)),
         ledger.values.optional_name(event.currency),
         ledger.values.optional_name(event.paying_credential),
+        Attribution::default(),
     )
 }
 fn is_subscription(key: &Key) -> bool {
@@ -426,17 +430,18 @@ fn parse_exact(value: String) -> Result<i128, ReportError> {
 struct RawCell {
     id: i64,
     hour: Hour,
-    dictionary: [i64; GROUPING_DIMENSIONS + 2],
+    dictionary: [i64; GROUPING_DIMENSIONS + 3],
     payload: String,
 }
 impl RawCell {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        let mut dictionary = [0; GROUPING_DIMENSIONS + 2];
+        let mut dictionary = [0; GROUPING_DIMENSIONS + 3];
         for (column, id) in dictionary[..GROUPING_DIMENSIONS].iter_mut().enumerate() {
             *id = row.get(column + 3)?;
         }
         dictionary[GROUPING_DIMENSIONS] = row.get(13)?;
         dictionary[GROUPING_DIMENSIONS + 1] = row.get(15)?;
+        dictionary[GROUPING_DIMENSIONS + 2] = row.get(16)?;
         Ok(Self {
             id: row.get(0)?,
             hour: Hour {
@@ -457,6 +462,7 @@ impl RawCell {
             dimensions,
             value(values, self.dictionary[GROUPING_DIMENSIONS])?,
             value(values, self.dictionary[GROUPING_DIMENSIONS + 1])?,
+            Attribution::from_dictionary(value(values, self.dictionary[GROUPING_DIMENSIONS + 2])?)?,
         ))
     }
 }
@@ -468,7 +474,7 @@ fn stored_recorded(
 ) -> Result<(Data, HashMap<i64, Key>), ReportError> {
     let mut data = Data::default();
     let mut keys = HashMap::new();
-    let mut statement=conn.prepare("SELECT cell_id,kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential
+    let mut statement=conn.prepare("SELECT cell_id,kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential,attribution
         FROM summary_cell WHERE kind=?1 AND hour_number=?2")?;
     let rows = statement
         .query_map(params![hour.kind, hour.number], RawCell::read)?
@@ -570,12 +576,16 @@ fn replace(
     )?;
     let mut cells = BTreeMap::new();
     for (key, cell) in &data.cells {
-        let mut ids = [0_i64; GROUPING_DIMENSIONS + 2];
-        for (id, text) in ids.iter_mut().zip(key.0.iter().chain([&key.1, &key.2])) {
+        let attribution = key.3.dictionary_value()?;
+        let mut ids = [0_i64; GROUPING_DIMENSIONS + 3];
+        for (id, text) in ids
+            .iter_mut()
+            .zip(key.0.iter().chain([&key.1, &key.2, &attribution]))
+        {
             *id = value_id(tx, &mut values, text)?;
         }
-        tx.execute("INSERT INTO summary_cell(kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![hour.kind,hour.number,ids[0],ids[1],ids[2],ids[3],ids[4],ids[5],ids[6],ids[7],ids[8],ids[9],ids[10],encode(cell)?,ids[11]])?;
+        tx.execute("INSERT INTO summary_cell(kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential,attribution)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![hour.kind,hour.number,ids[0],ids[1],ids[2],ids[3],ids[4],ids[5],ids[6],ids[7],ids[8],ids[9],ids[10],encode(cell)?,ids[11],ids[12]])?;
         cells.insert(key.clone(), tx.last_insert_rowid());
     }
     for ((key, (unit, role, exponent)), quantity) in &data.quantities {
@@ -1120,7 +1130,7 @@ fn scoped_frame<'c>(
     let mut observed = BTreeMap::new();
     let mut split = BTreeSet::new();
     let scope = scope.replace("h.", "c.");
-    let mut statement=conn.prepare(&format!("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.runner,c.harness,c.currency,c.payload,c.paying_credential
+    let mut statement=conn.prepare(&format!("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.runner,c.harness,c.currency,c.payload,c.paying_credential,c.attribution
         FROM summary_cell c{scope}"))?;
     let mut rows = statement.query(rusqlite::params_from_iter(&parameters))?;
     let mut raw = Vec::new();
@@ -2018,6 +2028,48 @@ mod tests {
     use crate::{ingest, pricing, subscription, verdict};
 
     #[test]
+    fn attribution_null_tuple_is_written_by_real_summary_maintenance() {
+        let mut conn = conn();
+        let id = record(
+            &mut conn,
+            "unattributed",
+            Some(1_000),
+            ChargeBasis::MeteredApi,
+            None,
+        );
+        priced(&mut conn, &id, "USD", 123);
+        let request = ReportRequest {
+            grain: "day".into(),
+            timezone: "UTC".into(),
+            ..Default::default()
+        };
+        let stale = spend_report(&conn, &request, 10_000).unwrap();
+        catch_up(&mut conn);
+        let built = spend_report(&conn, &request, 10_000).unwrap();
+        assert_eq!(
+            serde_json::to_value(stale).unwrap(),
+            serde_json::to_value(built).unwrap()
+        );
+        assert_eq!(
+            conn.query_row("SELECT attribution FROM summary_cell", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let data = stored(&conn, Hour { kind: 0, number: 0 }).unwrap();
+        let (key, cell) = data.cells.first_key_value().unwrap();
+        assert_eq!(key.3, Attribution::default());
+        assert_eq!(cell.events, 1);
+        assert_eq!(cell.total, 123);
+        let serialized = serde_json::to_value(key).unwrap();
+        assert_eq!(serialized.as_array().unwrap().len(), 4);
+        assert_eq!(
+            serialized[3],
+            serde_json::json!({"alfonso":null,"parent_alfonso":null,"workload":null,"task":null,"project_id":null,"workspace":null})
+        );
+    }
+
+    #[test]
     fn media_skipped_local_coverage_is_live_on_base_and_hourly_paths() {
         let mut conn = conn();
         assert!(
@@ -2826,7 +2878,7 @@ mod tests {
     #[test]
     fn format_three_payer_cells_are_never_served_before_rebuild() {
         let mut conn = credential_fixture();
-        assert_eq!(FORMAT, 6);
+        assert_eq!(FORMAT, 7);
         conn.execute(
             "UPDATE summary_hour SET format_version=3 WHERE hour_number=5",
             [],

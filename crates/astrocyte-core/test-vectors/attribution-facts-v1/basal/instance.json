@@ -1,0 +1,15 @@
+{
+  "alfonso": "agent_attribution",
+  "effective_from_ms": 1777593600000,
+  "fact_id": "basal:flow:attribution-template_5b00bebc916ea330:created",
+  "parent": null,
+  "project_id": null,
+  "recorded_at_ms": 1777593600000,
+  "subject": {
+    "flow_id": "attribution-template_5b00bebc916ea330",
+    "kind": "flow"
+  },
+  "supersedes": null,
+  "task": "basal.attribution-template",
+  "workload": "flow"
+}

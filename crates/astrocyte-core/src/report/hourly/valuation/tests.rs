@@ -185,6 +185,38 @@ fn state(conn: &Connection, hour: i64) -> String {
 }
 
 #[test]
+fn attribution_tuple_survives_real_valuation_publication() {
+    let mut conn = conn();
+    let config = config();
+    event(
+        &mut conn,
+        "unattributed",
+        1,
+        "A",
+        None,
+        None,
+        "metered_api",
+        4,
+    );
+    rate(&conn, "A", 3);
+    summaries(&mut conn);
+    drain(&mut conn, &config);
+    assert_eq!(state(&conn, 0), "built");
+    let cells = stored_cells(&conn, 0);
+    assert_eq!(cells.len(), 1);
+    let ((key, _), cell) = cells.first_key_value().unwrap();
+    assert_eq!(key.3, Attribution::default());
+    assert_eq!(cell.recorded.cell.events, 1);
+    assert_eq!(cell.numerator, 24);
+    let summary_key: String = conn
+        .query_row("SELECT summary_key FROM valuation_cell", [], |r| r.get(0))
+        .unwrap();
+    let encoded: serde_json::Value = serde_json::from_str(&summary_key).unwrap();
+    assert_eq!(encoded.as_array().unwrap().len(), 4);
+    assert_eq!(encoded[3]["alfonso"], serde_json::Value::Null);
+}
+
+#[test]
 fn valuation_summary_dirty_propagates_and_fences_publication() {
     let mut conn = conn();
     let config = config();

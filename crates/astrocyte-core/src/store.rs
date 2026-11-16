@@ -4960,6 +4960,160 @@ UPDATE rate_cache_state
     WHERE id = 1;
 "#,
     },
+    Migration {
+        version: 58,
+        statements: r#"-- Attribution is publisher evidence, never a mutation of ledger identity.
+CREATE TABLE attribution_fact (
+    fact_id TEXT PRIMARY KEY,
+    publisher TEXT NOT NULL,
+    body TEXT NOT NULL CHECK(json_valid(body)),
+    subject_kind TEXT NOT NULL CHECK(subject_kind IN ('session','run','flow')),
+    subject_runner TEXT,
+    subject_harness TEXT,
+    subject_session TEXT,
+    subject_run_id TEXT,
+    subject_flow_id TEXT,
+    alfonso TEXT,
+    parent_kind TEXT CHECK(parent_kind IN ('session','run','flow')),
+    parent_runner TEXT,
+    parent_harness TEXT,
+    parent_session TEXT,
+    parent_run_id TEXT,
+    parent_flow_id TEXT,
+    workload TEXT NOT NULL,
+    task TEXT,
+    project_id TEXT,
+    effective_from_ms INTEGER NOT NULL,
+    recorded_at_ms INTEGER NOT NULL,
+    supersedes TEXT
+) WITHOUT ROWID;
+CREATE INDEX attribution_fact_session ON attribution_fact(subject_runner,subject_session)
+    WHERE subject_kind='session';
+CREATE INDEX attribution_fact_run ON attribution_fact(subject_run_id) WHERE subject_kind='run';
+CREATE INDEX attribution_fact_flow ON attribution_fact(subject_flow_id) WHERE subject_kind='flow';
+CREATE INDEX attribution_fact_project ON attribution_fact(project_id);
+CREATE INDEX attribution_fact_supersedes ON attribution_fact(supersedes) WHERE supersedes IS NOT NULL;
+CREATE TRIGGER attribution_fact_no_update BEFORE UPDATE ON attribution_fact
+BEGIN SELECT RAISE(ABORT, 'attribution_fact_no_update'); END;
+CREATE TRIGGER attribution_fact_no_delete BEFORE DELETE ON attribution_fact
+BEGIN SELECT RAISE(ABORT, 'attribution_fact_no_delete'); END;
+CREATE TRIGGER attribution_fact_insert_once BEFORE INSERT ON attribution_fact
+WHEN EXISTS (SELECT 1 FROM attribution_fact WHERE fact_id=NEW.fact_id)
+BEGIN SELECT RAISE(ABORT, 'attribution_fact_insert_once'); END;
+
+CREATE TABLE placement_fact (
+    fact_id TEXT PRIMARY KEY,
+    publisher TEXT NOT NULL,
+    body TEXT NOT NULL CHECK(json_valid(body)),
+    project_id TEXT NOT NULL,
+    workspace_id TEXT,
+    effective_from_ms INTEGER NOT NULL,
+    recorded_at_ms INTEGER NOT NULL,
+    supersedes TEXT
+) WITHOUT ROWID;
+CREATE INDEX placement_fact_project_time ON placement_fact(project_id,effective_from_ms,recorded_at_ms);
+CREATE INDEX placement_fact_supersedes ON placement_fact(supersedes) WHERE supersedes IS NOT NULL;
+CREATE TRIGGER placement_fact_no_update BEFORE UPDATE ON placement_fact
+BEGIN SELECT RAISE(ABORT, 'placement_fact_no_update'); END;
+CREATE TRIGGER placement_fact_no_delete BEFORE DELETE ON placement_fact
+BEGIN SELECT RAISE(ABORT, 'placement_fact_no_delete'); END;
+CREATE TRIGGER placement_fact_insert_once BEFORE INSERT ON placement_fact
+WHEN EXISTS (SELECT 1 FROM placement_fact WHERE fact_id=NEW.fact_id)
+BEGIN SELECT RAISE(ABORT, 'placement_fact_insert_once'); END;
+
+CREATE TABLE attribution_cursor (
+    publisher TEXT PRIMARY KEY,
+    read_name TEXT NOT NULL,
+    cursor TEXT,
+    through TEXT,
+    last_read_at_ms INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE session_alias (
+    runner TEXT NOT NULL,
+    harness TEXT NOT NULL,
+    host_session TEXT NOT NULL,
+    bound_session TEXT NOT NULL,
+    PRIMARY KEY(runner,harness,host_session,bound_session)
+) WITHOUT ROWID;
+CREATE INDEX session_alias_host ON session_alias(host_session);
+CREATE TRIGGER session_alias_no_update BEFORE UPDATE ON session_alias
+BEGIN SELECT RAISE(ABORT, 'session_alias_no_update'); END;
+CREATE TRIGGER session_alias_no_delete BEFORE DELETE ON session_alias
+BEGIN SELECT RAISE(ABORT, 'session_alias_no_delete'); END;
+CREATE TRIGGER session_alias_insert_once BEFORE INSERT ON session_alias
+WHEN EXISTS (SELECT 1 FROM session_alias WHERE runner=NEW.runner AND harness=NEW.harness
+    AND host_session=NEW.host_session AND bound_session=NEW.bound_session)
+BEGIN SELECT RAISE(ABORT, 'session_alias_insert_once'); END;
+
+-- Only derived cells are discarded. Retained hours keep reports on the ledger
+-- until the bounded backlog builder publishes the wider dimension key.
+DROP TABLE summary_quantity;
+DROP TABLE summary_money;
+DROP TABLE summary_cell;
+CREATE TABLE summary_cell (
+    cell_id INTEGER PRIMARY KEY,
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    producer INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(producer>0),
+    provider INTEGER NOT NULL REFERENCES summary_value(value_id),
+    model INTEGER NOT NULL REFERENCES summary_value(value_id),
+    account INTEGER NOT NULL REFERENCES summary_value(value_id),
+    auth_selection INTEGER NOT NULL REFERENCES summary_value(value_id),
+    charge_basis INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(charge_basis>0),
+    work_class INTEGER NOT NULL REFERENCES summary_value(value_id),
+    project INTEGER NOT NULL REFERENCES summary_value(value_id),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id),
+    payload TEXT NOT NULL CHECK(json_valid(payload)),
+    paying_credential INTEGER NOT NULL REFERENCES summary_value(value_id),
+    runner INTEGER NOT NULL REFERENCES summary_value(value_id),
+    harness INTEGER NOT NULL REFERENCES summary_value(value_id),
+    attribution INTEGER NOT NULL DEFAULT 0 REFERENCES summary_value(value_id),
+    UNIQUE(kind,hour_number,producer,provider,model,account,auth_selection,charge_basis,work_class,project,currency,paying_credential,runner,harness,attribution),
+    FOREIGN KEY(kind,hour_number) REFERENCES summary_hour(kind,hour_number)
+);
+CREATE TABLE summary_quantity (
+    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
+    unit INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(unit>0),
+    role INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(role>0),
+    exponent INTEGER NOT NULL CHECK(exponent BETWEEN -9 AND 1),
+    units TEXT NOT NULL,
+    observations INTEGER NOT NULL CHECK(observations>=0),
+    covered_units TEXT NOT NULL,
+    covered_observations INTEGER NOT NULL CHECK(covered_observations>=0),
+    stated_observations INTEGER NOT NULL CHECK(stated_observations>=0 AND stated_observations<=observations),
+    PRIMARY KEY(cell_id,unit,role,exponent)
+) WITHOUT ROWID;
+CREATE TABLE summary_money (
+    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
+    kind INTEGER NOT NULL CHECK(kind IN (0,1)),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(currency>0),
+    nanos TEXT NOT NULL,
+    contributions INTEGER NOT NULL CHECK(contributions>0),
+    PRIMARY KEY(cell_id,kind,currency)
+) WITHOUT ROWID;
+DROP INDEX summary_hour_stale;
+CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
+    WHERE built_revision IS NOT revision OR format_version IS NOT 7;
+
+-- Serialized valuation keys carry the same attribution tuple as summary keys.
+DROP TABLE valuation_cell;
+CREATE TABLE valuation_cell (
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    cell_key TEXT NOT NULL CHECK(json_valid(cell_key)),
+    summary_key TEXT NOT NULL CHECK(json_valid(summary_key)),
+    plan TEXT NOT NULL,
+    plan_account TEXT,
+    plan_record TEXT CHECK(plan_record IS NULL OR json_valid(plan_record)),
+    recorded TEXT NOT NULL CHECK(json_valid(recorded)),
+    list_numerator TEXT NOT NULL,
+    unvalued TEXT NOT NULL CHECK(json_valid(unvalued)),
+    PRIMARY KEY(kind,hour_number,cell_key),
+    FOREIGN KEY(kind,hour_number) REFERENCES valuation_hour(kind,hour_number)
+) WITHOUT ROWID;
+UPDATE valuation_hour SET state='dirty',revision=revision+1;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -5015,6 +5169,7 @@ impl Drop for VmCounter {
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 #[cfg(test)]
 mod tests {
+    include!("store_v58_tests.rs");
     include!("store_v33_tests.rs");
 
     #[test]

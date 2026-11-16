@@ -1,0 +1,20 @@
+{
+  "alfonso": "agent_attribution",
+  "effective_from_ms": 1777593600000,
+  "fact_id": "basal:session:basal:flow-attribution-flow:attribution-run:0",
+  "parent": {
+    "flow_id": "attribution-flow",
+    "kind": "flow"
+  },
+  "project_id": null,
+  "recorded_at_ms": 1777593600000,
+  "subject": {
+    "harness": "broca",
+    "kind": "session",
+    "runner": "broca",
+    "session": "basal:flow-attribution-flow:attribution-run:0"
+  },
+  "supersedes": null,
+  "task": "basal.attribution-flow",
+  "workload": "flow"
+}

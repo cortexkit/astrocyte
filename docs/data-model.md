@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 57. A schema change appends a migration; an applied
+currently version 58. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -60,10 +60,14 @@ copies that timeout without running the table-creating probes.
 | `window_sample` | Each row preserves a capacity-window observation and its breakdown in the append-only history. | insert |
 | `multiplier_observation` | Each row records a daily subscription multiplier observation or an operator recompute that supersedes an earlier observation. | insert only |
 | `credential_window_sample` | Source-instant quota history for readings without an account, identified by provider, vault credential and pool. | insert only |
+| `attribution_fact` | Each row reserves a publisher's verbatim fact and indexed subject, parent, workload, task and project evidence. Ingestion is not enabled yet. | insert only; corrections append with `supersedes` |
+| `placement_fact` | Each row reserves a publisher's dated project-to-workspace placement and verbatim fact. Ingestion is not enabled yet. | insert only; corrections append with `supersedes` |
+| `attribution_cursor` | Each row can checkpoint one publisher's read name, opaque cursor, through position and last read time. | upsert with a committed page |
+| `session_alias` | Each row can preserve a runner/harness-qualified pair of recorded host session and bound session. | insert only |
 | `summary_value` | Each row assigns an exact stored string an integer identifier, with identifier zero reserved for null. | Builders insert new values. |
 | `summary_hour` | Each row records an hour's persistent revision, published revision, format, event count and time extrema. | Triggers advance revisions, and publication records a completed build. |
 | `summary_dirty_hour` | Each row identifies an hour that needs a fresh reduction from base rows. | Triggers insert dirty keys, and successful publication removes them. |
-| `summary_cell` | Each row holds dimension-keyed event and measurement counters, exact money sums and reason maps for one hour. | Rebuilds replace these rows. |
+| `summary_cell` | Each row holds dimension-keyed event and measurement counters, exact money sums and reason maps for one hour. Its hidden `attribution` value interns the tuple (alfonso, parent_alfonso, workload, task, project_id, workspace); zero means the all-null Not attributed tuple. | Rebuilds replace these rows. |
 | `summary_quantity` | Each row holds exact quantities for a cell, role, unit and exponent, including covered population, observation counts and stated-quantity counts. | Rebuilds replace these rows. |
 | `summary_money` | Each row holds current-head or adjustment contributions in their actual currency, together with a presence count. | Rebuilds replace these rows. |
 | `summary_cost_frequency` | Each row counts an exact current-head value in the dated, complete, currency-known work-class sample. | Rebuilds replace these rows. |
@@ -82,6 +86,15 @@ it when the database is replaced or restored, so a reader starts again at the
 lowest sequence instead of skipping a newly reused sequence number. The mirror
 keeps attempt identities across incarnations to prevent duplicate calls.
 
+Summary format 7 adds the attribution tuple to both summary and valuation keys.
+`alfonso` identifies the owning agent; `parent_alfonso` identifies the agent that
+owns the launching subject, which can differ from the child's owner.
+Until the attribution reader and join are enabled, every call writes the all-null
+tuple. Migration 58 discards only derived summary and valuation cells, preserves
+the hour metadata and ledger, and marks valuations dirty. The bounded backlog
+builder rebuilds stale hours; reports use ledger aggregation until each hour is
+current. Attribution grouping and filtering are not enabled by this migration.
+
 ## Immutability
 
 Triggers abort the change with the trigger's name as the error. "Insert only"
@@ -97,6 +110,9 @@ in the table above means both of these exist:
 - `multiplier_observation_no_update`, `multiplier_observation_no_delete`
 - `account_subscription_no_delete`, `credential_subscription_no_delete`
 - `step_detail_no_update`, `step_detail_no_delete`
+- `attribution_fact_no_update`, `attribution_fact_no_delete`
+- `placement_fact_no_update`, `placement_fact_no_delete`
+- `session_alias_no_update`, `session_alias_no_delete`
 
 Each of these tables also has a `BEFORE INSERT` trigger named
 `<table>_insert_once`. The same protection applies to `step_feed`, whose rows

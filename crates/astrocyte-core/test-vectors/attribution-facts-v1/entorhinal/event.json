@@ -1,0 +1,4 @@
+[
+  {"body":"{\"fact_id\":\"b:abababababababababababababababab:1:served-project\",\"supersedes\":null,\"project_id\":\"served-project\",\"workspace_id\":\"served-workspace\",\"effective_from_ms\":700,\"recorded_at_ms\":700}","headers":{"Nats-Msg-Id":"b:abababababababababababababababab:1:served-project"},"subject":"ck.{acct}.event.entorhinal.placement_fact.v1"},
+  {"body":"{\"fact_id\":\"e:assign:null-project\",\"supersedes\":null,\"project_id\":\"null-project\",\"workspace_id\":\"served-workspace\",\"effective_from_ms\":704,\"recorded_at_ms\":704}","headers":{"Nats-Msg-Id":"e:assign:null-project"},"subject":"ck.{acct}.event.entorhinal.placement_fact.v1"}
+]
