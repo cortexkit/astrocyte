@@ -389,7 +389,16 @@ fn valuation_pool_membership_matches_coverage_and_handles_unique_ambiguous_unmap
         roles: Vec::new(),
     };
     let member = |config: &MultiplierConfig, account, credential, basis| {
-        plan_member(&conn, config, &tokens, basis, account, credential, Some(1)).unwrap()
+        plan_member(
+            &PlanBook::load(&conn).unwrap(),
+            config,
+            &tokens,
+            basis,
+            account,
+            credential,
+            Some(1),
+        )
+        .unwrap()
     };
     assert_eq!(
         member(
@@ -940,3 +949,6 @@ mod fee_tests;
 
 #[path = "surface_tests.rs"]
 mod surface_tests;
+
+#[path = "perf_tests.rs"]
+mod perf_tests;

@@ -406,15 +406,52 @@ pub fn resolve(
     model: &str,
     at_ms: i64,
 ) -> Result<Option<ModelResolution>, MultiplierError> {
-    Ok(
-        resolved_model(conn, provider, model)?.map(|(segments, reference)| {
-            let mut resolution = resolution(&segments, at_ms);
-            if let ModelResolution::Rates(rates) = &mut resolution {
-                rates.reference_model = reference;
-            }
-            resolution
-        }),
-    )
+    Ok(ModelTimeline::load(conn, provider, model)?.map(|timeline| timeline.at(at_ms).clone()))
+}
+
+/// A model's resolved timeline frozen for one read snapshot. Calls select their
+/// own era in memory after the reader loads each distinct model once.
+pub(crate) struct ModelTimeline(Vec<ResolvedEra>);
+
+impl ModelTimeline {
+    pub(crate) fn load(
+        conn: &Connection,
+        provider: &str,
+        model: &str,
+    ) -> Result<Option<Self>, MultiplierError> {
+        Ok(
+            resolved_model(conn, provider, model)?.map(|(segments, reference)| {
+                let mut boundaries = BTreeSet::from([i64::MIN]);
+                for era in segments.values().flatten() {
+                    boundaries.insert(era.from_ms);
+                    boundaries.extend(era.until_ms);
+                }
+                let boundaries: Vec<_> = boundaries.into_iter().collect();
+                Self(
+                    boundaries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, from)| {
+                            let mut resolved = resolution(&segments, *from);
+                            if let ModelResolution::Rates(rates) = &mut resolved {
+                                rates.reference_model = reference.clone();
+                            }
+                            ResolvedEra {
+                                from_ms: *from,
+                                until_ms: boundaries.get(index + 1).copied(),
+                                resolution: resolved,
+                            }
+                        })
+                        .collect(),
+                )
+            }),
+        )
+    }
+
+    pub(crate) fn at(&self, at_ms: i64) -> &ModelResolution {
+        // Every loaded timeline starts at i64::MIN, even without rate segments.
+        &self.0[self.0.partition_point(|era| era.from_ms <= at_ms) - 1].resolution
+    }
 }
 
 type ResolvedModel = (BTreeMap<String, Vec<HistorySegment>>, Option<CatalogModel>);

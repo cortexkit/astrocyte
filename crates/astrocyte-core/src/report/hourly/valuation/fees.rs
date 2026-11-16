@@ -1,13 +1,13 @@
 //! Calendar fees and exact two-stage allocation, independent of report grouping.
-use super::{pools_for_provider, PlanMember, PlanRecordId};
+use super::{pools_for_provider, PlanBook, PlanMember, PlanRecordId};
 use crate::multiplier::MultiplierConfig;
 use crate::report::ReportError;
-use crate::subscription::{recurring_cost_nanos, PlanLedger};
+use crate::subscription::recurring_cost_nanos;
 use chrono::{Datelike, NaiveDate, Utc};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{Signed, ToPrimitive, Zero};
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -170,6 +170,15 @@ impl FeeDays {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Self, ReportError> {
+        Self::from_book(&PlanBook::load(conn)?, config, start_ms, end_ms)
+    }
+
+    pub(super) fn from_book(
+        book: &PlanBook,
+        config: &MultiplierConfig,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Self, ReportError> {
         if start_ms > end_ms {
             return Err(ReportError::Arithmetic);
         }
@@ -200,69 +209,69 @@ impl FeeDays {
             non_usd: BTreeSet::new(),
             conflicts: BTreeSet::new(),
         };
-        for ledger in [PlanLedger::Account, PlanLedger::Credential] {
-            let mut stmt = conn.prepare(&format!("SELECT {},provider,effective_from_ms,effective_to_ms,recurring_cost_minor,amount_exponent,currency,period FROM {} WHERE effective_from_ms<?2 AND (effective_to_ms IS NULL OR effective_to_ms>?1)", ledger.key_column(), ledger.table()))?;
-            let rows = stmt.query_map(params![first_day, day_end], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, u32>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            })?;
-            for row in rows {
-                let (identity, provider, from, to, minor, exponent, currency, period) = row?;
-                let pools = pools_for_provider(&provider, config);
-                let conflict = pools.len() != 1;
-                let member = PlanMember {
-                    plan: if conflict {
-                        "pool_conflict".into()
-                    } else {
-                        pools
-                            .into_iter()
-                            .next()
-                            .ok_or(ReportError::Integrity("missing plan pool"))?
+        for record in &book.records {
+            let PlanRecordId {
+                ledger,
+                provider,
+                identity,
+                effective_from_ms: from,
+            } = &record.id;
+            let (from, to, minor, exponent, currency, period) = (
+                *from,
+                record.until_ms,
+                record.minor,
+                record.exponent,
+                &record.currency,
+                &record.period,
+            );
+            if from >= day_end || to.is_some_and(|to| to <= first_day) {
+                continue;
+            }
+            let pools = pools_for_provider(provider, config);
+            let conflict = pools.len() != 1;
+            let member = PlanMember {
+                plan: if conflict {
+                    "pool_conflict".into()
+                } else {
+                    pools
+                        .into_iter()
+                        .next()
+                        .ok_or(ReportError::Integrity("missing plan pool"))?
+                },
+                plan_account: Some(identity.clone()),
+                record: Some(PlanRecordId {
+                    ledger: *ledger,
+                    provider: provider.clone(),
+                    identity: identity.clone(),
+                    effective_from_ms: from,
+                }),
+            };
+            let overlaps_window = from < end_ms && to.is_none_or(|to| to > start_ms);
+            if conflict && overlaps_window {
+                result.conflicts.insert(member.clone());
+            }
+            if currency != "USD" {
+                if overlaps_window {
+                    result.non_usd.insert(member);
+                }
+                continue;
+            }
+            let nanos =
+                recurring_cost_nanos(minor, exponent).map_err(|_| ReportError::Arithmetic)?;
+            let mut day = first_day.max(from.div_euclid(DAY_MS) * DAY_MS);
+            while day < day_end && to.is_none_or(|to| day < to) {
+                let next = day.checked_add(DAY_MS).ok_or(ReportError::Arithmetic)?;
+                let span = next.min(to.unwrap_or(next)) - day.max(from);
+                let fee = Fraction::new(i128::from(nanos), i128::from(period_days(day, period)?))?
+                    .checked_mul(&Fraction::new(i128::from(span), i128::from(DAY_MS))?)?;
+                result.days.push(FeeDay {
+                    key: DayMember {
+                        day_start_ms: day,
+                        member: member.clone(),
                     },
-                    plan_account: Some(identity.clone()),
-                    record: Some(PlanRecordId {
-                        ledger,
-                        provider,
-                        identity,
-                        effective_from_ms: from,
-                    }),
-                };
-                let overlaps_window = from < end_ms && to.is_none_or(|to| to > start_ms);
-                if conflict && overlaps_window {
-                    result.conflicts.insert(member.clone());
-                }
-                if currency != "USD" {
-                    if overlaps_window {
-                        result.non_usd.insert(member);
-                    }
-                    continue;
-                }
-                let nanos =
-                    recurring_cost_nanos(minor, exponent).map_err(|_| ReportError::Arithmetic)?;
-                let mut day = first_day.max(from.div_euclid(DAY_MS) * DAY_MS);
-                while day < day_end && to.is_none_or(|to| day < to) {
-                    let next = day.checked_add(DAY_MS).ok_or(ReportError::Arithmetic)?;
-                    let span = next.min(to.unwrap_or(next)) - day.max(from);
-                    let fee =
-                        Fraction::new(i128::from(nanos), i128::from(period_days(day, &period)?))?
-                            .checked_mul(&Fraction::new(i128::from(span), i128::from(DAY_MS))?)?;
-                    result.days.push(FeeDay {
-                        key: DayMember {
-                            day_start_ms: day,
-                            member: member.clone(),
-                        },
-                        fee,
-                    });
-                    day = next;
-                }
+                    fee,
+                });
+                day = next;
             }
         }
         Ok(result)

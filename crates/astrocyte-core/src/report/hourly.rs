@@ -162,107 +162,143 @@ fn is_subscription(key: &Key) -> bool {
 }
 
 impl Data {
+    fn observe_quantity(
+        &mut self,
+        key: &Key,
+        complete: bool,
+        (unit, role, units, exponent): (String, String, Option<i64>, Option<i32>),
+        covered: bool,
+    ) -> Result<(), ReportError> {
+        let quantity = self
+            .quantities
+            .entry((
+                key.clone(),
+                // Unknown quantities count in the scale-zero cell without
+                // entering its sum; stated_observations keeps them distinct
+                // from producer-reported zeros at that same scale.
+                (unit, role, exponent.unwrap_or(0)),
+            ))
+            .or_default();
+        add_count(&mut quantity.observations, 1)?;
+        if let Some(units) = units {
+            add_count(&mut quantity.stated_observations, 1)?;
+            sum(&mut quantity.units, i128::from(units))?;
+        }
+        if complete && is_subscription(key) && covered {
+            if let Some(units) = units {
+                // Subscription quantity presence still means a stated
+                // quantity, not a covered measurement with unknown usage.
+                add_count(&mut quantity.covered_observations, 1)?;
+                sum(&mut quantity.covered_units, i128::from(units))?;
+            }
+        }
+        Ok(())
+    }
+    fn observe_event(&mut self, ledger: &Ledger, event: &LedgerEvent) -> Result<Key, ReportError> {
+        let key = key(ledger, event);
+        let cell = self.cells.entry(key.clone()).or_default();
+        add_count(&mut self.events, 1)?;
+        add_count(&mut cell.events, 1)?;
+        add_count(&mut cell.measurements, event.measurement_rows())?;
+        add_count(
+            &mut cell.zero_measurements,
+            u64::from(event.measurement_rows() == 0),
+        )?;
+        add_count(&mut cell.priced, u64::from(event.is_fully_priced()))?;
+        add_count(
+            &mut cell.budget_uncertain,
+            u64::from(event.examined == 0 || !event.declined.is_empty()),
+        )?;
+        add_count(&mut cell.priced_measurements, event.priced_measurements)?;
+        let contributions = event
+            .priced_measurements
+            .checked_add(event.covered_measurements)
+            .ok_or(ReportError::Arithmetic)?;
+        add_count(&mut cell.head_contributions, contributions)?;
+        min(&mut cell.oldest, event.oldest_resolved_at_ms);
+        sum(&mut cell.heads, event.priced_nanos)?;
+        sum(&mut cell.adjustments, event.adjustment_nanos)?;
+        sum(&mut cell.total, i128::from(event.report_total()?))?;
+        min(&mut self.first, event.occurred_at_ms);
+        max(&mut self.last, event.occurred_at_ms);
+        if !event.is_fully_priced() {
+            add_count(
+                cell.reasons
+                    .entry(event.exclusion_reason().label(&ledger.reasons))
+                    .or_default(),
+                1,
+            )?;
+        }
+        for (reason, count) in &event.declined {
+            add_count(
+                cell.declines
+                    .entry(ledger.reasons.name(*reason).into())
+                    .or_default(),
+                *count,
+            )?;
+        }
+        if event.occurred_at_ms.is_some() && event.is_fully_priced() {
+            if let Some(currency) = &key.1 {
+                let producer = key.0[Grouping::Producer as usize]
+                    .clone()
+                    .ok_or(ReportError::Integrity("summary producer absent"))?;
+                add_count(
+                    self.frequencies
+                        .entry((
+                            producer,
+                            key.0[Grouping::WorkClass as usize].clone(),
+                            currency.clone(),
+                            event.current_head_total()?,
+                        ))
+                        .or_default(),
+                    1,
+                )?;
+            } else {
+                add_count(&mut cell.work_unknown, 1)?;
+            }
+            if is_subscription(&key) {
+                add_count(&mut cell.subscription_complete, 1)?;
+                add_count(&mut cell.covered_measurements, event.covered_measurements)?;
+            }
+        } else {
+            add_count(
+                cell.work_excluded
+                    .entry(event.exclusion_reason().label(&ledger.reasons))
+                    .or_default(),
+                1,
+            )?;
+        }
+        if is_subscription(&key)
+            && event.occurred_at_ms.is_some()
+            && key.0[Grouping::Account as usize]
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            add_count(&mut cell.subscription_missing_account, 1)?;
+        }
+        if contributions > 0 {
+            let currency = key
+                .1
+                .clone()
+                .ok_or(ReportError::Integrity("summary head currency absent"))?;
+            let money = self.money.entry((key.clone(), 0, currency)).or_default();
+            sum(&mut money.nanos, event.priced_nanos)?;
+            add_count(&mut money.contributions, contributions)?;
+        }
+        Ok(key)
+    }
     fn observe(&mut self, conn: &Connection, filter: &str) -> Result<usize, ReportError> {
         let ledger = load_scoped_ledger(conn, &DIMENSIONS, Some(filter))?;
         let mut event_keys = HashMap::new();
         for event in &ledger.events {
-            let key = key(&ledger, event);
+            let key = self.observe_event(&ledger, event)?;
             event_keys.insert(
                 event.key,
                 (
-                    key.clone(),
+                    key,
                     event.occurred_at_ms.is_some() && event.is_fully_priced(),
                 ),
             );
-            let cell = self.cells.entry(key.clone()).or_default();
-            add_count(&mut self.events, 1)?;
-            add_count(&mut cell.events, 1)?;
-            add_count(&mut cell.measurements, event.measurement_rows())?;
-            add_count(
-                &mut cell.zero_measurements,
-                u64::from(event.measurement_rows() == 0),
-            )?;
-            add_count(&mut cell.priced, u64::from(event.is_fully_priced()))?;
-            add_count(
-                &mut cell.budget_uncertain,
-                u64::from(event.examined == 0 || !event.declined.is_empty()),
-            )?;
-            add_count(&mut cell.priced_measurements, event.priced_measurements)?;
-            let contributions = event
-                .priced_measurements
-                .checked_add(event.covered_measurements)
-                .ok_or(ReportError::Arithmetic)?;
-            add_count(&mut cell.head_contributions, contributions)?;
-            min(&mut cell.oldest, event.oldest_resolved_at_ms);
-            sum(&mut cell.heads, event.priced_nanos)?;
-            sum(&mut cell.adjustments, event.adjustment_nanos)?;
-            sum(&mut cell.total, i128::from(event.report_total()?))?;
-            min(&mut self.first, event.occurred_at_ms);
-            max(&mut self.last, event.occurred_at_ms);
-            if !event.is_fully_priced() {
-                add_count(
-                    cell.reasons
-                        .entry(event.exclusion_reason().label(&ledger.reasons))
-                        .or_default(),
-                    1,
-                )?;
-            }
-            for (reason, count) in &event.declined {
-                add_count(
-                    cell.declines
-                        .entry(ledger.reasons.name(*reason).into())
-                        .or_default(),
-                    *count,
-                )?;
-            }
-            if event.occurred_at_ms.is_some() && event.is_fully_priced() {
-                if let Some(currency) = &key.1 {
-                    let producer = key.0[Grouping::Producer as usize]
-                        .clone()
-                        .ok_or(ReportError::Integrity("summary producer absent"))?;
-                    add_count(
-                        self.frequencies
-                            .entry((
-                                producer,
-                                key.0[Grouping::WorkClass as usize].clone(),
-                                currency.clone(),
-                                event.current_head_total()?,
-                            ))
-                            .or_default(),
-                        1,
-                    )?;
-                } else {
-                    add_count(&mut cell.work_unknown, 1)?;
-                }
-                if is_subscription(&key) {
-                    add_count(&mut cell.subscription_complete, 1)?;
-                    add_count(&mut cell.covered_measurements, event.covered_measurements)?;
-                }
-            } else {
-                add_count(
-                    cell.work_excluded
-                        .entry(event.exclusion_reason().label(&ledger.reasons))
-                        .or_default(),
-                    1,
-                )?;
-            }
-            if is_subscription(&key)
-                && event.occurred_at_ms.is_some()
-                && key.0[Grouping::Account as usize]
-                    .as_deref()
-                    .is_none_or(str::is_empty)
-            {
-                add_count(&mut cell.subscription_missing_account, 1)?;
-            }
-            if contributions > 0 {
-                let currency = key
-                    .1
-                    .clone()
-                    .ok_or(ReportError::Integrity("summary head currency absent"))?;
-                let money = self.money.entry((key.clone(), 0, currency)).or_default();
-                sum(&mut money.nanos, event.priced_nanos)?;
-                add_count(&mut money.contributions, contributions)?;
-            }
         }
         let selected = format!("SELECT event_key FROM usage_event WHERE {filter}");
         let mut statement=conn.prepare(&format!("SELECT m.event_key,m.unit,m.role,m.quantity_units,m.quantity_exponent,h.outcome
@@ -275,34 +311,12 @@ impl Data {
             let (key, complete) = event_keys
                 .get(&event_key)
                 .ok_or(ReportError::Integrity("summary measurement event absent"))?;
-            let units: Option<i64> = row.get(3)?;
-            let exponent: Option<i32> = row.get(4)?;
-            let quantity = self
-                .quantities
-                .entry((
-                    key.clone(),
-                    // Unknown quantities count in the scale-zero cell without
-                    // entering its sum; stated_observations keeps them distinct
-                    // from producer-reported zeros at that same scale.
-                    (row.get(1)?, row.get(2)?, exponent.unwrap_or(0)),
-                ))
-                .or_default();
-            add_count(&mut quantity.observations, 1)?;
-            if let Some(units) = units {
-                add_count(&mut quantity.stated_observations, 1)?;
-                sum(&mut quantity.units, i128::from(units))?;
-            }
-            if *complete
-                && is_subscription(key)
-                && row.get::<_, Option<String>>(5)?.as_deref() == Some("covered")
-            {
-                if let Some(units) = units {
-                    // Subscription quantity presence still means a stated
-                    // quantity, not a covered measurement with unknown usage.
-                    add_count(&mut quantity.covered_observations, 1)?;
-                    sum(&mut quantity.covered_units, i128::from(units))?;
-                }
-            }
+            self.observe_quantity(
+                key,
+                *complete,
+                (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+                row.get::<_, Option<String>>(5)?.as_deref() == Some("covered"),
+            )?;
         }
         let mut statement=conn.prepare(&format!("SELECT event_key,currency,amount_nanos FROM adjustment WHERE event_key IN ({selected})"))?;
         let mut rows = statement.query([])?;
@@ -331,6 +345,16 @@ struct Values<'c> {
     known: HashMap<i64, Option<String>>,
 }
 impl<'c> Values<'c> {
+    /// Join only the selected cells' dictionary ids, never the historical
+    /// dictionary as a whole. One statement replaces per-cell/id SQL lookups.
+    fn preload_cells(&mut self, scope: &str, parameters: &[i64]) -> Result<(), ReportError> {
+        let mut stmt = self.conn.prepare(&format!("SELECT DISTINCT v.value_id,v.value FROM summary_cell c JOIN summary_value v ON v.value_id IN (c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.runner,c.harness,c.currency,c.paying_credential) {scope}"))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(parameters))?;
+        while let Some(row) = rows.next()? {
+            self.known.insert(row.get(0)?, row.get(1)?);
+        }
+        Ok(())
+    }
     fn new(conn: &'c Connection) -> Self {
         Self {
             conn,
@@ -385,8 +409,11 @@ fn parse_exact(value: String) -> Result<i128, ReportError> {
         .parse()
         .map_err(|_| ReportError::Integrity("summary integer invalid"))
 }
-fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
-    let mut values = Values::new(conn);
+fn stored_recorded(
+    conn: &Connection,
+    hour: Hour,
+    values: &mut Values<'_>,
+) -> Result<(Data, HashMap<i64, Key>), ReportError> {
     let mut data = Data::default();
     let mut keys = HashMap::new();
     let mut statement=conn.prepare("SELECT cell_id,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential
@@ -395,12 +422,12 @@ fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
     while let Some(row) = rows.next()? {
         let mut dims = [const { None }; GROUPING_DIMENSIONS];
         for (column, dim) in dims.iter_mut().enumerate() {
-            *dim = value(&mut values, row.get(column + 1)?)?;
+            *dim = value(values, row.get(column + 1)?)?;
         }
         let key = (
             dims,
-            value(&mut values, row.get(11)?)?,
-            value(&mut values, row.get(13)?)?,
+            value(values, row.get(11)?)?,
+            value(values, row.get(13)?)?,
         );
         let cell = decode(&row.get::<_, String>(12)?)?;
         add_count(&mut data.events, cell.events)?;
@@ -438,6 +465,15 @@ fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
             },
         );
     }
+    Ok((data, keys))
+}
+fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
+    let mut values = Values::new(conn);
+    values.preload_cells(
+        "WHERE c.kind=?1 AND c.hour_number=?2",
+        &[hour.kind, hour.number],
+    )?;
+    let (mut data, keys) = stored_recorded(conn, hour, &mut values)?;
     let mut statement=conn.prepare("SELECT m.cell_id,m.kind,v.value,m.nanos,m.contributions FROM summary_money m JOIN summary_cell c USING(cell_id)
         JOIN summary_value v ON v.value_id=m.currency WHERE c.kind=?1 AND c.hour_number=?2")?;
     let mut rows = statement.query(params![hour.kind, hour.number])?;
@@ -1041,6 +1077,7 @@ fn scoped_frame<'c>(
     let mut observed = BTreeMap::new();
     let mut split = BTreeSet::new();
     let scope = scope.replace("h.", "c.");
+    values.preload_cells(&scope, &parameters)?;
     let mut statement=conn.prepare(&format!("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.runner,c.harness,c.currency,c.payload,c.paying_credential
         FROM summary_cell c{scope}"))?;
     let mut rows = statement.query(rusqlite::params_from_iter(&parameters))?;
@@ -1349,7 +1386,7 @@ pub(super) fn spend(
     let timezone = parsed.timezone;
     let grouping = &parsed.grouping;
     let mut seams = BTreeMap::new();
-    let Some(mut frame) = scoped_frame(
+    let Some(frame) = scoped_frame(
         conn,
         |hour, _, _| {
             if hour.kind == 1 {
@@ -1418,7 +1455,43 @@ pub(super) fn spend(
         oldest: base.rate_staleness.oldest_resolved_at_ms,
         ..Cell::default()
     };
-    let mut quantity_statement=conn.prepare("SELECT unit,role,exponent,units,observations,stated_observations FROM summary_quantity WHERE cell_id=?1")?;
+    let cell_ids = frame
+        .cells
+        .iter()
+        .filter(|(_, h, _, _)| h.kind == 0)
+        .map(|(id, _, _, _)| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut cell_quantities: BTreeMap<i64, Quantities> = BTreeMap::new();
+    if !cell_ids.is_empty() {
+        let mut stmt = conn.prepare(&format!("SELECT q.cell_id,u.value,r.value,q.exponent,q.units,q.observations,q.stated_observations FROM summary_quantity q LEFT JOIN summary_value u ON u.value_id=q.unit LEFT JOIN summary_value r ON r.value_id=q.role WHERE q.cell_id IN ({cell_ids})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let unit: String = row
+                .get::<_, Option<String>>(1)?
+                .ok_or(ReportError::Integrity("summary quantity unit absent"))?;
+            let role: String = row
+                .get::<_, Option<String>>(2)?
+                .ok_or(ReportError::Integrity("summary quantity role absent"))?;
+            let observations: u64 = row.get(5)?;
+            let stated: u64 = row.get(6)?;
+            let unknown = observations
+                .checked_sub(stated)
+                .ok_or(ReportError::Integrity(
+                    "summary stated count exceeds observations",
+                ))?;
+            cell_quantities.entry(row.get(0)?).or_default().observe(
+                &role,
+                &unit,
+                if stated == 0 {
+                    None
+                } else {
+                    Some((parse_exact(row.get(4)?)?, row.get(3)?))
+                },
+                unknown,
+            )?;
+        }
+    }
     for (cell_id, hour, key, cell) in frame.cells {
         add_count(&mut events, cell.events)?;
         add_count(&mut staleness.measurements, cell.measurements)?;
@@ -1445,29 +1518,8 @@ pub(super) fn spend(
                 currency: key.1,
             })
             .or_default();
-        let mut quantities = quantity_statement.query([cell_id])?;
-        while let Some(quantity) = quantities.next()? {
-            let unit = value(&mut frame.values, quantity.get(0)?)?
-                .ok_or(ReportError::Integrity("summary quantity unit absent"))?;
-            let role = value(&mut frame.values, quantity.get(1)?)?
-                .ok_or(ReportError::Integrity("summary quantity role absent"))?;
-            let observations: u64 = quantity.get(4)?;
-            let stated: u64 = quantity.get(5)?;
-            let unknown = observations
-                .checked_sub(stated)
-                .ok_or(ReportError::Integrity(
-                    "summary stated count exceeds observations",
-                ))?;
-            bucket.quantities.observe(
-                &role,
-                &unit,
-                if stated == 0 {
-                    None
-                } else {
-                    Some((parse_exact(quantity.get(3)?)?, quantity.get(2)?))
-                },
-                unknown,
-            )?;
+        if let Some(quantities) = cell_quantities.remove(&cell_id) {
+            bucket.quantities.merge(&quantities)?;
         }
         sum(&mut bucket.total, cell.total)?;
         if key.0[Grouping::ChargeBasis as usize].as_deref() == Some("metered_api") {

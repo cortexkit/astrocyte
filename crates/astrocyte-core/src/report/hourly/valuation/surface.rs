@@ -257,14 +257,15 @@ fn live(
     filter: &str,
     config: &MultiplierConfig,
     reasoning: &[String],
+    book: &PlanBook,
 ) -> Result<(Cells, bool), ReportError> {
     let mut cells = Cells::new();
-    let (_, fetched) = reduce(conn, filter, config, reasoning, &mut cells)?;
+    let (_, fetched) = reduce_with_book(conn, filter, config, reasoning, book, &mut cells)?;
     Ok((cells, fetched))
 }
 
 fn summary_members(
-    conn: &Connection,
+    book: &PlanBook,
     config: &MultiplierConfig,
     key: &Key,
     hour: Hour,
@@ -288,7 +289,7 @@ fn summary_members(
     let mut members: BTreeSet<_> = instants
         .map(|at| {
             plan_member(
-                conn,
+                book,
                 config,
                 &tokens,
                 key.0[Grouping::ChargeBasis as usize]
@@ -303,7 +304,7 @@ fn summary_members(
     if key.0[Grouping::Account as usize].is_none()
         && key.2.is_none()
         && key.0[Grouping::ChargeBasis as usize].as_deref() != Some("metered_api")
-        && conn.query_row("SELECT EXISTS(SELECT 1 FROM credential_subscription WHERE provider=?1 AND effective_from_ms<=?3 AND (effective_to_ms IS NULL OR effective_to_ms>?2))", params![tokens.provider, from, to], |r| r.get::<_, bool>(0))?
+        && book.possible_credential(&tokens.provider, from, to)
     {
         // Summaries retain the resolved payer only for subscription-included
         // calls. Other non-metered calls may still match a credential plan.
@@ -312,7 +313,11 @@ fn summary_members(
         let pools = pools_for_provider(&tokens.provider, config);
         if pools.len() == 1 {
             for pool in pools {
-                members.insert(PlanMember { plan: pool, plan_account: Some("account_unknown".into()), record: None });
+                members.insert(PlanMember {
+                    plan: pool,
+                    plan_account: Some("account_unknown".into()),
+                    record: None,
+                });
             }
         }
     }
@@ -441,7 +446,8 @@ pub(crate) fn report(
             end,
         )
     };
-    let book = FeeDays::load(conn, &config, from, to)?;
+    let plans = PlanBook::load(conn)?;
+    let book = FeeDays::from_book(&plans, &config, from, to)?;
     let record_starts = book
         .days
         .iter()
@@ -450,6 +456,18 @@ pub(crate) fn report(
     let mut day = DayWeights::default();
     let mut buckets: BTreeMap<BucketKey, Accumulator> = BTreeMap::new();
     let mut totals: BTreeMap<Option<String>, Accumulator> = BTreeMap::new();
+    let mut dictionary = Values::new(conn);
+    if parsed.range.is_none() {
+        dictionary.preload_cells("WHERE c.kind=0", &[])?;
+    } else {
+        dictionary.preload_cells(
+            "WHERE c.kind=0 AND c.hour_number BETWEEN ?1 AND ?2",
+            &[
+                day_start(from).div_euclid(HOUR_MS),
+                (to - 1).div_euclid(DAY_MS) * 24 + 23,
+            ],
+        )?;
+    }
     let mut stmt = conn.prepare("SELECT s.hour_number,s.revision,s.built_revision,s.format_version,EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=s.kind AND d.hour_number=s.hour_number),v.state='built' AND v.rate_generation=g.rate_generation AND v.rate_generation=r.generation AND v.config_generation=g.config_generation AND v.plan_generation=g.plan_generation AND NOT EXISTS(SELECT 1 FROM rate_dirty_hour d WHERE d.hour_number=s.hour_number) FROM summary_hour s LEFT JOIN valuation_hour v USING(kind,hour_number) CROSS JOIN valuation_state g CROSS JOIN rate_cache_state r WHERE s.kind=0 AND (?1 OR s.hour_number BETWEEN ?2 AND ?3) ORDER BY s.hour_number")?;
     let mut hours = stmt.query(params![
         parsed.range.is_none(),
@@ -468,9 +486,12 @@ pub(crate) fn report(
         let (cells, fetched) = if current {
             (stored_cells(conn, hour)?, true)
         } else if !summary_clean {
-            live(conn, &hour.filter(), &config, &reasoning)?
+            live(conn, &hour.filter(), &config, &reasoning, &plans)?
         } else {
-            (pending_cells(stored(conn, hour)?), false)
+            (
+                pending_cells(stored_recorded(conn, hour, &mut dictionary)?.0),
+                false,
+            )
         };
         let pending = !fetched;
         let in_fee_window = start >= day_start(from)
@@ -482,7 +503,7 @@ pub(crate) fn report(
         let mut inferred: BTreeMap<Key, BTreeSet<PlanMember>> = BTreeMap::new();
         for ((key, member), cell) in &cells {
             let members = if member.plan == "pending" {
-                summary_members(conn, &config, key, hour, &record_starts)?
+                summary_members(&plans, &config, key, hour, &record_starts)?
             } else {
                 BTreeSet::from([member.clone()])
             };
@@ -520,7 +541,7 @@ pub(crate) fn report(
                         data.observe(conn, &filter)?;
                         pending_cells(data)
                     } else {
-                        live(conn, &filter, &config, &reasoning)?.0
+                        live(conn, &filter, &config, &reasoning, &plans)?.0
                     };
                     &split
                 };

@@ -5,6 +5,8 @@ use crate::subscription::plan_lookup_key;
 use crate::valuation::{list_value_event, EventTokens, Unvalued, ValuationRules};
 
 pub mod fees;
+mod plans;
+pub use plans::PlanBook;
 pub mod surface;
 
 /// The immutable primary key of a record in either subscription ledger.
@@ -71,7 +73,7 @@ fn rule_matches(rule: &ScopeRule, event: &EventTokens, basis: &str) -> bool {
 /// An empty account selects neither ledger; it is not an absent account.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_member(
-    conn: &Connection,
+    book: &PlanBook,
     config: &MultiplierConfig,
     event: &EventTokens,
     basis: &str,
@@ -86,21 +88,12 @@ pub fn plan_member(
     if let (Some((ledger, identity)), Some(at)) =
         (plan_lookup_key(account, paying_credential), at_ms)
     {
-        let mut stmt = conn.prepare(&format!("SELECT provider,effective_from_ms FROM {} WHERE {}=?1 AND effective_from_ms<=?2 AND (effective_to_ms IS NULL OR effective_to_ms>?2) AND provider=?3", ledger.table(), ledger.key_column()))?;
-        for provider in stmt.query_map(params![identity, at, event.provider], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })? {
-            let (provider, effective_from_ms) = provider?;
-            for pool in pools_for_provider(&provider, config) {
+        for record in book.active(ledger, &event.provider, identity, at) {
+            for pool in pools_for_provider(&record.id.provider, config) {
                 records.insert(PlanMember {
                     plan: pool,
                     plan_account: Some(identity.into()),
-                    record: Some(PlanRecordId {
-                        ledger,
-                        provider: provider.clone(),
-                        identity: identity.into(),
-                        effective_from_ms,
-                    }),
+                    record: Some(record.id.clone()),
                 });
             }
         }
@@ -169,13 +162,79 @@ pub(crate) fn reduce(
     reasoning: &[String],
     cells: &mut Cells,
 ) -> Result<(usize, bool), ReportError> {
+    reduce_with_book(
+        conn,
+        filter,
+        config,
+        reasoning,
+        &PlanBook::load(conn)?,
+        cells,
+    )
+}
+
+fn measurement_sql(filter: &str) -> String {
+    format!("SELECT m.event_key,m.role,m.unit,m.source,m.quantity_units,m.quantity_exponent,h.outcome FROM measurement m LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit AND NOT EXISTS(SELECT 1 FROM priced_charge s WHERE s.supersedes=h.charge_key) WHERE m.event_key IN (SELECT event_key FROM usage_event WHERE {filter}) ORDER BY m.event_key,m.role,m.unit")
+}
+
+fn reduce_with_book(
+    conn: &Connection,
+    filter: &str,
+    config: &MultiplierConfig,
+    reasoning: &[String],
+    book: &PlanBook,
+    cells: &mut Cells,
+) -> Result<(usize, bool), ReportError> {
+    use crate::multiplier::ModelResolution;
+    use crate::rate_era::ModelTimeline;
+    use crate::valuation::MeasuredRole;
     let ledger = load_scoped_ledger(conn, &DIMENSIONS, Some(filter))?;
-    let mut members: BTreeMap<PlanMember, Vec<i64>> = BTreeMap::new();
-    let rules = ValuationRules::from_config(config, reasoning);
-    let mut fetched = true;
+    // Bulk reads stay scoped by the chunk's time/key bounds. In particular, do
+    // not pass per-member event-key lists through the runs reducer: its forced
+    // time index would scan unrelated history and valuation needs no runs data.
+    let mut measurements: BTreeMap<i64, Vec<(MeasuredRole, bool)>> = BTreeMap::new();
+    let mut stmt = conn.prepare(&measurement_sql(filter))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        measurements.entry(row.get(0)?).or_default().push((
+            (
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ),
+            row.get::<_, Option<String>>(6)?.as_deref() == Some("covered"),
+        ));
+    }
+    let mut payers = BTreeMap::new();
+    let mut stmt = conn.prepare(&format!("SELECT event_key,COALESCE(resolved_credential,auth_selection) FROM usage_event WHERE {filter}"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        payers.insert(row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?);
+    }
+    let mut timelines = BTreeMap::new();
     for event in &ledger.events {
         let key = key(&ledger, event);
-        let mut tokens = EventTokens {
+        if let Some(model) = &key.0[Grouping::Model as usize] {
+            let provider = key.0[Grouping::Provider as usize]
+                .clone()
+                .unwrap_or_default();
+            timelines
+                .entry((provider.clone(), model.clone()))
+                .or_insert_with(|| ModelTimeline::load(conn, &provider, model));
+        }
+    }
+    let rules = ValuationRules::from_config(config, reasoning);
+    let mut members: BTreeMap<PlanMember, Data> = BTreeMap::new();
+    let mut event_members = BTreeMap::new();
+    let mut fetched = true;
+    let valuation_error = ModelResolution::Unpriceable {
+        reason: "valuation_error".into(),
+    };
+    for event in &ledger.events {
+        let key = key(&ledger, event);
+        let measured = measurements.remove(&event.key).unwrap_or_default();
+        let tokens = EventTokens {
             producer: key.0[Grouping::Producer as usize]
                 .clone()
                 .unwrap_or_default(),
@@ -184,40 +243,36 @@ pub(crate) fn reduce(
                 .unwrap_or_default(),
             model: key.0[Grouping::Model as usize].clone(),
             mode: None,
-            roles: Vec::new(),
+            roles: measured.iter().map(|(role, _)| role.clone()).collect(),
         };
-        let mut stmt = conn.prepare("SELECT role,unit,source,quantity_units,quantity_exponent FROM measurement WHERE event_key=?1 ORDER BY role,unit")?;
-        tokens.roles = stmt
-            .query_map([event.key], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        let paying_credential: Option<String> = conn.query_row("SELECT COALESCE(resolved_credential,auth_selection) FROM usage_event WHERE event_key=?1",[event.key],|row|row.get(0))?;
         let member = plan_member(
-            conn,
+            book,
             config,
             &tokens,
             key.0[Grouping::ChargeBasis as usize]
                 .as_deref()
                 .unwrap_or_default(),
             key.0[Grouping::Account as usize].as_deref(),
-            paying_credential.as_deref(),
+            payers.get(&event.key).and_then(Option::as_deref),
             event.occurred_at_ms,
         )?;
-        members.entry(member.clone()).or_default().push(event.key);
+        let data = members.entry(member.clone()).or_default();
+        data.observe_event(&ledger, event)?;
+        for ((role, unit, _, units, exponent), covered) in measured {
+            data.observe_quantity(
+                &key,
+                event.occurred_at_ms.is_some() && event.is_fully_priced(),
+                (unit, role, units, exponent),
+                covered,
+            )?;
+        }
+        event_members.insert(event.key, (key.clone(), member.clone()));
         let resolution = match (&tokens.model, event.occurred_at_ms) {
             (Some(model), Some(at)) => {
-                match crate::rate_era::resolve(conn, &tokens.provider, model, at) {
-                    Ok(resolution) => resolution,
-                    Err(_) => Some(crate::multiplier::ModelResolution::Unpriceable {
-                        reason: "valuation_error".into(),
-                    }),
+                match timelines.get(&(tokens.provider.clone(), model.clone())) {
+                    Some(Ok(Some(timeline))) => Some(timeline.at(at)),
+                    Some(Err(_)) => Some(&valuation_error),
+                    _ => None,
                 }
             }
             _ => None,
@@ -226,8 +281,8 @@ pub(crate) fn reduce(
             fetched = false;
             continue;
         }
-        let value = list_value_event(&rules, resolution.as_ref(), &tokens)
-            .map_err(|_| ReportError::Arithmetic)?;
+        let value =
+            list_value_event(&rules, resolution, &tokens).map_err(|_| ReportError::Arithmetic)?;
         let cell = cells.entry((key, member)).or_default();
         cell.recorded.base_rate_tier_untested_tokens = checked_add(
             cell.recorded.base_rate_tier_untested_tokens,
@@ -236,19 +291,30 @@ pub(crate) fn reduce(
         sum(&mut cell.numerator, value.numerator)?;
         merge_unvalued(&mut cell.unvalued, &value.unvalued)?;
     }
-    for (member, events) in members {
-        let ids = events
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut data = Data::default();
-        data.observe(conn, &format!("event_key IN ({ids})"))?;
+    let mut stmt = conn.prepare(&format!("SELECT event_key,currency,amount_nanos FROM adjustment WHERE event_key IN (SELECT event_key FROM usage_event WHERE {filter})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let (key, member) = event_members
+            .get(&row.get::<_, i64>(0)?)
+            .ok_or(ReportError::Integrity("valuation adjustment event absent"))?;
+        let money = members
+            .get_mut(member)
+            .ok_or(ReportError::Integrity("valuation member absent"))?
+            .money
+            .entry((key.clone(), 1, row.get(1)?))
+            .or_default();
+        sum(&mut money.nanos, i128::from(row.get::<_, i64>(2)?))?;
+        add_count(&mut money.contributions, 1)?;
+    }
+    for (member, data) in members {
         for (key, recorded) in data.cells {
-            let cell = cells.entry((key, member.clone())).or_default();
-            cell.recorded.cell.merge(&recorded)?;
+            cells
+                .entry((key, member.clone()))
+                .or_default()
+                .recorded
+                .cell
+                .merge(&recorded)?;
         }
-        // Merge children too, so the payload is independent of page boundaries.
         for ((key, quantity_key), quantity) in data.quantities {
             merge_quantity(
                 &mut cells
