@@ -249,3 +249,90 @@ fn valuation_perf_actual_chunk_queries_pin_bounded_event_searches() {
         "valuation invoked the runs reducer"
     );
 }
+
+#[test]
+fn valuation_perf_built_seven_day_report_stays_within_vm_budget() {
+    let mut conn = conn();
+    rate(&conn, "A", 1_000_000_000);
+    plan(
+        &conn,
+        PlanLedger::Credential,
+        "provider",
+        "resolved",
+        0,
+        None,
+    );
+    calls(&conn, "built-report", 40, 7 * 24, 0, true, false);
+    summaries(&mut conn);
+    drain(&mut conn, &config());
+    // Fixed budget for 168 built hours, 40 cells per hour and two quantities
+    // per cell. This pins total reader work without embedding an old reader.
+    for ranged in [true, false] {
+        for grouping in [
+            vec![],
+            vec!["producer".into()],
+            vec!["plan".into(), "plan_account".into()],
+        ] {
+            let request = ReportRequest {
+                grouping,
+                grain: "day".into(),
+                timezone: "UTC".into(),
+                from_ms: ranged.then_some(0),
+                to_ms: ranged.then_some(7 * fees::DAY_MS),
+                ..ReportRequest::default()
+            };
+            let (report, statements, steps) = captured(&conn, || {
+                spend_report(&conn, &request, 8 * fees::DAY_MS).unwrap()
+            });
+            assert_eq!(report.rows.len(), 7);
+            assert_eq!(report.totals[0].events_total, 6_720);
+            assert_eq!(
+                report.totals[0].valuation.row.list_value.nanos,
+                1_344_000_000
+            );
+            assert_eq!(
+                report.totals[0]
+                    .valuation
+                    .row
+                    .list_value
+                    .not_yet_valued_hours,
+                0
+            );
+            eprintln!(
+                "built {:?} {:?}: {steps} VM steps, {} statements",
+                request.from_ms,
+                request.grouping,
+                statements.len()
+            );
+            let lookups: Vec<_> = statements
+                .iter()
+                .filter(|sql| {
+                    sql.starts_with("SELECT value_id,value FROM summary_value WHERE value_id IN (")
+                })
+                .collect();
+            assert_eq!(
+                lookups.len(),
+                2,
+                "built reader must resolve only cell and quantity dictionary ids"
+            );
+            for sql in lookups {
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                let plan = stmt
+                    .query_map([], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .join("\n");
+                assert!(
+                    plan.contains("SEARCH summary_value USING INTEGER PRIMARY KEY"),
+                    "{sql}\n{plan}"
+                );
+                assert!(!plan.contains("SCAN"), "{sql}\n{plan}");
+            }
+            assert!(
+                steps < 450_000,
+                "built seven-day report exceeded VM budget: {steps}"
+            );
+        }
+    }
+}

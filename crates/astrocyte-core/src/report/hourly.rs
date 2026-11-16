@@ -345,13 +345,26 @@ struct Values<'c> {
     known: HashMap<i64, Option<String>>,
 }
 impl<'c> Values<'c> {
-    /// Join only the selected cells' dictionary ids, never the historical
-    /// dictionary as a whole. One statement replaces per-cell/id SQL lookups.
-    fn preload_cells(&mut self, scope: &str, parameters: &[i64]) -> Result<(), ReportError> {
-        let mut stmt = self.conn.prepare(&format!("SELECT DISTINCT v.value_id,v.value FROM summary_cell c JOIN summary_value v ON v.value_id IN (c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.runner,c.harness,c.currency,c.paying_credential) {scope}"))?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(parameters))?;
+    /// Resolve each distinct, uncached id once, after reading the cells. Looking
+    /// up ids through a join per cell repeats work for shared dimension values.
+    fn preload_ids(&mut self, ids: impl IntoIterator<Item = i64>) -> Result<(), ReportError> {
+        let ids: BTreeSet<_> = ids
+            .into_iter()
+            .filter(|id| !self.known.contains_key(id))
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let selected = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT value_id,value FROM summary_value WHERE value_id IN ({selected})"
+        ))?;
+        let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             self.known.insert(row.get(0)?, row.get(1)?);
+        }
+        if ids.iter().any(|id| !self.known.contains_key(id)) {
+            return Err(ReportError::Integrity("summary dictionary value absent"));
         }
         Ok(())
     }
@@ -409,6 +422,45 @@ fn parse_exact(value: String) -> Result<i128, ReportError> {
         .parse()
         .map_err(|_| ReportError::Integrity("summary integer invalid"))
 }
+
+struct RawCell {
+    id: i64,
+    hour: Hour,
+    dictionary: [i64; GROUPING_DIMENSIONS + 2],
+    payload: String,
+}
+impl RawCell {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let mut dictionary = [0; GROUPING_DIMENSIONS + 2];
+        for (column, id) in dictionary[..GROUPING_DIMENSIONS].iter_mut().enumerate() {
+            *id = row.get(column + 3)?;
+        }
+        dictionary[GROUPING_DIMENSIONS] = row.get(13)?;
+        dictionary[GROUPING_DIMENSIONS + 1] = row.get(15)?;
+        Ok(Self {
+            id: row.get(0)?,
+            hour: Hour {
+                kind: row.get(1)?,
+                number: row.get(2)?,
+            },
+            dictionary,
+            payload: row.get(14)?,
+        })
+    }
+
+    fn key(&self, values: &mut Values<'_>) -> Result<Key, ReportError> {
+        let mut dimensions = [const { None }; GROUPING_DIMENSIONS];
+        for (dimension, id) in dimensions.iter_mut().zip(self.dictionary) {
+            *dimension = value(values, id)?;
+        }
+        Ok((
+            dimensions,
+            value(values, self.dictionary[GROUPING_DIMENSIONS])?,
+            value(values, self.dictionary[GROUPING_DIMENSIONS + 1])?,
+        ))
+    }
+}
+
 fn stored_recorded(
     conn: &Connection,
     hour: Hour,
@@ -416,22 +468,17 @@ fn stored_recorded(
 ) -> Result<(Data, HashMap<i64, Key>), ReportError> {
     let mut data = Data::default();
     let mut keys = HashMap::new();
-    let mut statement=conn.prepare("SELECT cell_id,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential
+    let mut statement=conn.prepare("SELECT cell_id,kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential
         FROM summary_cell WHERE kind=?1 AND hour_number=?2")?;
-    let mut rows = statement.query(params![hour.kind, hour.number])?;
-    while let Some(row) = rows.next()? {
-        let mut dims = [const { None }; GROUPING_DIMENSIONS];
-        for (column, dim) in dims.iter_mut().enumerate() {
-            *dim = value(values, row.get(column + 1)?)?;
-        }
-        let key = (
-            dims,
-            value(values, row.get(11)?)?,
-            value(values, row.get(13)?)?,
-        );
-        let cell = decode(&row.get::<_, String>(12)?)?;
+    let rows = statement
+        .query_map(params![hour.kind, hour.number], RawCell::read)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    values.preload_ids(rows.iter().flat_map(|cell| cell.dictionary))?;
+    for row in rows {
+        let key = row.key(values)?;
+        let cell = decode(&row.payload)?;
         add_count(&mut data.events, cell.events)?;
-        keys.insert(row.get::<_, i64>(0)?, key.clone());
+        keys.insert(row.id, key.clone());
         data.cells.insert(key, cell);
     }
     let bounds = conn
@@ -469,10 +516,6 @@ fn stored_recorded(
 }
 fn stored(conn: &Connection, hour: Hour) -> Result<Data, ReportError> {
     let mut values = Values::new(conn);
-    values.preload_cells(
-        "WHERE c.kind=?1 AND c.hour_number=?2",
-        &[hour.kind, hour.number],
-    )?;
     let (mut data, keys) = stored_recorded(conn, hour, &mut values)?;
     let mut statement=conn.prepare("SELECT m.cell_id,m.kind,v.value,m.nanos,m.contributions FROM summary_money m JOIN summary_cell c USING(cell_id)
         JOIN summary_value v ON v.value_id=m.currency WHERE c.kind=?1 AND c.hour_number=?2")?;
@@ -1077,10 +1120,10 @@ fn scoped_frame<'c>(
     let mut observed = BTreeMap::new();
     let mut split = BTreeSet::new();
     let scope = scope.replace("h.", "c.");
-    values.preload_cells(&scope, &parameters)?;
     let mut statement=conn.prepare(&format!("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.runner,c.harness,c.currency,c.payload,c.paying_credential
         FROM summary_cell c{scope}"))?;
     let mut rows = statement.query(rusqlite::params_from_iter(&parameters))?;
+    let mut raw = Vec::new();
     while let Some(row) = rows.next()? {
         let hour = Hour {
             kind: row.get(1)?,
@@ -1089,23 +1132,19 @@ fn scoped_frame<'c>(
         if !clean.contains(&hour) {
             continue;
         }
-        let mut dims = [const { None }; GROUPING_DIMENSIONS];
-        for (column, dim) in dims.iter_mut().enumerate() {
-            *dim = value(&mut values, row.get(column + 3)?)?;
-        }
-        let key = (
-            dims,
-            value(&mut values, row.get(13)?)?,
-            value(&mut values, row.get(15)?)?,
-        );
-        let payload: String = row.get(14)?;
-        let cell = decode(&payload)?;
+        raw.push(RawCell::read(row)?);
+    }
+    values.preload_ids(raw.iter().flat_map(|cell| cell.dictionary))?;
+    for row in raw {
+        let hour = row.hour;
+        let key = row.key(&mut values)?;
+        let cell = decode(&row.payload)?;
         add_count(observed.entry(hour).or_default(), cell.events)?;
         if seam(hour, &key, &cell)? {
             split.insert(hour);
         }
         if select(&key) {
-            cells.push((row.get(0)?, hour, key, cell));
+            cells.push((row.id, hour, key, cell));
         }
     }
     for hour in &clean {
@@ -1386,7 +1425,7 @@ pub(super) fn spend(
     let timezone = parsed.timezone;
     let grouping = &parsed.grouping;
     let mut seams = BTreeMap::new();
-    let Some(frame) = scoped_frame(
+    let Some(mut frame) = scoped_frame(
         conn,
         |hour, _, _| {
             if hour.kind == 1 {
@@ -1464,29 +1503,49 @@ pub(super) fn spend(
         .join(",");
     let mut cell_quantities: BTreeMap<i64, Quantities> = BTreeMap::new();
     if !cell_ids.is_empty() {
-        let mut stmt = conn.prepare(&format!("SELECT q.cell_id,u.value,r.value,q.exponent,q.units,q.observations,q.stated_observations FROM summary_quantity q LEFT JOIN summary_value u ON u.value_id=q.unit LEFT JOIN summary_value r ON r.value_id=q.role WHERE q.cell_id IN ({cell_ids})"))?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let unit: String = row
-                .get::<_, Option<String>>(1)?
+        let mut stmt = conn.prepare(&format!("SELECT cell_id,unit,role,exponent,units,observations,stated_observations FROM summary_quantity WHERE cell_id IN ({cell_ids})"))?;
+        struct RawQuantity {
+            cell: i64,
+            unit: i64,
+            role: i64,
+            exponent: i32,
+            units: String,
+            observations: u64,
+            stated: u64,
+        }
+        let quantities = stmt
+            .query_map([], |row| {
+                Ok(RawQuantity {
+                    cell: row.get(0)?,
+                    unit: row.get(1)?,
+                    role: row.get(2)?,
+                    exponent: row.get(3)?,
+                    units: row.get(4)?,
+                    observations: row.get(5)?,
+                    stated: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        frame.values.preload_ids(
+            quantities
+                .iter()
+                .flat_map(|quantity| [quantity.unit, quantity.role]),
+        )?;
+        for quantity in quantities {
+            let unit = value(&mut frame.values, quantity.unit)?
                 .ok_or(ReportError::Integrity("summary quantity unit absent"))?;
-            let role: String = row
-                .get::<_, Option<String>>(2)?
+            let role = value(&mut frame.values, quantity.role)?
                 .ok_or(ReportError::Integrity("summary quantity role absent"))?;
-            let observations: u64 = row.get(5)?;
-            let stated: u64 = row.get(6)?;
-            let unknown = observations
-                .checked_sub(stated)
-                .ok_or(ReportError::Integrity(
-                    "summary stated count exceeds observations",
-                ))?;
-            cell_quantities.entry(row.get(0)?).or_default().observe(
+            let unknown = quantity.observations.checked_sub(quantity.stated).ok_or(
+                ReportError::Integrity("summary stated count exceeds observations"),
+            )?;
+            cell_quantities.entry(quantity.cell).or_default().observe(
                 &role,
                 &unit,
-                if stated == 0 {
+                if quantity.stated == 0 {
                     None
                 } else {
-                    Some((parse_exact(row.get(4)?)?, row.get(3)?))
+                    Some((parse_exact(quantity.units)?, quantity.exponent))
                 },
                 unknown,
             )?;

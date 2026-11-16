@@ -457,17 +457,6 @@ pub(crate) fn report(
     let mut buckets: BTreeMap<BucketKey, Accumulator> = BTreeMap::new();
     let mut totals: BTreeMap<Option<String>, Accumulator> = BTreeMap::new();
     let mut dictionary = Values::new(conn);
-    if parsed.range.is_none() {
-        dictionary.preload_cells("WHERE c.kind=0", &[])?;
-    } else {
-        dictionary.preload_cells(
-            "WHERE c.kind=0 AND c.hour_number BETWEEN ?1 AND ?2",
-            &[
-                day_start(from).div_euclid(HOUR_MS),
-                (to - 1).div_euclid(DAY_MS) * 24 + 23,
-            ],
-        )?;
-    }
     let mut stmt = conn.prepare("SELECT s.hour_number,s.revision,s.built_revision,s.format_version,EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=s.kind AND d.hour_number=s.hour_number),v.state='built' AND v.rate_generation=g.rate_generation AND v.rate_generation=r.generation AND v.config_generation=g.config_generation AND v.plan_generation=g.plan_generation AND NOT EXISTS(SELECT 1 FROM rate_dirty_hour d WHERE d.hour_number=s.hour_number) FROM summary_hour s LEFT JOIN valuation_hour v USING(kind,hour_number) CROSS JOIN valuation_state g CROSS JOIN rate_cache_state r WHERE s.kind=0 AND (?1 OR s.hour_number BETWEEN ?2 AND ?3) ORDER BY s.hour_number")?;
     let mut hours = stmt.query(params![
         parsed.range.is_none(),
