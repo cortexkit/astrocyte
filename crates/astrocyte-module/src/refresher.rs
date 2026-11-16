@@ -1992,6 +1992,9 @@ fn run_loop_full(
             if summaries_behind && !stop.load(Ordering::Relaxed) {
                 summaries_behind = summary_tick(&state, &mut summaries, &stop);
             }
+            if multiplier.rates_behind() && !stop.load(Ordering::Relaxed) {
+                multiplier.fill_rates(&state);
+            }
             valuation_tick(&state, &mut valuations, &stop, Duration::from_millis(1_500));
             std::thread::sleep(
                 Duration::from_millis(250).min(interval.saturating_sub(started.elapsed())),
@@ -3839,6 +3842,10 @@ pub(crate) struct MultiplierStage {
     failure_logged: BTreeSet<(String, Option<String>, String)>,
     /// The UTC day the "member not recorded" skip was last logged.
     not_recorded_logged: Option<String>,
+    /// The catalog version whose model timelines are still being read, set
+    /// when a full tick's pass ran out of time. Passes then continue between
+    /// ticks until every model is read.
+    rates_pending: Option<i64>,
 }
 
 /// Why a day was not recorded, and whether only a configuration change can
@@ -3856,16 +3863,42 @@ impl MultiplierStage {
             recorded: BTreeSet::new(),
             failure_logged: BTreeSet::new(),
             not_recorded_logged: None,
+            rates_pending: None,
         }
+    }
+
+    /// True while model timelines for the current catalog are still unread.
+    pub(crate) fn rates_behind(&self) -> bool {
+        self.rates_pending.is_some()
+    }
+
+    /// One between-tick pass over the unread timelines. A failure leaves the
+    /// rest to the next full tick, which reads the catalog version again.
+    pub(crate) fn fill_rates(&mut self, state: &SharedState) {
+        let Some(version) = self.rates_pending else {
+            return;
+        };
+        self.rates_pending = match rate_era_fill(state, version) {
+            Ok(true) => Some(version),
+            Ok(false) => None,
+            Err(error) => {
+                tracing::warn!(target: "valuation", %error, "rate timeline refresh deferred");
+                None
+            }
+        };
     }
 
     /// `catalog_pending`: fusiform is configured but its history boundary is
     /// not yet discovered, so rates cannot be read yet. The day waits for it
     /// rather than failing.
     pub(crate) fn tick(&mut self, state: &SharedState, catalog_pending: bool, now_ms: i64) {
-        if let Err(error) = rate_era_tick(state) {
-            tracing::warn!(target: "valuation", %error, "rate timeline refresh deferred");
-        }
+        self.rates_pending = match rate_era_tick(state) {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(target: "valuation", %error, "rate timeline refresh deferred");
+                None
+            }
+        };
         let interval_end_ms = now_ms - now_ms.rem_euclid(DAY_MS);
         // The seven days the look-back covers, oldest first, each with the
         // end of its interval. A clock so far out that one of them has no
@@ -4170,17 +4203,27 @@ fn disclose_stale_sources(observation: &mut multiplier::Observation, sources: &[
     }
 }
 
-/// Refresh served timelines before multiplier work. Each transport call shares
-/// the tick's deadline; the writer is held only for discovery and publication.
-fn rate_era_tick(state: &SharedState) -> Result<(), String> {
+/// How long one pass keeps starting new model reads. Every catalog change makes
+/// every model's timeline stale, a few hundred reads, so passes continue between
+/// full ticks until none is left, as the summary backlog does.
+const RATE_FETCH_PASS_BUDGET: Duration = Duration::from_millis(1500);
+/// The deadline for one model's read, which is up to three fusiform calls
+/// (current identity, its served history, and an alias or twin target's
+/// history). Each model gets its own: when models shared the pass deadline,
+/// the first model's calls left the next too little time, and its read timed
+/// out on this side, not fusiform's.
+const RATE_FETCH_MODEL_BUDGET: Duration = Duration::from_secs(5);
+
+/// Refresh served timelines before multiplier work. The writer is held only for
+/// discovery and publication. Returns the catalog version when models are
+/// still unread after the pass.
+fn rate_era_tick(state: &SharedState) -> Result<Option<i64>, String> {
     use astrocyte_core::rate_era;
-    const BUDGET: Duration = Duration::from_millis(1500);
-    let started = std::time::Instant::now();
     let Some(catalog) = state.catalog_client() else {
-        return Ok(());
+        return Ok(None);
     };
-    let catalog = catalog.with_budget(BUDGET);
     let version = catalog
+        .with_budget(RATE_FETCH_MODEL_BUDGET)
         .catalog_version()
         .map_err(|error| format!("{error:?}"))?;
     let config = state.desired_config();
@@ -4194,8 +4237,25 @@ fn rate_era_tick(state: &SharedState) -> Result<(), String> {
         rate_era::prepare(tx, version, twins).map_err(|error| error.message())?;
         Ok(((), true))
     })?;
+    Ok(rate_era_fill(state, version)?.then_some(version))
+}
+
+/// Reads unread model timelines for `version` until the pass budget is spent.
+/// Returns whether any model is still unread.
+fn rate_era_fill(state: &SharedState, version: i64) -> Result<bool, String> {
+    use astrocyte_core::rate_era;
+    let started = std::time::Instant::now();
+    let Some(catalog) = state.catalog_client() else {
+        return Ok(false);
+    };
+    let config = state.desired_config();
+    let empty_twins = std::collections::BTreeMap::new();
+    let twins = match &config.subscription_multiplier {
+        config::MultiplierSetting::Recorded(config) => &config.api_twins,
+        config::MultiplierSetting::NotRecorded => &empty_twins,
+    };
     let mut attempted = std::collections::BTreeSet::new();
-    while started.elapsed() < BUDGET {
+    while started.elapsed() < RATE_FETCH_PASS_BUDGET {
         let pending = state
             .with_read_op(|conn| {
                 rate_era::pending(conn, 256).map_err(|error| (error.code().into(), error.message()))
@@ -4206,7 +4266,8 @@ fn rate_era_tick(state: &SharedState) -> Result<(), String> {
             break;
         };
         attempted.insert((provider.clone(), model.clone()));
-        let fetched = match rate_era::fetch(&catalog, &provider, &model, twins) {
+        let call = catalog.with_budget(RATE_FETCH_MODEL_BUDGET);
+        let fetched = match rate_era::fetch(&call, &provider, &model, twins) {
             Ok(fetched) => fetched,
             Err(error) => {
                 tracing::warn!(target: "valuation", %provider, %model, error = %error.message(), "served timeline fetch deferred");
@@ -4223,7 +4284,12 @@ fn rate_era_tick(state: &SharedState) -> Result<(), String> {
             Ok(((), true))
         })?;
     }
-    Ok(())
+    let remaining = state
+        .with_read_op(|conn| {
+            rate_era::pending(conn, 1).map_err(|error| (error.code().into(), error.message()))
+        })
+        .map_err(|(_, message)| message)?;
+    Ok(!remaining.is_empty())
 }
 
 /// Computes one day and appends it as the day's original row.

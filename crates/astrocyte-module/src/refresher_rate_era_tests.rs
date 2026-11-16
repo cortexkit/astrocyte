@@ -2,6 +2,10 @@ struct TimelineFusiform {
     store: std::path::PathBuf,
     version: std::sync::atomic::AtomicI64,
     requests: std::sync::Mutex<Vec<(String, String)>>,
+    /// How long each history read takes, standing in for a slow fusiform.
+    delay: Duration,
+    /// The deadline each history read was given.
+    timeouts: std::sync::Mutex<Vec<Duration>>,
 }
 
 impl TimelineFusiform {
@@ -60,7 +64,9 @@ impl CatalogConnection for TimelineFusiform {
         timeout: Duration,
     ) -> Result<fusiform_protocol::HistoryResponse, CatalogCallError> {
         self.outside_write_transaction();
-        assert!(timeout <= Duration::from_millis(1500) && !timeout.is_zero());
+        assert!(timeout <= RATE_FETCH_MODEL_BUDGET && !timeout.is_zero());
+        self.timeouts.lock().unwrap().push(timeout);
+        std::thread::sleep(self.delay);
         assert_eq!(request.served, Some(true));
         assert_eq!(request.fact_prefix.as_deref(), Some("rate."));
         self.requests
@@ -92,6 +98,8 @@ fn rate_era_refresher_rereads_alias_and_twin_timelines_on_catalog_advance() {
         store: directory.path().join("ledger.db"),
         version: std::sync::atomic::AtomicI64::new(1),
         requests: Default::default(),
+        delay: Duration::ZERO,
+        timeouts: Default::default(),
     });
     state
         .install_catalog(Some(CatalogClient::connect(peer.clone()).unwrap()))
@@ -139,4 +147,63 @@ fn rate_era_refresher_rereads_alias_and_twin_timelines_on_catalog_advance() {
     assert!(requests.contains(&("openai-codex".into(), "m".into())));
     assert!(requests.contains(&("openai".into(), "target-a".into())));
     assert!(requests.contains(&("openai".into(), "target-b".into())));
+}
+
+#[test]
+fn each_model_read_gets_its_own_deadline_and_reads_continue_between_ticks() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(state::leased_test_state(&directory));
+    publish_desired(&state, &directory);
+    state
+        .ordered_write(|tx| {
+            for i in 0..8 {
+                let id = format!("slow-{i}");
+                tx.execute(
+                    "INSERT INTO usage_event(event_id,producer,producer_ref,recorded_at_ms,provider,model,charge_basis) VALUES(?1,'opencode',?1,0,'openai',?1,'unknown')",
+                    [&id],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Ok(((), true))
+        })
+        .unwrap();
+    // Each read takes 400 ms, so one pass reads only some of the models.
+    let peer = Arc::new(TimelineFusiform {
+        store: directory.path().join("ledger.db"),
+        version: std::sync::atomic::AtomicI64::new(1),
+        requests: Default::default(),
+        delay: Duration::from_millis(400),
+        timeouts: Default::default(),
+    });
+    state
+        .install_catalog(Some(CatalogClient::connect(peer.clone()).unwrap()))
+        .unwrap();
+    let version = rate_era_tick(&state)
+        .unwrap()
+        .expect("a full tick's pass cannot read every slow model");
+    let mut stage = MultiplierStage::new(None);
+    stage.rates_pending = Some(version);
+    let mut passes = 0;
+    while stage.rates_behind() {
+        stage.fill_rates(&state);
+        passes += 1;
+        assert!(passes < 10, "between-tick passes must finish the reads");
+    }
+    let unread = state
+        .with_read_op(|conn| {
+            astrocyte_core::rate_era::pending(conn, 256)
+                .map_err(|error| (error.code().into(), error.message()))
+        })
+        .unwrap();
+    assert!(unread.is_empty(), "every model is read: {unread:?}");
+    // A model's read must not inherit what an earlier model left of the pass
+    // deadline; that is what made reads time out on this side.
+    let timeouts = peer.timeouts.lock().unwrap();
+    assert!(timeouts.len() >= 8);
+    assert!(
+        timeouts
+            .iter()
+            .all(|timeout| *timeout > RATE_FETCH_MODEL_BUDGET - Duration::from_secs(1)),
+        "every read gets close to its own full deadline: {timeouts:?}"
+    );
 }
