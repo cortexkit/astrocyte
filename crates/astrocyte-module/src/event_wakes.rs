@@ -195,6 +195,12 @@ async fn pull_session(
                         }
                         Ok::<(), ()>(())
                     });
+                } else {
+                    // A subject this reader doesn't know (a newer event version,
+                    // say) wakes nothing. Acknowledge it, or it would be
+                    // redelivered forever and count against the durable's
+                    // unacknowledged limit.
+                    message.ack().await.map_err(|_| ())?;
                 }
             }
             Some(result) = acknowledgements.next(), if !acknowledgements.is_empty() => result?,
