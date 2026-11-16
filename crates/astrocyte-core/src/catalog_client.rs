@@ -138,8 +138,9 @@ impl CatalogClient {
         Ok(Self::new(connection, history_start_ms))
     }
 
-    /// Discovers the boundary cooperatively, leaving installation to a later
-    /// attempt if shutdown arrives during a peer call. Each call keeps its
+    /// Like [`Self::connect`], but returns `None` without a client when the
+    /// stop flag is set before or after either discovery call, so the caller
+    /// stays without a catalog and a later run retries. Each call keeps its
     /// normal deadline; a stop prevents the next call, not the in-flight one.
     pub fn connect_until_stopped(
         connection: Arc<dyn CatalogConnection>,
