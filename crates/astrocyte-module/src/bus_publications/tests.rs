@@ -420,9 +420,22 @@ async fn bus_publications_multiplier_reconciles_null_plan_and_unchanged_values()
         bus.multiplier.entry(key).await.unwrap().unwrap().revision,
         entry.revision
     );
+    // A real Codex plan entry runs to about 16 KiB with its per-model rates; it
+    // fits under the bucket's declared 64 KiB and must be published.
+    let large = json!({"quota_provider":"codex","plan":"openai/pro_20x","samples":vec![0;8192]});
+    assert!(serde_json::to_vec(&large).unwrap().len() > 16_000);
+    let before = bus.attempts();
+    state
+        .bus_publications()
+        .multiplier(std::slice::from_ref(&large));
+    bus.after(before).await;
+    assert_eq!(
+        bus.multiplier.get(key).await.unwrap().unwrap().as_ref(),
+        serde_json::to_vec(&large).unwrap()
+    );
     let before = bus.attempts();
     state.bus_publications().multiplier(&[
-        json!({"quota_provider":"codex","plan":"openai/pro_20x","samples":vec![0;8192]}),
+        json!({"quota_provider":"codex","plan":"openai/pro_20x","samples":vec![0;40_000]}),
     ]);
     bus.after(before).await;
     assert!(bus.multiplier.get(key).await.unwrap().is_none());

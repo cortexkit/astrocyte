@@ -175,7 +175,14 @@ impl Control {
             }
             if let Some(values) = desired.multiplier {
                 multiplier
-                    .apply(connection, names, "multiplier", &values, None, 8192)
+                    .apply(
+                        connection,
+                        names,
+                        "multiplier",
+                        &values,
+                        None,
+                        declared_value_cap("multiplier"),
+                    )
                     .await;
             }
             let mut values = Values::new();
@@ -198,7 +205,7 @@ impl Control {
                         "read-marks",
                         &values,
                         Some(&prefixes),
-                        256,
+                        declared_value_cap("read-marks"),
                     )
                     .await;
             }
@@ -213,6 +220,18 @@ impl Control {
             changed.await;
         }
     }
+}
+
+/// The largest value the bus accepts in one of astrocyte's buckets, as
+/// bus-naming declares it. ck-bus provisions each bucket from the same
+/// declaration, so a value larger than this would be refused by the server;
+/// skipping it here keeps one oversized value from failing the whole mirror.
+fn declared_value_cap(bucket: &str) -> usize {
+    cortexkit_bus_naming::MODULE_BUCKETS
+        .iter()
+        .find(|row| row.owner == "astrocyte" && row.name == bucket)
+        .and_then(|row| usize::try_from(row.max_value_bytes).ok())
+        .unwrap_or_else(|| panic!("bus-naming declares no astrocyte bucket {bucket}"))
 }
 
 #[derive(Default)]
