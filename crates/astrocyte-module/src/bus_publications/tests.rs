@@ -116,7 +116,6 @@ fn bus_publications_key_components_are_total_and_unambiguous() {
 }
 
 #[tokio::test]
-#[ignore = "needs cortexkit-bus-nats with subject-matched subscribe denials"]
 async fn bus_publications_denied_bucket_does_not_interrupt_runner_steps() {
     let Some(server) = NatsServer::start_with_config(
         r#"accounts {
