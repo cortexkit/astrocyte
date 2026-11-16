@@ -3846,6 +3846,40 @@ pub(crate) struct MultiplierStage {
     /// when a full tick's pass ran out of time. Passes then continue between
     /// ticks until every model is read.
     rates_pending: Option<i64>,
+    /// Models whose last timeline read failed, and when to try them again.
+    rate_backoff: RateBackoff,
+}
+
+/// Failed timeline reads wait before they are tried again, so a model fusiform
+/// cannot serve in time is not retried every pass, each try holding the
+/// refresher for a full read deadline. The wait starts at a minute and doubles
+/// up to half an hour; a successful read clears it.
+#[derive(Default)]
+pub(crate) struct RateBackoff {
+    waits: std::collections::BTreeMap<(String, String), (std::time::Instant, Duration)>,
+}
+
+impl RateBackoff {
+    const FIRST: Duration = Duration::from_secs(60);
+    const MAX: Duration = Duration::from_secs(30 * 60);
+
+    fn waiting(&self, model: &(String, String), now: std::time::Instant) -> bool {
+        self.waits.get(model).is_some_and(|(until, _)| *until > now)
+    }
+
+    /// Returns whether this is the model's first failure since it last read
+    /// cleanly, so the warning is logged once rather than on every retry.
+    fn failed(&mut self, model: (String, String), now: std::time::Instant) -> bool {
+        let wait = self
+            .waits
+            .get(&model)
+            .map_or(Self::FIRST, |(_, wait)| (*wait * 2).min(Self::MAX));
+        self.waits.insert(model, (now + wait, wait)).is_none()
+    }
+
+    fn succeeded(&mut self, model: &(String, String)) {
+        self.waits.remove(model);
+    }
 }
 
 /// Why a day was not recorded, and whether only a configuration change can
@@ -3864,6 +3898,7 @@ impl MultiplierStage {
             failure_logged: BTreeSet::new(),
             not_recorded_logged: None,
             rates_pending: None,
+            rate_backoff: RateBackoff::default(),
         }
     }
 
@@ -3878,7 +3913,7 @@ impl MultiplierStage {
         let Some(version) = self.rates_pending else {
             return;
         };
-        self.rates_pending = match rate_era_fill(state, version) {
+        self.rates_pending = match rate_era_fill(state, version, &mut self.rate_backoff) {
             Ok(true) => Some(version),
             Ok(false) => None,
             Err(error) => {
@@ -3892,7 +3927,7 @@ impl MultiplierStage {
     /// not yet discovered, so rates cannot be read yet. The day waits for it
     /// rather than failing.
     pub(crate) fn tick(&mut self, state: &SharedState, catalog_pending: bool, now_ms: i64) {
-        self.rates_pending = match rate_era_tick(state) {
+        self.rates_pending = match rate_era_tick(state, &mut self.rate_backoff) {
             Ok(pending) => pending,
             Err(error) => {
                 tracing::warn!(target: "valuation", %error, "rate timeline refresh deferred");
@@ -4215,9 +4250,9 @@ const RATE_FETCH_PASS_BUDGET: Duration = Duration::from_millis(1500);
 const RATE_FETCH_MODEL_BUDGET: Duration = Duration::from_secs(5);
 
 /// Refresh served timelines before multiplier work. The writer is held only for
-/// discovery and publication. Returns the catalog version when models are
-/// still unread after the pass.
-fn rate_era_tick(state: &SharedState) -> Result<Option<i64>, String> {
+/// discovery and publication. Returns the catalog version when models that may
+/// be tried now are still unread after the pass.
+fn rate_era_tick(state: &SharedState, backoff: &mut RateBackoff) -> Result<Option<i64>, String> {
     use astrocyte_core::rate_era;
     let Some(catalog) = state.catalog_client() else {
         return Ok(None);
@@ -4237,12 +4272,18 @@ fn rate_era_tick(state: &SharedState) -> Result<Option<i64>, String> {
         rate_era::prepare(tx, version, twins).map_err(|error| error.message())?;
         Ok(((), true))
     })?;
-    Ok(rate_era_fill(state, version)?.then_some(version))
+    Ok(rate_era_fill(state, version, backoff)?.then_some(version))
 }
 
-/// Reads unread model timelines for `version` until the pass budget is spent.
-/// Returns whether any model is still unread.
-fn rate_era_fill(state: &SharedState, version: i64) -> Result<bool, String> {
+/// Reads unread model timelines for `version` until the pass budget is spent,
+/// skipping models still waiting after a failure. Returns whether a model that
+/// may be tried now is still unread; models only waiting out a failure leave
+/// to the full tick after their wait.
+fn rate_era_fill(
+    state: &SharedState,
+    version: i64,
+    backoff: &mut RateBackoff,
+) -> Result<bool, String> {
     use astrocyte_core::rate_era;
     let started = std::time::Instant::now();
     let Some(catalog) = state.catalog_client() else {
@@ -4261,7 +4302,10 @@ fn rate_era_fill(state: &SharedState, version: i64) -> Result<bool, String> {
                 rate_era::pending(conn, 256).map_err(|error| (error.code().into(), error.message()))
             })
             .map_err(|(_, message)| message)?;
-        let Some((provider, model)) = pending.into_iter().find(|model| !attempted.contains(model))
+        let now = std::time::Instant::now();
+        let Some((provider, model)) = pending
+            .into_iter()
+            .find(|model| !attempted.contains(model) && !backoff.waiting(model, now))
         else {
             break;
         };
@@ -4270,7 +4314,9 @@ fn rate_era_fill(state: &SharedState, version: i64) -> Result<bool, String> {
         let fetched = match rate_era::fetch(&call, &provider, &model, twins) {
             Ok(fetched) => fetched,
             Err(error) => {
-                tracing::warn!(target: "valuation", %provider, %model, error = %error.message(), "served timeline fetch deferred");
+                if backoff.failed((provider.clone(), model.clone()), std::time::Instant::now()) {
+                    tracing::warn!(target: "valuation", %provider, %model, error = %error.message(), "served timeline fetch deferred; retrying with backoff");
+                }
                 state.ordered_write(|tx| {
                     rate_era::record_failure(tx, &provider, &model, &error)
                         .map_err(|error| error.message())?;
@@ -4283,13 +4329,17 @@ fn rate_era_fill(state: &SharedState, version: i64) -> Result<bool, String> {
             rate_era::publish(tx, &fetched, version).map_err(|error| error.message())?;
             Ok(((), true))
         })?;
+        backoff.succeeded(&(provider, model));
     }
     let remaining = state
         .with_read_op(|conn| {
-            rate_era::pending(conn, 1).map_err(|error| (error.code().into(), error.message()))
+            rate_era::pending(conn, 256).map_err(|error| (error.code().into(), error.message()))
         })
         .map_err(|(_, message)| message)?;
-    Ok(!remaining.is_empty())
+    let now = std::time::Instant::now();
+    Ok(remaining
+        .iter()
+        .any(|model| !attempted.contains(model) && !backoff.waiting(model, now)))
 }
 
 /// Computes one day and appends it as the day's original row.

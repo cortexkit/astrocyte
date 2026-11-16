@@ -6,6 +6,8 @@ struct TimelineFusiform {
     delay: Duration,
     /// The deadline each history read was given.
     timeouts: std::sync::Mutex<Vec<Duration>>,
+    /// Models whose history read fails, as fusiform timing out would.
+    failing: Vec<String>,
 }
 
 impl TimelineFusiform {
@@ -73,6 +75,12 @@ impl CatalogConnection for TimelineFusiform {
             .lock()
             .unwrap()
             .push((request.provider_id.clone(), request.model_id.clone()));
+        if self.failing.contains(&request.model_id) {
+            return Err(CatalogCallError {
+                code: "unavailable".into(),
+                message: "fusiform exchange: response timeout".into(),
+            });
+        }
         let units = self.version.load(Ordering::SeqCst) * 1_000_000_000;
         let segments = if request.model_id.starts_with("target-") {
             json!({"rate.input":[{"from_ms":1,"until_ms":null,"state":"value","value":{"state":"priced","currency":"USD","units":units,"exponent":9,"unit_provenance":{"kind":"stated"}}}]})
@@ -100,6 +108,7 @@ fn rate_era_refresher_rereads_alias_and_twin_timelines_on_catalog_advance() {
         requests: Default::default(),
         delay: Duration::ZERO,
         timeouts: Default::default(),
+        failing: Vec::new(),
     });
     state
         .install_catalog(Some(CatalogClient::connect(peer.clone()).unwrap()))
@@ -119,26 +128,27 @@ fn rate_era_refresher_rereads_alias_and_twin_timelines_on_catalog_advance() {
             .unwrap()
     };
     assert!(resolved().is_none());
-    rate_era_tick(&state).unwrap();
+    let mut backoff = RateBackoff::default();
+    rate_era_tick(&state, &mut backoff).unwrap();
     let first = resolved().unwrap();
     assert!(
         matches!(&first,multiplier::ModelResolution::Rates(rates) if rates.base["input"]==multiplier::RateState::Priced {units_per_million:1_000_000_000})
     );
     let count = peer.requests.lock().unwrap().len();
-    rate_era_tick(&state).unwrap();
+    rate_era_tick(&state, &mut backoff).unwrap();
     assert_eq!(
         peer.requests.lock().unwrap().len(),
         count,
         "unchanged catalogs fetch no timelines"
     );
     peer.version.store(2, Ordering::SeqCst);
-    rate_era_tick(&state).unwrap();
+    rate_era_tick(&state, &mut backoff).unwrap();
     let second = resolved().unwrap();
     assert!(
         matches!(&second,multiplier::ModelResolution::Rates(rates) if rates.base["input"]==multiplier::RateState::Priced {units_per_million:2_000_000_000})
     );
     peer.version.store(3, Ordering::SeqCst);
-    rate_era_tick(&state).unwrap();
+    rate_era_tick(&state, &mut backoff).unwrap();
     let third = resolved().unwrap();
     assert!(
         matches!(&third,multiplier::ModelResolution::Rates(rates) if rates.reference_model.as_ref().unwrap().model_id=="target-b")
@@ -174,11 +184,13 @@ fn each_model_read_gets_its_own_deadline_and_reads_continue_between_ticks() {
         requests: Default::default(),
         delay: Duration::from_millis(400),
         timeouts: Default::default(),
+        failing: Vec::new(),
     });
     state
         .install_catalog(Some(CatalogClient::connect(peer.clone()).unwrap()))
         .unwrap();
-    let version = rate_era_tick(&state)
+    let mut backoff = RateBackoff::default();
+    let version = rate_era_tick(&state, &mut backoff)
         .unwrap()
         .expect("a full tick's pass cannot read every slow model");
     let mut stage = MultiplierStage::new(None);
@@ -205,5 +217,62 @@ fn each_model_read_gets_its_own_deadline_and_reads_continue_between_ticks() {
             .iter()
             .all(|timeout| *timeout > RATE_FETCH_MODEL_BUDGET - Duration::from_secs(1)),
         "every read gets close to its own full deadline: {timeouts:?}"
+    );
+}
+
+#[test]
+fn a_model_fusiform_cannot_serve_waits_before_it_is_tried_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(state::leased_test_state(&directory));
+    publish_desired(&state, &directory);
+    state
+        .ordered_write(|tx| {
+            for id in ["slow", "fine"] {
+                tx.execute(
+                    "INSERT INTO usage_event(event_id,producer,producer_ref,recorded_at_ms,provider,model,charge_basis) VALUES(?1,'opencode',?1,0,'openai',?1,'unknown')",
+                    [id],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Ok(((), true))
+        })
+        .unwrap();
+    let peer = Arc::new(TimelineFusiform {
+        store: directory.path().join("ledger.db"),
+        version: std::sync::atomic::AtomicI64::new(1),
+        requests: Default::default(),
+        delay: Duration::ZERO,
+        timeouts: Default::default(),
+        failing: vec!["slow".into()],
+    });
+    state
+        .install_catalog(Some(CatalogClient::connect(peer.clone()).unwrap()))
+        .unwrap();
+    let mut stage = MultiplierStage::new(None);
+    stage.tick(&state, false, NOW);
+    let tries = |model: &str| {
+        peer.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, requested)| requested == model)
+            .count()
+    };
+    assert_eq!(tries("slow"), 1, "the failing model is tried once");
+    assert_eq!(tries("fine"), 1);
+    // Only the failing model is left, and it is waiting: no between-tick
+    // passes, and the next full tick within the wait does not ask again.
+    assert!(!stage.rates_behind());
+    stage.tick(&state, false, NOW + 30_000);
+    assert_eq!(tries("slow"), 1, "a failed model waits before its next try");
+    // Once the wait has passed, the next full tick tries it again.
+    let model = ("openai".to_string(), "slow".to_string());
+    stage.rate_backoff.waits.get_mut(&model).unwrap().0 = std::time::Instant::now();
+    stage.tick(&state, false, NOW + 60_000);
+    assert_eq!(tries("slow"), 2);
+    assert_eq!(
+        stage.rate_backoff.waits[&model].1,
+        RateBackoff::FIRST * 2,
+        "a second failure doubles the wait"
     );
 }
