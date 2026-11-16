@@ -528,3 +528,125 @@ fn attribution_report_no_range_filters_undated_separately_from_dated_coverage() 
         }
     );
 }
+
+#[test]
+fn attribution_report_hour_and_fractional_offset_day_seams_match_ordinary_totals() {
+    let mut conn = conn();
+    plan(
+        &conn,
+        PlanLedger::Account,
+        "provider",
+        "account",
+        0,
+        Some(3 * DAY_MS),
+    );
+    for (n, at) in [
+        1,
+        HOUR_MS - 1,
+        HOUR_MS + 1,
+        66_599_999,
+        66_600_000,
+        DAY_MS - 1,
+        DAY_MS + 1,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        call(
+            &mut conn,
+            &format!("seam-{n}"),
+            at,
+            if n % 2 == 0 { "session-a" } else { "session-b" },
+            "a",
+            "subscription_included",
+            100,
+        );
+    }
+    facts(&mut conn);
+    rate(&conn, "a", 1_000_000_000);
+    summaries(&mut conn);
+    drain(&mut conn, &config());
+    for (grain, zone, to) in [
+        ("hour", "UTC", 2 * HOUR_MS),
+        ("day", "Asia/Kolkata", DAY_MS),
+        ("day", "America/New_York", DAY_MS),
+    ] {
+        let ordinary = spend_report(
+            &conn,
+            &request(json!({"grouping":["model"],"grain":grain,"timezone":zone,"to_ms":to})),
+            3 * DAY_MS,
+        )
+        .unwrap();
+        let split = spend_report(
+            &conn,
+            &request(
+                json!({"grouping":["alfonso","model"],"grain":grain,"timezone":zone,"to_ms":to}),
+            ),
+            3 * DAY_MS,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&split.totals).unwrap(),
+            serde_json::to_value(&ordinary.totals).unwrap(),
+            "{grain}/{zone}"
+        );
+        assert_eq!(
+            split.rate_staleness, ordinary.rate_staleness,
+            "{grain}/{zone}"
+        );
+        for expected in &ordinary.rows {
+            let rows = split
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.bucket_start_ms == expected.bucket_start_ms
+                        && row.bucket_end_ms == expected.bucket_end_ms
+                        && row.currency == expected.currency
+                        && row.grouping["model"] == expected.grouping["model"]
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.iter().map(|row| row.events_total).sum::<u64>(),
+                expected.events_total,
+                "{grain}/{zone}"
+            );
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.valuation.list_value.nanos)
+                    .sum::<i64>(),
+                expected.valuation.list_value.nanos,
+                "{grain}/{zone}"
+            );
+            let summed = rows
+                .iter()
+                .filter_map(|row| row.valuation.deduced.as_ref())
+                .map(|value| i128::from(value.nanos))
+                .sum::<i128>();
+            let target = i128::from(expected.valuation.deduced.as_ref().unwrap().nanos);
+            assert!(
+                (summed - target).abs() * 2 <= i128::try_from(rows.len()).unwrap(),
+                "{grain}/{zone}"
+            );
+        }
+        if zone == "Asia/Kolkata" {
+            assert_eq!(
+                split
+                    .rows
+                    .iter()
+                    .filter(|row| row.bucket_start_ms == -19_800_000)
+                    .map(|row| row.events_total)
+                    .sum::<u64>(),
+                4
+            );
+            assert_eq!(
+                split
+                    .rows
+                    .iter()
+                    .filter(|row| row.bucket_start_ms == 66_600_000)
+                    .map(|row| row.events_total)
+                    .sum::<u64>(),
+                3
+            );
+        }
+    }
+}
