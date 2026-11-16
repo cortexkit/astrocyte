@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::ReportError;
 
-// Format 7 adds the hidden attribution tuple to spend cells. Run cells are
+// Format 6 separates runner and host harness in spend cells. Run cells are
 // republished with the same hour so both reads agree.
-pub(crate) const FORMAT: i64 = 7;
+pub(crate) const FORMAT: i64 = 6;
 const HOUR_MS: i64 = 3_600_000;
 const MAX_RANGE: i64 = 31 * 24 * HOUR_MS;
 const HARNESSES: &[&str] = &[

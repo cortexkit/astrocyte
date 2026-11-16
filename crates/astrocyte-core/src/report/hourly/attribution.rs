@@ -1,5 +1,6 @@
-//! A single hidden dimension keeps attribution independent of report groupings.
-use super::{encode, ReportError};
+//! Independent projections share ledger reads and revision checks, not report keys.
+use super::valuation::{PlanMember, Recorded, ValuedCell};
+use super::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -7,7 +8,6 @@ pub(crate) struct Attribution {
     pub alfonso: Option<String>,
     pub parent_alfonso: Option<String>,
     pub workload: Option<String>,
-    pub task: Option<String>,
     pub project_id: Option<String>,
     pub workspace: Option<String>,
 }
@@ -22,14 +22,263 @@ impl Attribution {
             encode(self).map(Some)
         }
     }
+}
 
-    pub fn from_dictionary(value: Option<String>) -> Result<Self, ReportError> {
-        value.map_or_else(
-            || Ok(Self::default()),
-            |text| {
-                serde_json::from_str(&text)
-                    .map_err(|_| ReportError::Integrity("invalid attribution tuple"))
-            },
-        )
+// Without publisher evidence, every call stays Not attributed. A replacement
+// resolver can use evidence loaded once for the chunk, not query every event.
+pub(super) fn resolve(_event: &LedgerEvent) -> Attribution {
+    Attribution::default()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct AttributionKey {
+    currency: Option<String>,
+    attribution: Attribution,
+    provider: Option<String>,
+    model: Option<String>,
+}
+impl AttributionKey {
+    pub(super) fn new(key: &Key, attribution: &Attribution) -> Self {
+        Self {
+            currency: key.1.clone(),
+            attribution: attribution.clone(),
+            provider: key.0[Grouping::Provider as usize].clone(),
+            model: key.0[Grouping::Model as usize].clone(),
+        }
     }
+    fn ids(
+        &self,
+        tx: &Transaction<'_>,
+        values: &mut HashMap<Option<String>, i64>,
+    ) -> Result<[i64; 4], ReportError> {
+        let mut ids = [0; 4];
+        let tuple = self.attribution.dictionary_value()?;
+        for (id, text) in ids
+            .iter_mut()
+            .zip([&self.currency, &tuple, &self.provider, &self.model])
+        {
+            *id = value_id(tx, values, text)?;
+        }
+        Ok(ids)
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Projection {
+    cells: BTreeMap<AttributionKey, Recorded>,
+}
+impl Projection {
+    fn merge(&mut self, tuple: &Attribution, data: &Data) -> Result<(), ReportError> {
+        for (key, cell) in &data.cells {
+            self.cells
+                .entry(AttributionKey::new(key, tuple))
+                .or_default()
+                .cell
+                .merge(cell)?;
+        }
+        for ((key, qkey), q) in &data.quantities {
+            valuation::merge_quantity(
+                &mut self
+                    .cells
+                    .entry(AttributionKey::new(key, tuple))
+                    .or_default()
+                    .quantities,
+                qkey,
+                q,
+            )?;
+        }
+        for ((key, kind, currency), money) in &data.money {
+            valuation::merge_money(
+                &mut self
+                    .cells
+                    .entry(AttributionKey::new(key, tuple))
+                    .or_default()
+                    .money,
+                &(*kind, currency.clone()),
+                money,
+            )?;
+        }
+        Ok(())
+    }
+    pub(super) fn len(&self) -> usize {
+        self.cells.len()
+    }
+    pub(super) fn replace(
+        &self,
+        tx: &Transaction<'_>,
+        hour: Hour,
+        main_revision: i64,
+        own_revision: i64,
+    ) -> Result<(), ReportError> {
+        tx.execute(
+            "DELETE FROM attribution_cell WHERE kind=?1 AND hour_number=?2",
+            params![hour.kind, hour.number],
+        )?;
+        let mut values = HashMap::new();
+        for (key, cell) in &self.cells {
+            let [currency, tuple, provider, model] = key.ids(tx, &mut values)?;
+            tx.execute(
+                "INSERT INTO attribution_cell VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    hour.kind,
+                    hour.number,
+                    currency,
+                    tuple,
+                    provider,
+                    model,
+                    encode(cell)?
+                ],
+            )?;
+        }
+        tx.execute("UPDATE attribution_hour SET summary_revision=?3,summary_attribution_revision=?4 WHERE kind=?1 AND hour_number=?2",params![hour.kind,hour.number,main_revision,own_revision])?;
+        Ok(())
+    }
+}
+
+pub(super) type ValuationProjection = BTreeMap<(AttributionKey, PlanMember), ValuedCell>;
+pub(super) fn replace_valuation(
+    tx: &Transaction<'_>,
+    hour: Hour,
+    main_revision: i64,
+    own_revision: i64,
+    cells: ValuationProjection,
+    fetched: bool,
+) -> Result<(), ReportError> {
+    tx.execute(
+        "DELETE FROM attribution_valuation_cell WHERE kind=?1 AND hour_number=?2",
+        params![hour.kind, hour.number],
+    )?;
+    let mut values = HashMap::new();
+    if fetched {
+        for ((key, member), cell) in cells {
+            let [currency, tuple, provider, model] = key.ids(tx, &mut values)?;
+            tx.execute("INSERT INTO attribution_valuation_cell VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![hour.kind,hour.number,currency,tuple,provider,model,encode(&member)?,member.plan,member.plan_account,member.record.as_ref().map(encode).transpose()?,encode(&cell.recorded)?,cell.numerator.to_string(),encode(&cell.unvalued)?])?;
+        }
+    }
+    tx.execute("UPDATE attribution_hour SET valuation_revision=?3,valuation_attribution_revision=?4 WHERE kind=?1 AND hour_number=?2",params![hour.kind,hour.number,main_revision,own_revision])?;
+    Ok(())
+}
+
+pub(super) fn own_revision(conn: &Connection, hour: Hour) -> Result<i64, ReportError> {
+    Ok(conn
+        .query_row(
+            "SELECT revision FROM attribution_hour WHERE kind=?1 AND hour_number=?2",
+            params![hour.kind, hour.number],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+pub(super) fn summary_current(conn: &Connection, hour: Hour) -> Result<bool, ReportError> {
+    Ok(conn.query_row(&format!("SELECT built_revision=revision AND format_version={FORMAT} AND NOT EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=s.kind AND d.hour_number=s.hour_number) FROM summary_hour s WHERE kind=?1 AND hour_number=?2"),params![hour.kind,hour.number],|r|r.get::<_,Option<bool>>(0)).optional()?.flatten().unwrap_or(false))
+}
+pub(super) fn next_summary(
+    conn: &Connection,
+    after: Option<Hour>,
+) -> Result<Option<Hour>, ReportError> {
+    let read = |after: Option<Hour>| {
+        conn.query_row("SELECT kind,hour_number FROM attribution_hour INDEXED BY attribution_summary_stale WHERE (summary_revision IS NULL OR summary_attribution_revision IS NOT revision) AND (?1 IS NULL OR (kind,hour_number)>(?1,?2)) ORDER BY kind,hour_number LIMIT 1",params![after.map(|h|h.kind),after.map(|h|h.number)],|r|Ok(Hour{kind:r.get(0)?,number:r.get(1)?})).optional()
+    };
+    Ok(read(after)?.or(read(None)?))
+}
+
+pub(super) fn observe(
+    data: &mut Data,
+    projection: &mut Projection,
+    conn: &Connection,
+    filter: &str,
+) -> Result<usize, ReportError> {
+    let ledger = load_scoped_ledger(conn, &DIMENSIONS, Some(filter))?;
+    let mut groups: BTreeMap<Attribution, Data> = BTreeMap::new();
+    let mut events = HashMap::new();
+    for event in &ledger.events {
+        let tuple = resolve(event);
+        let key = groups
+            .entry(tuple.clone())
+            .or_default()
+            .observe_event(&ledger, event)?;
+        events.insert(
+            event.key,
+            (
+                tuple,
+                key,
+                event.occurred_at_ms.is_some() && event.is_fully_priced(),
+            ),
+        );
+    }
+    let selected = format!("SELECT event_key FROM usage_event WHERE {filter}");
+    let mut stmt=conn.prepare(&format!("SELECT m.event_key,m.unit,m.role,m.quantity_units,m.quantity_exponent,h.outcome FROM measurement m LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit AND NOT EXISTS(SELECT 1 FROM priced_charge s WHERE s.supersedes=h.charge_key) WHERE m.event_key IN ({selected})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let (tuple, key, complete) =
+            events
+                .get(&row.get::<_, i64>(0)?)
+                .ok_or(ReportError::Integrity(
+                    "attribution measurement event absent",
+                ))?;
+        groups
+            .get_mut(tuple)
+            .ok_or(ReportError::Integrity("attribution group absent"))?
+            .observe_quantity(
+                key,
+                *complete,
+                (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+                row.get::<_, Option<String>>(5)?.as_deref() == Some("covered"),
+            )?;
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT event_key,currency,amount_nanos FROM adjustment WHERE event_key IN ({selected})"
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let (tuple, key, _) = events
+            .get(&row.get::<_, i64>(0)?)
+            .ok_or(ReportError::Integrity(
+                "attribution adjustment event absent",
+            ))?;
+        let money = groups
+            .get_mut(tuple)
+            .ok_or(ReportError::Integrity("attribution group absent"))?
+            .money
+            .entry((key.clone(), 1, row.get(1)?))
+            .or_default();
+        sum(&mut money.nanos, i128::from(row.get::<_, i64>(2)?))?;
+        add_count(&mut money.contributions, 1)?;
+    }
+    for (tuple, group) in groups {
+        projection.merge(&tuple, &group)?;
+        add_count(&mut data.events, group.events)?;
+        min(&mut data.first, group.first);
+        max(&mut data.last, group.last);
+        for (key, cell) in group.cells {
+            data.cells.entry(key).or_default().merge(&cell)?;
+        }
+        for (key, q) in group.quantities {
+            let to = data.quantities.entry(key).or_default();
+            sum(&mut to.units, q.units)?;
+            add_count(&mut to.observations, q.observations)?;
+            add_count(&mut to.stated_observations, q.stated_observations)?;
+            sum(&mut to.covered_units, q.covered_units)?;
+            add_count(&mut to.covered_observations, q.covered_observations)?;
+        }
+        for (key, m) in group.money {
+            let to = data.money.entry(key).or_default();
+            sum(&mut to.nanos, m.nanos)?;
+            add_count(&mut to.contributions, m.contributions)?;
+        }
+        for (key, n) in group.frequencies {
+            add_count(data.frequencies.entry(key).or_default(), n)?;
+        }
+    }
+    crate::runs::observe(conn, filter, &mut data.runs)?;
+    Ok(ledger.events.len())
+}
+
+#[cfg(test)]
+pub(super) fn bump(conn: &Connection, hour: Hour) {
+    conn.execute(
+        "UPDATE attribution_hour SET revision=revision+1 WHERE kind=?1 AND hour_number=?2",
+        params![hour.kind, hour.number],
+    )
+    .unwrap();
 }

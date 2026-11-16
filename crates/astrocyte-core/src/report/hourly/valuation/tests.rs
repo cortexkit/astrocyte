@@ -185,35 +185,233 @@ fn state(conn: &Connection, hour: i64) -> String {
 }
 
 #[test]
-fn attribution_tuple_survives_real_valuation_publication() {
+fn attribution_projection_combines_ordinary_dimensions_without_losing_quantities() {
     let mut conn = conn();
     let config = config();
     event(
         &mut conn,
-        "unattributed",
+        "a",
         1,
         "A",
-        None,
+        Some("account-a"),
         None,
         "metered_api",
         4,
     );
+    event(
+        &mut conn,
+        "b",
+        2,
+        "A",
+        Some("account-b"),
+        None,
+        "metered_api",
+        6,
+    );
     rate(&conn, "A", 3);
     summaries(&mut conn);
     drain(&mut conn, &config);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM summary_cell", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM attribution_cell", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let payload: String = conn
+        .query_row("SELECT payload FROM attribution_cell", [], |r| r.get(0))
+        .unwrap();
+    let recorded: Recorded = serde_json::from_str(&payload).unwrap();
+    assert_eq!(recorded.cell.events, 2);
+    assert_eq!(recorded.cell.measurements, 4);
+    assert_eq!(recorded.cell.priced, 0);
+    assert_eq!(
+        recorded
+            .quantities
+            .iter()
+            .map(|(_, q)| q.observations)
+            .sum::<u64>(),
+        4
+    );
+    assert_eq!(
+        recorded
+            .quantities
+            .iter()
+            .find(|(key, _)| key.1 == "input")
+            .unwrap()
+            .1
+            .units,
+        10
+    );
+    assert_eq!(
+        recorded
+            .quantities
+            .iter()
+            .find(|(key, _)| key.1 == "output")
+            .unwrap()
+            .1
+            .units,
+        5
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT sum(CAST(list_numerator AS INTEGER)) FROM attribution_valuation_cell",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        60
+    );
+}
+
+#[test]
+fn attribution_changes_do_not_block_in_flight_main_publication() {
+    let mut conn = conn();
+    let config = config();
+    event(&mut conn, "one", 1, "A", None, None, "metered_api", 4);
+    rate(&conn, "A", 3);
+    prepare(&mut conn, &config);
+    let mut summary = SummaryMaintenance::default();
+    assert!(summary.read_chunk(&conn, 10_000).unwrap());
+    attribution::bump(&conn, Hour { kind: 0, number: 0 });
+    let tx = conn.transaction().unwrap();
+    assert!(summary.publish(&tx, 10_000).unwrap().published);
+    tx.commit().unwrap();
+    assert!(summary_current(&conn, Hour { kind: 0, number: 0 }).unwrap());
+    let mut valued = ValuationMaintenance::default();
+    assert!(valued.read_chunk(&conn, &config, &[]).unwrap());
+    attribution::bump(&conn, Hour { kind: 0, number: 0 });
+    let tx = conn.transaction().unwrap();
+    assert!(valued.publish(&tx).unwrap());
+    tx.commit().unwrap();
     assert_eq!(state(&conn, 0), "built");
-    let cells = stored_cells(&conn, 0);
-    assert_eq!(cells.len(), 1);
-    let ((key, _), cell) = cells.first_key_value().unwrap();
-    assert_eq!(key.3, Attribution::default());
-    assert_eq!(cell.recorded.cell.events, 1);
-    assert_eq!(cell.numerator, 24);
-    let summary_key: String = conn
+    assert_eq!(
+        stored_cells(&conn, 0)
+            .values()
+            .map(|c| c.numerator)
+            .sum::<i128>(),
+        24
+    );
+    assert_eq!(conn.query_row("SELECT count(*) FROM attribution_hour WHERE summary_attribution_revision IS NOT revision AND valuation_attribution_revision IS NOT revision",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+}
+
+#[test]
+fn attribution_only_backlog_writes_no_main_summary_or_valuation_rows() {
+    let mut conn = conn();
+    let config = config();
+    event(&mut conn, "one", 1, "A", None, None, "metered_api", 4);
+    rate(&conn, "A", 3);
+    summaries(&mut conn);
+    drain(&mut conn, &config);
+    conn.execute("UPDATE summary_audit_state SET next_due_ms=100000", [])
+        .unwrap();
+    conn.execute_batch("CREATE TEMP TABLE main_writes(table_name TEXT);")
+        .unwrap();
+    for table in [
+        "summary_hour",
+        "summary_cell",
+        "summary_quantity",
+        "summary_money",
+        "summary_cost_frequency",
+        "summary_run_cell",
+        "summary_dirty_hour",
+        "summary_audit_state",
+        "valuation_hour",
+        "valuation_cell",
+    ] {
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            conn.execute_batch(&format!("CREATE TEMP TRIGGER watch_{table}_{operation} AFTER {operation} ON {table} BEGIN INSERT INTO main_writes VALUES('{table}'); END;")).unwrap();
+        }
+    }
+    attribution::bump(&conn, Hour { kind: 0, number: 0 });
+    let mut summary = SummaryMaintenance::default();
+    for step in 0..100 {
+        assert!(step < 99, "attribution summary did not drain");
+        if summary.read_chunk(&conn, 10_000).unwrap() {
+            let tx = conn.transaction().unwrap();
+            let outcome = summary.publish(&tx, 10_000).unwrap();
+            if outcome.published {
+                assert!(outcome.attribution_only);
+            }
+            tx.commit().unwrap();
+        } else if !summary.has_pending() {
+            break;
+        }
+    }
+    assert_eq!(drain(&mut conn, &config), vec![0]);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM main_writes", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(conn.query_row("SELECT count(*) FROM attribution_hour a JOIN summary_hour s USING(kind,hour_number) JOIN valuation_hour v USING(kind,hour_number) WHERE a.summary_revision=s.revision AND a.summary_attribution_revision=a.revision AND a.valuation_revision=v.revision AND a.valuation_attribution_revision=a.revision",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT attribution,json_extract(payload,'$.cell.events') FROM attribution_cell",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        )
+        .unwrap(),
+        (0, 1)
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT list_numerator FROM attribution_valuation_cell",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "24"
+    );
+    let bytes: String = conn
         .query_row("SELECT summary_key FROM valuation_cell", [], |r| r.get(0))
         .unwrap();
-    let encoded: serde_json::Value = serde_json::from_str(&summary_key).unwrap();
-    assert_eq!(encoded.as_array().unwrap().len(), 4);
-    assert_eq!(encoded[3]["alfonso"], serde_json::Value::Null);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&bytes)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(FORMAT, 6);
+}
+
+#[test]
+fn attribution_own_revision_fences_summary_and_valuation_publication() {
+    let mut conn = conn();
+    let config = config();
+    event(&mut conn, "one", 1, "A", None, None, "metered_api", 4);
+    rate(&conn, "A", 3);
+    summaries(&mut conn);
+    drain(&mut conn, &config);
+    attribution::bump(&conn, Hour { kind: 0, number: 0 });
+    let mut summary = SummaryMaintenance::default();
+    assert!(summary.read_chunk(&conn, 10_000).unwrap());
+    attribution::bump(&conn, Hour { kind: 0, number: 0 });
+    let tx = conn.transaction().unwrap();
+    assert!(!summary.publish(&tx, 10_000).unwrap().published);
+    tx.commit().unwrap();
+    assert!(attribution::next_summary(&conn, None).unwrap().is_some());
+    let mut valued = ValuationMaintenance::default();
+    assert!(valued.read_chunk(&conn, &config, &[]).unwrap());
+    attribution::bump(&conn, Hour { kind: 0, number: 0 });
+    let tx = conn.transaction().unwrap();
+    assert!(!valued.publish(&tx).unwrap());
+    tx.commit().unwrap();
+    assert_eq!(state(&conn, 0), "built");
+    assert_eq!(
+        conn.query_row("SELECT sum(events_total) FROM summary_hour", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 }
 
 #[test]

@@ -67,7 +67,7 @@ copies that timeout without running the table-creating probes.
 | `summary_value` | Each row assigns an exact stored string an integer identifier, with identifier zero reserved for null. | Builders insert new values. |
 | `summary_hour` | Each row records an hour's persistent revision, published revision, format, event count and time extrema. | Triggers advance revisions, and publication records a completed build. |
 | `summary_dirty_hour` | Each row identifies an hour that needs a fresh reduction from base rows. | Triggers insert dirty keys, and successful publication removes them. |
-| `summary_cell` | Each row holds dimension-keyed event and measurement counters, exact money sums and reason maps for one hour. Its hidden `attribution` value interns the tuple (alfonso, parent_alfonso, workload, task, project_id, workspace); zero means the all-null Not attributed tuple. | Rebuilds replace these rows. |
+| `summary_cell` | Each row holds dimension-keyed event and measurement counters, exact money sums and reason maps for one hour. | Rebuilds replace these rows. |
 | `summary_quantity` | Each row holds exact quantities for a cell, role, unit and exponent, including covered population, observation counts and stated-quantity counts. | Rebuilds replace these rows. |
 | `summary_money` | Each row holds current-head or adjustment contributions in their actual currency, together with a presence count. | Rebuilds replace these rows. |
 | `summary_cost_frequency` | Each row counts an exact current-head value in the dated, complete, currency-known work-class sample. | Rebuilds replace these rows. |
@@ -80,20 +80,27 @@ copies that timeout without running the table-creating probes.
 | `valuation_state` | The singleton records synchronized rate, valuation-config and plan-record generations. | Valuation maintenance and plan-record triggers update it. |
 | `valuation_hour` | Each row records an hour's revision, three built generations and independent valuation state. | Ledger and plan triggers invalidate hours; valuation publication completes them. |
 | `valuation_cell` | Each row splits a summary key by plan member and subscription ledger record, retaining recorded counters, quantities and currency sums alongside the cell's list value and unvalued reasons. The list value is stored unrounded, in the valuer's numerator units (`ListValue` in `valuation.rs`), and is rounded to whole nanodollars only when a report serves it. | Valuation rebuilds replace these rows without changing spend summaries. |
+| `attribution_hour` | Each row tracks an independent attribution revision and completion marks for that revision and the existing summary/valuation hour revisions. | Builders publish completion marks; attribution changes can invalidate only these projections. |
+| `attribution_cell` | Each row aggregates an hour, currency, attribution tuple, provider and model, retaining counters, exact quantities with presence counts, and recorded currency sums. | The summary pass replaces these rows from its existing ledger read. |
+| `attribution_valuation_cell` | Each row adds the plan member and immutable plan record to an attribution key and retains the recorded payload, exact list numerator and unvalued reasons. | The valuation pass replaces these rows from its existing ledger read. |
 
 The payer store's incarnation identifies one database history. THALAMUS changes
 it when the database is replaced or restored, so a reader starts again at the
 lowest sequence instead of skipping a newly reused sequence number. The mirror
 keeps attempt identities across incarnations to prevent duplicate calls.
 
-Summary format 7 adds the attribution tuple to both summary and valuation keys.
+The attribution tuple is (alfonso, parent_alfonso, workload, project_id, workspace).
 `alfonso` identifies the owning agent; `parent_alfonso` identifies the agent that
 owns the launching subject, which can differ from the child's owner.
 Until the attribution reader and join are enabled, every call writes the all-null
-tuple. Migration 58 discards only derived summary and valuation cells, preserves
-the hour metadata and ledger, and marks valuations dirty. The bounded backlog
-builder rebuilds stale hours; reports use ledger aggregation until each hour is
-current. Attribution grouping and filtering are not enabled by this migration.
+tuple, represented by value id zero. Task remains in publisher facts but is not
+part of this projection because it can be unique per run. Ordinary summary and
+valuation keys and summary format 6 are unchanged. Migration 58 only adds tables:
+it preserves every existing row, including ordinary report caches. The summary
+and valuation backlog builders fill the new projections. When an hour's ordinary
+summary or valuation is stale, its pass builds both projections from one ledger
+read; when it is current, the pass writes only attribution cells. Attribution
+grouping and filtering are not enabled by this migration.
 
 ## Immutability
 

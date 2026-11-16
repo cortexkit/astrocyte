@@ -4,7 +4,6 @@ mod attribution;
 mod copy_bench;
 pub mod valuation;
 use super::*;
-use attribution::Attribution;
 use rusqlite::Transaction;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -35,13 +34,12 @@ const DIMENSIONS: [Grouping; GROUPING_DIMENSIONS] = [
     Grouping::Harness,
 ];
 
-// Hidden dimensions stay apart from the served grouping array: currency,
-// subscription payer and the attribution tuple have independent read semantics.
+// Report dimensions, currency, and the hidden subscription payer. Keeping the
+// payer separate means it cannot become a served spend-report grouping.
 type Key = (
     [Option<String>; GROUPING_DIMENSIONS],
     Option<String>,
     Option<String>,
-    Attribution,
 );
 type QuantityKey = (String, String, i32);
 type FrequencyKey = (String, Option<String>, String, i64);
@@ -158,7 +156,6 @@ fn key(ledger: &Ledger, event: &LedgerEvent) -> Key {
             .map(|value| ledger.values.optional_name(value)),
         ledger.values.optional_name(event.currency),
         ledger.values.optional_name(event.paying_credential),
-        Attribution::default(),
     )
 }
 fn is_subscription(key: &Key) -> bool {
@@ -430,18 +427,17 @@ fn parse_exact(value: String) -> Result<i128, ReportError> {
 struct RawCell {
     id: i64,
     hour: Hour,
-    dictionary: [i64; GROUPING_DIMENSIONS + 3],
+    dictionary: [i64; GROUPING_DIMENSIONS + 2],
     payload: String,
 }
 impl RawCell {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        let mut dictionary = [0; GROUPING_DIMENSIONS + 3];
+        let mut dictionary = [0; GROUPING_DIMENSIONS + 2];
         for (column, id) in dictionary[..GROUPING_DIMENSIONS].iter_mut().enumerate() {
             *id = row.get(column + 3)?;
         }
         dictionary[GROUPING_DIMENSIONS] = row.get(13)?;
         dictionary[GROUPING_DIMENSIONS + 1] = row.get(15)?;
-        dictionary[GROUPING_DIMENSIONS + 2] = row.get(16)?;
         Ok(Self {
             id: row.get(0)?,
             hour: Hour {
@@ -462,7 +458,6 @@ impl RawCell {
             dimensions,
             value(values, self.dictionary[GROUPING_DIMENSIONS])?,
             value(values, self.dictionary[GROUPING_DIMENSIONS + 1])?,
-            Attribution::from_dictionary(value(values, self.dictionary[GROUPING_DIMENSIONS + 2])?)?,
         ))
     }
 }
@@ -474,7 +469,7 @@ fn stored_recorded(
 ) -> Result<(Data, HashMap<i64, Key>), ReportError> {
     let mut data = Data::default();
     let mut keys = HashMap::new();
-    let mut statement=conn.prepare("SELECT cell_id,kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential,attribution
+    let mut statement=conn.prepare("SELECT cell_id,kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential
         FROM summary_cell WHERE kind=?1 AND hour_number=?2")?;
     let rows = statement
         .query_map(params![hour.kind, hour.number], RawCell::read)?
@@ -576,16 +571,12 @@ fn replace(
     )?;
     let mut cells = BTreeMap::new();
     for (key, cell) in &data.cells {
-        let attribution = key.3.dictionary_value()?;
-        let mut ids = [0_i64; GROUPING_DIMENSIONS + 3];
-        for (id, text) in ids
-            .iter_mut()
-            .zip(key.0.iter().chain([&key.1, &key.2, &attribution]))
-        {
+        let mut ids = [0_i64; GROUPING_DIMENSIONS + 2];
+        for (id, text) in ids.iter_mut().zip(key.0.iter().chain([&key.1, &key.2])) {
             *id = value_id(tx, &mut values, text)?;
         }
-        tx.execute("INSERT INTO summary_cell(kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential,attribution)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![hour.kind,hour.number,ids[0],ids[1],ids[2],ids[3],ids[4],ids[5],ids[6],ids[7],ids[8],ids[9],ids[10],encode(cell)?,ids[11],ids[12]])?;
+        tx.execute("INSERT INTO summary_cell(kind,hour_number,provider,model,account,auth_selection,charge_basis,work_class,project,producer,runner,harness,currency,payload,paying_credential)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![hour.kind,hour.number,ids[0],ids[1],ids[2],ids[3],ids[4],ids[5],ids[6],ids[7],ids[8],ids[9],ids[10],encode(cell)?,ids[11]])?;
         cells.insert(key.clone(), tx.last_insert_rowid());
     }
     for ((key, (unit, role, exponent)), quantity) in &data.quantities {
@@ -648,6 +639,10 @@ fn replace(
 struct Build {
     hour: Hour,
     revision: i64,
+    attribution_revision: i64,
+    main: bool,
+    attribution: attribution::Projection,
+    attribution_deferred: bool,
     after: Option<i64>,
     data: Data,
     audit: bool,
@@ -677,6 +672,7 @@ pub struct SummaryMaintenance {
 #[derive(Debug, Default)]
 pub struct SummaryOutcome {
     pub published: bool,
+    pub attribution_only: bool,
     pub audited: bool,
     pub mismatch: bool,
     pub examined: u64,
@@ -833,7 +829,15 @@ impl SummaryMaintenance {
             }
             let next = match dirty {
                 Some(hour) => Some(hour),
-                None => next_stale(conn, self.stale_after)?,
+                // Prefer candidates beyond the shared cursor before wrapping
+                // either queue, so a deferred ordinary hour cannot starve attribution.
+                None => [
+                    next_stale(conn, self.stale_after)?,
+                    attribution::next_summary(conn, self.stale_after)?,
+                ]
+                .into_iter()
+                .flatten()
+                .min_by_key(|hour| (self.stale_after.is_some_and(|after| *hour <= after), *hour)),
             };
             // Counted whether or not this step goes to the audit instead,
             // which alternates with rebuilds while the audit is due.
@@ -856,6 +860,10 @@ impl SummaryMaintenance {
             self.pending = Some(Build {
                 hour,
                 revision: revision(conn, hour)?,
+                attribution_revision: attribution::own_revision(conn, hour)?,
+                main: !attribution::summary_current(conn, hour)?,
+                attribution: attribution::Projection::default(),
+                attribution_deferred: false,
                 after: None,
                 data: Data::default(),
                 audit,
@@ -874,27 +882,51 @@ impl SummaryMaintenance {
         if build.revision != revision(conn, build.hour)? {
             return Ok(false);
         }
+        // Attribution changes invalidate only its projection; ordinary ledger
+        // counters can still finish against the unchanged main revision.
+        if !build.audit
+            && build.attribution_revision != attribution::own_revision(conn, build.hour)?
+        {
+            if !build.main {
+                return Ok(false);
+            }
+            build.attribution_deferred = true;
+        }
         let last = conn.query_row(&page_end_sql(build.hour, build.after), [], |row| {
             row.get::<_, Option<i64>>(0)
         })?;
         // An empty page reduces nothing, so it is not read.
         let count = match last {
-            Some(last) => build
-                .data
-                .observe(conn, &chunk_filter(build.hour, build.after, last))?,
+            Some(last) => {
+                let filter = chunk_filter(build.hour, build.after, last);
+                if build.audit {
+                    build.data.observe(conn, &filter)?
+                } else {
+                    attribution::observe(&mut build.data, &mut build.attribution, conn, &filter)?
+                }
+            }
             None => 0,
         };
         build.after = last;
         let max_publication_rows = MAX_PUBLICATION_ROWS;
         #[cfg(test)]
         let max_publication_rows = self.max_publication_rows.unwrap_or(max_publication_rows);
+        let main_rows = build.data.cells.len()
+            + build.data.quantities.len()
+            + build.data.money.len()
+            + build.data.frequencies.len()
+            + build.data.runs.len();
+        // A new projection must not make an ordinary hour unpublishable. If
+        // their combined writes exceed the budget, publish main cells now and
+        // let the attribution-only backlog spend a separate bounded commit.
+        build.attribution_deferred |=
+            build.main && main_rows + build.attribution.len() > max_publication_rows;
         build.deferred = !build.audit
-            && (build.data.cells.len()
-                + build.data.quantities.len()
-                + build.data.money.len()
-                + build.data.frequencies.len()
-                + build.data.runs.len()
-                > max_publication_rows);
+            && if build.main {
+                main_rows
+            } else {
+                build.attribution.len()
+            } > max_publication_rows;
         build.ready = count < CHUNK || build.deferred;
         let spent =
             u64::try_from(started.elapsed().as_millis()).map_err(|_| ReportError::Arithmetic)?;
@@ -936,7 +968,12 @@ impl SummaryMaintenance {
         let Some(build) = self.pending.take() else {
             return Ok(SummaryOutcome::default());
         };
-        if !build.ready || build.revision != revision(tx, build.hour)? {
+        let attribution_changed = !build.audit
+            && build.attribution_revision != attribution::own_revision(tx, build.hour)?;
+        if !build.ready
+            || build.revision != revision(tx, build.hour)?
+            || (attribution_changed && !build.main)
+        {
             return Ok(SummaryOutcome::default());
         }
         let mut outcome = SummaryOutcome {
@@ -988,8 +1025,19 @@ impl SummaryMaintenance {
             outcome.audited = true;
             self.prefer_audit = false;
         } else {
-            replace(tx, build.hour, build.revision, &build.data)?;
+            if build.main {
+                replace(tx, build.hour, build.revision, &build.data)?;
+            }
+            if !build.attribution_deferred && !attribution_changed {
+                build.attribution.replace(
+                    tx,
+                    build.hour,
+                    build.revision,
+                    build.attribution_revision,
+                )?;
+            }
             outcome.published = true;
+            outcome.attribution_only = !build.main;
             self.prefer_audit = true;
         }
         Ok(outcome)
@@ -1130,7 +1178,7 @@ fn scoped_frame<'c>(
     let mut observed = BTreeMap::new();
     let mut split = BTreeSet::new();
     let scope = scope.replace("h.", "c.");
-    let mut statement=conn.prepare(&format!("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.runner,c.harness,c.currency,c.payload,c.paying_credential,c.attribution
+    let mut statement=conn.prepare(&format!("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.runner,c.harness,c.currency,c.payload,c.paying_credential
         FROM summary_cell c{scope}"))?;
     let mut rows = statement.query(rusqlite::params_from_iter(&parameters))?;
     let mut raw = Vec::new();
@@ -2028,48 +2076,6 @@ mod tests {
     use crate::{ingest, pricing, subscription, verdict};
 
     #[test]
-    fn attribution_null_tuple_is_written_by_real_summary_maintenance() {
-        let mut conn = conn();
-        let id = record(
-            &mut conn,
-            "unattributed",
-            Some(1_000),
-            ChargeBasis::MeteredApi,
-            None,
-        );
-        priced(&mut conn, &id, "USD", 123);
-        let request = ReportRequest {
-            grain: "day".into(),
-            timezone: "UTC".into(),
-            ..Default::default()
-        };
-        let stale = spend_report(&conn, &request, 10_000).unwrap();
-        catch_up(&mut conn);
-        let built = spend_report(&conn, &request, 10_000).unwrap();
-        assert_eq!(
-            serde_json::to_value(stale).unwrap(),
-            serde_json::to_value(built).unwrap()
-        );
-        assert_eq!(
-            conn.query_row("SELECT attribution FROM summary_cell", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        let data = stored(&conn, Hour { kind: 0, number: 0 }).unwrap();
-        let (key, cell) = data.cells.first_key_value().unwrap();
-        assert_eq!(key.3, Attribution::default());
-        assert_eq!(cell.events, 1);
-        assert_eq!(cell.total, 123);
-        let serialized = serde_json::to_value(key).unwrap();
-        assert_eq!(serialized.as_array().unwrap().len(), 4);
-        assert_eq!(
-            serialized[3],
-            serde_json::json!({"alfonso":null,"parent_alfonso":null,"workload":null,"task":null,"project_id":null,"workspace":null})
-        );
-    }
-
-    #[test]
     fn media_skipped_local_coverage_is_live_on_base_and_hourly_paths() {
         let mut conn = conn();
         assert!(
@@ -2878,7 +2884,7 @@ mod tests {
     #[test]
     fn format_three_payer_cells_are_never_served_before_rebuild() {
         let mut conn = credential_fixture();
-        assert_eq!(FORMAT, 7);
+        assert_eq!(FORMAT, 6);
         conn.execute(
             "UPDATE summary_hour SET format_version=3 WHERE hour_number=5",
             [],
@@ -3559,6 +3565,7 @@ mod tests {
                 "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<{hours}-1)
                  INSERT INTO summary_hour(kind,hour_number,revision,built_revision,format_version)
                  SELECT 0,i,1,1,{FORMAT} FROM n;
+                 UPDATE attribution_hour SET summary_revision=1,summary_attribution_revision=revision;
                  UPDATE summary_audit_state SET next_due_ms={};",
                 i64::MAX
             ))
@@ -3622,6 +3629,35 @@ mod tests {
                 "idle wrapped step used {steps} VM steps for {hours} current hours"
             );
         }
+    }
+
+    #[test]
+    fn attribution_backlog_is_not_blocked_by_a_deferred_main_hour() {
+        let mut conn = conn();
+        for (id, at, work) in [
+            ("large-a", 0, "coding"),
+            ("large-b", 0, "analysis"),
+            ("later", HOUR_MS, "coding"),
+        ] {
+            record(&mut conn, id, Some(at), ChargeBasis::MeteredApi, Some(work));
+        }
+        catch_up(&mut conn);
+        conn.execute("UPDATE summary_audit_state SET next_due_ms=?1", [i64::MAX])
+            .unwrap();
+        conn.execute(
+            "UPDATE summary_hour SET format_version=?1 WHERE hour_number=0",
+            [FORMAT - 1],
+        )
+        .unwrap();
+        attribution::bump(&conn, Hour { kind: 0, number: 1 });
+        let mut maintenance = SummaryMaintenance {
+            max_publication_rows: Some(3),
+            ..Default::default()
+        };
+        assert!(step(&mut conn, &mut maintenance).deferred);
+        let later = step(&mut conn, &mut maintenance);
+        assert_eq!(later.hour, Some((0, 1)));
+        assert!(later.published && later.attribution_only);
     }
 
     #[test]

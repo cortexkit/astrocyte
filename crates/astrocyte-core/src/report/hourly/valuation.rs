@@ -38,17 +38,17 @@ impl PlanMember {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Recorded {
     #[serde(default)]
-    base_rate_tier_untested_tokens: i64,
-    cell: Cell,
-    quantities: Vec<(QuantityKey, Quantity)>,
-    money: Vec<((i64, String), Money)>,
+    pub(super) base_rate_tier_untested_tokens: i64,
+    pub(super) cell: Cell,
+    pub(super) quantities: Vec<(QuantityKey, Quantity)>,
+    pub(super) money: Vec<((i64, String), Money)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ValuedCell {
-    recorded: Recorded,
-    numerator: i128,
-    unvalued: Unvalued,
+    pub(super) recorded: Recorded,
+    pub(super) numerator: i128,
+    pub(super) unvalued: Unvalued,
 }
 
 type Cells = BTreeMap<(Key, PlanMember), ValuedCell>;
@@ -153,8 +153,9 @@ fn merge_unvalued(target: &mut Unvalued, value: &Unvalued) -> Result<(), ReportE
     Ok(())
 }
 
-/// Shared reduction for the chunked builder and bounded dirty-hour report reads.
+/// Exercise the ordinary reduction without building attribution projections.
 /// The caller holds a read snapshot covering rates, plans and ledger rows.
+#[cfg(test)]
 pub(crate) fn reduce(
     conn: &Connection,
     filter: &str,
@@ -183,6 +184,18 @@ fn reduce_with_book(
     reasoning: &[String],
     book: &PlanBook,
     cells: &mut Cells,
+) -> Result<(usize, bool), ReportError> {
+    reduce_both(conn, filter, config, reasoning, book, cells, None)
+}
+
+fn reduce_both(
+    conn: &Connection,
+    filter: &str,
+    config: &MultiplierConfig,
+    reasoning: &[String],
+    book: &PlanBook,
+    cells: &mut Cells,
+    mut projection: Option<&mut attribution::ValuationProjection>,
 ) -> Result<(usize, bool), ReportError> {
     use crate::multiplier::ModelResolution;
     use crate::rate_era::ModelTimeline;
@@ -225,7 +238,7 @@ fn reduce_with_book(
         }
     }
     let rules = ValuationRules::from_config(config, reasoning);
-    let mut members: BTreeMap<PlanMember, Data> = BTreeMap::new();
+    let mut members: BTreeMap<(PlanMember, attribution::Attribution), Data> = BTreeMap::new();
     let mut event_members = BTreeMap::new();
     let mut fetched = true;
     let valuation_error = ModelResolution::Unpriceable {
@@ -233,6 +246,11 @@ fn reduce_with_book(
     };
     for event in &ledger.events {
         let key = key(&ledger, event);
+        let tuple = if projection.is_some() {
+            attribution::resolve(event)
+        } else {
+            attribution::Attribution::default()
+        };
         let measured = measurements.remove(&event.key).unwrap_or_default();
         let tokens = EventTokens {
             producer: key.0[Grouping::Producer as usize]
@@ -256,7 +274,7 @@ fn reduce_with_book(
             payers.get(&event.key).and_then(Option::as_deref),
             event.occurred_at_ms,
         )?;
-        let data = members.entry(member.clone()).or_default();
+        let data = members.entry((member.clone(), tuple.clone())).or_default();
         data.observe_event(&ledger, event)?;
         for ((role, unit, _, units, exponent), covered) in measured {
             data.observe_quantity(
@@ -266,7 +284,7 @@ fn reduce_with_book(
                 covered,
             )?;
         }
-        event_members.insert(event.key, (key.clone(), member.clone()));
+        event_members.insert(event.key, (key.clone(), member.clone(), tuple.clone()));
         let resolution = match (&tokens.model, event.occurred_at_ms) {
             (Some(model), Some(at)) => {
                 match timelines.get(&(tokens.provider.clone(), model.clone())) {
@@ -283,22 +301,32 @@ fn reduce_with_book(
         }
         let value =
             list_value_event(&rules, resolution, &tokens).map_err(|_| ReportError::Arithmetic)?;
-        let cell = cells.entry((key, member)).or_default();
-        cell.recorded.base_rate_tier_untested_tokens = checked_add(
-            cell.recorded.base_rate_tier_untested_tokens,
-            value.base_rate_tier_untested_tokens,
-        )?;
-        sum(&mut cell.numerator, value.numerator)?;
-        merge_unvalued(&mut cell.unvalued, &value.unvalued)?;
+        let apply = |cell: &mut ValuedCell| -> Result<(), ReportError> {
+            cell.recorded.base_rate_tier_untested_tokens = checked_add(
+                cell.recorded.base_rate_tier_untested_tokens,
+                value.base_rate_tier_untested_tokens,
+            )?;
+            sum(&mut cell.numerator, value.numerator)?;
+            merge_unvalued(&mut cell.unvalued, &value.unvalued)?;
+            Ok(())
+        };
+        apply(cells.entry((key.clone(), member.clone())).or_default())?;
+        if let Some(projected) = projection.as_deref_mut() {
+            apply(
+                projected
+                    .entry((attribution::AttributionKey::new(&key, &tuple), member))
+                    .or_default(),
+            )?;
+        }
     }
     let mut stmt = conn.prepare(&format!("SELECT event_key,currency,amount_nanos FROM adjustment WHERE event_key IN (SELECT event_key FROM usage_event WHERE {filter})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
-        let (key, member) = event_members
+        let (key, member, tuple) = event_members
             .get(&row.get::<_, i64>(0)?)
             .ok_or(ReportError::Integrity("valuation adjustment event absent"))?;
         let money = members
-            .get_mut(member)
+            .get_mut(&(member.clone(), tuple.clone()))
             .ok_or(ReportError::Integrity("valuation member absent"))?
             .money
             .entry((key.clone(), 1, row.get(1)?))
@@ -306,8 +334,19 @@ fn reduce_with_book(
         sum(&mut money.nanos, i128::from(row.get::<_, i64>(2)?))?;
         add_count(&mut money.contributions, 1)?;
     }
-    for (member, data) in members {
+    for ((member, tuple), data) in members {
         for (key, recorded) in data.cells {
+            if let Some(projected) = projection.as_deref_mut() {
+                projected
+                    .entry((
+                        attribution::AttributionKey::new(&key, &tuple),
+                        member.clone(),
+                    ))
+                    .or_default()
+                    .recorded
+                    .cell
+                    .merge(&recorded)?;
+            }
             cells
                 .entry((key, member.clone()))
                 .or_default()
@@ -316,6 +355,20 @@ fn reduce_with_book(
                 .merge(&recorded)?;
         }
         for ((key, quantity_key), quantity) in data.quantities {
+            if let Some(projected) = projection.as_deref_mut() {
+                merge_quantity(
+                    &mut projected
+                        .entry((
+                            attribution::AttributionKey::new(&key, &tuple),
+                            member.clone(),
+                        ))
+                        .or_default()
+                        .recorded
+                        .quantities,
+                    &quantity_key,
+                    &quantity,
+                )?;
+            }
             merge_quantity(
                 &mut cells
                     .entry((key, member.clone()))
@@ -327,6 +380,20 @@ fn reduce_with_book(
             )?;
         }
         for ((key, kind, currency), money) in data.money {
+            if let Some(projected) = projection.as_deref_mut() {
+                merge_money(
+                    &mut projected
+                        .entry((
+                            attribution::AttributionKey::new(&key, &tuple),
+                            member.clone(),
+                        ))
+                        .or_default()
+                        .recorded
+                        .money,
+                    &(kind, currency.clone()),
+                    &money,
+                )?;
+            }
             merge_money(
                 &mut cells
                     .entry((key, member.clone()))
@@ -341,7 +408,7 @@ fn reduce_with_book(
     Ok((ledger.events.len(), fetched))
 }
 
-fn merge_quantity(
+pub(super) fn merge_quantity(
     values: &mut Vec<(QuantityKey, Quantity)>,
     key: &QuantityKey,
     value: &Quantity,
@@ -358,7 +425,7 @@ fn merge_quantity(
     }
     Ok(())
 }
-fn merge_money(
+pub(super) fn merge_money(
     values: &mut Vec<((i64, String), Money)>,
     key: &(i64, String),
     value: &Money,
@@ -396,6 +463,10 @@ fn generations(conn: &Connection) -> Result<Generations, ReportError> {
 struct Pending {
     hour: Hour,
     revision: i64,
+    attribution_revision: i64,
+    attribution: attribution::ValuationProjection,
+    attribution_deferred: bool,
+    main: bool,
     generations: Generations,
     after: Option<i64>,
     cells: Cells,
@@ -471,8 +542,12 @@ impl ValuationMaintenance {
         reasoning: &[String],
     ) -> Result<bool, ReportError> {
         if self.pending.is_none() {
-            let read = |after: Option<Hour>| {
-                conn.query_row(&format!("SELECT v.kind,v.hour_number FROM valuation_hour v JOIN summary_hour s USING(kind,hour_number) WHERE v.state='dirty' AND s.built_revision=s.revision AND s.format_version={FORMAT} AND (?1 IS NULL OR (v.kind,v.hour_number)>(?1,?2)) ORDER BY v.kind,v.hour_number LIMIT 1"),params![after.map(|h|h.kind),after.map(|h|h.number)],|r|Ok(Hour {kind:r.get(0)?,number:r.get(1)?})).optional()
+            let read = |after: Option<Hour>| -> rusqlite::Result<Option<Hour>> {
+                let main=conn.query_row(&format!("SELECT v.kind,v.hour_number FROM valuation_hour v JOIN summary_hour s USING(kind,hour_number) WHERE v.state='dirty' AND s.built_revision=s.revision AND s.format_version={FORMAT} AND (?1 IS NULL OR (v.kind,v.hour_number)>(?1,?2)) ORDER BY v.kind,v.hour_number LIMIT 1"),params![after.map(|h|h.kind),after.map(|h|h.number)],|r|Ok(Hour {kind:r.get(0)?,number:r.get(1)?})).optional()?;
+                if main.is_some() {
+                    return Ok(main);
+                }
+                conn.query_row(&format!("SELECT a.kind,a.hour_number FROM attribution_hour a INDEXED BY attribution_valuation_stale JOIN summary_hour s USING(kind,hour_number) WHERE (a.valuation_revision IS NULL OR a.valuation_attribution_revision IS NOT a.revision) AND s.built_revision=s.revision AND s.format_version={FORMAT} AND (?1 IS NULL OR (a.kind,a.hour_number)>(?1,?2)) ORDER BY a.kind,a.hour_number LIMIT 1"),params![after.map(|h|h.kind),after.map(|h|h.number)],|r|Ok(Hour {kind:r.get(0)?,number:r.get(1)?})).optional()
             };
             let hour = read(self.after)?.or(read(None)?);
             let Some(hour) = hour else {
@@ -482,6 +557,14 @@ impl ValuationMaintenance {
             self.pending = Some(Pending {
                 hour,
                 revision: valuation_revision(conn, hour)?,
+                attribution_revision: attribution::own_revision(conn, hour)?,
+                attribution: attribution::ValuationProjection::new(),
+                attribution_deferred: false,
+                main: conn.query_row(
+                    "SELECT state='dirty' FROM valuation_hour WHERE kind=?1 AND hour_number=?2",
+                    params![hour.kind, hour.number],
+                    |r| r.get(0),
+                )?,
                 generations: generations(conn)?,
                 after: None,
                 cells: Cells::new(),
@@ -493,23 +576,29 @@ impl ValuationMaintenance {
             .pending
             .take()
             .ok_or(ReportError::Integrity("valuation build absent"))?;
+        let attribution_changed =
+            pending.attribution_revision != attribution::own_revision(conn, pending.hour)?;
         if pending.revision != valuation_revision(conn, pending.hour)?
+            || (attribution_changed && !pending.main)
             || pending.generations != generations(conn)?
             || pending.generations.rate != cache_generation(conn)?
             || !summary_current(conn, pending.hour)?
         {
             return Ok(false);
         }
+        pending.attribution_deferred |= attribution_changed;
         let last = conn.query_row(&page_end_sql(pending.hour, pending.after), [], |r| {
             r.get::<_, Option<i64>>(0)
         })?;
         let count = if let Some(last) = last {
-            let (count, fetched) = reduce(
+            let (count, fetched) = reduce_both(
                 conn,
                 &chunk_filter(pending.hour, pending.after, last),
                 config,
                 reasoning,
+                &PlanBook::load(conn)?,
                 &mut pending.cells,
+                Some(&mut pending.attribution),
             )?;
             pending.fetched &= fetched;
             count
@@ -520,12 +609,18 @@ impl ValuationMaintenance {
         pending.ready = count < CHUNK;
         // Bound publication just as summaries do. An oversized hour remains
         // pending rather than monopolizing the writer with an unbounded commit.
-        if pending
+        let main_rows = pending
             .cells
             .values()
             .map(|cell| 1 + cell.recorded.quantities.len() + cell.recorded.money.len())
-            .sum::<usize>()
-            > MAX_PUBLICATION_ROWS
+            .sum::<usize>();
+        pending.attribution_deferred |=
+            pending.main && main_rows + pending.attribution.len() > MAX_PUBLICATION_ROWS;
+        if (if pending.main {
+            main_rows
+        } else {
+            pending.attribution.len()
+        }) > MAX_PUBLICATION_ROWS
         {
             return Ok(false);
         }
@@ -538,8 +633,11 @@ impl ValuationMaintenance {
         let Some(pending) = self.pending.take() else {
             return Ok(false);
         };
+        let attribution_changed =
+            pending.attribution_revision != attribution::own_revision(tx, pending.hour)?;
         if !pending.ready
             || pending.revision != valuation_revision(tx, pending.hour)?
+            || (attribution_changed && !pending.main)
             || pending.generations != generations(tx)?
             || pending.generations.rate != cache_generation(tx)?
             || !summary_current(tx, pending.hour)?
@@ -547,30 +645,42 @@ impl ValuationMaintenance {
             return Ok(false);
         }
         let h = pending.hour;
-        tx.execute(
-            "DELETE FROM valuation_cell WHERE kind=?1 AND hour_number=?2",
-            params![h.kind, h.number],
-        )?;
-        if pending.fetched {
-            for ((key, member), cell) in pending.cells {
-                tx.execute(
-                    "INSERT INTO valuation_cell VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                    params![
-                        h.kind,
-                        h.number,
-                        encode(&(&key, &member))?,
-                        encode(&key)?,
-                        member.plan,
-                        member.plan_account,
-                        member.record.as_ref().map(encode).transpose()?,
-                        encode(&cell.recorded)?,
-                        cell.numerator.to_string(),
-                        encode(&cell.unvalued)?
-                    ],
-                )?;
+        if pending.main {
+            tx.execute(
+                "DELETE FROM valuation_cell WHERE kind=?1 AND hour_number=?2",
+                params![h.kind, h.number],
+            )?;
+            if pending.fetched {
+                for ((key, member), cell) in pending.cells {
+                    tx.execute(
+                        "INSERT INTO valuation_cell VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                        params![
+                            h.kind,
+                            h.number,
+                            encode(&(&key, &member))?,
+                            encode(&key)?,
+                            member.plan,
+                            member.plan_account,
+                            member.record.as_ref().map(encode).transpose()?,
+                            encode(&cell.recorded)?,
+                            cell.numerator.to_string(),
+                            encode(&cell.unvalued)?
+                        ],
+                    )?;
+                }
             }
+            tx.execute("UPDATE valuation_hour SET rate_generation=?3,config_generation=?4,plan_generation=?5,state=?6 WHERE kind=?1 AND hour_number=?2",params![h.kind,h.number,pending.generations.rate,pending.generations.config,pending.generations.plan,if pending.fetched {"built"} else {"not_yet_valued"}])?;
         }
-        tx.execute("UPDATE valuation_hour SET rate_generation=?3,config_generation=?4,plan_generation=?5,state=?6 WHERE kind=?1 AND hour_number=?2",params![h.kind,h.number,pending.generations.rate,pending.generations.config,pending.generations.plan,if pending.fetched {"built"} else {"not_yet_valued"}])?;
+        if !pending.attribution_deferred && !attribution_changed {
+            attribution::replace_valuation(
+                tx,
+                h,
+                pending.revision,
+                pending.attribution_revision,
+                pending.attribution,
+                pending.fetched,
+            )?;
+        }
         Ok(true)
     }
 }

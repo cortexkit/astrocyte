@@ -11,7 +11,7 @@ mod attribution_storage {
     }
 
     #[test]
-    fn attribution_migration_preserves_ledger_and_requeues_derived_cells() {
+    fn attribution_migration_preserves_all_existing_rows_and_summary_format() {
         let conn = before_attribution();
         conn.execute_batch("INSERT INTO usage_event(event_id,producer,producer_ref,occurred_at_ms,charge_basis,recorded_at_ms)
                 VALUES('call','broca','call',20,'metered_api',21);
@@ -29,48 +29,23 @@ mod attribution_storage {
             UPDATE valuation_hour SET state='built';
             INSERT INTO valuation_cell VALUES(0,0,'[]','[]','api',NULL,NULL,'{}','100','{}');").unwrap();
         let before = all_rows(&conn);
-        let valuation_revision: i64 = conn
-            .query_row("SELECT revision FROM valuation_hour", [], |r| r.get(0))
-            .unwrap();
+        let schema_before: Vec<(String,String)> = conn.prepare("SELECT name,sql FROM sqlite_schema WHERE name IN ('summary_cell','summary_quantity','summary_money','summary_hour_stale','valuation_cell') ORDER BY name").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         conn.execute_batch(MIGRATIONS.last().unwrap().statements)
             .unwrap();
         assert_eq!(MIGRATIONS.last().unwrap().version, 58);
         for (table, rows) in before {
-            match table.as_str() {
-                "summary_cell" | "summary_quantity" | "summary_money" | "valuation_cell" => {
-                    assert!(table_rows(&conn, &table).is_empty(), "{table}");
-                }
-                "valuation_hour" => {
-                    assert_eq!(
-                        conn.query_row("SELECT state,revision FROM valuation_hour", [], |r| Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, i64>(1)?
-                        )))
-                        .unwrap(),
-                        ("dirty".into(), valuation_revision + 1)
-                    );
-                }
-                _ => assert_eq!(table_rows(&conn, &table), rows, "{table} must survive"),
-            }
+            assert_eq!(table_rows(&conn, &table), rows, "{table} must survive");
         }
-        assert_eq!(conn.query_row("SELECT count(*) FROM summary_hour INDEXED BY summary_hour_stale WHERE built_revision IS NOT revision OR format_version IS NOT 7", [], |r|r.get::<_,i64>(0)).unwrap(), 1);
-        // Only the new tuple may distinguish otherwise identical summary cells.
+        let schema_after: Vec<(String,String)> = conn.prepare("SELECT name,sql FROM sqlite_schema WHERE name IN ('summary_cell','summary_quantity','summary_money','summary_hour_stale','valuation_cell') ORDER BY name").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(schema_before, schema_after);
+        assert_eq!(conn.query_row("SELECT count(*) FROM summary_hour INDEXED BY summary_hour_stale WHERE built_revision IS NOT revision OR format_version IS NOT 6", [], |r|r.get::<_,i64>(0)).unwrap(), 0);
+        assert_eq!(conn.query_row("SELECT count(*) FROM attribution_hour WHERE summary_revision IS NULL AND valuation_revision IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert!(table_rows(&conn, "attribution_cell").is_empty());
+        assert!(table_rows(&conn, "attribution_valuation_cell").is_empty());
         conn.execute_batch(
-            "INSERT INTO summary_value VALUES(6,'tuple-a'),(7,'tuple-b');
-            INSERT INTO summary_cell VALUES(1,0,0,1,0,0,0,0,2,0,0,3,'{}',0,0,0,6),
-                (2,0,0,1,0,0,0,0,2,0,0,3,'{}',0,0,0,7);",
+            "UPDATE usage_event SET pricing_generation=pricing_generation+1 WHERE event_key=1",
         )
         .unwrap();
-        assert!(conn.execute_batch("INSERT INTO summary_cell SELECT 3,kind,hour_number,producer,provider,model,account,auth_selection,charge_basis,work_class,project,currency,payload,paying_credential,runner,harness,attribution FROM summary_cell WHERE cell_id=1").is_err());
-        conn.execute_batch(
-            "INSERT INTO summary_quantity VALUES(1,4,5,0,'12',1,'0',0,1);
-            INSERT INTO summary_money VALUES(1,0,3,'100',1);
-            DELETE FROM summary_cell WHERE cell_id=1;
-            UPDATE usage_event SET pricing_generation=pricing_generation+1 WHERE event_key=1;",
-        )
-        .unwrap();
-        assert!(table_rows(&conn, "summary_quantity").is_empty());
-        assert!(table_rows(&conn, "summary_money").is_empty());
         assert_eq!(
             conn.query_row("SELECT hour_number FROM summary_dirty_hour", [], |r| r
                 .get::<_, i64>(0))

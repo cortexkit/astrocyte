@@ -5045,73 +5045,61 @@ WHEN EXISTS (SELECT 1 FROM session_alias WHERE runner=NEW.runner AND harness=NEW
     AND host_session=NEW.host_session AND bound_session=NEW.bound_session)
 BEGIN SELECT RAISE(ABORT, 'session_alias_insert_once'); END;
 
--- Only derived cells are discarded. Retained hours keep reports on the ledger
--- until the bounded backlog builder publishes the wider dimension key.
-DROP TABLE summary_quantity;
-DROP TABLE summary_money;
-DROP TABLE summary_cell;
-CREATE TABLE summary_cell (
-    cell_id INTEGER PRIMARY KEY,
+-- Independent completion marks let attribution catch up without invalidating
+-- current ordinary reports. Attribution evidence has its own revision as well.
+CREATE TABLE attribution_hour (
     kind INTEGER NOT NULL,
     hour_number INTEGER NOT NULL,
-    producer INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(producer>0),
+    revision INTEGER NOT NULL DEFAULT 0,
+    summary_revision INTEGER,
+    summary_attribution_revision INTEGER,
+    valuation_revision INTEGER,
+    valuation_attribution_revision INTEGER,
+    FOREIGN KEY(kind,hour_number) REFERENCES summary_hour(kind,hour_number),
+    PRIMARY KEY(kind,hour_number)
+) WITHOUT ROWID;
+INSERT INTO attribution_hour(kind,hour_number) SELECT kind,hour_number FROM summary_hour;
+CREATE INDEX attribution_summary_stale ON attribution_hour(kind,hour_number)
+    WHERE summary_revision IS NULL OR summary_attribution_revision IS NOT revision;
+CREATE INDEX attribution_valuation_stale ON attribution_hour(kind,hour_number)
+    WHERE valuation_revision IS NULL OR valuation_attribution_revision IS NOT revision;
+CREATE TRIGGER attribution_summary_hour_insert AFTER INSERT ON summary_hour BEGIN
+    INSERT OR IGNORE INTO attribution_hour(kind,hour_number) VALUES(NEW.kind,NEW.hour_number);
+END;
+CREATE TRIGGER attribution_summary_hour_revision AFTER UPDATE OF revision ON summary_hour BEGIN
+    UPDATE attribution_hour SET summary_revision=NULL WHERE kind=NEW.kind AND hour_number=NEW.hour_number;
+END;
+CREATE TRIGGER attribution_valuation_hour_revision AFTER UPDATE OF revision ON valuation_hour BEGIN
+    UPDATE attribution_hour SET valuation_revision=NULL WHERE kind=NEW.kind AND hour_number=NEW.hour_number;
+END;
+CREATE TABLE attribution_cell (
+    kind INTEGER NOT NULL,
+    hour_number INTEGER NOT NULL,
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id),
+    attribution INTEGER NOT NULL REFERENCES summary_value(value_id),
     provider INTEGER NOT NULL REFERENCES summary_value(value_id),
     model INTEGER NOT NULL REFERENCES summary_value(value_id),
-    account INTEGER NOT NULL REFERENCES summary_value(value_id),
-    auth_selection INTEGER NOT NULL REFERENCES summary_value(value_id),
-    charge_basis INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(charge_basis>0),
-    work_class INTEGER NOT NULL REFERENCES summary_value(value_id),
-    project INTEGER NOT NULL REFERENCES summary_value(value_id),
-    currency INTEGER NOT NULL REFERENCES summary_value(value_id),
     payload TEXT NOT NULL CHECK(json_valid(payload)),
-    paying_credential INTEGER NOT NULL REFERENCES summary_value(value_id),
-    runner INTEGER NOT NULL REFERENCES summary_value(value_id),
-    harness INTEGER NOT NULL REFERENCES summary_value(value_id),
-    attribution INTEGER NOT NULL DEFAULT 0 REFERENCES summary_value(value_id),
-    UNIQUE(kind,hour_number,producer,provider,model,account,auth_selection,charge_basis,work_class,project,currency,paying_credential,runner,harness,attribution),
-    FOREIGN KEY(kind,hour_number) REFERENCES summary_hour(kind,hour_number)
-);
-CREATE TABLE summary_quantity (
-    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
-    unit INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(unit>0),
-    role INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(role>0),
-    exponent INTEGER NOT NULL CHECK(exponent BETWEEN -9 AND 1),
-    units TEXT NOT NULL,
-    observations INTEGER NOT NULL CHECK(observations>=0),
-    covered_units TEXT NOT NULL,
-    covered_observations INTEGER NOT NULL CHECK(covered_observations>=0),
-    stated_observations INTEGER NOT NULL CHECK(stated_observations>=0 AND stated_observations<=observations),
-    PRIMARY KEY(cell_id,unit,role,exponent)
+    PRIMARY KEY(kind,hour_number,currency,attribution,provider,model),
+    FOREIGN KEY(kind,hour_number) REFERENCES attribution_hour(kind,hour_number)
 ) WITHOUT ROWID;
-CREATE TABLE summary_money (
-    cell_id INTEGER NOT NULL REFERENCES summary_cell(cell_id) ON DELETE CASCADE,
-    kind INTEGER NOT NULL CHECK(kind IN (0,1)),
-    currency INTEGER NOT NULL REFERENCES summary_value(value_id) CHECK(currency>0),
-    nanos TEXT NOT NULL,
-    contributions INTEGER NOT NULL CHECK(contributions>0),
-    PRIMARY KEY(cell_id,kind,currency)
-) WITHOUT ROWID;
-DROP INDEX summary_hour_stale;
-CREATE INDEX summary_hour_stale ON summary_hour (kind, hour_number)
-    WHERE built_revision IS NOT revision OR format_version IS NOT 7;
-
--- Serialized valuation keys carry the same attribution tuple as summary keys.
-DROP TABLE valuation_cell;
-CREATE TABLE valuation_cell (
+CREATE TABLE attribution_valuation_cell (
     kind INTEGER NOT NULL,
     hour_number INTEGER NOT NULL,
-    cell_key TEXT NOT NULL CHECK(json_valid(cell_key)),
-    summary_key TEXT NOT NULL CHECK(json_valid(summary_key)),
+    currency INTEGER NOT NULL REFERENCES summary_value(value_id),
+    attribution INTEGER NOT NULL REFERENCES summary_value(value_id),
+    provider INTEGER NOT NULL REFERENCES summary_value(value_id),
+    model INTEGER NOT NULL REFERENCES summary_value(value_id),
+    plan_key TEXT NOT NULL CHECK(json_valid(plan_key)),
     plan TEXT NOT NULL,
     plan_account TEXT,
     plan_record TEXT CHECK(plan_record IS NULL OR json_valid(plan_record)),
     recorded TEXT NOT NULL CHECK(json_valid(recorded)),
     list_numerator TEXT NOT NULL,
     unvalued TEXT NOT NULL CHECK(json_valid(unvalued)),
-    PRIMARY KEY(kind,hour_number,cell_key),
-    FOREIGN KEY(kind,hour_number) REFERENCES valuation_hour(kind,hour_number)
+    PRIMARY KEY(kind,hour_number,currency,attribution,provider,model,plan_key),
+    FOREIGN KEY(kind,hour_number) REFERENCES attribution_hour(kind,hour_number)
 ) WITHOUT ROWID;
-UPDATE valuation_hour SET state='dirty',revision=revision+1;
 "#,
     },
 ];
