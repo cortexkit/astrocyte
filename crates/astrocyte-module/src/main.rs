@@ -137,7 +137,9 @@ fn main() -> Result<std::process::ExitCode, Box<dyn Error>> {
 /// clean stop would turn every stray SIGTERM into an outage. So the clean
 /// stop runs to completion first (refresher joined, both log lines written,
 /// store closed by the caller), and only then does the process die by the
-/// signal it was sent. EOF and GOODBYE still exit 0, and errors still exit 1.
+/// signal it was sent. Returned EOF and GOODBYE still exit 0, and errors still
+/// exit 1. On the registration channel the SDK exits before returning here
+/// for daemon ends: GOODBYE exits 0, while EOF and reset exit 1.
 ///
 /// Callers must have dropped the shared state before calling this, because a
 /// SIGTERM outcome does not return.
@@ -485,10 +487,10 @@ impl Shutdown {
 }
 
 fn finish_connection_end(end: ConnectionEnd, outcome: &Result<LoopEnd, ModuleError>) {
-    // subc-client-rs 0.40.3 lib.rs:3043-3070 exits 0 after the hook on the
-    // registration channel, even for Reset. Override only outcomes it would
-    // lose; local Closed and TCP connections authenticated with a launch nonce
-    // still return to our owner instead of exiting inside the SDK.
+    // Local Closed and TCP connections return to our owner, which logs errors
+    // and preserves SIGTERM. The registration SDK exits after this hook and
+    // knows only the transport end, not a failed refresher join or a recorded
+    // internal crash.
     if end == ConnectionEnd::Closed || !subc_os::registration_channel::supervised() {
         return;
     }
@@ -496,7 +498,11 @@ fn finish_connection_end(end: ConnectionEnd, outcome: &Result<LoopEnd, ModuleErr
         Ok(LoopEnd::Sigterm) => die_by_sigterm(),
         Err(error) => {
             log_terminal_error(error);
-            std::process::exit(1);
+            // EOF and reset already exit 1 in the SDK. Only GOODBYE would hide
+            // a module failure behind a successful exit after this hook.
+            if end == ConnectionEnd::Goodbye {
+                std::process::exit(1);
+            }
         }
         Ok(LoopEnd::Eof | LoopEnd::Goodbye) => {}
     }
@@ -622,10 +628,10 @@ where
 }
 
 /// How the helper's serving future ended, as a stop cause. GOODBYE and EOF
-/// are the daemon's deliberate stops. A reset connection is an error: the
-/// supervisor restarts the module either way, and a clean exit would read as
-/// a deliberate stop. Windows reports a killed daemon as a reset where Unix
-/// reports EOF, so a killed daemon exits 1 on Windows and 0 on Unix.
+/// stop the refresher cleanly; a reset is an error. A returned EOF exits 0,
+/// but on the registration channel the SDK exits 1 at EOF so the supervisor
+/// restarts the module. Windows can report a killed daemon as a reset where
+/// Unix reports EOF; neither is a deliberate registration-channel stop.
 fn how_serving_ended(
     result: Result<(), SubcModuleError>,
     connection_end: &Mutex<Option<ConnectionEnd>>,
@@ -1527,6 +1533,8 @@ impl Error for ModuleError {}
 mod tests {
     use super::*;
     mod ledger_confirmation;
+    #[cfg(unix)]
+    mod registration_shutdown;
     use crate::test_support::{self as refresher, test_state, HANG_GUARD};
 
     #[test]
@@ -4242,15 +4250,15 @@ mod tests {
         end.assert_shutdown_lines("sigterm");
     }
 
-    /// Only SIGTERM re-raises. A daemon that closes the connection is a
-    /// deliberate stop, and the module must still exit 0 after it.
+    /// Only SIGTERM re-raises. A non-registration TCP connection returns EOF
+    /// to the owner, which still exits 0 after joining the refresher.
     #[cfg(unix)]
     #[test]
-    fn daemon_eof_stops_cleanly_and_exits_zero() {
+    fn tcp_daemon_eof_stops_cleanly_and_exits_zero() {
         use std::os::unix::process::ExitStatusExt;
 
         let Some(end) = serve_production_run_in_a_child(
-            "daemon_eof_stops_cleanly_and_exits_zero",
+            "tcp_daemon_eof_stops_cleanly_and_exits_zero",
             ChildStop::DaemonEof,
         ) else {
             return;
@@ -4258,7 +4266,7 @@ mod tests {
         assert_eq!(
             (end.status.signal(), end.status.code()),
             (None, Some(0)),
-            "a daemon EOF is a deliberate stop and must exit 0: {:?}\n{}",
+            "a non-registration TCP EOF still returns to the owner and exits 0: {:?}\n{}",
             end.status,
             end.output
         );
