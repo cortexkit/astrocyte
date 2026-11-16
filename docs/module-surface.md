@@ -376,7 +376,7 @@ Reads never write. A refusal on a read is one of the codes below.
   `analytics_tokens_and_exact_media_units_are_additive`,
   `analytics_widened_range_caps_and_calendar_edges`,
   `analytics_refusals_are_specific_and_read_only`. Tagged handler samples are
-  in `crates/astrocyte-module/test-vectors/analytics-reads-v2`, pinned by
+  in `crates/astrocyte-module/test-vectors/analytics-reads-v3`, pinned by
   `analytics_vectors_match_real_dispatch_and_sha256sums`.
 
   Every row and currency total also carries `list_value`, with

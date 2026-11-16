@@ -135,6 +135,10 @@ dirty; rebuilds publish only unchanged hours. Per-call rows stay authoritative.
 A daily audit requeues differing hours.
 Details: [data model](docs/data-model.md#hourly-summaries).
 
+List value and deduced cost on `spend.report` come from separate valuation tables
+built from dated rates and ledger plans. They are valuations, never recorded
+spend; a rate or plan change rebuilds only the hours it touches.
+
 ## Subscription multiplier
 
 The multiplier records clean account-hour API list value per quota point, once
@@ -190,34 +194,20 @@ plan history.
 Dispatch and the manifest share `PUBLIC_OPERATION_NAMES` in
 `crates/astrocyte-module/src/ops.rs`.
 
-| Operation | Kind |
-|---|---|
-| `budget.verdict` | read |
-| `spend.report` | read |
-| `spend.subscription.report` | read |
-| `spend.workclass.report` | read |
-| `spend.ledger.coverage` | read |
-| `spend.charge.explain` | read |
-| `spend.reconcile` | read |
-| `spend.event.ingest` | write |
-| `spend.correction.ingest` | write |
-| `spend.chargeability.settle` | write |
-| `spend.statement.import` | write |
-| `spend.subscription.set` | write |
-| `spend.subscription.close` | write |
-| `spend.event.reprice` | write, operator repricing |
-| `spend.basis.correct` | write, charge-basis correction |
-| `spend.multiplier.report` | read |
-| `spend.multiplier.pace` | read |
-| `spend.multiplier.recompute` | write, operator recompute |
-| `usage.cache.sessions` | read |
-| `usage.cache.steps` | read |
-| `usage.runs.list` | read, session, run and flow totals |
-| `usage.runs.detail` | read, one run's items |
-| `spend.quota.history` | read, quota readings |
-| `usage.steps.subscribe` | read, watch |
-| `usage.steps.read` | read, live step feed |
-| `watermark.get` | read, THALAMUS read watermark |
+Reads:
+- spend: `budget.verdict`, `spend.report`, `spend.subscription.report`,
+  `spend.workclass.report`, `spend.ledger.coverage`, `spend.charge.explain`,
+  `spend.reconcile`, `spend.quota.history`;
+- multiplier: `spend.multiplier.report`, `spend.multiplier.pace`;
+- usage: `usage.cache.sessions`, `usage.cache.steps`, `usage.runs.list`,
+  `usage.runs.detail`, `usage.steps.read`, and the watch `usage.steps.subscribe`;
+- `watermark.get`, THALAMUS's read watermark.
+
+Writes: `spend.event.ingest`, `spend.correction.ingest`,
+`spend.chargeability.settle`, `spend.statement.import`,
+`spend.subscription.set`, `spend.subscription.close`, and three operator
+corrections: `spend.event.reprice`, `spend.basis.correct` and
+`spend.multiplier.recompute`.
 
 Astrocyte calls fusiform (`catalog.status`, `catalog.get`, `plan.prices`), insula
 (`usage.get`, `events_get`), colliculus (`usage.read`, `usage.ack`) and the ckbus

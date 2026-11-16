@@ -31,13 +31,15 @@ Internal records live in the ignored `.cortexkit/` folder, which tracks only
 - `subscription.rs`: effective-dated ledger plans and coverage.
 - `vault_plan.rs` keeps immutable tier history, seeds old config and reconciles
   vault-owned ledger plans.
-- `multiplier.rs`: the subscription multiplier: config, valuation, the daily
+- `valuation.rs`: one call's API list value; `rate_era.rs`: dated rates.
+- `multiplier.rs`: the subscription multiplier: config, the daily
   observation, recompute and report. `multiplier/clean.rs` finds clean
   account-hours; `multiplier/calibration.rs` holds the stability checks.
 - `statement.rs`, `statement_import.rs`, `reconcile.rs`: vendor statements, CSV
   import and statement-to-ledger reconciliation.
 - `report.rs`: the read model behind the spend reports, coverage and explain.
-  `report/hourly.rs` builds, reads and audits the hourly summaries.
+  `report/hourly.rs` builds, reads and audits the hourly summaries;
+  `report/hourly/valuation/` holds list value, fees and deduced cost.
 - `runs.rs`: session, run and flow cost reads, with their hourly totals.
 - `quota_history.rs`: recorded quota readings, bucketed.
 - `cache_diagnostics.rs`: harness steps per session and their cache verdicts.
