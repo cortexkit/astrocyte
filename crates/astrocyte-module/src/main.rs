@@ -17,13 +17,14 @@ use std::{
     fmt,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use astrocyte_core::store::MIGRATIONS;
 use cortexkit_role_llm_runner::watermark::LOG_READ_WATERMARK_V1;
 use cortexkit_store::{open_sqlite, Isolation, StorageBackend, StorageDescriptor};
 use cortexkit_store_types::module_store_path;
+use futures_util::{future::BoxFuture, FutureExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use state::{now_ms, PublicProjection, SharedState};
@@ -381,18 +382,135 @@ fn sigterm_received() -> Result<impl std::future::Future<Output = ()>, ModuleErr
 
 type RefresherThread = std::thread::JoinHandle<Result<(), String>>;
 
+/// Shared by the serving owner and the connection-end hook. Dropping a poll
+/// of either caller must not cancel a join or start shutdown's logs twice.
+struct Shutdown {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    refresher_join: futures_util::future::Shared<BoxFuture<'static, Result<(), ModuleError>>>,
+    started: Mutex<Option<(std::time::Instant, Result<LoopEnd, ModuleError>)>>,
+    finished: OnceLock<Result<LoopEnd, ModuleError>>,
+}
+
+impl Shutdown {
+    fn new(stop: Arc<std::sync::atomic::AtomicBool>, refresher: RefresherThread) -> Self {
+        // The blocking worker observes unexpected thread ends too, without
+        // keeping the executor busy while the refresher is running.
+        let joining = tokio::task::spawn_blocking(move || {
+            refresher
+                .join()
+                .map_err(|_| {
+                    ModuleError::Message("internal crash: refresher thread panicked".into())
+                })?
+                .map_err(ModuleError::Message)
+        });
+        Self {
+            stop,
+            refresher_join: async move {
+                joining
+                    .await
+                    .map_err(|error| ModuleError::Message(format!("refresher monitor: {error}")))?
+            }
+            .boxed()
+            .shared(),
+            started: Mutex::new(None),
+            finished: OnceLock::new(),
+        }
+    }
+
+    fn begin(
+        &self,
+        ended: Result<LoopEnd, ModuleError>,
+        subscriptions_stopping: &tokio::sync::watch::Sender<bool>,
+    ) {
+        let mut started = self
+            .started
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if started.is_none() {
+            let cause = match &ended {
+                Ok(end) => end.as_str(),
+                Err(_) => "error",
+            };
+            let stopping_at = std::time::Instant::now();
+            tracing::info!(target: "astrocyte", cause, clean = ended.is_ok(), "stopping refresher");
+            // The first cause wins, including SIGTERM racing a daemon close.
+            // The refresher and its bus/quota reader share this stop flag.
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            subscriptions_stopping.send_replace(true);
+            *started = Some((stopping_at, ended));
+        }
+    }
+
+    async fn unexpected_refresher_end(&self) -> Result<(), ModuleError> {
+        let result = self.refresher_join.clone().await;
+        let stopping = self
+            .started
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some();
+        if stopping {
+            // The hook may be joining the same thread while serve is polled.
+            // Its expected end must not beat the hook and look like a crash.
+            std::future::pending().await
+        } else {
+            result
+        }
+    }
+
+    /// Called after the SDK has finished or cancelled all accepted requests.
+    async fn finish(&self, state: &SharedState) -> Result<LoopEnd, ModuleError> {
+        let refresher_result = self.refresher_join.clone().await;
+        self.finished
+            .get_or_init(|| {
+                let started = self
+                    .started
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let (stopping_at, ended) = started.as_ref().expect("shutdown began before joining");
+                // The refresher joins its bus/quota reader before returning. No
+                // request handler or background writer can write after this line.
+                tracing::info!(target: "astrocyte",
+                stop_ms = u64::try_from(stopping_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "refresher stopped, nothing further will be written");
+                match state.crash_cause() {
+                    Some(cause) => Err(ModuleError::Message(format!("internal crash: {cause}"))),
+                    None => ended.clone().and_then(|end| refresher_result.map(|()| end)),
+                }
+            })
+            .clone()
+    }
+}
+
+fn finish_connection_end(end: ConnectionEnd, outcome: &Result<LoopEnd, ModuleError>) {
+    // subc-client-rs 0.40.3 lib.rs:3043-3070 exits 0 after the hook on the
+    // registration channel, even for Reset. Override only outcomes it would
+    // lose; local Closed and TCP connections authenticated with a launch nonce
+    // still return to our owner instead of exiting inside the SDK.
+    if end == ConnectionEnd::Closed || !subc_os::registration_channel::supervised() {
+        return;
+    }
+    match outcome {
+        Ok(LoopEnd::Sigterm) => die_by_sigterm(),
+        Err(error) => {
+            log_terminal_error(error);
+            std::process::exit(1);
+        }
+        Ok(LoopEnd::Eof | LoopEnd::Goodbye) => {}
+    }
+}
+
 /// How long the serve helper may take over a stop, per stage. When astrocyte
 /// stops serving itself (SIGTERM, a crash, a dead refresher), requests
 /// already accepted get up to this long to send their replies; then GOODBYE
 /// and the final flush get up to this long again. The helper also waits up
-/// to two seconds for drain hooks to start. Its whole part of a stop is
-/// therefore at most 2 s + 2 x 5 s = 12 s. The refresher is told to stop
-/// when the stop begins and is joined beside the helper's drain; every
-/// refresher stage honours its stop flag, so that join takes seconds. Both
-/// together fit well inside the supervisor's 30 s stop budget (the daemon
-/// caps a module's budget at 25 s). The helper's default of 2 s is raised
-/// so that a served write already running, such as a statement import, can
-/// still answer its caller.
+/// to two seconds for drain hooks to start. Its transport/drain work is
+/// therefore at most 2 s + 2 x 5 s = 12 s, excluding our connection-end hook.
+/// The refresher is told to stop when shutdown begins and joins on a blocking
+/// worker beside the helper's drain. That join is cooperative, not a hard
+/// timeout: a stage already calling a peer may finish that work before checking
+/// stop, so these helper budgets do not bound total shutdown time.
+/// The helper's default of 2 s is raised so that a served write already running,
+/// such as a statement import, can still answer its caller.
 const SERVE_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Serve until the daemon closes, a stop signal arrives, or an internal crash
@@ -431,14 +549,7 @@ where
             .map_err(|error| ModuleError::Message(format!("refresher initialization: {error}")))?
             .map_err(|error| ModuleError::Message(format!("refresher thread: {error}")))?;
 
-    // Joining on a blocking worker both observes an unexpected thread end
-    // while serving and keeps the executor available during deliberate stops.
-    let mut refresher_join = tokio::task::spawn_blocking(move || {
-        refresher_thread
-            .join()
-            .map_err(|_| ModuleError::Message("internal crash: refresher thread panicked".into()))?
-            .map_err(ModuleError::Message)
-    });
+    let shutdown = Arc::new(Shutdown::new(stop, refresher_thread));
 
     let connection_end = Arc::new(Mutex::new(None));
     let subscriptions_stopping = tokio::sync::watch::Sender::new(false);
@@ -447,6 +558,7 @@ where
         routes: RouteBinds::default(),
         connection_end: Arc::clone(&connection_end),
         subscriptions_stopping: subscriptions_stopping.clone(),
+        shutdown: Some(Arc::clone(&shutdown)),
         #[cfg(test)]
         confirmation_required: false,
     };
@@ -468,18 +580,15 @@ where
     tokio::pin!(serving);
     tokio::pin!(stop_signal);
 
-    let mut joined = None;
     let mut served = false;
     let ended = tokio::select! {
         biased;
         cause = state.crashed() => Err(ModuleError::Message(format!("internal crash: {cause}"))),
-        result = &mut refresher_join => {
+        result = shutdown.unexpected_refresher_end() => {
             let cause = match &result {
-                Ok(Ok(())) => "refresher ended without a stop request".to_string(),
-                Ok(Err(error)) => error.to_string(),
-                Err(error) => format!("refresher monitor: {error}"),
+                Ok(()) => "refresher ended without a stop request".to_string(),
+                Err(error) => error.to_string(),
             };
-            joined = Some(result);
             Err(ModuleError::Message(format!("internal crash: {cause}")))
         }
         () = &mut stop_signal => Ok(LoopEnd::Sigterm),
@@ -488,54 +597,17 @@ where
             how_serving_ended(result, &connection_end)
         }
     };
-    let cause = match &ended {
-        Ok(end) => end.as_str(),
-        Err(_) => "error",
-    };
-    // These two lines bracket shutdown. When the daemon's drain reports that
-    // some module still held work, they show whether astrocyte had already
-    // stopped by that instant and how long its refresher took to stop.
-    let stopping_at = std::time::Instant::now();
-    // `cause` says what ended serving: eof, goodbye, sigterm, or error.
-    tracing::info!(target: "astrocyte", cause, clean = ended.is_ok(),
-        "stopping refresher");
-    // Every refresher stage honours this flag, including a SQLite statement
-    // already running, so the join below takes seconds, well inside the
-    // supervisor's drain window, rather than however long the stage would
-    // have run.
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    // Open cache subscriptions end now rather than holding the helper's
-    // drain for its whole budget.
-    subscriptions_stopping.send_replace(true);
+    shutdown.begin(ended, &subscriptions_stopping);
     // When astrocyte stops on its own account, the helper finishes the
     // requests it accepted, sends GOODBYE and flushes, within
     // SERVE_DRAIN_BUDGET per stage. The refresher is joined at the same time.
-    let stop_serving = async {
-        if served {
-            Ok(())
-        } else {
-            stop_handle.stop();
-            serving.await
-        }
+    let stopped_serving = if served {
+        Ok(())
+    } else {
+        stop_handle.stop();
+        serving.await
     };
-    let join_refresher = async {
-        match joined {
-            Some(result) => result,
-            None => refresher_join.await,
-        }
-    };
-    let (stopped_serving, refresher_result) = tokio::join!(stop_serving, join_refresher);
-    let refresher_result = refresher_result
-        .map_err(|error| ModuleError::Message(format!("refresher monitor: {error}")))
-        .and_then(|result| result);
-    // Logged once both the refresher and every request handler have ended,
-    // so no write can follow it.
-    tracing::info!(target: "astrocyte",
-        stop_ms = u64::try_from(stopping_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "refresher stopped, nothing further will be written");
-
-    let ended = ended.and_then(|end| refresher_result.map(|()| end));
-    let ended = ended.and_then(|end| {
+    let ended = shutdown.finish(&state).await.and_then(|end| {
         stopped_serving
             .map(|()| end)
             .map_err(|error| serve_error(&error))
@@ -653,6 +725,7 @@ struct AstrocyteHandler {
     /// ends and when astrocyte stops itself. Every open `usage.steps.subscribe`
     /// stream ends then, and new ones are refused.
     subscriptions_stopping: tokio::sync::watch::Sender<bool>,
+    shutdown: Option<Arc<Shutdown>>,
 }
 
 #[async_trait]
@@ -785,6 +858,14 @@ impl ModuleHandler for AstrocyteHandler {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(end);
         self.routes.clear();
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.begin(
+                how_serving_ended(Ok(()), &self.connection_end),
+                &self.subscriptions_stopping,
+            );
+            let outcome = shutdown.finish(&self.state).await;
+            finish_connection_end(end, &outcome);
+        }
     }
 }
 
@@ -1424,7 +1505,7 @@ fn parse_subc_arg(args: impl IntoIterator<Item = OsString>) -> Result<PathBuf, M
     ))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum ModuleError {
     Message(String),
 }
@@ -2719,14 +2800,9 @@ mod tests {
         assert_eq!(reason, "catalog_unconfigured");
     }
 
-    /// The EOF stop path: when the daemon closes its connection, serving must
-    /// RETURN, because that return is what flips the refresher's stop flag
-    /// and joins it. Serving that reconnected, or waited, instead of
-    /// returning would leave the refresher running against a daemon that is
-    /// gone and every teardown hook unrun -- silently, because nothing else
-    /// observes the difference. The serve helper has its own fence for this;
-    /// this one covers astrocyte's owner around it. Bounded so a regression
-    /// fails by name rather than hanging the suite.
+    /// Serving over TCP with a launch nonce must still return after EOF. The
+    /// connection-end hook stops the refresher before that return; serving
+    /// must not reconnect or wait for another daemon instead of stopping.
     #[tokio::test(flavor = "multi_thread")]
     async fn module_loop_returns_on_daemon_eof_rather_than_reconnecting_or_waiting() {
         let daemon = FakeDaemon::start().await;
@@ -2739,9 +2815,7 @@ mod tests {
 
         let result = served(
             serving,
-            "serving did not return after the daemon's connection closed. The \
-             refresher's stop flag and join hang off this return; if serving now \
-             reconnects or waits, teardown never runs on a daemon cut, silently.",
+            "serving did not return after the daemon's connection closed",
         )
         .await;
         assert!(
@@ -3663,6 +3737,7 @@ mod tests {
             routes: RouteBinds::default(),
             connection_end: Arc::new(Mutex::new(None)),
             subscriptions_stopping: tokio::sync::watch::channel(false).0,
+            shutdown: None,
         };
         let handle = RouteHandle::detached(5, 1);
         let bind = RouteBindRequest::new(
@@ -4582,6 +4657,108 @@ mod logging_tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn connection_end_hook_alone_stops_the_refresher_and_logs_once() {
+        isolated(
+            "connection_end_hook_alone_stops_the_refresher_and_logs_once",
+            "info",
+            |log| {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let idle = tests::IdleRefresher::new();
+                runtime.block_on(async {
+                    let state = Arc::new(refresher::test_state());
+                    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let thread = idle.starter()(Arc::clone(&state), Arc::clone(&stop)).unwrap();
+                    let shutdown = Arc::new(Shutdown::new(Arc::clone(&stop), thread));
+                    let handler = AstrocyteHandler {
+                        confirmation_required: false,
+                        state,
+                        routes: RouteBinds::default(),
+                        connection_end: Arc::new(Mutex::new(None)),
+                        subscriptions_stopping: tokio::sync::watch::Sender::new(false),
+                        shutdown: Some(Arc::clone(&shutdown)),
+                    };
+                    // No serve future exists: only the hook can request and
+                    // finish this stop before the SDK ends the process.
+                    tokio::time::timeout(
+                        refresher::HANG_GUARD,
+                        handler.on_connection_end(ConnectionEnd::Eof),
+                    )
+                    .await
+                    .expect("the connection-end hook did not finish shutdown");
+                    assert!(
+                        stop.load(std::sync::atomic::Ordering::Relaxed),
+                        "the connection-end hook did not stop the refresher"
+                    );
+                    assert!(
+                        matches!(shutdown.refresher_join.peek(), Some(Ok(()))),
+                        "the hook returned before joining the refresher"
+                    );
+                    assert!(*handler.subscriptions_stopping.borrow());
+                    // A later owner or a second end notification cannot log
+                    // another shutdown or change the first end cause.
+                    handler.on_connection_end(ConnectionEnd::Goodbye).await;
+                    assert!(matches!(
+                        shutdown.finish(&handler.state).await,
+                        Ok(LoopEnd::Eof)
+                    ));
+                });
+                let text = std::fs::read_to_string(log.path()).unwrap();
+                let bodies: Vec<_> = text
+                    .lines()
+                    .map(|line| cortexkit_log::parse_line(line).unwrap().body.to_string())
+                    .collect();
+                let stopping: Vec<_> = bodies
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, body)| body.starts_with("stopping refresher"))
+                    .collect();
+                let stopped: Vec<_> = bodies
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, body)| {
+                        body.starts_with("refresher stopped, nothing further will be written")
+                    })
+                    .collect();
+                assert_eq!(stopping.len(), 1, "{text}");
+                assert_eq!(stopped.len(), 1, "{text}");
+                assert!(stopping[0].0 < stopped[0].0, "{text}");
+                assert!(stopping[0].1.contains("cause=eof"), "{text}");
+                assert!(stopping[0].1.contains("clean=true"), "{text}");
+                assert!(stopped[0].1.contains("stop_ms="), "{text}");
+            },
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sigterm_winning_a_connection_end_keeps_its_cause_and_joins_once() {
+        let idle = tests::IdleRefresher::new();
+        let state = Arc::new(refresher::test_state());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = idle.starter()(Arc::clone(&state), Arc::clone(&stop)).unwrap();
+        let shutdown = Arc::new(Shutdown::new(stop, thread));
+        let handler = AstrocyteHandler {
+            confirmation_required: false,
+            state,
+            routes: RouteBinds::default(),
+            connection_end: Arc::new(Mutex::new(None)),
+            subscriptions_stopping: tokio::sync::watch::Sender::new(false),
+            shutdown: Some(Arc::clone(&shutdown)),
+        };
+        shutdown.begin(Ok(LoopEnd::Sigterm), &handler.subscriptions_stopping);
+        tokio::time::timeout(refresher::HANG_GUARD, async {
+            tokio::join!(
+                handler.on_connection_end(ConnectionEnd::Eof),
+                shutdown.finish(&handler.state),
+            )
+            .1
+        })
+        .await
+        .expect("racing shutdown callers did not finish")
+        .map(|end| assert_eq!(end, LoopEnd::Sigterm))
+        .unwrap();
     }
 
     #[test]

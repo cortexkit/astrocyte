@@ -12,6 +12,7 @@ impl ConfirmationRig {
         let state = Arc::new(test_state());
         let daemon = FakeDaemon::start().await;
         let handler = AstrocyteHandler {
+            shutdown: None,
             state: Arc::clone(&state),
             routes: RouteBinds::default(),
             connection_end: Arc::new(Mutex::new(None)),
