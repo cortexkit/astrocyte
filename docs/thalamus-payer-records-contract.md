@@ -88,7 +88,13 @@ CREATE TABLE payer_record (
 - `request_kind`: `main` for a request whose usage astrocyte records from a
   transcript, or one of the row-less kinds whose usage it does not: `keep_warm`,
   `prime`, `resend_first_attempt`, `failed_before_row`, `title`,
-  `compaction_hook` and `generate`. Any other value makes the row unreadable.
+  `compaction_hook`, `generate` and `fork_answer`. Any other value makes the
+  row unreadable.
+  - `fork_answer` is the one model request a fork on a Pi head makes. It
+    writes no transcript, so its row carries the usage, under the fork's own
+    session (declared in `payer_session` with the head's `owner_principal`
+    before its first row) and the head's account, login and `charge_basis`.
+    There is exactly one row per fork request; no `main` row is written for it.
   - OpenCode's plugin kind `primary` replies with an assistant row that has
     tokens, so it is `main`, including requests from an agent named
     `compaction`.

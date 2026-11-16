@@ -431,6 +431,7 @@ fn record_row(tx: &Transaction<'_>, record: &Record, at: i64) -> Result<Option<S
             | "title"
             | "compaction_hook"
             | "generate"
+            | "fork_answer"
     ) {
         return Ok(Some(format!(
             "unknown request_kind {}",
@@ -916,6 +917,59 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
             assert_eq!(conn.query_row("SELECT through_seq FROM thalamus_payer_cursor",[],|r|r.get::<_,i64>(0)).unwrap(),1);
             Ok(())
         }).unwrap();
+    }
+
+    /// A fork on a Pi head answers with one model request and writes no
+    /// transcript, so its payer row carries the usage and is billed under the
+    /// fork's own session, which the store declares with the head's owner.
+    #[test]
+    fn thalamus_payer_fork_answer_is_billed_once_under_the_fork_session() {
+        let (_home, source, store, state) = fixture();
+        store
+            .execute(
+                "INSERT INTO payer_session VALUES ('pi','fork-1','owner-a',1000)",
+                [],
+            )
+            .unwrap();
+        insert(&store, "fork-attempt");
+        store
+            .execute(
+                "UPDATE payer_record SET request_kind='fork_answer', session='fork-1'",
+                [],
+            )
+            .unwrap();
+        source
+            .drain_for_health(&state, 100_000, &AtomicBool::new(false))
+            .unwrap();
+        state
+            .with_conn(|conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT session,producer_ref,work_class,COUNT(*) FROM usage_event",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    row,
+                    ("fork-1".into(), "fork-attempt".into(), "owner-a".into(), 1)
+                );
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM set_aside_record", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
