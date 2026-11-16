@@ -196,10 +196,8 @@ fn analytics_refusals_are_specific_and_read_only() {
             "hour_timezone_unsupported",
         ),
     ];
-    for dimension in ["alfonso", "workload", "workspace", "parent_alfonso"] {
-        cases.push((json!({"grouping":[dimension]}), "dimension_unavailable"));
-        cases.push((json!({"where":{dimension:[null]}}), "dimension_unavailable"));
-    }
+    cases.push((json!({"grouping":["task"]}), "dimension_unavailable"));
+    cases.push((json!({"where":{"task":[null]}}), "dimension_unavailable"));
     for (extra, expected) in cases {
         let mut request = json!({"grouping":[],"grain":"day","timezone":"UTC"});
         request

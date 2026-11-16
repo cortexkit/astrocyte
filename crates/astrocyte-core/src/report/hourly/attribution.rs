@@ -69,6 +69,7 @@ pub(super) struct Projection {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ReadPayload")]
 pub(super) struct Payload {
     #[serde(flatten)]
     pub(super) recorded: Recorded,
@@ -78,10 +79,37 @@ pub(super) struct Payload {
     pub(super) metered: i128,
 }
 
+// Decode known fields directly rather than buffering the entire nested JSON
+// through serde flatten. The stored representation stays byte-identical.
+#[derive(Deserialize)]
+struct ReadPayload {
+    #[serde(default)]
+    base_rate_tier_untested_tokens: i64,
+    cell: Cell,
+    quantities: Vec<(QuantityKey, Quantity)>,
+    money: Vec<((i64, String), Money)>,
+    #[serde(with = "exact")]
+    metered: i128,
+}
+impl From<ReadPayload> for Payload {
+    fn from(value: ReadPayload) -> Self {
+        Self {
+            recorded: Recorded {
+                base_rate_tier_untested_tokens: value.base_rate_tier_untested_tokens,
+                cell: value.cell,
+                quantities: value.quantities,
+                money: value.money,
+            },
+            metered: value.metered,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct ProjectedValue {
     pub(super) value: ValuedCell,
     pub(super) metered: i128,
+    pub(super) original_keys: BTreeSet<Key>,
 }
 impl Projection {
     fn merge(&mut self, tuple: &Attribution, data: &Data) -> Result<(), ReportError> {

@@ -1188,7 +1188,9 @@ pub fn spend_report(
     request: &ReportRequest,
     now_ms: i64,
 ) -> Result<SpendReport, ReportError> {
-    analytics::attribution_request(request)?;
+    if analytics::attribution_request(request)? {
+        return valuation::surface::attribution_report::report(conn, request, now_ms);
+    }
     valuation::surface::report(conn, request, now_ms)
 }
 

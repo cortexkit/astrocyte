@@ -60,10 +60,10 @@ copies that timeout without running the table-creating probes.
 | `window_sample` | Each row preserves a capacity-window observation and its breakdown in the append-only history. | insert |
 | `multiplier_observation` | Each row records a daily subscription multiplier observation or an operator recompute that supersedes an earlier observation. | insert only |
 | `credential_window_sample` | Source-instant quota history for readings without an account, identified by provider, vault credential and pool. | insert only |
-| `attribution_fact` | Each row reserves a publisher's verbatim fact and indexed subject, parent, workload, task and project evidence. Ingestion is not enabled yet. | insert only; corrections append with `supersedes` |
-| `placement_fact` | Each row reserves a publisher's dated project-to-workspace placement and verbatim fact. Ingestion is not enabled yet. | insert only; corrections append with `supersedes` |
-| `attribution_cursor` | Each row can checkpoint one publisher's read name, opaque cursor, through position and last read time. | upsert with a committed page |
-| `session_alias` | Each row can preserve a runner/harness-qualified pair of recorded host session and bound session. | insert only |
+| `attribution_fact` | Each row preserves one publisher's verbatim fact and indexed subject, parent, workload, task and project evidence. | insert only; corrections append with `supersedes` |
+| `placement_fact` | Each row preserves entorhinal's dated project-to-workspace placement and verbatim fact. | insert only; corrections append with `supersedes` |
+| `attribution_cursor` | Each row checkpoints one publisher's read name, opaque cursor, through position and last committed read time. | upsert with a changed committed page |
+| `session_alias` | Each row preserves a runner/harness-qualified pair of a ledger's recorded session and another published name for it. | insert only |
 | `summary_value` | Each row assigns an exact stored string an integer identifier, with identifier zero reserved for null. | Builders insert new values. |
 | `summary_hour` | Each row records an hour's persistent revision, published revision, format, event count and time extrema. | Triggers advance revisions, and publication records a completed build. |
 | `summary_dirty_hour` | Each row identifies an hour that needs a fresh reduction from base rows. | Triggers insert dirty keys, and successful publication removes them. |
@@ -81,7 +81,7 @@ copies that timeout without running the table-creating probes.
 | `valuation_hour` | Each row records an hour's revision, three built generations and independent valuation state. | Ledger and plan triggers invalidate hours; valuation publication completes them. |
 | `valuation_cell` | Each row splits a summary key by plan member and subscription ledger record, retaining recorded counters, quantities and currency sums alongside the cell's list value and unvalued reasons. The list value is stored unrounded, in the valuer's numerator units (`ListValue` in `valuation.rs`), and is rounded to whole nanodollars only when a report serves it. | Valuation rebuilds replace these rows without changing spend summaries. |
 | `attribution_hour` | Each row tracks an independent attribution revision and completion marks for that revision and the existing summary/valuation hour revisions. | Builders publish completion marks; attribution changes can invalidate only these projections. |
-| `attribution_cell` | Each row aggregates an hour, currency, attribution tuple, provider and model, retaining counters, exact quantities with presence counts, and recorded currency sums. | The summary pass replaces these rows from its existing ledger read. |
+| `attribution_cell` | Each row aggregates an hour, currency, attribution tuple, provider and model, retaining counters, exact quantities with presence counts, recorded currency sums and the exact metered subtotal before charge bases are combined. | The summary pass replaces these rows from its existing ledger read. |
 | `attribution_valuation_cell` | Each row adds the plan member and immutable plan record to an attribution key and retains the recorded payload, exact list numerator and unvalued reasons. | The valuation pass replaces these rows from its existing ledger read. |
 
 The payer store's incarnation identifies one database history. THALAMUS changes
@@ -92,15 +92,64 @@ keeps attempt identities across incarnations to prevent duplicate calls.
 The attribution tuple is (alfonso, parent_alfonso, workload, project_id, workspace).
 `alfonso` identifies the owning agent; `parent_alfonso` identifies the agent that
 owns the launching subject, which can differ from the child's owner.
-Until the attribution reader and join are enabled, every call writes the all-null
-tuple, represented by value id zero. Task remains in publisher facts but is not
+Calls with no matching fact write the all-null tuple, represented by value id
+zero. Task remains in publisher facts but is not
 part of this projection because it can be unique per run. Ordinary summary and
 valuation keys and summary format 6 are unchanged. Migration 58 only adds tables:
 it preserves every existing row, including ordinary report caches. The summary
 and valuation backlog builders fill the new projections. When an hour's ordinary
 summary or valuation is stale, its pass builds both projections from one ledger
 read; when it is current, the pass writes only attribution cells. Attribution
-grouping and filtering are not enabled by this migration.
+grouping and filtering use these split keys, with bounded hour reductions while
+stale, leaving ordinary report rows and keys unchanged. The public attribution project dimension is
+`project_id`; legacy `project` remains the ledger's recorded folder.
+
+Scheduled full refreshes page prefrontal-core, basal and magic-context's
+`attribution.read` and entorhinal's `placement.read`, committing each page with
+its opaque cursor. A terminal null `next` retains the request cursor; unchanged
+replays open no write transaction. Refusals and missing publishers leave cursor
+and health unchanged. Invalid facts, naming violations, cross-publisher subject
+claims and changed bodies for known identifiers go to `set_aside_record`, whose
+per-source counts appear in ledger coverage. Workload names contain lowercase
+letters, digits, underscores and hyphens, at most 64 bytes; task names also allow
+dot-separated components, at most 128 bytes. Missing runners are never inferred
+from a harness. A runner-less session subject is set aside; a runner-less parent
+keeps the fact but is separately counted and cannot supply a parent Alfonso.
+
+An attribution correction's known `supersedes` target must have the same
+publisher and exact published subject; placements require the same publisher
+and exact `project_id`. Otherwise the correction is set aside with reason
+`supersedes_other_subject`. An unknown target keeps the correction pending;
+the reference is checked when that target arrives. A later-disproved claim
+remains as immutable evidence but no longer participates in resolution, is
+counted in coverage, and dirties the hours it used to own.
+
+The existing THALAMUS roots readers append OpenCode shared-store session/ref
+pairs and Claude Code owner-session/host-UUID/ref pairs. Resolution loads facts,
+aliases and placements once per build batch, not per call. A call matches its
+BROCA run, then session, then flow. A fact's own session and the shared runner
+crate's `session_ref` meet the ledger session and its aliases. Reference inputs
+remain exactly as published; only lookup runner labels normalise
+`thalamus-harness` to `thalamus`, and host harness spellings need not agree.
+Each subject's newest unsuperseded fact wins. Parent ownership comes from that
+parent's own winning fact, and placement is selected at the call's occurrence
+time, so a project move splits an otherwise unchanged session.
+
+Committing facts, aliases or placements advances only `attribution_hour.revision`
+for potentially affected ledger hours. Session, run and flow invalidation uses
+the existing context/time indexes; placement uses the project's fact subjects
+from its effective time, including a superseded placement's earlier window.
+Ordinary summary and valuation revisions do not change. Stale attribution reads
+reduce only their affected hours; cached reads seek the split tables' primary
+keys. List values and subscription fee allocation reuse the ordinary arithmetic
+and unfiltered subscription-pool day totals.
+
+`attribution_cell` is a WITHOUT ROWID table. `attribution_valuation_cell` is a
+rowid table with the same logical composite primary key enforced by its unique
+index: the longer valuation payloads stay inline rather than overflowing the
+smaller local records of a WITHOUT ROWID index. This physical choice changes
+neither the key values nor the payload, and does not change either ordinary
+cache table.
 
 ## Immutability
 

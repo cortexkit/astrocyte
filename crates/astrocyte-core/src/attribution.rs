@@ -177,6 +177,16 @@ enum Action {
     Fact(Box<Fact>),
     Placement(Box<Placement>),
 }
+const VALID_PLACEMENT_CORRECTION:&str="NOT EXISTS(SELECT 1 FROM placement_fact p WHERE p.fact_id=f.supersedes AND (p.publisher<>f.publisher OR p.project_id<>f.project_id))";
+const VALID_CORRECTION:&str="NOT EXISTS(SELECT 1 FROM attribution_fact p WHERE p.fact_id=f.supersedes AND (p.publisher<>f.publisher OR p.subject_kind<>f.subject_kind OR p.subject_runner IS NOT f.subject_runner OR p.subject_harness IS NOT f.subject_harness OR p.subject_session IS NOT f.subject_session OR p.subject_run_id IS NOT f.subject_run_id OR p.subject_flow_id IS NOT f.subject_flow_id))";
+fn correction_scope(conn: &Connection, publisher: Publisher, fact: &Fact) -> Result<bool, String> {
+    let Some(previous) = &fact.supersedes else {
+        return Ok(true);
+    };
+    let (kind, runner, harness, session, run, flow) = fact.subject.columns();
+    let invalid=sql(conn.query_row("SELECT EXISTS(SELECT 1 FROM attribution_fact WHERE fact_id=?1 AND (publisher<>?2 OR subject_kind<>?3 OR subject_runner IS NOT ?4 OR subject_harness IS NOT ?5 OR subject_session IS NOT ?6 OR subject_run_id IS NOT ?7 OR subject_flow_id IS NOT ?8))",params![previous,publisher.module(),kind,runner,harness,session,run,flow],|row|row.get::<_,bool>(0)))?;
+    Ok(!invalid)
+}
 fn action(conn: &Connection, publisher: Publisher, body: &Value) -> Result<Action, String> {
     let table = if publisher == Publisher::Entorhinal {
         "placement_fact"
@@ -220,15 +230,17 @@ fn action(conn: &Connection, publisher: Publisher, body: &Value) -> Result<Actio
             return Ok(Action::Aside("malformed_fact"));
         }
         if let Some(previous) = &fact.supersedes {
-            let project = sql(conn
+            let previous = sql(conn
                 .query_row(
-                    "SELECT project_id FROM placement_fact WHERE fact_id=?1",
+                    "SELECT publisher,project_id FROM placement_fact WHERE fact_id=?1",
                     [previous],
-                    |r| r.get::<_, String>(0),
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
                 )
                 .optional())?;
-            if project.is_some_and(|project| project != fact.project_id) {
-                return Ok(Action::Aside("malformed_fact"));
+            if previous.is_some_and(|(owner, project)| {
+                owner != publisher.module() || project != fact.project_id
+            }) {
+                return Ok(Action::Aside("supersedes_other_subject"));
             }
         }
         return Ok(Action::Placement(Box::new(fact)));
@@ -262,8 +274,11 @@ fn action(conn: &Connection, publisher: Publisher, body: &Value) -> Result<Actio
     }) {
         return Ok(Action::Aside("malformed_fact"));
     }
+    if !correction_scope(conn, publisher, &fact)? {
+        return Ok(Action::Aside("supersedes_other_subject"));
+    }
     let (kind, runner, harness, session, run, flow) = fact.subject.columns();
-    let other=sql(conn.query_row("SELECT 1 FROM attribution_fact WHERE subject_kind=?1 AND subject_runner IS ?2 AND subject_harness IS ?3 AND subject_session IS ?4 AND subject_run_id IS ?5 AND subject_flow_id IS ?6 AND publisher<>?7 LIMIT 1",params![kind,runner,harness,session,run,flow,publisher.module()],|_|Ok(())).optional())?.is_some();
+    let other=sql(conn.query_row(&format!("SELECT 1 FROM attribution_fact f WHERE subject_kind=?1 AND subject_runner IS ?2 AND subject_harness IS ?3 AND subject_session IS ?4 AND subject_run_id IS ?5 AND subject_flow_id IS ?6 AND publisher<>?7 AND {VALID_CORRECTION} LIMIT 1"),params![kind,runner,harness,session,run,flow,publisher.module()],|_|Ok(())).optional())?.is_some();
     Ok(if other {
         Action::Aside("subject_has_other_publisher")
     } else {
@@ -352,6 +367,8 @@ pub fn commit_page(
     let mut changed = false;
     let mut subjects = BTreeSet::new();
     let mut placements = BTreeSet::new();
+    let mut arrived = Vec::new();
+    let mut placement_arrived = Vec::new();
     for body in &page.facts {
         match action(tx, publisher, body)? {
             Action::Known => {}
@@ -359,6 +376,7 @@ pub fn commit_page(
                 changed |= aside(tx, publisher, body, reason, now)?;
             }
             Action::Placement(fact) => {
+                placement_arrived.push(fact.fact_id.clone());
                 let previous = if let Some(previous) = &fact.supersedes {
                     sql(tx
                         .query_row(
@@ -381,6 +399,7 @@ pub fn commit_page(
                 ));
             }
             Action::Fact(fact) => {
+                arrived.push(fact.fact_id.clone());
                 let (kind, runner, harness, session, run, flow) = fact.subject.columns();
                 let parent = fact.parent.as_ref().map(Subject::columns);
                 changed|=sql(tx.execute("INSERT INTO attribution_fact SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22 WHERE NOT EXISTS(SELECT 1 FROM attribution_fact WHERE fact_id=?1)",params![fact.fact_id,publisher.module(),text(body)?,kind,runner,harness,session,run,flow,fact.alfonso,parent.map(|p|p.0),parent.and_then(|p|p.1),parent.and_then(|p|p.2),parent.and_then(|p|p.3),parent.and_then(|p|p.4),parent.and_then(|p|p.5),fact.workload,fact.task,fact.project_id,fact.effective_from_ms,fact.recorded_at_ms,fact.supersedes]))?!=0;
@@ -393,6 +412,44 @@ pub fn commit_page(
                 }
                 subjects.insert(fact.subject);
             }
+        }
+    }
+    for id in arrived {
+        let mut statement=sql(tx.prepare(&format!("SELECT publisher,body FROM attribution_fact f WHERE supersedes=?1 AND NOT ({VALID_CORRECTION})")))?;
+        let claims = sql(statement.query_map([id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }))?;
+        for claim in claims {
+            let (module, body) = sql(claim)?;
+            let publisher = Publisher::ALL
+                .into_iter()
+                .find(|publisher| publisher.module() == module)
+                .ok_or("unknown attribution publisher")?;
+            let body: Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+            let fact: Fact =
+                serde_json::from_value(body.clone()).map_err(|error| error.to_string())?;
+            // Evidence already kept for an unknown predecessor is immutable.
+            // Count a later-disproved claim and rebuild the hours it used to own.
+            changed |= aside(tx, publisher, &body, "supersedes_other_subject", now)?;
+            subjects.insert(fact.subject);
+        }
+    }
+    for id in placement_arrived {
+        let mut statement=sql(tx.prepare(&format!("SELECT body FROM placement_fact f WHERE supersedes=?1 AND NOT ({VALID_PLACEMENT_CORRECTION})")))?;
+        let claims = sql(statement.query_map([id], |row| row.get::<_, String>(0)))?;
+        for body in claims {
+            let body: Value =
+                serde_json::from_str(&sql(body)?).map_err(|error| error.to_string())?;
+            let fact: Placement =
+                serde_json::from_value(body.clone()).map_err(|error| error.to_string())?;
+            changed |= aside(
+                tx,
+                Publisher::Entorhinal,
+                &body,
+                "supersedes_other_subject",
+                now,
+            )?;
+            placements.insert((fact.project_id, fact.effective_from_ms));
         }
     }
     if changed {
@@ -727,7 +784,9 @@ pub(crate) struct Maps {
 impl Maps {
     pub(crate) fn load(conn: &Connection) -> Result<Self, String> {
         let mut groups: BTreeMap<Subject, Vec<Fact>> = BTreeMap::new();
-        let mut statement = sql(conn.prepare("SELECT body FROM attribution_fact"))?;
+        let mut statement = sql(conn.prepare(&format!(
+            "SELECT body FROM attribution_fact f WHERE {VALID_CORRECTION}"
+        )))?;
         let rows = sql(statement.query_map([], |r| r.get::<_, String>(0)))?;
         for body in rows {
             let fact: Fact = serde_json::from_str(&sql(body)?).map_err(|e| e.to_string())?;
@@ -787,7 +846,9 @@ impl Maps {
             })
             .collect();
         let mut groups: BTreeMap<String, Vec<Placement>> = BTreeMap::new();
-        let mut statement = sql(conn.prepare("SELECT body FROM placement_fact"))?;
+        let mut statement = sql(conn.prepare(&format!(
+            "SELECT body FROM placement_fact f WHERE {VALID_PLACEMENT_CORRECTION}"
+        )))?;
         let rows = sql(statement.query_map([], |r| r.get::<_, String>(0)))?;
         for body in rows {
             let placement: Placement =

@@ -4,6 +4,8 @@ use crate::money::round_nano_num;
 use crate::multiplier::{QuotaProviderConfig, WindowSelector};
 use fees::{Allocation, DayMember, DayWeights, FeeDays, PoolDay, Weights, DAY_MS};
 
+pub(crate) mod attribution_report;
+
 fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, ReportError> {
     serde_json::from_str(value).map_err(|_| ReportError::Integrity("invalid valuation payload"))
 }

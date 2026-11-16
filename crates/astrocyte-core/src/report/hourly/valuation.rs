@@ -353,6 +353,7 @@ fn reduce_both(
                 if key.0[Grouping::ChargeBasis as usize].as_deref() == Some("metered_api") {
                     sum(&mut cell.metered, recorded.total)?;
                 }
+                cell.original_keys.insert(key.clone());
                 cell.value.recorded.cell.merge(&recorded)?;
             }
             cells

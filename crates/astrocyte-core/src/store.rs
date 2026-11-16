@@ -5087,6 +5087,8 @@ CREATE TABLE attribution_cell (
     PRIMARY KEY(kind,hour_number,currency,attribution,provider,model),
     FOREIGN KEY(kind,hour_number) REFERENCES attribution_hour(kind,hour_number)
 ) WITHOUT ROWID;
+-- Keep long valuation payloads in rowid table pages rather than the smaller
+-- local records of a WITHOUT ROWID index. The logical key stays unique.
 CREATE TABLE attribution_valuation_cell (
     kind INTEGER NOT NULL,
     hour_number INTEGER NOT NULL,
@@ -5103,7 +5105,7 @@ CREATE TABLE attribution_valuation_cell (
     unvalued TEXT NOT NULL CHECK(json_valid(unvalued)),
     PRIMARY KEY(kind,hour_number,currency,attribution,provider,model,plan_key),
     FOREIGN KEY(kind,hour_number) REFERENCES attribution_hour(kind,hour_number)
-) WITHOUT ROWID;
+);
 "#,
     },
 ];

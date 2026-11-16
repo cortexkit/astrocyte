@@ -6,6 +6,9 @@ use crate::subscription::PlanLedger;
 use crate::test_support::conn;
 use serde_json::json;
 
+#[path = "attribution_report_tests.rs"]
+mod attribution_report_tests;
+
 fn config() -> MultiplierConfig {
     MultiplierConfig {
         api_twins: BTreeMap::new(),

@@ -305,7 +305,8 @@ Reads never write. A refusal on a read is one of the codes below.
   `rate_staleness`, and `hierarchy_resolution` (`unavailable`) when grouped by
   `project`. `grouping` names are `provider`, `model`, `account`,
   `auth_selection`, `charge_basis`, `work_class`, `project`, `producer`, `runner`,
-  `harness`, `plan`, `plan_account`; `grain` is
+  `harness`, `plan`, `plan_account`, `alfonso`, `parent_alfonso`, `workload`,
+  `project_id` and `workspace`; `grain` is
   `hour`, `day`, `week` or `month`; `timezone` is an IANA name. Refusals:
   `invalid_grouping` (unknown or repeated), `invalid_grain`,
   `invalid_timezone`. Test: `spend_report_refusal_keeps_its_code`.
@@ -343,12 +344,48 @@ Reads never write. A refusal on a read is one of the codes below.
   dimensions are ANDed, and null matches an absent dimension, not an empty
   string. Filters need not be grouping dimensions. An unknown key refuses
   `invalid_grouping`, just like an unknown grouping; an empty list refuses
-  `invalid_filter`. Recognized but unavailable dimensions `alfonso`, `workload`,
-  `workspace` and `parent_alfonso` refuse `dimension_unavailable` in grouping
-  and where. Unknown request members remain `malformed`.
+  `invalid_filter`. The recognized per-run `task` dimension still refuses
+  `dimension_unavailable` in grouping and where. Unknown request members remain
+  `malformed`.
   `undated` and `rate_staleness` describe the selected population, so a ranged
   report's zero undated count does not claim the ledger has no undated events;
   `ingest_freshness` remains global because it describes the sources.
+
+  Attribution dimensions are `alfonso`, `parent_alfonso`, `workload`,
+  `project_id` and `workspace`. Up to two distinct attribution dimensions may
+  appear across grouping and where, with at most one of `model` or `provider`,
+  whether grouped or filtered. Any other dimension combined with attribution,
+  or using both model and provider, refuses `combination_unavailable`, naming
+  the incompatible pair. Attribution supports the same ranges, calendar grains,
+  exact quantities, recorded spend, list value and deduced cost as ordinary
+  reports. Fees still use the whole unfiltered UTC day for each subscription
+  pool; attribution filters select only row weights, never fee denominators.
+
+  `project` is the folder the call ran in, as recorded in `project_root`; its
+  existing `hierarchy_resolution: "unavailable"` is unchanged. `project_id` is
+  the project the publisher named for the session or run. It has no
+  `hierarchy_resolution` member. Combining legacy `project` with an attribution
+  dimension is unavailable, not a request to translate folders into projects.
+
+  A call joins its run fact first, then its session fact, then its flow fact.
+  Session names meet through the runner's canonical reference and recorded
+  aliases; runner labels are normalised for matching, not for reference
+  computation. The newest unsuperseded fact supplies its owning `alfonso` and
+  workload. `parent_alfonso` comes from the launching subject's own winning
+  fact. Workspace is the placement of that fact's project at the call's
+  occurrence time. No fact means Not attributed: all five values are null,
+  never guessed. A known fact may itself name a null Alfonso, so a null Alfonso
+  group alone does not prove that every call lacks a fact.
+
+  A request grouping or filtering by attribution additionally carries
+  `attribution_coverage: {attributed_calls, unattributed_calls}`. These count
+  dated calls in the selected range with its non-attribution filters, ignoring
+  attribution filters. Their sum equals the ordinary report's dated call total
+  for that population. Even without a range, undated calls remain solely in
+  the separate `undated` disclosure. Ordinary requests omit attribution coverage.
+  Tests: `attribution_report_real_split_rows_keep_unattributed_and_all_metric_totals`,
+  `attribution_report_randomized_groups_sum_to_ordinary_totals_with_identical_model_filters`,
+  `attribution_report_filter_coverage_ignores_attribution_but_keeps_model_filter`.
 
   Each row and each currency total additionally carries `tokens` and `units`.
   Tokens have optional `input`, `output`, `reasoning`, `cache_read`,
@@ -432,6 +469,9 @@ Reads never write. A refusal on a read is one of the codes below.
   conservatively defer their provider's unique pool if a credential plan could
   match. This can delay a spread until the builder reaches the hour, but cannot
   assign a fee to the wrong calls.
+
+  Totals aggregate exact values; each row is rounded independently, so summed
+  rows may differ from the total by under one nanodollar per row.
 
   Only the USD currency total carries `deduced` and the fee diagnostics:
   `deduced_unspread_nanos`, `deduced_non_usd_plans`, `deduced_conflict_plans`.
@@ -1183,6 +1223,8 @@ Samples, generated through the real handler and pinned by test, are in
 | colliculus (media usage) | `management_surface`, module `colliculus` | `usage.read` pages and `usage.ack` after each committed page | Keep the committed cursor and retry. An absent module does not degrade health; transient route refusals (the module warming or reloading) defer the drain. `feed_not_admitted` means colliculus is not configured to let astrocyte read its usage feed; that won't fix itself, so it degrades health immediately. |
 | ckbus | Attested `management_surface`, module `ckbus` | `ckbus.credential`, `ckbus.credential_renew`, `ckbus.nonce_sign` | Retain per-tick insula polling and retry with exponential backoff (250 ms to 30 s). Never fail the module or change broker topology. |
 | claustrum (credential vault) | Attested `management_surface`, module `claustrum` | `credential.list_scoped` and held `auth.watch_scoped`, with empty params | Startup never waits for the peer. Missing vault or grant changes no history or ledger plans, is logged on transition and is shown in `spend.subscription.report`. `unknown_method` on watch enables full-tick-only list polling. |
+| prefrontal-core, basal, magic-context | Attested `management_surface` of each publisher | `attribution.read` with optional opaque `after` and page `limit` | Keep the committed cursor and health unchanged on refusal, module absence or routing failure; retry next scheduled refresh. |
+| entorhinal | Attested `management_surface`, module `entorhinal` | `placement.read` with optional opaque `after` and page `limit` | The same optional-reader behavior as attribution publishers. |
 
 Fusiform and insula use the connection files named in the
 [configuration](configuration.md). The ckbus route uses the module's daemon
@@ -1207,6 +1249,25 @@ by default, omitting both when `harness_ingest` is disabled or excludes `collicu
 The signal describes `usage.read` as an observe poller on the refresher tick cadence;
 its note records that `usage.ack` follows each committed page and retries acknowledge
 the durable watermark before reading.
+
+The manifest always declares the four attribution publishers as service clients.
+Its `self_signals` also describe each periodic read as a poller with an observe
+effect: the peer call reads facts rather than mutating the publisher. They run only
+on scheduled full refreshes, never the shorter pricing-only cycles. Each page
+commits its facts and cursor in one transaction. An empty page is one call.
+Only a returned `next` is a resume token; a terminal null keeps the request
+cursor and replays that suffix next refresh. A page containing only unchanged,
+known facts opens no write transaction, including no cursor update. Changed
+bodies for known identifiers are set aside as `fact_body_changed`, never
+replaced. Malformed facts, invalid open workload/task names, and subjects already
+claimed by another publisher are also set aside and counted by source in
+`spend.ledger.coverage`. Attribution-fact events do not yet trigger refreshes;
+only the scheduled refresh polls each publisher.
+Known correction targets must have the same publisher and exact subject
+(`project_id` for placements);
+`supersedes_other_subject` distinguishes a bad correction from a malformed body.
+Unknown targets are kept pending and checked on arrival, without deleting
+immutable evidence.
 
 Insula notices use `ck.{bus_account}.event.insula.quota_sampled.v1`, with no body.
 Astrocyte binds its pre-existing pull durable from `cortexkit-bus-naming`'s consumer

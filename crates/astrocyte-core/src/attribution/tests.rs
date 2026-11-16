@@ -293,6 +293,156 @@ fn attribution_join_computed_binding_ref_meets_a_roots_alias_without_a_raw_name_
 }
 
 #[test]
+fn attribution_supersedes_cannot_claim_another_publishers_subject() {
+    for publisher in [Publisher::Prefrontal, Publisher::Basal] {
+        let mut conn = conn();
+        let victim_subject = session("broca", "broca", "victim");
+        let mut victim = fact("victim", victim_subject);
+        victim["alfonso"] = json!("agent_victim");
+        ingest(&mut conn, Publisher::Prefrontal, vec![victim]);
+        let mut claim = fact("claim", session("broca", "broca", "claim"));
+        claim["supersedes"] = json!("victim");
+        ingest(&mut conn, publisher, vec![claim]);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM attribution_fact", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT reason FROM set_aside_record", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "supersedes_other_subject"
+        );
+        event(
+            &conn,
+            "victim-call",
+            "broca",
+            "broca",
+            Some("victim"),
+            None,
+            None,
+            100,
+        );
+        summaries(&mut conn);
+        assert_eq!(tuple(&conn).alfonso.as_deref(), Some("agent_victim"));
+    }
+}
+
+#[test]
+fn attribution_pending_supersedes_is_checked_when_target_arrives_and_dirties_the_claim() {
+    let mut conn = conn();
+    let mut claim = fact("claim", session("broca", "broca", "claim"));
+    claim["supersedes"] = json!("later");
+    ingest(&mut conn, Publisher::Basal, vec![claim.clone()]);
+    event(
+        &conn,
+        "claim-call",
+        "broca",
+        "broca",
+        Some("claim"),
+        None,
+        None,
+        100,
+    );
+    summaries(&mut conn);
+    assert_eq!(tuple(&conn).alfonso.as_deref(), Some("agent_owner"));
+    let ordinary: i64 = conn
+        .query_row(
+            "SELECT revision FROM summary_hour WHERE kind=0 AND hour_number=0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let own: i64 = conn
+        .query_row(
+            "SELECT revision FROM attribution_hour WHERE kind=0 AND hour_number=0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let later = fact("later", session("broca", "broca", "victim"));
+    ingest(&mut conn, Publisher::Prefrontal, vec![later]);
+    assert!(
+        conn.query_row(
+            "SELECT revision FROM attribution_hour WHERE kind=0 AND hour_number=0",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap()
+            > own
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT revision FROM summary_hour WHERE kind=0 AND hour_number=0",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        ordinary
+    );
+    summaries(&mut conn);
+    assert_eq!(tuple(&conn), Attribution::default());
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM attribution_fact", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT reason FROM set_aside_record WHERE source_key='attribution/basal'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "supersedes_other_subject"
+    );
+    let page = page(vec![claim]);
+    assert!(!page_needs_commit(&conn, Publisher::Basal, &page).unwrap());
+}
+
+#[test]
+fn attribution_pending_supersedes_accepts_a_late_same_publisher_exact_subject_target() {
+    let mut conn = conn();
+    let subject = session("broca", "broca", "session");
+    let mut newest = fact("new", subject.clone());
+    newest["supersedes"] = json!("old");
+    newest["recorded_at_ms"] = json!(20);
+    newest["alfonso"] = json!("new_owner");
+    ingest(&mut conn, Publisher::Prefrontal, vec![newest]);
+    let mut old = fact("old", subject);
+    old["recorded_at_ms"] = json!(10);
+    old["alfonso"] = json!("old_owner");
+    ingest(&mut conn, Publisher::Prefrontal, vec![old]);
+    event(
+        &conn,
+        "call",
+        "broca",
+        "broca",
+        Some("session"),
+        None,
+        None,
+        100,
+    );
+    summaries(&mut conn);
+    assert_eq!(tuple(&conn).alfonso.as_deref(), Some("new_owner"));
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM attribution_fact", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM set_aside_record", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn attribution_join_basal_pinned_flow_and_flow_session() {
     for by_session in [false, true] {
         let mut conn = conn();
@@ -502,6 +652,59 @@ fn attribution_placement_correction_dirties_the_superseded_effective_window() {
     ingest(&mut conn, Publisher::Entorhinal, vec![correction]);
     summaries(&mut conn);
     assert_eq!(tuple(&conn).workspace, None);
+}
+
+#[test]
+fn attribution_placement_pending_correction_checks_the_late_targets_project() {
+    for same_project in [false, true] {
+        let mut conn = conn();
+        let mut owner = fact("owner", session("broca", "broca", "s"));
+        owner["project_id"] = json!("served-project");
+        ingest(&mut conn, Publisher::Prefrontal, vec![owner]);
+        let claim = json!({"fact_id":"claim","project_id":"served-project","workspace_id":"served-workspace","effective_from_ms":0,"recorded_at_ms":2,"supersedes":"later"});
+        ingest(&mut conn, Publisher::Entorhinal, vec![claim.clone()]);
+        event(&conn, "call", "broca", "broca", Some("s"), None, None, 700);
+        summaries(&mut conn);
+        assert_eq!(tuple(&conn).workspace.as_deref(), Some("served-workspace"));
+        let own: i64 = conn
+            .query_row(
+                "SELECT revision FROM attribution_hour WHERE kind=0 AND hour_number=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let later = json!({"fact_id":"later","project_id":if same_project {"served-project"} else {"another-project"},"workspace_id":"old-workspace","effective_from_ms":0,"recorded_at_ms":1,"supersedes":null});
+        ingest(&mut conn, Publisher::Entorhinal, vec![later]);
+        assert!(
+            conn.query_row(
+                "SELECT revision FROM attribution_hour WHERE kind=0 AND hour_number=0",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+                > own
+        );
+        summaries(&mut conn);
+        assert_eq!(
+            tuple(&conn).workspace.as_deref(),
+            same_project.then_some("served-workspace")
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM placement_fact", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let reason: Option<String> = conn
+            .query_row("SELECT reason FROM set_aside_record", [], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert_eq!(
+            reason.as_deref(),
+            (!same_project).then_some("supersedes_other_subject")
+        );
+        assert!(!page_needs_commit(&conn, Publisher::Entorhinal, &page(vec![claim])).unwrap());
+    }
 }
 
 #[test]

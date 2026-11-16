@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn is_attribution_dimension(name: &str) -> bool {
     matches!(
         name,
-        "alfonso" | "parent_alfonso" | "workload" | "project" | "workspace"
+        "alfonso" | "parent_alfonso" | "workload" | "project_id" | "workspace"
     )
 }
 

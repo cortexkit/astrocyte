@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 const DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/test-vectors/analytics-reads-v3"
+    "/test-vectors/analytics-reads-v4"
 );
 
 fn fixture() -> SharedState {
@@ -39,7 +39,7 @@ fn plan_fixture(pending: bool) -> SharedState {
             ("included-alpha", "alpha", 1, 1_000_000_000_i64),
             ("included-beta", "beta", 3_600_001, 2_000_000_000),
         ] {
-            conn.execute("INSERT INTO usage_event(event_id,producer,producer_ref,provider,model,account_ref,occurred_at_ms,recorded_at_ms,charge_basis) VALUES(?1,'opencode',?1,'provider',?2,'account',?3,1,'subscription_included')",rusqlite::params![id,model,time]).unwrap();
+            conn.execute("INSERT INTO usage_event(event_id,producer,producer_ref,provider,model,account_ref,occurred_at_ms,recorded_at_ms,charge_basis,runner,harness,session) VALUES(?1,'opencode',?1,'provider',?2,'account',?3,1,'subscription_included','thalamus','opencode',?1)",rusqlite::params![id,model,time]).unwrap();
             for (role, quantity) in [("input", 100), ("output", 50)] {
                 conn.execute("INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent) VALUES((SELECT event_key FROM usage_event WHERE event_id=?1),?2,'token','billed','synthetic',?3,0)",rusqlite::params![id,role,quantity]).unwrap();
             }
@@ -122,6 +122,29 @@ fn build_hours(conn: &rusqlite::Connection) {
     }
 }
 
+fn attribution_fixture() -> SharedState {
+    use astrocyte_core::attribution::{commit_page, Page, Publisher};
+    let state = plan_fixture(false);
+    state.with_conn(|conn| {
+        let facts:Page=serde_json::from_value(json!({"facts":[
+            {"fact_id":"fixture-a","supersedes":null,"subject":{"kind":"session","runner":"thalamus-harness","harness":"opencode2","session":"included-alpha"},"alfonso":"agent_fixture","parent":null,"workload":"mason","task":null,"project_id":"project_fixture","effective_from_ms":0,"recorded_at_ms":1},
+            {"fact_id":"fixture-b","supersedes":null,"subject":{"kind":"session","runner":"thalamus-harness","harness":"opencode2","session":"included-beta"},"alfonso":null,"parent":{"kind":"session","runner":"thalamus-harness","harness":"opencode2","session":"included-alpha"},"workload":"summary","task":"magic-context.summary","project_id":"project_fixture","effective_from_ms":0,"recorded_at_ms":1}
+        ],"next":null,"through":2})).unwrap();
+        let placement:Page=serde_json::from_value(json!({"facts":[{"fact_id":"fixture-placement","project_id":"project_fixture","workspace_id":"workspace_fixture","effective_from_ms":0,"recorded_at_ms":1,"supersedes":null}],"next":null,"through":1})).unwrap();
+        let tx=conn.unchecked_transaction().unwrap();commit_page(&tx,Publisher::Prefrontal,None,&facts,1).unwrap();commit_page(&tx,Publisher::Entorhinal,None,&placement,1).unwrap();tx.commit().unwrap();
+        let mut summaries=SummaryMaintenance::default();let mut valuation=ValuationMaintenance::default();let config=MultiplierConfig{api_twins:Default::default(),plan_price_overrides:Default::default(),quota_providers:Default::default()};
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);
+        loop {
+            assert!(std::time::Instant::now()<deadline,"attribution projections did not drain");
+            if summaries.read_chunk(conn,10_000).unwrap() {let tx=conn.unchecked_transaction().unwrap();summaries.publish(&tx,10_000).unwrap();tx.commit().unwrap();}
+            let tx=conn.unchecked_transaction().unwrap();let ready=valuation.read_chunk(&tx,&config,&[]).unwrap();tx.commit().unwrap();
+            if ready {let tx=conn.unchecked_transaction().unwrap();valuation.publish(&tx).unwrap();tx.commit().unwrap();} else if !valuation.has_pending() {break;}
+        }
+        Ok(())
+    }).unwrap();
+    state
+}
+
 fn served(state: &SharedState, extra: Value) -> Value {
     let mut request = json!({"grouping":[],"grain":"day","timezone":"UTC"});
     request
@@ -158,16 +181,14 @@ fn vectors() -> Vec<(String, Value)> {
         ("hour-timezone-unsupported",json!({"grain":"hour","timezone":"Asia/Kolkata","from_ms":0,"to_ms":1})),
         ("malformed",json!({"unexpected":true})),
     ].into_iter().map(|(name,q)|(name.to_string(),q)).collect::<Vec<_>>();
-    for dimension in ["alfonso", "workload", "workspace", "parent_alfonso"] {
-        cases.push((
-            format!("unavailable-grouping-{dimension}"),
-            json!({"grouping":[dimension]}),
-        ));
-        cases.push((
-            format!("unavailable-where-{dimension}"),
-            json!({"where":{dimension:[null]}}),
-        ));
-    }
+    cases.push((
+        "unavailable-grouping-task".into(),
+        json!({"grouping":["task"]}),
+    ));
+    cases.push((
+        "unavailable-where-task".into(),
+        json!({"where":{"task":[null]}}),
+    ));
     let mut vectors: Vec<_> = cases
         .into_iter()
         .map(|(name, q)| (format!("{name}.json"), served(&state, q)))
@@ -197,6 +218,47 @@ fn vectors() -> Vec<(String, Value)> {
         ),
     ));
     vectors.push(("no-usd-fees.json".into(), served(&state, json!({"grouping":["producer"],"where":{"producer":["pi"]},"from_ms":0,"to_ms":86_400_000}))));
+    let attribution = attribution_fixture();
+    for (name, query) in [
+        ("attribution-alfonso", json!({"grouping":["alfonso"]})),
+        ("attribution-parent", json!({"grouping":["parent_alfonso"]})),
+        ("attribution-workload", json!({"grouping":["workload"]})),
+        ("attribution-project-id", json!({"grouping":["project_id"]})),
+        ("attribution-workspace", json!({"grouping":["workspace"]})),
+        (
+            "attribution-alfonso-model",
+            json!({"grouping":["alfonso","model"]}),
+        ),
+        (
+            "attribution-workload-parent",
+            json!({"grouping":["workload","parent_alfonso"]}),
+        ),
+        (
+            "attribution-filter",
+            json!({"grouping":["workload"],"where":{"alfonso":["agent_fixture"],"model":["alpha"]}}),
+        ),
+        (
+            "attribution-null",
+            json!({"grouping":["alfonso"],"where":{"alfonso":[null]}}),
+        ),
+        (
+            "attribution-combination-legacy-project",
+            json!({"grouping":["alfonso","project"]}),
+        ),
+        (
+            "attribution-combination-provider-model",
+            json!({"grouping":["alfonso","model"],"where":{"provider":["provider"]}}),
+        ),
+    ] {
+        vectors.push((format!("{name}.json"), served(&attribution, query)));
+    }
+    vectors.push((
+        "attribution-unattributed.json".into(),
+        served(
+            &state,
+            json!({"grouping":["alfonso"],"from_ms":0,"to_ms":86_400_000}),
+        ),
+    ));
     vectors
 }
 
@@ -207,6 +269,40 @@ fn analytics_vectors_match_real_dispatch_and_sha256sums() {
     for (name, value) in vectors() {
         let mut bytes = serde_json::to_vec(&value).unwrap();
         bytes.push(b'\n');
+        if [
+            "one-grouping.json",
+            "two-groupings.json",
+            "runner-harness.json",
+            "hour.json",
+            "where-null.json",
+            "range.json",
+            "invalid-grouping-where.json",
+            "invalid-filter.json",
+            "invalid-range.json",
+            "invalid-range-missing-end.json",
+            "range-too-large.json",
+            "hour-no-range.json",
+            "hour-range-too-large.json",
+            "hour-timezone-unsupported.json",
+            "malformed.json",
+            "plan.json",
+            "plan-account.json",
+            "where-plan.json",
+            "pending.json",
+            "no-usd-fees.json",
+        ]
+        .contains(&name.as_str())
+        {
+            assert_eq!(
+                std::fs::read(format!(
+                    "{}/test-vectors/analytics-reads-v3/{name}",
+                    env!("CARGO_MANIFEST_DIR")
+                ))
+                .unwrap(),
+                bytes,
+                "ordinary v3 frame changed: {name}"
+            );
+        }
         hashes.push_str(&format!("{:x}  {name}\n", Sha256::digest(&bytes)));
         if export {
             println!(

@@ -1,0 +1,1 @@
+{"error":{"code":"range_too_large","message":"reports are limited to 400 days (week/month may widen by one bucket on each side); hour reports require at most 744 UTC hours after widening: align the range or shorten it"}}
