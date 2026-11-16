@@ -4993,6 +4993,9 @@ CREATE INDEX attribution_fact_run ON attribution_fact(subject_run_id) WHERE subj
 CREATE INDEX attribution_fact_flow ON attribution_fact(subject_flow_id) WHERE subject_kind='flow';
 CREATE INDEX attribution_fact_project ON attribution_fact(project_id);
 CREATE INDEX attribution_fact_supersedes ON attribution_fact(supersedes) WHERE supersedes IS NOT NULL;
+CREATE INDEX attribution_parent_session ON attribution_fact(parent_runner,parent_session) WHERE parent_kind='session';
+CREATE INDEX attribution_parent_run ON attribution_fact(parent_run_id) WHERE parent_kind='run';
+CREATE INDEX attribution_parent_flow ON attribution_fact(parent_flow_id) WHERE parent_kind='flow';
 CREATE TRIGGER attribution_fact_no_update BEFORE UPDATE ON attribution_fact
 BEGIN SELECT RAISE(ABORT, 'attribution_fact_no_update'); END;
 CREATE TRIGGER attribution_fact_no_delete BEFORE DELETE ON attribution_fact
@@ -5036,6 +5039,7 @@ CREATE TABLE session_alias (
     PRIMARY KEY(runner,harness,host_session,bound_session)
 ) WITHOUT ROWID;
 CREATE INDEX session_alias_host ON session_alias(host_session);
+CREATE INDEX session_alias_bound ON session_alias(bound_session);
 CREATE TRIGGER session_alias_no_update BEFORE UPDATE ON session_alias
 BEGIN SELECT RAISE(ABORT, 'session_alias_no_update'); END;
 CREATE TRIGGER session_alias_no_delete BEFORE DELETE ON session_alias

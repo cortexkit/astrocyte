@@ -44,6 +44,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "cortexkit-role-llm-runner",
  "cortexkit-role-media",
  "cortexkit-store",
  "cortexkit-usage-steps",

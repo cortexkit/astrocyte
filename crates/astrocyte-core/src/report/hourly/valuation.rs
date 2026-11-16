@@ -195,8 +195,14 @@ fn reduce_both(
     reasoning: &[String],
     book: &PlanBook,
     cells: &mut Cells,
-    mut projection: Option<&mut attribution::ValuationProjection>,
+    projection: Option<(
+        &mut attribution::ValuationProjection,
+        &crate::attribution::Maps,
+    )>,
 ) -> Result<(usize, bool), ReportError> {
+    let (mut projection, maps) = projection.map_or((None, None), |(projection, maps)| {
+        (Some(projection), Some(maps))
+    });
     use crate::multiplier::ModelResolution;
     use crate::rate_era::ModelTimeline;
     use crate::valuation::MeasuredRole;
@@ -246,8 +252,8 @@ fn reduce_both(
     };
     for event in &ledger.events {
         let key = key(&ledger, event);
-        let tuple = if projection.is_some() {
-            attribution::resolve(event)
+        let tuple = if let Some(maps) = maps {
+            attribution::resolve(maps, &ledger, event)
         } else {
             attribution::Attribution::default()
         };
@@ -313,9 +319,10 @@ fn reduce_both(
         apply(cells.entry((key.clone(), member.clone())).or_default())?;
         if let Some(projected) = projection.as_deref_mut() {
             apply(
-                projected
+                &mut projected
                     .entry((attribution::AttributionKey::new(&key, &tuple), member))
-                    .or_default(),
+                    .or_default()
+                    .value,
             )?;
         }
     }
@@ -337,15 +344,16 @@ fn reduce_both(
     for ((member, tuple), data) in members {
         for (key, recorded) in data.cells {
             if let Some(projected) = projection.as_deref_mut() {
-                projected
+                let cell = projected
                     .entry((
                         attribution::AttributionKey::new(&key, &tuple),
                         member.clone(),
                     ))
-                    .or_default()
-                    .recorded
-                    .cell
-                    .merge(&recorded)?;
+                    .or_default();
+                if key.0[Grouping::ChargeBasis as usize].as_deref() == Some("metered_api") {
+                    sum(&mut cell.metered, recorded.total)?;
+                }
+                cell.value.recorded.cell.merge(&recorded)?;
             }
             cells
                 .entry((key, member.clone()))
@@ -363,6 +371,7 @@ fn reduce_both(
                             member.clone(),
                         ))
                         .or_default()
+                        .value
                         .recorded
                         .quantities,
                     &quantity_key,
@@ -388,6 +397,7 @@ fn reduce_both(
                             member.clone(),
                         ))
                         .or_default()
+                        .value
                         .recorded
                         .money,
                     &(kind, currency.clone()),
@@ -465,6 +475,7 @@ struct Pending {
     revision: i64,
     attribution_revision: i64,
     attribution: attribution::ValuationProjection,
+    attribution_maps: crate::attribution::Maps,
     attribution_deferred: bool,
     main: bool,
     generations: Generations,
@@ -559,6 +570,8 @@ impl ValuationMaintenance {
                 revision: valuation_revision(conn, hour)?,
                 attribution_revision: attribution::own_revision(conn, hour)?,
                 attribution: attribution::ValuationProjection::new(),
+                attribution_maps: crate::attribution::Maps::load(conn)
+                    .map_err(|_| ReportError::Integrity("invalid attribution evidence"))?,
                 attribution_deferred: false,
                 main: conn.query_row(
                     "SELECT state='dirty' FROM valuation_hour WHERE kind=?1 AND hour_number=?2",
@@ -598,7 +611,7 @@ impl ValuationMaintenance {
                 reasoning,
                 &PlanBook::load(conn)?,
                 &mut pending.cells,
-                Some(&mut pending.attribution),
+                Some((&mut pending.attribution, &pending.attribution_maps)),
             )?;
             pending.fetched &= fetched;
             count

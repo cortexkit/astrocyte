@@ -1,16 +1,8 @@
 //! Independent projections share ledger reads and revision checks, not report keys.
 use super::valuation::{PlanMember, Recorded, ValuedCell};
 use super::*;
+pub(crate) use crate::attribution::Attribution;
 use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct Attribution {
-    pub alfonso: Option<String>,
-    pub parent_alfonso: Option<String>,
-    pub workload: Option<String>,
-    pub project_id: Option<String>,
-    pub workspace: Option<String>,
-}
 
 impl Attribution {
     pub fn dictionary_value(&self) -> Result<Option<String>, ReportError> {
@@ -24,18 +16,26 @@ impl Attribution {
     }
 }
 
-// Without publisher evidence, every call stays Not attributed. A replacement
-// resolver can use evidence loaded once for the chunk, not query every event.
-pub(super) fn resolve(_event: &LedgerEvent) -> Attribution {
-    Attribution::default()
+pub(super) fn resolve(
+    maps: &crate::attribution::Maps,
+    ledger: &Ledger,
+    event: &LedgerEvent,
+) -> Attribution {
+    maps.resolve(
+        event.attribution_runner.map(|id| ledger.values.name(id)),
+        event.session.map(|id| ledger.values.name(id)),
+        event.run_ref.map(|id| ledger.values.name(id)),
+        event.flow_ref.map(|id| ledger.values.name(id)),
+        event.occurred_at_ms,
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct AttributionKey {
-    currency: Option<String>,
-    attribution: Attribution,
-    provider: Option<String>,
-    model: Option<String>,
+    pub(super) currency: Option<String>,
+    pub(super) attribution: Attribution,
+    pub(super) provider: Option<String>,
+    pub(super) model: Option<String>,
 }
 impl AttributionKey {
     pub(super) fn new(key: &Key, attribution: &Attribution) -> Self {
@@ -65,16 +65,35 @@ impl AttributionKey {
 
 #[derive(Default)]
 pub(super) struct Projection {
-    cells: BTreeMap<AttributionKey, Recorded>,
+    pub(super) cells: BTreeMap<AttributionKey, Payload>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Payload {
+    #[serde(flatten)]
+    pub(super) recorded: Recorded,
+    // The projection no longer has charge_basis in its key. Preserve its
+    // exact metered portion before combining different charge bases.
+    #[serde(with = "exact")]
+    pub(super) metered: i128,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct ProjectedValue {
+    pub(super) value: ValuedCell,
+    pub(super) metered: i128,
 }
 impl Projection {
     fn merge(&mut self, tuple: &Attribution, data: &Data) -> Result<(), ReportError> {
         for (key, cell) in &data.cells {
-            self.cells
+            let projected = self
+                .cells
                 .entry(AttributionKey::new(key, tuple))
-                .or_default()
-                .cell
-                .merge(cell)?;
+                .or_default();
+            if key.0[Grouping::ChargeBasis as usize].as_deref() == Some("metered_api") {
+                sum(&mut projected.metered, cell.total)?;
+            }
+            projected.recorded.cell.merge(cell)?;
         }
         for ((key, qkey), q) in &data.quantities {
             valuation::merge_quantity(
@@ -82,6 +101,7 @@ impl Projection {
                     .cells
                     .entry(AttributionKey::new(key, tuple))
                     .or_default()
+                    .recorded
                     .quantities,
                 qkey,
                 q,
@@ -93,6 +113,7 @@ impl Projection {
                     .cells
                     .entry(AttributionKey::new(key, tuple))
                     .or_default()
+                    .recorded
                     .money,
                 &(*kind, currency.clone()),
                 money,
@@ -135,7 +156,7 @@ impl Projection {
     }
 }
 
-pub(super) type ValuationProjection = BTreeMap<(AttributionKey, PlanMember), ValuedCell>;
+pub(super) type ValuationProjection = BTreeMap<(AttributionKey, PlanMember), ProjectedValue>;
 pub(super) fn replace_valuation(
     tx: &Transaction<'_>,
     hour: Hour,
@@ -152,7 +173,11 @@ pub(super) fn replace_valuation(
     if fetched {
         for ((key, member), cell) in cells {
             let [currency, tuple, provider, model] = key.ids(tx, &mut values)?;
-            tx.execute("INSERT INTO attribution_valuation_cell VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![hour.kind,hour.number,currency,tuple,provider,model,encode(&member)?,member.plan,member.plan_account,member.record.as_ref().map(encode).transpose()?,encode(&cell.recorded)?,cell.numerator.to_string(),encode(&cell.unvalued)?])?;
+            let recorded = Payload {
+                recorded: cell.value.recorded,
+                metered: cell.metered,
+            };
+            tx.execute("INSERT INTO attribution_valuation_cell VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![hour.kind,hour.number,currency,tuple,provider,model,encode(&member)?,member.plan,member.plan_account,member.record.as_ref().map(encode).transpose()?,encode(&recorded)?,cell.value.numerator.to_string(),encode(&cell.value.unvalued)?])?;
         }
     }
     tx.execute("UPDATE attribution_hour SET valuation_revision=?3,valuation_attribution_revision=?4 WHERE kind=?1 AND hour_number=?2",params![hour.kind,hour.number,main_revision,own_revision])?;
@@ -187,12 +212,13 @@ pub(super) fn observe(
     projection: &mut Projection,
     conn: &Connection,
     filter: &str,
+    maps: &crate::attribution::Maps,
 ) -> Result<usize, ReportError> {
     let ledger = load_scoped_ledger(conn, &DIMENSIONS, Some(filter))?;
     let mut groups: BTreeMap<Attribution, Data> = BTreeMap::new();
     let mut events = HashMap::new();
     for event in &ledger.events {
-        let tuple = resolve(event);
+        let tuple = resolve(maps, &ledger, event);
         let key = groups
             .entry(tuple.clone())
             .or_default()

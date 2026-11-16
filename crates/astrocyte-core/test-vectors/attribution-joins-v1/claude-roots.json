@@ -1,0 +1,9 @@
+{
+  "runner": "thalamus-harness",
+  "harness": "claude-code",
+  "entry": {
+    "session": "52a3ca5a-c774-478d-9576-78e488aca83e",
+    "session_ref": "a9125ea88f07afd6f945fe760cfadc71",
+    "owner_session": "ses_996f2ec3ef0b535d60baa17f4d05dec6"
+  }
+}

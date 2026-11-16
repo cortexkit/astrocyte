@@ -642,6 +642,7 @@ struct Build {
     attribution_revision: i64,
     main: bool,
     attribution: attribution::Projection,
+    attribution_maps: crate::attribution::Maps,
     attribution_deferred: bool,
     after: Option<i64>,
     data: Data,
@@ -863,6 +864,12 @@ impl SummaryMaintenance {
                 attribution_revision: attribution::own_revision(conn, hour)?,
                 main: !attribution::summary_current(conn, hour)?,
                 attribution: attribution::Projection::default(),
+                attribution_maps: if audit {
+                    crate::attribution::Maps::default()
+                } else {
+                    crate::attribution::Maps::load(conn)
+                        .map_err(|_| ReportError::Integrity("invalid attribution evidence"))?
+                },
                 attribution_deferred: false,
                 after: None,
                 data: Data::default(),
@@ -902,7 +909,13 @@ impl SummaryMaintenance {
                 if build.audit {
                     build.data.observe(conn, &filter)?
                 } else {
-                    attribution::observe(&mut build.data, &mut build.attribution, conn, &filter)?
+                    attribution::observe(
+                        &mut build.data,
+                        &mut build.attribution,
+                        conn,
+                        &filter,
+                        &build.attribution_maps,
+                    )?
                 }
             }
             None => 0,
@@ -1712,6 +1725,7 @@ pub(super) fn spend(
         reasons.insert("missing_occurred_at".into(), undated);
     }
     Ok(Some(SpendReport {
+        attribution_coverage: None,
         totals: headline.into_values().collect(),
         rows,
         undated: UndatedCoverage {

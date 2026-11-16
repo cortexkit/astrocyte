@@ -5,6 +5,7 @@
 //! serving are built on top of these producer-neutral records.
 
 pub mod attempt_usage;
+pub mod attribution;
 pub mod cache_diagnostics;
 pub mod canon;
 pub mod capacity;

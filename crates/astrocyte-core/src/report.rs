@@ -346,6 +346,14 @@ pub struct SpendReport {
     pub rate_staleness: RateStaleness,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hierarchy_resolution: Option<Availability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribution_coverage: Option<AttributionCoverage>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AttributionCoverage {
+    pub attributed_calls: u64,
+    pub unattributed_calls: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +362,7 @@ pub enum ReportRefusal {
     RangeTooLarge,
     InvalidFilter(String),
     DimensionUnavailable(String),
+    CombinationUnavailable(Vec<String>),
     HourTimezoneUnsupported,
     UnknownGrouping(String),
     DuplicateGrouping(String),
@@ -370,6 +379,7 @@ impl ReportRefusal {
             Self::RangeTooLarge => "range_too_large",
             Self::InvalidFilter(_) => "invalid_filter",
             Self::DimensionUnavailable(_) => "dimension_unavailable",
+            Self::CombinationUnavailable(_) => "combination_unavailable",
             Self::HourTimezoneUnsupported => "hour_timezone_unsupported",
             Self::UnknownGrouping(_) | Self::DuplicateGrouping(_) => "invalid_grouping",
             Self::UnknownGrain(_) => "invalid_grain",
@@ -385,6 +395,7 @@ impl ReportRefusal {
             Self::RangeTooLarge => "reports are limited to 400 days (week/month may widen by one bucket on each side); hour reports require at most 744 UTC hours after widening: align the range or shorten it".into(),
             Self::InvalidFilter(value) => format!("filter '{value}' must contain at least one value"),
             Self::DimensionUnavailable(value) => format!("dimension '{value}' is not available"),
+            Self::CombinationUnavailable(values) => format!("dimension combination is not available: {}",values.join(", ")),
             Self::HourTimezoneUnsupported => "hour grain requires whole-hour UTC offsets throughout the range".into(),
             Self::UnknownGrouping(value) => format!("unknown grouping dimension '{value}'"),
             Self::DuplicateGrouping(value) => format!("duplicate grouping dimension '{value}'"),
@@ -538,6 +549,10 @@ struct LedgerEvent {
     quantities: Quantities,
     key: i64,
     occurred_at_ms: Option<i64>,
+    attribution_runner: Option<u32>,
+    session: Option<u32>,
+    run_ref: Option<u32>,
+    flow_ref: Option<u32>,
     /// Interned in `Ledger::values`.
     currency: Option<u32>,
     charge_basis: ChargeBasis,
@@ -836,7 +851,8 @@ fn load_scoped_ledger_bound(
                  work_class,project_root,producer,
                  CASE WHEN account_ref IS NULL AND charge_basis='subscription_included'
                        THEN COALESCE(resolved_credential,auth_selection) END,
-                 runner,CASE WHEN producer='thalamus-harness' THEN harness ELSE producer END
+                 runner,CASE WHEN producer='thalamus-harness' THEN harness ELSE producer END,
+                 session,run_ref,flow_ref
          FROM usage_event{event_filter}"
     ))?;
     let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
@@ -873,6 +889,18 @@ fn load_scoped_ledger_bound(
             quantities: Quantities::default(),
             key: row.get(0)?,
             occurred_at_ms: row.get(1)?,
+            attribution_runner: text_column(row, 14)?
+                .map(|value| values.intern(value))
+                .transpose()?,
+            session: text_column(row, 16)?
+                .map(|value| values.intern(value))
+                .transpose()?,
+            run_ref: text_column(row, 17)?
+                .map(|value| values.intern(value))
+                .transpose()?,
+            flow_ref: text_column(row, 18)?
+                .map(|value| values.intern(value))
+                .transpose()?,
             currency: text_column(row, 2)?
                 .map(|value| values.intern(value))
                 .transpose()?,
@@ -1160,6 +1188,7 @@ pub fn spend_report(
     request: &ReportRequest,
     now_ms: i64,
 ) -> Result<SpendReport, ReportError> {
+    analytics::attribution_request(request)?;
     valuation::surface::report(conn, request, now_ms)
 }
 
@@ -1360,6 +1389,7 @@ fn spend_report_from_ledger(
         undated_reasons.insert("missing_occurred_at".into(), undated);
     }
     Ok(SpendReport {
+        attribution_coverage: None,
         totals: headline.into_values().collect(),
         rows,
         undated: UndatedCoverage {

@@ -1,4 +1,73 @@
 use super::*;
+
+pub(super) fn is_attribution_dimension(name: &str) -> bool {
+    matches!(
+        name,
+        "alfonso" | "parent_alfonso" | "workload" | "project" | "workspace"
+    )
+}
+
+pub(super) fn attribution_request(request: &ReportRequest) -> Result<bool, ReportError> {
+    let names: BTreeSet<_> = request
+        .grouping
+        .iter()
+        .chain(request.filters.keys())
+        .map(String::as_str)
+        .collect();
+    if names.contains("task") {
+        return Err(ReportError::Refused(ReportRefusal::DimensionUnavailable(
+            "task".into(),
+        )));
+    }
+    let attribution: Vec<_> = names
+        .iter()
+        .copied()
+        .filter(|name| is_attribution_dimension(name))
+        .collect();
+    if attribution.is_empty() {
+        return Ok(false);
+    }
+    for name in &names {
+        if !is_attribution_dimension(name) && Grouping::parse(name).is_none() {
+            return Err(ReportError::Refused(ReportRefusal::UnknownGrouping(
+                (*name).into(),
+            )));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for name in &request.grouping {
+        if !seen.insert(name) {
+            return Err(ReportError::Refused(ReportRefusal::DuplicateGrouping(
+                name.clone(),
+            )));
+        }
+    }
+    for (name, values) in &request.filters {
+        if values.is_empty() {
+            return Err(ReportError::Refused(ReportRefusal::InvalidFilter(
+                name.clone(),
+            )));
+        }
+    }
+    let refused = if attribution.len() > 2 {
+        Some(attribution.iter().map(|name| (*name).into()).collect())
+    } else if let Some(other) = names
+        .iter()
+        .find(|name| !is_attribution_dimension(name) && !matches!(**name, "model" | "provider"))
+    {
+        Some(vec![attribution[0].into(), (*other).into()])
+    } else if names.contains("model") && names.contains("provider") {
+        Some(vec!["model".into(), "provider".into()])
+    } else {
+        None
+    };
+    if let Some(pair) = refused {
+        return Err(ReportError::Refused(ReportRefusal::CombinationUnavailable(
+            pair,
+        )));
+    }
+    Ok(true)
+}
 use chrono::Offset;
 use rusqlite::types::Value as SqlValue;
 
