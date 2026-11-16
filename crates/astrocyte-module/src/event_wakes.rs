@@ -67,10 +67,10 @@ impl Control {
 
     /// How long a source with this `source_runtime` key may go without a
     /// successful drain before health calls it stale, when that differs from
-    /// the ordinary four poll intervals. While its durable is attached, a
-    /// wake-driven source is read only on a wake or at its backstop, so a quiet
-    /// feed is current for up to two backstops: one missed backstop still
-    /// reads as fresh, two in a row do not.
+    /// the ordinary four poll intervals. While its bus consumer is pulling
+    /// messages, a wake-driven source is read only on a wake or at its
+    /// backstop, so a quiet feed is current for up to two backstops: one missed
+    /// backstop still reads as fresh, two in a row do not.
     pub(crate) fn freshness_horizon_ms(&self, source_key: &str) -> Option<i64> {
         let source = match source_key {
             crate::refresher::colliculus_source::SOURCE_KEY => Source::Media,

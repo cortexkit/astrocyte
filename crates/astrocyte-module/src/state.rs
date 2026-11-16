@@ -1547,7 +1547,7 @@ mod health_tests {
         );
     }
 
-    /// While Colliculus's durable is attached, its feed is read only on a bus
+    /// While Colliculus's bus consumer is pulling, its feed is read only on a bus
     /// wake or at the 10-minute backstop, so the ordinary four-interval horizon
     /// would call a quiet, healthy feed stale. Attached, it gets two backstops
     /// (20 minutes); detached, it is polled every tick and keeps the ordinary
