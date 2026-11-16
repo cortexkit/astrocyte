@@ -1,7 +1,9 @@
 //! Guard against legacy per-call identities on claim-bound SDK connections.
 
 fn forbidden_identity(source: &str) -> bool {
-    // Old daemons may still return this refusal; sanitizing it is not an override.
+    // Older daemons can still refuse with the exact code `bad_consumer_identity`,
+    // so the source may name that code. Strip it before searching, so only a
+    // request that sends its own `consumer_identity` member is caught.
     source
         .replace("\"bad_consumer_identity\"", "")
         .contains("consumer_identity")
