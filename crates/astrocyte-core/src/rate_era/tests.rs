@@ -336,3 +336,80 @@ fn rate_era_failed_fetch_yields_to_other_pending_models() {
         Err(MultiplierError::RateFactUnrecognized(_))
     ));
 }
+
+/// A store that already holds calls learns every model in use when it migrates,
+/// instead of walking the whole ledger a few thousand calls per tick, and later
+/// discovery starts after the newest call it already counted.
+#[test]
+fn rate_era_migration_seeds_models_from_existing_calls() {
+    use crate::store::MIGRATIONS;
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    for migration in MIGRATIONS.iter().filter(|migration| migration.version < 57) {
+        conn.execute_batch(migration.statements).unwrap();
+    }
+    for (id, provider, model) in [
+        ("a", Some("anthropic"), Some("claude-opus-5-5")),
+        ("b", Some("anthropic"), Some("claude-opus-5-5")),
+        ("c", Some("openai"), Some("gpt-6.1-sol")),
+        ("d", None, Some("no-provider")),
+        ("e", Some("openai"), None),
+    ] {
+        conn.execute(
+            "INSERT INTO usage_event(event_id,producer,producer_ref,recorded_at_ms,charge_basis,provider,model) VALUES(?1,'p',?1,1,'unknown',?2,?3)",
+            params![id, provider, model],
+        )
+        .unwrap();
+    }
+    let newest: i64 = conn
+        .query_row("SELECT max(event_key) FROM usage_event", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    conn.execute_batch(
+        MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 57)
+            .unwrap()
+            .statements,
+    )
+    .unwrap();
+    let models: Vec<(String, String)> = conn
+        .prepare("SELECT provider,model FROM rate_model ORDER BY provider,model")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        models,
+        [
+            ("anthropic".to_string(), "claude-opus-5-5".to_string()),
+            ("openai".to_string(), "gpt-6.1-sol".to_string()),
+        ]
+    );
+    assert_eq!(
+        pending(&conn, 10).unwrap().len(),
+        2,
+        "seeded models wait for a fetch"
+    );
+    let after: i64 = conn
+        .query_row(
+            "SELECT after_event_key FROM rate_cache_state WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after, newest);
+    conn.execute(
+        "INSERT INTO usage_event(event_id,producer,producer_ref,recorded_at_ms,charge_basis,provider,model) VALUES('f','p','f',2,'unknown','xai','grok-5')",
+        [],
+    )
+    .unwrap();
+    discover(&conn, 2_000).unwrap();
+    assert_eq!(
+        pending(&conn, 10).unwrap().len(),
+        3,
+        "a later call is still discovered"
+    );
+}

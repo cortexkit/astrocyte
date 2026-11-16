@@ -4945,6 +4945,21 @@ CREATE TABLE valuation_cell (
 UPDATE valuation_hour SET state='dirty',revision=revision+1;
 "#,
     },
+    Migration {
+        version: 57,
+        statements: r#"-- Seed the rate cache with every model already in the ledger. Left to the
+-- refresher, discovery reads 2,000 calls per full tick, so a store holding three
+-- million calls would take about twelve hours to learn every model in use, and
+-- list values and new multiplier days would wait on it. Later calls are
+-- discovered incrementally from the newest call recorded here.
+INSERT OR IGNORE INTO rate_model(provider,model)
+    SELECT DISTINCT provider, model FROM usage_event
+    WHERE provider IS NOT NULL AND model IS NOT NULL;
+UPDATE rate_cache_state
+    SET after_event_key = max(after_event_key, coalesce((SELECT max(event_key) FROM usage_event), 0))
+    WHERE id = 1;
+"#,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
