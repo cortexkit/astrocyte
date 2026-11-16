@@ -972,6 +972,111 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
             .unwrap();
     }
 
+    /// Agent Runner's `fork_answer` rows exactly as its payer write stores them
+    /// (`tests/vectors/thalamus-pi-fork-payer`, 16 Nov 2026): a plain answer and
+    /// one the fork ended at a tool call. Each is billed once, under the fork's
+    /// own session with the head's owner, login, account and charge basis, from
+    /// the usage the row carries.
+    #[test]
+    fn thalamus_payer_pinned_fork_answer_rows_bill_once_each() {
+        const ROWS: [&[u8]; 2] = [
+            include_bytes!("../tests/vectors/thalamus-pi-fork-payer/fork-answer-plain.json"),
+            include_bytes!(
+                "../tests/vectors/thalamus-pi-fork-payer/fork-answer-tool-call-refused.json"
+            ),
+        ];
+        let (_home, source, store, state) = fixture();
+        let session = "pi-fork-1b0ac48aa38d4d628974d5872d36585b";
+        store
+            .execute(
+                "INSERT INTO payer_session VALUES ('pi',?1,'owner-head',1000)",
+                [session],
+            )
+            .unwrap();
+        for bytes in ROWS {
+            let row: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let text = |name: &str| row[name].as_str().map(str::to_owned);
+            store
+                .execute(
+                    "INSERT INTO payer_record(attempt_id,harness,session,request_kind,step_ref,
+                     recorded_at_ms,provider,model,charge_basis,auth_selection,account_ref,outcome,
+                     provider_request_id,provider_response_id,usage_json)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                    params![
+                        text("attempt_id"),
+                        text("harness"),
+                        text("session"),
+                        text("request_kind"),
+                        text("step_ref"),
+                        row["recorded_at_ms"].as_i64(),
+                        text("provider"),
+                        text("model"),
+                        text("charge_basis"),
+                        text("auth_selection"),
+                        text("account_ref"),
+                        text("outcome"),
+                        text("provider_request_id"),
+                        text("provider_response_id"),
+                        text("usage_json"),
+                    ],
+                )
+                .unwrap();
+        }
+        source
+            .drain_for_health(&state, 1_700_000_100_000, &AtomicBool::new(false))
+            .unwrap();
+        state
+            .with_conn(|conn| {
+                let calls: Vec<(String, String, String, String, String)> = conn
+                    .prepare(
+                        "SELECT session,work_class,charge_basis,auth_selection,account_ref
+                         FROM usage_event ORDER BY producer_ref",
+                    )
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                let expected = (
+                    session.to_owned(),
+                    "owner-head".to_owned(),
+                    "subscription_included".to_owned(),
+                    "cred-head".to_owned(),
+                    "acct-head".to_owned(),
+                );
+                assert_eq!(calls, vec![expected.clone(), expected]);
+                let measurements: Vec<(String, String, i64)> = conn
+                    .prepare(
+                        "SELECT role,unit,SUM(quantity_units) FROM measurement
+                         GROUP BY role,unit ORDER BY role,unit",
+                    )
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert_eq!(
+                    measurements,
+                    vec![
+                        ("cache_read".into(), "token".into(), 1_800),
+                        ("cache_write".into(), "token".into(), 60),
+                        ("input".into(), "token".into(), 24),
+                        ("output".into(), "token".into(), 14),
+                    ]
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[test]
     fn thalamus_payer_fallback_records_and_prices_each_model_once() {
         use astrocyte_core::catalog_client::{CatalogCallError, CatalogClient, CatalogConnection};
