@@ -1121,6 +1121,51 @@ mod tests {
         }
     }
 
+    /// Agent Runner's bodies for unasked steps
+    /// (`tests/vectors/thalamus-step-cause-unasked`, 16 Nov 2026). A step that
+    /// went out without asking the module carries the facts in force for its
+    /// session, so its cause can be named; all four facts reach the evidence as
+    /// sent. These samples carry no account, which stays unknown.
+    #[test]
+    fn agent_runner_unasked_step_facts_decode_into_evidence() {
+        const VECTORS: [(&str, &[u8]); 2] = [
+            (
+                "opencode2",
+                include_bytes!("../tests/vectors/thalamus-step-cause-unasked/opencode2.json"),
+            ),
+            (
+                "pi",
+                include_bytes!("../tests/vectors/thalamus-step-cause-unasked/pi.json"),
+            ),
+        ];
+        let subject = names()
+            .live_subject("thalamus-harness", STEP_EVENT, 1)
+            .unwrap();
+        for (name, bytes) in VECTORS {
+            let event = decode_step_finished(&subject, bytes)
+                .unwrap_or_else(|error| panic!("{name} does not decode: {error:?}"));
+            let step = feed_step(event).unwrap_or_else(|| panic!("{name} has no row identity"));
+            let evidence = &step.evidence;
+            assert_eq!(evidence.view_version, Some(7), "{name}");
+            assert_eq!(
+                evidence.signed_floor.as_deref(),
+                Some("previous-reply"),
+                "{name}"
+            );
+            assert_eq!(
+                evidence.tools_digest.as_deref(),
+                Some("cac09688e76222fae6219bfe2453f0026ba99f49084974addd97c5c165fd0c8a"),
+                "{name}"
+            );
+            assert_eq!(
+                evidence.system_digest.as_deref(),
+                Some("98d9872ac1f35aee39e46a1d9dce1333ba1233084aa640d8c6667203ea0050e3"),
+                "{name}"
+            );
+            assert!(evidence.account_ref.is_none(), "{name}");
+        }
+    }
+
     /// Every pinned broca body decodes on broca's live subject exactly as
     /// sent, keyed by runner and attempt id since broca sends no host record.
     /// Moved into the feed's window, each is served as its own runner row:
