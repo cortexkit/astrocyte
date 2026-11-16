@@ -1485,6 +1485,7 @@ pub(super) fn spend(
             .merge(&bucket.quantities)?;
         let cell = bucket.population;
         let row = SpendRow {
+            valuation: Default::default(),
             usage: bucket.quantities.render()?,
             quantities: bucket.quantities,
             bucket_start_ms: key.start_ms,
@@ -1508,6 +1509,7 @@ pub(super) fn spend(
         let total = headline
             .entry(row.currency.clone())
             .or_insert_with(|| SpendTotal {
+                valuation: Default::default(),
                 usage: UsageQuantities::default(),
                 currency: row.currency.clone(),
                 total_nanos: 0,
@@ -2112,6 +2114,8 @@ mod tests {
             serde_json::to_vec(expected).unwrap()
         );
     }
+    // This oracle compares recorded summaries with the ledger. Additive list
+    // value and fee allocation have their own served-path differential tests.
     fn compare(conn: &Connection) {
         for timezone in [
             "UTC",
@@ -2156,7 +2160,7 @@ mod tests {
                 ] {
                     let request = request(timezone, grain, grouping);
                     equal(
-                        &spend_report(conn, &request, 10_000).unwrap(),
+                        &recorded_spend_report(conn, &request, 10_000).unwrap(),
                         &spend_report_base(conn, &request, 10_000, None).unwrap(),
                     );
                 }
@@ -2180,7 +2184,7 @@ mod tests {
                 let mut request = request("UTC", "day", &["producer", "model"]);
                 request.filters.insert(dimension.name().into(), values);
                 equal(
-                    &spend_report(conn, &request, 10_000).unwrap(),
+                    &recorded_spend_report(conn, &request, 10_000).unwrap(),
                     &spend_report_base(conn, &request, 10_000, None).unwrap(),
                 );
             }
@@ -2203,7 +2207,7 @@ mod tests {
                             .insert("work_class".into(), vec![None, Some("coding".into())]);
                     }
                     equal(
-                        &spend_report(conn, &request, 10_000).unwrap(),
+                        &recorded_spend_report(conn, &request, 10_000).unwrap(),
                         &spend_report_base(conn, &request, 10_000, None).unwrap(),
                     );
                 }

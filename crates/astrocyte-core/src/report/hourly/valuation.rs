@@ -5,6 +5,7 @@ use crate::subscription::plan_lookup_key;
 use crate::valuation::{list_value_event, EventTokens, Unvalued, ValuationRules};
 
 pub mod fees;
+pub mod surface;
 
 /// The immutable primary key of a record in either subscription ledger.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -34,6 +35,8 @@ impl PlanMember {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Recorded {
+    #[serde(default)]
+    base_rate_tier_untested_tokens: i64,
     cell: Cell,
     quantities: Vec<(QuantityKey, Quantity)>,
     money: Vec<((i64, String), Money)>,
@@ -226,6 +229,10 @@ pub(crate) fn reduce(
         let value = list_value_event(&rules, resolution.as_ref(), &tokens)
             .map_err(|_| ReportError::Arithmetic)?;
         let cell = cells.entry((key, member)).or_default();
+        cell.recorded.base_rate_tier_untested_tokens = checked_add(
+            cell.recorded.base_rate_tier_untested_tokens,
+            value.base_rate_tier_untested_tokens,
+        )?;
         sum(&mut cell.numerator, value.numerator)?;
         merge_unvalued(&mut cell.unvalued, &value.unvalued)?;
     }

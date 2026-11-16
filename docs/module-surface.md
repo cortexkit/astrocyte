@@ -305,7 +305,7 @@ Reads never write. A refusal on a read is one of the codes below.
   `rate_staleness`, and `hierarchy_resolution` (`unavailable`) when grouped by
   `project`. `grouping` names are `provider`, `model`, `account`,
   `auth_selection`, `charge_basis`, `work_class`, `project`, `producer`, `runner`,
-  `harness`; `grain` is
+  `harness`, `plan`, `plan_account`; `grain` is
   `hour`, `day`, `week` or `month`; `timezone` is an IANA name. Refusals:
   `invalid_grouping` (unknown or repeated), `invalid_grain`,
   `invalid_timezone`. Test: `spend_report_refusal_keeps_its_code`.
@@ -345,7 +345,7 @@ Reads never write. A refusal on a read is one of the codes below.
   `invalid_grouping`, just like an unknown grouping; an empty list refuses
   `invalid_filter`. Recognized but unavailable dimensions `alfonso`, `workload`,
   `workspace` and `parent_alfonso` refuse `dimension_unavailable` in grouping
-  and where. `plan` is not supported. Unknown request members remain `malformed`.
+  and where. Unknown request members remain `malformed`.
   `undated` and `rate_staleness` describe the selected population, so a ranged
   report's zero undated count does not claim the ledger has no undated events;
   `ingest_freshness` remains global because it describes the sources.
@@ -378,6 +378,87 @@ Reads never write. A refusal on a read is one of the codes below.
   `analytics_refusals_are_specific_and_read_only`. Tagged handler samples are
   in `crates/astrocyte-module/test-vectors/analytics-reads-v2`, pinned by
   `analytics_vectors_match_real_dispatch_and_sha256sums`.
+
+  Every row and currency total also carries `list_value`, with
+  `{currency: "USD", nanos, unvalued: {measurements, tokens, by_reason},
+  not_yet_valued_hours}`. It values positive measurements at the published USD
+  API rates in force at each call, independently of recorded charge basis.
+  Exact line values are summed before one half-even rounding to nanodollars.
+  Unusable positive measurements each count once under `no_rate`, `refused`,
+  `non_usd`, `missing_model` or `valuation_error`; `tokens` counts their token
+  quantities. Zero quantities do not count as unvalued. Other valued measurements
+  in the same call still contribute, except that a valuation error discards the
+  entire call's partial valuation. `not_yet_valued_hours` counts distinct UTC
+  hours whose valuation is not current, not missing rates already fetched and
+  known to be absent. List value is therefore an at-least figure. Bundled usage
+  above a context threshold has no per-call prompt size: its tokens are
+  **valued at the base rate; the real cost may be higher**. The optional
+  `base_rate_tier_untested_tokens` counter on `list_value` counts those tokens
+  and is omitted when zero, on rows and totals. `tiered_bundle` is not an
+  unvalued reason.
+
+  `plan` names a configured quota pool, or the plan's provider when it maps to
+  no configured pool. Metered calls are `api`. Non-metered calls use ledger
+  coverage's account-first `plan_lookup_key`, with the resolved credential
+  preferred to the selected credential when there is no account. A matching
+  plan record supplies `plan_account` (its account or credential); scope-rule
+  matches without a record use `account_unknown`. No membership is `none`;
+  ambiguous pool membership is `pool_conflict`, still valued but never a fee
+  weight. Those non-pool values have null `plan_account`. Both dimensions work
+  in `grouping` and `where`, including null filters. When grouping or filtering
+  by either dimension, unbuilt or stale valuation hours retain recorded spend
+  under `plan: "pending"`, `plan_account: null`. Otherwise their recorded rows
+  are unchanged and their hours count in `not_yet_valued_hours`. A summary-dirty
+  hour uses the same per-call valuer and membership resolver as the builder;
+  an unfetched rate timeline leaves that hour pending. Calendar seams use the
+  same bounded per-call path. These figures never change recorded spend,
+  `total_nanos` or `metered_nanos`.
+
+  USD recorded-currency rows additionally carry `deduced`:
+  `{currency: "USD", nanos, pending_days}`. It is recorded spend plus the row's
+  exact share of USD subscription fees, rounded once half-even. Fees come only
+  from account/credential plan records, prorated over UTC calendar days of the
+  plan's month or year and over partial-day membership. Each record first
+  spreads its fee over its own calls' list value; fees without positive weight
+  then spread over the pool's `account_unknown` calls. Day denominators always
+  cover the whole UTC day, unfiltered; row numerators cover only matching calls.
+  Optional `by_rule_share` is the fraction of the row's fee share assigned by
+  that second stage, omitted when zero or when no fee was assigned. A day is
+  pending if it has not ended or any hour holding pool calls is not current;
+  pending fees are neither spread nor unspread. `pending_days` counts distinct
+  pending UTC days touching the row. A dirty summary is never a built valuation
+  hour even when its live row can be valued. While an hour awaits valuation,
+  non-metered NULL-account summary cells without a retained resolved payer
+  conservatively defer their provider's unique pool if a credential plan could
+  match. This can delay a spread until the builder reaches the hour, but cannot
+  assign a fee to the wrong calls.
+
+  Only the USD currency total carries `deduced` and the fee diagnostics:
+  `deduced_unspread_nanos`, `deduced_non_usd_plans`, `deduced_conflict_plans`.
+  Unspread fees are prorated to the report window's overlap with each UTC day
+  and rounded once. A filter on `plan` or `plan_account` restricts them to
+  matching records; a filter on any other dimension omits
+  `deduced_unspread_nanos`. Non-USD plans contribute no fee and count in
+  `deduced_non_usd_plans`; records mapping to multiple pools count in
+  `deduced_conflict_plans` and their USD fees go directly to unspread. Totals
+  aggregate exact values and distinct pending hours/days across rows before
+  rounding. Non-USD and null-currency totals carry `list_value` only. When USD
+  fees exist but no USD calls match, an additional USD total has zero recorded
+  spend and exposes those fees; no such entry is added without USD fees.
+  With explicit dates, the fee window is the widened report window. Without
+  dates, it starts at the first calendar bucket holding any dated summary hour
+  and ends at the end of the bucket holding `now_ms`; with no dated hours it
+  covers just that current bucket. Plans before the ledger's first bucket do
+  not contribute, but fee days after its last call still do. If the ledger's
+  first bucket is after the current bucket, the fee window is empty; recorded
+  spend and list value are still returned. Tests:
+  `report_surface_plan_grouping_filters_and_unfiltered_fee_weights`,
+  `report_surface_pending_hours_preserve_recorded_spend_and_distinct_counts`,
+  `report_surface_dirty_fallback_matches_built_across_five_timezones`,
+  `report_surface_existing_members_are_byte_identical`,
+  `report_surface_range_free_fees_cover_empty_ledger_and_days_after_last_call`,
+  `report_surface_currency_totals_expose_fees_once_and_do_not_add_empty_usd`,
+  `report_surface_bundle_counter_is_served_in_rows_and_totals`.
 - `spend.subscription.report` keeps `rows`, `coverage` and `ingest_freshness`.
   `rows` lists account plans only. The additive `credential_rows` lists covered
   usage of credential-keyed plans as `{provider, credential_ref,

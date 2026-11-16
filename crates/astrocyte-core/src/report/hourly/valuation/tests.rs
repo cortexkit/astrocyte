@@ -937,3 +937,6 @@ fn valuation_waits_for_summary_then_uses_second_rate_change_and_fences_rate_publ
 
 #[path = "fee_tests.rs"]
 mod fee_tests;
+
+#[path = "surface_tests.rs"]
+mod surface_tests;

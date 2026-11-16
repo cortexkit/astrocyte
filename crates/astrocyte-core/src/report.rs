@@ -90,6 +90,8 @@ enum Grouping {
     Producer,
     Runner,
     Harness,
+    Plan,
+    PlanAccount,
 }
 
 impl Grouping {
@@ -105,6 +107,8 @@ impl Grouping {
             "producer" => Some(Self::Producer),
             "runner" => Some(Self::Runner),
             "harness" => Some(Self::Harness),
+            "plan" => Some(Self::Plan),
+            "plan_account" => Some(Self::PlanAccount),
             _ => None,
         }
     }
@@ -121,6 +125,8 @@ impl Grouping {
             Self::Producer => "producer",
             Self::Runner => "runner",
             Self::Harness => "harness",
+            Self::Plan => "plan",
+            Self::PlanAccount => "plan_account",
         }
     }
 }
@@ -258,8 +264,10 @@ pub struct UndatedCoverage {
     pub reasons: BTreeMap<String, u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SpendRow {
+    #[serde(flatten)]
+    pub valuation: valuation::surface::RowValuation,
     #[serde(skip)]
     quantities: Quantities,
     #[serde(flatten)]
@@ -303,8 +311,10 @@ pub struct SpendRow {
     pub unpriced_measurements_by_reason: BTreeMap<String, u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SpendTotal {
+    #[serde(flatten)]
+    pub valuation: valuation::surface::TotalValuation,
     #[serde(flatten)]
     pub usage: UsageQuantities,
     pub currency: Option<String>,
@@ -327,7 +337,7 @@ pub struct SpendTotal {
     pub zero_measurement_events: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SpendReport {
     pub totals: Vec<SpendTotal>,
     pub rows: Vec<SpendRow>,
@@ -438,8 +448,8 @@ fn declined_reason(unpriced_reason: Option<&str>) -> &str {
     unpriced_reason.unwrap_or("unpriced")
 }
 
-/// Number of supported report dimensions; `Grouping` values index arrays of
-/// this length.
+/// Stored ledger/summary dimensions. Derived plan dimensions are resolved by
+/// the valuation reader and never index these fixed-format arrays.
 const GROUPING_DIMENSIONS: usize = Grouping::Harness as usize + 1;
 
 /// A fast non-cryptographic hasher for the in-memory joins of the ledger-wide
@@ -852,6 +862,7 @@ fn load_scoped_ledger_bound(
                 Grouping::Producer => text_column(row, 12)?,
                 Grouping::Runner => text_column(row, 14)?,
                 Grouping::Harness => text_column(row, 15)?,
+                Grouping::Plan | Grouping::PlanAccount => continue,
             };
             event_dimensions[*dimension as usize] =
                 value.map(|value| values.intern(value)).transpose()?;
@@ -1149,6 +1160,14 @@ pub fn spend_report(
     request: &ReportRequest,
     now_ms: i64,
 ) -> Result<SpendReport, ReportError> {
+    valuation::surface::report(conn, request, now_ms)
+}
+
+fn recorded_spend_report(
+    conn: &Connection,
+    request: &ReportRequest,
+    now_ms: i64,
+) -> Result<SpendReport, ReportError> {
     if let Ok(Some(report)) = hourly::spend(conn, request, now_ms) {
         return Ok(report);
     }
@@ -1264,6 +1283,7 @@ fn spend_report_from_ledger(
                 .checked_sub(population.events_priced)
                 .ok_or(ReportError::Arithmetic)?;
             Ok(SpendRow {
+                valuation: Default::default(),
                 usage: accumulator.quantities.render()?,
                 quantities: accumulator.quantities,
                 bucket_start_ms: key.start_ms,
@@ -1295,6 +1315,7 @@ fn spend_report_from_ledger(
     let mut headline: BTreeMap<Option<String>, SpendTotal> = BTreeMap::new();
     for row in &rows {
         let total = headline.entry(row.currency.clone()).or_insert(SpendTotal {
+            valuation: Default::default(),
             usage: UsageQuantities::default(),
             currency: row.currency.clone(),
             total_nanos: 0,

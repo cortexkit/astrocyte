@@ -170,8 +170,17 @@ impl FeeDays {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Self, ReportError> {
-        if start_ms >= end_ms {
+        if start_ms > end_ms {
             return Err(ReportError::Arithmetic);
+        }
+        if start_ms == end_ms {
+            return Ok(Self {
+                start_ms,
+                end_ms,
+                days: Vec::new(),
+                non_usd: BTreeSet::new(),
+                conflicts: BTreeSet::new(),
+            });
         }
         let first_day = start_ms
             .div_euclid(DAY_MS)

@@ -299,7 +299,7 @@ fn analytics_unknown_quantities_are_not_measured_zero_on_either_path() {
     measurement(&conn, "dirty", "input", "token", 7);
     let q:ReportRequest=serde_json::from_value(json!({"grouping":["producer"],"grain":"day","timezone":"UTC","where":{"work_class":[null]}})).unwrap();
     assert_eq!(
-        serde_json::to_value(spend_report(&conn, &q, 100).unwrap()).unwrap(),
+        serde_json::to_value(recorded_spend_report(&conn, &q, 100).unwrap()).unwrap(),
         serde_json::to_value(spend_report_base(&conn, &q, 100, None).unwrap()).unwrap()
     );
 }
