@@ -400,6 +400,28 @@ pub(crate) fn publish_multiplier(state: &SharedState) {
 }
 
 pub(crate) fn publish_watermark(state: &SharedState) {
+    if state
+        .with_conn(|connection| {
+            publish_watermark_on_connection(state, connection);
+            Ok(())
+        })
+        .is_err()
+    {
+        log_streak(
+            &state.bus_publications().warnings,
+            true,
+            "watermark snapshot",
+        );
+    }
+}
+
+/// Read and stage the watermark after its transaction commits, while the caller
+/// still holds the writer connection. Holding it through the in-memory snapshot
+/// update prevents an older watermark from replacing a newer one.
+pub(crate) fn publish_watermark_on_connection(
+    state: &SharedState,
+    connection: &rusqlite::Connection,
+) {
     let _snapshot = state
         .bus_publications()
         .watermark_snapshot
@@ -408,7 +430,10 @@ pub(crate) fn publish_watermark(state: &SharedState) {
     let principal = subc_protocol::Principal::Reserved {
         module_id: "thalamus-harness".into(),
     };
-    match crate::ops::watermark_get(state, Some(&principal), json!({})) {
+    let desired = state.desired_config();
+    let result = crate::ops::watermark_source(&desired, Some(&principal))
+        .and_then(|source| crate::ops::watermark_on_connection(connection, &desired, source));
+    match result {
         Ok(value) => {
             log_streak(
                 &state.bus_publications().warnings,

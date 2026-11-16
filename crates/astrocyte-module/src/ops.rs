@@ -953,7 +953,7 @@ fn map_cache_error(error: astrocyte_core::cache_diagnostics::CacheError) -> (Str
 
 /// A module whose own logs astrocyte reads, and the reader source that holds
 /// its read watermark.
-struct ReadSource {
+pub(crate) struct ReadSource {
     /// The module id the daemon attests at route bind (`Principal::Reserved`).
     module_id: &'static str,
     /// The source's key in `harness_ingest.exclude` and `read_watermark`.
@@ -991,6 +991,17 @@ pub fn watermark_get(
             format!("watermark params: {error}"),
         )
     })?;
+    let desired = state.desired_config();
+    let source = watermark_source(&desired, principal)?;
+    read_value(state, |connection| {
+        watermark_on_connection(connection, &desired, source)
+    })
+}
+
+pub(crate) fn watermark_source(
+    desired: &crate::config::AstrocyteConfig,
+    principal: Option<&Principal>,
+) -> Result<&'static ReadSource, (String, String)> {
     let source = match principal {
         Some(Principal::Reserved { module_id }) => READ_SOURCES
             .iter()
@@ -1003,8 +1014,7 @@ pub fn watermark_get(
             "astrocyte reads no logs written by this caller".into(),
         )
     })?;
-    let ingest = state.desired_config().harness_ingest;
-    if !ingest.ingests(source.source_key) {
+    if !desired.harness_ingest.ingests(source.source_key) {
         return Err((
             NOT_A_READ_SOURCE.into(),
             format!(
@@ -1013,12 +1023,23 @@ pub fn watermark_get(
             ),
         ));
     }
-    let stored = read_value(state, |connection| {
-        let sessions =
-            (source.watermark_ms)(connection).map_err(|error| ("internal".into(), error))?;
-        if !ingest.ingests(crate::refresher::thalamus_payer_source::SOURCE_KEY) {
-            return Ok(sessions);
-        }
+    Ok(source)
+}
+
+/// The caller chooses the connection: served reads use their snapshot, while
+/// post-commit publication uses the writer without waiting for an open report.
+pub(crate) fn watermark_on_connection(
+    connection: &rusqlite::Connection,
+    desired: &crate::config::AstrocyteConfig,
+    source: &ReadSource,
+) -> OpResult {
+    let sessions = (source.watermark_ms)(connection).map_err(|error| ("internal".into(), error))?;
+    let stored = if !desired
+        .harness_ingest
+        .ingests(crate::refresher::thalamus_payer_source::SOURCE_KEY)
+    {
+        sessions
+    } else {
         let payer = connection
             .query_row(
                 "SELECT watermark_ms FROM read_watermark WHERE source_key='thalamus-payer'",
@@ -1027,10 +1048,10 @@ pub fn watermark_get(
             )
             .optional()
             .map_err(|error| ("internal".into(), error.to_string()))?;
-        Ok(sessions
+        sessions
             .zip(payer)
-            .map(|(sessions, payer)| sessions.min(payer)))
-    })?;
+            .map(|(sessions, payer)| sessions.min(payer))
+    };
     let watermark_ms = stored
         .map(|ms| {
             u64::try_from(ms).map_err(|_| {

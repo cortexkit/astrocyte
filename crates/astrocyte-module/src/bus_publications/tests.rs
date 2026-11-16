@@ -206,6 +206,60 @@ async fn bus_publications_watermark_matches_served_value_only_after_commit() {
 }
 
 #[tokio::test]
+async fn bus_publications_watermark_commit_does_not_wait_for_held_reader() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = crate::state::leased_test_state(&directory);
+    let Some(bus) = TestBus::start(&state).await else {
+        return;
+    };
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let reader_state = state.clone();
+    let reader = std::thread::spawn(move || {
+        reader_state
+            .with_read_op(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM read_watermark", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                Ok(())
+            })
+            .unwrap();
+    });
+    let reader = crate::test_support::Background::new("held report reader", reader, move || {
+        let _ = release_tx.send(());
+    });
+    held_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("report never acquired the reader");
+    let before = bus.attempts();
+    let writer_state = state.clone();
+    let writer = tokio::task::spawn_blocking(move || store_watermarks(&writer_state, 123, false));
+    match tokio::time::timeout(Duration::from_secs(3), writer).await {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(error) => {
+            drop(reader);
+            panic!("watermark commit waited behind an open reader: {error}");
+        }
+    }
+    // Observe delivery before releasing the report, not merely a successful commit.
+    bus.after(before).await;
+    assert_eq!(
+        bus.read_marks
+            .get("thalamus.watermark")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        br#"{"watermark_ms":123}"#
+    );
+    drop(reader);
+    bus.finish().await;
+}
+
+#[tokio::test]
 async fn bus_publications_outage_never_rolls_back_steps_or_watermarks_or_health() {
     let state = test_state();
     let Some(mut bus) = TestBus::start(&state).await else {

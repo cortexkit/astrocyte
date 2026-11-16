@@ -538,7 +538,11 @@ impl SharedState {
                 let mut outcome = None;
                 store
                     .with_conn(|conn| {
-                        outcome = Some(run_ordered_transaction(conn, operation, skip_unchanged));
+                        let committed = run_ordered_transaction(conn, operation, skip_unchanged);
+                        if matches!(&committed, Ok((_, true))) {
+                            crate::bus_publications::publish_watermark_on_connection(self, conn);
+                        }
+                        outcome = Some(committed);
                         Ok(())
                     })
                     .map_err(|error| StoreFailure::Store(format!("store write: {error}")))?;
@@ -553,7 +557,11 @@ impl SharedState {
                 let guard = connection
                     .lock()
                     .map_err(|_| StoreFailure::Store("store mutex poisoned".into()))?;
-                run_ordered_transaction(&guard, operation, skip_unchanged)?
+                let committed = run_ordered_transaction(&guard, operation, skip_unchanged)?;
+                if committed.1 {
+                    crate::bus_publications::publish_watermark_on_connection(self, &guard);
+                }
+                committed
             }
         };
         if changed {
@@ -567,7 +575,6 @@ impl SharedState {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                     Some(format!("projection stale: {error}"));
             }
-            crate::bus_publications::publish_watermark(self);
         }
         Ok(value)
     }
