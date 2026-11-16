@@ -95,6 +95,7 @@ struct HubState {
 
 /// The open subscriptions and the newest cursor told to them.
 pub struct FeedHub {
+    pub(crate) publications: crate::bus_publications::Control,
     state: Mutex<HubState>,
     slots: Arc<Semaphore>,
     runner: Mutex<RunnerCounts>,
@@ -103,6 +104,7 @@ pub struct FeedHub {
 impl Default for FeedHub {
     fn default() -> Self {
         Self {
+            publications: crate::bus_publications::Control::default(),
             state: Mutex::new(HubState::default()),
             slots: Arc::new(Semaphore::new(MAX_FEED_SUBSCRIPTIONS)),
             runner: Mutex::new(RunnerCounts::default()),
@@ -328,6 +330,9 @@ impl FeedHub {
             return;
         }
         hub.through = Some(through);
+        if !changed.is_empty() {
+            self.publications.steps(feed::encode_cursor(through));
+        }
         hub.subscribers.retain(|subscriber| {
             if let Some(filter) = &subscriber.filter {
                 if !changed.contains(filter) {

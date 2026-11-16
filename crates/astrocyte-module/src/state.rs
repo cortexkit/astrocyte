@@ -567,6 +567,7 @@ impl SharedState {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                     Some(format!("projection stale: {error}"));
             }
+            crate::bus_publications::publish_watermark(self);
         }
         Ok(value)
     }
@@ -785,6 +786,7 @@ impl SharedState {
             degraded: None,
         };
         let _ = self.refresh_projection();
+        crate::bus_publications::publish_watermark(self);
     }
     pub(crate) fn mark_config_degraded(&self, message: String) {
         self.0
@@ -912,6 +914,10 @@ impl SharedState {
     /// The live step feed's subscriptions.
     pub fn step_feed(&self) -> &crate::step_feed::FeedHub {
         &self.0.step_feed
+    }
+
+    pub(crate) fn bus_publications(&self) -> &crate::bus_publications::Control {
+        &self.0.step_feed.publications
     }
 
     /// Append a step a runner announced on the bus to the live step feed,

@@ -8,7 +8,9 @@ use std::sync::Mutex;
 
 use serde::Deserialize;
 
-use super::declared_roots::{self, write_ack, Ack, Contained, ReadThrough, RootsFile};
+use super::declared_roots::{
+    self, write_ack_and_publish as write_ack, Ack, Contained, ReadThrough, RootsFile,
+};
 use super::harness_drain::{self, HarnessSource};
 use super::pi_source::{self, PiDrainOutcome, PiFileState};
 use super::thalamus_payer_join::{WaitQueue, WaitingCall};
@@ -110,6 +112,8 @@ impl PiThalamusSource {
                 *cache = Cache::default();
                 if paths.ack.exists() {
                     write_ack(
+                        state,
+                        SOURCE_KEY,
                         &paths.ack,
                         &Ack {
                             version: 1,
@@ -118,6 +122,14 @@ impl PiThalamusSource {
                     )
                     .map_err(|e| format!("write Pi session ack: {e}"))?;
                 }
+                declared_roots::publish_ack(
+                    state,
+                    SOURCE_KEY,
+                    &Ack {
+                        version: 1,
+                        read_through: vec![],
+                    },
+                );
                 return Ok(None);
             }
             RootsFile::UnknownVersion => {
@@ -391,9 +403,11 @@ impl PiThalamusSource {
                     .collect(),
             };
             if cache.ack.as_ref() != Some(&ack) || !paths.ack.exists() {
-                write_ack(&paths.ack, &ack).map_err(|e| format!("write Pi session ack: {e}"))?;
+                write_ack(state, SOURCE_KEY, &paths.ack, &ack)
+                    .map_err(|e| format!("write Pi session ack: {e}"))?;
                 cache.ack = Some(ack);
             }
+            declared_roots::publish_ack(state, SOURCE_KEY, cache.ack.as_ref().expect("ack loaded"));
         }
         Ok((!problems.is_empty()).then(|| problems.join("; ")))
     }

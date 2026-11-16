@@ -9,7 +9,9 @@ use std::sync::Mutex;
 use serde::Deserialize;
 
 use super::claude_code_source::{self, ClaudeCodeCache, ClaudeCodeDrainOutcome};
-use super::declared_roots::{self, write_ack, Ack, Contained, ReadThrough, RootsFile};
+use super::declared_roots::{
+    self, write_ack_and_publish as write_ack, Ack, Contained, ReadThrough, RootsFile,
+};
 use super::harness_drain::{self, HarnessSource};
 use super::thalamus_payer_join::{WaitQueue, WaitingCall};
 use super::SourceDrainError;
@@ -128,6 +130,8 @@ impl ClaudeThalamusSource {
                     // Prune acknowledgements for sessions the harness removed.
                     if paths.ack.exists() {
                         write_ack(
+                            state,
+                            SOURCE_KEY,
                             &paths.ack,
                             &Ack {
                                 version: 1,
@@ -136,6 +140,14 @@ impl ClaudeThalamusSource {
                         )
                         .map_err(|e| format!("write Claude Code session ack: {e}"))?;
                     }
+                    declared_roots::publish_ack(
+                        state,
+                        SOURCE_KEY,
+                        &Ack {
+                            version: 1,
+                            read_through: vec![],
+                        },
+                    );
                     return Ok(None);
                 }
                 RootsFile::UnknownVersion => {
@@ -370,10 +382,11 @@ impl ClaudeThalamusSource {
                     .collect(),
             };
             if cache.ack.as_ref() != Some(&ack) || !paths.ack.exists() {
-                write_ack(&paths.ack, &ack)
+                write_ack(state, SOURCE_KEY, &paths.ack, &ack)
                     .map_err(|e| format!("write Claude Code session ack: {e}"))?;
                 cache.ack = Some(ack);
             }
+            declared_roots::publish_ack(state, SOURCE_KEY, cache.ack.as_ref().expect("ack loaded"));
         }
         Ok((!problems.is_empty()).then(|| problems.join("; ")))
     }

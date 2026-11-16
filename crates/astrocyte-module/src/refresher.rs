@@ -4403,6 +4403,7 @@ fn record_multiplier_day(
             reason,
             needs_config: false,
         })?;
+    crate::bus_publications::publish_multiplier(state);
     Ok(observations)
 }
 
@@ -4580,7 +4581,7 @@ pub(crate) fn recompute_multiplier_day(
         }
         observations.extend(rows);
     }
-    state.ordered_op_write(|tx| {
+    let reply = state.ordered_op_write(|tx| {
         let mut recomputed = Vec::new();
         for observation in &observations {
             // Recheck inside the writer transaction: another writer may have
@@ -4616,7 +4617,9 @@ pub(crate) fn recompute_multiplier_day(
             }));
         }
         Ok((serde_json::json!({ "recomputed": recomputed }), true))
-    })
+    })?;
+    crate::bus_publications::publish_multiplier(state);
+    Ok(reply)
 }
 
 // The backfill and timestamp fixtures in these tests stay within i64.
@@ -8329,6 +8332,7 @@ pub fn log_pricing_failed(error: &str) {
 
 #[cfg(test)]
 mod multiplier_stage_tests {
+    include!("refresher_bus_publications_tests.rs");
     include!("refresher_multiplier_v2_tests.rs");
     include!("refresher_rate_era_tests.rs");
     use std::collections::BTreeMap;

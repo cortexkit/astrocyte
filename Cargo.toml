@@ -26,11 +26,11 @@ large_stack_arrays = "deny"
 [workspace.dependencies]
 astrocyte-readers = { path = "crates/astrocyte-readers" }
 winapi-util = "=0.1.11"
-subc-protocol = "=0.36.2"
-subc-transport = "=0.17.0"
-subc-control = "=0.38.2"
-subc-os = "=0.1.32"
-subc-client-rs = "=0.38.3"
+subc-protocol = "=0.37.1"
+subc-transport = "=0.18.0"
+subc-control = "=0.40.2"
+subc-os = "=0.1.39"
+subc-client-rs = "=0.40.3"
 subc-jsonc = "=0.1.2"
 
 cortexkit-log = "=0.3.5"
@@ -40,11 +40,9 @@ tracing = "0.1"
 cortexkit-store = { version = "=0.2.4", features = ["sqlite"] }
 cortexkit-store-types = "=0.2.2"
 cortexkit-provider-usage = "=0.14.0"
-# 0.2.8 adds `live_subject`, the plain-publish `live` root runners announce
-# finished steps on.
-cortexkit-bus-naming = "=0.2.8"
-cortexkit-bus-nats = "=0.3.0"
-cortexkit-bus-trait = "=0.3.0"
+cortexkit-bus-naming = "=0.4.0"
+cortexkit-bus-nats = "=0.5.0"
+cortexkit-bus-trait = "=0.3.1"
 async-nats = { version = "=0.50.0", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
 base64 = "=0.22.1"
 futures-util = "0.3"

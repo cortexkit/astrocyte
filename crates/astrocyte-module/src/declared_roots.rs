@@ -65,6 +65,26 @@ pub(crate) fn write_ack(path: &Path, ack: &impl Serialize) -> std::io::Result<()
     result
 }
 
+pub(crate) fn publish_ack(state: &crate::state::SharedState, source: &str, ack: &Ack) {
+    state.bus_publications().acknowledgements(
+        source,
+        ack.read_through
+            .iter()
+            .map(|entry| (entry.session.as_str(), entry.at_ms)),
+    );
+}
+
+pub(crate) fn write_ack_and_publish(
+    state: &crate::state::SharedState,
+    source: &str,
+    path: &Path,
+    ack: &Ack,
+) -> std::io::Result<()> {
+    write_ack(path, ack)?;
+    publish_ack(state, source, ack);
+    Ok(())
+}
+
 /// What one read of a roots file found.
 pub(crate) enum RootsFile<T> {
     /// The file does not exist: nothing is declared.
@@ -258,4 +278,111 @@ pub(crate) fn contain_pi_session(folder: &Path, declared: &Path) -> Result<Conta
                 if sessions == "pi-sessions")
         },
     )
+}
+
+#[cfg(test)]
+mod bus_publications_ack_tests {
+    use super::*;
+    use crate::bus_publications::tests::TestBus;
+    use crate::state::test_state;
+
+    #[tokio::test]
+    async fn bus_publications_ack_follows_file_success_and_revokes_removed_sessions() {
+        let state = test_state();
+        let Some(bus) = TestBus::start(&state).await else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ack.json");
+        let ack = Ack {
+            version: 1,
+            read_through: vec![ReadThrough {
+                session: "s/_.é".into(),
+                at_ms: 123,
+            }],
+        };
+        let before = bus.attempts();
+        write_ack_and_publish(&state, "pi-thalamus", &path, &ack).unwrap();
+        bus.after(before).await;
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            "{\"version\":1,\"read_through\":[{\"session\":\"s/_.é\",\"at_ms\":123}]}\n".as_bytes()
+        );
+        let key = "thalamus.ack.x70692d7468616c616d7573.x732f5f2ec3a9";
+        assert_eq!(
+            bus.read_marks.get(key).await.unwrap().unwrap().as_ref(),
+            "{\"session\":\"s/_.é\",\"source\":\"pi-thalamus\",\"through_ms\":123}".as_bytes()
+        );
+        let before = bus.attempts();
+        write_ack_and_publish(
+            &state,
+            "pi-thalamus",
+            &path.join("blocked.json"),
+            &Ack {
+                version: 1,
+                read_through: vec![],
+            },
+        )
+        .unwrap_err();
+        assert_eq!(bus.attempts(), before);
+        assert!(bus.read_marks.get(key).await.unwrap().is_some());
+        write_ack_and_publish(
+            &state,
+            "pi-thalamus",
+            &path,
+            &Ack {
+                version: 1,
+                read_through: vec![],
+            },
+        )
+        .unwrap();
+        bus.after(before).await;
+        assert!(bus.read_marks.get(key).await.unwrap().is_none());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"version\":1,\"read_through\":[]}\n"
+        );
+        let oversized = Ack {
+            version: 1,
+            read_through: vec![ReadThrough {
+                session: "s".repeat(256),
+                at_ms: 123,
+            }],
+        };
+        let before = bus.attempts();
+        write_ack_and_publish(&state, "pi-thalamus", &path, &oversized).unwrap();
+        bus.after(before).await;
+        let key = format!(
+            "thalamus.ack.x70692d7468616c616d7573.{}",
+            crate::bus_publications::key_component(&oversized.read_through[0].session)
+        );
+        assert!(bus.read_marks.get(key).await.unwrap().is_none());
+        assert!(state.crash_cause().is_none());
+        bus.finish().await;
+    }
+
+    #[tokio::test]
+    async fn bus_publications_ack_outage_keeps_file_and_module_healthy() {
+        let state = test_state();
+        let Some(mut bus) = TestBus::start(&state).await else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ack.json");
+        bus.server.stop();
+        let before = bus.attempts();
+        let ack = Ack {
+            version: 1,
+            read_through: vec![ReadThrough {
+                session: "session".into(),
+                at_ms: 456,
+            }],
+        };
+        write_ack_and_publish(&state, "claude-code-thalamus", &path, &ack).unwrap();
+        bus.after(before).await;
+        let file: Ack = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(file == ack);
+        assert!(state.crash_cause().is_none());
+        bus.finish().await;
+    }
 }

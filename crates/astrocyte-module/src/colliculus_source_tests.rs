@@ -51,7 +51,14 @@ impl Peer {
                                 use tokio::io::AsyncWriteExt;
                                 if subc_transport::auth::authenticate_server(&mut stream, &connection.key, &connection.daemon_id, &connection.daemon_ver, BUDGET).await.is_err() { return; }
                                 while let Ok(Some(request)) = read_frame(&mut stream).await {
+                                    if request.header.ty != FrameType::Request { continue; }
                                     let value: Value = serde_json::from_slice(&request.body).unwrap();
+                                    if value["op"] == "server.describe" {
+                                        let response = Frame::build(FrameType::Error, request.header.flags, 0, 0, request.header.corr,
+                                            serde_json::to_vec(&json!({"code":"unknown_op","message":"fixture has no description"})).unwrap()).unwrap();
+                                        if write_frame(&mut stream, &response).await.is_err() { return; }
+                                        continue;
+                                    }
                                     capture.lock().unwrap().push(value.clone());
                                     let (kind, body) = reply(&value);
                                     let response = Frame::build(kind, Flags::new(false, Priority::Passive, false), request.header.channel, request.header.epoch, request.header.corr, body).unwrap();

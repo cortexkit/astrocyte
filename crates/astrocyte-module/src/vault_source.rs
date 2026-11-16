@@ -13,9 +13,8 @@ use fusiform_protocol::PlanPricesRequest;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use serde_json::{json, Value};
-use subc_protocol::{Flags, Frame, FrameType, Priority};
-use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
-use tokio::net::TcpStream;
+use subc_client_rs::{CallOptions, ConsumerOptions, RouteHandle, SubcConsumer, SubscribeOptions};
+use subc_protocol::{Priority, RouteTarget};
 use tokio::sync::mpsc;
 
 use crate::quota_bus_client::Access;
@@ -127,62 +126,62 @@ fn decode_listing(value: Value, now: i64) -> Snapshot {
 }
 
 struct Route {
-    stream: TcpStream,
-    channel: u16,
-    epoch: u32,
+    consumer: SubcConsumer,
+    handle: RouteHandle,
+}
+
+fn call_options() -> CallOptions {
+    CallOptions {
+        timeout: BUDGET,
+        route_retry_deadline: BUDGET,
+        ..CallOptions::default()
+    }
+}
+
+fn sdk_refusal(error: subc_client_rs::CallError) -> String {
+    let code = error
+        .route_open_refusal()
+        .map(|body| body.code.as_str())
+        .or_else(|| error.code());
+    safe_refusal(&json!({"code": code}))
 }
 
 impl Route {
     async fn open(access: &Access) -> Result<Self, String> {
-        let metadata = connection_file::read(&access.path).map_err(|_| "vault_unavailable")?;
-        let endpoint = metadata.endpoints.first().ok_or("vault_unavailable")?;
-        let mut stream = crate::peer_exchange::connect_endpoint(&endpoint.host, endpoint.port)
+        // Supervised connections get a self claim from the SDK's serving registration owner.
+        let consumer = SubcConsumer::connect(&access.path, ConsumerOptions::default())
             .await
             .map_err(|_| "vault_unavailable")?;
-        authenticate_client(&mut stream, &metadata, BUDGET)
+        let identity = serde_json::from_value(
+            json!({"harness":"ck-astrocyte","session":"subscription-plans"}),
+        )
+        .map_err(|_| "encode")?;
+        let handle = consumer
+            .open_route(
+                RouteTarget::ManagementSurface {
+                    module_id: "claustrum".into(),
+                },
+                identity,
+                call_options(),
+            )
             .await
-            .map_err(|_| "vault_unavailable")?;
-        let reply = crate::peer_exchange::exchange(&mut stream, 0, 0, 1, serde_json::to_vec(&json!({
-            "op":"route.open", "target":{"kind":"management_surface","module_id":"claustrum"},
-            "identity":{"harness":"ck-astrocyte","session":"subscription-plans"},
-            "consumer_identity":{"module_id":access.module_id,"launch_nonce":access.nonce}, "config":[]
-        })).map_err(|_| "encode")?, crate::peer_exchange::ExchangeMode::Peer).await
-            .map_err(|_| "vault_unavailable")?;
-        let value: Value = serde_json::from_slice(&reply.body).map_err(|_| "invalid_response")?;
-        if reply.header.ty == FrameType::Error {
-            return Err(safe_refusal(&value));
-        }
-        Ok(Self {
-            stream,
-            channel: value["route_channel"]
-                .as_u64()
-                .and_then(|v| u16::try_from(v).ok())
-                .ok_or("invalid_route")?,
-            epoch: value["route_epoch"]
-                .as_u64()
-                .and_then(|v| u32::try_from(v).ok())
-                .ok_or("invalid_route")?,
-        })
+            .map_err(sdk_refusal)?;
+        Ok(Self { consumer, handle })
     }
 
     async fn list(access: &Access) -> Snapshot {
         tokio::time::timeout(BUDGET, async {
-            let mut route = Self::open(access).await?;
-            let reply = crate::peer_exchange::exchange(
-                &mut route.stream,
-                route.channel,
-                route.epoch,
-                2,
-                br#"{"method":"credential.list_scoped","params":{}}"#.to_vec(),
-                crate::peer_exchange::ExchangeMode::Peer,
-            )
-            .await
-            .map_err(|_| "vault_unavailable".to_string())?;
-            let value: Value =
-                serde_json::from_slice(&reply.body).map_err(|_| "invalid_response".to_string())?;
-            if reply.header.ty == FrameType::Error {
-                return Err(safe_refusal(&value));
-            }
+            let route = Self::open(access).await?;
+            let reply = route
+                .consumer
+                .request(
+                    &route.handle,
+                    br#"{"method":"credential.list_scoped","params":{}}"#.to_vec(),
+                    call_options(),
+                )
+                .await
+                .map_err(sdk_refusal)?;
+            let value = serde_json::from_slice(&reply).map_err(|_| "invalid_response")?;
             decode_listing(value, crate::state::now_ms())
         })
         .await
@@ -191,72 +190,46 @@ impl Route {
 
     async fn watch(access: Access, notices: mpsc::UnboundedSender<Result<(), String>>) {
         let opened = tokio::time::timeout(BUDGET, async {
-            let mut route = Self::open(&access).await?;
-            let request = Frame::build(
-                FrameType::Request,
-                Flags::new(false, Priority::Passive, false),
-                route.channel,
-                route.epoch,
-                2,
-                br#"{"method":"auth.watch_scoped","params":{}}"#.to_vec(),
-            )
-            .map_err(|_| "encode".to_string())?;
-            write_frame(&mut route.stream, &request)
+            let route = Self::open(&access).await?;
+            let subscription = route
+                .consumer
+                .subscribe_route(
+                    &route.handle,
+                    br#"{"method":"auth.watch_scoped","params":{}}"#.to_vec(),
+                    SubscribeOptions {
+                        priority: Priority::Passive,
+                        route_open_timeout: BUDGET,
+                        ..SubscribeOptions::default()
+                    },
+                )
                 .await
-                .map_err(|_| "vault_unavailable".to_string())?;
-            Ok::<_, String>(route)
+                .map_err(sdk_refusal)?;
+            Ok::<_, String>((route, subscription))
         })
         .await;
-        let mut route = match opened {
-            Ok(Ok(route)) => route,
+        let (_route, mut subscription) = match opened {
+            Ok(Ok(opened)) => opened,
             _ => {
                 let _ = notices.send(Err("vault_watch_unavailable".into()));
                 return;
             }
         };
-        loop {
-            let frame = match read_frame(&mut route.stream).await {
-                Ok(Some(frame)) => frame,
-                _ => {
-                    let _ = notices.send(Err("vault_watch_lost".into()));
-                    return;
-                }
-            };
-            if frame.header.ty == FrameType::Ping {
-                if let Ok(pong) = Frame::build_with_version(
-                    frame.header.ver,
-                    FrameType::Pong,
-                    frame.header.flags,
-                    0,
-                    0,
-                    frame.header.corr,
-                    vec![],
-                ) {
-                    if write_frame(&mut route.stream, &pong).await.is_err() {
-                        return;
-                    }
-                }
-                continue;
-            }
-            if frame.header.channel != route.channel
-                || frame.header.epoch != route.epoch
-                || frame.header.corr != 2
-            {
-                continue;
-            }
-            let result = match frame.header.ty {
-                FrameType::StreamData if WatchNotice::decode(&frame.body).is_ok() => Ok(()),
-                FrameType::Error => {
-                    let value = serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
-                    Err(safe_refusal(&value))
-                }
-                _ => Err("vault_watch_lost".into()),
-            };
+        while let Some(body) = subscription.events().recv().await {
+            let result = WatchNotice::decode(&body)
+                .map(|_| ())
+                .map_err(|_| "vault_watch_lost".into());
             let ended = result.is_err();
             if notices.send(result).is_err() || ended {
                 return;
             }
         }
+        let reason = subscription
+            .closed()
+            .await
+            .err()
+            .map(sdk_refusal)
+            .unwrap_or_else(|| "vault_watch_lost".into());
+        let _ = notices.send(Err(reason));
     }
 }
 

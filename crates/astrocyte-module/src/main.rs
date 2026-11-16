@@ -1121,6 +1121,7 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
         );
     }
     ModuleManifest::builder(module_id.to_string(), env!("CARGO_PKG_VERSION").to_string())
+        .registration_channel(true)
         .display_name(Some("Spend Ledger".to_string()))
         .expect("Spend Ledger is a valid module display name")
         .trust_tier(Some(TrustTier::FirstParty))
@@ -2322,6 +2323,7 @@ mod tests {
     #[test]
     fn manifest_declares_every_peer_call_when_all_peers_are_configured() {
         let manifest = manifest("astrocyte", &desired(true, true));
+        assert_eq!(manifest.registration_channel, Some(true));
         assert_eq!(
             self_signal_names(&manifest),
             [

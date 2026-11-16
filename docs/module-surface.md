@@ -1195,7 +1195,9 @@ Claustrum uses the module's daemon connection and launch identity, as colliculus
 does, under `reserved:astrocyte`'s category `llm-provider` `list` grant. No `read`
 grant or `credential.get_scoped` call is needed. The published
 `cortexkit-claustrum-client` 0.9.0 decoder and watch types validate replies;
-Astrocyte's existing transport presents the cached launch nonce. The reader
+Astrocyte's SDK consumer connections use the serving connection's claim when
+launched with a registration channel, and the SDK's implicit identity on older
+unbound launches. The reader
 re-lists after every notice and on daily full-tick backstops. Only full ticks
 record its queued observations, outside all peer calls.
 
@@ -1235,3 +1237,102 @@ reads their stores and files directly; see [harness readers](harness-readers.md)
   blindly; `spend.correction.ingest` is the one write with a retry key.
 - Served writes carry no operator identity. The caller is whoever subc
   admitted to the route.
+
+## Post-commit bus publications
+
+Astrocyte publishes three additive views for readers moving from polling to the
+fleet bus. The existing reports, `usage.steps.subscribe` notices, watermark
+operation, acknowledgement files and all reader polls remain in place. Subjects
+and bucket names come from `cortexkit-bus-naming`; Astrocyte reuses its existing
+ckbus credential and NATS connection without changing the `m_astrocyte` durable
+or its quota and runner-step readers. The module declares registration-channel
+support. The SDK's serve helper adopts that channel, and its consumer connections
+obtain a self claim from the serving registration owner. Calls do not supply a
+per-call identity; the SDK retains its implicit identity behavior for older,
+unbound launches.
+
+Ledger changes are committed before their values are staged for publication.
+Acknowledgement values are staged only after the corresponding atomic file
+write succeeds, or after reading an unchanged file that already exists. Network
+work runs independently of the writer, outside every store transaction. A bus
+failure neither rolls back a commit nor changes module health. A fixed warning
+is logged once per failure streak, without peer error text, credentials or
+values. The next change or credential session republishes the current desired
+state. These publications are hints and mirrors, not a replacement for the
+ledger or a new source of billing facts.
+
+### Live step hint
+
+After a commit appends rows to the live step feed, Astrocyte publishes on
+`ck.{acct}.live.astrocyte.steps_committed.v1`, constructed with
+`AccountNames::live_subject`. Magic-context is the registered reader. The exact
+body shape is `{"cursor":"c42"}`, using the newest feed cursor, not a row or a
+session name. A rollback and an unchanged feed emit nothing. There is at most
+one hint in flight; commits during a send replace the pending cursor with the
+newest one. The live subject is Core NATS, with no replay or offline delivery.
+The existing `usage.steps.subscribe` stream is unchanged.
+
+### Multiplier KV
+
+The `astrocyte.multiplier` bucket is written by Astrocyte and read by Striatum.
+`AccountNames::module_bucket_name("astrocyte", "multiplier")` derives its
+account-specific name. Values are limited to 8 KiB, with history 1 and no TTL.
+Each key identifies one `(quota_provider, plan)` pair and its value is the exact
+compact JSON serialization of that pair's entry in `spend.multiplier.report`'s
+`latest` list. Astrocyte stages a fresh list after every daily multiplier commit,
+after an operator recompute and at startup. Unchanged entries are not put again;
+keys absent from a later list are deleted. The current report retains historical
+entries independently of configuration, so removing a provider from config alone
+does not delete its key. A legacy pooled entry with a null plan disappears when
+the report starts serving plan-specific entries for that provider.
+
+Every non-null key component is `x` followed by lowercase hexadecimal of its
+UTF-8 bytes. Both components are always encoded, including ASCII ids that would
+already be valid NATS tokens. Dots therefore separate components only, and `/`,
+`_`, `.`, empty strings and non-ASCII ids cannot collide with escape spellings.
+The reserved component `n` denotes a null plan; an empty string is `x`, not `n`.
+For example, `(codex, openai/pro_20x)` maps to
+`x636f646578.x6f70656e61692f70726f5f323078`; `(codex, null)` maps to
+`x636f646578.n`. Values retain the readable `quota_provider` and `plan` fields.
+
+An entry larger than 8 KiB has no key: an existing value is deleted rather than
+left stale. Astrocyte never truncates or reshapes the report to fit the bucket.
+A fixed warning records the key and byte count once per oversize streak, never
+the value. A missing key sends a reader back to the existing report poll.
+
+### THALAMUS read-marks KV
+
+The `astrocyte.read-marks` bucket is written by Astrocyte and read by
+thalamus-harness. Its account-specific name comes from
+`AccountNames::module_bucket_name("astrocyte", "read-marks")`. Values are limited
+to 256 bytes, with history 1 and no TTL.
+
+`thalamus.watermark` holds exactly the value `watermark.get` serves:
+`{"watermark_ms":123}` or `{"watermark_ms":null}`. It is staged at startup and
+whenever the committed effective watermark changes, including changes in the
+payer watermark that bounds session progress. `watermark.get` remains available
+with its existing admission rules. When ingestion is disabled or its source is
+excluded, the operation stops serving a value and the key is deleted after the
+configuration commit is published, including at startup. Re-enabling the source
+restores its served value after the next commit; a served null watermark remains
+a key, not a deletion.
+
+For each session in a THALAMUS acknowledgement file, the key is
+`thalamus.ack.<encoded source>.<encoded session>`. Source and session ids use the
+same always-prefixed UTF-8 hex rule as multiplier keys; they are never treated
+as paths or as already-separated key fragments. For example, source
+`pi-thalamus` and session `s/_.é` map to
+`thalamus.ack.x70692d7468616c616d7573.x732f5f2ec3a9`. Its value is
+`{"session":"s/_.é","source":"pi-thalamus","through_ms":123}`. The readable ids
+are included so readers do not need to decode a key.
+
+The bucket mirrors each successfully written acknowledgement file's complete
+session set. Removing an entry from the file revokes its key; a failed file
+write changes neither the desired puts nor the desired deletions. Unchanged
+files also seed their entries when first read after startup. File writes and
+all source reads continue unchanged. A value above 256 bytes is omitted and any
+old key is deleted, with the same key-and-size warning policy as the multiplier
+bucket. It is never truncated. A missing key is not evidence that a session is
+unacknowledged until THALAMUS has switched to the bucket; during migration it
+must retain its acknowledgement-file read. A missing or stale bus view must
+never allow deletion that the file or `watermark.get` would not allow.

@@ -2,6 +2,8 @@ use super::*;
 use crate::{ops, refresher, state::test_state};
 use astrocyte_core::catalog_client::CatalogCallError;
 use fusiform_protocol::{PlanAmount, PlanPriceWire, PlanPricesResponse};
+use subc_protocol::{Flags, Frame, FrameType};
+use subc_transport::{connection_file, read_frame, write_frame};
 
 fn stage() -> Stage {
     let (ticks, _) = mpsc::unbounded_channel();
@@ -574,7 +576,8 @@ impl Peer {
             key: vec![17; subc_transport::KEY_LEN],
             daemon_id: [9; 16],
             pid: std::process::id(),
-            daemon_ver: "fixture".into(),
+            // SDK route admission requires a version with cancellation support.
+            daemon_ver: "0.39.0".into(),
         };
         connection_file::write_atomic(&path, &info).unwrap();
         let value = Arc::new(Mutex::new(listing(&["openai"], Some("pro_200"), Some(100))));
@@ -593,16 +596,19 @@ impl Peer {
                         tokio::spawn(async move {
                             if subc_transport::auth::authenticate_server(&mut stream,&info.key,&info.daemon_id,&info.daemon_ver,BUDGET).await.is_err() { return; }
                             while let Ok(Some(frame)) = read_frame(&mut stream).await {
+                                if frame.header.ty != FrameType::Request { continue; }
                                 let request: Value = serde_json::from_slice(&frame.body).unwrap();
                                 r.lock().unwrap().push(request.clone());
-                                let (kind,answer) = if request["op"] == "route.open" {
-                                    assert_eq!(request["consumer_identity"],json!({"module_id":"astrocyte","launch_nonce":"attested-fixture"}));
-                                    (FrameType::Response,json!({"route_channel":7,"route_epoch":1}))
+                                let (kind,answer) = if request["op"] == "server.describe" {
+                                    (FrameType::Error,json!({"code":"unknown_op","message":"fixture has no description"}))
+                                } else if request["op"] == "route.open" {
+                                    assert!(request.get("consumer_identity").is_none());
+                                    (FrameType::Response,json!({"op":"route.open","route_channel":7,"route_epoch":1}))
                                 } else if request["method"] == "credential.list_scoped" {
                                     assert_eq!(request["params"],json!({}));
                                     (FrameType::Response,v.lock().unwrap().clone())
                                 } else {
-                                    assert_eq!(request["method"],"auth.watch_scoped");
+                                    assert_eq!(request["method"],"auth.watch_scoped", "unexpected fixture request: {request}");
                                     if unsupported { (FrameType::Error,json!({"code":"unknown_method","message":"old vault"})) }
                                     else {
                                         let (sender,mut notices) = mpsc::unbounded_channel();

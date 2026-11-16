@@ -487,6 +487,8 @@ async fn stopped(stop: &AtomicBool) {
 }
 
 async fn reader_loop(state: &SharedState, insula: Option<&crate::qta_client::QtaClient>) {
+    crate::bus_publications::publish_multiplier(state);
+    crate::bus_publications::publish_watermark(state);
     let control = state.quota_bus();
     let access = loop {
         if let Some(access) = control.access() {
@@ -551,6 +553,7 @@ async fn reader_loop(state: &SharedState, insula: Option<&crate::qta_client::Qta
                 tokio::select! {
                     result = quota_session => result,
                     () = crate::runner_steps::follow(state, &connection, &names) => Ok(()),
+                    () = state.bus_publications().follow(&connection, &names) => Ok(()),
                 }
             })
             .await
@@ -644,4 +647,4 @@ async fn run_session(
 
 #[cfg(test)]
 #[path = "quota_events_tests.rs"]
-mod tests;
+pub(crate) mod tests;

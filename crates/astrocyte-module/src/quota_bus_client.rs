@@ -7,9 +7,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use cortexkit_bus_nats::{ConnectConfig, NatsConnection};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use subc_protocol::FrameType;
-use subc_transport::{authenticate_client, connection_file};
-use tokio::net::TcpStream;
+use subc_client_rs::{CallOptions, ConsumerOptions, RouteHandle, SubcConsumer};
+use subc_protocol::RouteTarget;
 use tokio::sync::Mutex;
 
 /// The nonce is shared with HELLO, never rediscovered or included in diagnostics.
@@ -21,10 +20,8 @@ pub(crate) struct Access {
 }
 
 struct Route {
-    stream: TcpStream,
-    channel: u16,
-    epoch: u32,
-    corr: u64,
+    consumer: SubcConsumer,
+    handle: RouteHandle,
 }
 
 pub(crate) struct Client {
@@ -70,39 +67,24 @@ impl Client {
     }
 
     async fn open(&self) -> Result<Route, &'static str> {
-        let metadata = connection_file::read(&self.access.path)
-            .map_err(|_| "ckbus connection file unavailable")?;
-        let endpoint = metadata.endpoints.first().ok_or("ckbus endpoint absent")?;
-        let mut stream = crate::peer_exchange::connect_endpoint(&endpoint.host, endpoint.port)
+        // The SDK binds supervised connections to a fresh claim from the serving owner.
+        let consumer = SubcConsumer::connect(&self.access.path, ConsumerOptions::default())
             .await
             .map_err(|_| "ckbus connection failed")?;
-        authenticate_client(&mut stream, &metadata, Duration::from_secs(2))
+        let identity =
+            serde_json::from_value(json!({"harness":"ck-astrocyte","session":"quota-events"}))
+                .map_err(|_| "ckbus route encoding failed")?;
+        let handle = consumer
+            .open_route(
+                RouteTarget::ManagementSurface {
+                    module_id: "ckbus".into(),
+                },
+                identity,
+                options(),
+            )
             .await
-            .map_err(|_| "ckbus transport authentication failed")?;
-        let mut route = Route {
-            stream,
-            channel: 0,
-            epoch: 0,
-            corr: 1,
-        };
-        let body = serde_json::to_vec(&json!({
-            "op": "route.open",
-            "target": {"kind": "management_surface", "module_id": "ckbus"},
-            "identity": {"harness": "ck-astrocyte", "session": "quota-events"},
-            "consumer_identity": {"module_id": self.access.module_id, "launch_nonce": self.access.nonce},
-        })).map_err(|_| "ckbus route encoding failed")?;
-        let value = exchange(&mut route, body).await?;
-        route.channel = value["route_channel"]
-            .as_u64()
-            .and_then(|v| u16::try_from(v).ok())
-            .filter(|v| *v != 0)
-            .ok_or("invalid ckbus route channel")?;
-        route.epoch = value["route_epoch"]
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .filter(|v| *v != 0)
-            .ok_or("invalid ckbus route epoch")?;
-        Ok(route)
+            .map_err(safe_call_error)?;
+        Ok(Route { consumer, handle })
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, &'static str> {
@@ -132,33 +114,35 @@ impl Client {
 }
 
 async fn exchange(route: &mut Route, body: Vec<u8>) -> Result<Value, &'static str> {
-    let corr = route.corr;
-    route.corr = route
-        .corr
-        .checked_add(1)
-        .ok_or("ckbus correlation exhausted")?;
-    let response = crate::peer_exchange::exchange(
-        &mut route.stream,
-        route.channel,
-        route.epoch,
-        corr,
-        body,
-        crate::peer_exchange::ExchangeMode::Peer,
-    )
-    .await
-    .map_err(|_| "ckbus exchange failed")?;
-    let value: Value = serde_json::from_slice(&response.body).map_err(|_| "invalid ckbus reply")?;
-    if response.header.ty == FrameType::Error {
-        // Server error text can echo request data. Only fixed structural codes leave this boundary.
-        return Err(match value["code"].as_str() {
-            Some("ckbus_credential_superseded") => "ckbus_credential_superseded",
-            Some("ckbus_credential_revoked") => "ckbus_credential_revoked",
-            Some("bad_consumer_identity") => "ckbus identity refused",
-            Some("ckbus_principal_direct") => "ckbus principal refused",
-            _ => "ckbus operation unavailable",
-        });
+    let response = route
+        .consumer
+        .request(&route.handle, body, options())
+        .await
+        .map_err(safe_call_error)?;
+    serde_json::from_slice(&response).map_err(|_| "invalid ckbus reply")
+}
+
+fn options() -> CallOptions {
+    CallOptions {
+        timeout: Duration::from_secs(2),
+        route_retry_deadline: Duration::from_secs(2),
+        ..CallOptions::default()
     }
-    Ok(value)
+}
+
+fn safe_call_error(error: subc_client_rs::CallError) -> &'static str {
+    // Server error text can echo request data. Only fixed structural codes leave this boundary.
+    match error
+        .route_open_refusal()
+        .map(|body| body.code.as_str())
+        .or_else(|| error.code())
+    {
+        Some("ckbus_credential_superseded") => "ckbus_credential_superseded",
+        Some("ckbus_credential_revoked") => "ckbus_credential_revoked",
+        Some("bad_consumer_identity") => "ckbus identity refused",
+        Some("ckbus_principal_direct") => "ckbus principal refused",
+        _ => "ckbus operation unavailable",
+    }
 }
 
 pub(crate) async fn credential(
@@ -210,37 +194,39 @@ pub(crate) async fn connect(
 ) -> Result<NatsConnection, &'static str> {
     let jwt = credential.jwt.clone();
     let key = credential.credential_public.clone();
-    let options = async_nats::ConnectOptions::with_auth_callback(move |nonce| {
-        let (client, jwt, key) = (client.clone(), jwt.clone(), key.clone());
-        async move {
-            let value = client
-                .lock()
-                .await
-                .call(
+    let options =
+        async_nats::ConnectOptions::with_auth_callback(move |nonce| {
+            let (client, jwt, key) = (client.clone(), jwt.clone(), key.clone());
+            async move {
+                // NATS requires a Sync authentication future; the SDK connection future
+                // is Send but not Sync. A task boundary keeps its transport private.
+                let value =
+                    tokio::spawn(async move {
+                        client.lock().await.call(
                     "ckbus.nonce_sign",
-                    json!({
-                        "credential_public": key, "nonce_b64": STANDARD.encode(nonce),
-                    }),
-                )
-                .await
-                .map_err(async_nats::AuthError::new)?;
-            let signature = value["signature_b64"]
-                .as_str()
-                .ok_or_else(|| async_nats::AuthError::new("signature absent"))?;
-            let signature = STANDARD
-                .decode(signature)
-                .map_err(|_| async_nats::AuthError::new("invalid signature"))?;
-            if signature.len() != 64 {
-                return Err(async_nats::AuthError::new("invalid signature length"));
+                    json!({"credential_public": key, "nonce_b64": STANDARD.encode(nonce)}),
+                ).await
+                    })
+                    .await
+                    .map_err(|_| async_nats::AuthError::new("signing task unavailable"))?
+                    .map_err(async_nats::AuthError::new)?;
+                let signature = value["signature_b64"]
+                    .as_str()
+                    .ok_or_else(|| async_nats::AuthError::new("signature absent"))?;
+                let signature = STANDARD
+                    .decode(signature)
+                    .map_err(|_| async_nats::AuthError::new("invalid signature"))?;
+                if signature.len() != 64 {
+                    return Err(async_nats::AuthError::new("invalid signature length"));
+                }
+                let mut auth = async_nats::Auth::new();
+                auth.jwt = Some(jwt);
+                auth.signature = Some(signature);
+                Ok(auth)
             }
-            let mut auth = async_nats::Auth::new();
-            auth.jwt = Some(jwt);
-            auth.signature = Some(signature);
-            Ok(auth)
-        }
-    })
-    .max_reconnects(0)
-    .connection_timeout(Duration::from_secs(2));
+        })
+        .max_reconnects(0)
+        .connection_timeout(Duration::from_secs(2));
     NatsConnection::connect(
         &credential.server_url,
         options,

@@ -341,7 +341,10 @@ struct Peer {
 
 impl Peer {
     fn start(reply: Reply) -> Self {
-        let (listener, path, connection) = crate::test_support::fake_daemon("quota-events", 31, 32);
+        let (listener, path, mut connection) =
+            crate::test_support::fake_daemon("quota-events", 31, 32);
+        connection.daemon_ver = "0.39.0".into();
+        subc_transport::connection_file::write_atomic(&path, &connection).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let opens = Arc::new(Mutex::new(Vec::new()));
         let (server_requests, server_opens) = (requests.clone(), opens.clone());
@@ -360,8 +363,11 @@ impl Peer {
                             use tokio::io::AsyncWriteExt;
                             if subc_transport::auth::authenticate_server(&mut stream, &connection.key, &connection.daemon_id, &connection.daemon_ver, Duration::from_secs(2)).await.is_err() { return; }
                             while let Ok(Some(request)) = read_frame(&mut stream).await {
+                                if request.header.ty != subc_protocol::FrameType::Request { continue; }
                                 let value: Value = serde_json::from_slice(&request.body).unwrap();
-                                let (kind, bytes) = if value["op"] == "route.open" {
+                                let (kind, bytes) = if value["op"] == "server.describe" {
+                                    (subc_protocol::FrameType::Error, serde_json::to_vec(&json!({"code":"unknown_op","message":"fixture has no description"})).unwrap())
+                                } else if value["op"] == "route.open" {
                                     opens.lock().unwrap().push(value);
                                     (subc_protocol::FrameType::Response, serde_json::to_vec(&json!({"op":"route.open","route_channel":7,"route_epoch":1})).unwrap())
                                 } else {
@@ -426,8 +432,7 @@ fn quota_reader_shutdown_cancels_mid_session_and_joins_within_the_drain_guard() 
     let opens = peer.opens.lock().unwrap();
     assert_eq!(opens.len(), 1);
     assert_eq!(opens[0]["target"]["module_id"], "ckbus");
-    assert_eq!(opens[0]["consumer_identity"]["module_id"], "astrocyte");
-    assert!(opens[0]["consumer_identity"]["launch_nonce"] == "fixture-handoff");
+    assert!(opens[0].get("consumer_identity").is_none());
     drop(opens);
     stop.store(true, Ordering::Relaxed);
     joined
@@ -481,14 +486,18 @@ fn quota_refused_consumer_identity_keeps_polling_and_does_not_fail_the_module() 
     assert!(state.crash_cause().is_none());
 }
 
-struct NatsServer {
+pub(crate) struct NatsServer {
     child: std::process::Child,
     _directory: tempfile::TempDir,
-    url: String,
+    pub(crate) url: String,
 }
 
 impl NatsServer {
-    fn start() -> Option<Self> {
+    pub(crate) fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+    pub(crate) fn start() -> Option<Self> {
         let version = match std::process::Command::new("nats-server")
             .arg("--version")
             .output()
