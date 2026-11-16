@@ -3850,13 +3850,16 @@ pub(crate) struct MultiplierStage {
     rate_backoff: RateBackoff,
 }
 
-/// Failed timeline reads wait before they are tried again, so a model fusiform
-/// cannot serve in time is not retried every pass, each try holding the
-/// refresher for a full read deadline. The wait starts at a minute and doubles
-/// up to half an hour; a successful read clears it.
+/// Failed timeline reads wait before they are tried again. The price catalog
+/// (fusiform) keeps building a timeline after this side stops waiting, so
+/// retrying a model it cannot serve in time on every pass loads the catalog
+/// and holds the refresher for a full read deadline each try. The wait starts
+/// at a minute and doubles up to half an hour; a successful read clears it, and
+/// a new catalog version clears every wait, since the change may be the cure.
 #[derive(Default)]
 pub(crate) struct RateBackoff {
     waits: std::collections::BTreeMap<(String, String), (std::time::Instant, Duration)>,
+    catalog_version: Option<i64>,
 }
 
 impl RateBackoff {
@@ -3879,6 +3882,12 @@ impl RateBackoff {
 
     fn succeeded(&mut self, model: &(String, String)) {
         self.waits.remove(model);
+    }
+
+    fn catalog_seen(&mut self, version: i64) {
+        if self.catalog_version.replace(version) != Some(version) {
+            self.waits.clear();
+        }
     }
 }
 
@@ -4261,6 +4270,7 @@ fn rate_era_tick(state: &SharedState, backoff: &mut RateBackoff) -> Result<Optio
         .with_budget(RATE_FETCH_MODEL_BUDGET)
         .catalog_version()
         .map_err(|error| format!("{error:?}"))?;
+    backoff.catalog_seen(version);
     let config = state.desired_config();
     let empty_twins = std::collections::BTreeMap::new();
     let twins = match &config.subscription_multiplier {
@@ -9546,6 +9556,9 @@ mod multiplier_stage_tests {
             "the same day and reason is already logged"
         );
         fusiform.unrecognized_key.store(false, Ordering::SeqCst);
+        // The failed model's timeline read waits before its next try; this
+        // stands in for that wait passing.
+        stage.rate_backoff.waits.clear();
         stage.tick(&state, false, NOW + 120_000);
         assert_eq!(
             current_day_observations(&state),

@@ -6,7 +6,7 @@ struct TimelineFusiform {
     delay: Duration,
     /// The deadline each history read was given.
     timeouts: std::sync::Mutex<Vec<Duration>>,
-    /// Models whose history read fails, as fusiform timing out would.
+    /// Models whose history read fails, standing in for the catalog timing out.
     failing: Vec<String>,
 }
 
@@ -275,4 +275,8 @@ fn a_model_fusiform_cannot_serve_waits_before_it_is_tried_again() {
         RateBackoff::FIRST * 2,
         "a second failure doubles the wait"
     );
+    // A new catalog version clears the wait: the change may be the cure.
+    peer.version.store(2, Ordering::SeqCst);
+    stage.tick(&state, false, NOW + 90_000);
+    assert_eq!(tries("slow"), 3, "a catalog change retries a waiting model");
 }
