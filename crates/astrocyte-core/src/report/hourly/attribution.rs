@@ -4,6 +4,9 @@ use super::*;
 pub(crate) use crate::attribution::Attribution;
 use serde::{Deserialize, Serialize};
 
+pub(super) const DELETE_CELLS_SQL: &str =
+    "DELETE FROM attribution_cell WHERE kind=?1 AND hour_number=?2";
+
 impl Attribution {
     pub fn dictionary_value(&self) -> Result<Option<String>, ReportError> {
         // The fixed null dictionary row represents Not attributed, avoiding a
@@ -159,10 +162,7 @@ impl Projection {
         main_revision: i64,
         own_revision: i64,
     ) -> Result<(), ReportError> {
-        tx.execute(
-            "DELETE FROM attribution_cell WHERE kind=?1 AND hour_number=?2",
-            params![hour.kind, hour.number],
-        )?;
+        tx.execute(DELETE_CELLS_SQL, params![hour.kind, hour.number])?;
         let mut values = HashMap::new();
         for (key, cell) in &self.cells {
             let [currency, tuple, provider, model] = key.ids(tx, &mut values)?;

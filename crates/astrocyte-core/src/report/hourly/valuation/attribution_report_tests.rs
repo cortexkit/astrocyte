@@ -344,6 +344,48 @@ fn attribution_report_query_plans_seek_split_hour_cells_for_each_required_shape(
 }
 
 #[test]
+fn attribution_summary_publication_plan_seeks_rowid_logical_key() {
+    use crate::report::hourly::attribution::DELETE_CELLS_SQL;
+    let conn = conn();
+    assert_eq!(
+        conn.query_row(
+            "SELECT wr FROM pragma_table_list WHERE name='attribution_cell'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    let columns=conn.prepare("SELECT name FROM pragma_index_info('sqlite_autoindex_attribution_cell_1') ORDER BY seqno").unwrap().query_map([],|row|row.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(
+        columns,
+        [
+            "kind",
+            "hour_number",
+            "currency",
+            "attribution",
+            "provider",
+            "model"
+        ]
+    );
+    assert!(conn.query_row("SELECT \"unique\" FROM pragma_index_list('attribution_cell') WHERE name='sqlite_autoindex_attribution_cell_1'",[],|row|row.get::<_,bool>(0)).unwrap());
+    let plan = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {DELETE_CELLS_SQL}"))
+        .unwrap()
+        .query_map(params![0, 1], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(plan.iter().any(|step|step=="SEARCH attribution_cell USING COVERING INDEX sqlite_autoindex_attribution_cell_1 (kind=? AND hour_number=?)"),"{plan:?}");
+    assert!(
+        !plan
+            .iter()
+            .any(|step| step.contains("SCAN attribution_cell") || step.contains("usage_event")),
+        "{plan:?}"
+    );
+}
+
+#[test]
 fn attribution_report_split_combination_matrix_preserves_legacy_project_and_task_refusals() {
     let conn = conn();
     let before = conn.total_changes();

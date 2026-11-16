@@ -144,12 +144,12 @@ reduce only their affected hours; cached reads seek the split tables' primary
 keys. List values and subscription fee allocation reuse the ordinary arithmetic
 and unfiltered subscription-pool day totals.
 
-`attribution_cell` is a WITHOUT ROWID table. `attribution_valuation_cell` is a
-rowid table with the same logical composite primary key enforced by its unique
-index: the longer valuation payloads stay inline rather than overflowing the
-smaller local records of a WITHOUT ROWID index. This physical choice changes
-neither the key values nor the payload, and does not change either ordinary
-cache table.
+`attribution_cell` and `attribution_valuation_cell` are rowid tables. Each keeps
+its logical composite primary key enforced by a unique index. Their larger
+local records reduce JSON payload overflow compared with WITHOUT ROWID
+indexes. These physical choices change neither key values nor payload bytes,
+and do not change either ordinary cache table. A query-plan test checks that
+replacing one summary hour uses its unique index, not a table scan.
 
 ## Immutability
 

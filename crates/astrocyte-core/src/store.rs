@@ -5076,6 +5076,8 @@ END;
 CREATE TRIGGER attribution_valuation_hour_revision AFTER UPDATE OF revision ON valuation_hour BEGIN
     UPDATE attribution_hour SET valuation_revision=NULL WHERE kind=NEW.kind AND hour_number=NEW.hour_number;
 END;
+-- Rowid pages hold more of each JSON payload locally, reducing overflow at
+-- ordinary summary payload sizes. The composite key remains unique.
 CREATE TABLE attribution_cell (
     kind INTEGER NOT NULL,
     hour_number INTEGER NOT NULL,
@@ -5086,7 +5088,7 @@ CREATE TABLE attribution_cell (
     payload TEXT NOT NULL CHECK(json_valid(payload)),
     PRIMARY KEY(kind,hour_number,currency,attribution,provider,model),
     FOREIGN KEY(kind,hour_number) REFERENCES attribution_hour(kind,hour_number)
-) WITHOUT ROWID;
+);
 -- Keep long valuation payloads in rowid table pages rather than the smaller
 -- local records of a WITHOUT ROWID index. The logical key stays unique.
 CREATE TABLE attribution_valuation_cell (
