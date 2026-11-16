@@ -498,6 +498,10 @@ impl NatsServer {
         let _ = self.child.wait();
     }
     pub(crate) fn start() -> Option<Self> {
+        Self::start_with_config("")
+    }
+
+    pub(crate) fn start_with_config(config: &str) -> Option<Self> {
         let version = match std::process::Command::new("nats-server")
             .arg("--version")
             .output()
@@ -521,10 +525,14 @@ impl NatsServer {
             .unwrap()
             .port();
         let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("server.conf");
+        std::fs::write(&config_path, config).unwrap();
         let stderr = std::fs::File::create(directory.path().join("server.log")).unwrap();
         let child = std::process::Command::new("nats-server")
             .args(["-js", "-a", "127.0.0.1", "-p", &port.to_string(), "-sd"])
             .arg(directory.path())
+            .arg("-c")
+            .arg(config_path)
             .stdout(std::process::Stdio::null())
             .stderr(stderr)
             .spawn()

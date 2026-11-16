@@ -2,6 +2,7 @@ use super::*;
 use crate::quota_events::tests::NatsServer;
 use crate::state::test_state;
 use crate::step_feed::{record_steps_for_test, TestStep};
+use cortexkit_bus_trait::PermissionViolationSource;
 use futures_util::FutureExt;
 use std::sync::atomic::Ordering;
 
@@ -112,6 +113,97 @@ fn bus_publications_key_components_are_total_and_unambiguous() {
     assert_eq!(pair_key("a.b", "c"), "x612e62.x63");
     assert_ne!(pair_key("a.b", "c"), pair_key("a", "b.c"));
     assert_eq!(key_component(""), "x");
+}
+
+#[tokio::test]
+#[ignore = "needs cortexkit-bus-nats with subject-matched subscribe denials"]
+async fn bus_publications_denied_bucket_does_not_interrupt_runner_steps() {
+    let Some(server) = NatsServer::start_with_config(
+        r#"accounts {
+            ledger {
+                jetstream: enabled
+                users: [
+                    {user: admin, password: fixture},
+                    {user: reader, password: fixture, permissions: {
+                        publish: {allow: ["ck.denied_publications.live.astrocyte.>"]}
+                        subscribe: {allow: [
+                            "_INBOX.>",
+                            "ck.denied_publications.live.broca.step.finished.v1",
+                            "ck.denied_publications.live.thalamus-harness.step.finished.v1",
+                            "ck.denied_publications.live.thalamus.step.finished.v1"
+                        ]}
+                    }}
+                ]
+            }
+        }"#,
+    ) else {
+        return;
+    };
+    let admin = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(client) = async_nats::ConnectOptions::new()
+                .user_and_password("admin".into(), "fixture".into())
+                .connect(&server.url)
+                .await
+            {
+                break client;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("nats-server did not become ready");
+    let connection = NatsConnection::connect(
+        &server.url,
+        async_nats::ConnectOptions::new().user_and_password("reader".into(), "fixture".into()),
+        cortexkit_bus_nats::ConnectConfig::new("denied-publications").unwrap(),
+    )
+    .await
+    .unwrap();
+    let names = AccountNames::derive("denied_publications").unwrap();
+    let state = test_state();
+    state.bus_publications().multiplier(&[]);
+    let mut violations = connection.permission_violations();
+    let runner = crate::runner_steps::follow(&state, &connection, &names);
+    tokio::pin!(runner);
+    // Register the runner's first subscription before the publisher sends its
+    // denied request, so the shared permission event arrives during subscribe.
+    assert!(futures_util::poll!(runner.as_mut()).is_pending());
+    let publisher = state.bus_publications().follow(&connection, &names);
+    tokio::pin!(publisher);
+    let bucket = names.module_bucket_name("astrocyte", "multiplier").unwrap();
+    let denied_subject = format!("$JS.API.STREAM.INFO.KV_{bucket}");
+    let (subject, body) = crate::runner_steps::test_event(&names, "minimal", "broca", |_| {});
+    let delivered = async {
+        let refusal = violations.next_violation().await.unwrap().unwrap();
+        assert_eq!(refusal.subject, denied_subject);
+        assert!(refusal.reason.contains("Permissions Violation"));
+        // Publish once: a subscription dropped and recreated after the refusal
+        // cannot recover a live event, because NATS does not retain it.
+        admin.publish(subject, body.into()).await.unwrap();
+        admin.flush().await.unwrap();
+        while state.step_feed().runner_counts().appended == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(crate::test_support::HANG_GUARD, async {
+        tokio::select! {
+            () = &mut runner => panic!("runner follower ended after a publisher refusal"),
+            () = &mut publisher => panic!("publisher ended after its bucket was refused"),
+            () = delivered => {},
+        }
+    })
+    .await
+    .expect("runner step was lost after the publisher's bucket request was refused");
+    let page = crate::step_feed::read(&state, json!({"harness":"broca", "session":"session_a"}))
+        .unwrap_or_else(|refusal| panic!("steps read refused: {}", refusal.message));
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0]["source"], "runner");
+    assert_eq!(page.rows[0]["step_ref"], "attempt_invented_b");
+    assert_eq!(
+        connection.client().connection_state(),
+        async_nats::connection::State::Connected
+    );
 }
 
 #[tokio::test]
