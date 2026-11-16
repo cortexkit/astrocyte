@@ -1,16 +1,27 @@
-# analytics-reads-v2
+# analytics-reads-v3
 
-Tagged sample set: `analytics-reads-v2`. Version 2 retains the existing sample
-bodies and adds a runner-by-harness grouping, including an unmanaged call.
-These spend.report frames come from the real dispatch handler over an invented
-store. No live-store identity or usage is included. The clock-dependent
-`rate_staleness.as_of_ms` alone is normalized to zero; all measurements are
-pending, so the oldest rate and its age are absent.
+Tagged sample set: `analytics-reads-v3`. Version 3 retains version 2's sample
+bodies apart from the additive list-value and deduced-cost members, and adds the
+five cases below. Version 2's published tag remains the historical sample set.
+These spend.report frames come from the real dispatch handler over invented
+usage. No live-store identity or usage is included.
+
+The existing cases and `no-usd-fees` use the original pending-usage fixture.
+`plan`, `plan-account` and `where-plan` use a separate USD subscription fixture
+with valued included usage; `pending` uses the same subscription usage with one
+hour not yet valued. The clock-dependent `rate_staleness.as_of_ms` alone is
+normalized to zero. No sample has a resolved recorded-charge rate timestamp,
+so the oldest rate and its age are absent.
 
 | Samples | Contract exercised |
 | --- | --- |
 | one-grouping, two-groupings | Producer and model groupings; inclusive output, cache lifetimes, exact media units and unknown quantity disclosure |
 | runner-harness | Write-once runner labels crossed with the host harness; null means unmanaged |
+| plan | Plan-pool grouping, USD API list value and deduced subscription cost, independent of zero recorded spend |
+| plan-account | Plan pool crossed with the ledger account that supplies coverage |
+| where-plan | Plan-pool filtering with model rows and subscription fee shares |
+| pending | An unvalued hour retains recorded usage under plan `pending` and discloses `not_yet_valued_hours` and pending fee days |
+| no-usd-fees | Null-currency usage without USD fees does not synthesize a USD total |
 | hour | UTC hour buckets with an explicit bounded range |
 | where-null | OR within a dimension, AND across dimensions, and JSON null for absent work class |
 | range | Outward widening of a half-open range to whole local calendar buckets |
@@ -30,5 +41,4 @@ ASTROCYTE_EXPORT_ANALYTICS_VECTORS=1 cargo test --workspace --locked analytics_v
 
 The test prints `VECTOR` JSON records containing each filename and exact bytes.
 `SHA256SUMS` covers every JSON sample and this README, but not itself. The sample
-tag is not a summary-cache version: schema migration 50 publishes summary format
-6 so runner and host harness remain distinct in cached reports.
+tag versions the reply examples, not the report's internal cache format.
