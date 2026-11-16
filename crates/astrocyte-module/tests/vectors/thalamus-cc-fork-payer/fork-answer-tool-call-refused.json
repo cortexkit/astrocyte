@@ -1,0 +1,17 @@
+{
+  "account_ref": "acct-1",
+  "attempt_id": "fork_run_8d97b54a28f1484dbd200a293edc710c",
+  "auth_selection": "oauth:anthropic:one",
+  "charge_basis": "subscription_included",
+  "harness": "claude-code",
+  "model": "claude-haiku-5-5",
+  "outcome": "completed",
+  "provider": "anthropic",
+  "provider_request_id": "req_standin_1",
+  "provider_response_id": "msg_1",
+  "recorded_at_ms": 1700000000000,
+  "request_kind": "fork_answer",
+  "session": "cc-fork-917493cc71544054a0a8e9a0f01dd278",
+  "step_ref": null,
+  "usage_json": "{\"usage_by_model\":[{\"model_used\":\"claude-haiku-5-5\",\"usage\":{\"cache_write_tokens\":0,\"cached_input_tokens\":800,\"input_tokens\":1000,\"output_tokens\":50}}]}"
+}

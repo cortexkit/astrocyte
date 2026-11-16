@@ -972,28 +972,25 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
             .unwrap();
     }
 
-    /// Agent Runner's `fork_answer` rows exactly as its payer write stores them
-    /// (`tests/vectors/thalamus-pi-fork-payer`, 16 Nov 2026): a plain answer and
-    /// one the fork ended at a tool call. Each is billed once, under the fork's
-    /// own session with the head's owner, login, account and charge basis, from
-    /// the usage the row carries.
-    #[test]
-    fn thalamus_payer_pinned_fork_answer_rows_bill_once_each() {
-        const ROWS: [&[u8]; 2] = [
-            include_bytes!("../tests/vectors/thalamus-pi-fork-payer/fork-answer-plain.json"),
-            include_bytes!(
-                "../tests/vectors/thalamus-pi-fork-payer/fork-answer-tool-call-refused.json"
-            ),
-        ];
+    type ForkCall = (String, String, String, String, String);
+
+    /// Records pinned `fork_answer` rows through the real payer drain, after
+    /// declaring the fork's session under `harness` with owner `owner-head`.
+    /// Returns each call's (session, owner, charge basis, login, account) and
+    /// the measurement totals per (role, unit).
+    fn record_pinned_fork_rows(
+        harness: &str,
+        session: &str,
+        rows: &[&[u8]],
+    ) -> (Vec<ForkCall>, Vec<(String, String, i64)>) {
         let (_home, source, store, state) = fixture();
-        let session = "pi-fork-1b0ac48aa38d4d628974d5872d36585b";
         store
             .execute(
-                "INSERT INTO payer_session VALUES ('pi',?1,'owner-head',1000)",
-                [session],
+                "INSERT INTO payer_session VALUES (?1,?2,'owner-head',1000)",
+                [harness, session],
             )
             .unwrap();
-        for bytes in ROWS {
+        for bytes in rows {
             let row: serde_json::Value = serde_json::from_slice(bytes).unwrap();
             let text = |name: &str| row[name].as_str().map(str::to_owned);
             store
@@ -1027,7 +1024,7 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
             .unwrap();
         state
             .with_conn(|conn| {
-                let calls: Vec<(String, String, String, String, String)> = conn
+                let calls = conn
                     .prepare(
                         "SELECT session,work_class,charge_basis,auth_selection,account_ref
                          FROM usage_event ORDER BY producer_ref",
@@ -1045,15 +1042,7 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
                     .unwrap()
                     .collect::<rusqlite::Result<_>>()
                     .unwrap();
-                let expected = (
-                    session.to_owned(),
-                    "owner-head".to_owned(),
-                    "subscription_included".to_owned(),
-                    "cred-head".to_owned(),
-                    "acct-head".to_owned(),
-                );
-                assert_eq!(calls, vec![expected.clone(), expected]);
-                let measurements: Vec<(String, String, i64)> = conn
+                let measurements = conn
                     .prepare(
                         "SELECT role,unit,SUM(quantity_units) FROM measurement
                          GROUP BY role,unit ORDER BY role,unit",
@@ -1063,18 +1052,84 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
                     .unwrap()
                     .collect::<rusqlite::Result<_>>()
                     .unwrap();
-                assert_eq!(
-                    measurements,
-                    vec![
-                        ("cache_read".into(), "token".into(), 1_800),
-                        ("cache_write".into(), "token".into(), 60),
-                        ("input".into(), "token".into(), 24),
-                        ("output".into(), "token".into(), 14),
-                    ]
-                );
-                Ok(())
+                Ok((calls, measurements))
             })
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Agent Runner's `fork_answer` rows from a Pi head, exactly as its payer
+    /// write stores them (`tests/vectors/thalamus-pi-fork-payer`, 16 Nov 2026):
+    /// a plain answer and one the fork ended at a tool call. Each is billed
+    /// once, under the fork's own session with the head's owner, login,
+    /// account and charge basis, from the usage the row carries.
+    #[test]
+    fn thalamus_payer_pinned_pi_fork_answer_rows_bill_once_each() {
+        let session = "pi-fork-1b0ac48aa38d4d628974d5872d36585b";
+        let (calls, measurements) = record_pinned_fork_rows(
+            "pi",
+            session,
+            &[
+                include_bytes!("../tests/vectors/thalamus-pi-fork-payer/fork-answer-plain.json"),
+                include_bytes!(
+                    "../tests/vectors/thalamus-pi-fork-payer/fork-answer-tool-call-refused.json"
+                ),
+            ],
+        );
+        let expected = (
+            session.to_owned(),
+            "owner-head".to_owned(),
+            "subscription_included".to_owned(),
+            "cred-head".to_owned(),
+            "acct-head".to_owned(),
+        );
+        assert_eq!(calls, vec![expected.clone(), expected]);
+        assert_eq!(
+            measurements,
+            vec![
+                ("cache_read".into(), "token".into(), 1_800),
+                ("cache_write".into(), "token".into(), 60),
+                ("input".into(), "token".into(), 24),
+                ("output".into(), "token".into(), 14),
+            ]
+        );
+    }
+
+    /// The same rows from a Claude Code head
+    /// (`tests/vectors/thalamus-cc-fork-payer`, 16 Nov 2026). The plain answer
+    /// carries a five-minute/one-hour split that sums to its cache write, so
+    /// that write is recorded per lifetime; the other answer wrote no cache.
+    #[test]
+    fn thalamus_payer_pinned_claude_code_fork_answer_rows_bill_once_each() {
+        let session = "cc-fork-917493cc71544054a0a8e9a0f01dd278";
+        let (calls, measurements) = record_pinned_fork_rows(
+            "claude-code",
+            session,
+            &[
+                include_bytes!("../tests/vectors/thalamus-cc-fork-payer/fork-answer-plain.json"),
+                include_bytes!(
+                    "../tests/vectors/thalamus-cc-fork-payer/fork-answer-tool-call-refused.json"
+                ),
+            ],
+        );
+        let expected = (
+            session.to_owned(),
+            "owner-head".to_owned(),
+            "subscription_included".to_owned(),
+            "oauth:anthropic:one".to_owned(),
+            "acct-1".to_owned(),
+        );
+        assert_eq!(calls, vec![expected.clone(), expected]);
+        assert_eq!(
+            measurements,
+            vec![
+                ("cache_read".into(), "token".into(), 1_700),
+                ("cache_write".into(), "token".into(), 0),
+                ("cache_write".into(), "token_cache_1h".into(), 20),
+                ("cache_write".into(), "token_cache_5m".into(), 10),
+                ("input".into(), "token".into(), 1_012),
+                ("output".into(), "token".into(), 57),
+            ]
+        );
     }
 
     #[test]
