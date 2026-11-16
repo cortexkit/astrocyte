@@ -40,7 +40,7 @@ tracing = "0.1"
 cortexkit-store = { version = "=0.2.4", features = ["sqlite"] }
 cortexkit-store-types = "=0.2.2"
 cortexkit-provider-usage = "=0.14.0"
-cortexkit-bus-naming = "=0.4.0"
+cortexkit-bus-naming = "=0.4.4"
 cortexkit-bus-nats = "=0.5.1"
 cortexkit-bus-trait = "=0.3.1"
 async-nats = { version = "=0.50.0", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }

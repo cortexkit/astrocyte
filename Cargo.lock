@@ -283,9 +283,9 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.4.0"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be84df2874202cd171f19acd2a38f6e13db498b31813a0f0e7a6e91235ddcc54"
+checksum = "80ef546ce7b3c9796810c1ffe36a7daf23d82a4af8772f7336704c248beddcfe"
 
 [[package]]
 name = "cortexkit-bus-nats"
