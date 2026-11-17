@@ -21,10 +21,11 @@ pub fn catalog_history_boundary(client: &CatalogClient) -> i64 {
 /// Discovery is the one catalog call that cannot be deferred to a per-event
 /// pricing failure, because every later call needs the boundary. It used to
 /// run at startup and a refusal exited the process. On a daemon restart every
-/// module boots at once, fusiform is not yet registered, and three refusals
-/// inside half a second spent the crash budget: the module was `failed` for
-/// a peer that was seconds from live. The dependency contract is register
-/// first and fail at USE, never block boot on a peer.
+/// module boots at once and fusiform is not yet registered. The supervisor
+/// marks a module `failed` after three crashes within ten minutes, and three
+/// refusals inside half a second did that: the module stayed down for a peer
+/// that was seconds from live. So a module registers first and fails only
+/// when it uses the peer; it never blocks startup waiting for one.
 pub struct PendingCatalog {
     pub(super) connection: Arc<dyn CatalogConnection>,
 }
@@ -36,8 +37,9 @@ impl PendingCatalog {
     ///
     /// NO REFUSAL FROM THE PEER IS FATAL HERE. This once returned Err on a
     /// non-retryable refusal, which killed the refresher thread at startup
-    /// and spent the crash budget in seconds -- against a healthy producer
-    /// one protocol version behind, whose boundary refusal carried a code the
+    /// and used up the supervisor's three restarts in seconds -- against a
+    /// healthy producer one protocol version behind, whose boundary refusal
+    /// carried a code the classifier did not expect.
     /// classifier did not expect. A catalog that cannot be discovered costs
     /// pricing; it must not cost ingest or capacity, which do not depend on
     /// it. The distinction the kind still buys is the log line: a retryable
