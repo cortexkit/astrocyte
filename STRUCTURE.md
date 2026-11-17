@@ -1,7 +1,7 @@
 # Codebase Structure
 
-This three-crate Cargo workspace is described in `ARCHITECTURE.md`; this page maps
-its files.
+A Cargo workspace of three crates. `ARCHITECTURE.md` explains how the parts work
+together; this file says where they live. To find a symbol, search the code.
 
 ## Repository
 
@@ -20,7 +20,7 @@ Internal records live in the ignored `.cortexkit/` folder, which tracks only
 
 ## `crates/astrocyte-core/src`
 
-- `store.rs`: `MIGRATIONS` (1 to 39), connection setup and `migrate_store`.
+- `store.rs`: `MIGRATIONS`, connection setup and `migrate_store`.
 - `fact.rs`: call and measurement identity.
 - `ingest.rs`: recording calls in one transaction, redelivery and quarantine,
   chargeability settlement, adjustments and charge-basis correction.
@@ -111,13 +111,14 @@ tests; samples pinned from peers are in `tests/vectors/`.
 
 ## Scripts
 
-- `scripts/gate.sh`: runs local checks and remote Linux/Windows suites before a push;
-  --fast runs only local checks.
-- `scripts/check_doc_references.py`: checks overview doc references and their combined size ceiling.
-- `scripts/check-file-sizes.py`: enforces the 5,000-line Rust source limit.
-- `scripts/fmt-check.sh`, `scripts/check-path-deps.py`,
+- `scripts/gate.sh`: CI's checks before a push: local checks, then the Linux and
+  Windows suites on the remote build servers; with --fast, only the local checks.
+- `scripts/check_doc_references.py`: checks every path, identifier, table and
+  operation named in the two overview docs, and their size ceiling.
+- `scripts/fmt-check.sh`, `scripts/check-path-deps.py`, `scripts/check-file-sizes.py`,
   `scripts/check-cortexkit-layout.sh`, `scripts/check_train_preconditions.py`:
-  formatting, no outside path dependencies, nothing internal tracked, CI shape.
+  formatting, no outside path dependencies, source files under 5,000 lines,
+  nothing internal tracked, CI shape.
 - `scripts/train-push.sh`, `scripts/watch-ci.sh`, `scripts/lib/`: landing on
   master through CI.
 

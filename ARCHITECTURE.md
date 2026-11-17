@@ -41,7 +41,7 @@ against fusiform. It serves spend and usage diagnostics over subc.
   refresher loop, peer clients and the mapping from each source into the ledger.
 - `astrocyte-readers`: parsers for harness session stores (Claude Code, Codex,
   OpenCode 1 and 2, Pi, Gemini CLI, Goose, Oh My Pi, Kimi CLI) and provider name
-  normalisation. Most are adapted from tokscale.
+  normalisation.
 
 ## Durable state
 
@@ -190,8 +190,7 @@ plan history.
 
 ## Served operations
 
-Dispatch and the manifest share `PUBLIC_OPERATION_NAMES` in
-`crates/astrocyte-module/src/ops.rs`.
+Dispatch and the manifest share `PUBLIC_OPERATION_NAMES` in `ops.rs`.
 
 Reads:
 - spend: `budget.verdict`, `spend.report`, `spend.subscription.report`,
