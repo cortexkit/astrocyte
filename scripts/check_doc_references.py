@@ -57,10 +57,19 @@ def source_text():
 def migrations():
     text = STORE.read_text()
     body = text[text.index("pub const MIGRATIONS") : text.index("#[cfg(test)]")]
-    return [
-        (int(v), sql)
-        for v, sql in re.findall(r'version:\s*(\d+),\s*statements:\s*r#"(.*?)"#', body, re.S)
-    ]
+    constants = {}
+    for path in (STORE.parent / "store/migrations").glob("*.rs"):
+        for name, sql in re.findall(r'const\s+(V\d+):\s*&str\s*=\s*r#"(.*?)"#;', path.read_text(), re.S):
+            constants[(path.stem, name)] = sql
+    entries = re.findall(
+        r'Migration\s*\{\s*version:\s*(\d+),\s*statements:\s*'
+        r'(?:r#"(.*?)"#|migrations::(\w+)::(V\d+)),\s*\}',
+        body,
+        re.S,
+    )
+    if len(entries) != len(re.findall(r'\bMigration\s*\{', body)):
+        raise ValueError("could not read every migration")
+    return [(int(v), constants[(module, name)] if module else sql) for v, sql, module, name in entries]
 
 
 def final_tables(chain):

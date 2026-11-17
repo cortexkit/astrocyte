@@ -20,12 +20,7 @@ RAW_STRING = re.compile(r'(?:br|cr|r)(#*)"')
 GENERATED_FILES: dict[str, str] = {}
 
 # Existing large files may shrink but must not grow. Split them by area when worked on.
-EXCEPTIONS: dict[str, tuple[int, str]] = {
-    "crates/astrocyte-core/src/store.rs": (
-        5_165,
-        "SQLite migrations, ledger storage and queries; split by area when next worked on.",
-    ),
-}
+EXCEPTIONS: dict[str, tuple[int, str]] = {}
 
 
 class Token(NamedTuple):
