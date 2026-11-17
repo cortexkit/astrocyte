@@ -471,7 +471,7 @@ fn hour_steps(history: usize) -> u64 {
         body["project_id"] = json!(format!("old-project-{index}"));
         store_fact(&tx, "prefrontal", &body);
         tx.execute(
-            "INSERT INTO placement_fact VALUES(?1,'entorhinal','{}',?2,'old-ws',0,1,NULL)",
+            "INSERT INTO placement_fact VALUES(?1,'entorhinal',json_object('fact_id',?1,'project_id',?2,'workspace_id','old-ws','effective_from_ms',0,'recorded_at_ms',1,'supersedes',NULL),?2,'old-ws',0,1,NULL)",
             params![format!("old-place-{index}"), format!("old-project-{index}")],
         )
         .unwrap();
