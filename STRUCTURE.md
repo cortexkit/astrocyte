@@ -61,9 +61,8 @@ A library shared by three binaries: `main.rs` (`ck-astrocyte`) and two tools,
 - `ops.rs`: `PUBLIC_OPERATION_NAMES` and `dispatch`.
 - `state.rs`: `SharedState`, the writer fence, the projection and health.
 - `config.rs`: closed configuration decoding and `INGEST_SOURCES`.
-- `refresher.rs`: the loop: full ticks, the fast lane, pricing, the queue check,
-  summaries and the multiplier stage. It also holds `harness_drain`, the drain
-  plumbing every file source shares.
+- `refresher.rs`: the loop and shared types; `refresher/` holds catalog, source
+  draining, pricing, queue checks, summaries and multiplier stages.
 - Harness sources, one per source key: `claude_code_source.rs`, `codex_source.rs`,
   `opencode_source.rs`, `opencode_v2_source.rs`, `pi_source.rs`,
   `gemini_source.rs`, `goose_source.rs`, `omp_source.rs`, `kimi_source.rs`.
