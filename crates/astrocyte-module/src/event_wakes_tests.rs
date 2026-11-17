@@ -33,7 +33,7 @@ fn event_wakes_backstop_and_fallback_are_independent() {
     let sources = [
         Source::Media,
         Source::Catalog,
-        Source::Attribution("prefrontal-core"),
+        Source::Attribution("prefrontal"),
         Source::Attribution("magic-context"),
         Source::Attribution("basal"),
         Source::Attribution("entorhinal"),

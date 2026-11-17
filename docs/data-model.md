@@ -104,7 +104,7 @@ grouping and filtering use these split keys, with bounded hour reductions while
 stale, leaving ordinary report rows and keys unchanged. The public attribution project dimension is
 `project_id`; legacy `project` remains the ledger's recorded folder.
 
-Scheduled full refreshes page prefrontal-core, basal and magic-context's
+Scheduled full refreshes page prefrontal, basal and magic-context's
 `attribution.read` and entorhinal's `placement.read`, committing each page with
 its opaque cursor. A terminal null `next` retains the request cursor; unchanged
 replays open no write transaction. Refusals and missing publishers leave cursor

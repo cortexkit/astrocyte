@@ -27,7 +27,7 @@ THALAMUS atomically replaces
       "session": "01234567-89ab-4cde-8123-456789abcdef",
       "session_ref": "runner/head",
       "path": "/home/me/.local/share/cortexkit/thalamus-harness/claude-code/sessions/01234567-89ab-4cde-8123-456789abcdef/config",
-      "owner_principal": "prefrontal-core",
+      "owner_principal": "prefrontal",
       "owner_session": "ses_core_bound_conversation",
       "state": "active",
       "done_at_ms": null

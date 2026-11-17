@@ -27,7 +27,7 @@ THALAMUS atomically replaces
       "path": "/home/me/.local/share/cortexkit/thalamus-harness/pi-sessions/worker-one",
       "session": null,
       "owner_session": "ses_core_bound_conversation",
-      "owner_principal": "prefrontal-core",
+      "owner_principal": "prefrontal",
       "state": "active",
       "done_at_ms": null
     }

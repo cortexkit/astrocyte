@@ -648,7 +648,7 @@ independently retried durable consumers share it with quota events, runner steps
 and the publishers. `m_astrocyte_media_usage` wakes the Colliculus reader;
 `m_astrocyte_catalog` wakes pending Fusiform discovery and rate-era catalog
 refresh; `m_astrocyte_attribution` wakes only the publisher named in the subject
-(prefrontal-core, magic-context, basal, or entorhinal). The payer durable is not
+(prefrontal, magic-context, basal, or entorhinal). The payer durable is not
 used: the payer store remains the only payer source.
 
 While each durable is attached and pulling, full ticks backstop media and catalog

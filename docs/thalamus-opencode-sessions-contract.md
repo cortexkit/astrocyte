@@ -36,7 +36,7 @@ atomically (a temporary file, then rename).
     {
       "path": "/home/me/.local/share/cortexkit/thalamus-harness/opencode-sessions/s-0123",
       "session_ref": "s-0123",
-      "owner_principal": "prefrontal-core",
+      "owner_principal": "prefrontal",
       "state": "active",
       "done_at_ms": null
     },
@@ -47,7 +47,7 @@ atomically (a temporary file, then rename).
         {
           "session": "ses_0123",
           "session_ref": "s-0456",
-          "owner_principal": "prefrontal-core",
+          "owner_principal": "prefrontal",
           "state": "active",
           "done_at_ms": null
         }
@@ -78,8 +78,8 @@ An entry without `kind` declares a folder for one session, with these fields:
 - `session_ref`: the harness module's reference for the session. Astrocyte
   uses it only in log lines in v1.
 - `owner_principal`: the module that started the session, as the bare
-  module id the daemon attests (for example `prefrontal-core` or
-  `magic-context`, never `reserved:prefrontal-core`). Astrocyte records it
+  module id the daemon attests (for example `prefrontal` or
+  `magic-context`, never `reserved:prefrontal`). Astrocyte records it
   verbatim as the `work_class` of every call from that folder.
 - `state`: `active` while the session may still write, including while its
   server is stopped for idleness. It becomes `done` only when the session
@@ -138,7 +138,7 @@ example, a session item may be:
 {
   "session": "ses_copy",
   "session_ref": "s-copy",
-  "owner_principal": "prefrontal-core",
+  "owner_principal": "prefrontal",
   "state": "active",
   "done_at_ms": null,
   "imported_through_seq": 1200

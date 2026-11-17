@@ -1299,7 +1299,7 @@ fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
         ("ckbus", true),
         ("claustrum", true),
         ("colliculus", desired.harness_ingest.ingests("colliculus")),
-        ("prefrontal-core", true),
+        ("prefrontal", true),
         ("basal", true),
         ("magic-context", true),
         ("entorhinal", true),
@@ -1793,7 +1793,7 @@ mod tests {
         let scope = flow_id.map(|flow_id| {
             ScopeStamp::new(
                 Principal::Reserved {
-                    module_id: "prefrontal-core".to_string(),
+                    module_id: "prefrontal".to_string(),
                 },
                 "scope-1",
                 1,
@@ -2444,7 +2444,7 @@ mod tests {
 
     fn expected_modules(base: &[&str]) -> Vec<String> {
         base.iter()
-            .chain(["prefrontal-core", "basal", "magic-context", "entorhinal"].iter())
+            .chain(["prefrontal", "basal", "magic-context", "entorhinal"].iter())
             .map(|name| (*name).into())
             .collect()
     }
@@ -2452,7 +2452,7 @@ mod tests {
         base.iter()
             .chain(
                 [
-                    "astrocyte-prefrontal-core-attribution-read",
+                    "astrocyte-prefrontal-attribution-read",
                     "astrocyte-basal-attribution-read",
                     "astrocyte-magic-context-attribution-read",
                     "astrocyte-entorhinal-placement-read",
@@ -2468,10 +2468,7 @@ mod tests {
         let manifest = manifest("astrocyte", &desired(false, false));
         let wire = serde_json::to_value(&manifest).unwrap();
         for (module, name) in [
-            (
-                "prefrontal-core",
-                "astrocyte-prefrontal-core-attribution-read",
-            ),
+            ("prefrontal", "astrocyte-prefrontal-attribution-read"),
             ("basal", "astrocyte-basal-attribution-read"),
             ("magic-context", "astrocyte-magic-context-attribution-read"),
             ("entorhinal", "astrocyte-entorhinal-placement-read"),
@@ -3476,7 +3473,7 @@ mod tests {
             (
                 7,
                 Principal::Reserved {
-                    module_id: "prefrontal-core".into(),
+                    module_id: "prefrontal".into(),
                 },
                 format!("fed-phone:{fingerprint}"),
             ),
@@ -3643,7 +3640,7 @@ mod tests {
             (
                 6,
                 Principal::Reserved {
-                    module_id: "prefrontal-core".into(),
+                    module_id: "prefrontal".into(),
                 },
                 false,
             ),
@@ -3852,7 +3849,7 @@ mod tests {
         };
         let callers = [
             (5, Principal::Direct),
-            (6, module("prefrontal-core")),
+            (6, module("prefrontal")),
             (7, module("broca")),
             (8, Principal::Unverified),
         ];

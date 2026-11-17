@@ -32,7 +32,7 @@ impl Publisher {
     ];
     pub fn module(self) -> &'static str {
         match self {
-            Self::Prefrontal => "prefrontal-core",
+            Self::Prefrontal => "prefrontal",
             Self::Basal => "basal",
             Self::MagicContext => "magic-context",
             Self::Entorhinal => "entorhinal",
