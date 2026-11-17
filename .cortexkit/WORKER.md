@@ -37,6 +37,13 @@ cargo test --workspace --locked <filter>                  # tests for what you c
   other work there, and on macOS each freshly built test binary also costs a security
   scan. If a remote job is refused for capacity, retry it later or with fewer vCPUs.
 
+Hand-written Rust source files must stay under 5,000 lines, excluding in-file test
+modules; whole test files and explicitly named generated files are exempt. Existing
+oversized files are pinned and may not grow: split them by area when next worked on,
+lower a pin after shrinking, and remove the exception once under 5,000 lines.
+`scripts/check-file-sizes.py` enforces the rule in `scripts/gate.sh --fast` and CI;
+use `--report` to see files at 4,000 lines or more.
+
 ## The full gate (head only)
 
 `scripts/gate.sh` runs CI's checks. Its local checks take about 4 seconds: the train

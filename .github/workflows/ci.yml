@@ -112,6 +112,11 @@ jobs:
       - name: No path dependency outside the repo
         run: python3 scripts/check-path-deps.py
 
+      - name: Hand-written Rust file sizes
+        run: |
+          python3 scripts/check-file-sizes.py --self-test
+          python3 scripts/check-file-sizes.py
+
       - name: Format check
         run: scripts/fmt-check.sh
 

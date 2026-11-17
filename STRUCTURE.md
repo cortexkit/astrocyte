@@ -1,7 +1,7 @@
 # Codebase Structure
 
-A Cargo workspace of three crates. `ARCHITECTURE.md` explains how the parts work
-together; this file says where they live. To find a symbol, search the code.
+This three-crate Cargo workspace is described in `ARCHITECTURE.md`; this page maps
+its files.
 
 ## Repository
 
@@ -111,10 +111,10 @@ tests; samples pinned from peers are in `tests/vectors/`.
 
 ## Scripts
 
-- `scripts/gate.sh`: CI's checks before a push: local checks, then the Linux and
-  Windows suites on the remote build servers; with --fast, only the local checks.
-- `scripts/check_doc_references.py`: checks every path, identifier, table and
-  operation named in the two overview docs, and their size ceiling.
+- `scripts/gate.sh`: runs local checks and remote Linux/Windows suites before a push;
+  --fast runs only local checks.
+- `scripts/check_doc_references.py`: checks overview doc references and their combined size ceiling.
+- `scripts/check-file-sizes.py`: enforces the 5,000-line Rust source limit.
 - `scripts/fmt-check.sh`, `scripts/check-path-deps.py`,
   `scripts/check-cortexkit-layout.sh`, `scripts/check_train_preconditions.py`:
   formatting, no outside path dependencies, nothing internal tracked, CI shape.

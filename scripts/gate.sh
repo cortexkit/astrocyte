@@ -28,6 +28,9 @@ step "nothing internal tracked under .cortexkit"
 scripts/check-cortexkit-layout.sh
 step "no path dependency outside the repo"
 python3 scripts/check-path-deps.py
+step "hand-written Rust file sizes"
+python3 scripts/check-file-sizes.py --self-test
+python3 scripts/check-file-sizes.py
 step "format"
 scripts/fmt-check.sh
 
