@@ -1094,6 +1094,44 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
         );
     }
 
+    /// The Pi rows again after Agent Runner added Pi's one-hour cache-write
+    /// count (`tests/vectors/thalamus-pi-fork-payer-v2`, 17 Nov 2026). Each
+    /// row's 10 five-minute and 20 one-hour tokens sum to its 30-token cache
+    /// write, so both writes are recorded per lifetime and none at the plain
+    /// rate; everything else bills as in the first version.
+    #[test]
+    fn thalamus_payer_pinned_pi_fork_answer_rows_record_the_cache_split() {
+        let session = "pi-fork-683ff27bb28b45ed8f3347da118fcef3";
+        let (calls, measurements) = record_pinned_fork_rows(
+            "pi",
+            session,
+            &[
+                include_bytes!("../tests/vectors/thalamus-pi-fork-payer-v2/fork-answer-plain.json"),
+                include_bytes!(
+                    "../tests/vectors/thalamus-pi-fork-payer-v2/fork-answer-tool-call-refused.json"
+                ),
+            ],
+        );
+        let expected = (
+            session.to_owned(),
+            "owner-head".to_owned(),
+            "subscription_included".to_owned(),
+            "cred-head".to_owned(),
+            "acct-head".to_owned(),
+        );
+        assert_eq!(calls, vec![expected.clone(), expected]);
+        assert_eq!(
+            measurements,
+            vec![
+                ("cache_read".into(), "token".into(), 1_800),
+                ("cache_write".into(), "token_cache_1h".into(), 40),
+                ("cache_write".into(), "token_cache_5m".into(), 20),
+                ("input".into(), "token".into(), 24),
+                ("output".into(), "token".into(), 14),
+            ]
+        );
+    }
+
     /// The same rows from a Claude Code head
     /// (`tests/vectors/thalamus-cc-fork-payer`, 16 Nov 2026). The plain answer
     /// carries a five-minute/one-hour split that sums to its cache write, so

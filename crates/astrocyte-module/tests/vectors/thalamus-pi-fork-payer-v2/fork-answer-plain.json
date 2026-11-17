@@ -1,0 +1,17 @@
+{
+  "account_ref": "acct-head",
+  "attempt_id": "fork_run_0e2294de74984a5e933eea24e9bd43d5",
+  "auth_selection": "cred-head",
+  "charge_basis": "subscription_included",
+  "harness": "pi",
+  "model": "pi-model",
+  "outcome": "completed",
+  "provider": "test",
+  "provider_request_id": null,
+  "provider_response_id": "msg_fork_answer",
+  "recorded_at_ms": 1700000000000,
+  "request_kind": "fork_answer",
+  "session": "pi-fork-683ff27bb28b45ed8f3347da118fcef3",
+  "step_ref": null,
+  "usage_json": "{\"usage_by_model\":[{\"cache_write_1h_tokens\":20,\"cache_write_5m_tokens\":10,\"model_used\":\"pi-model\",\"usage\":{\"cache_write_tokens\":30,\"cached_input_tokens\":900,\"input_tokens\":12,\"output_tokens\":7}}]}"
+}
