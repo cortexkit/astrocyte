@@ -42,17 +42,21 @@ impl Route {
         .await
         .map_err(|_| ())?
         .map_err(|_| ())?;
-        let identity=serde_json::from_value(json!({"harness":"ck-astrocyte","session":format!("attribution/{}",publisher.module())})).map_err(|_|())?;
-        let handle = consumer
-            .open_route(
-                RouteTarget::ManagementSurface {
-                    module_id: publisher.module().into(),
-                },
-                identity,
-                options(),
-            )
-            .await
-            .map_err(|_| ())?;
+        // Prefrontal answers under its new id after its rename and its old id
+        // before it. A refused open for an id not installed is cheap, so each
+        // refresh tries the preferred id first rather than remembering one.
+        let mut opened = None;
+        for module in publisher.modules() {
+            let identity=serde_json::from_value(json!({"harness":"ck-astrocyte","session":format!("attribution/{}",publisher.key())})).map_err(|_|())?;
+            let route = RouteTarget::ManagementSurface {
+                module_id: (*module).into(),
+            };
+            if let Ok(handle) = consumer.open_route(route, identity, options()).await {
+                opened = Some(handle);
+                break;
+            }
+        }
+        let handle = opened.ok_or(())?;
         Ok(Self {
             consumer,
             handle,
@@ -114,7 +118,7 @@ async fn drain_pages<T: ReadTransport>(
     let stored = state.with_conn(|conn| {
         conn.query_row(
             "SELECT cursor FROM attribution_cursor WHERE publisher=?1",
-            [publisher.module()],
+            [publisher.key()],
             |r| r.get::<_, Option<String>>(0),
         )
         .optional()
@@ -223,7 +227,7 @@ fn drain_selected(
             break;
         }
         let Some(ticket) = state.event_wakes().begin(
-            crate::event_wakes::Source::Attribution(publisher.module()),
+            crate::event_wakes::Source::Attribution(publisher.key()),
             full_tick,
             crate::state::now_ms(),
         ) else {
@@ -234,7 +238,7 @@ fn drain_selected(
         if let Err(error) = result {
             if !stop.load(Ordering::Relaxed) {
                 tracing::warn!(
-                    publisher = publisher.module(),
+                    publisher = publisher.key(),
                     %error,
                     "attribution page was not committed"
                 );

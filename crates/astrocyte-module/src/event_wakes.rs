@@ -125,7 +125,7 @@ const PUBLISHERS: [astrocyte_core::attribution::Publisher; 4] =
 pub(crate) async fn follow(state: &SharedState, connection: &NatsConnection, names: &AccountNames) {
     let media = [Source::Media];
     let catalog = [Source::Catalog];
-    let attribution = PUBLISHERS.map(|publisher| Source::Attribution(publisher.module()));
+    let attribution = PUBLISHERS.map(|publisher| Source::Attribution(publisher.key()));
     tokio::join!(
         follow_one(state, connection, names, "m_astrocyte_media_usage", &media),
         follow_one(state, connection, names, "m_astrocyte_catalog", &catalog),
@@ -173,21 +173,30 @@ async fn follow_one(
 
 fn subject_source(names: &AccountNames, subject: &str, sources: &[Source]) -> Option<Source> {
     sources.iter().copied().find(|source| {
-        let (publisher, event) = match source {
-            Source::Media => ("colliculus", "usage_recorded"),
-            Source::Catalog => ("fusiform", "catalog_changed"),
-            Source::Attribution(publisher) => (
-                *publisher,
-                if *publisher == "entorhinal" {
-                    "placement_fact"
-                } else {
-                    "attribution_fact"
-                },
-            ),
+        let (modules, event): (&[&str], _) = match source {
+            Source::Media => (&["colliculus"], "usage_recorded"),
+            Source::Catalog => (&["fusiform"], "catalog_changed"),
+            Source::Attribution(key) => {
+                let publisher = PUBLISHERS
+                    .into_iter()
+                    .find(|publisher| publisher.key() == *key);
+                (
+                    publisher.map_or(&[], |publisher| publisher.modules()),
+                    if *key == "entorhinal" {
+                        "placement_fact"
+                    } else {
+                        "attribution_fact"
+                    },
+                )
+            }
         };
-        names
-            .event_subject(publisher, event, 1)
-            .is_ok_and(|expected| expected == subject)
+        // A publisher renamed in place (prefrontal) publishes under either id
+        // during the change; both subjects wake the same read.
+        modules.iter().any(|module| {
+            names
+                .event_subject(module, event, 1)
+                .is_ok_and(|expected| expected == subject)
+        })
     })
 }
 

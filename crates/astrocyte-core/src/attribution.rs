@@ -30,12 +30,28 @@ impl Publisher {
         Self::MagicContext,
         Self::Entorhinal,
     ];
-    pub fn module(self) -> &'static str {
+    /// The publisher's identity in this store: the `publisher` column of
+    /// stored facts, the cursor row and set-aside sources. Prefrontal keeps
+    /// the module id it published under first (`prefrontal-core`) after its
+    /// rename to `prefrontal`, so its cursor carries on and a correction made
+    /// after the rename still matches the fact it replaces.
+    pub fn key(self) -> &'static str {
         match self {
-            Self::Prefrontal => "prefrontal",
+            Self::Prefrontal => "prefrontal-core",
             Self::Basal => "basal",
             Self::MagicContext => "magic-context",
             Self::Entorhinal => "entorhinal",
+        }
+    }
+    /// The module ids this publisher may run under, preferred first. Routes
+    /// and bus subjects try each, so one build reads prefrontal before and
+    /// after its rename.
+    pub fn modules(self) -> &'static [&'static str] {
+        match self {
+            Self::Prefrontal => &["prefrontal", "prefrontal-core"],
+            Self::Basal => &["basal"],
+            Self::MagicContext => &["magic-context"],
+            Self::Entorhinal => &["entorhinal"],
         }
     }
     pub fn read_name(self) -> &'static str {
@@ -46,7 +62,7 @@ impl Publisher {
         }
     }
     pub fn source(self) -> String {
-        format!("attribution/{}", self.module())
+        format!("attribution/{}", self.key())
     }
 }
 
@@ -179,7 +195,7 @@ fn correction_scope(conn: &Connection, publisher: Publisher, fact: &Fact) -> Res
         return Ok(true);
     };
     let (kind, runner, harness, session, run, flow) = fact.subject.columns();
-    let invalid=sql(conn.query_row("SELECT EXISTS(SELECT 1 FROM attribution_fact WHERE fact_id=?1 AND (publisher<>?2 OR subject_kind<>?3 OR subject_runner IS NOT ?4 OR subject_harness IS NOT ?5 OR subject_session IS NOT ?6 OR subject_run_id IS NOT ?7 OR subject_flow_id IS NOT ?8))",params![previous,publisher.module(),kind,runner,harness,session,run,flow],|row|row.get::<_,bool>(0)))?;
+    let invalid=sql(conn.query_row("SELECT EXISTS(SELECT 1 FROM attribution_fact WHERE fact_id=?1 AND (publisher<>?2 OR subject_kind<>?3 OR subject_runner IS NOT ?4 OR subject_harness IS NOT ?5 OR subject_session IS NOT ?6 OR subject_run_id IS NOT ?7 OR subject_flow_id IS NOT ?8))",params![previous,publisher.key(),kind,runner,harness,session,run,flow],|row|row.get::<_,bool>(0)))?;
     Ok(!invalid)
 }
 fn action(conn: &Connection, publisher: Publisher, body: &Value) -> Result<Action, String> {
@@ -203,7 +219,7 @@ fn action(conn: &Connection, publisher: Publisher, body: &Value) -> Result<Actio
         )
         .optional())?;
     if let Some((owner, stored)) = known {
-        return Ok(if owner != publisher.module() {
+        return Ok(if owner != publisher.key() {
             Action::Aside("subject_has_other_publisher")
         } else if serde_json::from_str::<Value>(&stored).map_err(|e| e.to_string())? != *body {
             Action::Aside("fact_body_changed")
@@ -233,7 +249,7 @@ fn action(conn: &Connection, publisher: Publisher, body: &Value) -> Result<Actio
                 )
                 .optional())?;
             if previous.is_some_and(|(owner, project)| {
-                owner != publisher.module() || project != fact.project_id
+                owner != publisher.key() || project != fact.project_id
             }) {
                 return Ok(Action::Aside("supersedes_other_subject"));
             }
@@ -273,7 +289,7 @@ fn action(conn: &Connection, publisher: Publisher, body: &Value) -> Result<Actio
         return Ok(Action::Aside("supersedes_other_subject"));
     }
     let (kind, runner, harness, session, run, flow) = fact.subject.columns();
-    let other=sql(conn.query_row(&format!("SELECT 1 FROM attribution_fact f WHERE subject_kind=?1 AND subject_runner IS ?2 AND subject_harness IS ?3 AND subject_session IS ?4 AND subject_run_id IS ?5 AND subject_flow_id IS ?6 AND publisher<>?7 AND {VALID_CORRECTION} LIMIT 1"),params![kind,runner,harness,session,run,flow,publisher.module()],|_|Ok(())).optional())?.is_some();
+    let other=sql(conn.query_row(&format!("SELECT 1 FROM attribution_fact f WHERE subject_kind=?1 AND subject_runner IS ?2 AND subject_harness IS ?3 AND subject_session IS ?4 AND subject_run_id IS ?5 AND subject_flow_id IS ?6 AND publisher<>?7 AND {VALID_CORRECTION} LIMIT 1"),params![kind,runner,harness,session,run,flow,publisher.key()],|_|Ok(())).optional())?.is_some();
     Ok(if other {
         Action::Aside("subject_has_other_publisher")
     } else {
@@ -330,7 +346,7 @@ pub fn page_needs_commit(
             None
         };
         if let Some((owner, stored)) = known {
-            if owner == publisher.module()
+            if owner == publisher.key()
                 && serde_json::from_str::<Value>(&stored).map_err(|e| e.to_string())? == *body
             {
                 continue;
@@ -383,7 +399,7 @@ pub fn commit_page(
                 } else {
                     None
                 };
-                changed|=sql(tx.execute("INSERT INTO placement_fact SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE NOT EXISTS(SELECT 1 FROM placement_fact WHERE fact_id=?1)",params![fact.fact_id,publisher.module(),text(body)?,fact.project_id,fact.workspace_id,fact.effective_from_ms,fact.recorded_at_ms,fact.supersedes]))?!=0;
+                changed|=sql(tx.execute("INSERT INTO placement_fact SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE NOT EXISTS(SELECT 1 FROM placement_fact WHERE fact_id=?1)",params![fact.fact_id,publisher.key(),text(body)?,fact.project_id,fact.workspace_id,fact.effective_from_ms,fact.recorded_at_ms,fact.supersedes]))?!=0;
                 // A correction can remove an older effective placement as well
                 // as introduce its own; both portions of the timeline change.
                 placements.insert((
@@ -397,7 +413,7 @@ pub fn commit_page(
                 arrived.push(fact.fact_id.clone());
                 let (kind, runner, harness, session, run, flow) = fact.subject.columns();
                 let parent = fact.parent.as_ref().map(Subject::columns);
-                let inserted=sql(tx.execute("INSERT INTO attribution_fact SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22 WHERE NOT EXISTS(SELECT 1 FROM attribution_fact WHERE fact_id=?1)",params![fact.fact_id,publisher.module(),text(body)?,kind,runner,harness,session,run,flow,fact.alfonso,parent.map(|p|p.0),parent.and_then(|p|p.1),parent.and_then(|p|p.2),parent.and_then(|p|p.3),parent.and_then(|p|p.4),parent.and_then(|p|p.5),fact.workload,fact.task,fact.project_id,fact.effective_from_ms,fact.recorded_at_ms,fact.supersedes]))?!=0;
+                let inserted=sql(tx.execute("INSERT INTO attribution_fact SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22 WHERE NOT EXISTS(SELECT 1 FROM attribution_fact WHERE fact_id=?1)",params![fact.fact_id,publisher.key(),text(body)?,kind,runner,harness,session,run,flow,fact.alfonso,parent.map(|p|p.0),parent.and_then(|p|p.1),parent.and_then(|p|p.2),parent.and_then(|p|p.3),parent.and_then(|p|p.4),parent.and_then(|p|p.5),fact.workload,fact.task,fact.project_id,fact.effective_from_ms,fact.recorded_at_ms,fact.supersedes]))?!=0;
                 if inserted {
                     insert_session_ref(tx, &fact.fact_id, runner, harness, session)?;
                 }
@@ -422,7 +438,7 @@ pub fn commit_page(
             let (module, body) = sql(claim)?;
             let publisher = Publisher::ALL
                 .into_iter()
-                .find(|publisher| publisher.module() == module)
+                .find(|publisher| publisher.key() == module)
                 .ok_or("unknown attribution publisher")?;
             let body: Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
             let fact: Fact =
@@ -471,7 +487,7 @@ pub fn commit_page(
             .or(request_cursor)
             .map(text)
             .transpose()?;
-        sql(tx.execute("INSERT INTO attribution_cursor VALUES(?1,?2,?3,?4,?5) ON CONFLICT(publisher) DO UPDATE SET read_name=excluded.read_name,cursor=excluded.cursor,through=excluded.through,last_read_at_ms=excluded.last_read_at_ms",params![publisher.module(),publisher.read_name(),cursor,text(&page.through)?,now]))?;
+        sql(tx.execute("INSERT INTO attribution_cursor VALUES(?1,?2,?3,?4,?5) ON CONFLICT(publisher) DO UPDATE SET read_name=excluded.read_name,cursor=excluded.cursor,through=excluded.through,last_read_at_ms=excluded.last_read_at_ms",params![publisher.key(),publisher.read_name(),cursor,text(&page.through)?,now]))?;
     }
     Ok(changed)
 }

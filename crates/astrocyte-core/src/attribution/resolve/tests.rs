@@ -129,7 +129,7 @@ fn universe(rng: &mut Rng, direct: bool) -> Universe {
             "supersedes": supersedes,
         });
         let publisher = if rng.chance(85) {
-            "prefrontal"
+            "prefrontal-core"
         } else {
             "basal"
         };
@@ -234,7 +234,7 @@ fn ingest(conn: &mut Connection, rng: &mut Rng, universe: &Universe) {
             let page = Page {
                 facts: batch
                     .iter()
-                    .filter(|(name, _)| name == publisher.module())
+                    .filter(|(name, _)| name == publisher.key())
                     .map(|(_, body)| body.clone())
                     .collect(),
                 next: None,
@@ -469,7 +469,7 @@ fn hour_steps(history: usize) -> u64 {
         };
         let mut body = live_fact(&format!("old-{index}"), subject, Value::Null);
         body["project_id"] = json!(format!("old-project-{index}"));
-        store_fact(&tx, "prefrontal", &body);
+        store_fact(&tx, "prefrontal-core", &body);
         tx.execute(
             "INSERT INTO placement_fact VALUES(?1,'entorhinal',json_object('fact_id',?1,'project_id',?2,'workspace_id','old-ws','effective_from_ms',0,'recorded_at_ms',1,'supersedes',NULL),?2,'old-ws',0,1,NULL)",
             params![format!("old-place-{index}"), format!("old-project-{index}")],

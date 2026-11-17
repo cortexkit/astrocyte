@@ -33,7 +33,7 @@ fn event_wakes_backstop_and_fallback_are_independent() {
     let sources = [
         Source::Media,
         Source::Catalog,
-        Source::Attribution("prefrontal"),
+        Source::Attribution("prefrontal-core"),
         Source::Attribution("magic-context"),
         Source::Attribution("basal"),
         Source::Attribution("entorhinal"),
@@ -139,8 +139,8 @@ async fn event_wakes_real_nats_denied_catalog_preserves_other_consumers_and_rede
                 .map(|publisher| {
                     names
                         .event_subject(
-                            publisher.module(),
-                            if publisher.module() == "entorhinal" {
+                            publisher.key(),
+                            if publisher.key() == "entorhinal" {
                                 "placement_fact"
                             } else {
                                 "attribution_fact"
@@ -317,4 +317,25 @@ async fn event_wakes_real_nats_denied_catalog_preserves_other_consumers_and_rede
     })
     .await
     .unwrap_or_else(|_| panic!("isolated consumers did not finish {}", stage.get()));
+}
+
+/// Prefrontal publishes under `prefrontal-core` until its rename and under
+/// `prefrontal` after it. Either subject wakes the one prefrontal read, whose
+/// stored identity stays `prefrontal-core`.
+#[test]
+fn either_prefrontal_subject_wakes_the_prefrontal_read() {
+    let names = AccountNames::derive("rename").unwrap();
+    let sources = PUBLISHERS.map(|publisher| Source::Attribution(publisher.key()));
+    for module in ["prefrontal", "prefrontal-core"] {
+        let subject = names.event_subject(module, "attribution_fact", 1).unwrap();
+        assert_eq!(
+            subject_source(&names, &subject, &sources),
+            Some(Source::Attribution("prefrontal-core")),
+            "{module}"
+        );
+    }
+    let stranger = names
+        .event_subject("prefrontal-corex", "attribution_fact", 1)
+        .unwrap();
+    assert_eq!(subject_source(&names, &stranger, &sources), None);
 }

@@ -61,7 +61,7 @@ fn event_wakes_attribution_idle_opens_no_routes_and_subject_selects_one_publishe
     let state = test_state();
     let stop = AtomicBool::new(false);
     let sources =
-        Publisher::ALL.map(|publisher| crate::event_wakes::Source::Attribution(publisher.module()));
+        Publisher::ALL.map(|publisher| crate::event_wakes::Source::Attribution(publisher.key()));
     state.event_wakes().attached(&sources, true);
     let now = crate::state::now_ms();
     for source in sources {
@@ -235,7 +235,7 @@ fn attribution_reader_pinned_magic_context_and_placement_pages_use_their_own_cur
                 assert_eq!(
                     conn.query_row(
                         "SELECT read_name FROM attribution_cursor WHERE publisher=?1",
-                        [publisher.module()],
+                        [publisher.key()],
                         |r| r.get::<_, String>(0)
                     )
                     .unwrap(),

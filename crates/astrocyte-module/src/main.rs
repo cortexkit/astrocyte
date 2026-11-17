@@ -1300,6 +1300,7 @@ fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
         ("claustrum", true),
         ("colliculus", desired.harness_ingest.ingests("colliculus")),
         ("prefrontal", true),
+        ("prefrontal-core", true),
         ("basal", true),
         ("magic-context", true),
         ("entorhinal", true),
@@ -1491,10 +1492,10 @@ fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignal
     }
     for publisher in astrocyte_core::attribution::Publisher::ALL {
         declarations.push(SelfSignalDeclaration{
-            name:format!("astrocyte-{}-{}",publisher.module(),publisher.read_name().replace('.',"-")),
+            name:format!("astrocyte-{}-{}",publisher.modules()[0],publisher.read_name().replace('.',"-")),
             kind:SelfSignalKind::Poller,effect:SelfSignalEffect::Observe,
             anchored_to:SignalAnchor::FixedInterval,cadence:Some(tick_cadence()),
-            domain:Some(publisher.module().into()),
+            domain:Some(publisher.modules()[0].into()),
             note:Some(format!("{} on each full refresher tick, paging from the durable cursor. Terminal suffixes replay without writes; refusals retry next tick without changing health.",publisher.read_name())),
         });
     }
@@ -2444,7 +2445,16 @@ mod tests {
 
     fn expected_modules(base: &[&str]) -> Vec<String> {
         base.iter()
-            .chain(["prefrontal", "basal", "magic-context", "entorhinal"].iter())
+            .chain(
+                [
+                    "prefrontal",
+                    "prefrontal-core",
+                    "basal",
+                    "magic-context",
+                    "entorhinal",
+                ]
+                .iter(),
+            )
             .map(|name| (*name).into())
             .collect()
     }
