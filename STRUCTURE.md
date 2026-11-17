@@ -1,7 +1,7 @@
 # Codebase Structure
 
 A Cargo workspace of three crates. `ARCHITECTURE.md` explains how the parts work
-together; this file says where they live. To find a symbol, search the code.
+together; this file says where they live.
 
 ## Repository
 
@@ -134,8 +134,8 @@ tests; samples pinned from peers are in `tests/vectors/`.
 
 ## Where new code goes
 
-- **Schema:** a new `Migration` at the end of `MIGRATIONS` in `store.rs`. Never
-  edit an applied migration.
+- **Schema:** a new `Migration` at the end of `MIGRATIONS` in `store.rs`, its SQL
+  in `store/migrations/`. Never edit an applied migration.
 - **A served operation:** its logic in `astrocyte-core`, its name in
   `PUBLIC_OPERATION_NAMES` and `dispatch`, and its contract in
   `docs/module-surface.md`.
