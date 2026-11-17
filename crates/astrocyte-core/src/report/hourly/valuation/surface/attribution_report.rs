@@ -169,16 +169,10 @@ struct Live<'c> {
     config: &'c MultiplierConfig,
     reasoning: &'c [String],
     plans: &'c PlanBook,
-    maps: Option<crate::attribution::Maps>,
+    resolver: crate::attribution::Resolver,
 }
 impl Live<'_> {
     fn cells(&mut self, filter: &str) -> Result<(ReportCells, bool), ReportError> {
-        if self.maps.is_none() {
-            self.maps = Some(
-                crate::attribution::Maps::load(self.conn)
-                    .map_err(|_| ReportError::Integrity("invalid attribution evidence"))?,
-            );
-        }
         let mut ordinary = Cells::new();
         let mut projection = ValuationProjection::new();
         let (_, fetched) = reduce_both(
@@ -188,12 +182,7 @@ impl Live<'_> {
             self.reasoning,
             self.plans,
             &mut ordinary,
-            Some((
-                &mut projection,
-                self.maps
-                    .as_ref()
-                    .ok_or(ReportError::Integrity("attribution maps absent"))?,
-            )),
+            Some((&mut projection, &mut self.resolver)),
         )?;
         Ok((projection.into_iter().collect(), fetched))
     }
@@ -317,7 +306,7 @@ pub(crate) fn report(
         config: &config,
         reasoning: &reasoning,
         plans: &plans,
-        maps: None,
+        resolver: crate::attribution::Resolver::default(),
     };
     let mut output = Output::default();
     let mut day = DayWeights::default();

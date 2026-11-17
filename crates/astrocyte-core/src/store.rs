@@ -128,9 +128,47 @@ pub fn migrate_store(store: &SqliteStore) -> Result<MigrationOutcome, StoreError
         restore.restore()?;
         applied += rebuilt?.applied;
     }
+    let before = MIGRATIONS.partition_point(|migration| migration.version < SESSION_REF_VERSION);
+    let earlier = store.migrate("astrocyte", &MIGRATIONS[..before])?;
+    applied += earlier.applied;
+    if earlier.recorded < SESSION_REF_VERSION {
+        store
+            .with_conn(|conn| Ok(migrate_session_refs(conn, &MIGRATIONS[before])))?
+            .map_err(|error| {
+                StoreError::Migration(format!(
+                    "namespace 'astrocyte' migration {SESSION_REF_VERSION}: {error}"
+                ))
+            })?;
+        applied += 1;
+    }
     let mut outcome = store.migrate("astrocyte", MIGRATIONS)?;
     outcome.applied += applied;
     Ok(outcome)
+}
+
+/// The migration that adds `attribution_session_ref`. Its rows are SHA-256
+/// references SQLite can't compute, so the store runs the migration itself:
+/// the table, the backfill from every stored session fact and the version
+/// record commit together, exactly as a SQL-only migration would.
+const SESSION_REF_VERSION: u32 = 59;
+fn migrate_session_refs(conn: &Connection, migration: &Migration) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute_batch(migration.statements)
+        .map_err(|e| e.to_string())?;
+    crate::attribution::backfill_session_refs(&tx)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    tx.execute(
+        "INSERT INTO cortexkit_schema_version(namespace,version,applied_at_unix) VALUES(?1,?2,?3)",
+        rusqlite::params![
+            "astrocyte",
+            migration.version,
+            i64::try_from(now).unwrap_or(i64::MAX)
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
 }
 
 fn set_foreign_keys(conn: &Connection, enabled: bool) -> rusqlite::Result<()> {
@@ -424,6 +462,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 58,
         statements: migrations::v41_v58::V58,
     },
+    // Run by `migrate_session_refs`, which also fills the table in Rust.
+    Migration {
+        version: 59,
+        statements: migrations::v41_v58::V59,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -480,6 +523,7 @@ impl Drop for VmCounter {
 #[cfg(test)]
 mod tests {
     include!("store_v58_tests.rs");
+    include!("store_v59_tests.rs");
     include!("store_v33_tests.rs");
 
     #[test]

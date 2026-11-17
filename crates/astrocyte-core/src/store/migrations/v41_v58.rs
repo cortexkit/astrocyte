@@ -970,3 +970,23 @@ CREATE TABLE attribution_valuation_cell (
     FOREIGN KEY(kind,hour_number) REFERENCES attribution_hour(kind,hour_number)
 );
 "#;
+
+// SQLite can't compute a session_ref, so this migration's rows are filled in
+// Rust by `migrate_store`, in the same transaction that runs this SQL.
+pub(in crate::store) const V59: &str = r#"-- Each session fact filed under the session_ref computed from its subject, so
+-- attribution can find a fact by that name through an index.
+CREATE TABLE attribution_session_ref (
+    runner TEXT NOT NULL,
+    session_ref TEXT NOT NULL,
+    fact_id TEXT NOT NULL,
+    PRIMARY KEY(runner,session_ref,fact_id)
+) WITHOUT ROWID;
+CREATE TRIGGER attribution_session_ref_no_update BEFORE UPDATE ON attribution_session_ref
+BEGIN SELECT RAISE(ABORT, 'attribution_session_ref_no_update'); END;
+CREATE TRIGGER attribution_session_ref_no_delete BEFORE DELETE ON attribution_session_ref
+BEGIN SELECT RAISE(ABORT, 'attribution_session_ref_no_delete'); END;
+CREATE TRIGGER attribution_session_ref_insert_once BEFORE INSERT ON attribution_session_ref
+WHEN EXISTS (SELECT 1 FROM attribution_session_ref WHERE runner=NEW.runner
+    AND session_ref=NEW.session_ref AND fact_id=NEW.fact_id)
+BEGIN SELECT RAISE(ABORT, 'attribution_session_ref_insert_once'); END;
+"#;

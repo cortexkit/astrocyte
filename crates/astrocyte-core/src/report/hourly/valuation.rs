@@ -197,10 +197,10 @@ fn reduce_both(
     cells: &mut Cells,
     projection: Option<(
         &mut attribution::ValuationProjection,
-        &crate::attribution::Maps,
+        &mut crate::attribution::Resolver,
     )>,
 ) -> Result<(usize, bool), ReportError> {
-    let (mut projection, maps) = projection.map_or((None, None), |(projection, maps)| {
+    let (mut projection, mut maps) = projection.map_or((None, None), |(projection, maps)| {
         (Some(projection), Some(maps))
     });
     use crate::multiplier::ModelResolution;
@@ -252,8 +252,8 @@ fn reduce_both(
     };
     for event in &ledger.events {
         let key = key(&ledger, event);
-        let tuple = if let Some(maps) = maps {
-            attribution::resolve(maps, &ledger, event)
+        let tuple = if let Some(resolver) = maps.as_deref_mut() {
+            attribution::resolve(resolver, conn, &ledger, event)?
         } else {
             attribution::Attribution::default()
         };
@@ -476,7 +476,7 @@ struct Pending {
     revision: i64,
     attribution_revision: i64,
     attribution: attribution::ValuationProjection,
-    attribution_maps: crate::attribution::Maps,
+    attribution_resolver: crate::attribution::Resolver,
     attribution_deferred: bool,
     main: bool,
     generations: Generations,
@@ -571,8 +571,7 @@ impl ValuationMaintenance {
                 revision: valuation_revision(conn, hour)?,
                 attribution_revision: attribution::own_revision(conn, hour)?,
                 attribution: attribution::ValuationProjection::new(),
-                attribution_maps: crate::attribution::Maps::load(conn)
-                    .map_err(|_| ReportError::Integrity("invalid attribution evidence"))?,
+                attribution_resolver: crate::attribution::Resolver::default(),
                 attribution_deferred: false,
                 main: conn.query_row(
                     "SELECT state='dirty' FROM valuation_hour WHERE kind=?1 AND hour_number=?2",
@@ -612,7 +611,7 @@ impl ValuationMaintenance {
                 reasoning,
                 &PlanBook::load(conn)?,
                 &mut pending.cells,
-                Some((&mut pending.attribution, &pending.attribution_maps)),
+                Some((&mut pending.attribution, &mut pending.attribution_resolver)),
             )?;
             pending.fetched &= fetched;
             count

@@ -20,17 +20,21 @@ impl Attribution {
 }
 
 pub(super) fn resolve(
-    maps: &crate::attribution::Maps,
+    resolver: &mut crate::attribution::Resolver,
+    conn: &Connection,
     ledger: &Ledger,
     event: &LedgerEvent,
-) -> Attribution {
-    maps.resolve(
-        event.attribution_runner.map(|id| ledger.values.name(id)),
-        event.session.map(|id| ledger.values.name(id)),
-        event.run_ref.map(|id| ledger.values.name(id)),
-        event.flow_ref.map(|id| ledger.values.name(id)),
-        event.occurred_at_ms,
-    )
+) -> Result<Attribution, ReportError> {
+    resolver
+        .resolve(
+            conn,
+            event.attribution_runner.map(|id| ledger.values.name(id)),
+            event.session.map(|id| ledger.values.name(id)),
+            event.run_ref.map(|id| ledger.values.name(id)),
+            event.flow_ref.map(|id| ledger.values.name(id)),
+            event.occurred_at_ms,
+        )
+        .map_err(|_| ReportError::Integrity("invalid attribution evidence"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -240,13 +244,13 @@ pub(super) fn observe(
     projection: &mut Projection,
     conn: &Connection,
     filter: &str,
-    maps: &crate::attribution::Maps,
+    resolver: &mut crate::attribution::Resolver,
 ) -> Result<usize, ReportError> {
     let ledger = load_scoped_ledger(conn, &DIMENSIONS, Some(filter))?;
     let mut groups: BTreeMap<Attribution, Data> = BTreeMap::new();
     let mut events = HashMap::new();
     for event in &ledger.events {
-        let tuple = resolve(maps, &ledger, event);
+        let tuple = resolve(resolver, conn, &ledger, event)?;
         let key = groups
             .entry(tuple.clone())
             .or_default()

@@ -63,6 +63,7 @@ copies that timeout without running the table-creating probes.
 | `attribution_fact` | Each row preserves one publisher's verbatim fact and indexed subject, parent, workload, task and project evidence. | insert only; corrections append with `supersedes` |
 | `placement_fact` | Each row preserves entorhinal's dated project-to-workspace placement and verbatim fact. | insert only; corrections append with `supersedes` |
 | `attribution_cursor` | Each row checkpoints one publisher's read name, opaque cursor, through position and last committed read time. | upsert with a changed committed page |
+| `attribution_session_ref` | Each row files one session fact under the `session_ref` computed from its runner, harness and session, so resolution can find the fact by that name through an index. Migration 59 fills it in Rust for facts stored earlier, in the migration's own transaction. | insert only, beside its fact |
 | `session_alias` | Each row preserves a runner/harness-qualified pair of a ledger's recorded session and another published name for it. | insert only |
 | `summary_value` | Each row assigns an exact stored string an integer identifier, with identifier zero reserved for null. | Builders insert new values. |
 | `summary_hour` | Each row records an hour's persistent revision, published revision, format, event count and time extrema. | Triggers advance revisions, and publication records a completed build. |
@@ -125,8 +126,10 @@ remains as immutable evidence but no longer participates in resolution, is
 counted in coverage, and dirties the hours it used to own.
 
 The existing THALAMUS roots readers append OpenCode shared-store session/ref
-pairs and Claude Code owner-session/host-UUID/ref pairs. Resolution loads facts,
-aliases and placements once per build batch, not per call. A call matches its
+pairs and Claude Code owner-session/host-UUID/ref pairs. Resolution looks up only
+the subjects, alias components and projects a build or report asks about, through
+their indexes, and remembers each answer for that build or report, so its cost
+follows the distinct subjects in the hour, not the stored history. A call matches its
 BROCA run, then session, then flow. A fact's own session and the shared runner
 crate's `session_ref` meet the ledger session and its aliases. Reference inputs
 remain exactly as published; only lookup runner labels normalise
@@ -169,6 +172,7 @@ in the table above means both of these exist:
 - `attribution_fact_no_update`, `attribution_fact_no_delete`
 - `placement_fact_no_update`, `placement_fact_no_delete`
 - `session_alias_no_update`, `session_alias_no_delete`
+- `attribution_session_ref_no_update`, `attribution_session_ref_no_delete`
 
 Each of these tables also has a `BEFORE INSERT` trigger named
 `<table>_insert_once`. The same protection applies to `step_feed`, whose rows

@@ -642,7 +642,7 @@ struct Build {
     attribution_revision: i64,
     main: bool,
     attribution: attribution::Projection,
-    attribution_maps: crate::attribution::Maps,
+    attribution_resolver: crate::attribution::Resolver,
     attribution_deferred: bool,
     after: Option<i64>,
     data: Data,
@@ -864,12 +864,7 @@ impl SummaryMaintenance {
                 attribution_revision: attribution::own_revision(conn, hour)?,
                 main: !attribution::summary_current(conn, hour)?,
                 attribution: attribution::Projection::default(),
-                attribution_maps: if audit {
-                    crate::attribution::Maps::default()
-                } else {
-                    crate::attribution::Maps::load(conn)
-                        .map_err(|_| ReportError::Integrity("invalid attribution evidence"))?
-                },
+                attribution_resolver: crate::attribution::Resolver::default(),
                 attribution_deferred: false,
                 after: None,
                 data: Data::default(),
@@ -914,7 +909,7 @@ impl SummaryMaintenance {
                         &mut build.attribution,
                         conn,
                         &filter,
-                        &build.attribution_maps,
+                        &mut build.attribution_resolver,
                     )?
                 }
             }

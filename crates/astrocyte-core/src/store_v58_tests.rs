@@ -1,6 +1,10 @@
 mod attribution_storage {
     use super::*;
 
+    fn v58() -> &'static Migration {
+        MIGRATIONS.iter().find(|m| m.version == 58).unwrap()
+    }
+
     fn before_attribution() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         initialize_connection(&conn).unwrap();
@@ -30,9 +34,7 @@ mod attribution_storage {
             INSERT INTO valuation_cell VALUES(0,0,'[]','[]','api',NULL,NULL,'{}','100','{}');").unwrap();
         let before = all_rows(&conn);
         let schema_before: Vec<(String,String)> = conn.prepare("SELECT name,sql FROM sqlite_schema WHERE name IN ('summary_cell','summary_quantity','summary_money','summary_hour_stale','valuation_cell') ORDER BY name").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-        conn.execute_batch(MIGRATIONS.last().unwrap().statements)
-            .unwrap();
-        assert_eq!(MIGRATIONS.last().unwrap().version, 58);
+        conn.execute_batch(v58().statements).unwrap();
         for (table, rows) in before {
             assert_eq!(table_rows(&conn, &table), rows, "{table} must survive");
         }
@@ -65,8 +67,7 @@ mod attribution_storage {
     #[test]
     fn attribution_evidence_is_append_only_even_with_replace_and_default_trigger_settings() {
         let conn = before_attribution();
-        conn.execute_batch(MIGRATIONS.last().unwrap().statements)
-            .unwrap();
+        conn.execute_batch(v58().statements).unwrap();
         conn.pragma_update(None, "recursive_triggers", false)
             .unwrap();
         conn.execute_batch("INSERT INTO attribution_fact(fact_id,publisher,body,subject_kind,subject_runner,subject_session,workload,effective_from_ms,recorded_at_ms)
