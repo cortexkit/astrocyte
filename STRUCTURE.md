@@ -117,8 +117,8 @@ tests; samples pinned from peers are in `tests/vectors/`.
   operation named in the two overview docs, and their size ceiling.
 - `scripts/fmt-check.sh`, `scripts/check-path-deps.py`, `scripts/check-file-sizes.py`,
   `scripts/check-cortexkit-layout.sh`, `scripts/check_train_preconditions.py`:
-  formatting, no outside path dependencies, source files under 5,000 lines,
-  nothing internal tracked, CI shape.
+  formatting, no outside path dependencies, files under 5,000 lines, no
+  internal `.cortexkit/` file tracked, CI fit for trains.
 - `scripts/train-push.sh`, `scripts/watch-ci.sh`, `scripts/lib/`: landing on
   master through CI.
 
