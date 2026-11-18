@@ -20,7 +20,10 @@ impl TestBus {
     pub(crate) async fn start(state: &SharedState) -> Option<Self> {
         let server = NatsServer::start()?;
         let names = AccountNames::derive("astrocyte_test").unwrap();
-        let connection = tokio::time::timeout(Duration::from_secs(5), async {
+        // Only a hang bound: nats-server with JetStream has taken over 5 s to
+        // accept connections under the full Windows suite. A ready server
+        // connects at once, so this costs nothing when it starts quickly.
+        let connection = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Ok(connection) = NatsConnection::connect(
                     &server.url,
