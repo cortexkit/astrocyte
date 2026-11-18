@@ -1057,7 +1057,7 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
             .unwrap()
     }
 
-    /// Agent Runner's `fork_answer` rows from a Pi head, exactly as its payer
+    /// Thalamus's `fork_answer` rows from a Pi head, exactly as its payer
     /// write stores them (`tests/vectors/thalamus-pi-fork-payer`, 16 Nov 2026):
     /// a plain answer and one the fork ended at a tool call. Each is billed
     /// once, under the fork's own session with the head's owner, login,
@@ -1094,7 +1094,7 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
         );
     }
 
-    /// The Pi rows again after Agent Runner added Pi's one-hour cache-write
+    /// The Pi rows again after Thalamus added Pi's one-hour cache-write
     /// count (`tests/vectors/thalamus-pi-fork-payer-v2`, 17 Nov 2026). Each
     /// row's 10 five-minute and 20 one-hour tokens sum to its 30-token cache
     /// write, so both writes are recorded per lifetime and none at the plain

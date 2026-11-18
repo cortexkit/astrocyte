@@ -1057,7 +1057,7 @@ mod tests {
         assert!(rows(&state, json!({"harness": "broca", "session": "head"})).is_empty());
     }
 
-    /// Agent Runner's step bodies with the rewrite-cause facts, as its
+    /// Thalamus's step bodies with the rewrite-cause facts, as its
     /// publisher wrote them for each host (`tests/vectors/thalamus-step-cause`,
     /// 16 Nov 2026). Each fact the body carries reaches the cause evidence
     /// unchanged, and a fact the body leaves out stays unknown. Claude Code
@@ -1121,7 +1121,7 @@ mod tests {
         }
     }
 
-    /// Agent Runner's bodies for unasked steps
+    /// Thalamus's bodies for unasked steps
     /// (`tests/vectors/thalamus-step-cause-unasked`, 16 Nov 2026). A step that
     /// went out without asking the module carries the facts in force for its
     /// session, so its cause can be named; all four facts reach the evidence as
