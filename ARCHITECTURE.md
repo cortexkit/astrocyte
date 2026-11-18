@@ -157,7 +157,7 @@ dropped-prompt flag) in session order, from the ledger and `step_detail`; recent
 sessions come from memory (`recent_steps.rs`). The live step feed keeps a day of
 normalised steps in `step_feed`, merging recorded steps with runner
 announcements; a recorded row always wins. Subscribers get cursor notices and
-page rows themselves. Only local apps and Callosum phones may read it.
+page rows themselves. Only local apps and the person's phones and desktops via Callosum may read it.
 
 ## Serving and write ordering
 

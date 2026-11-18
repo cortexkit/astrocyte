@@ -40,7 +40,7 @@ see [operations](operations.md).
 - Every other operation on a flow route is refused `flow_scopes_unsupported`
   before dispatch, including every write and the principal-checked reads
   `usage.steps.subscribe`, `usage.steps.read`, `usage.runs.subscribe` and `watermark.get`. Without a
-  flow, the step feed admits only local apps and Callosum phones, and
+  flow, the step feed admits only local apps and Callosum phones and desktops, and
   `watermark.get` admits only `thalamus-harness`. Tests:
   `manifest_provides_flow_scopes_and_exact_read_operations`,
   `a_flow_stamped_subscription_report_is_advertised_and_served`,
@@ -745,7 +745,8 @@ the durable reads.
 
 **Who may call.** The daemon-attested principal at route bind decides:
 `Principal::Direct` (local apps on the same computer) and `reserved:callosum`
-with a phone-class device label (`fed-phone:<fingerprint>`). Every other
+with the person's phone or desktop as the device label (`fed-phone:<fingerprint>`
+or `fed-app:<fingerprint>`). Every other
 principal is refused `not_permitted`, simulators (`fed-sim:`) and other
 computers (`fed-computer:`) included.
 
@@ -988,8 +989,8 @@ detail `{"through": "<newest cursor>"}`: reload per-session history with
   unavailable or refuses the subscription, astrocyte logs it once and retries,
   and no new runner rows arrive; runner rows already appended stay served
   until a feed append prunes them. Quota events are not affected.
-- The phone's device label is the route's bind identity `harness`
-  (`fed-phone:<fingerprint>`), as Callosum stamps it; the principal must be
+- The device label is the route's bind identity `harness`
+  (`fed-phone:<fingerprint>` or `fed-app:<fingerprint>`), as Callosum stamps it; the principal must be
   `reserved:callosum` as well.
 - A subscriber's queue holds 64 cursors. A subscriber whose notices are held
   up for longer than that ends `lagged`.
@@ -1060,7 +1061,7 @@ Absent, excluded and newly appearing payer stores are covered by
 These reads serve machine-wide session, BROCA run and BROCA flow costs from the
 ledger, never from client-side pricing. They share the live feed's admission
 check: `Principal::Direct` and reserved `callosum` routes with a `fed-phone:`
-identity harness. Every other caller is refused `not_permitted` before operation-specific parameters are decoded.
+or `fed-app:` identity harness. Every other caller is refused `not_permitted` before operation-specific parameters are decoded.
 Each reply is the response frame's `result`, read from one SQLite snapshot.
 
 **Keys** are closed tagged objects:
@@ -1160,7 +1161,7 @@ Notices are coalesced to at most one per two seconds per subscriber, and an idle
 ledger sends nothing. No call or price evidence is carried by a notice.
 
 Admission is exactly the Runs reads' admission: local apps and Callosum phone
-routes, not flows. The watch shares the step watch's 16 subscription slots and
+and desktop routes, not flows. The watch shares the step watch's 16 subscription slots and
 held-request pool. Opening refusals are `not_permitted`, `subscription_capacity`,
 `draining`, and `malformed` (unknown parameters). Cancellation ends with the same
 `cancelled` error as the step watch; route closure and module shutdown end the

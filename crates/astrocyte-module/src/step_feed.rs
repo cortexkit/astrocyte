@@ -55,14 +55,17 @@ pub fn require_read_permission(method: &str, allowed: bool) -> Result<(), (Strin
 }
 
 /// The principals that may read the feed and Runs: local apps (`Direct`) and
-/// Callosum's phone routes, whose bind names the phone in the harness field
-/// (`fed-phone:<fingerprint>`). Simulators (`fed-sim:`), other computers
-/// (`fed-computer:`) and every other principal are refused `not_permitted`.
+/// Callosum's routes for the person's own apps on another computer, whose
+/// bind names the device in the harness field: a phone (`fed-phone:`) or a
+/// paired desktop (`fed-app:`), each followed by its fingerprint. Simulators
+/// (`fed-sim:`), other computers (`fed-computer:`) and every other principal
+/// are refused `not_permitted`.
 pub fn may_read_feed(principal: Option<&Principal>, harness: &str) -> bool {
     match principal {
         Some(Principal::Direct) => true,
         Some(Principal::Reserved { module_id }) => {
-            module_id == "callosum" && harness.starts_with("fed-phone:")
+            module_id == "callosum"
+                && (harness.starts_with("fed-phone:") || harness.starts_with("fed-app:"))
         }
         _ => false,
     }
@@ -1464,12 +1467,14 @@ mod tests {
     }
 
     #[test]
-    fn only_local_apps_and_callosum_phones_may_read_the_feed() {
+    fn only_local_apps_and_callosum_phones_and_desktops_may_read_the_feed() {
         let callosum = Principal::Reserved {
             module_id: "callosum".into(),
         };
         assert!(may_read_feed(Some(&Principal::Direct), "anything"));
         assert!(may_read_feed(Some(&callosum), "fed-phone:abc"));
+        assert!(may_read_feed(Some(&callosum), "fed-app:abc"));
+        assert!(!may_read_feed(Some(&callosum), "fed-appx:abc"));
         assert!(!may_read_feed(Some(&callosum), "fed-sim:abc"));
         assert!(!may_read_feed(Some(&callosum), "fed-computer:abc"));
         assert!(!may_read_feed(
