@@ -185,10 +185,21 @@ impl CatalogClient {
         }
     }
 
-    pub fn catalog_version(&self) -> Result<i64, CatalogClientError> {
+    /// The version that cached rate timelines are keyed on. Fusiform's
+    /// `rates_version` moves only when a served price, or a fact prices
+    /// inherit through, can have changed. `catalog_version` also moves on every
+    /// grade, effort and workload write, and keying on it would re-read every
+    /// timeline after each one. A fusiform too old to serve `rates_version`
+    /// reports 0, so then this falls back to `catalog_version`.
+    pub fn rates_version(&self) -> Result<i64, CatalogClientError> {
         self.connection
             .catalog_status_with_timeout(StatusRequest::default(), self.remaining()?)
-            .map(|status| status.catalog_version)
+            .map(|status| {
+                i64::try_from(status.rates_version)
+                    .ok()
+                    .filter(|version| *version > 0)
+                    .unwrap_or(status.catalog_version)
+            })
             .map_err(CatalogClientError::Call)
     }
 

@@ -27,7 +27,7 @@ pub(crate) struct MultiplierStage {
     failure_logged: BTreeSet<(String, Option<String>, String)>,
     /// The UTC day the "member not recorded" skip was last logged.
     not_recorded_logged: Option<String>,
-    /// The catalog version whose model timelines are still being read, set
+    /// The rates version whose model timelines are still being read, set
     /// when a full tick's pass ran out of time. Passes then continue between
     /// ticks until every model is read.
     pub(super) rates_pending: Option<i64>,
@@ -40,7 +40,8 @@ pub(crate) struct MultiplierStage {
 /// retrying a model it cannot serve in time on every pass loads the catalog
 /// and holds the refresher for a full read deadline each try. The wait starts
 /// at a minute and doubles up to half an hour; a successful read clears it, and
-/// a new catalog version clears every wait, since the change may be the cure.
+/// a new rates version (`CatalogClient::rates_version`) clears every wait,
+/// since the change may be the cure.
 #[derive(Default)]
 pub(crate) struct RateBackoff {
     waits: std::collections::BTreeMap<(String, String), (std::time::Instant, Duration)>,
@@ -489,8 +490,9 @@ const RATE_FETCH_PASS_BUDGET: Duration = Duration::from_millis(1500);
 const RATE_FETCH_MODEL_BUDGET: Duration = Duration::from_secs(5);
 
 /// Refresh served timelines before multiplier work. The writer is held only for
-/// discovery and publication. Returns the catalog version when models that may
-/// be tried now are still unread after the pass.
+/// discovery and publication. Timelines are keyed on fusiform's rates version,
+/// so a catalog move that changes no price queues nothing. Returns that version
+/// when models that may be tried now are still unread after the pass.
 pub(super) fn rate_era_tick(
     state: &SharedState,
     backoff: &mut RateBackoff,
@@ -500,7 +502,7 @@ pub(super) fn rate_era_tick(
     };
     let version = catalog
         .with_budget(RATE_FETCH_MODEL_BUDGET)
-        .catalog_version()
+        .rates_version()
         .map_err(|error| format!("{error:?}"))?;
     backoff.catalog_seen(version);
     rate_era_refresh(state, version, backoff)
@@ -920,6 +922,11 @@ mod multiplier_stage_tests {
         uncovered: std::sync::atomic::AtomicBool,
         history_fingerprint: std::sync::atomic::AtomicI64,
         history_version: std::sync::atomic::AtomicI64,
+        history_calls: AtomicUsize,
+        /// Served as `rates_version`; 0 is what an older fusiform reports.
+        rates_version: std::sync::atomic::AtomicI64,
+        /// Catalog moves that change no price, such as a grade write.
+        other_catalog_moves: std::sync::atomic::AtomicI64,
     }
 
     impl FakeFusiform {
@@ -935,6 +942,9 @@ mod multiplier_stage_tests {
                 uncovered: std::sync::atomic::AtomicBool::new(false),
                 history_fingerprint: std::sync::atomic::AtomicI64::new(320_000_000_000),
                 history_version: std::sync::atomic::AtomicI64::new(1),
+                history_calls: AtomicUsize::new(0),
+                rates_version: std::sync::atomic::AtomicI64::new(0),
+                other_catalog_moves: std::sync::atomic::AtomicI64::new(0),
             })
         }
     }
@@ -947,6 +957,7 @@ mod multiplier_stage_tests {
         ) -> Result<fusiform_protocol::HistoryResponse, CatalogCallError> {
             assert_eq!(request.served, Some(true));
             assert_eq!(request.fact_prefix.as_deref(), Some("rate."));
+            self.history_calls.fetch_add(1, Ordering::SeqCst);
             let response = self.catalog_get(CatalogGetRequest {
                 paged: false,
                 page_token: None,
@@ -987,7 +998,9 @@ mod multiplier_stage_tests {
                 self.history_version.fetch_add(1, Ordering::SeqCst);
             }
             Ok(
-                serde_json::from_value(serde_json::json!({"source": "fake", "catalog_version": self.history_version.load(Ordering::SeqCst),
+                serde_json::from_value(serde_json::json!({"source": "fake",
+                "catalog_version": self.history_version.load(Ordering::SeqCst) + self.other_catalog_moves.load(Ordering::SeqCst),
+                "rates_version": self.rates_version.load(Ordering::SeqCst),
                 "model_count": 0, "era_count": 0, "recent_polls": []}))
                 .unwrap(),
             )
@@ -1356,6 +1369,46 @@ mod multiplier_stage_tests {
                 Ok(rows)
             })
             .unwrap()
+    }
+
+    /// A catalog move that changes no price, such as a grade write, must not
+    /// re-read every rate timeline; a rates-version move must. An older
+    /// fusiform serves no rates version (0), and then any catalog move
+    /// re-reads, as before rates_version existed.
+    #[test]
+    fn rate_timelines_are_reread_only_when_the_rates_version_moves() {
+        for served in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = Arc::new(state::leased_test_state(&directory));
+            publish_desired(&state, &directory);
+            seed_usage(&state);
+            let fusiform = FakeFusiform::new(false);
+            if served {
+                fusiform.rates_version.store(5, Ordering::SeqCst);
+            }
+            install_catalog(&state, &fusiform);
+            let mut stage = MultiplierStage::new(Some(fusiform.clone()));
+            stage.tick(&state, false, NOW);
+            let first = fusiform.history_calls.load(Ordering::SeqCst);
+            assert!(first > 0, "the first tick reads the timelines");
+            stage.tick(&state, false, NOW);
+            assert_eq!(fusiform.history_calls.load(Ordering::SeqCst), first);
+
+            fusiform.other_catalog_moves.fetch_add(1, Ordering::SeqCst);
+            stage.tick(&state, false, NOW);
+            let after_grade = fusiform.history_calls.load(Ordering::SeqCst);
+            if served {
+                assert_eq!(after_grade, first, "a grade write re-read the timelines");
+                fusiform.rates_version.store(6, Ordering::SeqCst);
+                stage.tick(&state, false, NOW);
+                assert!(fusiform.history_calls.load(Ordering::SeqCst) > first);
+            } else {
+                assert!(
+                    after_grade > first,
+                    "an older fusiform keys on the catalog version"
+                );
+            }
+        }
     }
 
     #[test]

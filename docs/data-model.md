@@ -76,7 +76,7 @@ copies that timeout without running the table-creating probes.
 | `summary_audit_state` | The row records the independent audit's cursor, next start time and progress statistics. | The audit updates this row. |
 | `rate_era` | Each row caches one served rate-key segment, including absent and refused intervals, separately from ledger prices. | Refresher publication replaces changed timelines. |
 | `rate_model` | Each row records a fetched catalog version and current alias target or a plan provider's public API-card target (its API twin); an index finds referring models. | The refresher discovers new models incrementally and re-reads them on catalog advances. |
-| `rate_cache_state` | The singleton records the catalog version, cache generation, call-discovery cursor and twin configuration. | The refresher updates this row. |
+| `rate_cache_state` | The singleton records fusiform's rates version (its catalog version from a fusiform too old to serve one), cache generation, call-discovery cursor and twin configuration. | The refresher updates this row. |
 | `rate_dirty_hour` | Each row queues a summary-backed hour holding a model whose timeline or reference changed. | Rate publication inserts keys for the model and its referrers; valuation maintenance consumes them. |
 | `valuation_state` | The singleton records synchronized rate, valuation-config and plan-record generations. | Valuation maintenance and plan-record triggers update it. |
 | `valuation_hour` | Each row records an hour's revision, three built generations and independent valuation state. | Ledger and plan triggers invalidate hours; valuation publication completes them. |

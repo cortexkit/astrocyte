@@ -146,7 +146,7 @@ tier history by account or credential ID. `routing_eligible` carries sample-size
 and stability results. It retries missing days for a week and appends
 recomputations without changing the ledger. New days take each call's dated
 rates from `rate_era.rs`, a cache of Fusiform's served `catalog.history` that
-the refresher fills outside transactions and re-reads when the catalog moves. The [subscription multiplier](docs/subscription-multiplier.md)
+the refresher fills outside transactions and re-reads when its rates move. The [subscription multiplier](docs/subscription-multiplier.md)
 explains the thresholds and public API-twin valuation.
 
 ## Cache diagnostics and the step feed
