@@ -2415,6 +2415,7 @@ mod tests {
         fn new(facts: BTreeMap<String, Value>) -> Arc<Self> {
             Arc::new(Self {
                 response: Mutex::new(CatalogGetResponse {
+                    overrides: Vec::new(),
                     source: "models.dev".into(),
                     resolved_at_ms: 1_000,
                     catalog_version: 7,

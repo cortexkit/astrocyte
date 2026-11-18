@@ -503,7 +503,10 @@ impl Stage {
             .ok_or_else(|| "plan_prices_unavailable".to_string())
             .and_then(|source| {
                 source
-                    .plan_prices(PlanPricesRequest { provider_id: None })
+                    .plan_prices(PlanPricesRequest {
+                        provider_id: None,
+                        at_ms: None,
+                    })
                     .map_err(|_| "plan_prices_unavailable".into())
             });
         self.price_available = result.is_ok();

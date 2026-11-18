@@ -704,6 +704,7 @@ mod tests {
                 boundary_code: "no_coverage".into(),
                 boundary_message: None,
                 response: CatalogGetResponse {
+                    overrides: Vec::new(),
                     source: "models.dev".into(),
                     resolved_at_ms: boundary + 10,
                     catalog_version: 99,

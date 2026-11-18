@@ -1066,6 +1066,7 @@ mod multiplier_stage_tests {
                 }
             }
             Ok(CatalogGetResponse {
+                overrides: Vec::new(),
                 source: "models.dev".into(),
                 resolved_at_ms: request.at_ms.unwrap_or(1),
                 catalog_version: 1,

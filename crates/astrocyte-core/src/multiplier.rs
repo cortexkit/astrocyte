@@ -1447,7 +1447,10 @@ pub fn resolve_plans(
         })?;
         Some(
             source
-                .plan_prices(PlanPricesRequest { provider_id: None })
+                .plan_prices(PlanPricesRequest {
+                    provider_id: None,
+                    at_ms: None,
+                })
                 .map_err(|error| {
                     MultiplierError::PlanPrices(format!(
                         "plan.prices: {}: {}",
@@ -5499,6 +5502,7 @@ mod tests {
                 request: fusiform_protocol::CatalogGetRequest,
             ) -> Result<fusiform_protocol::CatalogGetResponse, CatalogCallError> {
                 Ok(fusiform_protocol::CatalogGetResponse {
+                    overrides: Vec::new(),
                     source: "models.dev".into(),
                     resolved_at_ms: request.at_ms.unwrap(),
                     catalog_version: 1,
@@ -5748,6 +5752,7 @@ mod tests {
                     }
                 };
                 Ok(CatalogGetResponse {
+                    overrides: Vec::new(),
                     source: "models.dev".into(),
                     resolved_at_ms: 5,
                     catalog_version: 1,
@@ -5865,6 +5870,7 @@ mod tests {
                 });
             };
             Ok(fusiform_protocol::CatalogGetResponse {
+                overrides: Vec::new(),
                 source: "models.dev".into(),
                 resolved_at_ms: 100,
                 catalog_version: 1,
@@ -5948,6 +5954,7 @@ mod tests {
             let model_key = format!("{provider}/{model}");
             self.requests.lock().unwrap().push(request);
             Ok(fusiform_protocol::CatalogGetResponse {
+                overrides: Vec::new(),
                 source: "models.dev".into(),
                 resolved_at_ms: 999,
                 catalog_version: 1,
@@ -6627,6 +6634,7 @@ mod tests {
                     }
                 }
                 Ok(CatalogGetResponse {
+                    overrides: Vec::new(),
                     source: "models.dev".into(),
                     resolved_at_ms: request.at_ms.unwrap(),
                     catalog_version: 1_790_261_588_698,
