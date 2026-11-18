@@ -30,21 +30,37 @@ impl Source {
 struct Lane {
     attached: bool,
     last_started: Option<i64>,
+    /// The last read did not commit. Until one does, every full tick reads
+    /// again, as without a bus consumer. Otherwise a read that fails while
+    /// the producer is still starting (for example after a daemon restart)
+    /// waits out the whole backstop, and the source shows stale until then.
+    failed: bool,
     waiting: Vec<oneshot::Sender<bool>>,
 }
 
 #[derive(Default)]
 pub(crate) struct Control(Mutex<BTreeMap<Source, Lane>>);
 
-pub(crate) struct Ticket(Vec<oneshot::Sender<bool>>);
+pub(crate) struct Ticket<'a> {
+    control: &'a Control,
+    source: Source,
+    waiting: Vec<oneshot::Sender<bool>>,
+}
 
-impl Ticket {
+impl Ticket<'_> {
     pub(crate) fn has_notice(&self) -> bool {
-        !self.0.is_empty()
+        !self.waiting.is_empty()
     }
 
     pub(crate) fn finish(self, committed: bool) {
-        for waiting in self.0 {
+        self.control
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(self.source)
+            .or_default()
+            .failed = !committed;
+        for waiting in self.waiting {
             let _ = waiting.send(committed);
         }
     }
@@ -100,7 +116,7 @@ impl Control {
 
     /// Detach the waiting batch before opening a route. A message arriving during
     /// that read must wait for another read, even if the first one commits.
-    pub(crate) fn begin(&self, source: Source, full_tick: bool, now: i64) -> Option<Ticket> {
+    pub(crate) fn begin(&self, source: Source, full_tick: bool, now: i64) -> Option<Ticket<'_>> {
         let mut lanes = self
             .0
             .lock()
@@ -108,6 +124,7 @@ impl Control {
         let lane = lanes.entry(source).or_default();
         let due = full_tick
             && (!lane.attached
+                || lane.failed
                 || lane
                     .last_started
                     .is_none_or(|last| now.saturating_sub(last) >= source.backstop()));
@@ -115,7 +132,11 @@ impl Control {
             return None;
         }
         lane.last_started = Some(now);
-        Some(Ticket(std::mem::take(&mut lane.waiting)))
+        Some(Ticket {
+            control: self,
+            source,
+            waiting: std::mem::take(&mut lane.waiting),
+        })
     }
 }
 

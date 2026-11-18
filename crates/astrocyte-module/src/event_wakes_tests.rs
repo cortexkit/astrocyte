@@ -339,3 +339,22 @@ fn either_prefrontal_subject_wakes_the_prefrontal_read() {
         .unwrap();
     assert_eq!(subject_source(&names, &stranger, &sources), None);
 }
+
+/// A failed read must not wait out the backstop. After a daemon restart the
+/// first read can fail while the producer is still starting; full ticks keep
+/// reading until one commits, then the backstop spacing returns.
+#[test]
+fn a_failed_read_retries_every_full_tick_until_one_commits() {
+    for source in [Source::Media, Source::Catalog, Source::Attribution("basal")] {
+        let control = Control::default();
+        control.attached(&[source], true);
+        control.begin(source, true, 0).unwrap().finish(false);
+        let retry = control.begin(source, true, 30_000);
+        assert!(retry.is_some(), "{source:?} waited for the backstop");
+        retry.unwrap().finish(true);
+        assert!(
+            control.begin(source, true, 60_000).is_none(),
+            "{source:?} kept reading after a commit"
+        );
+    }
+}
