@@ -3534,6 +3534,84 @@ mod tests {
         let _ = served(serving, "serving did not end at EOF").await;
     }
 
+    /// Callosum's binds for a paired computer's app carry a federated scope
+    /// stamp. Since subc-protocol 0.37.4 the stamp may name the sending
+    /// computer's machine id, the principal that opened the call there, the
+    /// session's portable project and its run id. Older readers refuse the
+    /// whole bind on those members, so this pins that a bind carrying all of
+    /// them binds, and that a paired desktop is served Runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_federated_desktop_bind_with_every_stamp_member_is_served() {
+        use subc_protocol::scope::{
+            FederatedAttributes, FederatedPeerClass, FederatedProject, RemoteClaim, RootKey,
+            RootKeyKind, ScopeAttributes, ScopeKind, ScopeStamp,
+        };
+        use subc_protocol::{BindIdentity, Principal, RouteTarget};
+        let state = Arc::new(test_state());
+        let daemon = FakeDaemon::start().await;
+        let refresher = IdleRefresher::new();
+        let serving = serve_idle(&daemon, Arc::clone(&state), &refresher);
+        let mut stream = daemon.accept_and_ack().await;
+        let fingerprint = "0123456789abcdef0123456789abcdef";
+        let mut facts = FederatedAttributes::new(
+            FederatedPeerClass::App,
+            fingerprint.into(),
+            "pair:1".into(),
+            "Desktop".into(),
+        )
+        .with_origin_principal(Some(Principal::Reserved {
+            module_id: "prefrontal".into(),
+        }))
+        .with_project(Some(FederatedProject::new(
+            "project",
+            RootKey::new(RootKeyKind::Remote, "owner/repo"),
+        )))
+        .with_remote_claim(Some(RemoteClaim::run("remote-agent").with_run_id("run-1")));
+        facts.peer_box_id = Some("d".repeat(32));
+        facts.validate().unwrap();
+        let callosum = Principal::Reserved {
+            module_id: "callosum".into(),
+        };
+        let scope = ScopeStamp::new(callosum.clone(), "peer", 1, ScopeKind::Federated)
+            .with_attributes(ScopeAttributes::new().with_federated(Some(facts)))
+            .with_owner_authorized(true);
+        let bind = serde_json::to_vec(&ModuleControlRequest::RouteBind {
+            route_channel: 8,
+            epoch: 1,
+            target: RouteTarget::ManagementSurface {
+                module_id: DEFAULT_MODULE_ID.to_string(),
+            },
+            identity: BindIdentity::new(format!("fed-app:{fingerprint}"), "s"),
+            principal: Some(callosum),
+            consumer_capabilities: None,
+            role_versions: None,
+            admission_facts: None,
+            scope: Some(scope),
+            call_mode: None,
+        })
+        .unwrap();
+        for member in ["peer_box_id", "origin_principal", "project", "run_id"] {
+            assert!(
+                String::from_utf8_lossy(&bind).contains(member),
+                "the bind lacks {member}"
+            );
+        }
+        send(&mut stream, control_request(80, bind)).await;
+        let ack = frame_for(&mut stream, 0, 80).await;
+        assert_eq!(ack.header.ty, FrameType::Response, "route.bind refused");
+        send(
+            &mut stream,
+            request_frame(8, 100, ops::OP_RUNS_LIST, json!({"from_ms":0,"to_ms":1})),
+        )
+        .await;
+        let reply = frame_for(&mut stream, 8, 100).await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let value: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(value["result"]["totals"]["rows"], 0);
+        drop(stream);
+        let _ = served(serving, "serving did not end at EOF").await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn runs_reads_are_served_to_direct_and_callosum_phone_routes() {
         let state = Arc::new(test_state());

@@ -26,7 +26,7 @@ large_stack_arrays = "deny"
 [workspace.dependencies]
 astrocyte-readers = { path = "crates/astrocyte-readers" }
 winapi-util = "=0.1.11"
-subc-protocol = "=0.37.2"
+subc-protocol = "=0.37.4"
 subc-transport = "=0.18.0"
 subc-control = "=0.41.0"
 subc-os = "=0.1.39"
