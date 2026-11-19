@@ -299,7 +299,7 @@ impl Reader {
                     if reread {
                         if let Some(access) = &access {
                             let snapshot = Route::list(access).await;
-                            last_list = Some(crate::state::now_ms());
+                            last_list = snapshot.as_ref().ok().map(|_| crate::state::now_ms());
                             output.lock().unwrap().push(snapshot);
                         }
                     }

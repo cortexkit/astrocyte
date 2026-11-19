@@ -707,6 +707,44 @@ fn vault_watch_notice_is_applied_on_next_full_tick_without_restart() {
 }
 
 #[test]
+fn regression_vault_failed_watch_reread_retries_on_full_tick() {
+    let peer = Peer::start(false);
+    let state = test_state();
+    state.install_quota_bus_access(
+        peer.access.path.clone(),
+        peer.access.module_id.clone(),
+        peer.access.nonce.clone(),
+    );
+    state.acknowledge_module_hello();
+    let reader = Reader::start(Arc::new(AtomicBool::new(false)));
+    reader.tick(&state);
+    crate::test_support::wait_until("initial vault list and watch notice", || {
+        reader.snapshots.lock().unwrap().len() >= 2
+    });
+    let mut invalid = listing(&["openai"], Some("plus"), Some(200));
+    invalid["result"]["grant_tuples"] = json!([]);
+    *peer.value.lock().unwrap() = invalid;
+    peer.watchers.lock().unwrap()[0].send(Value::Null).unwrap();
+    crate::test_support::wait_until("one failed reread", || {
+        reader.snapshots.lock().unwrap().iter().any(Result::is_err)
+    });
+    *peer.value.lock().unwrap() = listing(&["openai"], Some("plus"), Some(200));
+    assert!(reader.tick(&state).iter().any(Result::is_err));
+    crate::test_support::wait_until("successful list without another watch notice", || {
+        reader.snapshots.lock().unwrap().iter().any(|result| {
+            result.as_ref().is_ok_and(|listing| {
+                listing
+                    .plans
+                    .iter()
+                    .any(|plan| plan.plan_key.as_deref() == Some("openai/plus"))
+            })
+        })
+    });
+    assert_eq!(peer.count("auth.watch_scoped"), 1);
+    reader.join();
+}
+
+#[test]
 fn vault_unknown_watch_method_polls_only_on_full_ticks() {
     let peer = Peer::start(true);
     let state = test_state();
