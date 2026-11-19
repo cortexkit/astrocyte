@@ -145,3 +145,38 @@ BEGIN
         WHERE harness=OLD.harness AND step_ref=OLD.step_ref);
 END;
 "#;
+
+pub(in crate::store) const V62: &str = r#"
+-- One unit list serves both cache-step quantities and their baseline projection.
+CREATE VIEW cache_token_unit AS
+SELECT 'token' AS unit UNION ALL SELECT 'token_cache_5m' UNION ALL SELECT 'token_cache_1h';
+
+DROP TRIGGER cache_read_projection;
+CREATE TRIGGER cache_read_projection AFTER INSERT ON measurement
+WHEN NEW.role = 'cache_read' AND NEW.unit IN (SELECT unit FROM cache_token_unit)
+     AND NEW.quantity_exponent = 0
+BEGIN
+    INSERT INTO cache_read_session(producer, session)
+    SELECT e.producer, e.session FROM usage_event e
+    WHERE e.event_key = NEW.event_key AND e.session IS NOT NULL
+      AND e.occurred_at_ms IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM cache_read_session c
+          WHERE c.producer = e.producer AND c.session = e.session);
+    INSERT INTO cache_read_step(session_id, occurred_at_ms, event_key, cursor)
+    SELECT c.session_id, e.occurred_at_ms, e.event_key, s.cursor
+    FROM usage_event e
+    CROSS JOIN cache_read_session c ON c.producer = e.producer AND c.session = e.session
+    CROSS JOIN cache_step_sequence s ON s.event_key = e.event_key
+    WHERE e.event_key = NEW.event_key AND e.occurred_at_ms IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM cache_read_step r WHERE r.session_id = c.session_id
+          AND r.occurred_at_ms = e.occurred_at_ms AND r.event_key = e.event_key);
+    UPDATE cache_read_session
+    SET first_positive_cursor = (SELECT s.cursor FROM cache_step_sequence s WHERE s.event_key = NEW.event_key)
+    WHERE NEW.quantity_units > 0
+      AND session_id = (SELECT c.session_id FROM usage_event e
+          CROSS JOIN cache_read_session c ON c.producer = e.producer AND c.session = e.session
+          WHERE e.event_key = NEW.event_key AND e.occurred_at_ms IS NOT NULL)
+      AND (first_positive_cursor IS NULL OR first_positive_cursor >
+          (SELECT s.cursor FROM cache_step_sequence s WHERE s.event_key = NEW.event_key));
+END;
+"#;

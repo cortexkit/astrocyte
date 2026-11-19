@@ -474,6 +474,9 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 61,
         statements: migrations::v60_v79::V61,
+    },    Migration {
+        version: 62,
+        statements: migrations::v60_v79::V62,
     },
 ];
 

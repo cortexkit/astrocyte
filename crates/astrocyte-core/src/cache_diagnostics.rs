@@ -309,15 +309,25 @@ pub struct SessionSteps {
     pub undated: u64,
 }
 
-/// A step's token count from its measurements: the sum over every unit of
-/// the role, counting only plain token counts (exponent 0). NULL when the
-/// reader stored none, which keeps an absent count apart from a zero.
-macro_rules! role_sum {
+macro_rules! cache_token_units_sql {
+    () => {
+        "(SELECT unit FROM cache_token_unit)"
+    };
+}
+
+/// SQLite integers cannot hold the sum of the three possible token units.
+/// Return a single quantity as an integer, or the exact decimal addends for
+/// Rust to sum without conversion to a floating-point number.
+macro_rules! token_count {
     ($role:literal) => {
         concat!(
-            "(SELECT SUM(m.quantity_units) FROM measurement m WHERE m.event_key=e.event_key AND m.role='",
+            "(SELECT CASE WHEN COUNT(m.quantity_units)=1 THEN MAX(m.quantity_units)
+                          ELSE group_concat(m.quantity_units,',') END
+              FROM measurement m WHERE m.event_key=e.event_key AND m.role='",
             $role,
-            "' AND m.quantity_exponent=0)"
+            "' AND m.unit IN ",
+            cache_token_units_sql!(),
+            " AND m.quantity_exponent=0)"
         )
     };
 }
@@ -329,15 +339,15 @@ macro_rules! step_columns {
         concat!(
             "s.cursor,e.producer_ref,e.occurred_at_ms,e.provider,e.model,",
             "COALESCE(d.finish,e.terminal_status),d.context_limit,",
-            role_sum!("input"),
+            token_count!("input"),
             ",",
-            role_sum!("cache_read"),
+            token_count!("cache_read"),
             ",",
-            role_sum!("cache_write"),
+            token_count!("cache_write"),
             ",",
-            role_sum!("output"),
+            token_count!("output"),
             ",",
-            role_sum!("reasoning"),
+            token_count!("reasoning"),
             ",NULL FROM usage_event e LEFT JOIN step_detail d ON d.event_key=e.event_key",
             " JOIN cache_step_sequence s ON s.event_key=e.event_key"
         )
@@ -433,6 +443,24 @@ macro_rules! projection_sql {
 }
 
 fn count(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<u64>> {
+    if matches!(row.get_ref(column)?, rusqlite::types::ValueRef::Text(_)) {
+        let addends = row.get::<_, String>(column)?;
+        let mut total = 0_u64;
+        for units in addends.split(',') {
+            let units = units.parse::<u64>().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let Some(sum) = total.checked_add(units) else {
+                return Ok(None);
+            };
+            total = sum;
+        }
+        return Ok(Some(total));
+    }
     row.get::<_, Option<i64>>(column)?
         .map(|value| {
             u64::try_from(value)
@@ -1254,19 +1282,28 @@ mod tests {
         " WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL",
         " AND (e.occurred_at_ms,s.cursor)<(?3,?4)",
         " AND EXISTS (SELECT 1 FROM measurement m WHERE m.event_key=e.event_key",
-        " AND m.role='cache_read' AND m.quantity_exponent=0)",
+        " AND m.role='cache_read' AND m.unit IN ",
+        cache_token_units_sql!(),
+        " AND m.quantity_exponent=0)",
         " ORDER BY e.occurred_at_ms DESC, e.event_key DESC LIMIT 1"
     );
-    pub(super) const WALK_READS_CACHE_SQL: &str = "SELECT EXISTS (SELECT 1 FROM usage_event e
+    pub(super) const WALK_READS_CACHE_SQL: &str = concat!(
+        "SELECT EXISTS (SELECT 1 FROM usage_event e
          JOIN measurement m ON m.event_key=e.event_key
          WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL
-           AND m.role='cache_read' AND m.quantity_exponent=0 AND m.quantity_units>0)";
-    pub(super) const WALK_READ_CACHE_THROUGH_SQL: &str =
+           AND m.role='cache_read' AND m.unit IN ",
+        cache_token_units_sql!(),
+        " AND m.quantity_exponent=0 AND m.quantity_units>0)"
+    );
+    pub(super) const WALK_READ_CACHE_THROUGH_SQL: &str = concat!(
         "SELECT EXISTS (SELECT 1 FROM usage_event e
          JOIN cache_step_sequence s ON s.event_key=e.event_key
          JOIN measurement m ON m.event_key=e.event_key
          WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms IS NOT NULL AND s.cursor<=?3
-           AND m.role='cache_read' AND m.quantity_exponent=0 AND m.quantity_units>0)";
+           AND m.role='cache_read' AND m.unit IN ",
+        cache_token_units_sql!(),
+        " AND m.quantity_exponent=0 AND m.quantity_units>0)"
+    );
 
     /// Run `work` with this thread's projection reads switched to the ledger
     /// walks.

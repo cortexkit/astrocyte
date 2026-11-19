@@ -1134,6 +1134,108 @@ mod tests {
     use super::*;
     use crate::state::test_state;
 
+    fn cache_test_event(step: &str, session: &str, at: i64, tokens: i64, characters: i64) -> Value {
+        json!({"producer":"pi", "producer_ref":step, "session":session,
+        "occurred_at_ms":at, "charge_basis":"metered_api", "measurements":[
+            {"role":"input", "unit":"token", "kind":"billed", "source":"test", "quantity_units":tokens, "quantity_exponent":0},
+            {"role":"input", "unit":"character", "kind":"billed", "source":"test", "quantity_units":characters, "quantity_exponent":0}
+        ]})
+    }
+
+    #[test]
+    fn regression_cache_diagnostics_counts_token_units_only() {
+        let state = test_state();
+        dispatch(
+            &state,
+            OP_EVENT_INGEST,
+            cache_test_event("mixed", "mixed", now_ms(), 12, 50),
+        )
+        .unwrap();
+        let cache = dispatch(
+            &state,
+            OP_CACHE_STEPS,
+            json!({"harness":"pi","session":"mixed"}),
+        )
+        .unwrap();
+        let feed = dispatch(&state, OP_STEPS_READ, json!({})).unwrap();
+        assert_eq!(cache["steps"][0]["input"], 12);
+        assert_eq!(feed["rows"][0]["input"], 12);
+    }
+
+    #[test]
+    fn regression_cache_diagnostics_character_read_does_not_make_session_cache_positive() {
+        let state = test_state();
+        let at = now_ms();
+        let mut event = cache_test_event("characters", "mixed", at, 0, 123);
+        for measurement in event["measurements"].as_array_mut().unwrap() {
+            measurement["role"] = json!("cache_read");
+        }
+        dispatch(&state, OP_EVENT_INGEST, event).unwrap();
+        let reply = dispatch(
+            &state,
+            OP_CACHE_STEPS,
+            json!({"harness":"pi","session":"mixed"}),
+        )
+        .unwrap();
+        assert_eq!(reply["steps"][0]["cache_read"], 0);
+        assert_eq!(reply["steps"][0]["verdict"], "unknown");
+    }
+
+    #[test]
+    fn regression_cache_diagnostics_mixed_unit_overflow_does_not_stall_feed() {
+        let state = test_state();
+        let at = now_ms();
+        for (step, session, tokens, characters) in [
+            ("before", "good", 12, 0),
+            ("large", "other", i64::MAX, 1),
+            ("after", "good", 13, 0),
+        ] {
+            dispatch(
+                &state,
+                OP_EVENT_INGEST,
+                cache_test_event(step, session, at, tokens, characters),
+            )
+            .unwrap();
+        }
+        let feed = dispatch(&state, OP_STEPS_READ, json!({})).unwrap();
+        let rows = feed["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{feed}");
+        assert_eq!(rows[1]["input"], i64::MAX);
+        assert_eq!(rows[2]["step_ref"], "after");
+    }
+
+    #[test]
+    fn regression_cache_diagnostics_unrepresentable_token_total_is_omitted() {
+        let state = test_state();
+        let at = now_ms();
+        let mut event = cache_test_event("overflow", "mixed", at, i64::MAX, 50);
+        let measurements = event["measurements"].as_array_mut().unwrap();
+        for (unit, quantity) in [("token_cache_5m", i64::MAX), ("token_cache_1h", 2)] {
+            measurements.push(
+                json!({"role":"input", "unit":unit, "kind":"billed", "source":"test",
+                "quantity_units":quantity, "quantity_exponent":0}),
+            );
+        }
+        dispatch(&state, OP_EVENT_INGEST, event).unwrap();
+        dispatch(
+            &state,
+            OP_EVENT_INGEST,
+            cache_test_event("next", "other", at, 7, 0),
+        )
+        .unwrap();
+        let feed = dispatch(&state, OP_STEPS_READ, json!({})).unwrap();
+        assert!(feed["rows"][0].get("input").is_none());
+        assert_eq!(feed["rows"][0]["step_ref"], "overflow");
+        assert_eq!(feed["rows"][1]["input"], 7);
+        let cache = dispatch(
+            &state,
+            OP_CACHE_STEPS,
+            json!({"harness":"pi","session":"mixed"}),
+        )
+        .unwrap();
+        assert!(cache["steps"][0].get("input").is_none());
+    }
+
     #[test]
     fn watermark_requires_both_committed_passes_and_serves_the_lower_value() {
         let state = test_state();
