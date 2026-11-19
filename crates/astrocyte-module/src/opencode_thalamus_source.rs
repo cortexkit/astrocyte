@@ -124,6 +124,8 @@ struct Folder {
 
 impl Folder {
     fn payer_waiting(&self) -> usize {
+        #[cfg(test)]
+        PAYER_TOTAL_VISITS.with(|visits| visits.set(visits.get() + 1));
         self.v1.payer_waiting() + self.v2.payer_waiting()
     }
 
@@ -142,6 +144,11 @@ impl Folder {
             done_sessions: HashSet::new(),
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAYER_TOTAL_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// What reading one declared folder found.
@@ -177,7 +184,7 @@ impl Cache {
         at: i64,
         stop: &AtomicBool,
         mode: DrainMode,
-    ) -> Result<(), SourceDrainError> {
+    ) -> Result<usize, SourceDrainError> {
         let mut total = self.payer_waiting();
         for folder in self.folders.values() {
             let before = folder.v1.payer_waiting();
@@ -192,7 +199,7 @@ impl Cache {
         if self.folders.is_empty() {
             state.set_payer_waiting(SOURCE_KEY, 0);
         }
-        Ok(())
+        Ok(total)
     }
 }
 
@@ -227,12 +234,12 @@ impl OpenCodeThalamusSource {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         // Queued payloads survive a missing store or declaration until they
         // resolve. Neither an idle tail nor a missing file may drop a call.
-        cache.drain_payer_waits(state, at, stop, DrainMode::Full)?;
+        let mut payer_waiting = cache.drain_payer_waits(state, at, stop, DrainMode::Full)?;
         let mut problems = Vec::new();
         let declarations_known =
             match declared_roots::read::<Entry>(roots, "OpenCode session roots") {
                 RootsFile::Absent => {
-                    if cache.payer_waiting() == 0 {
+                    if payer_waiting == 0 {
                         *cache = Cache::default();
                         forget_source(state)?;
                         return Ok(None);
@@ -333,18 +340,14 @@ impl OpenCodeThalamusSource {
                 ));
                 continue;
             }
-            let other_waiting = cache.payer_waiting().saturating_sub(
-                cache
-                    .folders
-                    .get(&canonical)
-                    .map_or(0, Folder::payer_waiting),
-            );
             let reader = cache
                 .folders
                 .entry(canonical.clone())
                 .or_insert_with(|| Folder::new(&canonical));
+            let other_waiting = payer_waiting.saturating_sub(reader.payer_waiting());
             let database = canonical.join("opencode.db");
             let read = read_folder(reader, entry, &database, state, at, stop, other_waiting);
+            payer_waiting = other_waiting + reader.payer_waiting();
             match read {
                 Ok(FolderRead::Gone) => {}
                 Ok(FolderRead::Read {
@@ -378,7 +381,7 @@ impl OpenCodeThalamusSource {
         cache.folders.retain(|path, folder| {
             seen.contains(path) || folder.v1.has_payer_waits() || folder.v2.has_payer_waits()
         });
-        complete &= cache.payer_waiting() == 0;
+        complete &= payer_waiting == 0;
         let stores = declarations_known.then(|| {
             seen.iter()
                 .map(|path| path.to_string_lossy().into_owned())
@@ -416,6 +419,7 @@ impl HarnessSource for OpenCodeThalamusSource {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .drain_payer_waits(state, at, stop, DrainMode::Fast)
+            .map(|_| ())
     }
 
     fn drain_for_health(
@@ -729,6 +733,29 @@ mod tests {
         roots: PathBuf,
         source: OpenCodeThalamusSource,
         state: Arc<SharedState>,
+    }
+
+    #[test]
+    fn declared_opencode_payer_total_visits_grow_linearly() {
+        let measure = |folders| {
+            let f = Fixture::new();
+            let entries = (0..folders)
+                .map(|index| {
+                    let session = format!("session-{index}");
+                    fs::create_dir_all(f.folder.join(&session)).unwrap();
+                    f.entry(&session, false)
+                })
+                .collect();
+            f.declare(entries);
+            f.tick(T0);
+            assert_eq!(f.source.cache.lock().unwrap().folders.len(), folders);
+            PAYER_TOTAL_VISITS.with(|visits| visits.set(0));
+            f.tick(T0 + 1);
+            PAYER_TOTAL_VISITS.with(std::cell::Cell::get)
+        };
+        let visits = [measure(100), measure(1_000)];
+        eprintln!("folder payer-queue counts at 100 and 1,000 folders: {visits:?}");
+        assert_eq!(visits, [300, 3_000]);
     }
 
     #[test]
