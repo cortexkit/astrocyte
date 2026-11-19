@@ -581,26 +581,32 @@ pub fn append_changes(
     Ok(appended)
 }
 
-const PRUNE_CANDIDATES_SQL: &str = "SELECT MAX(feed_cursor) FROM (SELECT feed_cursor,
-    committed_at_ms FROM step_feed ORDER BY feed_cursor LIMIT ?2) WHERE committed_at_ms<?1";
+const PRUNE_CANDIDATES_SQL: &str =
+    "SELECT feed_cursor,committed_at_ms FROM step_feed ORDER BY feed_cursor LIMIT ?1";
 
 // Look up content-free host metadata by the shared cursor, never by decoding
 // a step reference. The left join keeps older calls without an id unchanged.
 const MESSAGE_ID_SQL: &str = "SELECT m.message_id FROM cache_step_sequence s
     LEFT JOIN step_message m ON m.event_key=s.event_key WHERE s.cursor=?1";
 
-/// Delete expired rows among the oldest `PRUNE_BATCH`, and record the newest
+/// Delete the expired prefix among the oldest `PRUNE_BATCH`, and record its newest
 /// cursor deleted so reads from before it are refused.
 ///
-/// A row's cursor and commit time are assigned at the same append, so the
-/// oldest rows are the ones that expire first. Looking only at the oldest
-/// `PRUNE_BATCH` keeps every call bounded: filtering the whole table by
-/// commit time would read the full day's feed on each append whenever
-/// nothing has expired, which is most of the time.
+/// A wall-clock rollback can put an expired row after a live one. Wait for
+/// that live row to expire before crossing it: reads skip every cursor up to
+/// the recorded boundary. Limiting the window keeps each prune bounded.
 fn prune(conn: &Connection, window_start: i64) -> rusqlite::Result<()> {
-    let newest_expired: Option<i64> = conn
-        .prepare_cached(PRUNE_CANDIDATES_SQL)?
-        .query_row(params![window_start, PRUNE_BATCH], |row| row.get(0))?;
+    let mut newest_expired: Option<i64> = None;
+    {
+        let mut statement = conn.prepare_cached(PRUNE_CANDIDATES_SQL)?;
+        let mut rows = statement.query([PRUNE_BATCH])?;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, i64>(1)? >= window_start {
+                break;
+            }
+            newest_expired = Some(row.get(0)?);
+        }
+    }
     let Some(newest_expired) = newest_expired else {
         return Ok(());
     };
@@ -1247,6 +1253,45 @@ mod tests {
             costs[1] < costs[0] + 100,
             "an append with nothing expired must not read the whole feed: {costs:?}"
         );
+    }
+
+    #[test]
+    fn regression_feed_clock_rollback_does_not_hide_retained_rows() {
+        let conn = conn();
+        for (id, at) in [
+            ("live", 3_600_000),
+            ("expired", 1),
+            ("later", FEED_WINDOW_MS + 2),
+        ] {
+            let tx = conn.unchecked_transaction().unwrap();
+            assert_eq!(
+                append_runner_step(&tx, at, &runner_step(id, at)).unwrap(),
+                RunnerAppend::Appended
+            );
+            tx.commit().unwrap();
+        }
+        let page = read(
+            &conn,
+            FeedReadRequest {
+                after: None,
+                limit: None,
+                harness: None,
+                session: None,
+            },
+        )
+        .unwrap();
+        let steps: Vec<_> = page
+            .rows
+            .iter()
+            .map(|row| row["step_ref"].as_str().unwrap())
+            .collect();
+        assert!(steps.contains(&"live"), "{steps:?}");
+        assert!(steps.contains(&"later"), "{steps:?}");
+        let (pruned, first_live): (i64, i64) = conn.query_row(
+            "SELECT pruned_through,(SELECT MIN(feed_cursor) FROM step_feed WHERE step_ref='live') FROM step_feed_state",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert!(pruned < first_live);
     }
 
     #[test]

@@ -974,7 +974,8 @@ detail `{"through": "<newest cursor>"}`: reload per-session history with
   read of old history) is not added to the feed; `usage.cache.steps` serves
   it. Rows become eligible for deletion 24 hours after they were committed;
   each feed append deletes up to 1,000 of them, so a cursor stays readable
-  until the deletion reaches it.
+  until the deletion reaches it. Pruning stops at the oldest live row, even
+  when a backward wall-clock step made later cursors expire first.
 - Runner rows come from the `step.finished.v1` events of the runners the bus
   naming table grants astrocyte; today those are `broca`, `thalamus-harness`
   and `thalamus`. Astrocyte follows each runner's own subject,
