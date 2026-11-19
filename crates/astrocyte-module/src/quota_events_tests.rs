@@ -730,6 +730,15 @@ fn quota_real_reader_credentials_attach_and_shutdown_mid_pull() {
 /// `runner` feed row through the whole reader path.
 #[test]
 fn bus_reader_without_insula_serves_runner_step_events() {
+    assert_runner_delivery(false);
+}
+
+#[test]
+fn regression_missing_quota_durable_does_not_block_runner_delivery() {
+    assert_runner_delivery(true);
+}
+
+fn assert_runner_delivery(configure_insula: bool) {
     let Some(server) = NatsServer::start() else {
         return;
     };
@@ -760,7 +769,8 @@ fn bus_reader_without_insula_serves_runner_step_events() {
     );
     state.acknowledge_module_hello();
     let stop = Arc::new(AtomicBool::new(false));
-    let reader = Reader::start(state.clone(), None, stop.clone()).unwrap();
+    let insula = configure_insula.then(|| peer.path.clone());
+    let reader = Reader::start(state.clone(), insula, stop.clone()).unwrap();
     let (subject, body) = crate::runner_steps::test_event(&names, "minimal", "thalamus", |_| {});
     runtime().block_on(async {
         let publisher = tokio::time::timeout(Duration::from_secs(10), async {

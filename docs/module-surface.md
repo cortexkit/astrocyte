@@ -1323,6 +1323,8 @@ capacity freshness horizon minus one cadence: normally 90 seconds. Event commits
 refresh capacity sooner; empty pulls never do. Any bus failure restores per-tick
 polling. Transitions are logged; health reply shapes, freshness rules, the
 multiplier and `budget.verdict` are unchanged.
+If only the quota durable cannot bind, runner steps and the other bus paths
+continue on the existing connection while quota falls back to polling.
 
 broca, the coding harnesses and thalamus-harness are not called. astrocyte
 reads their stores and files directly; see [harness readers](harness-readers.md).

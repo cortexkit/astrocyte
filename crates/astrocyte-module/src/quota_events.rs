@@ -524,11 +524,10 @@ async fn reader_loop(state: &SharedState, insula: Option<&crate::qta_client::Qta
                 AccountNames::derive(&credential.acct).map_err(|_| "invalid bus account")?;
             let quota = match insula {
                 Some(insula) => {
-                    let consumer = bind(&connection, &names.streams().event).await?;
                     let subject = names
                         .event_subject("insula", "quota_sampled", 1)
                         .map_err(|_| "invalid quota subject")?;
-                    Some((insula, consumer, subject))
+                    Some((insula, subject))
                 }
                 None => None,
             };
@@ -540,16 +539,20 @@ async fn reader_loop(state: &SharedState, insula: Option<&crate::qta_client::Qta
             let remaining = Duration::from_secs(u64::try_from(remaining).unwrap_or(0));
             let quota_session = async {
                 match &quota {
-                    Some((insula, consumer, subject)) => {
-                        run_session(
-                            control,
-                            insula,
-                            &credential,
-                            consumer,
-                            subject,
-                            &mut cursors,
-                        )
-                        .await
+                    Some((insula, subject)) => {
+                        let mut retry = Duration::from_millis(250);
+                        let consumer = loop {
+                            match bind(&connection, &names.streams().event).await {
+                                Ok(consumer) => break consumer,
+                                Err(reason) => {
+                                    control.unavailable(reason);
+                                    tokio::time::sleep(retry).await;
+                                    retry = (retry * 2).min(Duration::from_secs(30));
+                                }
+                            }
+                        };
+                        run_session(control, insula, &credential, &consumer, subject, &mut cursors)
+                            .await
                     }
                     None => std::future::pending().await,
                 }
