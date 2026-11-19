@@ -253,6 +253,13 @@ const RUNNER_POSITIVE_SQL: &str = "SELECT e.latest_feed_cursor,f.row_json FROM s
     WHERE e.harness=?1 AND e.session=?2 AND e.step_ref<>?3 AND e.feed_source='runner'
       AND e.latest_feed_cursor IS NOT NULL AND e.positive_read=1
     ORDER BY e.latest_feed_cursor DESC LIMIT 1";
+const RUNNER_UNKNOWN_BEFORE_SQL: &str = "SELECT f.row_json FROM step_evidence e
+    INDEXED BY step_evidence_runner_cache
+    JOIN step_feed f ON f.feed_cursor=e.latest_feed_cursor
+    WHERE e.harness=?1 AND e.session=?2 AND e.feed_source='runner'
+      AND e.latest_feed_cursor IS NOT NULL AND e.reports_cache=1 AND e.occurred_at_ms<?3
+      AND f.committed_at_ms>=?4 AND json_extract(f.row_json,'$.verdict')='unknown'
+    ORDER BY e.occurred_at_ms,e.latest_feed_cursor";
 
 fn unrecorded_body(body: &str) -> rusqlite::Result<cache::UnrecordedStep> {
     let row: Value = serde_json::from_str(body).map_err(|error| {
@@ -356,6 +363,13 @@ pub fn append_runner_step(
         return Ok(RunnerAppend::Superseded);
     }
     let unrecorded = runner_only_steps(conn, harness, session, step_ref, step.step.occurred_at_ms)?;
+    let first_positive = step.step.cache_read.is_some_and(|read| read > 0)
+        && cache::CacheModel::of(harness) == cache::CacheModel::Explicit
+        && !unrecorded
+            .iter()
+            .any(|row| row.counts.cache_read.is_some_and(|read| read > 0))
+        && (!cache::CACHE_HARNESSES.contains(&harness)
+            || !cache::session_reads_cache(conn, harness, session)?);
     let served = cache::unrecorded_step(conn, harness, session, step.step.clone(), &unrecorded)?;
     let to_sql = |error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
     let body = row_body(harness, session, FeedSource::Runner, &served, None).map_err(to_sql)?;
@@ -375,7 +389,19 @@ pub fn append_runner_step(
         }
     }
     let body = serde_json::to_string(&Value::Object(row)).map_err(to_sql)?;
-    let appended = append_body(conn, now_ms, &body, facts_changed, old_position)?;
+    let mut appended = append_body(conn, now_ms, &body, facts_changed, old_position)?;
+    if first_positive {
+        let earlier = conn
+            .prepare_cached(RUNNER_UNKNOWN_BEFORE_SQL)?
+            .query_map(
+                params![harness, session, step.step.occurred_at_ms, window_start],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for body in earlier {
+            appended |= refresh_runner_diagnostics(conn, now_ms, &body)?;
+        }
+    }
     prune(conn, window_start)?;
     evidence::prune(conn, now_ms)?;
     Ok(if appended {
@@ -434,7 +460,7 @@ pub fn rejudge_runner_steps(conn: &Connection, now_ms: i64) -> rusqlite::Result<
     let window_start = now_ms.saturating_sub(FEED_WINDOW_MS);
     let candidates = conn
         .prepare_cached(
-            "SELECT f.harness,f.session,f.step_ref,f.row_json FROM step_feed f
+            "SELECT f.harness,f.row_json FROM step_feed f
              WHERE f.source='runner' AND f.committed_at_ms>=?1
                AND json_extract(f.row_json,'$.occurred_at_ms')>=?1
                AND NOT EXISTS (SELECT 1 FROM step_feed n WHERE n.harness=f.harness
@@ -442,71 +468,79 @@ pub fn rejudge_runner_steps(conn: &Connection, now_ms: i64) -> rusqlite::Result<
              ORDER BY json_extract(f.row_json,'$.occurred_at_ms'),f.feed_cursor",
         )?
         .query_map([window_start], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let to_sql = |error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
     let mut appended = 0;
-    for (harness, session, step_ref, body) in candidates {
+    for (harness, body) in candidates {
         if cache::CACHE_HARNESSES.contains(&harness.as_str()) {
             continue;
         }
-        let mut body: Value = serde_json::from_str(&body).map_err(to_sql)?;
-        let original = body.clone();
-        let count = |name| body.get(name).and_then(Value::as_u64);
-        // Only diagnostic fields are copied back. Output, reasoning, names,
-        // run id and cache-write splits remain exactly as the runner stored them.
-        let row = cache::StepRow {
-            cursor: 0,
-            step_ref: step_ref.clone(),
-            occurred_at_ms: body["occurred_at_ms"].as_i64().unwrap_or(0),
-            input: count("input"),
-            cache_read: count("cache_read"),
-            cache_write: count("cache_write"),
-            output: None,
-            reasoning: None,
-            provider: None,
-            model: None,
-            finish: None,
-            context_limit: None,
-            request_body_len: count("request_body_len"),
-        };
-        let unrecorded =
-            runner_only_steps(conn, &harness, &session, &step_ref, row.occurred_at_ms)?;
-        let served = cache::unrecorded_step(conn, &harness, &session, row, &unrecorded)?;
-        let served = serde_json::to_value(served).map_err(to_sql)?;
-        let fields = body
-            .as_object_mut()
-            .expect("a stored runner row is an object");
-        for field in [
-            "prompt",
-            "retention",
-            "verdict",
-            "prompt_dropped",
-            "request_size",
-        ] {
-            if let Some(value) = served.get(field) {
-                fields.insert(field.into(), value.clone());
-            } else {
-                fields.remove(field);
-            }
-        }
-        // A row whose verdict fields are unchanged needs nothing: its cause
-        // was computed when it was appended. Skipping it avoids recording or
-        // comparing a step whose diagnostic fields have not changed.
-        if body == original {
-            continue;
-        }
-        if append_body(conn, now_ms, &body.to_string(), true, None)? {
+        if refresh_runner_diagnostics(conn, now_ms, &body)? {
             appended += 1;
         }
     }
     Ok(appended)
+}
+
+/// Re-emit an existing runner row with updated diagnostics, leaving its measurements unchanged.
+fn refresh_runner_diagnostics(
+    conn: &Connection,
+    now_ms: i64,
+    body: &str,
+) -> rusqlite::Result<bool> {
+    let to_sql = |error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
+    let mut body: Value = serde_json::from_str(body).map_err(to_sql)?;
+    let original = body.clone();
+    let harness = original["harness"].as_str().expect("stored runner harness");
+    let session = original["session"].as_str().expect("stored runner session");
+    let step_ref = original["step_ref"]
+        .as_str()
+        .expect("stored runner step reference");
+    let count = |name| body.get(name).and_then(Value::as_u64);
+    // Only diagnostic fields are copied back. Output, reasoning, names,
+    // run id and cache-write splits remain exactly as the runner stored them.
+    let row = cache::StepRow {
+        cursor: 0,
+        step_ref: step_ref.to_owned(),
+        occurred_at_ms: body["occurred_at_ms"].as_i64().unwrap_or(0),
+        input: count("input"),
+        cache_read: count("cache_read"),
+        cache_write: count("cache_write"),
+        output: None,
+        reasoning: None,
+        provider: None,
+        model: None,
+        finish: None,
+        context_limit: None,
+        request_body_len: count("request_body_len"),
+    };
+    let unrecorded = runner_only_steps(conn, harness, session, step_ref, row.occurred_at_ms)?;
+    let served = cache::unrecorded_step(conn, harness, session, row, &unrecorded)?;
+    let served = serde_json::to_value(served).map_err(to_sql)?;
+    let fields = body
+        .as_object_mut()
+        .expect("a stored runner row is an object");
+    for field in [
+        "prompt",
+        "retention",
+        "verdict",
+        "prompt_dropped",
+        "request_size",
+    ] {
+        if let Some(value) = served.get(field) {
+            fields.insert(field.into(), value.clone());
+        } else {
+            fields.remove(field);
+        }
+    }
+    // A row whose verdict fields are unchanged needs nothing: its cause
+    // was computed when it was appended. Skipping it avoids recording or
+    // comparing a step whose diagnostic fields have not changed.
+    if body == original {
+        return Ok(false);
+    }
+    append_body(conn, now_ms, &body.to_string(), true, None)
 }
 
 /// The newest stored row body for an identity, if any.
@@ -976,6 +1010,42 @@ mod tests {
             .unwrap(),
             (None, "{}".into(), 1_000)
         );
+    }
+
+    #[test]
+    fn regression_runner_first_positive_revises_retained_earlier_verdicts() {
+        let mut costs = Vec::new();
+        for earlier in [10_i64, 1_000] {
+            let conn = conn();
+            let tx = conn.unchecked_transaction().unwrap();
+            for at in 1..=earlier {
+                let mut step = runner_step(&format!("old-{at}"), at);
+                step.harness = "broca".into();
+                step.step.cache_read = Some(0);
+                append_runner_step(&tx, 2_000, &step).unwrap();
+            }
+            let mut positive = runner_step("positive", earlier + 1);
+            positive.harness = "broca".into();
+            let counter = crate::store::VmCounter::start(&tx);
+            append_runner_step(&tx, 2_000, &positive).unwrap();
+            costs.push(counter.steps());
+            let corrected: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM step_feed WHERE feed_cursor>?1 AND step_ref LIKE 'old-%'
+                 AND json_extract(row_json,'$.verdict') IN ('cold_start','stable')",
+                    [earlier],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let first: Value =
+                serde_json::from_str(&newest_body(&tx, "broca", "old-1").unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(first["verdict"], "cold_start");
+            assert_eq!(corrected, earlier);
+            tx.commit().unwrap();
+        }
+        eprintln!("runner first-positive append at 10 / 1000 earlier rows: {costs:?} VM steps");
+        assert!(costs[1] < costs[0] * 125, "{costs:?}");
     }
 
     #[test]

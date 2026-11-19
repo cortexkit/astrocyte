@@ -987,7 +987,9 @@ detail `{"through": "<newest cursor>"}`: reload per-session history with
   from an event reaches the spend ledger.
 - A runner row's `prompt`, `retention`, `verdict`, `prompt_dropped` and
   `request_size` are computed by the same rules as a file row's, over the
-  session's recorded steps and its other runner rows. `run_id`, and
+  session's recorded steps and its other runner rows. A runner's first positive
+  cache read in a session can append corrected verdicts for earlier retained
+  runner rows. `run_id`, and
   `cache_write_5m` and `cache_write_1h` when the event split them, are sent
   only on runner rows. `output` includes `reasoning` unless the event says
   reasoning is outside it.
