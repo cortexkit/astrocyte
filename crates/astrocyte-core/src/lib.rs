@@ -6,6 +6,7 @@
 
 pub mod attempt_usage;
 pub mod attribution;
+pub mod broca;
 pub mod cache_diagnostics;
 pub mod canon;
 pub mod capacity;

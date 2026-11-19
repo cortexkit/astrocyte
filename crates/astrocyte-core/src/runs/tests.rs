@@ -771,12 +771,12 @@ fn runs_migration_34_requeues_existing_clean_hours_before_reuse() {
         limit: None,
         after: None,
     };
-    let before = serde_json::to_value(list(&c, &q).unwrap()).unwrap();
-    // The current reducer needs the current schema, after the migration-34
-    // assertion above has independently established that old hours requeue.
+    // The current reader and reducer need the current schema. Check the v34
+    // dirty marker before later migrations can requeue hours themselves.
     for migration in &crate::store::MIGRATIONS[34..] {
         c.execute_batch(migration.statements).unwrap();
     }
+    let before = serde_json::to_value(list(&c, &q).unwrap()).unwrap();
     fill(&mut c);
     assert_eq!(before, serde_json::to_value(list(&c, &q).unwrap()).unwrap());
 }

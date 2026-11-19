@@ -9,6 +9,7 @@ fn bounded_page(cursor: i64, events: Vec<EventRecordRequest>, pending: bool) -> 
             ordinal: 2,
         },
         events,
+        broca_facts: Vec::new(),
         set_aside: Vec::new(),
         pending_known: 0,
         pending_unknown: pending,

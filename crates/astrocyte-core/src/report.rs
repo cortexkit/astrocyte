@@ -2309,6 +2309,7 @@ pub struct LedgerCoverage {
     pub events_unpriced: u64,
     pub events_undated: u64,
     pub zero_measurement_events: u64,
+    pub broca_segment_usage_mismatches: u64,
     /// WHY EVENTS WERE EXCLUDED, one entry per excluded EVENT, out of
     /// `events_total`; sums to `events_unpriced`.
     pub unpriced_events_by_reason: BTreeMap<String, u64>,
@@ -2395,6 +2396,7 @@ fn ledger_coverage_base(
     let provider_readings = load_provider_capacity_readings(conn)?;
     Ok(LedgerCoverage {
         thalamus_payer: load_thalamus_payer_coverage(conn)?,
+        broca_segment_usage_mismatches: crate::broca::segment_usage_mismatches(conn)?,
         set_aside_by_source: load_set_aside_coverage(conn)?,
         skipped_local_by_source: load_skipped_local_coverage(conn)?,
         events_total: population.events_total,

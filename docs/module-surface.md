@@ -546,11 +546,16 @@ Reads never write. A refusal on a read is one of the codes below.
 - `spend.ledger.coverage`: `set_aside_by_source`, `skipped_local_by_source`, `events_total`,
   `events_unpriced`, `events_undated`, `zero_measurement_events`,
   `unpriced_events_by_reason`, `unpriced_measurements_by_reason`,
-  `ingest_freshness`, `rate_staleness`, `capacity`. Test:
+  `broca_segment_usage_mismatches`, `ingest_freshness`, `rate_staleness`, `capacity`. Test:
   `open_coverage_report_does_not_stall_an_ingest_commit`.
   `skipped_local_by_source` is always a map of producer keys to counts of local
   work acknowledged without spend events; it is empty when no work was skipped.
   Test: `media_skipped_local_coverage_is_live_on_base_and_hourly_paths`.
+  `broca_segment_usage_mismatches` counts marked BROCA segments for which any
+  reported usage quantity differs from the sum of attempt shares naming the
+  segment. An unreported quantity is distinct from zero. This is a consistency
+  check, not a pricing input; it can report a mismatch while the reader has
+  seen the segment but has not yet ingested all its shares.
   Optional `thalamus_payer` reports lifetime counts of distinct identities:
   `transcript_calls_without_payer` (timeout or queue overflow), `late_payer_rows`,
   `unmatched_main_rows`, `set_aside_payer_rows`, `owner_disagreements` (the owner
@@ -1099,13 +1104,17 @@ sort oldest first, with undated (`occurred_at_ms: null`) items first and stable
 ledger order for ties. Harness items are
 `{step_ref, occurred_at_ms, provider, model, measurements}`: `step_ref` is the
 verbatim producer reference also used by the feed for step-based harnesses.
-Goose's reference identifies its accumulated session event, not a feed call. BROCA items instead carry
-`segment_ref`, the fact id; it is not a feed step id.
+Goose's reference identifies its accumulated session event, not a feed call.
+BROCA attempt items carry a `step_ref` identifying the attempt share in the
+ledger, not its live feed step id. Other BROCA items carry `segment_ref`, the
+fact id.
 
-Pricing units are `step` for ordinary harnesses, `run_segment` for BROCA, and
-`session_total` for Goose. Goose's detail has one item for its accumulated
-session event. Segment/session-total costs belong to the run/session as a whole;
-clients must not divide them over feed calls.
+Pricing units are `step` for ordinary harnesses and BROCA runs with any attempt
+calls, `run_segment` for other BROCA runs and flows, and `session_total` for
+Goose. A BROCA `step` run can still have `segment_ref` items for unmarked
+segments such as warm calls. Goose's detail has one item for its accumulated
+session event. Segment/session-total costs belong to the run/session as a
+whole; clients must not divide them over feed calls.
 
 **Tokens** have optional `input`, `output`, `reasoning`, `cache_read`, and
 `cache_write` integer members. Missing is not zero: a role is absent when no

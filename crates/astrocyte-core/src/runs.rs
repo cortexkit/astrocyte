@@ -52,13 +52,24 @@ impl RunKey {
             Err(Error::Refusal("invalid_request"))
         }
     }
-    fn pricing_unit(&self) -> &'static str {
+    fn pricing_unit(&self, has_attempts: bool) -> &'static str {
         match self {
             Self::Session { harness, .. } if harness == "goose" => "session_total",
             Self::Session { .. } => "step",
+            Self::Run { .. } if has_attempts => "step",
             _ => "run_segment",
         }
     }
+}
+
+fn has_broca_attempts(conn: &Connection, run_id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM usage_event e INDEXED BY usage_event_run_time
+           CROSS JOIN broca_attempt_detail a ON a.event_key=e.event_key
+           WHERE e.run_ref=?1 AND e.producer='broca')",
+        [run_id],
+        |row| row.get(0),
+    )
 }
 
 #[derive(Debug)]
@@ -273,6 +284,7 @@ struct Event {
     model: Option<String>,
     session: Option<String>,
     work_class: Option<String>,
+    broca_attempt: bool,
     measurements: Vec<Measurement>,
 }
 impl Event {
@@ -369,7 +381,8 @@ fn event_key(
 fn base_sql(filter: &str, index: &str) -> String {
     format!("WITH selected AS MATERIALIZED (SELECT * FROM usage_event INDEXED BY {index} WHERE {filter})
         SELECT e.event_key,e.producer,e.session,e.run_ref,e.flow_ref,e.producer_ref,e.occurred_at_ms,e.provider,e.model,e.work_class,
-        m.role,m.unit,m.quantity_units,m.quantity_exponent,h.outcome,h.charge_nanos,h.currency,h.unpriced_reason,m.kind
+        m.role,m.unit,m.quantity_units,m.quantity_exponent,h.outcome,h.charge_nanos,h.currency,h.unpriced_reason,m.kind,
+        CASE WHEN e.producer='broca' THEN EXISTS(SELECT 1 FROM broca_attempt_detail a WHERE a.event_key=e.event_key) ELSE 0 END
         FROM selected e LEFT JOIN measurement m ON m.event_key=e.event_key
         LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit
             AND NOT EXISTS(SELECT 1 FROM priced_charge child WHERE child.supersedes=h.charge_key)
@@ -403,6 +416,7 @@ fn visit(
                 model: row.get(8)?,
                 session,
                 work_class: row.get(9)?,
+                broca_attempt: row.get(19)?,
                 measurements: Vec::new(),
             });
         }
@@ -731,7 +745,7 @@ fn page_rows(conn: &Connection, cells: Cells) -> Result<Vec<RunRow>, Error> {
     let mut rows: BTreeMap<RunKey, RunRow> = BTreeMap::new();
     for ((key, provider, model), cell) in cells {
         let row = rows.entry(key.clone()).or_insert_with(|| RunRow {
-            pricing_unit: key.pricing_unit().into(),
+            pricing_unit: key.pricing_unit(false).into(),
             key,
             first_at_ms: cell.first,
             last_at_ms: cell.last,
@@ -772,6 +786,10 @@ fn page_rows(conn: &Connection, cells: Cells) -> Result<Vec<RunRow>, Error> {
         if let RunKey::Run { run_id, .. } = &row.key {
             // The label can be on a segment outside the requested time range.
             row.session = conn.query_row("SELECT session FROM usage_event INDEXED BY usage_event_run_time WHERE run_ref=?1 AND producer='broca' AND session IS NOT NULL LIMIT 1", [run_id], |r| r.get(0)).optional()?;
+            row.pricing_unit = row
+                .key
+                .pricing_unit(has_broca_attempts(conn, run_id)?)
+                .into();
         }
     }
     Ok(rows)
@@ -1007,7 +1025,7 @@ pub fn detail(conn: &Connection, request: &DetailRequest) -> Result<DetailReply,
     );
     let mut items = BTreeMap::new();
     visit(conn, &page, index, values, |event| {
-        let segment = request.key.harness() == "broca";
+        let segment = request.key.harness() == "broca" && !event.broca_attempt;
         items.insert(
             (event.time, event.id),
             DetailItem {
@@ -1045,9 +1063,13 @@ pub fn detail(conn: &Connection, request: &DetailRequest) -> Result<DetailReply,
         None
     };
     probe.phase("detail_page");
+    let has_attempts = match &request.key {
+        RunKey::Run { run_id, .. } => has_broca_attempts(conn, run_id)?,
+        _ => false,
+    };
     Ok(DetailReply {
         key: request.key.clone(),
-        pricing_unit: request.key.pricing_unit().into(),
+        pricing_unit: request.key.pricing_unit(has_attempts).into(),
         items: items.into_values().collect(),
         totals,
         next,

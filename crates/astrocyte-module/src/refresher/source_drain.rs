@@ -1,6 +1,7 @@
 //! Source page validation and drain health live here, apart from the loop that orders stages.
 
 use super::*;
+use astrocyte_core::{broca, ingest::RecordDisposition};
 
 pub fn drain_once(
     state: &SharedState,
@@ -54,7 +55,10 @@ pub(super) fn drain_once_in_lane(
     };
     validate_page(&page)?;
     source.refuse_regression(current.as_ref(), &page)?;
-    if !mode.has_work(page.events.len(), page.set_aside.len()) {
+    if !mode.has_work(
+        page.events.len() + page.broca_facts.len(),
+        page.set_aside.len(),
+    ) {
         return Ok(DrainOutcome::default());
     }
     let cursor = &page.cursor;
@@ -75,28 +79,61 @@ pub(super) fn drain_once_in_lane(
             // it in the same transaction as the cursor it records.
             harness_drain::ensure_runtime_row_in_tx(tx, &source_key)
                 .map_err(|error| format!("initialize source runtime: {error}"))?;
-            let newly_seen =
-                harness_drain::record_set_aside_in_tx(tx, &source_key, &page.set_aside, now_ms)?;
             let mut events_recorded = 0;
             let mut quarantined_redeliveries = 0;
             for event in &page.events {
-                // Read, not Pushed: this process fetched the record from the
-                // producer's store, so reading it again says nothing about the
-                // producer and must not write redelivery_log.
-                let outcome = astrocyte_core::ingest::record_event_in_tx(
-                    tx,
-                    event,
-                    now_ms,
-                    astrocyte_core::ingest::DeliveryPath::Read,
-                )
-                .map_err(|error| format!("record producer event: {error:?}"))?;
+                quarantined_redeliveries += usize::from(record_read_call(tx, event, now_ms)?);
                 events_recorded += 1;
-                if outcome.disposition
-                    == astrocyte_core::ingest::RecordDisposition::QuarantinedRedelivery
-                {
-                    quarantined_redeliveries += 1;
+            }
+            let mut set_aside = page.set_aside;
+            for (seq, fact) in &page.broca_facts {
+                let locator = || format!("{discovery_path:?}:{}:export_seq:{seq}", cursor.lineage);
+                match fact {
+                    broca_source::BrocaFact::Attempt(attempt) => {
+                        let outcome = broca::record_attempt_in_tx(tx, attempt, now_ms)
+                            .map_err(|error| format!("record BROCA attempt: {error:?}"))?;
+                        events_recorded += attempt.calls.len() - outcome.skipped_shares.len();
+                        if outcome.disposition == RecordDisposition::QuarantinedRedelivery {
+                            quarantined_redeliveries += 1;
+                        }
+                        for (index, segment) in outcome.skipped_shares {
+                            set_aside.push(SetAsideRecord {
+                                locator: format!("{}:share:{index}", locator()),
+                                reason: format!("segment_already_billed: {segment}"),
+                            });
+                        }
+                    }
+                    broca_source::BrocaFact::MarkedSegment(segment) => {
+                        if !broca::record_segment_in_tx(tx, segment, now_ms)
+                            .map_err(|error| format!("record BROCA segment evidence: {error}"))?
+                        {
+                            set_aside.push(SetAsideRecord {
+                                locator: locator(),
+                                reason: format!(
+                                    "conflicting evidence for BROCA segment {}",
+                                    segment.fact_id
+                                ),
+                            });
+                        }
+                    }
+                    broca_source::BrocaFact::Event(event) => {
+                        if broca::segment_has_attempts(tx, &event.producer_ref)
+                            .map_err(|error| format!("look up BROCA segment's shares: {error}"))?
+                        {
+                            set_aside.push(SetAsideRecord {
+                                locator: locator(),
+                                reason: format!("segment_already_billed: {}", event.producer_ref),
+                            });
+                        } else {
+                            quarantined_redeliveries +=
+                                usize::from(record_read_call(tx, event, now_ms)?);
+                            events_recorded += 1;
+                        }
+                    }
                 }
             }
+            let newly_seen =
+                harness_drain::record_set_aside_in_tx(tx, &source_key, &set_aside, now_ms)?;
             let updated = tx
                 .execute(
                     "UPDATE source_runtime
@@ -135,6 +172,23 @@ pub(super) fn drain_once_in_lane(
         .map_err(PullError::Store)?;
     harness_drain::warn_set_aside(&source_key, &newly_seen);
     Ok(outcome)
+}
+
+fn record_read_call(
+    tx: &Transaction<'_>,
+    event: &EventRecordRequest,
+    now_ms: i64,
+) -> Result<bool, String> {
+    // Re-reading a local store is not a producer redelivery and does not write
+    // redelivery_log. A conflicting payload is still quarantined.
+    astrocyte_core::ingest::record_event_in_tx(
+        tx,
+        event,
+        now_ms,
+        astrocyte_core::ingest::DeliveryPath::Read,
+    )
+    .map(|outcome| outcome.disposition == RecordDisposition::QuarantinedRedelivery)
+    .map_err(|error| format!("record producer event: {error:?}"))
 }
 
 /// The stored cursor, or `None` when there is none yet or no row at all.
@@ -405,6 +459,7 @@ mod tests {
     impl SourceClient for OnePage {
         fn pull(&self, _since: Option<SourceCursor>, _limit: u32) -> Result<ExportPage, PullError> {
             Ok(ExportPage {
+                broca_facts: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: SourceCursor {
                     lineage: "instance-a:3".into(),
@@ -550,6 +605,7 @@ mod tests {
                 ordinal: self.seq,
             };
             Ok(ExportPage {
+                broca_facts: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: cursor.clone(),
                 high_water: cursor,
@@ -635,6 +691,7 @@ mod tests {
             )
             .unwrap();
             Ok(ExportPage {
+                broca_facts: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: SourceCursor {
                     lineage: "inst:2".into(),
@@ -893,6 +950,7 @@ mod harness_ingest_tests {
                 ordinal: 7,
             };
             Ok(ExportPage {
+                broca_facts: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: position.clone(),
                 high_water: position,

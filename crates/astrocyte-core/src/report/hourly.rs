@@ -1303,6 +1303,7 @@ pub(super) fn coverage(
         )?
     };
     Ok(Some(LedgerCoverage {
+        broca_segment_usage_mismatches: crate::broca::segment_usage_mismatches(conn)?,
         thalamus_payer: load_thalamus_payer_coverage(conn)?,
         set_aside_by_source: load_set_aside_coverage(conn)?,
         skipped_local_by_source: load_skipped_local_coverage(conn)?,

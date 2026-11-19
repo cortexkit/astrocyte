@@ -63,14 +63,23 @@ mod session_refs {
             })
             .unwrap();
         let outcome = migrate_store(&store).unwrap();
-        assert_eq!((outcome.applied, outcome.recorded), (1, 59));
+        let latest = MIGRATIONS.last().unwrap().version;
+        assert_eq!((outcome.applied, outcome.recorded), (latest - 58, latest));
         store
             .with_conn(|conn| {
                 assert_eq!(table_rows(conn, "attribution_session_ref"), expected);
+                assert!(table_rows(conn, "broca_attempt_detail").is_empty());
+                assert!(table_rows(conn, "broca_segment_evidence").is_empty());
                 let others: Vec<_> = all_rows(conn)
                     .into_iter()
                     .filter(|(table, _)| {
-                        table != "attribution_session_ref" && table != "cortexkit_schema_version"
+                        !matches!(
+                            table.as_str(),
+                            "attribution_session_ref"
+                                | "cortexkit_schema_version"
+                                | "broca_attempt_detail"
+                                | "broca_segment_evidence"
+                        )
                     })
                     .collect();
                 let before: Vec<_> = before
@@ -136,7 +145,10 @@ mod session_refs {
             })
             .unwrap();
         let started = std::time::Instant::now();
-        assert_eq!(migrate_store(&store).unwrap().recorded, 59);
+        assert_eq!(
+            migrate_store(&store).unwrap().recorded,
+            MIGRATIONS.last().unwrap().version
+        );
         let elapsed = started.elapsed();
         let rows: i64 = store
             .with_conn(|conn| {

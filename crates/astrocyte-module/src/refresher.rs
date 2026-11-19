@@ -119,6 +119,7 @@ pub struct ExportPage {
     /// The producer's newest position when it served this page.
     pub high_water: SourceCursor,
     pub events: Vec<EventRecordRequest>,
+    pub(crate) broca_facts: Vec<(i64, broca_source::BrocaFact)>,
     pub set_aside: Vec<SetAsideRecord>,
     /// This is a producer-provided exact count, not a sequence-number
     /// subtraction. Unknown lag remains explicit when the producer could not
@@ -1389,6 +1390,7 @@ mod tests {
                 ordinal: 1,
             };
             Ok(ExportPage {
+                broca_facts: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: cursor.clone(),
                 high_water: cursor,
@@ -1789,6 +1791,7 @@ mod loop_tests {
     impl SourceClient for ReadySource {
         fn pull(&self, _since: Option<SourceCursor>, _limit: u32) -> Result<ExportPage, PullError> {
             Ok(ExportPage {
+                broca_facts: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: SourceCursor {
                     lineage: "live:1".into(),
@@ -1992,6 +1995,7 @@ mod loop_tests {
             )
             .unwrap();
             Ok(ExportPage {
+                broca_facts: Vec::new(),
                 set_aside: Vec::new(),
                 cursor: SourceCursor {
                     lineage: "pricing:1".into(),

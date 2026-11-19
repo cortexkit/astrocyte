@@ -8,9 +8,8 @@
 //! the same transaction as each insert. This reader tails that table from the
 //! durable cursor and decodes each row with the decoder the `usage.export`
 //! pull used, so an event keeps the identity and payload the pull gave it.
-//! A row whose segment carries `"kind": "system_one"` is a fact from one of
-//! BROCA's batch models and has its own decoder. Other kinds are set aside
-//! (see [`decode_store_row`]). BROCA steps will arrive from its step log.
+//! `system_one` batch facts and `model_attempt` request facts have their own
+//! decoders. Unrecognized kinds are set aside (see [`decode_store_row`]).
 //!
 //! When `BROCA_STATE_ROOT` is unset, BROCA writes to the same path, resolving
 //! the data home in the same order as this reader
@@ -27,17 +26,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use astrocyte_core::broca::{Attempt, MarkedSegment, TokenUsage};
 use astrocyte_core::ingest::EventRecordRequest;
 use astrocyte_readers::{
     file_identity::{file_identity, same_identity},
     read_io,
 };
 use rusqlite::{Connection, ErrorCode};
-use serde_json::Value;
+use serde_json::{value::RawValue, Value};
 
 use super::{interrupt_on_stop, ExportPage, PullError, SourceClient, SourceCursor};
 use crate::wire_map::{
-    map_fact, map_system_one_fact, WireSpendSegmentFact, WireSystemOneFact, SYSTEM_ONE_KIND,
+    map_attempt, map_fact, map_system_one_fact, WireModelAttempt, WireSpendSegmentFact,
+    WireSystemOneFact, MODEL_ATTEMPT_KIND, SYSTEM_ONE_KIND,
 };
 
 pub(crate) const BROCA_SOURCE_KEY: &str = "broca";
@@ -369,18 +370,29 @@ fn read_snapshot(
     })
 }
 
-/// Decode one row by the `kind` its segment carries.
+#[derive(Debug, Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "avoid allocations for the common legacy event"
+)]
+pub(crate) enum BrocaFact {
+    Event(EventRecordRequest),
+    MarkedSegment(MarkedSegment),
+    Attempt(Attempt),
+}
+
+/// Decode one row by the `kind` its fact carries.
 ///
 /// A segment with no `kind` is a session fact and is decoded exactly as the
-/// `usage.export` pull served it. A `system_one` segment is a batch fact. Any
-/// other `kind`, including a `kind` that is not a string, is refused with the
+/// `usage.export` pull served it. `system_one` and `model_attempt` identify
+/// batch and request facts. Any unrecognized `kind` is refused with the
 /// kind named, so the row is set aside as evidence: decoding it as a session
 /// fact could record a charge under a shape BROCA did not mean.
 fn decode_store_row(
     export_seq: i64,
     fact_id: &str,
     segment_json: &str,
-) -> Result<EventRecordRequest, String> {
+) -> Result<BrocaFact, String> {
     let export_seq = u64::try_from(export_seq)
         .map_err(|_| format!("export_seq {export_seq} of fact {fact_id} is negative"))?;
     let segment: Value = serde_json::from_str(segment_json)
@@ -388,11 +400,16 @@ fn decode_store_row(
     if !segment.is_object() {
         return Err(format!("segment_json of fact {fact_id} is not an object"));
     }
-    let kind = segment.get("kind").cloned();
-    match kind {
-        None => decode_session_segment(export_seq, fact_id, segment),
+    match segment.get("kind") {
+        None => decode_session_segment(export_seq, fact_id, segment, segment_json),
         Some(Value::String(kind)) if kind == SYSTEM_ONE_KIND => {
-            decode_system_one_segment(export_seq, fact_id, segment)
+            decode_system_one_segment(export_seq, fact_id, segment).map(BrocaFact::Event)
+        }
+        Some(Value::String(kind)) if kind == MODEL_ATTEMPT_KIND => {
+            let wire: WireModelAttempt = serde_json::from_str(segment_json)
+                .map_err(|error| format!("decode attempt of fact {fact_id}: {error}"))?;
+            refuse_fact_id_mismatch(export_seq, fact_id, &wire.fact_id)?;
+            map_attempt(wire, segment_json.to_owned()).map(BrocaFact::Attempt)
         }
         Some(kind) => Err(format!("segment of fact {fact_id} has unknown kind {kind}")),
     }
@@ -407,7 +424,8 @@ fn decode_session_segment(
     export_seq: u64,
     fact_id: &str,
     mut segment: Value,
-) -> Result<EventRecordRequest, String> {
+    segment_json: &str,
+) -> Result<BrocaFact, String> {
     segment
         .as_object_mut()
         .ok_or_else(|| format!("segment_json of fact {fact_id} is not an object"))?
@@ -415,7 +433,26 @@ fn decode_session_segment(
     let wire: WireSpendSegmentFact = serde_json::from_value(segment)
         .map_err(|error| format!("decode segment of fact {fact_id}: {error}"))?;
     refuse_fact_id_mismatch(export_seq, fact_id, &wire.fact_id)?;
-    map_fact(wire)
+    if wire.usage_in_attempts {
+        #[derive(serde::Deserialize)]
+        struct StoredUsage<'a> {
+            #[serde(borrow)]
+            usage: &'a RawValue,
+        }
+        let stored: StoredUsage<'_> = serde_json::from_str(segment_json)
+            .map_err(|error| format!("decode marked usage of fact {fact_id}: {error}"))?;
+        if !stored.usage.get().starts_with('{') {
+            return Err(format!("usage of fact {fact_id} is not an object"));
+        }
+        serde_json::from_str::<TokenUsage>(stored.usage.get())
+            .map_err(|error| format!("decode marked usage of fact {fact_id}: {error}"))?;
+        return Ok(BrocaFact::MarkedSegment(MarkedSegment {
+            fact_id: wire.fact_id,
+            run_id: wire.run_id,
+            usage_json: stored.usage.get().to_owned(),
+        }));
+    }
+    map_fact(wire).map(BrocaFact::Event)
 }
 
 fn decode_system_one_segment(
@@ -447,16 +484,19 @@ fn refuse_fact_id_mismatch(
 }
 
 fn page_from_snapshot(snapshot: Snapshot, path: &Path) -> Result<ExportPage, PullError> {
-    let mut events = Vec::new();
+    let mut broca_facts = Vec::new();
     let mut set_aside = Vec::new();
     for row in &snapshot.rows {
+        let locator = || {
+            format!(
+                "{path:?}:{}:export_seq:{}",
+                snapshot.lineage, row.export_seq
+            )
+        };
         match decode_store_row(row.export_seq, &row.fact_id, &row.segment_json) {
-            Ok(event) => events.push(event),
+            Ok(fact) => broca_facts.push((row.export_seq, fact)),
             Err(reason) => set_aside.push(crate::refresher::SetAsideRecord {
-                locator: format!(
-                    "{path:?}:{}:export_seq:{}",
-                    snapshot.lineage, row.export_seq
-                ),
+                locator: locator(),
                 reason,
             }),
         }
@@ -472,7 +512,8 @@ fn page_from_snapshot(snapshot: Snapshot, path: &Path) -> Result<ExportPage, Pul
         .map_or(snapshot.high_water, |row| row.export_seq);
     let high_water = snapshot.high_water.max(consumed);
     Ok(ExportPage {
-        events,
+        events: Vec::new(),
+        broca_facts,
         set_aside,
         cursor: SourceCursor {
             lineage: snapshot.lineage.clone(),
@@ -561,6 +602,8 @@ mod tests {
     fn source(path: &Path) -> BrocaSource {
         BrocaSource::at(path, Arc::new(AtomicBool::new(false)))
     }
+
+    mod broca_attempt_tests;
 
     #[test]
     fn set_aside_broca_bad_row_keeps_good_rows_and_progress() {
@@ -667,7 +710,9 @@ mod tests {
         let page = source(&path).pull(None, PAGE_LIMIT).unwrap();
 
         let pulled = map_fact(serde_json::from_value(wire_fixture()).unwrap()).unwrap();
-        assert_eq!(page.events, vec![pulled]);
+        assert!(
+            matches!(&page.broca_facts[..], [(_, BrocaFact::Event(event))] if event == &pulled)
+        );
         assert_eq!(
             page.cursor,
             SourceCursor {
@@ -1695,8 +1740,15 @@ mod tests {
         let mut cursor = None;
         loop {
             let page = broca.pull(cursor.clone(), PAGE_LIMIT).unwrap();
-            let done = page.events.is_empty();
-            requests.extend(page.events);
+            let done = page.broca_facts.is_empty();
+            requests.extend(
+                page.broca_facts
+                    .into_iter()
+                    .filter_map(|(_, fact)| match fact {
+                        BrocaFact::Event(event) => Some(event),
+                        _ => None,
+                    }),
+            );
             cursor = Some(page.cursor);
             if done {
                 break;
@@ -1724,7 +1776,7 @@ mod tests {
              high water {}",
             full_cursor.lineage,
             full_cursor.ordinal,
-            first_tick.events.len(),
+            first_tick.broca_facts.len(),
             first_tick.cursor.lineage,
             first_tick.cursor.ordinal,
             first_tick.high_water.ordinal

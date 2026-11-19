@@ -16,6 +16,8 @@ copies that timeout without running the table-creating probes.
 |---|---|---|
 | `usage_event` | Each row records one usage event per producer reference and lineage, its admission selection (`auth_selection`), the paying credential (`resolved_credential`) when reported, and its pricing projection. | insert; three projection columns, see below |
 | `measurement` | Each row records one immutable event quantity for a role and unit. | insert only |
+| `broca_segment_evidence` | Each row preserves the fact id, run id, original usage object and ingest time of a BROCA segment whose usage is billed through attempts instead. It has no ledger call. | insert only, once per fact |
+| `broca_attempt_detail` | Each row keeps a BROCA call's attempt identifiers, original share index, outcome and HTTP status, response counts, tier, speed, pricing mode, and reported share usage and segment link. The first recorded share retains the full attempt body for redelivery checks. | insert only, once per call |
 | `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
 | `step_message` | Each row records the host's own message id for a newly recorded event, for joining live feed rows within their harness and session. Old events are not backfilled. | insert only, once per event |
 | `cache_step_sequence` | Each row maps a ledger event to a durable cache cursor. | insert |

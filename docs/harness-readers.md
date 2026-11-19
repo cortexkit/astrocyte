@@ -210,7 +210,8 @@ Each source resolves its store path by these rules, implemented in
 | `goose` | One session's accumulated usage, not one call | `sessions.id` | `sessions.id` |
 | `omp` | One assistant message with usage | entry `id` | session header `id` |
 | `kimi` | One `StatusUpdate` record | `payload.message_id` | session directory name |
-| `broca` | One session or `system_one` spend fact | `fact_id` | none |
+| `broca` | One unmarked session or `system_one` spend fact | `fact_id` | none |
+| `broca` | One share of a model attempt, or one unmeasured call if the attempt contains no shares | `model_attempt:<fact_id>:<zero-based share position>` (position 0 for an unmeasured call) | none |
 
 Pi's call keys in the two `pi` rows above are built by
 `cortexkit_usage_steps::pi_step_ref`, the function runners also use, so a
@@ -434,7 +435,28 @@ Rules that affect what is recorded:
   rate. Any other split keeps the total with no quantity and a source ending
   `:conflicted`; a total alone is recorded as `token`. Test:
   `a_cache_write_lifetime_split_is_recorded_per_lifetime`.
-- BROCA steps will arrive from its step log, not `export_facts`.
+- A BROCA `model_attempt` fact describes one provider request. Each share in
+  `usage_by_model` records its own call at `sent_at_ms`, using its provider,
+  model and usage. Even repeated shares of the same model stay distinct. If
+  `usage_by_model` is absent, the request is recorded without measurements or
+  charges. The outcome is kept verbatim and does not affect pricing. Attempt
+  shares use the same credential and cache-write mapping as session facts.
+  The request's served speed, or its share's nonstandard served tier if speed
+  is absent, selects the rate mode. Requested tiers do not set the mode.
+  A nonstandard mode with no matching rate stays unpriced (`no_rate`); it
+  never uses the standard rate instead.
+- A session segment with `usage_in_attempts: true` records only evidence, not a
+  call. Unmarked segments, including warm segments, still record calls. BROCA
+  does not mark or emit attempts for segments it previously exported unmarked.
+  If either kind of call nevertheless arrives after the other has claimed the
+  same segment, the later call is set aside as `segment_already_billed`. Other
+  shares of that attempt keep their original positions. An unchanged attempt
+  replay adds no calls; a changed body is quarantined in `rejected_delivery`
+  when a call for that attempt was already recorded. Producer samples are pinned
+  in `crates/astrocyte-module/tests/vectors/broca-attempt-facts-1119/`.
+- Neither BROCA segments nor attempt calls supply the prior cache reads used
+  to judge cache changes, or enter the live step feed. BROCA's live runner
+  announcements are separate.
 - A BROCA row is set aside, with the reason, when its segment has any unknown
   `kind`, including `model_step`, or is a
   `system_one` fact that is missing a required member or

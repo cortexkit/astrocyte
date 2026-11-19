@@ -318,8 +318,8 @@ pub struct RepricePlan {
     /// The mode the request's own record states it ran in (`fast`,
     /// `standard`, ...), or `None` when the record states none. It selects a
     /// `rate.<role>.mode.<mode>` rate; see [`stated_mode_condition`]. The
-    /// ledger stores no request mode yet, so every plan read from the store
-    /// carries `None` and prices at the unconditional rate.
+    /// ledger learns this from BROCA attempt details or the `speed_mode`
+    /// selector on a Colliculus media usage fact.
     mode: Option<String>,
     targets: Vec<MeasurementPlan>,
     all_measurements: Vec<MeasurementPlan>,
@@ -423,10 +423,11 @@ fn read_plan_in_tx(
     }
     let event = tx
         .query_row(
-            "SELECT provider,model,account_ref,occurred_at_ms,charge_basis,currency,
-                    pricing_generation,producer,event_key,media_facts,
-                    COALESCE(resolved_credential,auth_selection)
-             FROM usage_event WHERE event_id=?1",
+            "SELECT e.provider,e.model,e.account_ref,e.occurred_at_ms,e.charge_basis,e.currency,
+                    e.pricing_generation,e.producer,e.event_key,e.media_facts,
+                    COALESCE(e.resolved_credential,e.auth_selection),broca.mode
+             FROM usage_event e LEFT JOIN broca_attempt_detail broca USING(event_key)
+             WHERE e.event_id=?1",
             [event_id],
             |row| {
                 let basis = row.get::<_, String>(4)?;
@@ -455,6 +456,7 @@ fn read_plan_in_tx(
                     row.get::<_, i64>(8)?,
                     crate::media::read_facts(row, 9)?,
                     row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             },
         )
@@ -474,7 +476,7 @@ fn read_plan_in_tx(
         .as_ref()
         .map(|facts| facts.selectors.clone())
         .unwrap_or_default();
-    let mode = selectors.remove("speed_mode");
+    let mode = selectors.remove("speed_mode").or(event.11);
     // Both names describe one price condition. Equal statements need only one
     // selector; differing statements remain available to refuse contradictory rates.
     if mode

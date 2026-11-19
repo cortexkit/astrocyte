@@ -19,6 +19,8 @@ pub struct WireSpendSegmentFact {
     )]
     pub export_seq: u64,
     pub fact_id: String,
+    #[serde(default)]
+    pub usage_in_attempts: bool,
     pub run_id: String,
     pub session: WireBindIdentity,
     pub provider: String,
@@ -90,33 +92,7 @@ pub struct WireBindIdentity {
     pub session: String,
 }
 
-/// The five token counts are `Option` ON PURPOSE, and the absence is the
-/// point. OpenAI, Gemini, DeepSeek and the subscription lanes have NO
-/// cache-write concept at all — there is no such field on their wire — so a
-/// non-`Option` field with `#[serde(default)]` turns "this provider does not
-/// measure that" into "a measurement was taken and came back zero". Those are
-/// different propositions, and the second is the majority of this ledger's
-/// traffic: 21,392 openai cache_write rows, 5,128 google, 3,263 ollama-cloud
-/// (both cache_write AND reasoning), against anthropic as the only provider
-/// with a positive value anywhere. Measured 2026-09-19 with 0 NULL quantities
-/// across 197,404 measurements — a three-state column whose third state had
-/// never occurred.
-///
-/// serde maps a missing key to `None` for `Option` without an attribute; the
-/// test below pins that rather than trusting it.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct WireUsage {
-    pub input_tokens: Option<u64>,
-    pub cached_input_tokens: Option<u64>,
-    pub cache_write_tokens: Option<u64>,
-    /// The parts of `cache_write_tokens` written for Anthropic's 5-minute and
-    /// 1-hour cache lifetimes, when the provider reported them. The two
-    /// lifetimes are priced at different rates.
-    pub cache_write_5m_tokens: Option<u64>,
-    pub cache_write_1h_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub reasoning_tokens: Option<u64>,
-}
+use astrocyte_core::broca::TokenUsage as WireUsage;
 
 pub use astrocyte_core::ingest::DERIVED_OUTPUT_SOURCE;
 
@@ -161,19 +137,18 @@ fn reasoning_is_inside_output(provider: &str, usage_policy_version: Option<u32>)
 ///   subset rule, so the measurement is kept with NO quantity and a
 ///   `:conflicted` source: the call still lands and counts, and pricing
 ///   refuses the role instead of pricing a clamped guess.
-fn output_measurement(wire: &WireSpendSegmentFact) -> Result<Option<MeasurementInput>, String> {
-    let Some(output) = wire.usage.output_tokens else {
+fn output_measurement(
+    usage: &WireUsage,
+    reasoning_included_in_output: bool,
+) -> Result<Option<MeasurementInput>, String> {
+    let Some(output) = usage.output_tokens else {
         return Ok(None);
     };
-    let (source, quantity) = match wire.usage.reasoning_tokens {
-        Some(reasoning)
-            if reasoning_is_inside_output(&wire.provider, wire.usage_policy_version) =>
-        {
-            match output.checked_sub(reasoning) {
-                Some(visible) => (DERIVED_OUTPUT_SOURCE.to_string(), Some(visible)),
-                None => (format!("{DERIVED_OUTPUT_SOURCE}:conflicted"), None),
-            }
-        }
+    let (source, quantity) = match usage.reasoning_tokens {
+        Some(reasoning) if reasoning_included_in_output => match output.checked_sub(reasoning) {
+            Some(visible) => (DERIVED_OUTPUT_SOURCE.to_string(), Some(visible)),
+            None => (format!("{DERIVED_OUTPUT_SOURCE}:conflicted"), None),
+        },
         _ => ("usage.output_tokens".to_string(), Some(output)),
     };
     let quantity_units = quantity
@@ -263,28 +238,39 @@ fn cache_write_measurements(usage: &WireUsage) -> Result<Vec<MeasurementInput>, 
     .collect()
 }
 
-pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String> {
-    let output = output_measurement(&wire)?;
+fn usage_measurements(
+    usage: &WireUsage,
+    reasoning_included_in_output: bool,
+) -> Result<Vec<MeasurementInput>, String> {
+    let output = output_measurement(usage, reasoning_included_in_output)?;
     let mut measurements = reported_token_measurements([
-        ("input", "input_tokens", wire.usage.input_tokens),
+        ("input", "input_tokens", usage.input_tokens),
         (
             "cache_read",
             "cached_input_tokens",
-            wire.usage.cached_input_tokens,
+            usage.cached_input_tokens,
         ),
     ])?;
-    measurements.extend(cache_write_measurements(&wire.usage)?);
+    measurements.extend(cache_write_measurements(usage)?);
     measurements.extend(reported_token_measurements([(
         "reasoning",
         "reasoning_tokens",
-        wire.usage.reasoning_tokens,
+        usage.reasoning_tokens,
     )])?);
     // Output goes back in its original position, before reasoning, so the
     // measurement order is unchanged from the verbatim mapping.
-    let reasoning_at = measurements.len() - usize::from(wire.usage.reasoning_tokens.is_some());
+    let reasoning_at = measurements.len() - usize::from(usage.reasoning_tokens.is_some());
     if let Some(output) = output {
         measurements.insert(reasoning_at, output);
     }
+    Ok(measurements)
+}
+
+pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String> {
+    let measurements = usage_measurements(
+        &wire.usage,
+        reasoning_is_inside_output(&wire.provider, wire.usage_policy_version),
+    )?;
     Ok(EventRecordRequest {
         producer: BROCA_PRODUCER.into(),
         // BROCA's content-hash references survive restarts. Adding an instance
@@ -316,6 +302,9 @@ pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String
         step_detail: Default::default(),
     })
 }
+
+mod broca_attempt;
+pub(crate) use broca_attempt::{map_attempt, WireModelAttempt, MODEL_ATTEMPT_KIND};
 
 /// The producer name every BROCA fact is recorded under, whatever its kind.
 const BROCA_PRODUCER: &str = "broca";
