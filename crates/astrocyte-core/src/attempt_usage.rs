@@ -109,16 +109,22 @@ fn decode_model(
     let cache_write = count(usage, "cache_write_tokens")?;
     let output = count(usage, "output_tokens")?;
     let reasoning = count(usage, "reasoning_tokens")?;
-    let cache_5m = count(entry, "cache_write_5m_tokens")?;
-    let cache_1h = count(entry, "cache_write_1h_tokens")?;
-    if let (Some(five), Some(hour)) = (cache_5m, cache_1h) {
-        let total = five
-            .checked_add(hour)
-            .ok_or_else(|| "cache-write split sum overflows".to_string())?;
-        if cache_write != Some(total) {
-            return Err("cache-write split sum must equal cache_write_tokens".to_string());
+    let (cache_5m, cache_1h) = match (
+        count(entry, "cache_write_5m_tokens")?,
+        count(entry, "cache_write_1h_tokens")?,
+    ) {
+        (Some(five), Some(hour)) => {
+            let total = five
+                .checked_add(hour)
+                .ok_or_else(|| "cache-write split sum overflows".to_string())?;
+            if cache_write != Some(total) {
+                return Err("cache-write split sum must equal cache_write_tokens".to_string());
+            }
+            (Some(five), Some(hour))
         }
-    }
+        // One lifetime alone cannot replace the total or establish it.
+        _ => (None, None),
+    };
     if reasoning.is_some() && reasoning_included.is_none() {
         return Err("reasoning_tokens requires reasoning_included_in_output".to_string());
     }
@@ -145,7 +151,7 @@ fn decode_model(
             "cache_write",
             "token",
             "usage.cache_write_tokens",
-            if cache_5m.is_some() || cache_1h.is_some() {
+            if cache_5m.is_some() {
                 None
             } else {
                 cache_write
@@ -236,6 +242,22 @@ mod tests {
                 ("reasoning", "token", Some(0))
             ]
         );
+    }
+
+    #[test]
+    fn attempt_usage_partial_cache_split_preserves_reported_total_and_absence() {
+        for part in ["cache_write_5m_tokens", "cache_write_1h_tokens"] {
+            let envelope = format!(r#"{{"usage":{{"cache_write_tokens":100}},"{part}":30}}"#);
+            let decoded = decode_attempt_usage(&envelope, "model-a").unwrap();
+            assert_eq!(
+                quantities(&decoded, 0),
+                [("cache_write", "token", Some(100))]
+            );
+
+            let no_total = format!(r#"{{"usage":{{}},"{part}":30}}"#);
+            let decoded = decode_attempt_usage(&no_total, "model-a").unwrap();
+            assert!(quantities(&decoded, 0).is_empty());
+        }
     }
 
     #[test]

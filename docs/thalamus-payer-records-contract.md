@@ -135,6 +135,7 @@ CREATE TABLE payer_record (
     never means 0. `input_tokens` excludes cache reads and writes.
   - `cache_write_5m_tokens`, `cache_write_1h_tokens`: optional, beside `usage`.
     When both are present they sum to `cache_write_tokens`.
+    A lone lifetime count does not replace the total or establish one when it is absent.
   - `reasoning_included_in_output`: required whenever `reasoning_tokens` is
     present, including a reported 0.
   - A request the vendor served with more than one model carries
