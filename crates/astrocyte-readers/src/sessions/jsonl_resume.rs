@@ -124,7 +124,17 @@ pub(crate) fn read_appended_lines<S>(
     fresh: impl FnOnce() -> S,
     on_line: impl FnMut(&mut S, &[u8]),
 ) -> Option<JsonlRead<S>> {
-    read_appended_lines_inner(path, previous, check, fresh, on_line, false).ok()
+    let mut on_line = on_line;
+    read_appended_lines_inner(
+        path,
+        previous,
+        check,
+        fresh,
+        |s, bytes, _| on_line(s, bytes),
+        false,
+        false,
+    )
+    .ok()
 }
 
 /// Fallible read for callers that must distinguish an unreadable file from an
@@ -136,7 +146,22 @@ pub(crate) fn try_read_appended_lines<S>(
     fresh: impl FnOnce() -> S,
     on_line: impl FnMut(&mut S, &[u8]),
 ) -> std::io::Result<JsonlRead<S>> {
-    read_appended_lines_inner(path, previous, check, fresh, on_line, true)
+    let mut on_line = on_line;
+    try_read_appended_lines_with_tail(path, previous, check, fresh, false, |s, bytes, _| {
+        on_line(s, bytes)
+    })
+}
+
+/// A closed writer can leave a complete final record without a newline.
+pub(crate) fn try_read_appended_lines_with_tail<S>(
+    path: &Path,
+    previous: Option<JsonlResumePoint<S>>,
+    check: PrefixCheck,
+    fresh: impl FnOnce() -> S,
+    final_tail: bool,
+    on_line: impl FnMut(&mut S, &[u8], Option<std::ops::Range<u64>>),
+) -> std::io::Result<JsonlRead<S>> {
+    read_appended_lines_inner(path, previous, check, fresh, on_line, true, final_tail)
 }
 
 fn read_appended_lines_inner<S>(
@@ -144,8 +169,9 @@ fn read_appended_lines_inner<S>(
     previous: Option<JsonlResumePoint<S>>,
     check: PrefixCheck,
     fresh: impl FnOnce() -> S,
-    mut on_line: impl FnMut(&mut S, &[u8]),
+    mut on_line: impl FnMut(&mut S, &[u8], Option<std::ops::Range<u64>>),
     fail_on_io_error: bool,
+    final_tail: bool,
 ) -> std::io::Result<JsonlRead<S>> {
     let mut file = crate::read_io::open(path)?;
 
@@ -214,18 +240,23 @@ fn read_appended_lines_inner<S>(
             Err(_) => break,
         }
         observed_len += raw.len() as u64;
-        if raw.last() != Some(&b'\n') {
+        let terminated = raw.last() == Some(&b'\n');
+        if !terminated && !final_tail {
             // An unterminated tail: a writer mid-append. Not consumed.
             break;
         }
-        let mut payload: &[u8] = &raw[..raw.len() - 1];
+        let mut payload: &[u8] = &raw[..raw.len() - usize::from(terminated)];
         if payload.last() == Some(&b'\r') {
             payload = &payload[..payload.len() - 1];
         }
         if consumed == 0 && payload.starts_with(bom) {
             payload = &payload[bom.len()..];
         }
-        on_line(&mut state, payload);
+        on_line(
+            &mut state,
+            payload,
+            (!terminated).then_some(consumed..observed_len),
+        );
         hasher.update(&raw);
         hashed_bytes += raw.len() as u64;
         consumed += raw.len() as u64;

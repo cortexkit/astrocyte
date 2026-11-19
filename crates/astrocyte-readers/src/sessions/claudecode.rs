@@ -774,6 +774,8 @@ pub struct ClaudeResumableParse {
     pub counts: ClaudeParseCounts,
     /// Calls still waiting for completion after this call.
     pub pending_calls: usize,
+    /// Byte range of a malformed final line in a done session.
+    pub rejected_tail: Option<std::ops::Range<u64>>,
 }
 
 /// Read one complete line into the state.
@@ -919,6 +921,18 @@ pub fn parse_claude_file_transactional(
     now_ms: i64,
     quiet_window_ms: i64,
 ) -> (ClaudeResumableParse, ReadTransaction) {
+    parse_claude_file_with_final_tail(path, previous, check, now_ms, quiet_window_ms, false)
+}
+
+/// Use `final_tail` only when the declaring producer has closed the session.
+pub fn parse_claude_file_with_final_tail(
+    path: &Path,
+    previous: Option<ClaudeResumePoint>,
+    check: ClaudePrefixCheck,
+    now_ms: i64,
+    quiet_window_ms: i64,
+    final_tail: bool,
+) -> (ClaudeResumableParse, ReadTransaction) {
     let mut transaction = ReadTransaction::default();
     if let Some(point) = &previous {
         begin_history(&point.0.state, &mut transaction);
@@ -931,17 +945,21 @@ pub fn parse_claude_file_transactional(
     let mut counts = ClaudeParseCounts::default();
     let mut set_aside = Vec::new();
     let mut buffer = Vec::with_capacity(4096);
-    let read = super::jsonl_resume::try_read_appended_lines(
+    let mut rejected_tail = None;
+    let read = super::jsonl_resume::try_read_appended_lines_with_tail(
         path,
         previous.map(|point| point.0),
         check,
         // A first read, or a full re-read, counts as growth.
         || fresh,
-        |state, payload| {
+        final_tail,
+        |state, payload, tail| {
             counts.lines += 1;
             let skipped = counts.skipped_lines;
             parse_line(payload, &mut buffer, &mut state.parse, &mut counts);
-            if counts.skipped_lines > skipped {
+            if counts.skipped_lines > skipped && tail.is_some() {
+                rejected_tail = tail;
+            } else if counts.skipped_lines > skipped {
                 set_aside.push((
                     state.parse.lines,
                     "Claude Code record could not be decoded".into(),
@@ -983,6 +1001,7 @@ pub fn parse_claude_file_transactional(
             hashed_bytes: read.hashed_bytes,
             counts,
             pending_calls,
+            rejected_tail,
         },
         transaction,
     )

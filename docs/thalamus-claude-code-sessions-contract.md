@@ -117,6 +117,7 @@ calls. Completed calls are ready immediately. Calls without a completion marker
 must pass the normal Claude Code 10-minute quiet window, even in a done session.
 An empty config can be acknowledged after its read commits. Active sessions
 never receive a new acknowledgement.
+In a done session, an unterminated final record is read as final, and a malformed tail is set aside and blocks acknowledgement.
 
 The acknowledgement is written only after the ledger transaction commits. A
 failed transaction neither advances the reader's in-memory offsets nor issues

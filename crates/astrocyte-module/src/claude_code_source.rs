@@ -16,7 +16,7 @@ use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::EventRecordRequest;
 use astrocyte_readers::provider_identity::inferred_provider_from_model;
 use astrocyte_readers::sessions::claudecode::{
-    parse_claude_file_transactional, ClaudeCodeCall, ClaudeParseCounts, ClaudePrefixCheck,
+    parse_claude_file_with_final_tail, ClaudeCodeCall, ClaudeParseCounts, ClaudePrefixCheck,
     ClaudeResumePoint, ReadTransaction, CLAUDE_CODE_QUIET_WINDOW_MS,
 };
 use rusqlite::params;
@@ -228,6 +228,7 @@ impl ClaudeCodeSource {
             None,
             stop,
             mode,
+            false,
         )?;
         let ClaudeCodeRead {
             mut outcome,
@@ -278,6 +279,7 @@ pub(crate) struct ClaudeCodeRead {
 
 /// Read a Claude projects directory, returning proposed file offsets and call
 /// state separately so failed ledger commits cannot skip calls on the next drain.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_projects(
     root: &Path,
     previous: &ClaudeCodeCache,
@@ -286,6 +288,7 @@ pub(crate) fn read_projects(
     work_class: Option<&str>,
     stop: &AtomicBool,
     mode: DrainMode,
+    final_tail: bool,
 ) -> Result<ClaudeCodeRead, SourceDrainError> {
     let mut transactions = Vec::new();
     let result = read_projects_staged(
@@ -296,6 +299,7 @@ pub(crate) fn read_projects(
         work_class,
         stop,
         mode,
+        final_tail,
         &mut transactions,
     );
     match result {
@@ -321,6 +325,7 @@ fn read_projects_staged(
     work_class: Option<&str>,
     stop: &AtomicBool,
     mode: DrainMode,
+    final_tail: bool,
     transactions: &mut Vec<ReadTransaction>,
 ) -> Result<ClaudeCodeRead, SourceDrainError> {
     let files = if mode.is_full() {
@@ -395,12 +400,13 @@ fn read_projects_staged(
             }
         }
         let previous_offset = point.as_ref().map(|point| point.offset());
-        let (parse, transaction) = parse_claude_file_transactional(
+        let (parse, transaction) = parse_claude_file_with_final_tail(
             &path,
             point.map(|point| (*point).clone()),
             check,
             recorded_at_ms,
             quiet_window_ms,
+            final_tail,
         );
         transactions.push(transaction);
         if let Some(reason) = parse.io_error {
@@ -409,6 +415,19 @@ fn read_projects_staged(
             );
         }
         let offset = parse.resume.as_ref().map(ClaudeResumePoint::offset);
+        if final_tail && offset.is_none_or(|offset| offset < stat.len) {
+            return Err(format!(
+                "Claude Code done file {} was not read through its observed length",
+                path.display()
+            )
+            .into());
+        }
+        if let Some(range) = parse.rejected_tail {
+            set_aside.push(crate::refresher::SetAsideRecord {
+                locator: format!("{path:?}:bytes:{}..{}", range.start, range.end),
+                reason: "Claude Code final record could not be decoded".into(),
+            });
+        }
         windows.insert(
             path.clone(),
             crate::refresher::harness_drain::WindowSchedule::after_read(

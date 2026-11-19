@@ -261,6 +261,7 @@ impl ClaudeThalamusSource {
                     Some(&root.owner_principal),
                     stop,
                     harness_drain::DrainMode::Full,
+                    root.state == SessionState::Done,
                 )?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     claude_code_source::ClaudeCodeRead {
@@ -587,6 +588,55 @@ mod tests {
             format!("{record}\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn done_claude_tail_is_recorded_or_blocks_deletion_with_evidence() {
+        for valid in [true, false] {
+            let f = Fixture::new();
+            f.call(SESSION, "tail", true);
+            let path = f
+                .config(SESSION)
+                .join("projects/encoded-cwd/session/subagents/tail.jsonl");
+            let mut bytes = fs::read(&path).unwrap();
+            assert_eq!(bytes.pop(), Some(b'\n'));
+            if !valid {
+                assert_eq!(bytes.pop(), Some(b'}'));
+            }
+            fs::write(&path, &bytes).unwrap();
+            f.declare(vec![f.root(SESSION, false)]);
+            f.tick(100);
+            assert!(f.events().is_empty());
+            f.declare(vec![f.root(SESSION, true)]);
+            f.tick(200);
+            assert_eq!(f.events().len(), usize::from(valid));
+            f.state
+                .with_conn(|conn| {
+                    let locator = format!("{path:?}:bytes:0..{}", bytes.len());
+                    let evidence: i64 = conn
+                        .query_row(
+                            "SELECT count(*) FROM set_aside_record WHERE locator=?1",
+                            [locator],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(evidence, i64::from(!valid));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                f.source
+                    .cache
+                    .lock()
+                    .unwrap()
+                    .ack
+                    .as_ref()
+                    .unwrap()
+                    .read_through
+                    .len(),
+                usize::from(valid)
+            );
+        }
     }
 
     #[test]

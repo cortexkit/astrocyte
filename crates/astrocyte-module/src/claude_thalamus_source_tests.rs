@@ -336,6 +336,7 @@ fn claude_payer_mirrored_facts_are_stated_and_other_call_facts_stay_unchanged() 
         Some("prefrontal-core verbatim"),
         &AtomicBool::new(false),
         harness_drain::DrainMode::Full,
+        false,
     )
     .unwrap();
     claude_code_source::record_requests_in_lane(
