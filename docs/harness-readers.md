@@ -461,7 +461,7 @@ Rules that affect what is recorded:
   `kind`, including `model_step`, or is a
   `system_one` fact that is missing a required member or
   carries both or neither of `run_id` and `flow_id`. Such a row is never
-  decoded as a session fact. The rows around it are recorded and the cursor
+  decoded as a session fact. A non-text or non-UTF-8 SQLite payload is also set aside. The rows around it are recorded and the cursor
   moves past it. Tests:
   `session_and_system_one_facts_in_one_store_are_both_recorded`,
   `set_aside_unknown_kind_and_malformed_system_one_rows_keep_good_rows_and_progress`.

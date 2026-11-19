@@ -32,6 +32,7 @@ use astrocyte_readers::{
     file_identity::{file_identity, same_identity},
     read_io,
 };
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode};
 use serde_json::Value;
 
@@ -220,7 +221,7 @@ impl SourceClient for BrocaSource {
 struct StoreRow {
     export_seq: i64,
     fact_id: String,
-    segment_json: String,
+    segment_json: Result<String, String>,
 }
 
 /// What one read snapshot saw.
@@ -339,7 +340,15 @@ fn read_snapshot(
                 Ok(StoreRow {
                     export_seq: row.get(0)?,
                     fact_id: row.get(1)?,
-                    segment_json: row.get(2)?,
+                    segment_json: match row.get_ref(2)? {
+                        ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+                            .map(str::to_owned)
+                            .map_err(|error| format!("segment_json is not UTF-8: {error}")),
+                        value => Err(format!(
+                            "segment_json is not Text (got {:?})",
+                            value.data_type()
+                        )),
+                    },
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -476,7 +485,12 @@ fn page_from_snapshot(snapshot: Snapshot, path: &Path) -> Result<ExportPage, Pul
                 snapshot.lineage, row.export_seq
             )
         };
-        match decode_store_row(row.export_seq, &row.fact_id, &row.segment_json) {
+        match row
+            .segment_json
+            .as_deref()
+            .map_err(Clone::clone)
+            .and_then(|json| decode_store_row(row.export_seq, &row.fact_id, json))
+        {
             Ok(fact) => broca_facts.push((row.export_seq, fact)),
             Err(reason) => set_aside.push(crate::refresher::SetAsideRecord {
                 locator: locator(),
@@ -587,6 +601,32 @@ mod tests {
     }
 
     mod broca_attempt_tests;
+
+    #[test]
+    fn set_aside_broca_blob_keeps_good_rows_and_progress() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("run-index.db");
+        create_store(&path, "instance-a", 1);
+        add_fact(&path, 1, "good-before");
+        add_fact(&path, 2, "bad");
+        add_fact(&path, 3, "good-after");
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE export_facts SET segment_json=X'7B7D' WHERE export_seq=2",
+                [],
+            )
+            .unwrap();
+        let state = test_state();
+        let broca = source(&path);
+        drain_once(&state, &broca, BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
+        assert_eq!(count(&state, "usage_event"), 2);
+        assert_eq!(runtime(&state).unwrap().1, Some(3));
+        let rows = set_aside_rows(&state);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].0.ends_with("export_seq:2"));
+        assert!(rows[0].1.contains("segment_json") && rows[0].1.contains("Blob"));
+    }
 
     #[test]
     fn set_aside_broca_bad_row_keeps_good_rows_and_progress() {
