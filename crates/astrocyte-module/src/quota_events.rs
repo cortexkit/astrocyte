@@ -26,6 +26,7 @@ type Account = (String, Option<String>);
 struct Pending {
     snapshot: CapacitySnapshot,
     account: Account,
+    published_ms: i64,
     done: oneshot::Sender<Result<(), String>>,
 }
 
@@ -185,6 +186,7 @@ impl Control {
         inner.pending.push_back(Pending {
             snapshot,
             account: notice.account(),
+            published_ms,
             done,
         });
         Some(completed)
@@ -213,17 +215,23 @@ fn mode(inner: &mut Inner, now: i64) -> bool {
 
 /// The refresher owns writes, so joining the bus reader cannot leave a SQLite worker behind.
 pub(crate) fn drain(state: &SharedState, stop: &AtomicBool) {
-    let pending = {
+    let (pending, snapshot_boundary_ms) = {
         let mut inner = state
             .quota_bus()
             .0
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        std::mem::take(&mut inner.pending)
+        (
+            std::mem::take(&mut inner.pending),
+            inner.snapshot_boundary_ms,
+        )
     };
     for reading in pending {
         let result = if stop.load(Ordering::Relaxed) {
             Err("quota reader stopping".into())
+        } else if reading.published_ms <= snapshot_boundary_ms {
+            // A snapshot can commit after this reading is queued but before it is drained.
+            Ok(())
         } else {
             state.ordered_write(|tx| {
                 apply_account_in_tx(

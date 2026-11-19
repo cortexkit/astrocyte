@@ -91,6 +91,38 @@ fn cursors() -> Cursors {
 }
 
 #[test]
+fn regression_quota_pending_read_cannot_replace_newer_committed_snapshot() {
+    struct Next;
+    impl CapacitySource for Next {
+        fn poll(&self) -> Result<CapacitySnapshot, PullError> {
+            let entries =
+                serde_json::from_value::<Vec<ProviderUsage>>(json!([entry("a", 30.0)])).unwrap();
+            Ok(crate::capacity_map::map_usage_array(&entries, None).unwrap())
+        }
+    }
+    let (state, _) = seeded();
+    let control = state.quota_bus();
+    let boundary = control.0.lock().unwrap().snapshot_boundary_ms;
+    let old = serde_json::from_value::<Vec<ProviderUsage>>(json!([entry("a", 20.0)])).unwrap();
+    let old = crate::capacity_map::map_usage_array(&old, None).unwrap();
+    let completed = control
+        .submit(&notice(2, "run1"), old, boundary + 1)
+        .unwrap();
+    let ticket = control.poll_ticket(boundary + 2, None).unwrap();
+    state
+        .ordered_write(|tx| {
+            astrocyte_core::capacity::apply_snapshot_in_tx(tx, &Next.poll().unwrap(), boundary + 2)
+                .map_err(|error| error.to_string())?;
+            Ok(((), true))
+        })
+        .unwrap();
+    control.finish_poll(ticket, true);
+    tick(&state, None);
+    assert_eq!(rows(&state)[0].1.to_bits(), 30_f64.to_bits());
+    runtime().block_on(completed).unwrap().unwrap();
+}
+
+#[test]
 fn quota_in_sequence_fetches_exact_digest_persists_only_its_account_before_completion() {
     let (state, _) = seeded();
     state
