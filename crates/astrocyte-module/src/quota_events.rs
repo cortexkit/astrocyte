@@ -47,25 +47,28 @@ struct Inner {
 }
 
 /// Process-local cursors restart with a snapshot owed, even if a notice was acked before a crash.
-pub(crate) struct Control(Mutex<Inner>);
+pub(crate) struct Control(Mutex<Inner>, Cursors);
 
 impl Default for Control {
     fn default() -> Self {
-        Self(Mutex::new(Inner {
-            access: None,
-            hello_acked: false,
-            attached: false,
-            credential_expires_ms: 0,
-            last_pull_ms: None,
-            reason: "no credential",
-            event_driven: false,
-            owed: 1,
-            fulfilled: 0,
-            last_snapshot_ms: None,
-            snapshot_boundary_ms: i64::MIN,
-            snapshot_in_flight: false,
-            pending: VecDeque::new(),
-        }))
+        Self(
+            Mutex::new(Inner {
+                access: None,
+                hello_acked: false,
+                attached: false,
+                credential_expires_ms: 0,
+                last_pull_ms: None,
+                reason: "no credential",
+                event_driven: false,
+                owed: 1,
+                fulfilled: 0,
+                last_snapshot_ms: None,
+                snapshot_boundary_ms: i64::MIN,
+                snapshot_in_flight: false,
+                pending: VecDeque::new(),
+            }),
+            Cursors::default(),
+        )
     }
 }
 
@@ -156,13 +159,14 @@ impl Control {
         }
     }
 
-    pub fn finish_poll(&self, ticket: PollTicket, success: bool) {
+    pub fn finish_poll(&self, ticket: PollTicket, committed: Option<&CapacitySnapshot>) {
         let mut inner = self.0.lock().unwrap_or_else(|p| p.into_inner());
         inner.snapshot_in_flight = false;
-        if success {
+        if let Some(snapshot) = committed {
             inner.fulfilled = ticket.owed;
             inner.last_snapshot_ms = Some(ticket.started_ms);
             inner.snapshot_boundary_ms = ticket.started_ms;
+            self.1.retire(snapshot);
         }
     }
 
@@ -366,43 +370,76 @@ fn reading(notice: &Notice, bytes: &[u8]) -> Result<(CapacitySnapshot, i64), &'s
 }
 
 #[derive(Default)]
-struct Cursors(HashMap<Account, (String, u64)>);
+struct Cursors(Mutex<HashMap<Account, (String, u64)>>);
 
 impl Cursors {
+    fn retire(&self, snapshot: &CapacitySnapshot) {
+        let Some(complete) = &snapshot.complete_providers else {
+            return;
+        };
+        let retained: std::collections::HashSet<_> = snapshot
+            .observations
+            .iter()
+            .map(|row| (row.provider.as_str(), row.account_ref.as_str()))
+            .collect();
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(provider, account), _| {
+                account.as_deref().is_none_or(|account| {
+                    !complete.contains(provider) || retained.contains(&(provider.as_str(), account))
+                })
+            });
+    }
+
     async fn admit(
-        &mut self,
+        &self,
         control: &Control,
         notice: Notice,
         fetch: impl std::future::Future<Output = Result<Vec<u8>, crate::refresher::PullError>>,
     ) -> Result<(), &'static str> {
         let key = notice.account();
-        let last = self.0.get(&key);
-        if last.is_some_and(|(epoch, seq)| epoch == &notice.epoch && notice.seq <= *seq) {
-            return Ok(());
-        }
-        let in_sequence = last.is_some_and(|(epoch, seq)| {
-            epoch == &notice.epoch && seq.checked_add(1) == Some(notice.seq)
-        });
-        if !in_sequence {
-            control.owe_snapshot();
-        } else {
-            match fetch
-                .await
-                .ok()
-                .and_then(|body| reading(&notice, &body).ok())
-            {
-                Some((snapshot, published_ms)) => {
-                    if let Some(completed) = control.submit(&notice, snapshot, published_ms) {
-                        completed
-                            .await
-                            .map_err(|_| "quota write cancelled")?
-                            .map_err(|_| "quota write failed")?;
-                    }
-                }
-                None => control.owe_snapshot(),
+        {
+            let mut cursors = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            let last = cursors.get(&key);
+            if last.is_some_and(|(epoch, seq)| epoch == &notice.epoch && notice.seq <= *seq) {
+                return Ok(());
+            }
+            let in_sequence = last.is_some_and(|(epoch, seq)| {
+                epoch == &notice.epoch && seq.checked_add(1) == Some(notice.seq)
+            });
+            if !in_sequence {
+                cursors.insert(key, (notice.epoch, notice.seq));
+                drop(cursors);
+                control.owe_snapshot();
+                return Ok(());
             }
         }
-        self.0.insert(key, (notice.epoch, notice.seq));
+        match fetch
+            .await
+            .ok()
+            .and_then(|body| reading(&notice, &body).ok())
+        {
+            Some((snapshot, published_ms)) => {
+                if let Some(completed) = control.submit(&notice, snapshot, published_ms) {
+                    completed
+                        .await
+                        .map_err(|_| "quota write cancelled")?
+                        .map_err(|_| "quota write failed")?;
+                }
+            }
+            None => control.owe_snapshot(),
+        }
+        // A committed complete snapshot may have retired this account while
+        // the reader was fetching or waiting for the refresher to drain it.
+        if let Some(cursor) = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(&key)
+        {
+            *cursor = (notice.epoch, notice.seq);
+        }
         Ok(())
     }
 }
@@ -506,7 +543,6 @@ async fn reader_loop(state: &SharedState, insula: Option<&crate::qta_client::Qta
     };
     let client = quota_bus_client::Client::new(access);
     let mut prior = None;
-    let mut cursors = Cursors::default();
     let mut delay = Duration::from_millis(250);
     loop {
         let credential = match quota_bus_client::credential(&client, prior.as_ref()).await {
@@ -551,7 +587,7 @@ async fn reader_loop(state: &SharedState, insula: Option<&crate::qta_client::Qta
                                 }
                             }
                         };
-                        run_session(control, insula, &credential, &consumer, subject, &mut cursors)
+                        run_session(control, insula, &credential, &consumer, subject, &control.1)
                             .await
                     }
                     None => std::future::pending().await,
@@ -612,7 +648,7 @@ async fn run_session(
     credential: &Credential,
     consumer: &PullConsumer,
     subject: &str,
-    cursors: &mut Cursors,
+    cursors: &Cursors,
 ) -> Result<(), &'static str> {
     while chrono::Utc::now().timestamp() < credential.exp.saturating_sub(60) {
         let batch = pull(consumer).await?;

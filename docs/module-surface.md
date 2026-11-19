@@ -1318,6 +1318,9 @@ have no complete-provider retirement authority. First notices, new epochs, gaps,
 missing bodies or failed validation record a snapshot obligation before ack.
 Duplicates do not write again. Progress acks protect pending writes; final acks
 follow commit or recorded recovery. A restart begins with a snapshot owed.
+Queued events published at or before the start of a committed `usage.get`
+snapshot cannot replace it. A complete inventory also forgets event cursors
+for accounts the snapshot retires.
 
 Healthy attachment, a current credential and a recent successful pull suppress
 per-tick snapshots. The backstop is the earlier of ten minutes and the existing

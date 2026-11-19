@@ -87,7 +87,9 @@ fn body(notice: &mut Notice) -> Vec<u8> {
 }
 
 fn cursors() -> Cursors {
-    Cursors([(("codex".into(), Some("a".into())), ("run1".into(), 1))].into())
+    Cursors(Mutex::new(
+        [(("codex".into(), Some("a".into())), ("run1".into(), 1))].into(),
+    ))
 }
 
 #[test]
@@ -116,7 +118,7 @@ fn regression_quota_pending_read_cannot_replace_newer_committed_snapshot() {
             Ok(((), true))
         })
         .unwrap();
-    control.finish_poll(ticket, true);
+    control.finish_poll(ticket, Some(&Next.poll().unwrap()));
     tick(&state, None);
     assert_eq!(rows(&state)[0].1.to_bits(), 30_f64.to_bits());
     runtime().block_on(completed).unwrap().unwrap();
@@ -142,7 +144,7 @@ fn quota_in_sequence_fetches_exact_digest_persists_only_its_account_before_compl
     let mut notice = notice(2, "run1");
     let bytes = body(&mut notice);
     let fetched = AtomicUsize::new(0);
-    let mut cursors = cursors();
+    let cursors = cursors();
     runtime().block_on(async {
         let mut admitted = Box::pin(cursors.admit(state.quota_bus(), notice, async {
             fetched.fetch_add(1, Ordering::SeqCst);
@@ -184,7 +186,7 @@ fn quota_gap_epoch_missing_body_or_digest_mismatch_owes_snapshot_before_completi
     ] {
         let (state, capacity) = seeded();
         let before = rows(&state);
-        let mut cursors = if case == "first" {
+        let cursors = if case == "first" {
             Cursors::default()
         } else {
             cursors()
@@ -230,7 +232,7 @@ fn quota_gap_epoch_missing_body_or_digest_mismatch_owes_snapshot_before_completi
         let ticket = state
             .capacity_poll_ticket(now_ms())
             .expect("snapshot was not owed before completion");
-        state.quota_bus().finish_poll(ticket, false);
+        state.quota_bus().finish_poll(ticket, None);
         assert_eq!(rows(&state), before, "{case}: wrote partial state");
         assert_eq!(sample_count(&state), 2);
         assert_eq!(
@@ -253,7 +255,7 @@ fn quota_duplicate_and_redelivery_do_not_fetch_write_or_owe_another_snapshot() {
         .quota_bus()
         .pulled(chrono::Utc::now().timestamp() + 900, now_ms());
     let before = rows(&state);
-    let mut cursors = cursors();
+    let cursors = cursors();
     runtime().block_on(async {
         for seq in [1, 1] {
             cursors
@@ -280,7 +282,9 @@ fn quota_unlabeled_event_updates_provider_readings_without_touching_labeled_acco
     let mut notice = notice(2, "run1");
     notice.account = None;
     let bytes = body(&mut notice);
-    let mut cursors = Cursors([(("codex".into(), None), ("run1".into(), 1))].into());
+    let cursors = Cursors(Mutex::new(
+        [(("codex".into(), None), ("run1".into(), 1))].into(),
+    ));
     runtime().block_on(async {
         let mut admitted = Box::pin(cursors.admit(state.quota_bus(), notice, async { Ok(bytes) }));
         assert!(futures_util::poll!(admitted.as_mut()).is_pending());
@@ -326,7 +330,9 @@ fn quota_healthy_reader_bounds_backstop_by_freshness_and_dead_reader_polls_every
     let ticket = state
         .capacity_poll_ticket(started + quiet_interval)
         .expect("quiet capacity would become stale before the backstop");
-    state.quota_bus().finish_poll(ticket, true);
+    state
+        .quota_bus()
+        .finish_poll(ticket, Some(&Capacity(AtomicUsize::new(0)).poll().unwrap()));
     state.quota_bus().unavailable("no credential");
     tick(&state, Some(&capacity));
     tick(&state, Some(&capacity));
@@ -360,6 +366,48 @@ fn quota_healthy_reader_bounds_backstop_by_freshness_and_dead_reader_polls_every
         state.capacity_poll_ticket(started + BACKSTOP_MS).is_some(),
         "backstop exceeded ten minutes"
     );
+}
+
+#[test]
+fn regression_quota_complete_snapshot_retires_only_missing_labeled_cursors() {
+    struct NewInventory;
+    impl CapacitySource for NewInventory {
+        fn poll(&self) -> Result<CapacitySnapshot, PullError> {
+            let entries =
+                serde_json::from_value::<Vec<ProviderUsage>>(json!([entry("a", 30.0)])).unwrap();
+            Ok(
+                crate::capacity_map::map_usage_array(&entries, Some(["codex".into()].into()))
+                    .unwrap(),
+            )
+        }
+    }
+    let (state, _) = seeded();
+    let cursors = &state.quota_bus().1;
+    let active = ("codex".into(), Some("a".into()));
+    let retired = ("codex".into(), Some("b".into()));
+    let unlabeled = ("codex".into(), None);
+    let other_provider = ("claude".into(), Some("c".into()));
+    for key in [&active, &retired, &unlabeled, &other_provider] {
+        cursors
+            .0
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ("epoch".into(), 100));
+    }
+    tick(&state, Some(&NewInventory));
+    assert_eq!(
+        rows(&state)
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect::<Vec<_>>(),
+        ["a"]
+    );
+    let kept = cursors.0.lock().unwrap();
+    assert_eq!(kept.len(), 3);
+    assert!(!kept.contains_key(&retired));
+    for key in [&active, &unlabeled, &other_provider] {
+        assert_eq!(kept.get(key).unwrap().1, 100);
+    }
 }
 
 type Reply = Arc<dyn Fn(&Value) -> Option<(subc_protocol::FrameType, Vec<u8>)> + Send + Sync>;
@@ -881,8 +929,8 @@ fn event_wakes_quota_real_durable_survives_refused_catalog_and_never_creates_top
         let credential = Credential { jwt: "fixture".into(), exp: chrono::Utc::now().timestamp() + 900,
             acct: names.account().into(), inbox_prefix: "unused".into(), server_url: server.url.clone(),
             credential_public: "quota_fixture".into(), spawn_generation: 1, credential_epoch: 1 };
-        let mut cursors = cursors();
-        let session = run_session(state.quota_bus(), &insula, &credential, &consumer, &subject, &mut cursors);
+        let cursors = cursors();
+        let session = run_session(state.quota_bus(), &insula, &credential, &consumer, &subject, &cursors);
         tokio::pin!(session);
         let wakes = crate::event_wakes::follow(&state, &connection, &names);
         tokio::pin!(wakes);

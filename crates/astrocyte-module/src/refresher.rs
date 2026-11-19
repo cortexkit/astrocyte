@@ -1355,10 +1355,9 @@ fn run_iteration_all(
         }) {
             let result = capacity.poll();
             let now_ms = current_time_ms();
-            let succeeded = result.is_ok();
-            let persisted = match result {
+            let persisted = match &result {
                 Ok(snapshot) => state.ordered_write(|tx| {
-                    apply_snapshot_in_tx(tx, &snapshot, now_ms)
+                    apply_snapshot_in_tx(tx, snapshot, now_ms)
                         .map_err(|error| format!("apply capacity snapshot: {error}"))?;
                     Ok(((), true))
                 }),
@@ -1370,7 +1369,7 @@ fn run_iteration_all(
             };
             state
                 .quota_bus()
-                .finish_poll(ticket, succeeded && persisted.is_ok());
+                .finish_poll(ticket, persisted.as_ref().ok().and(result.as_ref().ok()));
             if let Err(error) = persisted {
                 log_capacity_failed(&error);
             }
