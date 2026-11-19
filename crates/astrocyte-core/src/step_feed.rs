@@ -749,6 +749,133 @@ mod tests {
         }
     }
 
+    fn evidence_only_predecessor_cause(
+        predecessor_account: &str,
+        current_account: &str,
+        evidence_age_ms: i64,
+    ) -> cortexkit_usage_steps::Cause {
+        let conn = conn();
+        let first_at = 2 * FEED_WINDOW_MS;
+        let current_at = first_at + 36 * 60 * 60 * 1000;
+        let mut first = runner_step("first", first_at);
+        first.evidence.account_ref = Some(predecessor_account.into());
+        first.evidence.finished_at_ms = Some(u64::try_from(first_at + 1_000).unwrap());
+        first.evidence.cache_ttl_ms = Some(3_600_000);
+        append_runner_step(&conn, first_at, &first).unwrap();
+        let mut current = runner_step("current", current_at);
+        current.step.cache_read = Some(0);
+        current.evidence.account_ref = Some(current_account.into());
+        let earlier = runner_only_steps(&conn, "pi", "session", "current", current_at).unwrap();
+        let served =
+            cache::unrecorded_step(&conn, "pi", "session", current.step, &earlier).unwrap();
+        let body = row_body("pi", "session", FeedSource::Runner, &served, None).unwrap();
+        evidence::save(
+            &conn,
+            current_at,
+            "pi",
+            "current",
+            "broca",
+            &current.evidence,
+        )
+        .unwrap();
+        if evidence_age_ms > evidence::EVIDENCE_WINDOW_MS {
+            conn.execute(
+                "UPDATE step_evidence SET recorded_at_ms=?1 WHERE step_ref='first'",
+                [current_at - evidence_age_ms],
+            )
+            .unwrap();
+        }
+        prune(&conn, current_at.saturating_sub(FEED_WINDOW_MS)).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM step_feed WHERE step_ref='first'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "the fixture must exercise an evidence-only predecessor"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM step_evidence WHERE step_ref='first'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "the age cutoff must be enforced by the lookup, not fixture deletion"
+        );
+        append_body(&conn, current_at, &body, true, None).unwrap();
+        evidence::cause(&conn, "pi", "current").unwrap().unwrap()
+    }
+
+    #[test]
+    fn rewrite_evidence_only_predecessor_explains_account_change() {
+        assert_eq!(
+            evidence_only_predecessor_cause("account-a", "account-b", 0),
+            cortexkit_usage_steps::Cause::AccountOrModelChanged
+        );
+    }
+
+    #[test]
+    fn rewrite_evidence_only_predecessor_explains_cache_expiry() {
+        assert_eq!(
+            evidence_only_predecessor_cause("account-a", "account-a", 0),
+            cortexkit_usage_steps::Cause::CacheExpired
+        );
+    }
+
+    #[test]
+    fn rewrite_predecessor_outside_evidence_window_stays_unexplained() {
+        assert_eq!(
+            evidence_only_predecessor_cause(
+                "account-a",
+                "account-b",
+                evidence::EVIDENCE_WINDOW_MS + 1,
+            ),
+            cortexkit_usage_steps::Cause::Unexplained
+        );
+    }
+
+    #[test]
+    fn rewrite_empty_evidence_only_predecessor_stays_unexplained() {
+        let conn = conn();
+        let first_at = 2 * FEED_WINDOW_MS;
+        let current_at = first_at + 36 * 60 * 60 * 1000;
+        let first = runner_step("first", first_at);
+        let body = row_body(
+            "pi",
+            "session",
+            FeedSource::Runner,
+            &cache::unrecorded_step(&conn, "pi", "session", first.step, &[]).unwrap(),
+            None,
+        )
+        .unwrap();
+        append_body(&conn, first_at, &body, true, None).unwrap();
+        let mut current = runner_step("current", current_at);
+        current.step.cache_read = Some(0);
+        let earlier = runner_only_steps(&conn, "pi", "session", "current", current_at).unwrap();
+        let served =
+            cache::unrecorded_step(&conn, "pi", "session", current.step, &earlier).unwrap();
+        let body = row_body("pi", "session", FeedSource::File, &served, None).unwrap();
+        prune(&conn, current_at.saturating_sub(FEED_WINDOW_MS)).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT facts_json FROM step_evidence WHERE step_ref='first'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "{}"
+        );
+        append_body(&conn, current_at, &body, true, None).unwrap();
+        assert_eq!(
+            evidence::cause(&conn, "pi", "current").unwrap(),
+            Some(cortexkit_usage_steps::Cause::Unexplained)
+        );
+    }
+
     #[test]
     fn rewrite_order_seeks_keep_start_time_ties_warmups_and_chain_moves() {
         let conn = conn();

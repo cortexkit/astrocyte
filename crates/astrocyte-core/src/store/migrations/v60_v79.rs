@@ -93,3 +93,55 @@ WHEN EXISTS (SELECT 1 FROM broca_segment_mismatch
              WHERE fact_id=NEW.fact_id AND role=NEW.role AND unit=NEW.unit)
 BEGIN SELECT RAISE(ABORT,'broca_segment_mismatch_insert_once'); END;
 "#;
+
+pub(in crate::store) const V61: &str = r#"-- Provider and model must outlive the one-day feed copy for rewrite causes.
+ALTER TABLE step_evidence ADD COLUMN provider TEXT;
+ALTER TABLE step_evidence ADD COLUMN model TEXT;
+
+UPDATE step_evidence SET
+    provider=json_extract(f.row_json,'$.provider'),
+    model=json_extract(f.row_json,'$.model')
+FROM step_feed f WHERE f.feed_cursor=step_evidence.latest_feed_cursor;
+
+CREATE INDEX step_evidence_retained_neighbours
+    ON step_evidence(harness,session,runner,order_ms,first_feed_cursor)
+    WHERE latest_feed_cursor IS NULL;
+
+DROP TRIGGER step_feed_index_evidence;
+CREATE TRIGGER step_feed_index_evidence AFTER INSERT ON step_feed
+BEGIN
+    INSERT INTO step_evidence(harness,step_ref,recorded_at_ms,facts_json,first_feed_cursor,
+        session,order_ms,feed_source,occurred_at_ms,reports_cache,positive_read,latest_feed_cursor,
+        provider,model)
+    VALUES (NEW.harness,NEW.step_ref,NEW.committed_at_ms,'{}',NEW.feed_cursor,
+        NEW.session,json_extract(NEW.row_json,'$.occurred_at_ms'),NEW.source,
+        json_extract(NEW.row_json,'$.occurred_at_ms'),
+        COALESCE(json_type(NEW.row_json,'$.cache_read')='integer',0),
+        COALESCE(json_extract(NEW.row_json,'$.cache_read')>0,0),NEW.feed_cursor,
+        json_extract(NEW.row_json,'$.provider'),json_extract(NEW.row_json,'$.model'))
+    ON CONFLICT(harness,step_ref) DO UPDATE SET
+        first_feed_cursor=COALESCE(first_feed_cursor,NEW.feed_cursor),
+        session=NEW.session,feed_source=NEW.source,latest_feed_cursor=NEW.feed_cursor,
+        occurred_at_ms=excluded.occurred_at_ms,reports_cache=excluded.reports_cache,
+        positive_read=excluded.positive_read,
+        order_ms=COALESCE(json_extract(facts_json,'$.started_at_ms'),excluded.occurred_at_ms),
+        provider=excluded.provider,model=excluded.model;
+END;
+
+DROP TRIGGER step_evidence_restore_live_placeholder;
+CREATE TRIGGER step_evidence_restore_live_placeholder AFTER DELETE ON step_evidence
+BEGIN
+    INSERT INTO step_evidence(harness,step_ref,recorded_at_ms,facts_json,first_feed_cursor,
+        session,order_ms,feed_source,occurred_at_ms,reports_cache,positive_read,latest_feed_cursor,
+        provider,model)
+    SELECT f.harness,f.step_ref,f.committed_at_ms,'{}',
+        (SELECT MIN(feed_cursor) FROM step_feed WHERE harness=OLD.harness AND step_ref=OLD.step_ref),
+        f.session,json_extract(f.row_json,'$.occurred_at_ms'),f.source,
+        json_extract(f.row_json,'$.occurred_at_ms'),
+        COALESCE(json_type(f.row_json,'$.cache_read')='integer',0),
+        COALESCE(json_extract(f.row_json,'$.cache_read')>0,0),f.feed_cursor,
+        json_extract(f.row_json,'$.provider'),json_extract(f.row_json,'$.model')
+    FROM step_feed f WHERE f.feed_cursor=(SELECT MAX(feed_cursor) FROM step_feed
+        WHERE harness=OLD.harness AND step_ref=OLD.step_ref);
+END;
+"#;

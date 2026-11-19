@@ -1,6 +1,6 @@
 //! Short-lived runner facts and permanent, append-only rewrite explanations.
 
-use cortexkit_usage_steps::{cause::rewrite_cause, Cause, StepRow};
+use cortexkit_usage_steps::{cause::rewrite_cause, Cause, StepRow, StepSource, Verdict};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -190,6 +190,7 @@ fn record_cause(conn: &Connection, row: &StepRow, computed: Option<Cause>) -> ru
 struct ComparedRow {
     row: StepRow,
     runner: Option<String>,
+    order_ms: u64,
     first_cursor: i64,
 }
 
@@ -200,19 +201,18 @@ fn compared(
 ) -> rusqlite::Result<ComparedRow> {
     let runner = hydrate(conn, &mut row)?;
     row.insert("cursor".into(), Value::from("0"));
-    let row = serde_json::from_value(Value::Object(row)).map_err(json_error)?;
+    let row: StepRow = serde_json::from_value(Value::Object(row)).map_err(json_error)?;
+    let order_ms = row.started_at_ms.unwrap_or(row.occurred_at_ms);
     Ok(ComparedRow {
         row,
         runner,
+        order_ms,
         first_cursor,
     })
 }
 
 fn order(row: &ComparedRow) -> (u64, i64) {
-    (
-        row.row.started_at_ms.unwrap_or(row.row.occurred_at_ms),
-        row.first_cursor,
-    )
+    (row.order_ms, row.first_cursor)
 }
 
 /// A row can leave a comparison chain when late evidence identifies its runner
@@ -245,6 +245,14 @@ const PREVIOUS_SQL: &str = "SELECT f.row_json,e.first_feed_cursor FROM step_evid
     JOIN step_feed f ON f.feed_cursor=e.latest_feed_cursor
     WHERE e.harness=?1 AND e.session=?2 AND e.runner IS ?3 AND e.step_ref<>?4
       AND e.latest_feed_cursor IS NOT NULL AND (e.order_ms,e.first_feed_cursor)<(?5,?6)
+    ORDER BY e.order_ms DESC,e.first_feed_cursor DESC LIMIT 1";
+const PREVIOUS_EVIDENCE_SQL: &str = "SELECT e.step_ref,e.session,e.facts_json,e.provider,e.model,
+    t.value,s.value,e.first_feed_cursor,e.order_ms FROM step_evidence e
+    LEFT JOIN step_digest t ON t.digest_key=e.tools_key
+    LEFT JOIN step_digest s ON s.digest_key=e.system_key
+    WHERE e.harness=?1 AND e.session=?2 AND e.runner IS ?3 AND e.step_ref<>?4
+      AND e.latest_feed_cursor IS NULL AND e.recorded_at_ms>=?7
+      AND (e.order_ms,e.first_feed_cursor)<(?5,?6)
     ORDER BY e.order_ms DESC,e.first_feed_cursor DESC LIMIT 1";
 const NEXT_SQL: &str = "SELECT f.row_json,e.first_feed_cursor FROM step_evidence e
     JOIN step_feed f ON f.feed_cursor=e.latest_feed_cursor
@@ -285,6 +293,126 @@ fn neighbour(
         .transpose()
 }
 
+struct StoredEvidence {
+    step_ref: String,
+    session: String,
+    facts: String,
+    provider: Option<String>,
+    model: Option<String>,
+    tools: Option<String>,
+    system: Option<String>,
+    first_cursor: i64,
+    order_ms: u64,
+}
+
+fn evidence_compared(
+    harness: &str,
+    runner: Option<String>,
+    stored: StoredEvidence,
+    prompt: u64,
+    prompt_dropped: bool,
+    verdict: Verdict,
+) -> rusqlite::Result<ComparedRow> {
+    let mut evidence: Evidence = serde_json::from_str(&stored.facts).map_err(json_error)?;
+    evidence.tools_digest = stored.tools;
+    evidence.system_digest = stored.system;
+    // `rewrite_cause` 0.2.8 reads only provider, model, account, finish and TTL,
+    // request start, both digests, view and signed floor from the predecessor.
+    // The remaining required row members are inert private placeholders, never
+    // stored or served. The placeholder-independence test guards this assumption.
+    let mut row = StepRow::new(
+        "0",
+        harness,
+        StepSource::Other("evidence-only".into()),
+        stored.step_ref,
+        stored.session,
+        0,
+        prompt,
+        verdict,
+        prompt_dropped,
+    );
+    row.started_at_ms = evidence.started_at_ms;
+    row.finished_at_ms = evidence.finished_at_ms;
+    row.account_ref = evidence.account_ref;
+    row.cache_ttl_ms = evidence.cache_ttl_ms;
+    row.cache_implicit = evidence.cache_implicit;
+    row.warm_up = evidence.warm_up;
+    row.view_version = evidence.view_version;
+    row.tools_digest = evidence.tools_digest;
+    row.system_digest = evidence.system_digest;
+    row.signed_floor = evidence.signed_floor;
+    row.provider = stored.provider;
+    row.model = stored.model;
+    Ok(ComparedRow {
+        row,
+        runner,
+        order_ms: stored.order_ms,
+        first_cursor: stored.first_cursor,
+    })
+}
+
+fn previous_evidence(
+    conn: &Connection,
+    now_ms: i64,
+    harness: &str,
+    session: &str,
+    excluded: &str,
+    position: &Position,
+) -> rusqlite::Result<Option<ComparedRow>> {
+    let stored = conn
+        .prepare_cached(PREVIOUS_EVIDENCE_SQL)?
+        .query_row(
+            params![
+                harness,
+                session,
+                position.runner.as_deref(),
+                excluded,
+                position.order.0,
+                position.order.1,
+                now_ms.saturating_sub(EVIDENCE_WINDOW_MS)
+            ],
+            |row| {
+                Ok(StoredEvidence {
+                    step_ref: row.get(0)?,
+                    session: row.get(1)?,
+                    facts: row.get(2)?,
+                    provider: row.get(3)?,
+                    model: row.get(4)?,
+                    tools: row.get(5)?,
+                    system: row.get(6)?,
+                    first_cursor: row.get(7)?,
+                    order_ms: row.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    stored
+        .map(|stored| {
+            evidence_compared(
+                harness,
+                position.runner.clone(),
+                stored,
+                0,
+                false,
+                Verdict::Other("evidence-only".into()),
+            )
+        })
+        .transpose()
+}
+
+fn previous(
+    conn: &Connection,
+    now_ms: i64,
+    harness: &str,
+    session: &str,
+    excluded: &str,
+    position: &Position,
+) -> rusqlite::Result<Option<ComparedRow>> {
+    let feed = neighbour(conn, PREVIOUS_SQL, harness, session, excluded, position)?;
+    let evidence = previous_evidence(conn, now_ms, harness, session, excluded, position)?;
+    Ok(feed.into_iter().chain(evidence).max_by_key(order))
+}
+
 /// Recompute the changed step and the successors of both its old and new
 /// positions. A late insertion or newly known runner can change predecessors
 /// even when the following steps' own facts have not changed.
@@ -314,14 +442,7 @@ pub(crate) fn compute(
         runner: current.runner.clone(),
         order: order(&current),
     };
-    let prev = neighbour(
-        conn,
-        PREVIOUS_SQL,
-        harness,
-        session,
-        step_ref,
-        &new_position,
-    )?;
+    let prev = previous(conn, now_ms, harness, session, step_ref, &new_position)?;
     let computed = rewrite_cause(prev.as_ref().map(|other| &other.row), &current.row);
     record_cause(conn, &current.row, computed.clone())?;
     let mut positions = vec![new_position.clone()];
@@ -343,14 +464,7 @@ pub(crate) fn compute(
             runner: next.runner.clone(),
             order: order(&next),
         };
-        let previous = neighbour(
-            conn,
-            PREVIOUS_SQL,
-            harness,
-            session,
-            step_ref,
-            &next_position,
-        )?;
+        let previous = previous(conn, now_ms, harness, session, step_ref, &next_position)?;
         // The current emission has not been inserted yet. Its new facts must
         // win over an older feed body when it is the successor's predecessor.
         let prev = previous
@@ -410,29 +524,46 @@ mod tests {
     #[test]
     fn rewrite_neighbour_queries_seek_the_order_index() {
         let conn = conn();
-        for sql in [PREVIOUS_SQL, NEXT_SQL] {
+        for (sql, index) in [
+            (PREVIOUS_SQL, "step_evidence_neighbours"),
+            (PREVIOUS_EVIDENCE_SQL, "step_evidence_retained_neighbours"),
+            (NEXT_SQL, "step_evidence_neighbours"),
+        ] {
             for runner in [None, Some("broca")] {
+                let values: Vec<&dyn rusqlite::ToSql> = if sql == PREVIOUS_EVIDENCE_SQL {
+                    vec![&"pi", &"session", &runner, &"excluded", &100, &1, &0]
+                } else {
+                    vec![&"pi", &"session", &runner, &"excluded", &100, &1]
+                };
                 let plan = conn
                     .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
                     .unwrap()
-                    .query_map(
-                        params!["pi", "session", runner, "excluded", 100, 1],
-                        |row| row.get::<_, String>(3),
-                    )
+                    .query_map(values.as_slice(), |row| row.get::<_, String>(3))
                     .unwrap()
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .unwrap();
                 assert!(
-                    plan.iter().any(|line| line
-                        .contains("SEARCH e USING INDEX step_evidence_neighbours")
-                        && line.contains("order_ms")),
+                    plan.iter().any(|line| {
+                        line.contains(&format!("SEARCH e USING INDEX {index}"))
+                            && line.contains("order_ms")
+                    }),
                     "{plan:?}"
                 );
-                assert!(
-                    plan.iter()
-                        .any(|line| line.contains("SEARCH f USING INTEGER PRIMARY KEY")),
-                    "{plan:?}"
-                );
+                if sql == PREVIOUS_EVIDENCE_SQL {
+                    for digest in ["t", "s"] {
+                        assert!(
+                            plan.iter().any(|line| line
+                                .contains(&format!("SEARCH {digest} USING INTEGER PRIMARY KEY"))),
+                            "{plan:?}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        plan.iter()
+                            .any(|line| line.contains("SEARCH f USING INTEGER PRIMARY KEY")),
+                        "{plan:?}"
+                    );
+                }
                 assert!(
                     !plan
                         .iter()
@@ -441,6 +572,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rewrite_neighbour_steps_are_flat_at_two_history_sizes() {
+        for evidence_only in [false, true] {
+            let mut costs = Vec::new();
+            for count in [1_000_i64, 10_000] {
+                let conn = conn();
+                conn.execute_batch("DROP TRIGGER step_feed_index_evidence;")
+                    .unwrap();
+                conn.execute(
+                    "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                     INSERT INTO step_feed(feed_cursor,harness,step_ref,source,session,committed_at_ms,row_json)
+                     SELECT i,'pi','step-'||i,'runner','session',1,
+                       json_object('cursor','0','harness','pi','source','runner',
+                         'step_ref','step-'||i,'session','session','occurred_at_ms',i,
+                         'prompt',100,'verdict','stable','prompt_dropped',json('false')) FROM n",
+                    [count],
+                )
+                .unwrap();
+                conn.execute(
+                    "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                     INSERT INTO step_evidence(harness,step_ref,runner,recorded_at_ms,facts_json,
+                       first_feed_cursor,session,order_ms,feed_source,occurred_at_ms,reports_cache,
+                       positive_read,latest_feed_cursor,provider,model)
+                     SELECT 'pi','step-'||i,'broca',?2,'{}',i,'session',i,'runner',i,0,0,
+                       CASE ?3 WHEN 1 THEN i END,'anthropic','model' FROM n",
+                    params![
+                        count,
+                        EVIDENCE_WINDOW_MS,
+                        if evidence_only { 0_i64 } else { 1_i64 }
+                    ],
+                )
+                .unwrap();
+                let position = Position {
+                    runner: Some("broca".into()),
+                    order: (u64::try_from(count + 1).unwrap(), count + 1),
+                };
+                let counter = crate::store::VmCounter::start(&conn);
+                let found = previous(
+                    &conn,
+                    EVIDENCE_WINDOW_MS + 1,
+                    "pi",
+                    "session",
+                    "current",
+                    &position,
+                )
+                .unwrap();
+                costs.push(counter.steps());
+                let found = found.expect("the measured lookup must find a row");
+                assert_eq!(
+                    order(&found),
+                    (u64::try_from(count).unwrap(), count),
+                    "the lookup must return the newest predecessor"
+                );
+            }
+            eprintln!(
+                "evidence-only={evidence_only} predecessor VM instructions at 1,000 / 10,000 evidence rows: {costs:?}"
+            );
+            assert!(
+                costs[1] < costs[0] + 100,
+                "predecessor lookup scanned evidence history: {costs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_predecessor_ignores_inert_required_row_fields() {
+        let stored = || {
+            StoredEvidence {
+                step_ref: "previous".into(),
+                session: "session".into(),
+                facts: r#"{"started_at_ms":100,"finished_at_ms":150,"account_ref":"account","cache_ttl_ms":10}"#.into(),
+                provider: Some("anthropic".into()),
+                model: Some("model".into()),
+                tools: None,
+            system: None,
+            first_cursor: 1,
+            order_ms: 100,
+            }
+        };
+        let first = evidence_compared(
+            "pi",
+            Some("broca".into()),
+            stored(),
+            0,
+            false,
+            Verdict::Other("placeholder-a".into()),
+        )
+        .unwrap();
+        let second = evidence_compared(
+            "pi",
+            Some("broca".into()),
+            stored(),
+            1_000_000,
+            true,
+            Verdict::Bust,
+        )
+        .unwrap();
+        let mut current = StepRow::new(
+            "2",
+            "pi",
+            StepSource::Runner,
+            "current",
+            "session",
+            200,
+            100,
+            Verdict::FullBust,
+            false,
+        );
+        current.started_at_ms = Some(200);
+        current.account_ref = Some("account".into());
+        current.provider = Some("anthropic".into());
+        current.model = Some("model".into());
+        let first_cause = rewrite_cause(Some(&first.row), &current);
+        assert_eq!(first_cause, Some(Cause::CacheExpired));
+        assert_eq!(first_cause, rewrite_cause(Some(&second.row), &current));
     }
 
     #[test]

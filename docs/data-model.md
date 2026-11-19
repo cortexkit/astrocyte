@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 58. A schema change appends a migration; an applied
+currently version 61. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -28,7 +28,7 @@ copies that timeout without running the table-creating probes.
 | `cache_read_step` | Each row locates one dated step of a session that carries a plain cache-read measurement, zero reads included. | derived; a measurement trigger inserts it |
 | `step_feed` | Each row is one emission of a served cache step for `usage.steps.read`; the newest row for a harness and step wins. | insert; rows older than 24 hours are deleted |
 | `step_feed_state` | The row records the cache cursor the feed has caught up to and the newest feed cursor retention deleted. | one row |
-| `step_evidence` | Each row retains a step's runner identity, first feed cursor, indexed live ordering and cache witnesses, and optional event-only rewrite facts under `(harness, step_ref)`. | upsert; bounded 30-day retention |
+| `step_evidence` | Each row retains a step's runner identity, provider and model, first feed cursor, indexed live ordering and cache witnesses, and optional event-only rewrite facts under `(harness, step_ref)`. | upsert; bounded 30-day retention |
 | `step_digest` | Each row interns one distinct tool or system digest used by retained evidence. | insert; delete after its last reference expires or changes |
 | `step_cause` | Each row records a changed explanation for one step identity; the newest key wins, including a null correction to no cause. | append only; kept forever |
 | `chargeability_transition` | Each row records the one terminal settlement of an event's chargeability. | insert only |

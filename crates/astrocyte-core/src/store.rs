@@ -471,6 +471,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 60,
         statements: migrations::v60_v79::V60,
     },
+    Migration {
+        version: 61,
+        statements: migrations::v60_v79::V61,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
@@ -4100,6 +4104,101 @@ mod tests {
                 steps
             );
         }
+    }
+
+    #[test]
+    fn schema_v61_backfills_and_maintains_evidence_provider_and_model() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_connection(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version < 61) {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        for step_ref in ["live", "expired"] {
+            crate::rewrite_evidence::save(
+                &conn,
+                100,
+                "pi",
+                step_ref,
+                "broca",
+                &crate::rewrite_evidence::Evidence {
+                    started_at_ms: Some(100),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            r#"INSERT INTO step_feed(feed_cursor,harness,step_ref,source,session,committed_at_ms,row_json)
+            VALUES (10,'pi','live','runner','session',100,'{"occurred_at_ms":100,"provider":"anthropic","model":"model-a"}'),
+                   (11,'pi','expired','runner','session',100,'{"occurred_at_ms":100,"provider":"openai","model":"model-b"}');
+            DELETE FROM step_feed WHERE feed_cursor=11;"#,
+        )
+        .unwrap();
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 61)
+            .expect("migration 61");
+        conn.execute_batch(migration.statements).unwrap();
+        let stored: Vec<(String, Option<String>, Option<String>)> = conn
+            .prepare("SELECT step_ref,provider,model FROM step_evidence ORDER BY step_ref")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            stored,
+            [
+                ("expired".into(), None, None),
+                (
+                    "live".into(),
+                    Some("anthropic".into()),
+                    Some("model-a".into()),
+                ),
+            ]
+        );
+        crate::rewrite_evidence::save(
+            &conn,
+            200,
+            "pi",
+            "new",
+            "broca",
+            &crate::rewrite_evidence::Evidence::default(),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO step_feed(harness,step_ref,source,session,committed_at_ms,row_json)
+             VALUES ('pi','new','runner','session',200,'{\"occurred_at_ms\":200,\"provider\":\"google\",\"model\":\"model-c\"}')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT provider,model FROM step_evidence WHERE step_ref='new'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            ("google".into(), "model-c".into())
+        );
+        conn.execute("DELETE FROM step_evidence WHERE step_ref='live'", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT runner,facts_json,provider,model FROM step_evidence WHERE step_ref='live'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap(),
+            (None, "{}".into(), "anthropic".into(), "model-a".into(),)
+        );
     }
 
     #[test]
