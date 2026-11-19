@@ -140,6 +140,7 @@ impl OmpSource {
                     resume: parse.resume,
                 }
             },
+            |call| call.entry_id.as_str(),
             map_call,
             |total, counts| {
                 total.add(counts);
@@ -176,7 +177,7 @@ impl HarnessSource for OmpSource {
         Ok(health_reason(
             "Oh My Pi",
             outcome.quarantined_redeliveries,
-            outcome.counts.usage_not_ingested(),
+            outcome.counts.usage_not_ingested() + outcome.calls_set_aside,
         ))
     }
 }

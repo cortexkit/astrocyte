@@ -131,6 +131,7 @@ impl KimiSource {
                     resume: parse.resume,
                 }
             },
+            |call| call.message_id.as_str(),
             map_call,
             |total, counts| {
                 total.add(counts);
@@ -167,7 +168,7 @@ impl HarnessSource for KimiSource {
         Ok(health_reason(
             "Kimi CLI",
             outcome.quarantined_redeliveries,
-            outcome.counts.usage_not_ingested(),
+            outcome.counts.usage_not_ingested() + outcome.calls_set_aside,
         ))
     }
 }
@@ -287,6 +288,56 @@ mod tests {
 
     fn drain(source: &KimiSource, state: &SharedState, at: i64) -> KimiDrainOutcome {
         source.drain(state, at, &NEVER_STOP).unwrap()
+    }
+
+    #[test]
+    fn regression_kimi_out_of_range_counter_is_set_aside_and_resume_advances() {
+        let temp = TempDir::new().unwrap();
+        let path = write_file(
+            temp.path(),
+            WIRE,
+            &[
+                status("before", [1, 2, 0, 0]),
+                status("oversized", [1, i64::MAX.unsigned_abs() + 1, 0, 0]),
+                status("after", [3, 4, 0, 0]),
+            ]
+            .concat(),
+        );
+        let state = test_state();
+        let source = KimiSource::at(temp.path());
+        assert_eq!(drain(&source, &state, 1).rows_recorded, 2);
+        let (locator, reason): (String, String) = state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT locator,reason FROM set_aside_record WHERE source_key='kimi'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(locator, format!("{path:?}:oversized"));
+        assert!(
+            reason.contains("token_usage.output exceeds stored integer range"),
+            "{reason}"
+        );
+        append(&path, &status("resumed", [5, 6, 0, 0]));
+        let resumed = drain(&source, &state, 2);
+        assert_eq!(
+            (
+                resumed.files_resumed,
+                resumed.calls_emitted,
+                resumed.rows_recorded
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM usage_event WHERE producer='kimi'"
+            ),
+            3
+        );
     }
 
     fn count(state: &SharedState, sql: &str) -> i64 {

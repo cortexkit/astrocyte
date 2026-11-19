@@ -638,7 +638,27 @@ pub(crate) fn record_requests_in_lane(
     stop_requested: &dyn Fn() -> bool,
     mode: DrainMode,
 ) -> Result<RecordTally, SourceDrainError> {
-    if !mode.has_work(requests.len(), 0) {
+    record_requests_and_evidence_in_lane(
+        state,
+        key,
+        requests,
+        &[],
+        recorded_at_ms,
+        stop_requested,
+        mode,
+    )
+}
+
+fn record_requests_and_evidence_in_lane(
+    state: &SharedState,
+    key: &str,
+    requests: &[EventRecordRequest],
+    evidence: &[super::SetAsideRecord],
+    recorded_at_ms: i64,
+    stop_requested: &dyn Fn() -> bool,
+    mode: DrainMode,
+) -> Result<RecordTally, SourceDrainError> {
+    if !mode.has_work(requests.len(), evidence.len()) {
         return Ok(RecordTally::default());
     }
     let mut stopped = false;
@@ -658,13 +678,15 @@ pub(crate) fn record_requests_in_lane(
         if mode.is_full() {
             mark_current_in_tx(tx, key, key, recorded_at_ms)?;
         }
-        Ok((dispositions, true))
+        let newly_seen = record_set_aside_in_tx(tx, key, evidence, recorded_at_ms)?;
+        Ok(((dispositions, newly_seen), true))
     });
-    let dispositions = match committed {
+    let (dispositions, newly_seen) = match committed {
         Ok(dispositions) => dispositions,
         Err(_) if stopped => return Err(SourceDrainError::Stopped),
         Err(reason) => return Err(SourceDrainError::Failed(reason)),
     };
+    warn_set_aside(key, &newly_seen);
     Ok(RecordTally::from_dispositions(dispositions))
 }
 
@@ -718,6 +740,7 @@ pub(crate) struct JsonlDrainOutcome<C> {
     pub counts: C,
     pub skipped_lines_by_file: std::collections::BTreeMap<PathBuf, u64>,
     pub calls_emitted: usize,
+    pub calls_set_aside: u64,
     pub rows_recorded: usize,
     pub exact_redeliveries: usize,
     pub quarantined_redeliveries: usize,
@@ -745,6 +768,7 @@ pub(crate) fn drain_jsonl<P, C: Default, Call>(
     stop: &AtomicBool,
     keep: &dyn Fn(&Path) -> bool,
     parse: impl Fn(&Path, Option<P>, PrefixCheck) -> JsonlRead<P, C, Call>,
+    reference: impl Fn(&Call) -> &str,
     map: impl Fn(Call) -> Result<EventRecordRequest, String>,
     add_counts: impl Fn(&mut C, &C) -> u64,
     offset: impl Fn(&P) -> u64,
@@ -775,6 +799,7 @@ pub(crate) fn drain_jsonl<P, C: Default, Call>(
     let mut outcome = JsonlDrainOutcome::default();
     let mut next = ResumeCache::default();
     let mut requests = Vec::new();
+    let mut evidence = Vec::new();
     for path in files {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(SourceDrainError::Stopped);
@@ -834,10 +859,18 @@ pub(crate) fn drain_jsonl<P, C: Default, Call>(
         }
         outcome.calls_emitted += parsed.calls.len();
         if let Some(point) = parsed.resume {
-            next.resume.insert(path, point);
+            next.resume.insert(path.clone(), point);
         }
         for call in parsed.calls {
-            requests.push(map(call)?);
+            let reference = reference(&call).to_owned();
+            match map(call) {
+                Ok(request) => requests.push(request),
+                Err(reason) => {
+                    let locator = format!("{path:?}:{reference}");
+                    evidence.push(super::SetAsideRecord { locator, reason });
+                    outcome.calls_set_aside += 1;
+                }
+            }
         }
     }
     if !mode.is_full() {
@@ -849,10 +882,11 @@ pub(crate) fn drain_jsonl<P, C: Default, Call>(
             next.prefix_verified_ms.entry(path).or_insert(verified);
         }
     }
-    let tally = record_requests_in_lane(
+    let tally = record_requests_and_evidence_in_lane(
         state,
         key,
         &requests,
+        &evidence,
         recorded_at_ms,
         &|| stop.load(std::sync::atomic::Ordering::Relaxed),
         mode,
