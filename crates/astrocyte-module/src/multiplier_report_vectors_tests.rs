@@ -184,7 +184,18 @@ fn assert_case(body: &Value, case: Case) {
     let result = &body["result"];
     assert_eq!(result["latest"].as_array().unwrap().len(), 1);
     assert_eq!(result["series"].as_array().unwrap().len(), 2);
-    assert_eq!(result["latest"][0], result["series"][1]);
+    let mut latest = result["latest"][0].clone();
+    let last_eligible = latest.as_object_mut().unwrap().remove("last_eligible");
+    if matches!(case, Case::Eligible) {
+        let last_eligible = last_eligible.expect("eligible latest row describes itself");
+        assert_eq!(last_eligible["day"], latest["observation_day"]);
+        assert_eq!(last_eligible["interval_end_ms"], latest["interval_end_ms"]);
+        assert_eq!(last_eligible["multiplier"], latest["multiplier"]);
+        assert_eq!(last_eligible["fee_multiplier"], latest["fee_multiplier"]);
+    } else {
+        assert!(last_eligible.is_none());
+    }
+    assert_eq!(latest, result["series"][1]);
     for row in result["series"].as_array().unwrap() {
         assert_eq!(row["quota_provider"], case.provider());
         assert_eq!(row["plan"], case.plan());

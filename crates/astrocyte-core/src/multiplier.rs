@@ -2792,7 +2792,7 @@ pub fn multiplier_report(
                            WHERE child.supersedes = o.observation_id))";
     // A pooled legacy head is only a fallback until that provider has any
     // plan-specific observation. The history below still retains every head.
-    let latest = observation_rows(
+    let mut latest = observation_rows(
         conn,
         &format!(
             "{HEADS}
@@ -2809,6 +2809,57 @@ pub fn multiplier_report(
         ),
         &[],
     )?;
+    // Read the numbers directly instead of passing them through SQLite's JSON
+    // formatting, which can shorten a REAL and change the served value.
+    let mut eligible_statement = conn.prepare(&format!(
+        "{HEADS}
+         SELECT h.quota_provider, h.plan, h.observation_day, h.interval_end_ms,
+                h.multiplier, h.fee_multiplier
+         FROM head h
+         WHERE h.routing_eligible = 1
+           AND h.observation_id = (
+               SELECT e.observation_id FROM head e
+               WHERE e.quota_provider = h.quota_provider
+                 AND e.plan IS h.plan
+                 AND e.routing_eligible = 1
+               ORDER BY e.observation_day DESC, e.observation_id DESC LIMIT 1)"
+    ))?;
+    let eligible = eligible_statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<f64>>(4)?,
+            row.get::<_, Option<f64>>(5)?,
+        ))
+    })?;
+    let mut last_eligible = BTreeMap::new();
+    for row in eligible {
+        let (provider, plan, day, interval_end_ms, multiplier, fee_multiplier) = row?;
+        if let Some(plan) = plan {
+            last_eligible.insert(
+                (provider, plan),
+                json!({
+                    "day": day,
+                    "interval_end_ms": interval_end_ms,
+                    "multiplier": multiplier,
+                    "fee_multiplier": fee_multiplier,
+                }),
+            );
+        }
+    }
+    for row in &mut latest {
+        let provider = row["quota_provider"].as_str().unwrap_or_default();
+        let Some(plan) = row["plan"].as_str() else {
+            continue;
+        };
+        if let Some(value) = last_eligible.get(&(provider.to_owned(), plan.to_owned())) {
+            row.as_object_mut()
+                .expect("observation row is an object")
+                .insert("last_eligible".into(), value.clone());
+        }
+    }
     let series = observation_rows(
         conn,
         &format!(

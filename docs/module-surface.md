@@ -583,6 +583,9 @@ Reads never write. A refusal on a read is one of the codes below.
 - `spend.multiplier.report`: `latest` contains each provider/plan's newest head,
   ordered by `(quota_provider, plan)`. A legacy pooled row (`plan: null`) appears
   there only when its provider has no plan-specific observation at all.
+  Each `latest` row also carries `last_eligible`, the newest unsuperseded
+  eligible head for that provider/plan as `{day, interval_end_ms, multiplier,
+  fee_multiplier}`; it is absent when the plan has never had an eligible head.
   `series` keeps every head in the requested day range, including both legacy
   pooled and plan-specific heads. Refusal: `invalid_range` (`from_ms`
   negative or not before `to_ms`). Test:

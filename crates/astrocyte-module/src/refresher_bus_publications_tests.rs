@@ -63,6 +63,53 @@ async fn bus_publications_multiplier_daily_and_recompute_match_report_bytes() {
 }
 
 #[tokio::test]
+async fn bus_publications_multiplier_last_eligible_matches_report() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(state::leased_test_state(&directory));
+    publish_desired(&state, &directory);
+    let fusiform = FakeFusiform::new(false);
+    install_catalog(&state, &fusiform);
+    seed_usage(&state);
+    state.ordered_write(|tx| {
+        // Spread equal attributed usage over seven days so the daily stage
+        // produces an eligible head rather than a stability diagnostic.
+        for index in 0..40 {
+            let id = format!("eligible-{index}");
+            let at = DAY_START - (index % 7 + 1) * DAY_MS
+                + ((index / 7) % 4 * 6 + 3) * 3_600_000;
+            tx.execute("INSERT INTO usage_event(event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis,account_ref) VALUES (?1,'opencode','lineage',?1,?2,?2,'openai','m','unknown','acct')", params![id, at]).map_err(|error| error.to_string())?;
+            tx.execute("INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent) VALUES ((SELECT event_key FROM usage_event WHERE event_id=?1),'input','token','billed','usage.input',1000,0)", [id]).map_err(|error| error.to_string())?;
+        }
+        Ok(((), true))
+    }).unwrap();
+    let Some(bus) = crate::bus_publications::tests::TestBus::start(&state).await else {
+        return;
+    };
+    let key = "x636f646578.x6f70656e61692f70726f5f323078";
+    let before = bus.attempts();
+    MultiplierStage::new(Some(fusiform)).tick(&state, false, NOW);
+    bus.after(before).await;
+
+    let report = crate::ops::dispatch(
+        &state,
+        crate::ops::OP_MULTIPLIER_REPORT,
+        json!({"from_ms":0,"to_ms":1}),
+    )
+    .unwrap();
+    let last_eligible = report["latest"][0]
+        .get("last_eligible")
+        .expect("an eligible latest row carries its own values");
+    assert_eq!(
+        last_eligible["day"],
+        report["latest"][0]["observation_day"]
+    );
+    let published = bus.multiplier.get(key).await.unwrap().unwrap();
+    let published: serde_json::Value = serde_json::from_slice(published.as_ref()).unwrap();
+    assert_eq!(published["last_eligible"], *last_eligible);
+    bus.finish().await;
+}
+
+#[tokio::test]
 async fn bus_publications_multiplier_startup_restores_current_pairs() {
     let directory = tempfile::tempdir().unwrap();
     let state = Arc::new(state::leased_test_state(&directory));

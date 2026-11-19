@@ -1374,6 +1374,171 @@ fn v2_unpriced_share_does_not_veto_an_adequate_stable_sample() {
     );
 }
 
+fn observation_days_later(observation: &Observation, days: i64) -> Observation {
+    let mut shifted = observation.clone();
+    let offset = days * DAY;
+    shifted.interval_start_ms += offset;
+    shifted.interval_end_ms += offset;
+    shifted.token_interval_start_ms = shifted.token_interval_start_ms.map(|at| at + offset);
+    shifted.token_interval_end_ms = shifted.token_interval_end_ms.map(|at| at + offset);
+    shifted.snapshot_at_ms += offset;
+    shifted.observation_day = utc_day(shifted.interval_end_ms).unwrap();
+    shifted
+}
+
+fn eligible_plan_observation(conn: &Connection) -> Observation {
+    let mut observation = sample_observation(conn);
+    observation.plan = Some("openai/pro_200".into());
+    observation.routing_eligible = true;
+    observation.eligibility_reasons.clear();
+    observation
+}
+
+fn latest_report(conn: &Connection) -> Value {
+    multiplier_report(
+        conn,
+        &MultiplierReportRequest {
+            from_ms: 0,
+            to_ms: 10 * DAY,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn v2_latest_last_eligible_uses_newest_eligible_plan_head() {
+    let mut conn = conn();
+    let mut first = eligible_plan_observation(&conn);
+    first.multiplier = Some(1.25);
+    first.fee_multiplier = None;
+    let mut second = observation_days_later(&first, 1);
+    second.multiplier = Some(2.5);
+    second.fee_multiplier = Some(0.75);
+    let mut newest = observation_days_later(&second, 1);
+    newest.routing_eligible = false;
+    newest.eligibility_reasons = vec!["insufficient_points".into()];
+    newest.multiplier = Some(9.0);
+    newest.fee_multiplier = Some(0.25);
+    let tx = conn.transaction().unwrap();
+    for observation in [&first, &second, &newest] {
+        insert_observation_in_tx(&tx, observation).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let report = latest_report(&conn);
+    let latest = &report["latest"][0];
+    assert_eq!(latest["observation_day"], "1970-01-04");
+    assert_eq!(latest["routing_eligible"], false);
+    assert_eq!(
+        latest["last_eligible"],
+        json!({
+            "day": "1970-01-03",
+            "interval_end_ms": 2 * DAY,
+            "multiplier": 2.5,
+            "fee_multiplier": 0.75,
+        })
+    );
+    println!("latest with last_eligible: {}", serde_json::to_string(latest).unwrap());
+    assert!(report["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row.get("last_eligible").is_none()));
+}
+
+#[test]
+fn v2_latest_last_eligible_describes_eligible_latest_row() {
+    let mut conn = conn();
+    let mut eligible = eligible_plan_observation(&conn);
+    eligible.multiplier = None;
+    eligible.fee_multiplier = None;
+    let tx = conn.transaction().unwrap();
+    insert_observation_in_tx(&tx, &eligible).unwrap();
+    tx.commit().unwrap();
+
+    let report = latest_report(&conn);
+    let latest = &report["latest"][0];
+    assert_eq!(latest["routing_eligible"], true);
+    assert_eq!(
+        latest["last_eligible"],
+        json!({
+            "day": latest["observation_day"],
+            "interval_end_ms": latest["interval_end_ms"],
+            "multiplier": null,
+            "fee_multiplier": null,
+        })
+    );
+}
+
+#[test]
+fn v2_latest_last_eligible_is_absent_without_an_eligible_plan_head() {
+    let mut conn = conn();
+    let mut never_eligible = eligible_plan_observation(&conn);
+    never_eligible.routing_eligible = false;
+    never_eligible.eligibility_reasons = vec!["insufficient_points".into()];
+    let mut legacy = never_eligible.clone();
+    legacy.quota_provider = "legacy".into();
+    legacy.plan = None;
+    legacy.eligibility_reasons = vec!["legacy_estimator".into()];
+    let mut eligible_control = never_eligible.clone();
+    eligible_control.plan = Some("openai/pro_100".into());
+    eligible_control.routing_eligible = true;
+    eligible_control.eligibility_reasons.clear();
+    let tx = conn.transaction().unwrap();
+    for observation in [&never_eligible, &legacy, &eligible_control] {
+        insert_observation_in_tx(&tx, observation).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let report = latest_report(&conn);
+    let latest = report["latest"].as_array().unwrap();
+    assert_eq!(latest.len(), 3);
+    assert!(latest
+        .iter()
+        .find(|row| row["plan"] == "openai/pro_100")
+        .unwrap()
+        .get("last_eligible")
+        .is_some());
+    assert!(latest
+        .iter()
+        .filter(|row| row["plan"] != "openai/pro_100")
+        .all(|row| row.get("last_eligible").is_none()));
+}
+
+#[test]
+fn v2_latest_last_eligible_ignores_superseded_eligible_heads() {
+    let mut conn = conn();
+    let mut older = eligible_plan_observation(&conn);
+    older.multiplier = Some(1.25);
+    older.fee_multiplier = Some(0.5);
+    let mut superseded = observation_days_later(&older, 1);
+    superseded.multiplier = Some(2.5);
+    let mut correction = superseded.clone();
+    correction.routing_eligible = false;
+    correction.eligibility_reasons = vec!["insufficient_points".into()];
+    correction.multiplier = Some(7.0);
+    let mut newest = observation_days_later(&correction, 1);
+    newest.multiplier = Some(9.0);
+    let tx = conn.transaction().unwrap();
+    for observation in [&older, &superseded, &newest] {
+        insert_observation_in_tx(&tx, observation).unwrap();
+    }
+    insert_superseding_observation_in_tx(&tx, &correction).unwrap();
+    tx.commit().unwrap();
+
+    let report = latest_report(&conn);
+    assert_eq!(report["latest"][0]["observation_day"], "1970-01-04");
+    assert_eq!(
+        report["latest"][0]["last_eligible"],
+        json!({
+            "day": "1970-01-02",
+            "interval_end_ms": DAY,
+            "multiplier": 1.25,
+            "fee_multiplier": 0.5,
+        })
+    );
+}
+
 #[test]
 fn v2_latest_uses_ordered_plan_heads_instead_of_legacy_pool() {
     let mut conn = conn();

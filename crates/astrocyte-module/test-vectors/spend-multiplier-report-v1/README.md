@@ -13,7 +13,7 @@ fixtures, not evidence of any provider's actual calibration or tariff.
 |---|---|
 | `quota-unestablished.json` | Both `latest` and `series` retain an ineligible pool with a null quota multiplier and explicit eligibility reasons |
 | `low-resolution.json` | A low-burn pool has `low_resolution: true`, a numeric descriptive ratio, and `insufficient_points` prohibits routing |
-| `routing-eligible.json` | A normal per-plan head has a positive quota multiplier, routing eligibility, model valuation and stability diagnostics |
+| `routing-eligible.json` | A normal per-plan head has a positive quota multiplier, routing eligibility, model valuation and stability diagnostics; `latest.last_eligible` repeats that head's routing values |
 | `narrow-range.json` | A one-millisecond range includes the earlier day's head at its lower bound and excludes the newer head; `latest` remains unchanged |
 
 The first three requests use `{"from_ms":0,"to_ms":777600001}`. Each store
