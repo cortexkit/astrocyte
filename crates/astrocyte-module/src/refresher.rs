@@ -1040,6 +1040,30 @@ fn run_tick(
     // a tick, never a whole ledger walk. Anything it enqueues is priced on the
     // next tick.
     reconciler.tick(state, stop);
+    if let Err(error) = check_broca_segments_tick(state, current_time_ms(), stop) {
+        if !stop.load(Ordering::Relaxed) {
+            tracing::warn!(%error, "BROCA segment coverage check failed");
+        }
+    }
+}
+
+fn check_broca_segments_tick(
+    state: &SharedState,
+    now_ms: i64,
+    stop: &AtomicBool,
+) -> Result<usize, String> {
+    if stop.load(Ordering::Relaxed) {
+        return Ok(0);
+    }
+    // This advances only the coverage cursor and writes diagnostic evidence;
+    // no usage or pricing projections need refreshing.
+    state.ordered_tail_write(|tx| {
+        let checked = interrupt_on_stop(tx, stop, || {
+            astrocyte_core::broca::check_segments_in_tx(tx, now_ms)
+        })
+        .map_err(|error| error.to_string())?;
+        Ok((checked, false))
+    })
 }
 
 /// Test fixture over `run_iteration_full` with capacity and catalog absent.

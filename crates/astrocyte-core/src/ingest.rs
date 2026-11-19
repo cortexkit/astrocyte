@@ -928,6 +928,13 @@ fn canonical_incoming_payload(
     request: &EventRecordRequest,
     media: Option<&crate::media::MediaFacts>,
 ) -> Result<String, CanonError> {
+    jcs_serialize(&incoming_payload_value(request, media))
+}
+
+pub(crate) fn incoming_payload_value(
+    request: &EventRecordRequest,
+    media: Option<&crate::media::MediaFacts>,
+) -> serde_json::Value {
     let mut measurements = request.measurements.iter().collect::<Vec<_>>();
     measurements.sort_by(|left, right| (&left.role, &left.unit).cmp(&(&right.role, &right.unit)));
     let mut payload = json!({
@@ -968,7 +975,27 @@ fn canonical_incoming_payload(
     if let (Some(media), Some(object)) = (media, payload.as_object_mut()) {
         object.insert("media_facts".into(), json!(media));
     }
-    jcs_serialize(&payload)
+    payload
+}
+
+/// For calls first recorded by a reader that already stores credential and
+/// charge-basis provenance and separates reasoning from output, require those
+/// fields and the measurements to match exactly.
+pub(crate) fn strictly_restates_event(
+    tx: &Transaction<'_>,
+    request: &EventRecordRequest,
+) -> Result<bool, IngestError> {
+    let Some((_, stored)) = load_event_payload(tx, request)? else {
+        return Ok(false);
+    };
+    let mut incoming = request.measurements.iter().collect::<Vec<_>>();
+    incoming.sort_by(|left, right| (&left.role, &left.unit).cmp(&(&right.role, &right.unit)));
+    Ok(stored.restated_by(request, None)
+        && stored.auth_selection == request.auth_selection
+        && stored.resolved_credential == request.resolved_credential
+        && stored.charge_basis_mapping_version == request.charge_basis_mapping_version
+        && stored.charge_basis_overrides == request.charge_basis_overrides
+        && stored.measurements.iter().eq(incoming))
 }
 
 fn load_event_payload(

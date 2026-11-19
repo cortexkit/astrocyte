@@ -306,6 +306,19 @@ pub fn map_fact(wire: WireSpendSegmentFact) -> Result<EventRecordRequest, String
 mod broca_attempt;
 pub(crate) use broca_attempt::{map_attempt, WireModelAttempt, MODEL_ATTEMPT_KIND};
 
+pub(crate) fn map_marked_segment(
+    wire: WireSpendSegmentFact,
+) -> Result<astrocyte_core::broca::MarkedSegment, String> {
+    Ok(astrocyte_core::broca::MarkedSegment {
+        fact_id: wire.fact_id,
+        run_id: wire.run_id,
+        measurements: usage_measurements(
+            &wire.usage,
+            reasoning_is_inside_output(&wire.provider, wire.usage_policy_version),
+        )?,
+    })
+}
+
 /// The producer name every BROCA fact is recorded under, whatever its kind.
 const BROCA_PRODUCER: &str = "broca";
 

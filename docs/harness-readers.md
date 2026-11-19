@@ -451,8 +451,8 @@ Rules that affect what is recorded:
   If either kind of call nevertheless arrives after the other has claimed the
   same segment, the later call is set aside as `segment_already_billed`. Other
   shares of that attempt keep their original positions. An unchanged attempt
-  replay adds no calls; a changed body is quarantined in `rejected_delivery`
-  when a call for that attempt was already recorded. Producer samples are pinned
+  replay adds no calls; changes to the recorded calls or their details, or to
+  which positions would be recorded, go to `rejected_delivery`. Producer samples are pinned
   in `crates/astrocyte-module/tests/vectors/broca-attempt-facts-1119/`.
 - Neither BROCA segments nor attempt calls supply the prior cache reads used
   to judge cache changes, or enter the live step feed. BROCA's live runner

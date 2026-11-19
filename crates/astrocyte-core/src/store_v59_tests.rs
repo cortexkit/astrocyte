@@ -70,6 +70,16 @@ mod session_refs {
                 assert_eq!(table_rows(conn, "attribution_session_ref"), expected);
                 assert!(table_rows(conn, "broca_attempt_detail").is_empty());
                 assert!(table_rows(conn, "broca_segment_evidence").is_empty());
+                assert!(table_rows(conn, "broca_segment_measurement").is_empty());
+                assert!(table_rows(conn, "broca_segment_mismatch").is_empty());
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT checked_through FROM broca_segment_check_state WHERE id=1",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    0,
+                );
                 let others: Vec<_> = all_rows(conn)
                     .into_iter()
                     .filter(|(table, _)| {
@@ -79,6 +89,9 @@ mod session_refs {
                                 | "cortexkit_schema_version"
                                 | "broca_attempt_detail"
                                 | "broca_segment_evidence"
+                                | "broca_segment_measurement"
+                                | "broca_segment_mismatch"
+                                | "broca_segment_check_state"
                         )
                     })
                     .collect();

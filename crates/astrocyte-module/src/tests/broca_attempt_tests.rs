@@ -133,6 +133,10 @@ fn coverage(state: &SharedState) -> Value {
     crate::ops::dispatch(state, crate::ops::OP_LEDGER_COVERAGE, json!({})).unwrap()
 }
 
+fn check_segments(state: &SharedState, at_ms: i64) -> usize {
+    crate::refresher::check_broca_segments_tick(state, at_ms, &AtomicBool::new(false)).unwrap()
+}
+
 #[test]
 fn broca_attempt_vectors_match_sha256sums() {
     let directory = vector_dir();
@@ -189,6 +193,16 @@ fn broca_attempt_vectors_bill_attempts_without_double_billing() {
             })
             .unwrap();
         assert_eq!(totals, actual, "{name}");
+        assert_eq!(
+            check_segments(&state, 3_603_001),
+            if name == LEGACY {
+                0
+            } else if name == POOLED {
+                1
+            } else {
+                2
+            }
+        );
         assert_eq!(
             coverage(&state)["broca_segment_usage_mismatches"],
             0,
@@ -374,6 +388,7 @@ fn broca_attempt_redelivery_is_exact_or_quarantined_as_a_whole() {
         "measurement",
         "priced_charge",
         "broca_segment_evidence",
+        "broca_segment_measurement",
         "broca_attempt_detail",
         "redelivery_log",
     ];
@@ -390,32 +405,56 @@ fn broca_attempt_redelivery_is_exact_or_quarantined_as_a_whole() {
     assert_eq!(count(&state, "rejected_delivery"), 0);
     assert_eq!(tables.map(|table| count(&state, table)), before);
 
-    let mut changed = sample_rows(HANDOFF).pop().unwrap();
-    changed["outcome"] = json!("changed_on_replay");
-    let extra = changed["usage_by_model"][0].clone();
-    changed["usage_by_model"]
+    let original = sample_rows(HANDOFF).pop().unwrap();
+    let write = |value: &Value| {
+        store
+            .execute(
+                "UPDATE export_facts SET segment_json=?1 WHERE export_seq=3",
+                [value.to_string()],
+            )
+            .unwrap();
+    };
+    // Re-encoding changes byte order and formatting but not any stored value.
+    write(&original);
+    assert_eq!(replay().quarantined_redeliveries, 0);
+
+    let mut detail_change = original.clone();
+    detail_change["outcome"] = json!("changed_on_replay");
+    let mut measurement_change = original.clone();
+    measurement_change["usage_by_model"][1]["usage"]["input_tokens"] = json!(3);
+    let mut call_change = original.clone();
+    call_change["resolved_credential_id"] = json!("newly-claimed-payer");
+    let mut additional_share = original.clone();
+    let extra = additional_share["usage_by_model"][0].clone();
+    additional_share["usage_by_model"]
         .as_array_mut()
         .unwrap()
         .push(extra);
-    store
-        .execute(
-            "UPDATE export_facts SET segment_json=?1 WHERE export_seq=3",
-            [changed.to_string()],
-        )
-        .unwrap();
-    assert_eq!(replay().quarantined_redeliveries, 1);
+    let mut fewer_shares = original;
+    fewer_shares["usage_by_model"].as_array_mut().unwrap().pop();
+    for changed in [
+        detail_change,
+        measurement_change,
+        call_change,
+        additional_share,
+        fewer_shares,
+    ] {
+        write(&changed);
+        assert_eq!(replay().quarantined_redeliveries, 1);
+    }
     assert_eq!(tables.map(|table| count(&state, table)), before);
     assert_eq!(read_rows(&state,
         "SELECT json_extract(r.incoming_payload,'$.outcome'),a.outcome,a.share_index FROM rejected_delivery r
-         JOIN broca_attempt_detail a ON a.event_key=r.stored_event_key",
+         JOIN broca_attempt_detail a ON a.event_key=r.stored_event_key ORDER BY r.rowid",
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))),
-        [("changed_on_replay".into(), "complete".into(), 0)]);
+         ["changed_on_replay", "complete", "complete", "complete", "complete"].map(|o| (o.into(), "complete".into(), 0)));
 }
 
 #[test]
-fn broca_attempt_coverage_distinguishes_missing_usage_from_zero() {
+fn broca_attempt_coverage_checks_only_mature_segments_and_records_each_mismatch_once() {
     let mut rows = sample_rows(RETRIED);
     rows[0]["usage"]["reasoning_tokens"] = json!(0);
+    rows[0]["usage"]["input_tokens"] = json!(39);
     rows[1]["usage"]["input_tokens"] = json!(21);
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("run-index.db");
@@ -423,7 +462,105 @@ fn broca_attempt_coverage_distinguishes_missing_usage_from_zero() {
     append_values(&path, &rows);
     let state = test_state();
     drain(&state, &path);
+    assert_eq!(check_segments(&state, 3_603_000), 0);
+    assert_eq!(count(&state, "broca_segment_mismatch"), 0);
+    assert_eq!(coverage(&state)["broca_segment_usage_mismatches"], 0);
+    assert_eq!(check_segments(&state, 3_603_001), 2);
+    assert_eq!(check_segments(&state, 3_603_002), 0);
     assert_eq!(coverage(&state)["broca_segment_usage_mismatches"], 2);
+    assert_eq!(
+        read_rows(
+            &state,
+            "SELECT m.role,m.unit,m.segment_quantity,m.attempts_quantity,m.checked_at_ms
+           FROM broca_segment_mismatch m JOIN broca_segment_evidence e USING(fact_id)
+          ORDER BY e.segment_key,m.role",
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, i64>(4)?
+            ))
+        ),
+        [
+            (
+                "input".into(),
+                "token".into(),
+                Some(39),
+                Some(40),
+                3_603_001
+            ),
+            ("reasoning".into(), "token".into(), Some(0), None, 3_603_001),
+            (
+                "input".into(),
+                "token".into(),
+                Some(21),
+                Some(20),
+                3_603_001
+            )
+        ]
+    );
+    assert_append_only(&state, "broca_segment_mismatch", "fact_id", 3);
+}
+
+#[test]
+fn broca_attempt_coverage_records_overflow_and_checks_the_next_segment() {
+    let mut rows = sample_rows(RETRIED);
+    let first_segment = rows[0]["fact_id"].clone();
+    let second_segment = rows[1]["fact_id"].clone();
+    let mut changed = 0;
+    for row in &mut rows {
+        if let Some(shares) = row["usage_by_model"].as_array_mut() {
+            for share in shares {
+                if share["segment_fact_id"] == first_segment {
+                    share["usage"]["input_tokens"] = json!(5_000_000_000_000_000_000_i64);
+                    changed += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(changed, 2);
+    rows[1]["usage"]["input_tokens"] = json!(21);
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("run-index.db");
+    create_store(&path, "over-range-usage", 1);
+    append_values(&path, &rows);
+    let state = test_state();
+    drain(&state, &path);
+    assert_eq!(check_segments(&state, 3_603_001), 2);
+    assert_eq!(check_segments(&state, 3_603_002), 0);
+    assert_eq!(coverage(&state)["broca_segment_usage_mismatches"], 2);
+    assert_eq!(
+        read_rows(
+            &state,
+            "SELECT m.fact_id,m.role,m.segment_quantity,m.attempts_quantity,m.over_range
+             FROM broca_segment_mismatch m JOIN broca_segment_evidence e USING(fact_id)
+             ORDER BY e.segment_key,m.role",
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, bool>(4)?
+            ))
+        ),
+        [
+            (
+                first_segment.as_str().unwrap().into(),
+                "input".into(),
+                40,
+                None,
+                true
+            ),
+            (
+                second_segment.as_str().unwrap().into(),
+                "input".into(),
+                21,
+                Some(20),
+                false
+            )
+        ]
+    );
 }
 
 #[test]
@@ -433,24 +570,35 @@ fn broca_attempt_and_segment_evidence_are_append_only_even_with_replace() {
     load_vectors(HANDOFF, &path);
     let state = test_state();
     drain(&state, &path);
-    for table in ["broca_attempt_detail", "broca_segment_evidence"] {
-        for (sql, trigger) in [
-            (format!("UPDATE {table} SET fact_id=fact_id"), "no_update"),
-            (format!("DELETE FROM {table}"), "no_delete"),
-            (
-                format!("INSERT OR REPLACE INTO {table} SELECT * FROM {table}"),
-                "insert_once",
-            ),
-        ] {
-            let result = state.ordered_write(|tx| {
-                tx.execute(&sql, [])
-                    .map_err(|e| e.to_string())
-                    .map(|_| ((), true))
-            });
-            assert_eq!(result.unwrap_err(), format!("{table}_{trigger}"));
-        }
-        assert_eq!(count(&state, table), 2);
+    for (table, identity, rows) in [
+        ("broca_attempt_detail", "fact_id", 2),
+        ("broca_segment_evidence", "fact_id", 2),
+        ("broca_segment_measurement", "segment_key", 8),
+    ] {
+        assert_append_only(&state, table, identity, rows);
     }
+}
+
+fn assert_append_only(state: &SharedState, table: &str, identity: &str, rows: i64) {
+    for (sql, trigger) in [
+        (
+            format!("UPDATE {table} SET {identity}={identity}"),
+            "no_update",
+        ),
+        (format!("DELETE FROM {table}"), "no_delete"),
+        (
+            format!("INSERT OR REPLACE INTO {table} SELECT * FROM {table}"),
+            "insert_once",
+        ),
+    ] {
+        let result = state.ordered_write(|tx| {
+            tx.execute(&sql, [])
+                .map_err(|e| e.to_string())
+                .map(|_| ((), true))
+        });
+        assert_eq!(result.unwrap_err(), format!("{table}_{trigger}"));
+    }
+    assert_eq!(count(state, table), rows);
 }
 
 #[test]
@@ -566,6 +714,17 @@ fn broca_attempt_double_billing_guard_preserves_share_positions_and_redelivery()
         "redelivery_log",
     ];
     let before = tables.map(|table| count(&state, table));
+    assert_eq!(replay().quarantined_redeliveries, 0);
+    assert_eq!(tables.map(|table| count(&state, table)), before);
+    assert_eq!(count(&state, "rejected_delivery"), 0);
+
+    rows[2]["usage_by_model"][0]["usage"]["input_tokens"] = json!(987);
+    store
+        .execute(
+            "UPDATE export_facts SET segment_json=?1 WHERE export_seq=3",
+            [rows[2].to_string()],
+        )
+        .unwrap();
     assert_eq!(replay().quarantined_redeliveries, 0);
     assert_eq!(tables.map(|table| count(&state, table)), before);
     assert_eq!(count(&state, "rejected_delivery"), 0);

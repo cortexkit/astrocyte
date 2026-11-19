@@ -16,8 +16,11 @@ copies that timeout without running the table-creating probes.
 |---|---|---|
 | `usage_event` | Each row records one usage event per producer reference and lineage, its admission selection (`auth_selection`), the paying credential (`resolved_credential`) when reported, and its pricing projection. | insert; three projection columns, see below |
 | `measurement` | Each row records one immutable event quantity for a role and unit. | insert only |
-| `broca_segment_evidence` | Each row preserves the fact id, run id, original usage object and ingest time of a BROCA segment whose usage is billed through attempts instead. It has no ledger call. | insert only, once per fact |
-| `broca_attempt_detail` | Each row keeps a BROCA call's attempt identifiers, original share index, outcome and HTTP status, response counts, tier, speed, pricing mode, and reported share usage and segment link. The first recorded share retains the full attempt body for redelivery checks. | insert only, once per call |
+| `broca_segment_evidence` | Each row preserves the fact id, run id and ingest time of a BROCA segment whose usage is billed through attempts instead. It has no ledger call. | insert only, once per fact |
+| `broca_segment_measurement` | Each row preserves a marked segment's quantity in the same roles and units as ledger measurements. | insert only, once per segment, role and unit |
+| `broca_attempt_detail` | Each row keeps a BROCA call's attempt identifiers, original share index, outcome and HTTP status, response counts, tier, speed, pricing mode and segment link. Usage lives in the call's ledger measurements. | insert only, once per call |
+| `broca_segment_check_state` | The singleton stores the insertion cursor of the last segment checked against its attempt shares. | advances with each checked batch |
+| `broca_segment_mismatch` | Each row preserves a differing segment and attempt quantity (including whether each side reported it), the role and unit, and the check time. When the attempt sum exceeds the integer range, `over_range` is set and the sum is NULL. | insert only, once per segment, role and unit |
 | `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
 | `step_message` | Each row records the host's own message id for a newly recorded event, for joining live feed rows within their harness and session. Old events are not backfilled. | insert only, once per event |
 | `cache_step_sequence` | Each row maps a ledger event to a durable cache cursor. | insert |

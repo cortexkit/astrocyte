@@ -1,6 +1,5 @@
-use astrocyte_core::broca::{Attempt, AttemptCall};
+use astrocyte_core::broca::{Attempt, AttemptCall, AttemptDetail};
 use astrocyte_core::catalog_client::stated_mode_condition;
-use serde_json::value::RawValue;
 
 use super::*;
 
@@ -39,7 +38,7 @@ pub(crate) struct WireModelAttempt {
 struct WireAttemptShare {
     provider: String,
     model: String,
-    usage: Box<RawValue>,
+    usage: WireUsage,
     served_service_tier: Option<String>,
     segment_fact_id: String,
 }
@@ -48,19 +47,14 @@ fn stored_integer(value: u64, name: &str) -> Result<i64, String> {
     i64::try_from(value).map_err(|_| format!("{name} exceeds stored integer range"))
 }
 
-pub(crate) fn map_attempt(wire: WireModelAttempt, fact_json: String) -> Result<Attempt, String> {
+pub(crate) fn map_attempt(wire: WireModelAttempt) -> Result<Attempt, String> {
     let sent_at = stored_integer(wire.sent_at_ms, "sent_at_ms")?;
     let call = |index: usize, share: Option<&WireAttemptShare>| {
         let (provider, model) = share.map_or((&wire.provider, &wire.model), |share| {
             (&share.provider, &share.model)
         });
         let measurements = if let Some(share) = share {
-            if !share.usage.get().starts_with('{') {
-                return Err(format!("usage of share {index} is not an object"));
-            }
-            let usage = serde_json::from_str(share.usage.get())
-                .map_err(|error| format!("decode usage of share {index}: {error}"))?;
-            usage_measurements(&usage, wire.reasoning_included_in_output)?
+            usage_measurements(&share.usage, wire.reasoning_included_in_output)?
         } else {
             Vec::new()
         };
@@ -102,7 +96,6 @@ pub(crate) fn map_attempt(wire: WireModelAttempt, fact_json: String) -> Result<A
             served_service_tier,
             mode,
             segment_fact_id: share.map(|share| share.segment_fact_id.clone()),
-            usage_json: share.map(|share| share.usage.get().to_owned()),
         })
     };
     let calls = match &wire.usage_by_model {
@@ -116,18 +109,19 @@ pub(crate) fn map_attempt(wire: WireModelAttempt, fact_json: String) -> Result<A
     };
     Ok(Attempt {
         fact_id: wire.fact_id,
-        fact_json,
-        attempt_id: wire.attempt_id,
-        step_id: stored_integer(wire.step_id, "step_id")?,
-        attempt: stored_integer(wire.attempt, "attempt")?,
-        outcome: wire.outcome,
-        http_status: wire.http_status,
-        content_received: wire.content_received,
-        response_bytes: stored_integer(wire.response_bytes, "response_bytes")?,
-        recorded_at_ms: stored_integer(wire.recorded_at_ms, "recorded_at_ms")?,
-        requested_service_tier: wire.requested_service_tier,
-        served_speed: wire.served_speed,
-        served_account_ref: wire.served_account_ref,
+        detail: AttemptDetail {
+            attempt_id: wire.attempt_id,
+            step_id: stored_integer(wire.step_id, "step_id")?,
+            attempt: stored_integer(wire.attempt, "attempt")?,
+            outcome: wire.outcome,
+            http_status: wire.http_status,
+            content_received: wire.content_received,
+            response_bytes: stored_integer(wire.response_bytes, "response_bytes")?,
+            recorded_at_ms: stored_integer(wire.recorded_at_ms, "recorded_at_ms")?,
+            requested_service_tier: wire.requested_service_tier,
+            served_speed: wire.served_speed,
+            served_account_ref: wire.served_account_ref,
+        },
         calls,
     })
 }

@@ -553,9 +553,11 @@ Reads never write. A refusal on a read is one of the codes below.
   Test: `media_skipped_local_coverage_is_live_on_base_and_hourly_paths`.
   `broca_segment_usage_mismatches` counts marked BROCA segments for which any
   reported usage quantity differs from the sum of attempt shares naming the
-  segment. An unreported quantity is distinct from zero. This is a consistency
-  check, not a pricing input; it can report a mismatch while the reader has
-  seen the segment but has not yet ingested all its shares.
+  segment. The refresher checks a bounded batch per tick and waits until a
+  segment has been in the ledger for more than an hour, giving its attempts
+  time to arrive. It records each differing role and unit once; an unreported
+  quantity is distinct from zero. This is a consistency check, not a pricing
+  input.
   Optional `thalamus_payer` reports lifetime counts of distinct identities:
   `transcript_calls_without_payer` (timeout or queue overflow), `late_payer_rows`,
   `unmatched_main_rows`, `set_aside_payer_rows`, `owner_disagreements` (the owner

@@ -26,19 +26,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use astrocyte_core::broca::{Attempt, MarkedSegment, TokenUsage};
+use astrocyte_core::broca::{Attempt, MarkedSegment};
 use astrocyte_core::ingest::EventRecordRequest;
 use astrocyte_readers::{
     file_identity::{file_identity, same_identity},
     read_io,
 };
 use rusqlite::{Connection, ErrorCode};
-use serde_json::{value::RawValue, Value};
+use serde_json::Value;
 
 use super::{interrupt_on_stop, ExportPage, PullError, SourceClient, SourceCursor};
 use crate::wire_map::{
-    map_attempt, map_fact, map_system_one_fact, WireModelAttempt, WireSpendSegmentFact,
-    WireSystemOneFact, MODEL_ATTEMPT_KIND, SYSTEM_ONE_KIND,
+    map_attempt, map_fact, map_marked_segment, map_system_one_fact, WireModelAttempt,
+    WireSpendSegmentFact, WireSystemOneFact, MODEL_ATTEMPT_KIND, SYSTEM_ONE_KIND,
 };
 
 pub(crate) const BROCA_SOURCE_KEY: &str = "broca";
@@ -401,7 +401,7 @@ fn decode_store_row(
         return Err(format!("segment_json of fact {fact_id} is not an object"));
     }
     match segment.get("kind") {
-        None => decode_session_segment(export_seq, fact_id, segment, segment_json),
+        None => decode_session_segment(export_seq, fact_id, segment),
         Some(Value::String(kind)) if kind == SYSTEM_ONE_KIND => {
             decode_system_one_segment(export_seq, fact_id, segment).map(BrocaFact::Event)
         }
@@ -409,7 +409,7 @@ fn decode_store_row(
             let wire: WireModelAttempt = serde_json::from_str(segment_json)
                 .map_err(|error| format!("decode attempt of fact {fact_id}: {error}"))?;
             refuse_fact_id_mismatch(export_seq, fact_id, &wire.fact_id)?;
-            map_attempt(wire, segment_json.to_owned()).map(BrocaFact::Attempt)
+            map_attempt(wire).map(BrocaFact::Attempt)
         }
         Some(kind) => Err(format!("segment of fact {fact_id} has unknown kind {kind}")),
     }
@@ -424,7 +424,6 @@ fn decode_session_segment(
     export_seq: u64,
     fact_id: &str,
     mut segment: Value,
-    segment_json: &str,
 ) -> Result<BrocaFact, String> {
     segment
         .as_object_mut()
@@ -434,23 +433,7 @@ fn decode_session_segment(
         .map_err(|error| format!("decode segment of fact {fact_id}: {error}"))?;
     refuse_fact_id_mismatch(export_seq, fact_id, &wire.fact_id)?;
     if wire.usage_in_attempts {
-        #[derive(serde::Deserialize)]
-        struct StoredUsage<'a> {
-            #[serde(borrow)]
-            usage: &'a RawValue,
-        }
-        let stored: StoredUsage<'_> = serde_json::from_str(segment_json)
-            .map_err(|error| format!("decode marked usage of fact {fact_id}: {error}"))?;
-        if !stored.usage.get().starts_with('{') {
-            return Err(format!("usage of fact {fact_id} is not an object"));
-        }
-        serde_json::from_str::<TokenUsage>(stored.usage.get())
-            .map_err(|error| format!("decode marked usage of fact {fact_id}: {error}"))?;
-        return Ok(BrocaFact::MarkedSegment(MarkedSegment {
-            fact_id: wire.fact_id,
-            run_id: wire.run_id,
-            usage_json: stored.usage.get().to_owned(),
-        }));
+        return map_marked_segment(wire).map(BrocaFact::MarkedSegment);
     }
     map_fact(wire).map(BrocaFact::Event)
 }
