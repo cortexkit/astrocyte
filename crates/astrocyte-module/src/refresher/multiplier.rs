@@ -548,21 +548,23 @@ fn rate_era_fill(
         config::MultiplierSetting::Recorded(config) => &config.api_twins,
         config::MultiplierSetting::NotRecorded => &empty_twins,
     };
-    let mut attempted = std::collections::BTreeSet::new();
-    while started.elapsed() < RATE_FETCH_PASS_BUDGET {
-        let pending = state
-            .with_read_op(|conn| {
-                rate_era::pending(conn, 256).map_err(|error| (error.code().into(), error.message()))
-            })
-            .map_err(|(_, message)| message)?;
-        let now = std::time::Instant::now();
-        let Some((provider, model)) = pending
-            .into_iter()
-            .find(|model| !attempted.contains(model) && !backoff.waiting(model, now))
-        else {
-            break;
-        };
-        attempted.insert((provider.clone(), model.clone()));
+    let pending = state
+        .with_read_op(|conn| {
+            rate_era::pending(conn, 256).map_err(|error| (error.code().into(), error.message()))
+        })
+        .map_err(|(_, message)| message)?;
+    let at_limit = pending.len() == 256;
+    let mut attempted = false;
+    let mut found_reference = false;
+    for key in pending {
+        if backoff.waiting(&key, std::time::Instant::now()) {
+            continue;
+        }
+        if started.elapsed() >= RATE_FETCH_PASS_BUDGET {
+            return Ok(true);
+        }
+        attempted = true;
+        let (provider, model) = key;
         let call = catalog.with_budget(RATE_FETCH_MODEL_BUDGET);
         let fetched = match rate_era::fetch(&call, &provider, &model, twins) {
             Ok(fetched) => fetched,
@@ -582,17 +584,11 @@ fn rate_era_fill(
             rate_era::publish(tx, &fetched, version).map_err(|error| error.message())?;
             Ok(((), true))
         })?;
+        found_reference |= fetched.reference.is_some();
         backoff.succeeded(&(provider, model));
     }
-    let remaining = state
-        .with_read_op(|conn| {
-            rate_era::pending(conn, 256).map_err(|error| (error.code().into(), error.message()))
-        })
-        .map_err(|(_, message)| message)?;
-    let now = std::time::Instant::now();
-    Ok(remaining
-        .iter()
-        .any(|model| !attempted.contains(model) && !backoff.waiting(model, now)))
+    // Publishing can discover a reference target that wasn't in this page.
+    Ok(found_reference || (at_limit && attempted))
 }
 
 /// Computes one day and appends it as the day's original row.

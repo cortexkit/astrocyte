@@ -147,6 +147,8 @@ END;
 "#;
 
 pub(in crate::store) const V62: &str = r#"
+CREATE INDEX rate_model_version ON rate_model(catalog_version);
+
 -- One unit list serves both cache-step quantities and their baseline projection.
 CREATE VIEW cache_token_unit AS
 SELECT 'token' AS unit UNION ALL SELECT 'token_cache_5m' UNION ALL SELECT 'token_cache_1h';

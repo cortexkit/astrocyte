@@ -3,6 +3,27 @@ use crate::test_support::conn;
 use crate::valuation::{value_event, EventTokens, ValuationRules};
 use sha2::{Digest, Sha256};
 
+#[test]
+fn regression_caught_up_rate_model_selection_seeks_version_index() {
+    let mut costs = Vec::new();
+    for models in [1_000, 10_000] {
+        let conn = conn();
+        prepare(&conn, 42, &BTreeMap::new()).unwrap();
+        conn.execute(
+            "WITH RECURSIVE ids(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM ids WHERE i<?1)
+             INSERT INTO rate_model(provider,model,catalog_version)
+             SELECT 'fixture',printf('model%06d',i),42 FROM ids",
+            [models],
+        )
+        .unwrap();
+        let counter = crate::store::VmCounter::start(&conn);
+        assert!(pending(&conn, 256).unwrap().is_empty());
+        costs.push(counter.steps());
+    }
+    eprintln!("caught-up rate model selection at 1000 / 10000 models: {costs:?} VM steps");
+    assert!(costs[1] <= costs[0] + 40, "{costs:?}");
+}
+
 const OPUS: &[u8] =
     include_bytes!("../../test-vectors/fusiform-served-history-v1/anthropic--claude-opus-5-5.json");
 const GPT: &[u8] =

@@ -88,9 +88,14 @@ pub fn prepare(
 }
 
 pub fn pending(conn: &Connection, limit: i64) -> Result<Vec<Model>, MultiplierError> {
-    let mut stmt = conn.prepare(
-        "SELECT provider,model FROM rate_model WHERE catalog_version IS NULL OR catalog_version <
-         (SELECT catalog_version FROM rate_cache_state WHERE id=1) ORDER BY last_attempt,catalog_version,provider,model LIMIT ?1",
+    let mut stmt = conn.prepare_cached(
+        "SELECT provider,model FROM (
+             SELECT provider,model,last_attempt,catalog_version FROM rate_model
+             WHERE catalog_version IS NULL
+             UNION ALL
+             SELECT provider,model,last_attempt,catalog_version FROM rate_model
+             WHERE catalog_version < (SELECT catalog_version FROM rate_cache_state WHERE id=1)
+         ) ORDER BY last_attempt,catalog_version,provider,model LIMIT ?1",
     )?;
     let rows = stmt.query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?;
     rows.collect::<Result<_, _>>().map_err(Into::into)
