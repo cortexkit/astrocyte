@@ -126,8 +126,8 @@ pub(crate) struct PricingWalk {
 
 /// The coverage backfill's position, carried across refresher ticks.
 ///
-/// Each tick reads one bounded batch of the backfill set in event-id order,
-/// starting after the last event the previous tick reached, and wraps to the
+/// Each tick reads one bounded page of candidate charges in index order,
+/// starting after the last candidate the previous tick reached, and wraps to the
 /// start once a batch reaches the end of the set. An event whose reprice
 /// fails keeps its uncovered head, so it stays in the set and is retried when
 /// the sweep comes round to it again; it is never dropped, and it cannot hold
@@ -143,9 +143,8 @@ struct BackfillSweep {
     /// generation and can put events anywhere in the set, including behind
     /// the cursor, so a new generation starts a new sweep from the start.
     generation: Option<i64>,
-    /// Last backfill event id the sweep reached; `None` starts at the
-    /// beginning of the set.
-    after: Option<String>,
+    /// Last candidate charge reached, even if the page returned no events.
+    after: Option<astrocyte_core::subscription::CoverageCursor>,
     /// An event failed to reprice since this sweep started.
     failed: bool,
 }
@@ -225,6 +224,8 @@ pub(crate) struct PricingPass {
     pub(crate) backfill_queried: bool,
     /// SQLite virtual-machine steps spent reading the pending queue.
     pub(crate) queue_selection_steps: i64,
+    /// SQLite VM steps spent selecting the coverage backfill page.
+    pub(crate) backfill_selection_steps: i64,
     /// The pass stopped on its per-tick budget before reaching all selected
     /// queue or coverage-backfill events.
     pub(crate) paused: bool,
@@ -612,12 +613,8 @@ fn run_pricing_walk_with_clock(
         }
         let batch_events = budget.backfill_events.max(1);
         let backfill = match state.with_conn(|conn| {
-            astrocyte_core::subscription::coverage_backfill_event_ids(
-                conn,
-                sweep.after.as_deref(),
-                batch_events,
-            )
-            .map_err(|error| format!("{}: {}", error.code(), error.message()))
+            astrocyte_core::subscription::coverage_backfill_page(conn, sweep.after, batch_events)
+                .map_err(|error| format!("{}: {}", error.code(), error.message()))
         }) {
             Ok(backfill) => backfill,
             Err(error) => {
@@ -625,9 +622,10 @@ fn run_pricing_walk_with_clock(
                 return finish_pricing_pass(pass, failures);
             }
         };
-        // A short batch read to the end of the set, so it ends the sweep.
-        let reaches_end = backfill.len() < batch_events;
-        let batch_last = backfill.last().cloned();
+        // A short candidate page read to the end of the index.
+        let reaches_end = backfill.reached_end;
+        let batch_last = backfill.through;
+        pass.backfill_selection_steps = backfill.vm_steps;
         // Every event in the batch was attempted; false when the pass
         // stopped or ran out of time partway through it.
         let mut batch_attempted = true;
@@ -641,11 +639,13 @@ fn run_pricing_walk_with_clock(
         // because the failure would be silent and misleading: the same
         // event priced twice in one pass makes the second attempt refuse
         // as already priced, which reports a healthy pass as a failure.
-        let mut fresh = Vec::with_capacity(backfill.len());
-        for event_id in backfill {
+        let mut fresh = Vec::with_capacity(backfill.events.len());
+        let mut positions = std::collections::HashMap::with_capacity(backfill.events.len());
+        for (cursor, event_id) in backfill.events {
             if attempted.contains(&event_id) {
                 sweep.failed |= failed.contains(&event_id);
             } else {
+                positions.insert(event_id.clone(), cursor);
                 fresh.push(event_id);
             }
         }
@@ -682,7 +682,7 @@ fn run_pricing_walk_with_clock(
             }
             // The attempted events are always a prefix of the group.
             if let Some(last) = group.get(..processed).and_then(<[String]>::last) {
-                last_attempted = Some(last.clone());
+                last_attempted = positions.get(last).copied();
             }
             if processed < group.len() {
                 batch_attempted = false;
@@ -2176,6 +2176,99 @@ pub(super) mod tests {
     /// Asserted on whether the query ran, because a drained backfill returns
     /// nothing either way and its result cannot say whether it was skipped.
     #[test]
+    fn regression_backfill_advances_across_empty_candidate_pages() {
+        let state = test_state();
+        state
+            .ordered_write(|tx| {
+                for ordinal in 0..5 {
+                    let at = if ordinal < 3 {
+                        1_600_000_000_000
+                    } else {
+                        1_800_000_000_000
+                    };
+                    insert_account_event(
+                        tx,
+                        &format!("coverage-{ordinal}"),
+                        at,
+                        "subscription_included",
+                        "claude",
+                    )?;
+                }
+                Ok(((), true))
+            })
+            .unwrap();
+        run_pricing_pass(&state, 1, &NEVER_STOP).unwrap();
+        declare_plan(&state, 1_700_000_000_000);
+        let mut walk = PricingWalk::new(PricingBudget {
+            backfill_events: 2,
+            ..PricingBudget::WHOLE_QUEUE
+        });
+        let mut run = |at| {
+            run_pricing_walk(&state, at, &NEVER_STOP, &mut walk)
+                .unwrap()
+                .priced
+        };
+        assert_eq!(
+            run(2),
+            0,
+            "the first two candidates are outside plan coverage"
+        );
+        assert!(
+            backfill_due(&state).is_some(),
+            "an empty page is not the end"
+        );
+        assert_eq!(run(3), 1);
+        assert_eq!(run(4), 1);
+        assert_eq!(backfill_due(&state), None);
+        for event in ["coverage-3", "coverage-4"] {
+            assert_eq!(head(&state, event).outcome, "covered");
+        }
+    }
+
+    #[test]
+    fn regression_backfill_selection_vm_steps_follow_page_not_history() {
+        let mut steps = Vec::new();
+        for count in [20, 400] {
+            let state = test_state();
+            state
+                .ordered_write(|tx| {
+                    for ordinal in 0..count {
+                        insert_account_event(
+                            tx,
+                            &format!("old-{ordinal:05}"),
+                            1_600_000_000_000,
+                            "subscription_included",
+                            "claude",
+                        )?;
+                    }
+                    insert_account_event(
+                        tx,
+                        "in-window",
+                        1_800_000_000_000,
+                        "subscription_included",
+                        "claude",
+                    )?;
+                    Ok(((), true))
+                })
+                .unwrap();
+            run_pricing_pass(&state, 1, &NEVER_STOP).unwrap();
+            declare_plan(&state, 1_700_000_000_000);
+            let mut walk = PricingWalk::new(PricingBudget {
+                backfill_events: 8,
+                ..PricingBudget::WHOLE_QUEUE
+            });
+            let pass = run_pricing_walk(&state, 2, &NEVER_STOP, &mut walk).unwrap();
+            assert_eq!(pass.priced, 0);
+            assert!(pass.backfill_selection_steps > 0);
+            steps.push(pass.backfill_selection_steps);
+        }
+        eprintln!(
+            "coverage backfill first-page SQLite steps at 20 / 400 historical charges: {steps:?}"
+        );
+        assert!(steps[1] <= steps[0] + 32, "{steps:?}");
+    }
+
+    #[test]
     fn coverage_backfill_runs_after_a_plan_write_and_not_on_a_quiet_tick() {
         let state = test_state();
         assert!(
@@ -2270,20 +2363,16 @@ pub(super) mod tests {
             .unwrap();
         run_pricing_pass(&state, 1, &NEVER_STOP).unwrap();
         declare_plan(&state, 1_700_000_000_000);
-        let full = run_pricing_pass(&state, 2, &NEVER_STOP).unwrap();
+        let mut walk = PricingWalk::new(PricingBudget::WHOLE_QUEUE);
+        let mut tick = |at| run_pricing_walk(&state, at, &NEVER_STOP, &mut walk).unwrap();
+        let full = tick(2);
         assert!(full.backfill_queried);
         assert_eq!(full.priced, COVERAGE_BACKFILL_PER_PASS);
         assert!(
-            run_pricing_pass(&state, 3, &NEVER_STOP)
-                .unwrap()
-                .backfill_queried,
+            tick(3).backfill_queried,
             "a full batch may have left work, so the next pass looks again"
         );
-        assert!(
-            !run_pricing_pass(&state, 4, &NEVER_STOP)
-                .unwrap()
-                .backfill_queried
-        );
+        assert!(!tick(4).backfill_queried);
     }
 
     /// An event that keeps failing to reprice must not hold the backfill on
@@ -2382,16 +2471,21 @@ pub(super) mod tests {
                     .map_err(|error| error.to_string())
             })
             .unwrap();
-        // The sweep that retried it saw it fail, so its end does not drain.
-        assert_eq!(tick(8).unwrap().priced, 0);
+        // The sweep that retried it saw it fail. It still has to visit the
+        // three now-superseded candidates before reaching the end.
+        for at in 8..=11 {
+            assert_eq!(tick(at).unwrap().priced, 0);
+        }
         assert!(backfill_due(&state).is_some());
-        assert_eq!(tick(9).unwrap().priced, 1);
+        assert_eq!(tick(12).unwrap().priced, 1);
         assert_eq!(head(&state, "ev-0").outcome, "covered");
         assert!(
             backfill_due(&state).is_some(),
             "a full batch is not the end"
         );
-        assert_eq!(tick(10).unwrap().priced, 0);
+        for at in 13..=16 {
+            assert_eq!(tick(at).unwrap().priced, 0);
+        }
         assert_eq!(
             backfill_due(&state),
             None,

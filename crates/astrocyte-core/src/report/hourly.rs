@@ -3213,8 +3213,12 @@ mod tests {
         );
         declare(&mut conn, HOUR_MS / 2);
         assert_eq!(
-            subscription::coverage_backfill_event_ids(&conn, None, 100)
+            subscription::coverage_backfill_page(&conn, None, 100)
                 .unwrap()
+                .events
+                .into_iter()
+                .map(|(_, event)| event)
+                .collect::<Vec<_>>()
                 .as_slice(),
             std::slice::from_ref(&id)
         );

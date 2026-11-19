@@ -525,95 +525,80 @@ pub fn plan_in_force(
     .map_err(SubscriptionError::Store)
 }
 
-/// Events whose current charge head says `no_subscription_in_force` but whose
-/// instant does fall inside a declared plan's effective range, by the same
-/// matching rule [`read_reprice`] uses: the event's account in the account
-/// ledger, or, for an event with no account, its paying credential in the
-/// credential ledger.
-///
-/// Declaring a plan changes nothing that was already recorded, and the pricing
-/// pass looks only at measurements that have no charge head at all, so without
-/// this list an event that was recorded before its plan was declared would keep
-/// saying no plan covers it for as long as it exists. The effective-range test
-/// here is deliberately the same half-open comparison `subscription_in_force`
-/// makes directly above -- a plan must be in force at the event's instant, not
-/// merely in force now -- so:
-///
-///   * an event this returns resolves to `covered` and then leaves the answer,
-///     which makes the list drain rather than repeat;
-///   * an event no plan covers at its own instant never enters the list, so it
-///     is never rewritten with the reason it already carries;
-///   * with no plan declared the join is empty and so is the answer, which is
-///     what makes this free for an installation that has declared none.
-///
-/// An event with no recorded instant never joins either: every comparison
-/// against a NULL instant is NULL, and an undated event is unpriced for that
-/// reason instead.
-///
-/// `limit` bounds one batch, taken in event-id order from just after `after`
-/// (from the start when `after` is `None`). The caller passes the last id of
-/// its previous batch, so successive batches move through the backlog even
-/// when some of the events they return fail to reprice: a failed event keeps
-/// its uncovered head and stays in the set, and a batch that always started
-/// from the beginning would return the same failed prefix on every pass and
-/// never reach the events behind it.
-pub fn coverage_backfill_event_ids(
+/// Position in the partial index of charges that were recorded as uncovered.
+/// A later charge can supersede a candidate, but does not remove its index entry.
+#[derive(Clone, Copy, Debug)]
+pub struct CoverageCursor(i64, i64);
+
+pub struct CoverageBackfillPage {
+    /// End of the candidate page, including candidates that no longer need work.
+    pub through: Option<CoverageCursor>,
+    pub reached_end: bool,
+    pub events: Vec<(CoverageCursor, String)>,
+    pub vm_steps: i64,
+}
+
+/// Seek directly to the next bounded page in the charge index before looking
+/// up current heads and plan coverage. An empty match set is not the end of
+/// the sweep when a full page of candidates was examined.
+pub fn coverage_backfill_page(
     conn: &Connection,
-    after: Option<&str>,
+    after: Option<CoverageCursor>,
     limit: usize,
-) -> Result<Vec<String>, SubscriptionError> {
+) -> Result<CoverageBackfillPage, SubscriptionError> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    // Every string sorts at or after the empty one, so `>= ''` is the start.
-    let (comparison, cursor) = match after {
-        Some(after) => (">", after),
-        None => (">=", ""),
+    let CoverageCursor(after_event, after_charge) = after.unwrap_or(CoverageCursor(0, 0));
+    let mut statement = conn.prepare_cached(
+        "WITH candidates AS MATERIALIZED (
+             SELECT event_key,charge_key FROM priced_charge INDEXED BY priced_charge_subscription_backfill
+             WHERE outcome='unpriced' AND unpriced_reason='no_subscription_in_force'
+               AND (event_key,charge_key)>(?1,?2)
+             ORDER BY event_key,charge_key LIMIT ?3
+         )
+         SELECT c.event_key,c.charge_key,CASE WHEN NOT EXISTS (
+             SELECT 1 FROM priced_charge AS child WHERE child.supersedes=c.charge_key
+         ) AND CASE WHEN e.account_ref IS NOT NULL THEN EXISTS (
+             SELECT 1 FROM account_subscription AS p
+             WHERE p.provider=e.provider AND p.account_ref=e.account_ref
+               AND p.effective_from_ms=(SELECT MAX(a.effective_from_ms) FROM account_subscription a
+                   WHERE a.provider=e.provider AND a.account_ref=e.account_ref AND a.effective_from_ms<=e.occurred_at_ms)
+               AND (p.effective_to_ms IS NULL OR p.effective_to_ms>e.occurred_at_ms)
+         ) ELSE EXISTS (
+             SELECT 1 FROM credential_subscription AS p
+             WHERE p.provider=e.provider AND p.credential_ref=COALESCE(e.resolved_credential,e.auth_selection)
+               AND p.effective_from_ms=(SELECT MAX(a.effective_from_ms) FROM credential_subscription a
+                   WHERE a.provider=e.provider AND a.credential_ref=COALESCE(e.resolved_credential,e.auth_selection)
+                     AND a.effective_from_ms<=e.occurred_at_ms)
+               AND (p.effective_to_ms IS NULL OR p.effective_to_ms>e.occurred_at_ms)
+         ) END THEN e.event_id END
+         FROM candidates AS c CROSS JOIN usage_event AS e ON e.event_key=c.event_key
+         ORDER BY c.event_key,c.charge_key",
+    )?;
+    statement.reset_status(rusqlite::StatementStatus::VmStep);
+    let mut page = CoverageBackfillPage {
+        through: None,
+        reached_end: true,
+        events: Vec::new(),
+        vm_steps: 0,
     };
-    // The first half finds account-keyed calls; the second finds calls with no
-    // account whose paying credential (`resolved_credential`, else
-    // `auth_selection`) names a credential plan, compared exactly. UNION
-    // removes an event both halves return.
-    let mut statement = conn.prepare(&format!(
-        "SELECT DISTINCT event.event_id
-         FROM priced_charge AS head
-         CROSS JOIN usage_event AS event ON event.event_key=head.event_key
-         CROSS JOIN account_subscription AS plan
-           ON plan.provider=event.provider
-          AND plan.account_ref=event.account_ref
-          AND plan.effective_from_ms<=event.occurred_at_ms
-          AND (plan.effective_to_ms IS NULL
-               OR plan.effective_to_ms>event.occurred_at_ms)
-         WHERE head.outcome='unpriced'
-           AND head.unpriced_reason='no_subscription_in_force'
-           AND NOT EXISTS (
-               SELECT 1 FROM priced_charge AS child
-               WHERE child.supersedes=head.charge_key
-           )
-           AND event.event_id {comparison} ?2
-         UNION
-         SELECT event.event_id
-         FROM priced_charge AS head
-         CROSS JOIN usage_event AS event ON event.event_key=head.event_key
-         CROSS JOIN credential_subscription AS plan
-           ON plan.provider=event.provider
-          AND plan.credential_ref=COALESCE(event.resolved_credential,event.auth_selection)
-          AND plan.effective_from_ms<=event.occurred_at_ms
-          AND (plan.effective_to_ms IS NULL
-               OR plan.effective_to_ms>event.occurred_at_ms)
-         WHERE head.outcome='unpriced'
-           AND head.unpriced_reason='no_subscription_in_force'
-           AND event.account_ref IS NULL
-           AND NOT EXISTS (
-               SELECT 1 FROM priced_charge AS child
-               WHERE child.supersedes=head.charge_key
-           )
-           AND event.event_id {comparison} ?2
-         ORDER BY 1
-         LIMIT ?1"
-    ))?;
-    let event_ids = statement
-        .query_map(params![limit, cursor], |row| row.get(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(event_ids)
+    let mut seen = std::collections::HashSet::new();
+    let mut examined = 0;
+    {
+        let mut rows = statement.query(params![after_event, after_charge, limit])?;
+        while let Some(row) = rows.next()? {
+            let cursor = CoverageCursor(row.get(0)?, row.get(1)?);
+            page.through = Some(cursor);
+            examined += 1;
+            if let Some(event) = row.get::<_, Option<String>>(2)? {
+                if seen.insert(event.clone()) {
+                    page.events.push((cursor, event));
+                }
+            }
+        }
+    }
+    page.reached_end = examined < limit;
+    page.vm_steps = i64::from(statement.get_status(rusqlite::StatementStatus::VmStep));
+    Ok(page)
 }
 
 /// Record that the declared plans changed, so the next pricing pass runs the
@@ -2409,7 +2394,12 @@ mod tests {
         let due = coverage_backfill_due(&conn).unwrap();
         assert!(due.is_some() && due != drained, "{drained:?} -> {due:?}");
         assert_eq!(
-            coverage_backfill_event_ids(&conn, None, 100).unwrap(),
+            coverage_backfill_page(&conn, None, 100)
+                .unwrap()
+                .events
+                .into_iter()
+                .map(|(_, event)| event)
+                .collect::<Vec<_>>(),
             vec!["inside".to_string()]
         );
     }

@@ -2661,13 +2661,11 @@ mod tests {
         for (name, _) in &indexes {
             conn.execute_batch(&format!("DROP INDEX {name}")).unwrap();
         }
-        // The backfill query is measured on its first batch, which starts at
-        // the lowest event id (`>= ''`) rather than after a cursor.
+        // The first candidate page skips past the large prefix of other charge reasons.
         let subscription = real_query(
             include_str!("subscription.rs"),
-            "SELECT DISTINCT event.event_id",
-        )
-        .replace("{comparison}", ">=");
+            "WITH candidates AS MATERIALIZED",
+        );
         let tokens = real_query(
             include_str!("multiplier.rs"),
             "SELECT e.event_key, e.producer, e.provider, e.model, m.role, m.unit, m.source,",
@@ -2675,7 +2673,7 @@ mod tests {
         let mut cases = vec![(
             "backfill",
             subscription,
-            vec![Integer(100), Text(String::new())],
+            vec![Integer(0), Integer(0), Integer(100)],
             "priced_charge_subscription_backfill",
         )];
         cases.push((
@@ -2725,7 +2723,10 @@ mod tests {
         ));
         let before: Vec<_> = cases
             .iter()
-            .map(|(_, sql, values, _)| query_metrics(&conn, sql, values))
+            .map(|(_, sql, values, _)| {
+                let before = sql.replace(" INDEXED BY priced_charge_subscription_backfill", "");
+                query_metrics(&conn, &before, values)
+            })
             .collect();
         for (_, sql) in indexes {
             conn.execute_batch(&sql).unwrap();
@@ -2744,8 +2745,9 @@ mod tests {
             assert!(steps * 10 < old_steps, "{name}: {old_steps} -> {steps}");
         }
         assert_eq!(
-            crate::subscription::coverage_backfill_event_ids(&conn, None, 100)
+            crate::subscription::coverage_backfill_page(&conn, None, 10_000)
                 .unwrap()
+                .events
                 .len(),
             10
         );
