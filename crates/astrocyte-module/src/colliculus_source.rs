@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use astrocyte_core::ingest::{record_media_event_in_tx, RecordDisposition};
 use cortexkit_role_media::usage::{
-    self, UsageAckAnswer, UsageAckRequest, UsageReadAnswer, UsageReadRequest,
+    self, UsageAckAnswer, UsageAckRequest, UsageEntry, UsageReadRequest,
 };
 use rusqlite::{params, OptionalExtension};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_client_rs::{
     CallError, CallOptions, ConsumerOptions, NotSentCause, RouteHandle, SubcConsumer,
@@ -92,7 +92,30 @@ fn sdk_error(error: CallError) -> FeedError {
     }
 }
 
-fn check_page_structure(page: &UsageReadAnswer) -> Result<(), FeedError> {
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReadPage {
+    entries: Vec<ReadEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seq: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReadEntry {
+    seq: u64,
+    #[serde(flatten)]
+    payload: serde_json::Map<String, Value>,
+}
+
+impl ReadEntry {
+    fn decode(self) -> Result<UsageEntry, serde_json::Error> {
+        let mut body = self.payload;
+        body.insert("seq".into(), self.seq.into());
+        serde_json::from_value(Value::Object(body))
+    }
+}
+
+fn check_page_structure(page: &ReadPage) -> Result<(), FeedError> {
     // The contract's answer check also validates every record. Check only the
     // envelope here so one unreadable entry cannot stall the whole feed.
     if page.entries.len() > usize::try_from(LIMIT).expect("small page limit") {
@@ -305,7 +328,7 @@ impl ColliculusSource {
             if stop.load(Ordering::Relaxed) {
                 return Err(FeedError::Stopped);
             }
-            let page: UsageReadAnswer = route
+            let page: ReadPage = route
                 .request(
                     "usage.read",
                     json!(UsageReadRequest::new(LIMIT).with_after_seq(cursor)),
@@ -324,18 +347,26 @@ impl ColliculusSource {
             } else {
                 replayed = false;
             }
+            let has_entries = !page.entries.is_empty();
             let mut stopped = false;
             let committed = state.ordered_write(|tx| {
                 let mut local = 0_i64;
                 let mut evidence = Vec::new();
                 let mut quarantined = false;
-                for entry in &page.entries {
+                for entry in page.entries {
                     if stop.load(Ordering::Relaxed) {
                         stopped = true;
                         return Err("media ingest stopped".into());
                     }
                     let locator = format!("usage.read/seq/{}", entry.seq);
-                    if let Err(error) = usage::check_usage_entry(entry) {
+                    let entry = match entry.decode() {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            evidence.push(SetAsideRecord { locator, reason: format!("undecodable media entry: {error}") });
+                            continue;
+                        }
+                    };
+                    if let Err(error) = usage::check_usage_entry(&entry) {
                         evidence.push(SetAsideRecord { locator, reason: format!("invalid media entry: {error}") });
                         continue;
                     }
@@ -360,7 +391,7 @@ impl ColliculusSource {
                 tx.execute("INSERT INTO media_feed_cursor(source_key,through_seq,skipped_local) VALUES(?1,?2,?3) ON CONFLICT(source_key) DO UPDATE SET through_seq=excluded.through_seq,skipped_local=media_feed_cursor.skipped_local+excluded.skipped_local", params![SOURCE_KEY,next.to_string(),local]).map_err(|error| error.to_string())?;
                 harness_drain::ensure_runtime_row_in_tx(tx, SOURCE_KEY).map_err(|error| error.to_string())?;
                 harness_drain::mark_current_in_tx(tx, SOURCE_KEY, SOURCE_KEY, now)?;
-                tx.execute("UPDATE source_runtime SET pending_unknown=?2 WHERE source_key=?1", params![SOURCE_KEY,!page.entries.is_empty()]).map_err(|error| error.to_string())?;
+                tx.execute("UPDATE source_runtime SET pending_unknown=?2 WHERE source_key=?1", params![SOURCE_KEY,has_entries]).map_err(|error| error.to_string())?;
                 Ok(((new, quarantined), true))
             });
             let (new, anomalous) = match committed {
@@ -370,7 +401,7 @@ impl ColliculusSource {
             harness_drain::warn_set_aside(SOURCE_KEY, &new);
             unhealthy |= anomalous;
             cursor = next;
-            if page.entries.is_empty() {
+            if !has_entries {
                 break;
             }
             // ordered_write returns only after SQLite commits events, evidence,

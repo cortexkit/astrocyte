@@ -433,6 +433,22 @@ fn media_feed_pages_commit_before_ack_and_retry_failed_ack() {
 }
 
 #[test]
+fn media_ill_typed_record_is_set_aside_with_siblings_and_ack() {
+    let state = test_state();
+    let mut bad = vendor_entry(2);
+    bad["record"]["measurements"][0]["quantity"] = json!(90);
+    let peer = Peer::start(fixed_page(vec![vendor_entry(1), bad, vendor_entry(3)]));
+    tick(&state, &peer.source());
+    assert_eq!(count(&state, "usage_event"), 2);
+    assert_eq!(
+        count(&state, "set_aside_record WHERE locator='usage.read/seq/2'"),
+        1
+    );
+    assert_eq!(cursor(&state).as_deref(), Some("3"));
+    assert_eq!(peer.calls("usage.ack")[0]["params"]["through_seq"], 3);
+}
+
+#[test]
 fn media_failed_commit_acks_nothing_and_retries_the_page() {
     let state = test_state();
     state.with_conn(|conn| {

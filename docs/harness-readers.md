@@ -569,8 +569,9 @@ billing rule. Observed measurements are retained but never priced. Entries
 that fail the contract's entry or record checks, records whose quantities cannot
 fit the store, and raw undecodable or oversize entries are set aside with their
 feed location and reason. Valid records on the same page are still recorded; the
-evidence and cursor commit together before the page is acknowledged. Invalid page
-structure instead fails the page without advancing or acknowledging it.
+evidence and cursor commit together before the page is acknowledged. A structured
+entry that fails to decode is set aside by its sequence without blocking its siblings.
+Invalid page structure instead fails the page without advancing or acknowledging it.
 
 The contract admits a quantity only when it has at most nine fractional digits and
 its coefficient (the digits without the point) fits a signed 64-bit integer, which
