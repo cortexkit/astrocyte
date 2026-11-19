@@ -308,6 +308,8 @@ struct Mirror {
     warnings: Arc<Mutex<Warnings>>,
     #[cfg(test)]
     fail_next_put: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    key_read_delay: Duration,
 }
 
 impl Mirror {
@@ -338,12 +340,10 @@ impl Mirror {
             .filter(|(_, value)| value.len() <= cap)
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            self.reconcile(connection, names, bucket, &desired, prefixes),
-        )
-        .await;
-        let failed = !matches!(result, Ok(Ok(())));
+        let failed = self
+            .reconcile(connection, names, bucket, &desired, prefixes)
+            .await
+            .is_err();
         if failed {
             self.values = None;
         }
@@ -366,16 +366,22 @@ impl Mirror {
         let bucket = names
             .module_bucket_name("astrocyte", bucket)
             .map_err(|_| ())?;
-        let store = async_nats::jetstream::new(client)
-            .get_key_value(bucket)
-            .await
-            .map_err(|_| ())?;
+        let context = async_nats::jetstream::new(client);
+        let store = kv_step(context.get_key_value(bucket)).await?;
         if self.values.is_none() {
             let mut values = Values::new();
-            let mut keys = store.keys().await.map_err(|_| ())?;
-            while let Some(key) = keys.next().await {
+            let mut keys = kv_step(store.keys()).await?;
+            while let Some(key) = kv_step_raw(keys.next()).await? {
                 let key = key.map_err(|_| ())?;
-                if let Some(value) = store.get(&key).await.map_err(|_| ())? {
+                let value = kv_step(async {
+                    #[cfg(test)]
+                    if !self.key_read_delay.is_zero() {
+                        tokio::time::sleep(self.key_read_delay).await;
+                    }
+                    store.get(&key).await
+                })
+                .await?;
+                if let Some(value) = value {
                     values.insert(key, value.to_vec());
                 }
             }
@@ -395,7 +401,7 @@ impl Mirror {
         // removed keys before replacements, and omit oversized values rather than
         // truncating the evidence THALAMUS uses to decide whether deletion is safe.
         for key in removed {
-            store.delete(&key).await.map_err(|_| ())?;
+            kv_step(store.delete(&key)).await?;
             values.remove(&key);
         }
         for (key, value) in desired {
@@ -407,12 +413,25 @@ impl Mirror {
                 {
                     return Err(());
                 }
-                store.put(key, value.clone().into()).await.map_err(|_| ())?;
+                kv_step(store.put(key, value.clone().into())).await?;
                 values.insert(key.clone(), value.clone());
             }
         }
         Ok(())
     }
+}
+
+// Bound a stalled broker operation, not the total time to reconcile a bucket.
+async fn kv_step_raw<T>(operation: impl std::future::Future<Output = T>) -> Result<T, ()> {
+    tokio::time::timeout(Duration::from_secs(2), operation)
+        .await
+        .map_err(|_| ())
+}
+
+async fn kv_step<T, E>(
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, ()> {
+    kv_step_raw(operation).await?.map_err(|_| ())
 }
 
 pub(crate) fn publish_multiplier(state: &SharedState) {

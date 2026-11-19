@@ -157,6 +157,46 @@ async fn bus_publications_failed_put_retries_without_another_change() {
 }
 
 #[tokio::test]
+async fn regression_bus_slow_bucket_revokes_stale_acknowledgement() {
+    let state = test_state();
+    let Some(bus) = TestBus::start(&state).await else {
+        return;
+    };
+    let stale = "thalamus.ack.source.stale";
+    let current = "thalamus.ack.source.current";
+    bus.read_marks
+        .put(stale, b"old".to_vec().into())
+        .await
+        .unwrap();
+    bus.read_marks
+        .put(current, b"existing".to_vec().into())
+        .await
+        .unwrap();
+    let mut mirror = Mirror {
+        key_read_delay: Duration::from_millis(1_100),
+        ..Mirror::default()
+    };
+    assert!(
+        mirror
+            .apply(
+                &bus.connection,
+                &bus.names,
+                "read-marks",
+                &[(current.into(), b"existing".to_vec())].into(),
+                Some(&["thalamus.ack.source.".into()]),
+                declared_value_cap("read-marks")
+            )
+            .await
+    );
+    assert!(bus.read_marks.get(stale).await.unwrap().is_none());
+    assert_eq!(
+        bus.read_marks.get(current).await.unwrap().unwrap().as_ref(),
+        b"existing"
+    );
+    bus.finish().await;
+}
+
+#[tokio::test]
 async fn bus_publications_denied_bucket_does_not_interrupt_runner_steps() {
     let Some(server) = NatsServer::start_with_config(
         r#"accounts {
