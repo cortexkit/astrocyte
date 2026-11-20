@@ -274,7 +274,9 @@ mod tests {
     }
 
     fn write_file(root: &Path, relative: &str, contents: &str) -> PathBuf {
-        let path = root.join(relative);
+        // Match the path assembled by directory traversal, including its separators.
+        let mut path = root.to_path_buf();
+        path.extend(Path::new(relative).components());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, contents).unwrap();
         path
@@ -337,6 +339,22 @@ mod tests {
                 "SELECT COUNT(*) FROM usage_event WHERE producer='kimi'"
             ),
             3
+        );
+
+        append(&path, &status("oversized-fast", [1, u64::MAX, 0, 0]));
+        append(&path, &status("fast", [7, 8, 0, 0]));
+        let fast = source
+            .drain_in_lane(&state, 3, &NEVER_STOP, DrainMode::Fast)
+            .unwrap();
+        assert_eq!(fast.files_resumed, 1);
+        assert_eq!(fast.rows_recorded, 1);
+        assert_eq!(fast.calls_set_aside, 1);
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM set_aside_record WHERE source_key='kimi'"
+            ),
+            2
         );
     }
 
