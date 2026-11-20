@@ -128,27 +128,41 @@ fn rate_era_refresher_rereads_alias_and_twin_timelines_on_catalog_advance() {
             .unwrap()
     };
     assert!(resolved().is_none());
-    let mut backoff = RateBackoff::default();
-    rate_era_tick(&state, &mut backoff).unwrap();
+    let mut stage = MultiplierStage::new(None);
+    let mut refresh = |new_target| {
+        const MAX_BETWEEN_TICK_PASSES: usize = 1;
+        stage.rates_pending = rate_era_tick(&state, &mut stage.rate_backoff).unwrap();
+        if new_target {
+            assert!(stage.rates_behind(), "a new target needs a between-tick pass");
+        }
+        for _ in 0..MAX_BETWEEN_TICK_PASSES {
+            stage.fill_rates(&state);
+        }
+        assert!(
+            !stage.rates_behind(),
+            "alias and twin timelines must resolve within {MAX_BETWEEN_TICK_PASSES} between-tick pass"
+        );
+    };
+    refresh(true);
     let first = resolved().unwrap();
     assert!(
         matches!(&first,multiplier::ModelResolution::Rates(rates) if rates.base["input"]==multiplier::RateState::Priced {units_per_million:1_000_000_000})
     );
     let count = peer.requests.lock().unwrap().len();
-    rate_era_tick(&state, &mut backoff).unwrap();
+    refresh(false);
     assert_eq!(
         peer.requests.lock().unwrap().len(),
         count,
         "unchanged catalogs fetch no timelines"
     );
     peer.version.store(2, Ordering::SeqCst);
-    rate_era_tick(&state, &mut backoff).unwrap();
+    refresh(false);
     let second = resolved().unwrap();
     assert!(
         matches!(&second,multiplier::ModelResolution::Rates(rates) if rates.base["input"]==multiplier::RateState::Priced {units_per_million:2_000_000_000})
     );
     peer.version.store(3, Ordering::SeqCst);
-    rate_era_tick(&state, &mut backoff).unwrap();
+    refresh(true);
     let third = resolved().unwrap();
     assert!(
         matches!(&third,multiplier::ModelResolution::Rates(rates) if rates.reference_model.as_ref().unwrap().model_id=="target-b")
