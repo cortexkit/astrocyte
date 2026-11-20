@@ -316,8 +316,9 @@ fn evidence_compared(
     let mut evidence: Evidence = serde_json::from_str(&stored.facts).map_err(json_error)?;
     evidence.tools_digest = stored.tools;
     evidence.system_digest = stored.system;
-    // `rewrite_cause` 0.2.8 reads only provider, model, account, finish and TTL,
-    // request start, both digests, view and signed floor from the predecessor.
+    // This row stands for the session's earlier step whose feed copy has expired.
+    // `rewrite_cause` 0.2.8 reads only its provider, model, account, finish and TTL,
+    // request start, both digests, view and signed floor.
     // The remaining required row members are inert private placeholders, never
     // stored or served. The placeholder-independence test guards this assumption.
     let mut row = StepRow::new(
