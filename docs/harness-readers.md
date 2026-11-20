@@ -67,6 +67,7 @@ replacement hint changes. On Unix, path metadata supplies device and inode
 identity. On Windows, creation time is only a replacement hint. A replacement
 with equal size, modification time and creation time can be missed by a Windows
 fast cycle; the next full tick keeps the real open-handle identity check.
+The fast lane selects hot paths from indexed deadlines without scanning or copying the cold file cache.
 Brand-new session files wait for discovery on the next full tick, at most
 `poll_interval_secs` (30 seconds in production). Codex archives,
 Gemini JSON documents and declared OpenCode store reads stay on full ticks;

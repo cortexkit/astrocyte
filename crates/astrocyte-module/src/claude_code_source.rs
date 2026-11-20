@@ -72,7 +72,7 @@ pub(crate) struct ClaudeCodeCache {
     resume: HashMap<PathBuf, Arc<ClaudeResumePoint>>,
     /// When each file's consumed prefix was last verified end to end.
     prefix_verified_ms: HashMap<PathBuf, i64>,
-    windows: HashMap<PathBuf, crate::refresher::harness_drain::WindowSchedule>,
+    windows: crate::refresher::harness_drain::WindowSchedules,
 }
 
 #[cfg(test)]
@@ -215,11 +215,24 @@ impl ClaudeCodeSource {
                 }
             }
         }
-        let previous = self
-            .cache
-            .lock()
-            .map_err(|_| "Claude Code cache lock poisoned".to_string())?
-            .clone();
+        let (previous, hot) = {
+            use crate::refresher::harness_drain::select_files;
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| "Claude Code cache lock poisoned".to_string())?;
+            if mode.is_full() {
+                (cache.clone(), Vec::new())
+            } else {
+                let hot = cache.windows.hot_paths(recorded_at_ms);
+                let stage = ClaudeCodeCache {
+                    resume: select_files(&cache.resume, &hot),
+                    prefix_verified_ms: select_files(&cache.prefix_verified_ms, &hot),
+                    windows: cache.windows.select(&hot),
+                };
+                (stage, hot)
+            }
+        };
         let read = read_projects(
             root,
             &previous,
@@ -262,7 +275,18 @@ impl ClaudeCodeSource {
             .cache
             .lock()
             .map_err(|_| "Claude Code cache lock poisoned".to_string())?;
-        *cache = next_cache;
+        if mode.is_full() {
+            *cache = next_cache;
+        } else {
+            for path in hot {
+                cache.resume.remove(&path);
+            }
+            cache.resume.extend(next_cache.resume);
+            cache
+                .prefix_verified_ms
+                .extend(next_cache.prefix_verified_ms);
+            cache.windows.extend(next_cache.windows);
+        }
         Ok(outcome)
     }
 }
@@ -356,7 +380,7 @@ fn read_projects_staged(
     let mut outcome = ClaudeCodeDrainOutcome::default();
     let mut resume_points = HashMap::with_capacity(files.len());
     let mut verified_ms = HashMap::with_capacity(files.len());
-    let mut windows = HashMap::with_capacity(files.len());
+    let mut windows = crate::refresher::harness_drain::WindowSchedules::default();
     if !mode.is_full() {
         resume_points.clone_from(&previous.resume);
         verified_ms.clone_from(previous_verified);

@@ -1,8 +1,9 @@
 //! Process-local read deadlines, published with the drain's committed resume points.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use astrocyte_readers::file_identity::{inode_of, same_identity};
@@ -50,11 +51,10 @@ impl FileStat {
         previous.is_none_or(|window| !self.same(&window.stat))
     }
 
-    fn recent(&self, now_ms: i64) -> bool {
+    fn modified_ms(&self) -> Option<i64> {
         self.modified
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .and_then(|age| i64::try_from(age.as_millis()).ok())
-            .is_some_and(|modified| (0..=QUIET_CHECK_MS).contains(&now_ms.saturating_sub(modified)))
     }
 
     pub(crate) fn read(path: &Path) -> std::io::Result<Self> {
@@ -158,11 +158,6 @@ pub(crate) struct WindowSchedule {
 }
 
 impl WindowSchedule {
-    pub(crate) fn hot(&self, now: i64) -> bool {
-        // If the observed time moves backward, keep checking conservatively
-        // until a full tick resets the content deadlines against the new time.
-        self.stat.recent(now) || now.saturating_sub(self.changed_ms) <= QUIET_CHECK_MS
-    }
     /// Skip archive decompression between daily full-file verifications when
     /// its size, modification time and file identity have not changed.
     pub(crate) fn defer_archive(&self, stat: &FileStat, now: i64, full_due: bool) -> bool {
@@ -195,6 +190,85 @@ impl WindowSchedule {
             changed_ms,
             checked_ms: now,
             ready,
+        }
+    }
+}
+
+/// Index both clocks that can make a file hot. Range queries avoid walking
+/// cold paths, and remain valid if the wall clock moves backwards.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WindowSchedules {
+    windows: HashMap<PathBuf, WindowSchedule>,
+    changed: BTreeMap<i64, BTreeSet<PathBuf>>,
+    modified: BTreeMap<i64, BTreeSet<PathBuf>>,
+}
+
+impl WindowSchedules {
+    pub(crate) fn get(&self, path: &Path) -> Option<&WindowSchedule> {
+        self.windows.get(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.windows.is_empty()
+    }
+
+    pub(crate) fn insert(&mut self, path: PathBuf, window: WindowSchedule) {
+        let changed = window.changed_ms;
+        let modified = window.stat.modified_ms();
+        if let Some(old) = self.windows.insert(path.clone(), window) {
+            remove_from_index(&mut self.changed, old.changed_ms, &path);
+            if let Some(modified) = old.stat.modified_ms() {
+                remove_from_index(&mut self.modified, modified, &path);
+            }
+        }
+        self.changed
+            .entry(changed)
+            .or_default()
+            .insert(path.clone());
+        if let Some(modified) = modified {
+            self.modified.entry(modified).or_default().insert(path);
+        }
+    }
+
+    pub(crate) fn hot_paths(&self, now: i64) -> Vec<PathBuf> {
+        let oldest = now.saturating_sub(QUIET_CHECK_MS);
+        self.changed
+            .range(oldest..)
+            .chain(self.modified.range(oldest..=now))
+            .flat_map(|(_, paths)| paths)
+            .inspect(|_| {
+                #[cfg(test)]
+                super::harness_drain::note_fast_file_visit();
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn select(&self, paths: &[PathBuf]) -> Self {
+        let mut selected = Self::default();
+        for path in paths {
+            if let Some(window) = self.get(path) {
+                selected.insert(path.clone(), window.clone());
+            }
+        }
+        selected
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        for (path, window) in other.windows {
+            self.insert(path, window);
+        }
+    }
+}
+
+fn remove_from_index(index: &mut BTreeMap<i64, BTreeSet<PathBuf>>, time: i64, path: &Path) {
+    if let std::collections::btree_map::Entry::Occupied(mut entry) = index.entry(time) {
+        entry.get_mut().remove(path);
+        if entry.get().is_empty() {
+            entry.remove();
         }
     }
 }

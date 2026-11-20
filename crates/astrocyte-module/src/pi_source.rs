@@ -24,7 +24,8 @@ use chrono::DateTime;
 use rusqlite::params;
 use serde::Deserialize;
 
-use crate::refresher::jsonl_schedule::{full_due, FileStat, WindowSchedule};
+use crate::refresher::harness_drain::select_files;
+use crate::refresher::jsonl_schedule::{full_due, FileStat, WindowSchedule, WindowSchedules};
 use crate::refresher::SourceDrainError;
 use crate::state::SharedState;
 
@@ -240,7 +241,7 @@ struct PiCache {
     /// When each file's consumed prefix was last verified end to end, on the
     /// drain's `recorded_at_ms` clock. Committed together with `resume`.
     prefix_verified_ms: HashMap<PathBuf, i64>,
-    windows: HashMap<PathBuf, WindowSchedule>,
+    windows: WindowSchedules,
     /// For each file, how far its session-header search has read and whether
     /// it found the header (see `HeaderScan`). Committed together with
     /// `resume`, and trusted only for a file whose resume verified.
@@ -377,22 +378,30 @@ impl PiSource {
                 }
             }
         }
-        let (cached_resume, cached_verified, cached_header_scans, cached_windows, payer_wait) = {
+        let (
+            cached_resume,
+            cached_verified,
+            cached_header_scans,
+            cached_windows,
+            payer_wait,
+            files,
+        ) = {
             let cache = self
                 .cache
                 .lock()
                 .map_err(|_| "Pi file cache lock poisoned".to_string())?;
+            let files = mode
+                .files(&cache.windows, recorded_at_ms, || jsonl_files(root))
+                .map_err(|error| format!("read Pi session root {}: {error}", root.display()))?;
             (
-                cache.resume.clone(),
-                cache.prefix_verified_ms.clone(),
-                cache.header_scans.clone(),
-                cache.windows.clone(),
+                select_files(&cache.resume, &files),
+                select_files(&cache.prefix_verified_ms, &files),
+                select_files(&cache.header_scans, &files),
+                cache.windows.select(&files),
                 cache.payer_wait.clone(),
+                files,
             )
         };
-        let files = mode
-            .files(&cached_windows, recorded_at_ms, || jsonl_files(root))
-            .map_err(|error| format!("read Pi session root {}: {error}", root.display()))?;
         // A windowed drain skips records outside the requested time range.
         // Saving its offset would make later drains resume past those skipped
         // records and never ingest them, so a windowed drain neither resumes
@@ -403,7 +412,7 @@ impl PiSource {
         let mut resume_points = HashMap::with_capacity(files.len());
         let mut verified_ms = HashMap::with_capacity(files.len());
         let mut header_scans = HashMap::with_capacity(files.len());
-        let mut windows = HashMap::with_capacity(files.len());
+        let mut windows = WindowSchedules::default();
         if !mode.is_full() {
             resume_points.clone_from(&cached_resume);
             verified_ms.clone_from(&cached_verified);
@@ -412,7 +421,7 @@ impl PiSource {
         }
         let mut observations = Vec::new();
         let mut set_aside = Vec::new();
-        for path in files {
+        for path in files.iter().cloned() {
             // Nothing has been written yet and the caches below are replaced
             // only after the commit, so abandoning the pass here leaves the
             // store and the caches as they were. A restart rereads every file
@@ -566,10 +575,21 @@ impl PiSource {
             .lock()
             .map_err(|_| "Pi cache lock poisoned".to_string())?;
         if resumable {
-            cache.resume = resume_points;
-            cache.prefix_verified_ms = verified_ms;
-            cache.header_scans = header_scans;
-            cache.windows = windows;
+            if mode.is_full() {
+                cache.resume = resume_points;
+                cache.prefix_verified_ms = verified_ms;
+                cache.header_scans = header_scans;
+                cache.windows = windows;
+            } else {
+                for path in files {
+                    cache.resume.remove(&path);
+                    cache.header_scans.remove(&path);
+                }
+                cache.resume.extend(resume_points);
+                cache.prefix_verified_ms.extend(verified_ms);
+                cache.header_scans.extend(header_scans);
+                cache.windows.extend(windows);
+            }
         }
         cache.identities.extend(additions);
         cache.payer_wait = next_payer_wait;

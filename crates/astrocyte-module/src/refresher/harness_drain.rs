@@ -175,20 +175,14 @@ pub(crate) enum DrainMode {
 impl DrainMode {
     pub(crate) fn files(
         self,
-        windows: &std::collections::HashMap<PathBuf, WindowSchedule>,
+        windows: &WindowSchedules,
         now: i64,
         walk: impl FnOnce() -> std::io::Result<Vec<PathBuf>>,
     ) -> std::io::Result<Vec<PathBuf>> {
         if self.is_full() {
             walk()
         } else {
-            let mut files: Vec<_> = windows
-                .iter()
-                .filter(|(_, window)| window.hot(now))
-                .map(|(path, _)| path.clone())
-                .collect();
-            files.sort();
-            Ok(files)
+            Ok(windows.hot_paths(now))
         }
     }
     pub(crate) fn write<T>(
@@ -253,24 +247,44 @@ impl DrainMode {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAST_FILE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_fast_file_visit() {
+    FAST_FILE_VISITS.with(|visits| visits.set(visits.get() + 1));
+}
+
 pub(crate) const PAGE_LIMIT: u32 = 10_000;
 
 /// How often a file's whole consumed prefix is re-hashed instead of only
 /// the trailing window, on the drain's clock. Gemini JSON documents retain
 /// their separate hourly policy.
 pub(crate) const FULL_PREFIX_VERIFY_INTERVAL_MS: i64 = super::jsonl_schedule::DAILY_VERIFY_MS;
-pub(crate) use super::jsonl_schedule::{FileStat, WindowSchedule};
+pub(crate) use super::jsonl_schedule::{FileStat, WindowSchedule, WindowSchedules};
+
+pub(crate) fn select_files<T: Clone>(
+    map: &HashMap<PathBuf, T>,
+    paths: &[PathBuf],
+) -> HashMap<PathBuf, T> {
+    paths
+        .iter()
+        .filter_map(|path| map.get(path).map(|value| (path.clone(), value.clone())))
+        .collect()
+}
 
 /// Resume points and full-verification times for one source's files.
 ///
-/// Resume points are moved into the next read and published after commit.
-/// A failed or stopped drain leaves no points, so the next drain rereads
-/// the files; content-derived identity makes that conservative replay safe.
+/// Resume points are moved into a read and published after commit. A failed
+/// or stopped drain drops the points it took, so those files are reread;
+/// content-derived identity makes that conservative replay safe.
 #[derive(Debug)]
 pub(crate) struct ResumeCache<P> {
     pub resume: HashMap<PathBuf, P>,
     pub prefix_verified_ms: HashMap<PathBuf, i64>,
-    pub windows: HashMap<PathBuf, WindowSchedule>,
+    pub windows: WindowSchedules,
 }
 
 impl<P> Default for ResumeCache<P> {
@@ -278,8 +292,27 @@ impl<P> Default for ResumeCache<P> {
         Self {
             resume: HashMap::new(),
             prefix_verified_ms: HashMap::new(),
-            windows: HashMap::new(),
+            windows: WindowSchedules::default(),
         }
+    }
+}
+
+impl<P> ResumeCache<P> {
+    pub(crate) fn take_hot(&mut self, paths: &[PathBuf]) -> Self {
+        Self {
+            resume: paths
+                .iter()
+                .filter_map(|path| self.resume.remove(path).map(|point| (path.clone(), point)))
+                .collect(),
+            prefix_verified_ms: select_files(&self.prefix_verified_ms, paths),
+            windows: self.windows.select(paths),
+        }
+    }
+
+    pub(crate) fn extend(&mut self, next: Self) {
+        self.resume.extend(next.resume);
+        self.prefix_verified_ms.extend(next.prefix_verified_ms);
+        self.windows.extend(next.windows);
     }
 }
 
@@ -781,21 +814,27 @@ pub(crate) fn drain_jsonl<P, C: Default, Call>(
             ..JsonlDrainOutcome::default()
         });
     };
-    let (mut previous_points, previous_verified, previous_windows) = {
+    let (previous, files) = {
         let mut previous = cache
             .lock()
             .map_err(|_| format!("{label} cache lock poisoned"))?;
-        (
-            std::mem::take(&mut previous.resume),
-            previous.prefix_verified_ms.clone(),
-            previous.windows.clone(),
-        )
+        let files = mode
+            .files(&previous.windows, recorded_at_ms, || {
+                files_below(root, keep)
+            })
+            .map_err(|error| format!("read {root_label} root {}: {error}", root.display()))?;
+        let staged = if mode.is_full() {
+            std::mem::take(&mut *previous)
+        } else {
+            previous.take_hot(&files)
+        };
+        (staged, files)
     };
-    let files = mode
-        .files(&previous_windows, recorded_at_ms, || {
-            files_below(root, keep)
-        })
-        .map_err(|error| format!("read {root_label} root {}: {error}", root.display()))?;
+    let ResumeCache {
+        resume: mut previous_points,
+        prefix_verified_ms: previous_verified,
+        windows: previous_windows,
+    } = previous;
     let mut outcome = JsonlDrainOutcome::default();
     let mut next = ResumeCache::default();
     let mut requests = Vec::new();
@@ -873,15 +912,6 @@ pub(crate) fn drain_jsonl<P, C: Default, Call>(
             }
         }
     }
-    if !mode.is_full() {
-        next.resume.extend(previous_points);
-        for (path, window) in previous_windows {
-            next.windows.entry(path).or_insert(window);
-        }
-        for (path, verified) in previous_verified {
-            next.prefix_verified_ms.entry(path).or_insert(verified);
-        }
-    }
     let tally = record_requests_and_evidence_in_lane(
         state,
         key,
@@ -894,8 +924,13 @@ pub(crate) fn drain_jsonl<P, C: Default, Call>(
     outcome.rows_recorded = tally.recorded;
     outcome.exact_redeliveries = tally.exact_redeliveries;
     outcome.quarantined_redeliveries = tally.quarantined_redeliveries;
-    *cache
+    let mut cache = cache
         .lock()
-        .map_err(|_| format!("{label} cache lock poisoned"))? = next;
+        .map_err(|_| format!("{label} cache lock poisoned"))?;
+    if mode.is_full() {
+        *cache = next;
+    } else {
+        cache.extend(next);
+    }
     Ok(outcome)
 }

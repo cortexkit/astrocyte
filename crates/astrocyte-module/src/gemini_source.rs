@@ -174,34 +174,38 @@ impl GeminiSource {
                 ..GeminiDrainOutcome::default()
             });
         };
-        let previous = std::mem::take(
-            &mut *self
+        let (previous, files) = {
+            let mut cache = self
                 .cache
                 .lock()
-                .map_err(|_| "Gemini CLI cache lock poisoned".to_string())?,
-        );
+                .map_err(|_| "Gemini CLI cache lock poisoned".to_string())?;
+            let files = mode
+                .files(&cache.jsonl.windows, recorded_at_ms, || {
+                    files_below(root, &is_gemini_chat_recording)
+                })
+                .map_err(|error| format!("read Gemini CLI root {}: {error}", root.display()))?;
+            let previous = if mode.is_full() {
+                std::mem::take(&mut *cache)
+            } else {
+                GeminiCache {
+                    jsonl: cache.jsonl.take_hot(&files),
+                    ..GeminiCache::default()
+                }
+            };
+            (previous, files)
+        };
         let (mut previous_points, previous_verified, previous_windows) = (
             previous.jsonl.resume,
             previous.jsonl.prefix_verified_ms,
             previous.jsonl.windows,
         );
         let previous_documents = previous.documents;
-        let files = mode
-            .files(&previous_windows, recorded_at_ms, || {
-                files_below(root, &is_gemini_chat_recording)
-            })
-            .map_err(|error| format!("read Gemini CLI root {}: {error}", root.display()))?;
 
         let mut outcome = GeminiDrainOutcome {
             files_found: files.len(),
             ..GeminiDrainOutcome::default()
         };
         let mut next = GeminiCache::default();
-        if !mode.is_full() {
-            next.documents.clone_from(&previous_documents);
-            next.jsonl.prefix_verified_ms.clone_from(&previous_verified);
-            next.jsonl.windows.clone_from(&previous_windows);
-        }
         let mut calls = Vec::new();
         for path in files {
             if stop.load(Ordering::Relaxed) {
@@ -218,6 +222,9 @@ impl GeminiSource {
                 if !mode.is_full()
                     && !stat.fast_changed(previous_windows.get(&path), recorded_at_ms)
                 {
+                    if let Some(window) = previous_windows.get(&path) {
+                        next.jsonl.windows.insert(path.clone(), window.clone());
+                    }
                     if let Some(previous) = previous {
                         next.jsonl.resume.insert(path, previous);
                     }
@@ -310,9 +317,6 @@ impl GeminiSource {
             .map(map_call)
             .collect::<Result<Vec<_>, _>>()?;
 
-        if !mode.is_full() {
-            next.jsonl.resume.extend(previous_points);
-        }
         let tally = record_requests_in_lane(
             state,
             GEMINI_SOURCE_KEY,
@@ -325,10 +329,15 @@ impl GeminiSource {
         outcome.exact_redeliveries = tally.exact_redeliveries;
         outcome.quarantined_redeliveries = tally.quarantined_redeliveries;
 
-        *self
+        let mut cache = self
             .cache
             .lock()
-            .map_err(|_| "Gemini CLI cache lock poisoned".to_string())? = next;
+            .map_err(|_| "Gemini CLI cache lock poisoned".to_string())?;
+        if mode.is_full() {
+            *cache = next;
+        } else {
+            cache.jsonl.extend(next.jsonl);
+        }
         Ok(outcome)
     }
 }

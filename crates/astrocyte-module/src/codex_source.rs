@@ -65,7 +65,7 @@ struct CodexCache {
     resume: HashMap<PathBuf, Arc<CodexResumePoint>>,
     /// When each file's consumed prefix was last verified end to end.
     prefix_verified_ms: HashMap<PathBuf, i64>,
-    windows: HashMap<PathBuf, crate::refresher::harness_drain::WindowSchedule>,
+    windows: crate::refresher::harness_drain::WindowSchedules,
 }
 
 #[derive(Debug, Clone)]
@@ -231,39 +231,40 @@ impl CodexSource {
             );
             mode.ensure_runtime(state, CODEX_SOURCE_KEY)?;
         }
-        let (mut previous_points, previous_verified, previous_windows) = {
+        let mut outcome = CodexDrainOutcome::default();
+        let (mut previous_points, previous_verified, previous_windows, files) = {
+            use crate::refresher::harness_drain::select_files;
             let cache = self
                 .cache
                 .lock()
                 .map_err(|_| "Codex cache lock poisoned".to_string())?;
+            let files = mode
+                .files(&cache.windows, recorded_at_ms, || {
+                    let mut files = Vec::new();
+                    for (directory, root) in &present {
+                        let found = jsonl_files(root).map_err(|error| {
+                            std::io::Error::new(
+                                error.kind(),
+                                format!("read Codex session root {}: {error}", root.display()),
+                            )
+                        })?;
+                        outcome.files_by_directory.insert(directory, found.len());
+                        files.extend(found);
+                    }
+                    Ok(files)
+                })
+                .map_err(|error| error.to_string())?;
             (
-                cache.resume.clone(),
-                cache.prefix_verified_ms.clone(),
-                cache.windows.clone(),
+                select_files(&cache.resume, &files),
+                select_files(&cache.prefix_verified_ms, &files),
+                cache.windows.select(&files),
+                files,
             )
         };
 
-        let mut outcome = CodexDrainOutcome::default();
-        let files = mode
-            .files(&previous_windows, recorded_at_ms, || {
-                let mut files = Vec::new();
-                for (directory, root) in &present {
-                    let found = jsonl_files(root).map_err(|error| {
-                        std::io::Error::new(
-                            error.kind(),
-                            format!("read Codex session root {}: {error}", root.display()),
-                        )
-                    })?;
-                    outcome.files_by_directory.insert(directory, found.len());
-                    files.extend(found);
-                }
-                Ok(files)
-            })
-            .map_err(|error| error.to_string())?;
-
         let mut resume_points = HashMap::with_capacity(files.len());
         let mut verified_ms = HashMap::with_capacity(files.len());
-        let mut windows = HashMap::with_capacity(files.len());
+        let mut windows = crate::refresher::harness_drain::WindowSchedules::default();
         if !mode.is_full() {
             resume_points.clone_from(&previous_points);
             verified_ms.clone_from(&previous_verified);
@@ -271,7 +272,7 @@ impl CodexSource {
         }
         let mut requests = Vec::new();
         let mut set_aside = Vec::new();
-        for path in files {
+        for path in files.iter().cloned() {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
@@ -396,9 +397,18 @@ impl CodexSource {
             .cache
             .lock()
             .map_err(|_| "Codex cache lock poisoned".to_string())?;
-        cache.resume = resume_points;
-        cache.prefix_verified_ms = verified_ms;
-        cache.windows = windows;
+        if mode.is_full() {
+            cache.resume = resume_points;
+            cache.prefix_verified_ms = verified_ms;
+            cache.windows = windows;
+        } else {
+            for path in files {
+                cache.resume.remove(&path);
+            }
+            cache.resume.extend(resume_points);
+            cache.prefix_verified_ms.extend(verified_ms);
+            cache.windows.extend(windows);
+        }
         Ok(outcome)
     }
 }

@@ -526,6 +526,32 @@ fn add_jsonl_inventory(corpus: &mut Corpus) -> usize {
     6
 }
 
+#[test]
+fn idle_fast_jsonl_schedule_visits_do_not_follow_cold_history() {
+    let measure = |n, shared| {
+        let root = TempDir::new().unwrap();
+        for i in 0..n {
+            fs::write(root.path().join(format!("session-{i}.jsonl")), "{}\n").unwrap();
+        }
+        let source: Box<dyn harness_drain::HarnessSource> = if shared {
+            Box::new(omp_source::OmpSource::at(root.path()))
+        } else {
+            Box::new(pi_source::PiSource::at(root.path()))
+        };
+        let state = test_state();
+        let stop = AtomicBool::new(false);
+        let now = current_time_ms();
+        source.drain_for_health(&state, now, &stop).unwrap();
+        harness_drain::FAST_FILE_VISITS.with(|visits| visits.set(0));
+        source.drain_fast(&state, now + 3_600_000, &stop).unwrap();
+        harness_drain::FAST_FILE_VISITS.with(std::cell::Cell::get)
+    };
+    let pi = [measure(1_000, false), measure(10_000, false)];
+    let omp = [measure(1_000, true), measure(10_000, true)];
+    eprintln!("fast schedule visits at 1,000 and 10,000 cold files: Pi {pi:?}; OMP {omp:?}");
+    assert_eq!((pi, omp), ([0, 0], [0, 0]));
+}
+
 #[cfg(unix)]
 #[test]
 fn idle_fast_cycle_opens_nothing_and_stats_only_hot_files() {
