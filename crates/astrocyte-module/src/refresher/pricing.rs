@@ -1398,8 +1398,8 @@ pub(super) mod tests {
     }
 
     /// A backlog of tens of thousands must not be repriced inside one tick, and
-    /// must still drain: each pass takes a bounded slice and what it covers
-    /// leaves the set, so the next pass takes the next slice.
+    /// must still drain: each pass takes a bounded slice and the next pass
+    /// resumes past those candidates, even though the old charges still exist.
     #[test]
     fn one_pass_takes_at_most_the_cap_and_the_next_pass_takes_the_rest() {
         let state = test_state();
@@ -1420,28 +1420,24 @@ pub(super) mod tests {
             })
             .unwrap();
 
+        let mut walk = PricingWalk::new(PricingBudget::WHOLE_QUEUE);
+        let mut tick = |at| run_pricing_walk(&state, at, &NEVER_STOP, &mut walk).unwrap();
+
         // No plan yet, so all of these are priced through the no-head selection
         // the pass already had. That selection is uncapped and stays uncapped:
         // newly recorded facts keep their priority over the backfill.
-        assert_eq!(
-            price_unpriced_events(&state, 1, &NEVER_STOP).unwrap(),
-            total
-        );
+        assert_eq!(tick(1).priced, total);
         assert_eq!(covered_heads(&state), 0);
 
         declare_plan(&state, 1_700_000_000_000);
-        assert_eq!(
-            price_unpriced_events(&state, 2, &NEVER_STOP).unwrap(),
-            COVERAGE_BACKFILL_PER_PASS
-        );
+        assert_eq!(tick(2).priced, COVERAGE_BACKFILL_PER_PASS);
         assert_eq!(covered_heads(&state), COVERAGE_BACKFILL_PER_PASS as i64);
 
-        assert_eq!(
-            price_unpriced_events(&state, 3, &NEVER_STOP).unwrap(),
-            surplus
-        );
+        assert_eq!(tick(3).priced, surplus);
         assert_eq!(covered_heads(&state), total as i64);
-        assert_eq!(price_unpriced_events(&state, 4, &NEVER_STOP).unwrap(), 0);
+        let quiet = tick(4);
+        assert_eq!(quiet.priced, 0);
+        assert!(!quiet.backfill_queried);
     }
 
     /// A catalog that answers discovery but refuses the next `refusals`
