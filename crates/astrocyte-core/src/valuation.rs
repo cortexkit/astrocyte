@@ -26,7 +26,8 @@ pub struct EventTokens {
     pub producer: String,
     pub provider: String,
     pub model: Option<String>,
-    /// The mode recorded for this request, if known.
+    /// The pricing mode recorded for this request, such as a fast service tier;
+    /// it selects mode-specific catalog rates. None when not reported.
     pub mode: Option<String>,
     pub broca_attempt: bool,
     pub roles: Vec<MeasuredRole>,

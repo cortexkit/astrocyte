@@ -571,7 +571,8 @@ that fail the contract's entry or record checks, records whose quantities cannot
 fit the store, and raw undecodable or oversize entries are set aside with their
 feed location and reason. Valid records on the same page are still recorded; the
 evidence and cursor commit together before the page is acknowledged. A structured
-entry that fails to decode is set aside by its sequence without blocking its siblings.
+entry that fails to decode is set aside under its feed sequence number without
+blocking its siblings.
 Invalid page structure instead fails the page without advancing or acknowledging it.
 
 The contract admits a quantity only when it has at most nine fractional digits and

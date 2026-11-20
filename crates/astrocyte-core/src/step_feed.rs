@@ -534,9 +534,9 @@ fn refresh_runner_diagnostics(
             fields.remove(field);
         }
     }
-    // A row whose verdict fields are unchanged needs nothing: its cause
-    // was computed when it was appended. Skipping it avoids recording or
-    // comparing a step whose diagnostic fields have not changed.
+    // A row whose verdict fields are unchanged needs nothing: the step's rewrite
+    // cause was computed by comparing it with the preceding step on append.
+    // Skipping it avoids storing an identical row or comparing those steps again.
     if body == original {
         return Ok(false);
     }

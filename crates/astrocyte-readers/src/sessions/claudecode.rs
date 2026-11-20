@@ -924,7 +924,8 @@ pub fn parse_claude_file_transactional(
     parse_claude_file_with_final_tail(path, previous, check, now_ms, quiet_window_ms, false)
 }
 
-/// Use `final_tail` only when the declaring producer has closed the session.
+/// Use `final_tail` only after the session's producer has marked it done; bytes
+/// past the last newline are then final.
 pub fn parse_claude_file_with_final_tail(
     path: &Path,
     previous: Option<ClaudeResumePoint>,

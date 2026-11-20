@@ -279,7 +279,8 @@ pub(crate) fn select_files<T: Clone>(
 ///
 /// Resume points are moved into a read and published after commit. A failed
 /// or stopped drain drops the points it took, so those files are reread;
-/// content-derived identity makes that conservative replay safe.
+/// each call's identity is a hash of its producer, session and message id, so
+/// rereading records nothing twice.
 #[derive(Debug)]
 pub(crate) struct ResumeCache<P> {
     pub resume: HashMap<PathBuf, P>,
