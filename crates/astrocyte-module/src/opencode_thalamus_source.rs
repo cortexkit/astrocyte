@@ -816,7 +816,9 @@ mod tests {
                 source: OpenCodeThalamusSource::from_data_home(home),
                 temp,
                 folder,
-                state: Arc::new(test_state()),
+                state: Arc::new(
+                    super::super::thalamus_payer_join::test_state_without_payer_source(),
+                ),
             }
         }
 

@@ -1173,7 +1173,14 @@ fn commit_page_in_lane(
             set_aside,
             recorded_at_ms,
         )?;
-        let resolution = resolve_payer_in_tx(tx, home, waiting, calls, recorded_at_ms)?;
+        let resolution = resolve_payer_in_tx(
+            tx,
+            home,
+            waiting,
+            calls,
+            recorded_at_ms,
+            thalamus_payer_join::snapshot_wait_enabled(state),
+        )?;
         let mut dispositions =
             vec![RecordDisposition::ExactRedelivery; resolution.already_recorded];
         for request in &resolution.ready {
@@ -1251,9 +1258,10 @@ pub(crate) fn resolve_payer_in_tx(
     waiting: &WaitQueue,
     calls: &[WaitingCall],
     now: i64,
+    await_session_snapshot: bool,
 ) -> Result<Resolution, String> {
     if home.joins_payer() {
-        waiting.resolve_in_tx(tx, "opencode", calls, now)
+        waiting.resolve_in_tx(tx, "opencode", calls, now, await_session_snapshot)
     } else {
         Ok(Resolution {
             ready: calls.iter().map(|call| call.request.clone()).collect(),

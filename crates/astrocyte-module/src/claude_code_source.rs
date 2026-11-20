@@ -683,7 +683,15 @@ pub(crate) fn record_requests_in_lane(
         )?;
         let resolution = payer_wait
             .as_ref()
-            .map(|(queue, calls)| queue.resolve_in_tx(tx, "claude-code", calls, recorded_at_ms))
+            .map(|(queue, calls)| {
+                queue.resolve_in_tx(
+                    tx,
+                    "claude-code",
+                    calls,
+                    recorded_at_ms,
+                    super::thalamus_payer_join::snapshot_wait_enabled(state),
+                )
+            })
             .transpose()?;
         let requests = resolution
             .as_ref()

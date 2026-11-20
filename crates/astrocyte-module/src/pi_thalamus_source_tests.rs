@@ -1,5 +1,5 @@
+use super::super::thalamus_payer_join::test_state_without_payer_source;
 use super::*;
-use crate::state::test_state;
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use std::fs;
@@ -46,7 +46,7 @@ impl Fixture {
             ack: path.join("cortexkit/astrocyte/acks/pi.json"),
             source: PiThalamusSource::from_data_home(path),
             home,
-            state: Arc::new(test_state()),
+            state: Arc::new(test_state_without_payer_source()),
         }
     }
     fn root(&self) -> Value {

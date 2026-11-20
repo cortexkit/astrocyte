@@ -51,6 +51,52 @@ pub(crate) struct Resolution {
     pub(crate) overflow_started: bool,
 }
 
+impl Resolution {
+    fn wait_for_payer(
+        &mut self,
+        tx: &Transaction<'_>,
+        id: String,
+        call: &WaitingCall,
+        now: i64,
+    ) -> Result<bool, String> {
+        let started = match call.completed_at_ms {
+            Some(completed) => completed,
+            None => first_seen(tx, &id, now)?,
+        };
+        if now.saturating_sub(started) < PAYER_WAIT_MS {
+            if self.next.len() < MAX_WAITING_CALLS {
+                self.next.waiting.insert(id, call.clone());
+                return Ok(true);
+            }
+            if !self.next.overflow_reported {
+                self.next.overflow_reported = true;
+                self.overflow_started = true;
+            }
+        }
+        count_coverage(tx, "without_payer", &id)?;
+        Ok(false)
+    }
+}
+
+pub(crate) fn snapshot_wait_enabled(state: &crate::state::SharedState) -> bool {
+    state
+        .desired_config()
+        .harness_ingest
+        .ingests(super::thalamus_payer_source::SOURCE_KEY)
+}
+
+#[cfg(test)]
+pub(crate) fn test_state_without_payer_source() -> crate::state::SharedState {
+    let state = crate::state::test_state();
+    let mut config = state.desired_config();
+    config
+        .harness_ingest
+        .exclude
+        .push(super::thalamus_payer_source::SOURCE_KEY.into());
+    state.publish_desired(config, 1);
+    state
+}
+
 impl WaitQueue {
     /// A refused declaration must not release calls queued under its owner.
     /// Full transcript scans can rediscover them once the declaration is valid.
@@ -116,7 +162,20 @@ impl WaitQueue {
         harness: &str,
         calls: &[WaitingCall],
         now_ms: i64,
+        await_session_snapshot: bool,
     ) -> Result<Resolution, String> {
+        let snapshot_begin: Option<i64> =
+            if await_session_snapshot && (!calls.is_empty() || !self.is_empty()) {
+                tx.query_row(
+                    "SELECT updated_at_ms FROM read_watermark WHERE source_key=?1",
+                    [super::thalamus_payer_source::SOURCE_KEY],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+            } else {
+                None
+            };
         let mut result = Resolution {
             ready: Vec::new(),
             next: Self {
@@ -153,10 +212,37 @@ impl WaitQueue {
                 )
                 .optional()
                 .map_err(|e| e.to_string())?;
-            let Some(owner) = owner else {
+            if owner.is_none() {
+                if await_session_snapshot && call.native_session().is_some() {
+                    let start = match request.occurred_at_ms.or(call.completed_at_ms) {
+                        Some(start) => start,
+                        None => first_seen(tx, &id, now_ms)?,
+                    };
+                    // Equal timestamps don't show whether the call began before the snapshot.
+                    if snapshot_begin.is_none_or(|begin| begin <= start) {
+                        let recorded: bool = tx
+                            .query_row(
+                                "SELECT EXISTS(SELECT 1 FROM usage_event WHERE event_id=?1)",
+                                [&id],
+                                |row| row.get(0),
+                            )
+                            .map_err(|error| error.to_string())?;
+                        if recorded {
+                            result.already_recorded += 1;
+                            continue;
+                        }
+                        if result.next.waiting.contains_key(&id) {
+                            continue;
+                        }
+                        if result.wait_for_payer(tx, id, call, now_ms)? {
+                            continue;
+                        }
+                    }
+                }
                 result.ready.push(request.clone());
                 continue;
-            };
+            }
+            let owner = owner.flatten();
             if let (Some(owner), Some(roots_owner)) =
                 (owner.as_deref(), request.work_class.as_deref())
             {
@@ -207,24 +293,10 @@ impl WaitQueue {
                     if result.next.waiting.contains_key(&id) {
                         continue;
                     }
-                    let started = match call.completed_at_ms {
-                        Some(completed) => completed,
-                        None => first_seen(tx, &id, now_ms)?,
-                    };
-                    if now_ms.saturating_sub(started) < PAYER_WAIT_MS
-                        && result.next.len() < MAX_WAITING_CALLS
-                    {
-                        result.next.waiting.insert(id, call.clone());
+                    if result.wait_for_payer(tx, id, call, now_ms)? {
                         continue;
                     }
-                    if now_ms.saturating_sub(started) < PAYER_WAIT_MS
-                        && !result.next.overflow_reported
-                    {
-                        result.next.overflow_reported = true;
-                        result.overflow_started = true;
-                    }
                     unknown(&mut ready);
-                    count_coverage(tx, "without_payer", &id)?;
                 }
             }
             result.ready.push(ready);
@@ -358,7 +430,8 @@ mod tests {
     ) -> (usize, usize, bool) {
         let resolution = state
             .ordered_write(|tx| {
-                let resolution = queue.resolve_in_tx(tx, "pi", calls, now)?;
+                let resolution =
+                    queue.resolve_in_tx(tx, "pi", calls, now, snapshot_wait_enabled(state))?;
                 for request in &resolution.ready {
                     astrocyte_core::ingest::record_event_in_tx(
                         tx,
@@ -385,14 +458,82 @@ mod tests {
     }
 
     #[test]
-    fn payer_wait_queue_unmanaged_call_is_byte_identical_and_immediate() {
+    fn payer_waits_for_a_snapshot_that_can_see_a_new_declared_session() {
         let state = test_state();
+        let original = call("new-session", Some(105));
+        let snapshot = |at| {
+            state
+                .ordered_write(|tx| {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO read_watermark VALUES ('thalamus-payer',?1,?2)",
+                        params![at - 60_000_i64, at],
+                    )
+                    .unwrap();
+                    Ok(((), true))
+                })
+                .unwrap();
+        };
+        snapshot(99);
+        let mut queue = WaitQueue::default();
+        assert_eq!(
+            pass(&state, &mut queue, std::slice::from_ref(&original), 106).0,
+            0
+        );
+        assert_eq!(queue.len(), 1);
+        assert!(stored(&state).is_empty());
+
+        // A restart loses the process-local queue, not the unread transcript.
+        let mut queue = WaitQueue::default();
+        assert_eq!(pass(&state, &mut queue, &[original], 110).0, 0);
+        manage(&state);
+        payer(
+            &state,
+            "new-payer",
+            "new-session",
+            Some("metered_api"),
+            "new-login",
+        );
+        snapshot(111);
+        assert_eq!(pass(&state, &mut queue, &[], 112).0, 1);
+        assert_eq!(
+            stored(&state),
+            [(
+                "new-session".into(),
+                "metered_api".into(),
+                Some("new-login".into()),
+                Some("account".into())
+            )]
+        );
+    }
+
+    #[test]
+    fn payer_wait_without_first_snapshot_is_bounded_across_an_undated_replay() {
+        let state = test_state();
+        let mut original = call("undated-session", None);
+        original.request.occurred_at_ms = None;
+        let mut queue = WaitQueue::default();
+        assert_eq!(
+            pass(&state, &mut queue, std::slice::from_ref(&original), 100).0,
+            0
+        );
+        let mut queue = WaitQueue::default();
+        assert_eq!(pass(&state, &mut queue, &[original], 600_099).0, 0);
+        assert_eq!(pass(&state, &mut queue, &[], 600_100).0, 1);
+        assert_eq!(
+            stored(&state),
+            [("undated-session".into(), "unknown".into(), None, None)]
+        );
+    }
+
+    #[test]
+    fn payer_wait_queue_unmanaged_call_is_byte_identical_and_immediate() {
+        let state = test_state_without_payer_source();
         let original = call("unmanaged", Some(100));
         let mut queue = WaitQueue::default();
         state
             .ordered_write(|tx| {
                 let resolved =
-                    queue.resolve_in_tx(tx, "pi", std::slice::from_ref(&original), 101)?;
+                    queue.resolve_in_tx(tx, "pi", std::slice::from_ref(&original), 101, false)?;
                 assert_eq!(resolved.ready, vec![original.request.clone()]);
                 assert!(resolved.next.is_empty());
                 Ok(((), true))
@@ -531,7 +672,7 @@ mod tests {
         queue = WaitQueue::default();
         assert_eq!(pass(&state, &mut queue, &[original], 609_999).0, 0);
         let failed = state.ordered_write::<()>(|tx| {
-            let proposed = queue.resolve_in_tx(tx, "pi", &[], 610_000)?;
+            let proposed = queue.resolve_in_tx(tx, "pi", &[], 610_000, true)?;
             assert_eq!(proposed.ready.len(), 1);
             assert!(proposed.next.is_empty());
             Err("injected failure before commit".into())

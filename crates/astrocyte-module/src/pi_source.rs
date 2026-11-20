@@ -1045,13 +1045,16 @@ pub(crate) fn record_calls(
     } else {
         DrainMode::Fast
     };
+    let await_session_snapshot = source_key == super::pi_thalamus_source::SOURCE_KEY
+        && super::thalamus_payer_join::snapshot_wait_enabled(state);
     let committed = mode.write(state, |tx| {
         if stop_requested() {
             stopped = true;
             return Err("Pi ingest stopped".into());
         }
         let newly_seen = record_set_aside_in_tx(tx, source_key, set_aside, recorded_at_ms)?;
-        let payer = payer_wait.resolve_in_tx(tx, "pi", calls, recorded_at_ms)?;
+        let payer =
+            payer_wait.resolve_in_tx(tx, "pi", calls, recorded_at_ms, await_session_snapshot)?;
         let mut dispositions = Vec::new();
         let mut copied = 0;
         for request in &payer.ready {

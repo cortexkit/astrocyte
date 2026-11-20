@@ -542,7 +542,14 @@ fn commit(
                 }),
             }
         }
-        let resolution = resolve_payer_in_tx(tx, home, waiting, &calls, now)?;
+        let resolution = resolve_payer_in_tx(
+            tx,
+            home,
+            waiting,
+            &calls,
+            now,
+            super::thalamus_payer_join::snapshot_wait_enabled(state),
+        )?;
         outcome.skipped_recorded += resolution.already_recorded;
         for request in &resolution.ready {
             if stop.load(Ordering::Relaxed) {

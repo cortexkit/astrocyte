@@ -175,6 +175,7 @@ and reading continues.
   10 minutes, the readers' existing quiet window, for its payer row. Without
   one by then, it is recorded with basis unknown and no account. Coverage
   counts those calls, and health does not change.
+  A call from a session store listed by THALAMUS in `roots.json` also waits within that bound if payer ingestion is enabled but no completed payer snapshot began after the call started.
 - **A row-less row** is recorded as its own call: producer `thalamus-harness`,
   the session as lineage, `attempt_id` as the producer reference, measurements
   from `usage_json`, the payer from the row, and the session's

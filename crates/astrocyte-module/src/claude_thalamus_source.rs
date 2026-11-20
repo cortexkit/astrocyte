@@ -453,12 +453,12 @@ impl HarnessSource for ClaudeThalamusSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::test_state;
     include!("claude_thalamus_source_tests.rs");
     use crate::refresher::{
         claude_code_source::ClaudeCodeSource, run_iteration_with_claude_code,
         run_iteration_with_harness,
     };
-    use crate::state::test_state;
     use rusqlite::OptionalExtension;
     use serde_json::{json, Value};
     use std::path::Path;
@@ -512,7 +512,9 @@ mod tests {
                 source: ClaudeThalamusSource::from_data_home(home),
                 temp,
                 folder,
-                state: Arc::new(test_state()),
+                state: Arc::new(
+                    super::super::thalamus_payer_join::test_state_without_payer_source(),
+                ),
             }
         }
 
