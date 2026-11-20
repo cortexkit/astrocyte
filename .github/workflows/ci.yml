@@ -132,7 +132,11 @@ jobs:
   test-windows:
     name: Test (windows)
     runs-on: windows-2025
-    timeout-minutes: 30
+    # Tests take about 15 minutes here, and saving the Cargo cache afterwards
+    # takes another 10 to 12 when the cache key is new. A 30-minute limit
+    # cancelled runs whose tests had all passed. A wedged test still stops
+    # long before the 6-hour default.
+    timeout-minutes: 45
     env:
       ASTROCYTE_REQUIRE_NATS_SERVER: "1"
     steps:
