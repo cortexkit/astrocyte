@@ -829,6 +829,24 @@ fn load_scoped_ledger(
     load_scoped_ledger_bound(conn, dimensions, filter, &[], false)
 }
 
+/// SQL counterpart of `pricing::effective_output` for bulk report reductions.
+/// The two indexed lookups run only for legacy inclusive output rows. Keep
+/// the stored measurement intact for explain and run detail items.
+pub(crate) fn reported_quantity_sql() -> String {
+    format!(
+        "CASE WHEN m.role='output' AND m.unit='token' AND m.quantity_exponent=0
+             AND m.source='{}' AND EXISTS (SELECT 1 FROM usage_event e WHERE e.event_key=m.event_key
+                 AND e.producer='broca' AND e.provider IS NOT '{}')
+         THEN (SELECT CASE WHEN r.quantity_units>m.quantity_units THEN NULL
+                           ELSE m.quantity_units-COALESCE(r.quantity_units,0) END
+               FROM (SELECT 1) seed LEFT JOIN measurement r ON r.event_key=m.event_key
+                 AND r.role='reasoning' AND r.unit='token' AND r.quantity_exponent=0)
+         ELSE m.quantity_units END",
+        crate::ingest::INCLUSIVE_OUTPUT_SOURCE,
+        crate::pricing::OUTPUT_EXCLUSIVE_BEFORE_FIX_PROVIDER
+    )
+}
+
 fn load_scoped_ledger_bound(
     conn: &Connection,
     dimensions: &[Grouping],
@@ -933,15 +951,20 @@ fn load_scoped_ledger_bound(
     let mut measurements_total = 0_u64;
     {
         let mut lookup = EventLookup::new(&index);
+        let report_quantity = if quantities {
+            reported_quantity_sql()
+        } else {
+            "NULL".into()
+        };
         let mut statement = conn.prepare(&format!(
-            "SELECT event_key,role,unit,quantity_units,kind,quantity_exponent FROM measurement{child_filter}"
+            "SELECT event_key,role,unit,quantity_units,kind,quantity_exponent,{report_quantity} FROM measurement m{child_filter}"
         ))?;
         let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
         while let Some(row) = rows.next()? {
             let position = lookup.find(row.get(0)?)?;
             let event = &mut events[position];
             let quantity = row
-                .get::<_, Option<i64>>(3)?
+                .get::<_, Option<i64>>(6)?
                 .zip(row.get::<_, Option<i32>>(5)?);
             if quantities {
                 event.quantities.observe(

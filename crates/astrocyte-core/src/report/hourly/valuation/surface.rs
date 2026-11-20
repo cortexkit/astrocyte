@@ -117,6 +117,22 @@ impl Accumulator {
 fn day_start(at: i64) -> i64 {
     at.div_euclid(DAY_MS) * DAY_MS
 }
+fn usd_total_deduced(
+    allocation: &Allocation,
+    totals: &BTreeMap<Option<String>, Accumulator>,
+    recorded: i64,
+) -> Result<Option<fees::Deduced>, ReportError> {
+    // The fee follows the plan's currency, not the currency of its matching calls.
+    let mut weights = Weights::default();
+    for total in totals.values() {
+        for (member, weight) in &total.weights.0 {
+            weights.checked_add(member.clone(), *weight)?;
+        }
+    }
+    let (share, pending) = allocation.row(&weights)?;
+    share.deduced("USD", recorded, pending.len())
+}
+
 fn is_plan(dimension: &Grouping) -> bool {
     matches!(dimension, Grouping::Plan | Grouping::PlanAccount)
 }
@@ -283,6 +299,7 @@ fn summary_members(
             .unwrap_or_default(),
         model: key.0[Grouping::Model as usize].clone(),
         mode: None,
+        broca_attempt: false,
         roles: Vec::new(),
     };
     let instants = [from, to]
@@ -459,12 +476,21 @@ pub(crate) fn report(
     let mut buckets: BTreeMap<BucketKey, Accumulator> = BTreeMap::new();
     let mut totals: BTreeMap<Option<String>, Accumulator> = BTreeMap::new();
     let mut dictionary = Values::new(conn);
-    let mut stmt = conn.prepare("SELECT s.hour_number,s.revision,s.built_revision,s.format_version,EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=s.kind AND d.hour_number=s.hour_number),v.state='built' AND v.rate_generation=g.rate_generation AND v.rate_generation=r.generation AND v.config_generation=g.config_generation AND v.plan_generation=g.plan_generation AND NOT EXISTS(SELECT 1 FROM rate_dirty_hour d WHERE d.hour_number=s.hour_number) FROM summary_hour s LEFT JOIN valuation_hour v USING(kind,hour_number) CROSS JOIN valuation_state g CROSS JOIN rate_cache_state r WHERE s.kind=0 AND (?1 OR s.hour_number BETWEEN ?2 AND ?3) ORDER BY s.hour_number")?;
-    let mut hours = stmt.query(params![
-        parsed.range.is_none(),
-        day_start(from).div_euclid(HOUR_MS),
-        (to - 1).div_euclid(DAY_MS) * 24 + 23
-    ])?;
+    let select = "SELECT s.hour_number,s.revision,s.built_revision,s.format_version,EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=s.kind AND d.hour_number=s.hour_number),v.state='built' AND v.config_generation=g.config_generation AND NOT EXISTS(SELECT 1 FROM rate_dirty_hour d WHERE d.hour_number=s.hour_number) FROM summary_hour s LEFT JOIN valuation_hour v USING(kind,hour_number) CROSS JOIN valuation_state g WHERE s.kind=0";
+    // Keep the bounded predicate separate so SQLite can seek by hour as well as kind.
+    let (predicate, bounds) = if parsed.range.is_some() {
+        (
+            " AND s.hour_number BETWEEN ?1 AND ?2",
+            Some([
+                day_start(from).div_euclid(HOUR_MS),
+                (to - 1).div_euclid(DAY_MS) * 24 + 23,
+            ]),
+        )
+    } else {
+        ("", None)
+    };
+    let mut stmt = conn.prepare_cached(&format!("{select}{predicate} ORDER BY s.hour_number"))?;
+    let mut hours = stmt.query(rusqlite::params_from_iter(bounds.into_iter().flatten()))?;
     while let Some(row) = hours.next()? {
         let hour = Hour {
             kind: 0,
@@ -609,6 +635,8 @@ pub(crate) fn report(
         total.valuation.row =
             acc.value(&allocation, total.currency.as_deref(), total.total_nanos)?;
         if total.currency.as_deref() == Some("USD") {
+            total.valuation.row.deduced =
+                usd_total_deduced(&allocation, &totals, total.total_nanos)?;
             total.valuation.deduced_unspread_nanos = fee_totals.deduced_unspread_nanos;
             total.valuation.deduced_non_usd_plans = Some(fee_totals.deduced_non_usd_plans);
             total.valuation.deduced_conflict_plans = Some(fee_totals.deduced_conflict_plans);

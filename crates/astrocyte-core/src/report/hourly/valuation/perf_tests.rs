@@ -108,6 +108,94 @@ fn valuation_perf_hour_build_is_linear_at_100_and_1000_calls() {
 }
 
 #[test]
+fn ledger_regression_bounded_report_hour_seek_is_independent_of_history() {
+    let measure = |history: i64| {
+        let mut conn = conn();
+        rate(&conn, "A", 1_000_000_000);
+        let hour = 10_008;
+        let from = hour * HOUR_MS;
+        calls(&conn, "target", 1, 24, from, false, true);
+        summaries(&mut conn);
+        drain(&mut conn, &config());
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i+1<{history})
+             INSERT INTO summary_hour(kind,hour_number,revision,built_revision,format_version)
+             SELECT 0,i,1,1,{FORMAT} FROM n;
+             ANALYZE;"
+        ))
+        .unwrap();
+        let request = ReportRequest {
+            grain: "day".into(),
+            timezone: "UTC".into(),
+            from_ms: Some(from),
+            to_ms: Some(from + fees::DAY_MS),
+            ..ReportRequest::default()
+        };
+        let counter = VmCounter::start(&conn);
+        let report = spend_report(&conn, &request, from + 2 * fees::DAY_MS).unwrap();
+        assert_eq!(report.rows[0].events_total, 24);
+        assert_eq!(report.rows[0].valuation.list_value.nanos, 4_800_000);
+        counter.steps()
+    };
+    let counts = [measure(1_000), measure(10_000)];
+    eprintln!("bounded spend report VM steps at 1,000 and 10,000 history hours: {counts:?}");
+    assert!(
+        counts[1] <= counts[0] + 100,
+        "VM steps grew with history: {counts:?}"
+    );
+}
+
+#[test]
+fn ledger_regression_small_valuation_changes_do_not_retag_history() {
+    let measure = |history| {
+        let mut conn = conn();
+        prepare(&mut conn, &config());
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i+1<{history})
+             INSERT INTO summary_hour(kind,hour_number,revision,built_revision,format_version)
+             SELECT 0,i,1,1,{FORMAT} FROM n;
+             UPDATE valuation_hour SET state='built',rate_generation=0,plan_generation=0,config_generation=1;"
+        )).unwrap();
+        let plan_counter = VmCounter::start(&conn);
+        plan(
+            &conn,
+            PlanLedger::Account,
+            "provider",
+            "account",
+            (history - 1) * HOUR_MS,
+            Some(history * HOUR_MS),
+        );
+        let plan_steps = plan_counter.steps();
+        conn.execute_batch("INSERT INTO rate_dirty_hour VALUES(0); UPDATE rate_cache_state SET generation=1 WHERE id=1;").unwrap();
+        let rate_counter = VmCounter::start(&conn);
+        let tx = conn.unchecked_transaction().unwrap();
+        ValuationMaintenance::prepare(&tx, &config(), &[]).unwrap();
+        tx.commit().unwrap();
+        let rate_steps = rate_counter.steps();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM valuation_hour WHERE state='dirty'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        (plan_steps, rate_steps)
+    };
+    let (small, large) = (measure(1_000), measure(10_000));
+    eprintln!("(plan, rate) VM steps at 1,000 and 10,000 history hours: {small:?}, {large:?}");
+    assert!(
+        large.0 <= small.0 + 100,
+        "plan change rewrote unrelated history"
+    );
+    assert!(
+        large.1 <= small.1 + 100,
+        "rate change rewrote unrelated history"
+    );
+}
+
+#[test]
 fn valuation_perf_same_hour_is_independent_of_tenfold_unrelated_history() {
     let mut measured = Vec::new();
     for unrelated in [1_000, 10_000] {

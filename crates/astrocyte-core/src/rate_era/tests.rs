@@ -63,6 +63,7 @@ fn numerator(
         provider: provider.into(),
         model: Some(model.into()),
         mode: None,
+        broca_attempt: false,
         roles: vec![(
             role.into(),
             unit.into(),

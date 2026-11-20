@@ -2,13 +2,13 @@
 //! the hourly report's invalidation, bounded rebuild, publication and audit.
 use std::collections::BTreeMap;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::report::ReportError;
 
-// Format 6 separates runner and host harness in spend cells. Run cells are
-// republished with the same hour so both reads agree.
+// Format 6 separates runner and host harness in spend cells. Run and spend
+// cells are republished together when a migration dirties an affected hour.
 pub(crate) const FORMAT: i64 = 6;
 const HOUR_MS: i64 = 3_600_000;
 const MAX_RANGE: i64 = 31 * 24 * HOUR_MS;
@@ -286,12 +286,18 @@ struct Event {
     work_class: Option<String>,
     broca_attempt: bool,
     measurements: Vec<Measurement>,
+    reported_output: Option<Quantity>,
 }
 impl Event {
     fn totals(&self) -> Result<Totals, ReportError> {
         let mut totals = Totals::default();
         for m in &self.measurements {
-            if let Some(q) = &m.quantity {
+            let reported = if m.role == "output" && m.unit == "token" {
+                &self.reported_output
+            } else {
+                &m.quantity
+            };
+            if let Some(q) = reported {
                 if let Some(value) = whole_tokens(q)
                     .filter(|_| m.unit == "token" || m.unit.starts_with("token_cache_"))
                 {
@@ -379,10 +385,12 @@ fn event_key(
 }
 
 fn base_sql(filter: &str, index: &str) -> String {
+    let quantity = crate::report::reported_quantity_sql();
     format!("WITH selected AS MATERIALIZED (SELECT * FROM usage_event INDEXED BY {index} WHERE {filter})
         SELECT e.event_key,e.producer,e.session,e.run_ref,e.flow_ref,e.producer_ref,e.occurred_at_ms,e.provider,e.model,e.work_class,
         m.role,m.unit,m.quantity_units,m.quantity_exponent,h.outcome,h.charge_nanos,h.currency,h.unpriced_reason,m.kind,
-        CASE WHEN e.producer='broca' THEN EXISTS(SELECT 1 FROM broca_attempt_detail a WHERE a.event_key=e.event_key) ELSE 0 END
+        CASE WHEN e.producer='broca' THEN EXISTS(SELECT 1 FROM broca_attempt_detail a WHERE a.event_key=e.event_key) ELSE 0 END,
+        CASE WHEN m.role='output' AND m.unit='token' THEN {quantity} END
         FROM selected e LEFT JOIN measurement m ON m.event_key=e.event_key
         LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit
             AND NOT EXISTS(SELECT 1 FROM priced_charge child WHERE child.supersedes=h.charge_key)
@@ -418,6 +426,7 @@ fn visit(
                 work_class: row.get(9)?,
                 broca_attempt: row.get(19)?,
                 measurements: Vec::new(),
+                reported_output: None,
             });
         }
         if let Some(role) = row.get::<_, Option<String>>(10)? {
@@ -433,25 +442,31 @@ fn visit(
                 (Some(units), Some(exponent)) => Some(Quantity { units, exponent }),
                 _ => None,
             };
-            current
+            let event = current
                 .as_mut()
-                .ok_or(ReportError::Integrity("event absent"))?
-                .measurements
-                .push(Measurement {
-                    role,
-                    unit: row.get(11)?,
-                    quantity,
-                    amount_nanos: if priced { row.get(15)? } else { None },
-                    currency: if priced { row.get(16)? } else { None },
-                    reason: if observed {
-                        Some("observed_only".into())
-                    } else if state == "unpriced" {
-                        row.get(17)?
-                    } else {
-                        None
-                    },
-                    state,
-                });
+                .ok_or(ReportError::Integrity("event absent"))?;
+            let unit: String = row.get(11)?;
+            if role == "output" && unit == "token" {
+                event.reported_output = row
+                    .get::<_, Option<i64>>(20)?
+                    .zip(quantity.as_ref().map(|q| q.exponent))
+                    .map(|(units, exponent)| Quantity { units, exponent });
+            }
+            event.measurements.push(Measurement {
+                role,
+                unit,
+                quantity,
+                amount_nanos: if priced { row.get(15)? } else { None },
+                currency: if priced { row.get(16)? } else { None },
+                reason: if observed {
+                    Some("observed_only".into())
+                } else if state == "unpriced" {
+                    row.get(17)?
+                } else {
+                    None
+                },
+                state,
+            });
         }
     }
     if let Some(event) = current {
@@ -983,11 +998,7 @@ pub fn detail(conn: &Connection, request: &DetailRequest) -> Result<DetailReply,
     let mut probe = Probe::new(conn);
     let clean=format!("c.run_key={} AND EXISTS(SELECT 1 FROM summary_hour h WHERE h.kind=c.kind AND h.hour_number=c.hour_number AND h.built_revision=h.revision AND h.format_version={FORMAT} AND NOT EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=h.kind AND d.hour_number=h.hour_number))",quoted(&key_text(&request.key)?));
     let (_, mut totals) = summed(conn, &clean)?;
-    let mut stmt = conn.prepare(&stale_hours_sql())?;
-    let hours = stmt
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
-        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
-    for (kind, hour) in hours {
+    for (kind, hour) in stale_key_hours(conn, filter, index, value, request.key.harness())? {
         let time = if kind == 1 {
             "occurred_at_ms IS NULL".into()
         } else {
@@ -1088,16 +1099,50 @@ fn candidates_sql(clean: &str, request: &ListRequest, resume: &str) -> String {
         request.from_ms,request.to_ms,clean.replace("c.","newer."))
 }
 
-/// Every summary hour that is not clean: queued as dirty, or not built at its
-/// current revision and format. Each half seeks a small set (the dirty queue,
-/// the `summary_hour_stale` partial index) rather than reading every hour,
-/// which the planner can do only while the format named here matches the
-/// index's. A dirty-queue row always has its `summary_hour` row (foreign key);
-/// the join keeps the answer the same even if one did not.
-fn stale_hours_sql() -> String {
+/// Jump to the first event of each hour through the key/time index, then only
+/// reduce hours without a current summary. Neither the global dirty queue nor
+/// all the individual events of a clean hour need to be read.
+fn stale_key_hours(
+    conn: &Connection,
+    filter: &str,
+    index: &str,
+    value: &str,
+    producer: &str,
+) -> rusqlite::Result<Vec<(i64, i64)>> {
+    let mut current = conn.prepare_cached(&format!(
+        "SELECT EXISTS(SELECT 1 FROM summary_hour h WHERE h.kind=?1 AND h.hour_number=?2
+         AND h.built_revision=h.revision AND h.format_version={FORMAT}
+         AND NOT EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=h.kind AND d.hour_number=h.hour_number))"
+    ))?;
+    let mut next = conn.prepare(&key_hour_seek_sql(filter, index))?;
+    let undated: bool = conn.query_row(&format!(
+        "SELECT EXISTS(SELECT 1 FROM usage_event INDEXED BY {index} WHERE ({filter}) AND occurred_at_ms IS NULL)"
+    ), params![value, producer], |row| row.get(0))?;
+    let mut stale = Vec::new();
+    if undated && !current.query_row([1_i64, 0], |row| row.get::<_, bool>(0))? {
+        stale.push((1, 0));
+    }
+    let mut from = i64::MIN;
+    while let Some(at) = next
+        .query_row(params![value, producer, from], |row| row.get::<_, i64>(0))
+        .optional()?
+    {
+        let hour = at.div_euclid(HOUR_MS);
+        if !current.query_row([0_i64, hour], |row| row.get::<_, bool>(0))? {
+            stale.push((0, hour));
+        }
+        let Some(next_hour) = (hour + 1).checked_mul(HOUR_MS) else {
+            break;
+        };
+        from = next_hour;
+    }
+    Ok(stale)
+}
+
+fn key_hour_seek_sql(filter: &str, index: &str) -> String {
     format!(
-        "SELECT kind,hour_number FROM summary_hour WHERE built_revision IS NOT revision OR format_version IS NOT {FORMAT}
-        UNION SELECT h.kind,h.hour_number FROM summary_dirty_hour d CROSS JOIN summary_hour h ON h.kind=d.kind AND h.hour_number=d.hour_number"
+        "SELECT occurred_at_ms FROM usage_event INDEXED BY {index} WHERE ({filter})
+             AND occurred_at_ms>=?3 ORDER BY occurred_at_ms LIMIT 1"
     )
 }
 

@@ -479,6 +479,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 62,
         statements: migrations::v60_v79::V62,
     },
+    Migration {
+        version: 63,
+        statements: migrations::v60_v79::V63,
+    },
 ];
 
 /// Counts the SQLite virtual-machine instructions a connection runs between

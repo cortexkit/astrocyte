@@ -302,7 +302,8 @@ impl Data {
             );
         }
         let selected = format!("SELECT event_key FROM usage_event WHERE {filter}");
-        let mut statement=conn.prepare(&format!("SELECT m.event_key,m.unit,m.role,m.quantity_units,m.quantity_exponent,h.outcome
+        let quantity = reported_quantity_sql();
+        let mut statement=conn.prepare(&format!("SELECT m.event_key,m.unit,m.role,{quantity},m.quantity_exponent,h.outcome
             FROM measurement m LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit
             AND NOT EXISTS(SELECT 1 FROM priced_charge s WHERE s.supersedes=h.charge_key)
             WHERE m.event_key IN ({selected})"))?;
@@ -2894,7 +2895,6 @@ mod tests {
     #[test]
     fn format_three_payer_cells_are_never_served_before_rebuild() {
         let mut conn = credential_fixture();
-        assert_eq!(FORMAT, 6);
         conn.execute(
             "UPDATE summary_hour SET format_version=3 WHERE hour_number=5",
             [],

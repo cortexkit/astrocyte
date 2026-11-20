@@ -147,7 +147,7 @@ pub(crate) enum EffectiveOutput {
 /// none is `metered_api`, and none has ever had a priced charge row. A basis
 /// correction to `metered_api` on one of them would make this ambiguity
 /// matter again and needs its own decision.
-const OUTPUT_EXCLUSIVE_BEFORE_FIX_PROVIDER: &str = "xai";
+pub(crate) const OUTPUT_EXCLUSIVE_BEFORE_FIX_PROVIDER: &str = "xai";
 
 /// The output quantity ledger pricing charges and the multiplier values for
 /// one event. Both must call this so neither counts a token the other does
@@ -1196,6 +1196,56 @@ fn resolve_catalog_snapshot(
     }
     resolved_currency(plan.currency.as_deref(), &measurements)?;
     Ok(ResolvedReprice::for_plan(plan, measurements))
+}
+
+pub(crate) fn unit_list_nanos(
+    snapshot: &CatalogSnapshot,
+    role: &str,
+    unit: &str,
+    (units, exponent): (i64, i32),
+    facts: Option<&crate::media::MediaFacts>,
+    recorded_mode: Option<&str>,
+) -> Result<i64, crate::valuation::UnvaluedReason> {
+    use crate::valuation::UnvaluedReason;
+    let mut selectors = facts
+        .map(|facts| facts.selectors.clone())
+        .unwrap_or_default();
+    let mode = selectors.remove("speed_mode");
+    let mode = mode.as_deref().or(recorded_mode);
+    if mode.is_some_and(|mode| {
+        selectors
+            .get("mode")
+            .is_some_and(|selector| selector == mode)
+    }) {
+        selectors.remove("mode");
+    }
+    let measurement = MeasurementPlan {
+        role: role.into(),
+        unit: unit.into(),
+        source: String::new(),
+        price_selectors: selectors,
+        quantity_units: Some(units),
+        quantity_exponent: Some(exponent),
+        current_head: None,
+    };
+    match resolve_measurement(snapshot, &measurement, role, mode, units, exponent) {
+        Ok(ChargeDecision::Priced {
+            amount,
+            charge_nanos,
+            ..
+        }) if amount.currency.as_str() == "USD" => Ok(charge_nanos),
+        Ok(ChargeDecision::Priced { .. }) => Err(UnvaluedReason::NonUsd),
+        Ok(ChargeDecision::Unpriced {
+            reason: UnpricedReason::RateWithheld | UnpricedReason::RateUncertain,
+            ..
+        }) => Err(UnvaluedReason::Refused),
+        Ok(ChargeDecision::Unpriced {
+            reason: UnpricedReason::ArithmeticOutOfRange,
+            ..
+        })
+        | Err(_) => Err(UnvaluedReason::ValuationError),
+        Ok(_) => Err(UnvaluedReason::NoRate),
+    }
 }
 
 fn resolve_measurement(

@@ -5,7 +5,7 @@ use crate::report::hourly::attribution::{
 };
 
 pub(crate) const CELLS_SQL:&str="SELECT currency,attribution,provider,model,plan_key,recorded,list_numerator,unvalued FROM attribution_valuation_cell WHERE kind=?1 AND hour_number=?2";
-pub(crate) const HOURS_SQL:&str="SELECT s.hour_number,s.revision,s.built_revision,s.format_version,EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=s.kind AND d.hour_number=s.hour_number),v.state='built' AND v.rate_generation=g.rate_generation AND v.rate_generation=r.generation AND v.config_generation=g.config_generation AND v.plan_generation=g.plan_generation AND NOT EXISTS(SELECT 1 FROM rate_dirty_hour d WHERE d.hour_number=s.hour_number),a.summary_revision=s.revision AND a.summary_attribution_revision=a.revision AND a.valuation_revision=v.revision AND a.valuation_attribution_revision=a.revision,s.events_total FROM summary_hour s LEFT JOIN valuation_hour v USING(kind,hour_number) LEFT JOIN attribution_hour a USING(kind,hour_number) CROSS JOIN valuation_state g CROSS JOIN rate_cache_state r WHERE s.kind=0 AND s.hour_number BETWEEN ?1 AND ?2 ORDER BY s.hour_number";
+pub(crate) const HOURS_SQL:&str="SELECT s.hour_number,s.revision,s.built_revision,s.format_version,EXISTS(SELECT 1 FROM summary_dirty_hour d WHERE d.kind=s.kind AND d.hour_number=s.hour_number),v.state='built' AND v.config_generation=g.config_generation AND NOT EXISTS(SELECT 1 FROM rate_dirty_hour d WHERE d.hour_number=s.hour_number),a.summary_revision=s.revision AND a.summary_attribution_revision=a.revision AND a.valuation_revision=v.revision AND a.valuation_attribution_revision=a.revision,s.events_total FROM summary_hour s LEFT JOIN valuation_hour v USING(kind,hour_number) LEFT JOIN attribution_hour a USING(kind,hour_number) CROSS JOIN valuation_state g WHERE s.kind=0 AND s.hour_number BETWEEN ?1 AND ?2 ORDER BY s.hour_number";
 
 struct Request<'a> {
     raw: &'a ReportRequest,
@@ -418,6 +418,8 @@ pub(crate) fn report(
         total.valuation.row =
             acc.value(&allocation, total.currency.as_deref(), total.total_nanos)?;
         if total.currency.as_deref() == Some("USD") {
+            total.valuation.row.deduced =
+                usd_total_deduced(&allocation, &output.totals, total.total_nanos)?;
             total.valuation.deduced_unspread_nanos = fee_totals.deduced_unspread_nanos;
             total.valuation.deduced_non_usd_plans = Some(fee_totals.deduced_non_usd_plans);
             total.valuation.deduced_conflict_plans = Some(fee_totals.deduced_conflict_plans);

@@ -182,3 +182,179 @@ BEGIN
           (SELECT s.cursor FROM cache_step_sequence s WHERE s.event_key = NEW.event_key));
 END;
 "#;
+
+pub(in crate::store) const V63: &str = r#"
+-- An hour's revision invalidates its payload. The plan generation fences builds
+-- in flight; it need not be copied to hours outside the changed interval.
+DROP TRIGGER valuation_account_insert;
+DROP TRIGGER valuation_credential_insert;
+DROP TRIGGER valuation_account_close;
+DROP TRIGGER valuation_credential_close;
+CREATE TRIGGER valuation_account_insert AFTER INSERT ON account_subscription BEGIN
+    UPDATE valuation_hour SET state='dirty',revision=revision+1 WHERE kind=0
+      AND hour_number BETWEEN NEW.effective_from_ms/3600000
+        AND COALESCE((NEW.effective_to_ms-1)/3600000,9223372036854775807);
+    UPDATE valuation_state SET plan_generation=plan_generation+1 WHERE id=1;
+END;
+CREATE TRIGGER valuation_credential_insert AFTER INSERT ON credential_subscription BEGIN
+    UPDATE valuation_hour SET state='dirty',revision=revision+1 WHERE kind=0
+      AND hour_number BETWEEN NEW.effective_from_ms/3600000
+        AND COALESCE((NEW.effective_to_ms-1)/3600000,9223372036854775807);
+    UPDATE valuation_state SET plan_generation=plan_generation+1 WHERE id=1;
+END;
+CREATE TRIGGER valuation_account_close AFTER UPDATE OF effective_to_ms ON account_subscription BEGIN
+    UPDATE valuation_hour SET state='dirty',revision=revision+1 WHERE kind=0
+      AND hour_number>=NEW.effective_to_ms/3600000;
+    UPDATE valuation_state SET plan_generation=plan_generation+1 WHERE id=1;
+END;
+CREATE TRIGGER valuation_credential_close AFTER UPDATE OF effective_to_ms ON credential_subscription BEGIN
+    UPDATE valuation_hour SET state='dirty',revision=revision+1 WHERE kind=0
+      AND hour_number>=NEW.effective_to_ms/3600000;
+    UPDATE valuation_state SET plan_generation=plan_generation+1 WHERE id=1;
+END;
+-- Start with attempt details, not ledger events. Publication of revised
+-- valuation rows also invalidates the matching attribution valuations.
+UPDATE valuation_hour SET state='dirty',revision=revision+1
+WHERE (kind,hour_number) IN (
+    SELECT DISTINCT e.occurred_at_ms IS NULL,
+        COALESCE(e.occurred_at_ms/3600000-(e.occurred_at_ms%3600000<0),0)
+FROM broca_attempt_detail b CROSS JOIN usage_event e ON e.event_key=b.event_key
+);
+
+-- Only these legacy output measurements change the summary quantities. Bump
+-- the summary revision to invalidate the same hour's valuation and attribution
+-- payloads through their existing triggers. Leave other format-6 hours current.
+CREATE TEMP TABLE legacy_output_hour(kind INTEGER,hour_number INTEGER,PRIMARY KEY(kind,hour_number)) WITHOUT ROWID;
+INSERT INTO legacy_output_hour
+SELECT DISTINCT e.occurred_at_ms IS NULL,
+    COALESCE(e.occurred_at_ms/3600000-(e.occurred_at_ms%3600000<0),0)
+FROM usage_event e INDEXED BY usage_event_multiplier_scope_time
+CROSS JOIN measurement o ON o.event_key=e.event_key AND o.role='output' AND o.unit='token'
+CROSS JOIN measurement r ON r.event_key=e.event_key AND r.role='reasoning' AND r.unit='token'
+WHERE e.producer='broca' AND e.provider IS NOT 'xai'
+    AND o.source='usage.output_tokens' AND o.quantity_exponent=0 AND o.quantity_units IS NOT NULL
+    AND r.quantity_exponent=0 AND r.quantity_units>0;
+INSERT INTO summary_hour(kind,hour_number,revision)
+SELECT kind,hour_number,1 FROM legacy_output_hour WHERE 1
+ON CONFLICT(kind,hour_number) DO UPDATE SET revision=revision+1;
+INSERT OR IGNORE INTO summary_dirty_hour(kind,hour_number)
+SELECT kind,hour_number FROM legacy_output_hour;
+DROP TABLE legacy_output_hour;
+
+-- Unit prices were not included in cached list value. Invalidate the two
+-- valuation projections for matching hours without rebuilding recorded spend
+-- or run summaries. Start with measurements and look up each event by key.
+UPDATE valuation_hour SET state='dirty',revision=revision+1
+WHERE state='built' AND (kind,hour_number) IN (
+    SELECT DISTINCT 0,e.occurred_at_ms/3600000-(e.occurred_at_ms%3600000<0)
+    FROM measurement m CROSS JOIN usage_event e ON e.event_key=m.event_key
+    WHERE m.unit IN ('second','character','image','request','result')
+        AND m.quantity_units>0 AND e.occurred_at_ms IS NOT NULL
+);
+
+-- Before failed refreshes retained the last good version, they could leave a
+-- built hour whose model (or alias target) no longer resolved in a live read.
+-- We cannot distinguish that NULL from an intentional reference reset, so
+-- invalidate built hours for those models and let the next fetch resolve them.
+WITH RECURSIVE unavailable(provider,model) AS (
+    SELECT provider,model FROM rate_model WHERE catalog_version IS NULL
+    UNION
+    SELECT m.provider,m.model FROM unavailable u
+    JOIN rate_model m ON m.reference_provider=u.provider AND m.reference_model=u.model
+)
+UPDATE valuation_hour SET state='dirty',revision=revision+1
+WHERE state='built' AND kind=0 AND hour_number IN (
+    SELECT DISTINCT c.hour_number FROM unavailable u
+    JOIN summary_value p ON p.value=u.provider
+    JOIN summary_value m ON m.value=u.model
+    JOIN summary_cell c ON c.provider=p.value_id AND c.model=m.value_id
+    WHERE c.kind=0
+);
+
+-- Use the same normalization for the reader, insert triggers and backfill.
+-- SQLite's date functions do not accept the entire RFC 3339 offset range.
+CREATE VIEW quota_reset_samples AS
+WITH raw(credential,provider,identity,pool_key,fetched_at_instant,reset) AS (
+    SELECT 0,provider,account_ref,pool_key,fetched_at_instant,resets_at FROM window_sample
+    UNION ALL
+    SELECT 1,provider,credential_ref,pool_key,fetched_at_instant,resets_at FROM credential_window_sample
+), parts AS (
+    SELECT *, CASE WHEN upper(substr(reset,-1))='Z' THEN 'Z' ELSE substr(reset,-6) END AS zone,
+        substr(reset,20,length(reset)-19-CASE WHEN upper(substr(reset,-1))='Z' THEN 1 ELSE 6 END) AS fraction,
+        substr(reset,18,2) AS second
+    FROM raw
+)
+SELECT credential,provider,identity,pool_key,fetched_at_instant,
+    CASE WHEN length(reset)>=20 AND substr(reset,1,19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt ][0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+          AND date(substr(reset,1,10),'+0 days')=substr(reset,1,10)
+          AND substr(reset,12,2)<='23' AND substr(reset,15,2)<='59' AND second<='60'
+          AND (zone='Z' OR (length(reset)>=25 AND zone GLOB '[+-][0-9][0-9]:[0-9][0-9]' AND substr(zone,2,2)<='23' AND substr(zone,5,2)<='59'))
+          AND (fraction='' OR (substr(fraction,1,1)='.' AND length(fraction)>1 AND substr(fraction,2) NOT GLOB '*[^0-9]*'))
+         THEN unixepoch(substr(reset,1,10)||'T'||substr(reset,12,6)||min(second,'59')||'Z')*1000
+            + CASE WHEN second='60' THEN 1000 ELSE 0 END
+            + CAST(substr(substr(fraction,2)||'000',1,3) AS INTEGER)
+            - CASE WHEN zone='Z' THEN 0 ELSE
+                (CASE WHEN substr(zone,1,1)='-' THEN -1 ELSE 1 END)
+                * (CAST(substr(zone,2,2) AS INTEGER)*60 + CAST(substr(zone,5,2) AS INTEGER))*60000 END
+    END AS reset_ms
+FROM parts;
+
+-- Rebuildable projection: delayed readings can lower the earliest fetched
+-- time of a known period. No other update or replacement is allowed.
+CREATE TABLE quota_reset_period (
+    credential INTEGER NOT NULL CHECK(credential IN (0,1)),
+    provider TEXT NOT NULL,
+    identity TEXT NOT NULL,
+    pool_key TEXT NOT NULL,
+    reset_ms INTEGER NOT NULL,
+    first_fetched INTEGER NOT NULL,
+    PRIMARY KEY(credential,provider,identity,pool_key,reset_ms)
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO quota_reset_period
+SELECT credential,provider,identity,pool_key,reset_ms,min(fetched_at_instant)
+FROM quota_reset_samples WHERE reset_ms IS NOT NULL
+GROUP BY credential,provider,identity,pool_key,reset_ms;
+
+CREATE TRIGGER quota_reset_period_no_delete BEFORE DELETE ON quota_reset_period
+BEGIN SELECT RAISE(ABORT,'quota_reset_period_no_delete'); END;
+CREATE TRIGGER quota_reset_period_guard_update BEFORE UPDATE ON quota_reset_period
+WHEN NEW.credential IS NOT OLD.credential OR NEW.provider IS NOT OLD.provider
+    OR NEW.identity IS NOT OLD.identity OR NEW.pool_key IS NOT OLD.pool_key
+    OR NEW.reset_ms IS NOT OLD.reset_ms OR NEW.first_fetched>OLD.first_fetched
+BEGIN SELECT RAISE(ABORT,'quota_reset_period_guard_update'); END;
+
+-- Insert through a view: update or insert explicitly, so a direct duplicate
+-- insert (including INSERT OR REPLACE) cannot evade the guard.
+CREATE TRIGGER quota_reset_period_insert_once BEFORE INSERT ON quota_reset_period
+WHEN EXISTS (SELECT 1 FROM quota_reset_period WHERE credential=NEW.credential
+    AND provider=NEW.provider AND identity=NEW.identity AND pool_key=NEW.pool_key AND reset_ms=NEW.reset_ms)
+BEGIN SELECT RAISE(ABORT,'quota_reset_period_insert_once'); END;
+
+CREATE TRIGGER window_sample_reset_period AFTER INSERT ON window_sample BEGIN
+    UPDATE quota_reset_period SET first_fetched=NEW.fetched_at_instant
+    WHERE credential=0 AND provider=NEW.provider AND identity=NEW.account_ref AND pool_key=NEW.pool_key
+      AND reset_ms=(SELECT reset_ms FROM quota_reset_samples WHERE credential=0 AND provider=NEW.provider
+        AND identity=NEW.account_ref AND pool_key=NEW.pool_key AND fetched_at_instant=NEW.fetched_at_instant)
+      AND first_fetched>NEW.fetched_at_instant;
+    INSERT INTO quota_reset_period
+    SELECT s.credential,s.provider,s.identity,s.pool_key,s.reset_ms,s.fetched_at_instant
+    FROM quota_reset_samples s WHERE s.credential=0 AND s.provider=NEW.provider AND s.identity=NEW.account_ref
+      AND s.pool_key=NEW.pool_key AND s.fetched_at_instant=NEW.fetched_at_instant AND s.reset_ms IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM quota_reset_period p WHERE p.credential=s.credential AND p.provider=s.provider
+        AND p.identity=s.identity AND p.pool_key=s.pool_key AND p.reset_ms=s.reset_ms);
+END;
+CREATE TRIGGER credential_window_sample_reset_period AFTER INSERT ON credential_window_sample BEGIN
+    UPDATE quota_reset_period SET first_fetched=NEW.fetched_at_instant
+    WHERE credential=1 AND provider=NEW.provider AND identity=NEW.credential_ref AND pool_key=NEW.pool_key
+      AND reset_ms=(SELECT reset_ms FROM quota_reset_samples WHERE credential=1 AND provider=NEW.provider
+        AND identity=NEW.credential_ref AND pool_key=NEW.pool_key AND fetched_at_instant=NEW.fetched_at_instant)
+      AND first_fetched>NEW.fetched_at_instant;
+    INSERT INTO quota_reset_period
+    SELECT s.credential,s.provider,s.identity,s.pool_key,s.reset_ms,s.fetched_at_instant
+    FROM quota_reset_samples s WHERE s.credential=1 AND s.provider=NEW.provider AND s.identity=NEW.credential_ref
+      AND s.pool_key=NEW.pool_key AND s.fetched_at_instant=NEW.fetched_at_instant AND s.reset_ms IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM quota_reset_period p WHERE p.credential=s.credential AND p.provider=s.provider
+        AND p.identity=s.identity AND p.pool_key=s.pool_key AND p.reset_ms=s.reset_ms);
+END;
+"#;

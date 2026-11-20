@@ -206,6 +206,10 @@ Tier changes bound vault-owned intervals and open successors at the change
 time. A hand-recorded plan is never closed or changed. Missing prices create
 no new ledger plan and remain visible, with raw provider/tier and account IDs,
 in `spend.subscription.report`; a later price is picked up by the hourly retry.
+If one plan cannot be changed, such as a backdated tier whose change time
+precedes the open plan, its ledger interval stays unchanged and other plans
+still reconcile. The report lists the refusal as `reconciliation_refusals`
+with `provider`, `identity`, `ledger` (`account` or `credential`) and `code`.
 That report also shows hand/vault differences, disagreements between vault
 records, ChatGPT credential/account mismatches and vault-read status. Existing
 coverage backfill covers waiting calls; the multiplier itself never changes

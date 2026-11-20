@@ -26,10 +26,9 @@ pub struct EventTokens {
     pub producer: String,
     pub provider: String,
     pub model: Option<String>,
-    /// The mode the request's record states it ran in, `None` when it states
-    /// none. The ledger stores no request mode yet, so events read from the
-    /// store carry `None`.
+    /// The mode recorded for this request, if known.
     pub mode: Option<String>,
+    pub broca_attempt: bool,
     pub roles: Vec<MeasuredRole>,
 }
 
@@ -115,7 +114,7 @@ pub struct Unvalued {
 }
 
 impl Unvalued {
-    fn count(
+    pub(crate) fn count(
         &mut self,
         unit: &str,
         quantity: i64,
@@ -361,7 +360,8 @@ pub fn value_event(
     // one call. Each role uses its own largest exceeded threshold.
     // The prompt is read from the event's measurements as stored, including
     // lifetime-split cache writes, using the ledger's prompt-size function.
-    let per_request = PER_REQUEST_PRODUCERS.contains(&event.producer.as_str());
+    let per_request =
+        event.broca_attempt || PER_REQUEST_PRODUCERS.contains(&event.producer.as_str());
     let prompt =
         prompt_size(event.roles.iter().map(|(role, unit, _, units, exponent)| {
             (role.as_str(), unit.as_str(), *units, *exponent)

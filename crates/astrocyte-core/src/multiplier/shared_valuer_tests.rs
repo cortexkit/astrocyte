@@ -4,6 +4,7 @@ fn shared_event(measurements: &[(&str, &str, i64)]) -> EventTokens {
         provider: "openai".into(),
         model: Some("m".into()),
         mode: None,
+        broca_attempt: false,
         roles: measurements
             .iter()
             .map(|(role, unit, quantity)| {

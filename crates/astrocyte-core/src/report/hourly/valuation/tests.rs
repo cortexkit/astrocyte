@@ -1,5 +1,6 @@
 use super::*;
 use crate::ingest;
+use crate::money::round_nano_num;
 use crate::multiplier::{QuotaProviderConfig, WindowSelector};
 use crate::rate_era::{fetched, publish};
 use crate::subscription::PlanLedger;
@@ -121,6 +122,255 @@ fn drain(conn: &mut Connection, config: &MultiplierConfig) -> Vec<i64> {
         }
     }
     hours
+}
+
+#[test]
+fn valuation_migration_requeues_existing_media_and_unavailable_rate_hours_only() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    crate::store::initialize_connection(&conn).unwrap();
+    let (migration, previous) = crate::store::MIGRATIONS.split_last().unwrap();
+    for step in previous {
+        conn.execute_batch(step.statements).unwrap();
+    }
+    let history = serde_json::from_value(json!({"source":"test","provider_id":"provider","model_id":"media","fact_prefix":"rate.","eras":[],"served_by_key":{
+        "rate.input_audio.per_second":[{"from_ms":0,"until_ms":null,"state":"value","value":{"state":"priced","units":7,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"},"per":1}}]
+    }})).unwrap();
+    publish(
+        &conn,
+        &fetched(history, "provider", "media", None).unwrap(),
+        1,
+    )
+    .unwrap();
+    let media = serde_json::from_value(json!({"producer":"colliculus","producer_ref":"media","provider":"provider","model":"media","occurred_at_ms":1,"charge_basis":"metered_api","measurements":[
+        {"role":"input_audio","unit":"second","kind":"billed","source":"fixture","quantity_units":2,"quantity_exponent":0}
+    ]})).unwrap();
+    ingest::record_event(&mut conn, &media, 1).unwrap();
+    for (hour, model) in [(1, "ordinary"), (2, "failed"), (3, "alias")] {
+        rate(&conn, model, 1_000_000_000);
+        event(
+            &mut conn,
+            model,
+            hour * HOUR_MS,
+            model,
+            None,
+            None,
+            "unknown",
+            100,
+        );
+    }
+    conn.execute("UPDATE rate_model SET reference_provider='provider',reference_model='failed' WHERE model='alias'", []).unwrap();
+    summaries(&mut conn);
+    assert_eq!(drain(&mut conn, &config()), [0, 1, 2, 3]);
+
+    // Simulate a cached media hour with no list value and a rate model whose
+    // failed refresh cleared its catalog version.
+    conn.execute(
+        "UPDATE valuation_cell SET list_numerator='0' WHERE hour_number=0",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE rate_model SET catalog_version=NULL WHERE model='failed'",
+        [],
+    )
+    .unwrap();
+    let original = stored_cells(&conn, 1);
+    conn.execute_batch(migration.statements).unwrap();
+    let hours = |sql| {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert!(hours("SELECT hour_number FROM summary_dirty_hour").is_empty());
+    assert_eq!(
+        hours("SELECT hour_number FROM valuation_hour WHERE state='dirty' ORDER BY hour_number"),
+        [0, 2, 3]
+    );
+    assert_eq!(hours("SELECT hour_number FROM attribution_hour WHERE valuation_revision IS NULL ORDER BY hour_number"),[0,2,3]);
+    assert_eq!(drain(&mut conn, &config()), [0, 2, 3]);
+    assert_eq!(stored_cells(&conn, 1), original);
+    assert_eq!(
+        stored_cells(&conn, 0)
+            .values()
+            .map(|cell| cell.numerator)
+            .sum::<i128>(),
+        14_000_000
+    );
+    assert_eq!(state(&conn, 2), "not_yet_valued");
+    assert_eq!(state(&conn, 3), "not_yet_valued");
+}
+
+#[test]
+fn ledger_regression_media_list_value_uses_unit_pricing_and_dated_rates() {
+    let mut conn = conn();
+    let rate = |units| json!({"state":"priced","units":units,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"},"per":2,"increment":{"kind":"quantum","quantity":2},"minimum_quantity":{"kind":"minimum","quantity":3}});
+    let history = serde_json::from_value(json!({"source":"test","provider_id":"provider","model_id":"media","fact_prefix":"rate.","eras":[],"served_by_key":{
+        "rate.input_audio.per_second":[{"from_ms":0,"until_ms":2,"state":"value","value":rate(7)}, {"from_ms":2,"until_ms":null,"state":"value","value":rate(11)}]
+    }})).unwrap();
+    publish(
+        &conn,
+        &fetched(history, "provider", "media", None).unwrap(),
+        1,
+    )
+    .unwrap();
+    for at in [1, 2] {
+        let event = serde_json::from_value(json!({"producer":"colliculus","producer_ref":format!("media-{at}"),"provider":"provider","model":"media","occurred_at_ms":at,"charge_basis":"metered_api","measurements":[
+            {"role":"input_audio","unit":"second","kind":"billed","source":"fixture","quantity_units":9,"quantity_exponent":-1}
+        ]})).unwrap();
+        ingest::record_event(&mut conn, &event, 1).unwrap();
+    }
+    let request = ReportRequest {
+        from_ms: Some(0),
+        to_ms: Some(fees::DAY_MS),
+        grain: "day".into(),
+        timezone: "UTC".into(),
+        ..ReportRequest::default()
+    };
+    let list = |conn: &Connection| {
+        spend_report(conn, &request, 2 * fees::DAY_MS)
+            .unwrap()
+            .rows
+            .remove(0)
+            .valuation
+            .list_value
+    };
+    for built in [false, true] {
+        if built {
+            summaries(&mut conn);
+            drain(&mut conn, &config());
+        }
+        let value = list(&conn);
+        // 0.9 seconds rounds up to 2 and then to the minimum of 3.
+        // The two charges round 10.5 and 16.5 to 10 and 16 respectively.
+        assert_eq!(value.nanos, 26);
+        assert_eq!(value.unvalued.measurements, 0);
+    }
+}
+
+#[test]
+fn broca_attempt_migration_dirties_only_its_valuation_and_attribution_hours() {
+    let conn = Connection::open_in_memory().unwrap();
+    crate::store::initialize_connection(&conn).unwrap();
+    let (last, previous) = crate::store::MIGRATIONS.split_last().unwrap();
+    for migration in previous {
+        conn.execute_batch(migration.statements).unwrap();
+    }
+    conn.execute_batch(&format!("INSERT INTO usage_event(event_id,producer,producer_ref,occurred_at_ms,recorded_at_ms,charge_basis,pricing_generation)
+        VALUES ('legacy','broca','legacy',0,1,'unknown',0),('attempt','broca','attempt',{HOUR_MS},1,'unknown',0);
+        INSERT INTO broca_attempt_detail(event_key,fact_id,share_index,attempt_id,step_id,attempt,outcome,content_received,response_bytes,recorded_at_ms,requested_service_tier)
+        SELECT event_key,'fact',0,'attempt',1,0,'complete',1,1,1,'standard' FROM usage_event WHERE event_id='attempt';
+        UPDATE summary_hour SET built_revision=revision,format_version={FORMAT};
+        DELETE FROM summary_dirty_hour;
+        UPDATE valuation_hour SET state='built';
+        UPDATE attribution_hour SET valuation_revision=1;")).unwrap();
+    conn.execute_batch(last.statements).unwrap();
+    let hours = conn.prepare("SELECT v.hour_number,v.state,a.valuation_revision,s.built_revision=s.revision FROM valuation_hour v JOIN attribution_hour a USING(kind,hour_number) JOIN summary_hour s USING(kind,hour_number) ORDER BY v.hour_number").unwrap()
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?,r.get::<_, String>(1)?,r.get::<_, Option<i64>>(2)?,r.get::<_, bool>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(
+        hours,
+        [
+            (0, "built".into(), Some(1), true),
+            (1, "dirty".into(), None, true)
+        ]
+    );
+}
+
+#[test]
+fn ledger_regression_broca_attempt_values_fast_mode_and_own_prompt_tier() {
+    let mut conn = conn();
+    let segment = |units: i64| json!([{"from_ms":0,"until_ms":null,"state":"value","value":{"state":"priced","units":units,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}}}]);
+    for (model, rates) in [
+        (
+            "fast-rate",
+            json!({"rate.input":segment(1_000_000_000),"rate.input.mode.fast":segment(4_000_000_000)}),
+        ),
+        ("missing-fast", json!({"rate.input":segment(1_000_000_000)})),
+        (
+            "tier",
+            json!({"rate.input":segment(1_000_000_000),"rate.input.above_context.100":segment(5_000_000_000)}),
+        ),
+    ] {
+        let history = serde_json::from_value(json!({"source":"test","provider_id":"provider","model_id":model,"fact_prefix":"rate.","eras":[],"served_by_key":rates})).unwrap();
+        publish(
+            &conn,
+            &fetched(history, "provider", model, None).unwrap(),
+            1,
+        )
+        .unwrap();
+        let (quantity, mode) = if model == "tier" {
+            (101, "standard")
+        } else {
+            (1_000, "fast")
+        };
+        let request = serde_json::from_value(json!({"producer":"broca","producer_ref":model,"provider":"provider","model":model,"occurred_at_ms":1,"charge_basis":"metered_api","measurements":[{"role":"input","unit":"token","kind":"billed","source":"fixture","quantity_units":quantity,"quantity_exponent":0}]})).unwrap();
+        let outcome = ingest::record_event(&mut conn, &request, 1).unwrap();
+        conn.execute("INSERT INTO broca_attempt_detail(event_key,fact_id,share_index,attempt_id,step_id,attempt,outcome,content_received,response_bytes,recorded_at_ms,requested_service_tier,mode) VALUES((SELECT event_key FROM usage_event WHERE event_id=?1),?2,0,?2,1,0,'complete',1,1,1,'standard',?3)",params![outcome.event_id,model,mode]).unwrap();
+    }
+    let mut cells = Cells::new();
+    assert!(
+        reduce(&conn, "occurred_at_ms=1", &config(), &[], &mut cells)
+            .unwrap()
+            .1
+    );
+    let value = |model: &str| {
+        cells
+            .iter()
+            .find(|((key, _), _)| key.0[Grouping::Model as usize].as_deref() == Some(model))
+            .unwrap()
+            .1
+    };
+    assert_eq!(
+        round_nano_num(value("fast-rate").numerator).unwrap(),
+        4_000_000
+    );
+    assert_eq!(round_nano_num(value("tier").numerator).unwrap(), 505_000);
+    assert_eq!(value("tier").recorded.base_rate_tier_untested_tokens, 0);
+    assert_eq!(value("missing-fast").numerator, 0);
+    assert_eq!(value("missing-fast").unvalued.measurements, 1);
+}
+
+#[test]
+fn ledger_regression_failed_rate_reload_keeps_clean_and_dirty_list_value_equal() {
+    let mut conn = conn();
+    rate(&conn, "A", 1_000_000_000);
+    event(&mut conn, "original", 1, "A", None, None, "unknown", 100);
+    summaries(&mut conn);
+    drain(&mut conn, &config());
+    let list_value = |conn: &Connection| {
+        let request = ReportRequest {
+            from_ms: Some(0),
+            to_ms: Some(fees::DAY_MS),
+            grain: "day".into(),
+            timezone: "UTC".into(),
+            ..ReportRequest::default()
+        };
+        spend_report(conn, &request, 2 * fees::DAY_MS)
+            .unwrap()
+            .rows
+            .remove(0)
+            .valuation
+            .list_value
+    };
+    let before = list_value(&conn);
+    assert_eq!(before.nanos, 200_000);
+    crate::rate_era::prepare(&conn, 2, &config().api_twins).unwrap();
+    crate::rate_era::record_failure(
+        &conn,
+        "provider",
+        "A",
+        &crate::multiplier::MultiplierError::RateFactUnrecognized("unknown rate key".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::rate_era::pending(&conn, 1).unwrap(),
+        vec![("provider".into(), "A".into())]
+    );
+    assert_eq!(list_value(&conn), before);
+    event(&mut conn, "zero", 2, "A", None, None, "unknown", 0);
+    assert_eq!(list_value(&conn), before);
 }
 
 fn summaries(conn: &mut Connection) {
@@ -510,7 +760,7 @@ fn valuation_unfetched_models_wait_and_plan_intervals_dirty() {
 }
 
 #[test]
-fn valuation_selective_generations_fast_forward_only_unaffected_current_hours() {
+fn valuation_selective_invalidation_keeps_unaffected_hours_current_without_retagging() {
     let mut conn = conn();
     let config = config();
     for (hour, model) in [(0, "A"), (1, "B"), (2, "B"), (3, "B"), (4, "B")] {
@@ -589,8 +839,13 @@ fn valuation_selective_generations_fast_forward_only_unaffected_current_hours() 
         )
         .unwrap();
         assert_eq!(stored_cells(&conn, hour), full, "hour {hour}");
-        let current: bool = conn.query_row("SELECT h.state='built' AND h.rate_generation=s.rate_generation AND h.config_generation=s.config_generation AND h.plan_generation=s.plan_generation FROM valuation_hour h CROSS JOIN valuation_state s WHERE h.kind=0 AND h.hour_number=?1",[hour],|r|r.get(0)).unwrap();
-        assert!(current, "all three generations must match");
+        let (current, retagged): (bool, bool) = conn.query_row("SELECT h.state='built' AND h.config_generation=s.config_generation,h.rate_generation=s.rate_generation AND h.plan_generation=s.plan_generation FROM valuation_hour h CROSS JOIN valuation_state s WHERE h.kind=0 AND h.hour_number=?1",[hour],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert!(current, "hour {hour} must be current");
+        assert_eq!(
+            retagged,
+            rebuilt.contains(&hour),
+            "only rebuilt hours receive current generation stamps"
+        );
     }
     assert_eq!(stored_cells(&conn, 1), before[1]);
     assert_eq!(stored_cells(&conn, 3), before[3]);
@@ -619,6 +874,7 @@ fn valuation_pool_membership_matches_coverage_and_handles_unique_ambiguous_unmap
         provider: "provider".into(),
         model: Some("A".into()),
         mode: None,
+        broca_attempt: false,
         roles: Vec::new(),
     };
     let member = |config: &MultiplierConfig, account, credential, basis| {

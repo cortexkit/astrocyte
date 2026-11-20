@@ -18,6 +18,15 @@ pub struct Diagnostics {
     pub hand_vault_differences: Vec<HandDifference>,
     pub chatgpt_account_mismatches: Vec<AccountMismatch>,
     pub vault_record_differences: Vec<RecordDifference>,
+    pub reconciliation_refusals: Vec<ReconciliationRefusal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReconciliationRefusal {
+    pub provider: String,
+    pub identity: String,
+    pub ledger: &'static str,
+    pub code: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -375,6 +384,26 @@ enum LedgerChange {
     Set(PlanLedger, SetSubscriptionRequest),
 }
 
+impl LedgerChange {
+    fn key(&self) -> (PlanLedger, &str, &str) {
+        match self {
+            Self::Close(ledger, request) => (*ledger, &request.provider, &request.account_ref),
+            Self::Set(ledger, request) => (*ledger, &request.provider, &request.account_ref),
+        }
+    }
+
+    fn apply(&self, tx: &Transaction<'_>) -> Result<(), subscription::SubscriptionError> {
+        match self {
+            Self::Close(ledger, request) => {
+                subscription::close_plan_in_tx(tx, *ledger, request).map(|_| ())
+            }
+            Self::Set(ledger, request) => {
+                subscription::set_plan_in_tx(tx, *ledger, request, Some(VAULT_OPERATOR)).map(|_| ())
+            }
+        }
+    }
+}
+
 impl Reconciliation {
     pub fn has_changes(&self) -> bool {
         !self.changes.is_empty()
@@ -382,18 +411,36 @@ impl Reconciliation {
 
     /// Apply actions prepared in this write transaction, so intervening
     /// hand-recorded plans cannot be overwritten by an earlier preview.
-    pub fn apply_in_tx(self, tx: &Transaction<'_>) -> Result<Diagnostics, String> {
-        for change in self.changes {
-            match change {
-                LedgerChange::Close(ledger, request) => {
-                    subscription::close_plan_in_tx(tx, ledger, &request)
-                        .map_err(|error| error.message())?;
+    pub fn apply_in_tx(mut self, tx: &Transaction<'_>) -> Result<Diagnostics, String> {
+        // A successor's close and set are one plan change. If either is
+        // refused, preserve the old interval and keep reconciling other keys.
+        for changes in self.changes.chunk_by(|a, b| a.key() == b.key()) {
+            let (ledger, provider, identity) = changes[0].key();
+            tx.execute_batch("SAVEPOINT vault_plan_change")
+                .map_err(|error| error.to_string())?;
+            match changes.iter().try_for_each(|change| change.apply(tx)) {
+                Ok(()) => tx
+                    .execute_batch("RELEASE vault_plan_change")
+                    .map_err(|error| error.to_string())?,
+                Err(error) => {
+                    tx.execute_batch("ROLLBACK TO vault_plan_change; RELEASE vault_plan_change")
+                        .map_err(|error| error.to_string())?;
+                    if error.code() == "internal" {
+                        return Err(error.message());
+                    }
+                    self.diagnostics
+                        .reconciliation_refusals
+                        .push(ReconciliationRefusal {
+                            provider: provider.into(),
+                            identity: identity.into(),
+                            ledger: match ledger {
+                                PlanLedger::Account => "account",
+                                PlanLedger::Credential => "credential",
+                            },
+                            code: error.code(),
+                        });
                 }
-                LedgerChange::Set(ledger, request) => {
-                    subscription::set_plan_in_tx(tx, ledger, &request, Some(VAULT_OPERATOR))
-                        .map_err(|error| error.message())?;
-                }
-            };
+            }
         }
         Ok(self.diagnostics)
     }
@@ -621,6 +668,66 @@ pub fn at(conn: &Connection, end_ms: i64) -> rusqlite::Result<Vec<VaultPlan>> {
 mod tests {
     use super::*;
     use crate::multiplier::vm_steps;
+
+    #[test]
+    fn ledger_regression_vault_refusal_does_not_roll_back_other_accounts() {
+        for refused_first in [true, false] {
+            let mut conn = crate::test_support::conn();
+            conn.execute_batch("INSERT INTO account_subscription(account_ref,provider,plan_name,recurring_cost_minor,currency,amount_exponent,period,effective_from_ms,operator) VALUES('A','openai','old',2000,'USD',2,'month',2000,'vault');").unwrap();
+            let refused = LedgerChange::Close(
+                PlanLedger::Account,
+                CloseSubscriptionRequest {
+                    provider: "openai".into(),
+                    account_ref: "A".into(),
+                    effective_to: 1_500,
+                },
+            );
+            let allowed = LedgerChange::Set(
+                PlanLedger::Account,
+                SetSubscriptionRequest {
+                    provider: "openai".into(),
+                    account_ref: "B".into(),
+                    plan_name: "plus".into(),
+                    recurring_cost_minor: 2000,
+                    currency: "USD".into(),
+                    amount_exponent: 2,
+                    period: SubscriptionPeriod::Month,
+                    effective_from: 3000,
+                },
+            );
+            let changes = if refused_first {
+                vec![refused, allowed]
+            } else {
+                vec![allowed, refused]
+            };
+            let tx = conn.transaction().unwrap();
+            let diagnostics = Reconciliation {
+                diagnostics: Diagnostics::default(),
+                changes,
+            }
+            .apply_in_tx(&tx)
+            .unwrap();
+            assert_eq!(
+                diagnostics.reconciliation_refusals,
+                [ReconciliationRefusal {
+                    provider: "openai".into(),
+                    identity: "A".into(),
+                    ledger: "account",
+                    code: "close_before_effective_from",
+                }]
+            );
+            tx.commit().unwrap();
+            let rows: Vec<(String, String, Option<i64>)> = conn.prepare("SELECT account_ref,plan_name,effective_to_ms FROM account_subscription ORDER BY account_ref").unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert_eq!(
+                rows,
+                [
+                    ("A".into(), "old".into(), None),
+                    ("B".into(), "plus".into(), None)
+                ]
+            );
+        }
+    }
 
     fn history_row(
         conn: &Connection,

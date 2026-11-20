@@ -174,7 +174,8 @@ pub(crate) fn reduce(
 }
 
 fn measurement_sql(filter: &str) -> String {
-    format!("SELECT m.event_key,m.role,m.unit,m.source,m.quantity_units,m.quantity_exponent,h.outcome FROM measurement m LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit AND NOT EXISTS(SELECT 1 FROM priced_charge s WHERE s.supersedes=h.charge_key) WHERE m.event_key IN (SELECT event_key FROM usage_event WHERE {filter}) ORDER BY m.event_key,m.role,m.unit")
+    let quantity = reported_quantity_sql();
+    format!("SELECT m.event_key,m.role,m.unit,m.source,m.quantity_units,m.quantity_exponent,h.outcome,{quantity} FROM measurement m LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit AND NOT EXISTS(SELECT 1 FROM priced_charge s WHERE s.supersedes=h.charge_key) WHERE m.event_key IN (SELECT event_key FROM usage_event WHERE {filter}) ORDER BY m.event_key,m.role,m.unit")
 }
 
 fn reduce_with_book(
@@ -210,7 +211,8 @@ fn reduce_both(
     // Bulk reads stay scoped by the chunk's time/key bounds. In particular, do
     // not pass per-member event-key lists through the runs reducer: its forced
     // time index would scan unrelated history and valuation needs no runs data.
-    let mut measurements: BTreeMap<i64, Vec<(MeasuredRole, bool)>> = BTreeMap::new();
+    type ReportedMeasurement = (MeasuredRole, bool, Option<i64>);
+    let mut measurements: BTreeMap<i64, Vec<ReportedMeasurement>> = BTreeMap::new();
     let mut stmt = conn.prepare(&measurement_sql(filter))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -223,13 +225,22 @@ fn reduce_both(
                 row.get(5)?,
             ),
             row.get::<_, Option<String>>(6)?.as_deref() == Some("covered"),
+            row.get(7)?,
         ));
     }
     let mut payers = BTreeMap::new();
-    let mut stmt = conn.prepare(&format!("SELECT event_key,COALESCE(resolved_credential,auth_selection) FROM usage_event WHERE {filter}"))?;
+    let mut stmt = conn.prepare(&format!("SELECT e.event_key,COALESCE(e.resolved_credential,e.auth_selection),b.event_key IS NOT NULL,b.mode,e.media_facts FROM usage_event e LEFT JOIN broca_attempt_detail b ON b.event_key=e.event_key WHERE e.event_key IN (SELECT event_key FROM usage_event WHERE {filter})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
-        payers.insert(row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?);
+        payers.insert(
+            row.get::<_, i64>(0)?,
+            (
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                crate::media::read_facts(row, 4)?,
+            ),
+        );
     }
     let mut timelines = BTreeMap::new();
     for event in &ledger.events {
@@ -258,6 +269,7 @@ fn reduce_both(
             attribution::Attribution::default()
         };
         let measured = measurements.remove(&event.key).unwrap_or_default();
+        let (payer, broca_attempt, mode, media) = payers.remove(&event.key).unwrap_or_default();
         let tokens = EventTokens {
             producer: key.0[Grouping::Producer as usize]
                 .clone()
@@ -266,8 +278,15 @@ fn reduce_both(
                 .clone()
                 .unwrap_or_default(),
             model: key.0[Grouping::Model as usize].clone(),
-            mode: None,
-            roles: measured.iter().map(|(role, _)| role.clone()).collect(),
+            mode,
+            broca_attempt,
+            roles: measured
+                .iter()
+                .filter(|((_, unit, _, _, _), _, _)| {
+                    !crate::catalog_client::RATE_UNITS.contains(&unit.as_str())
+                })
+                .map(|(role, _, _)| role.clone())
+                .collect(),
         };
         let member = plan_member(
             book,
@@ -277,36 +296,79 @@ fn reduce_both(
                 .as_deref()
                 .unwrap_or_default(),
             key.0[Grouping::Account as usize].as_deref(),
-            payers.get(&event.key).and_then(Option::as_deref),
+            payer.as_deref(),
             event.occurred_at_ms,
         )?;
         let data = members.entry((member.clone(), tuple.clone())).or_default();
         data.observe_event(&ledger, event)?;
-        for ((role, unit, _, units, exponent), covered) in measured {
+        for ((role, unit, _, _, exponent), covered, units) in &measured {
             data.observe_quantity(
                 &key,
                 event.occurred_at_ms.is_some() && event.is_fully_priced(),
-                (unit, role, units, exponent),
-                covered,
+                (
+                    unit.clone(),
+                    role.clone(),
+                    *units,
+                    exponent.filter(|_| units.is_some()),
+                ),
+                *covered,
             )?;
         }
         event_members.insert(event.key, (key.clone(), member.clone(), tuple.clone()));
-        let resolution = match (&tokens.model, event.occurred_at_ms) {
-            (Some(model), Some(at)) => {
-                match timelines.get(&(tokens.provider.clone(), model.clone())) {
-                    Some(Ok(Some(timeline))) => Some(timeline.at(at)),
-                    Some(Err(_)) => Some(&valuation_error),
-                    _ => None,
-                }
+        let timeline = tokens
+            .model
+            .as_ref()
+            .and_then(|model| timelines.get(&(tokens.provider.clone(), model.clone())));
+        let (resolution, unit_rates) = match (timeline, event.occurred_at_ms) {
+            (Some(Ok(Some(timeline))), Some(at)) => {
+                (Some(timeline.at(at)), Some(timeline.unit_rates_at(at)))
             }
-            _ => None,
+            (Some(Err(_)), Some(_)) => (Some(&valuation_error), None),
+            _ => (None, None),
         };
         if tokens.model.is_some() && (resolution.is_none() || event.occurred_at_ms.is_none()) {
             fetched = false;
             continue;
         }
-        let value =
+        let mut value =
             list_value_event(&rules, resolution, &tokens).map_err(|_| ReportError::Arithmetic)?;
+        for ((role, unit, _, raw_units, raw_exponent), _, _) in measured {
+            let Some((units, exponent)) =
+                raw_units.zip(raw_exponent).filter(|(units, _)| *units > 0)
+            else {
+                continue;
+            };
+            if !crate::catalog_client::RATE_UNITS.contains(&unit.as_str()) {
+                continue;
+            }
+            use crate::valuation::UnvaluedReason;
+            let result = unit_rates
+                .ok_or(if tokens.model.is_none() {
+                    UnvaluedReason::MissingModel
+                } else {
+                    UnvaluedReason::ValuationError
+                })
+                .and_then(|rates| {
+                    crate::pricing::unit_list_nanos(
+                        rates,
+                        &role,
+                        &unit,
+                        (units, exponent),
+                        media.as_ref(),
+                        tokens.mode.as_deref(),
+                    )
+                });
+            match result {
+                Ok(nanos) => sum(
+                    &mut value.numerator,
+                    i128::from(nanos) * crate::money::NUMERATOR_SCALE,
+                )?,
+                Err(reason) => value
+                    .unvalued
+                    .count(&unit, units, reason)
+                    .map_err(|_| ReportError::Arithmetic)?,
+            }
+        }
         let apply = |cell: &mut ValuedCell| -> Result<(), ReportError> {
             cell.recorded.base_rate_tier_untested_tokens = checked_add(
                 cell.recorded.base_rate_tier_untested_tokens,
@@ -529,11 +591,9 @@ impl ValuationMaintenance {
             |r| r.get(0),
         )?;
         if rate != old.rate {
-            // An unfetched hour may have been reduced before its first summary
-            // publication, so it cannot yet appear in the model-to-summary lookup.
-            tx.execute("UPDATE valuation_hour SET state='dirty',revision=revision+1 WHERE state='not_yet_valued'",[])?;
+            // Publishing even an unfetched hour requires a current summary.
+            // Rate invalidation finds those hours by model in summary_cell.
             tx.execute("UPDATE valuation_hour SET state='dirty',revision=revision+1 WHERE kind=0 AND hour_number IN (SELECT hour_number FROM rate_dirty_hour)",[])?;
-            tx.execute("UPDATE valuation_hour SET rate_generation=?1 WHERE state='built' AND rate_generation=?2 AND config_generation=?3 AND plan_generation=?4",params![rate,old.rate,old.config,old.plan])?;
             tx.execute(
                 "UPDATE valuation_state SET rate_generation=?1 WHERE id=1",
                 [rate],

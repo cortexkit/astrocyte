@@ -65,6 +65,7 @@ copies that timeout without running the table-creating probes.
 | `window_sample` | Each row preserves a capacity-window observation and its breakdown in the append-only history. | insert |
 | `multiplier_observation` | Each row records a daily subscription multiplier observation or an operator recompute that supersedes an earlier observation. | insert only |
 | `credential_window_sample` | Source-instant quota history for readings without an account, identified by provider, vault credential and pool. | insert only |
+| `quota_reset_period` | Rebuildable quota history index: for each provider, account or credential, and pool, stores each reset as a UTC epoch millisecond and the earliest reading that reported it. | insert or lower earliest instant |
 | `attribution_fact` | Each row preserves one publisher's verbatim fact and indexed subject, parent, workload, task and project evidence. | insert only; corrections append with `supersedes` |
 | `placement_fact` | Each row preserves entorhinal's dated project-to-workspace placement and verbatim fact. | insert only; corrections append with `supersedes` |
 | `attribution_cursor` | Each row checkpoints one publisher's read name, opaque cursor, through position and last committed read time. | upsert with a changed committed page |

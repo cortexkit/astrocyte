@@ -250,17 +250,10 @@ fn first_sample_sql(credential: bool) -> String {
     )
 }
 
-/// A recorded reset time (RFC 3339 text) in epoch milliseconds; unreadable
-/// text counts as unknown, as in the multiplier.
-fn reset_ms(text: Option<String>) -> Option<i64> {
-    text.and_then(|text| chrono::DateTime::parse_from_rfc3339(&text).ok())
-        .map(|at| at.timestamp_millis())
-}
-
 fn predecessor_sql(credential: bool) -> String {
     let (table, field) = sample_table(credential);
     format!(
-        "SELECT COALESCE(raw_used_percent,used_percent),resets_at FROM {table}
+        "SELECT COALESCE(raw_used_percent,used_percent) FROM {table}
              WHERE provider=?1 AND {field}=?2 AND pool_key=?3 AND fetched_at_instant<?4
              ORDER BY fetched_at_instant DESC LIMIT 1"
     )
@@ -268,12 +261,58 @@ fn predecessor_sql(credential: bool) -> String {
 
 fn samples_sql(credential: bool) -> String {
     let (table, field) = sample_table(credential);
+    let reset = reset_lookup_sql(credential);
     format!(
-        "SELECT fetched_at_instant,COALESCE(raw_used_percent,used_percent),window_minutes,resets_at
-             FROM {table} WHERE provider=?1 AND {field}=?2 AND pool_key=?3
-             AND fetched_at_instant>=?4 AND fetched_at_instant<=?5
-             ORDER BY fetched_at_instant"
+        "SELECT fetched_at_instant,COALESCE(raw_used_percent,used_percent),window_minutes,{reset}
+         FROM {table} s WHERE provider=?1 AND {field}=?2 AND pool_key=?3
+         AND fetched_at_instant BETWEEN ?4 AND ?5 ORDER BY fetched_at_instant"
     )
+}
+
+fn reset_lookup_sql(credential: bool) -> String {
+    let (_, field) = sample_table(credential);
+    format!(
+        "(SELECT r.reset_ms FROM quota_reset_samples r WHERE r.credential={}
+        AND r.provider=s.provider AND r.identity=s.{field} AND r.pool_key=s.pool_key
+        AND r.fetched_at_instant=s.fetched_at_instant)",
+        i64::from(credential)
+    )
+}
+
+fn previous_accepted(
+    conn: &Connection,
+    credential: bool,
+    key: (&str, &str, &str),
+    start: i64,
+    period: Option<(i64, i64)>,
+) -> rusqlite::Result<Option<f64>> {
+    let (provider, identity, pool) = key;
+    let Some((horizon, first)) = period else {
+        return conn
+            .prepare_cached(&predecessor_sql(credential))?
+            .query_row(params![provider, identity, pool, start], |row| row.get(0))
+            .optional();
+    };
+    // Seek on the raw time index first. Ordering the UNION view itself would
+    // sort every sample of the period before returning the first predecessor.
+    let (table, field) = sample_table(credential);
+    let reset = reset_lookup_sql(credential);
+    let mut statement = conn.prepare_cached(&format!(
+        "SELECT COALESCE(raw_used_percent,used_percent),window_minutes,{reset} FROM {table} s
+         WHERE provider=?1 AND {field}=?2 AND pool_key=?3
+           AND fetched_at_instant<?4 AND fetched_at_instant>=?5 ORDER BY fetched_at_instant DESC"
+    ))?;
+    let mut rows = statement.query(params![provider, identity, pool, start, first])?;
+    while let Some(row) = rows.next()? {
+        let minutes: Option<i64> = row.get(1)?;
+        let reset: Option<i64> = row.get(2)?;
+        if reset.is_none_or(|reset| {
+            horizon.saturating_sub(reset) <= minutes.map_or(RESET_TOLERANCE_MS, reset_tolerance_ms)
+        }) {
+            return row.get(0).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 fn read_window(
@@ -285,15 +324,21 @@ fn read_window(
     (start, end): (i64, i64),
     grain_ms: i64,
 ) -> rusqlite::Result<Window> {
-    let predecessor: Option<(f64, Option<String>)> = conn
-        .prepare_cached(&predecessor_sql(credential))?
-        .query_row(params![provider, identity, pool, start], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
+    let period = conn
+        .prepare_cached(
+            "SELECT reset_ms,first_fetched FROM quota_reset_period
+        WHERE credential=?1 AND provider=?2 AND identity=?3 AND pool_key=?4 AND first_fetched<?5
+        ORDER BY reset_ms DESC LIMIT 1",
+        )?
+        .query_row(
+            params![i64::from(credential), provider, identity, pool, start],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .optional()?;
-    let mut previous = predecessor.as_ref().map(|(used, _)| *used);
+    let mut previous =
+        previous_accepted(conn, credential, (provider, identity, pool), start, period)?;
     // The latest reset time seen so far: the current allowance period's end.
-    let mut horizon = predecessor.and_then(|(_, reset)| reset_ms(reset));
+    let mut horizon = period.map(|(reset, _)| reset);
     let mut statement = conn.prepare_cached(&samples_sql(credential))?;
     let mut rows = statement.query(params![provider, identity, pool, start, end])?;
     let mut window = Window {
@@ -311,7 +356,7 @@ fn read_window(
         let at_ms = at_ns.div_euclid(NANOS_PER_MS);
         let start_ms = at_ms.div_euclid(grain_ms) * grain_ms;
         let minutes: Option<i64> = row.get(2)?;
-        let reset = reset_ms(row.get(3)?);
+        let reset = row.get(3)?;
         let tolerance = minutes.map_or(RESET_TOLERANCE_MS, reset_tolerance_ms);
         // A reading whose reset time is older than the current period's is a
         // provider's cached answer from the previous allowance. The subscription
@@ -444,6 +489,169 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn ledger_regression_quota_predecessor_does_not_restore_a_stale_period() {
+        for credential in [false, true] {
+            let conn = conn();
+            for (at, used, reset) in [
+                (0, 91.0, PERIOD_ONE),
+                (HOUR_MS / 2, 4.0, PERIOD_TWO),
+                (HOUR_MS - 1, 91.0, PERIOD_ONE),
+                (HOUR_MS, 92.0, PERIOD_ONE),
+                (HOUR_MS + 1, 5.0, PERIOD_TWO),
+            ] {
+                sample(&conn, credential, "account", at, used, None, reset);
+            }
+            let wide = quota_history(&conn, &request(0, 2 * HOUR_MS, "hour")).unwrap();
+            let narrow = quota_history(&conn, &request(HOUR_MS, 2 * HOUR_MS, "hour")).unwrap();
+            assert_eq!(narrow.windows[0].buckets, wide.windows[0].buckets[1..]);
+            assert_eq!(
+                narrow.windows[0].buckets,
+                [Bucket {
+                    start_ms: HOUR_MS,
+                    used_percent_max: 5.0,
+                    samples: 1
+                }]
+            );
+            assert!(narrow.windows[0].resets.is_empty());
+        }
+    }
+
+    #[test]
+    fn quota_reset_projection_backfill_normalizes_and_guards_periods() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::initialize_connection(&conn).unwrap();
+        let (last, previous) = crate::store::MIGRATIONS.split_last().unwrap();
+        for migration in previous {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+        for credential in [false, true] {
+            let (table, field) = sample_table(credential);
+            conn.execute_batch(&format!("WITH RECURSIVE n(i) AS (SELECT 200 UNION ALL SELECT i+1 FROM n WHERE i<10199)
+                INSERT INTO {table}(provider,{field},pool_key,fetched_at_instant,used_percent,resets_at,window_minutes)
+                SELECT 'claude','account','primary', i*{NANOS_PER_MS},80,'1970-01-02T23:59:00.0009+23:59',300 FROM n")).unwrap();
+        }
+        let started = std::time::Instant::now();
+        conn.execute_batch(last.statements).unwrap();
+        let count = conn
+            .query_row("SELECT count(*) FROM quota_reset_period", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        eprintln!(
+            "quota projection backfill: 20,000 synthetic samples -> {count} period rows in {:?}",
+            started.elapsed()
+        );
+        assert_eq!(count, 2);
+        for credential in [false, true] {
+            sample(
+                &conn,
+                credential,
+                "account",
+                100,
+                79.0,
+                None,
+                Some("1970-01-02t00:00:00z"),
+            );
+            sample(
+                &conn,
+                credential,
+                "account",
+                50,
+                90.0,
+                None,
+                Some("2026-02-30T00:00:00Z"),
+            );
+            sample(
+                &conn,
+                credential,
+                "account",
+                70,
+                90.0,
+                None,
+                Some("bad reset"),
+            );
+            let lookup = || {
+                conn.query_row(
+                    "SELECT reset_ms,first_fetched FROM quota_reset_period WHERE credential=?1",
+                    [i64::from(credential)],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .unwrap()
+            };
+            assert_eq!(lookup(), (DAY_MS, 100 * NANOS_PER_MS));
+            assert_eq!(
+                previous_accepted(
+                    &conn,
+                    credential,
+                    ("claude", "account", "primary"),
+                    150 * NANOS_PER_MS,
+                    Some(lookup())
+                )
+                .unwrap(),
+                Some(79.0)
+            );
+        }
+        for sql in [
+            "DELETE FROM quota_reset_period",
+            "UPDATE quota_reset_period SET first_fetched=first_fetched+1",
+            "UPDATE quota_reset_period SET reset_ms=reset_ms+1",
+            "INSERT OR REPLACE INTO quota_reset_period SELECT * FROM quota_reset_period LIMIT 1",
+        ] {
+            assert!(conn.execute(sql, []).is_err(), "guard accepted {sql}");
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM quota_reset_period", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn quota_reset_projection_read_cost_follows_periods_not_samples() {
+        let measure = |history| {
+            let conn = conn();
+            for index in 0..history {
+                sample(
+                    &conn,
+                    false,
+                    "account",
+                    -DAY_MS + index,
+                    95.0,
+                    None,
+                    PERIOD_ONE,
+                );
+                sample(
+                    &conn,
+                    false,
+                    "account",
+                    -HOUR_MS + index,
+                    50.0,
+                    None,
+                    PERIOD_TWO,
+                );
+            }
+            sample(&conn, false, "account", 0, 5.0, None, PERIOD_THREE);
+            let (report, steps) = crate::multiplier::vm_steps(&conn, || {
+                quota_history(&conn, &request(0, HOUR_MS, "hour")).unwrap()
+            });
+            assert_eq!(report.windows[0].resets.len(), 1);
+            let count = conn
+                .query_row("SELECT count(*) FROM quota_reset_period", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
+            assert_eq!(count, 3);
+            (report, steps)
+        };
+        let (small, small_steps) = measure(100);
+        let (large, large_steps) = measure(10_000);
+        assert_eq!(small, large);
+        eprintln!("quota 100/10,000 samples per period: {small_steps}/{large_steps} VM steps");
+        assert!(large_steps <= small_steps + 100);
     }
 
     #[test]
@@ -713,7 +921,7 @@ mod tests {
             let (table, field) = sample_table(credential);
             let index = format!("sqlite_autoindex_{table}_1");
             for (sql, expected) in [
-                (samples_sql(credential), format!("SEARCH {table} USING INDEX {index} (provider=? AND {field}=? AND pool_key=? AND fetched_at_instant>? AND fetched_at_instant<?)")),
+                (samples_sql(credential), format!("SEARCH s USING INDEX {index} (provider=? AND {field}=? AND pool_key=? AND fetched_at_instant>? AND fetched_at_instant<?)")),
                 (predecessor_sql(credential), format!("SEARCH {table} USING INDEX {index} (provider=? AND {field}=? AND pool_key=? AND fetched_at_instant<?)")),
                 (first_sample_sql(credential), format!("SEARCH {table} USING COVERING INDEX {index} (provider=? AND {field}=? AND pool_key=?)")),
                 (next_series_sql(credential, NextSeries::Pool), format!("SEARCH {table} USING COVERING INDEX {index} (provider=? AND {field}=? AND pool_key>?)")),
@@ -854,14 +1062,11 @@ mod tests {
             if selected.is_empty() {
                 continue;
             }
-            let predecessor = samples.iter().rev().find(|sample| sample.at < from);
-            let mut period_ends: Vec<_> = predecessor
-                .and_then(|sample| sample.reset)
-                .into_iter()
-                .collect();
+            let mut period_ends = Vec::new();
+            let mut predecessor = None;
             let mut accepted: Vec<&ReferenceSample> = Vec::new();
             let mut resets = Vec::new();
-            for sample in selected {
+            for sample in samples.iter().filter(|sample| sample.at < to) {
                 // Compare against every accepted period end rather than sharing
                 // the indexed reader's running horizon or tolerance helper.
                 let tolerance = sample.minutes.map_or(600_000, |minutes| {
@@ -872,7 +1077,7 @@ mod tests {
                     if shift < -tolerance {
                         continue;
                     }
-                    if shift > tolerance {
+                    if shift > tolerance && sample.at >= from {
                         if let Some(previous) = accepted.last().copied().or(predecessor) {
                             resets.push(Reset {
                                 at_ms: sample.at,
@@ -885,7 +1090,14 @@ mod tests {
                 if let Some(reset) = sample.reset {
                     period_ends.push(reset);
                 }
-                accepted.push(sample);
+                if sample.at < from {
+                    predecessor = Some(sample);
+                } else {
+                    accepted.push(sample);
+                }
+            }
+            if accepted.is_empty() {
+                continue;
             }
             let mut buckets = BTreeMap::<_, Vec<f64>>::new();
             for sample in &accepted {

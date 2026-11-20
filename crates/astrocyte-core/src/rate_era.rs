@@ -329,9 +329,11 @@ pub fn record_failure(
         MultiplierError::RateFactUnrecognized(message) => Some(message.as_str()),
         _ => None,
     };
-    // Failed models move later in the queue so a short tick cannot starve new models.
+    // Keep the last fetched timeline usable during retries. A model selected by
+    // pending() already has either no version or an older version than the cache.
+    // Move it later in the queue so a short tick cannot starve new models.
     conn.execute(
-        "UPDATE rate_model SET catalog_version=NULL,last_error=?3,
+        "UPDATE rate_model SET last_error=?3,
          last_attempt=(SELECT COALESCE(MAX(last_attempt),0)+1 FROM rate_model)
          WHERE provider=?1 AND model=?2",
         params![provider, model, diagnostic],
@@ -339,7 +341,7 @@ pub fn record_failure(
     Ok(())
 }
 
-fn resolution(segments: &BTreeMap<String, Vec<HistorySegment>>, at_ms: i64) -> ModelResolution {
+fn snapshot_at(segments: &BTreeMap<String, Vec<HistorySegment>>, at_ms: i64) -> CatalogSnapshot {
     let mut snapshot = CatalogSnapshot {
         source: "rate_era".into(),
         resolved_at_ms: at_ms,
@@ -368,7 +370,11 @@ fn resolution(segments: &BTreeMap<String, Vec<HistorySegment>>, at_ms: i64) -> M
             }
         }
     }
-    let mut resolution = multiplier::rates_from_snapshot(&snapshot);
+    snapshot
+}
+
+fn resolution(snapshot: &CatalogSnapshot) -> ModelResolution {
+    let mut resolution = multiplier::rates_from_snapshot(snapshot);
     match &mut resolution {
         ModelResolution::Unpriceable { reason } if reason == "no_catalog_coverage" => {
             *reason = "no_rate".into()
@@ -416,7 +422,7 @@ pub fn resolve(
 
 /// A model's resolved timeline frozen for one read snapshot. Calls select their
 /// own era in memory after the reader loads each distinct model once.
-pub(crate) struct ModelTimeline(Vec<ResolvedEra>);
+pub(crate) struct ModelTimeline(Vec<(ResolvedEra, CatalogSnapshot)>);
 
 impl ModelTimeline {
     pub(crate) fn load(
@@ -437,15 +443,25 @@ impl ModelTimeline {
                         .iter()
                         .enumerate()
                         .map(|(index, from)| {
-                            let mut resolved = resolution(&segments, *from);
+                            let mut snapshot = snapshot_at(&segments, *from);
+                            let mut resolved = resolution(&snapshot);
                             if let ModelResolution::Rates(rates) = &mut resolved {
                                 rates.reference_model = reference.clone();
                             }
-                            ResolvedEra {
-                                from_ms: *from,
-                                until_ms: boundaries.get(index + 1).copied(),
-                                resolution: resolved,
-                            }
+                            let is_unit = |key: &String, _: &mut Value| {
+                                crate::catalog_client::parse_rate_key(key)
+                                    .is_ok_and(|parsed| parsed.unit.is_some())
+                            };
+                            snapshot.facts.retain(is_unit);
+                            snapshot.withheld_facts.retain(is_unit);
+                            (
+                                ResolvedEra {
+                                    from_ms: *from,
+                                    until_ms: boundaries.get(index + 1).copied(),
+                                    resolution: resolved,
+                                },
+                                snapshot,
+                            )
                         })
                         .collect(),
                 )
@@ -454,8 +470,16 @@ impl ModelTimeline {
     }
 
     pub(crate) fn at(&self, at_ms: i64) -> &ModelResolution {
+        &self.entry_at(at_ms).0.resolution
+    }
+
+    pub(crate) fn unit_rates_at(&self, at_ms: i64) -> &CatalogSnapshot {
+        &self.entry_at(at_ms).1
+    }
+
+    fn entry_at(&self, at_ms: i64) -> &(ResolvedEra, CatalogSnapshot) {
         // Every loaded timeline starts at i64::MIN, even without rate segments.
-        &self.0[self.0.partition_point(|era| era.from_ms <= at_ms) - 1].resolution
+        &self.0[self.0.partition_point(|(era, _)| era.from_ms <= at_ms) - 1]
     }
 }
 
@@ -534,7 +558,7 @@ pub fn resolved_rates(
                     reason: "no_catalog_coverage".into(),
                 }
             } else {
-                resolution(&segments, *from_ms)
+                resolution(&snapshot_at(&segments, *from_ms))
             };
             if let ModelResolution::Rates(model_rates) = &mut resolution {
                 model_rates.reference_model = reference.clone();

@@ -579,8 +579,14 @@ fn runs_query_plans_seek_base_ranges_and_batched_keys_without_statistics() {
         p.contains("summary_run_activity (kind=? AND last_ms>? AND last_ms<?)"),
         "{p}"
     );
-    let p = plan(&c, &stale_hours_sql());
-    assert!(p.contains("summary_hour_stale"), "{p}");
+    let p = plan(
+        &c,
+        &key_hour_seek_sql("session=?1 AND producer=?2", "usage_event_session_time"),
+    );
+    assert!(
+        p.contains("usage_event_session_time (session=? AND occurred_at_ms>?)"),
+        "{p}"
+    );
     assert!(
         !p.lines()
             .any(|line| line.trim() == "SCAN summary_hour" || line.trim() == "SCAN h"),
@@ -908,6 +914,146 @@ fn runs_list_of_an_old_range_skips_later_summary_cells() {
 }
 
 #[test]
+fn ledger_regression_legacy_broca_inclusive_output_is_counted_once() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    crate::store::initialize_connection(&conn).unwrap();
+    let (migration, previous) = crate::store::MIGRATIONS.split_last().unwrap();
+    for step in previous {
+        conn.execute_batch(step.statements).unwrap();
+    }
+    let event = serde_json::from_value(json!({"producer":"broca","producer_ref":"legacy-output","run_ref":"old-run","provider":"anthropic","model":"model","occurred_at_ms":1,"charge_basis":"unknown","measurements":[
+        {"role":"output","unit":"token","kind":"billed","source":"usage.output_tokens","quantity_units":100,"quantity_exponent":0},
+        {"role":"reasoning","unit":"token","kind":"billed","source":"usage.reasoning_tokens","quantity_units":30,"quantity_exponent":0}
+    ]})).unwrap();
+    ingest::record_event(&mut conn, &event, 1).unwrap();
+    record(&mut conn, 3, "priced", Some(HOUR_MS + 1));
+    fill(&mut conn);
+    // Emulate the old reducer's cached run token total.
+    conn.execute(
+        "UPDATE summary_run_cell SET output='130' WHERE hour_number=0",
+        [],
+    )
+    .unwrap();
+    let state = |conn: &Connection| {
+        conn.prepare("SELECT s.hour_number,s.revision,s.built_revision,s.format_version,v.revision,a.summary_revision,a.valuation_revision FROM summary_hour s JOIN valuation_hour v USING(kind,hour_number) JOIN attribution_hour a USING(kind,hour_number) ORDER BY s.hour_number").unwrap()
+            .query_map([], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?,row.get::<_,Option<i64>>(5)?,row.get::<_,Option<i64>>(6)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    };
+    conn.execute("UPDATE valuation_hour SET state='built'", [])
+        .unwrap();
+    conn.execute(
+        "UPDATE attribution_hour SET summary_revision=1,valuation_revision=1",
+        [],
+    )
+    .unwrap();
+    let before = state(&conn);
+    conn.execute_batch(migration.statements).unwrap();
+    let dirty = state(&conn);
+    assert_eq!(dirty[1], before[1]);
+    assert_eq!(
+        dirty[0],
+        (
+            0,
+            before[0].1 + 1,
+            before[0].2,
+            6,
+            before[0].4 + 1,
+            None,
+            None
+        )
+    );
+    assert_eq!(
+        conn.query_row("SELECT hour_number FROM summary_dirty_hour", [], |row| row
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    let key = RunKey::Run {
+        harness: "broca".into(),
+        run_id: "old-run".into(),
+    };
+    for built in [false, true] {
+        if built {
+            fill(&mut conn);
+            let rebuilt = state(&conn);
+            assert_eq!(rebuilt[1], before[1]);
+            assert_eq!(rebuilt[0].1, rebuilt[0].2);
+        }
+        let detail = detail(
+            &conn,
+            &DetailRequest {
+                key: key.clone(),
+                limit: None,
+                after: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(detail.totals.tokens.output, Some(100));
+        assert_eq!(detail.totals.tokens.reasoning, Some(30));
+        let list = list(
+            &conn,
+            &ListRequest {
+                from_ms: 0,
+                to_ms: HOUR_MS,
+                harness: None,
+                limit: None,
+                after: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(list.totals.tokens.output, Some(100));
+        let request = crate::report::ReportRequest {
+            from_ms: Some(0),
+            to_ms: Some(HOUR_MS),
+            grain: "hour".into(),
+            timezone: "UTC".into(),
+            ..Default::default()
+        };
+        let report = serde_json::to_value(
+            crate::report::spend_report(&conn, &request, 2 * HOUR_MS).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["totals"][0]["tokens"]["output"], 100);
+        assert_eq!(report["totals"][0]["tokens"]["reasoning"], 30);
+    }
+}
+
+#[test]
+fn ledger_regression_run_detail_skips_unrelated_stale_hours() {
+    let request = DetailRequest {
+        key: RunKey::Session {
+            harness: "opencode".into(),
+            session: "ses_synthetic_3".into(),
+        },
+        limit: Some(2),
+        after: None,
+    };
+    let measure = |history| {
+        let conn = later_summary_history(history, false);
+        conn.execute_batch(
+            "INSERT INTO summary_dirty_hour SELECT kind,hour_number FROM summary_hour WHERE hour_number=0 OR hour_number>100000;",
+        ).unwrap();
+        let counter = crate::store::VmCounter::start(&conn);
+        let reply = serde_json::to_value(detail(&conn, &request).unwrap()).unwrap();
+        (reply, counter.steps())
+    };
+    let (small, small_steps) = measure(100);
+    let (large, large_steps) = measure(1_000);
+    assert_eq!(small, large);
+    assert!(small["items"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty()));
+    eprintln!(
+        "run detail VM steps with 100/1,000 unrelated stale hours: {small_steps}/{large_steps}"
+    );
+    assert!(
+        large_steps <= small_steps + 100,
+        "detail walked the stale backlog"
+    );
+}
+
+#[test]
 fn runs_detail_finds_unclean_hours_without_reading_every_hour() {
     let request = DetailRequest {
         key: RunKey::Session {
@@ -940,16 +1086,15 @@ fn runs_detail_finds_unclean_hours_without_reading_every_hour() {
          UPDATE summary_hour SET format_version=1 WHERE kind=0 AND hour_number=1;",
     )
     .unwrap();
-    let p = plan(&c, &stale_hours_sql());
-    assert!(p.contains("summary_hour_stale"), "{p}");
-    let stale: Vec<(i64, i64)> = c
-        .prepare(&stale_hours_sql())
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(stale, vec![(0, 0), (0, 1)]);
+    let stale = stale_key_hours(
+        &c,
+        "session=?1 AND producer=?2",
+        "usage_event_session_time",
+        "ses_synthetic_3",
+        "opencode",
+    )
+    .unwrap();
+    assert_eq!(stale, vec![(0, 0)]);
     assert_eq!(
         serde_json::to_value(detail(&c, &request).unwrap()).unwrap(),
         clean

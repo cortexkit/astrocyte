@@ -421,7 +421,8 @@ Reads never write. A refusal on a read is one of the codes below.
   `{currency: "USD", nanos, unvalued: {measurements, tokens, by_reason},
   not_yet_valued_hours}`. It values positive measurements at the published USD
   API rates in force at each call, independently of recorded charge basis.
-  Exact line values are summed before one half-even rounding to nanodollars.
+  Exact token line values are summed before one half-even rounding to nanodollars.
+  Unit-billed measurements are valued per measurement, as they would be charged.
   Unusable positive measurements each count once under `no_rate`, `refused`,
   `non_usd`, `missing_model` or `valuation_error`; `tokens` counts their token
   quantities. Zero quantities do not count as unvalued. Other valued measurements
@@ -483,9 +484,12 @@ Reads never write. A refusal on a read is one of the codes below.
   `deduced_non_usd_plans`; records mapping to multiple pools count in
   `deduced_conflict_plans` and their USD fees go directly to unspread. Totals
   aggregate exact values and distinct pending hours/days across rows before
-  rounding. Non-USD and null-currency totals carry `list_value` only. When USD
-  fees exist but no USD calls match, an additional USD total has zero recorded
-  spend and exposes those fees; no such entry is added without USD fees.
+  rounding. Non-USD and null-currency totals carry `list_value` only. Assigned
+  shares of a USD plan fee count toward the USD total even when the matching
+  call has a different or unknown recorded currency; the call's recorded spend
+  and any row-level `deduced` field are unchanged. When USD fees exist but no
+  USD calls match, an additional USD total has zero recorded spend and exposes
+  those fees; no such entry is added without USD fees.
   With explicit dates, the fee window is the widened report window. Without
   dates, it starts at the first calendar bucket holding any dated summary hour
   and ends at the end of the bucket holding `now_ms`; with no dated hours it
@@ -1241,8 +1245,9 @@ member, a wrong type or another grain refuses `malformed`.
   drop alone is not a reset, and a reading with no reset time cannot start a
   period. A cached reading whose reset time is older than the current period's
   by more than that tolerance is excluded from both buckets and resets. The
-  last reading before the range supplies the starting reset time and percent
-  to detect a reset at the range's first reading; it adds to no bucket.
+  most recent period observed before the range supplies the starting reset
+  time, and the last accepted reading supplies the previous percent. Earlier
+  readings add to no bucket.
 - `earliest_sample_ms` is the first recorded reading among the selected
   providers, from either table and regardless of the range, or `null` if none.
   A provider with no reading in the range can set it without appearing in

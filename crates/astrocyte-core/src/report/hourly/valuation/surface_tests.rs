@@ -36,6 +36,41 @@ fn ready(conn: &mut Connection) {
 }
 
 #[test]
+fn ledger_regression_usd_fee_survives_null_recorded_currency_in_both_readers() {
+    let mut conn = conn();
+    rate(&conn, "A", 1_000_000_000);
+    plan(&conn, PlanLedger::Account, "provider", "account", 0, None);
+    event(
+        &mut conn,
+        "unknown-basis",
+        1,
+        "A",
+        Some("account"),
+        None,
+        "unknown",
+        100,
+    );
+    ready(&mut conn);
+
+    for grouping in [&[][..], &["alfonso"][..]] {
+        let value = report(&conn, &request(grouping, 0, DAY_MS));
+        assert_eq!(value["rows"][0]["list_value"]["nanos"], 200_000);
+        assert!(value["rows"][0]["currency"].is_null());
+        assert!(value["rows"][0].get("deduced").is_none());
+        let usd = value["totals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|total| total["currency"] == "USD")
+            .unwrap();
+        assert_eq!(usd["total_nanos"], 0);
+        assert_eq!(usd["list_value"]["nanos"], 0);
+        assert_eq!(usd["deduced"]["nanos"], 645_161_290);
+        assert_eq!(usd["deduced_unspread_nanos"], 0);
+    }
+}
+
+#[test]
 fn report_surface_plan_grouping_filters_and_unfiltered_fee_weights() {
     let mut conn = conn();
     rate(&conn, "A", 1_000_000_000);

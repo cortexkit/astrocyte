@@ -544,6 +544,9 @@ impl Stage {
             "unknown_plans":report.unknown_plans,"unpriced_plans":report.unpriced_plans,
             "hand_vault_differences":report.hand_vault_differences,"vault_record_differences":report.vault_record_differences,
             "chatgpt_account_mismatches":report.chatgpt_account_mismatches});
+        if !report.reconciliation_refusals.is_empty() {
+            value["reconciliation_refusals"] = json!(report.reconciliation_refusals);
+        }
         if !self.invalid_plan_tier_since.is_empty() {
             value["invalid_plan_tier_since"] = json!(self.invalid_plan_tier_since);
         }

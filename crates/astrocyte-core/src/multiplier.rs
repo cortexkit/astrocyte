@@ -1721,8 +1721,10 @@ fn for_scoped_events(
     let (predicate, values) = scope_interval(scope, from, to);
     let sql = format!(
         "SELECT e.event_key, e.producer, e.provider, e.model, m.role, m.unit, m.source,
-                m.quantity_units,m.quantity_exponent,e.occurred_at_ms,e.work_class,e.account_ref
+                m.quantity_units,m.quantity_exponent,e.occurred_at_ms,e.work_class,e.account_ref,
+                b.event_key IS NOT NULL,b.mode
          FROM usage_event e LEFT JOIN measurement m ON m.event_key=e.event_key
+         LEFT JOIN broca_attempt_detail b ON b.event_key=e.event_key
          WHERE {predicate} AND e.occurred_at_ms >= CAST(? AS INTEGER)
            AND e.occurred_at_ms < CAST(? AS INTEGER) ORDER BY e.event_key"
     );
@@ -1741,7 +1743,8 @@ fn for_scoped_events(
                     producer: row.get(1)?,
                     provider: row.get(2)?,
                     model: row.get(3)?,
-                    mode: None,
+                    mode: row.get(13)?,
+                    broca_attempt: row.get(12)?,
                     roles: Vec::new(),
                 },
                 occurred_at_ms: row.get(9)?,
@@ -4297,6 +4300,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: Some("m".into()),
                 mode: mode.map(str::to_owned),
+                broca_attempt: false,
                 roles: vec![(
                     "cache_write".into(),
                     "token_cache_1h".into(),
@@ -4550,6 +4554,7 @@ mod tests {
             provider: "openai".into(),
             model: Some("m".into()),
             mode: mode.map(str::to_string),
+            broca_attempt: false,
             roles: vec![
                 (
                     "input".into(),
@@ -4597,6 +4602,7 @@ mod tests {
             provider: "openai".into(),
             model: Some("m".into()),
             mode: None,
+            broca_attempt: false,
             roles: vec![
                 (
                     "input".into(),
