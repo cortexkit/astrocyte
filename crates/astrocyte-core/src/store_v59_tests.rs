@@ -72,6 +72,7 @@ mod session_refs {
                 assert!(table_rows(conn, "broca_segment_evidence").is_empty());
                 assert!(table_rows(conn, "broca_segment_measurement").is_empty());
                 assert!(table_rows(conn, "broca_segment_mismatch").is_empty());
+                assert!(table_rows(conn, "quota_reset_period").is_empty());
                 assert_eq!(
                     conn.query_row(
                         "SELECT checked_through FROM broca_segment_check_state WHERE id=1",
@@ -92,6 +93,7 @@ mod session_refs {
                                 | "broca_segment_measurement"
                                 | "broca_segment_mismatch"
                                 | "broca_segment_check_state"
+                                | "quota_reset_period"
                         )
                     })
                     .collect();
