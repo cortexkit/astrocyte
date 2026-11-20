@@ -2652,7 +2652,7 @@ mod tests {
         let mut conn = pre19();
         // Keep the charged history and queried window fixed. Extra calls
         // outside the window expose the cost of scanning history even when
-        // each matching row also looks up BROCA's recorded service tier.
+        // each matching row also looks up its recorded service tier.
         seed_query_history(&conn, 4_000, 15_000);
         conn.execute_batch("UPDATE usage_event SET currency='USD';
             INSERT INTO adjustment (adjustment_id,event_id,currency,amount_nanos,reason,occurred_at_ms,recorded_at_ms,origin)
