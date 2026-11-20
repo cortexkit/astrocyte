@@ -34,11 +34,17 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_folder_name("worker-one")
+    }
+
+    fn with_folder_name(name: &str) -> Self {
         let home = TempDir::new().unwrap();
         let path = fs::canonicalize(home.path()).unwrap();
         let roots = path.join("cortexkit/thalamus-harness/pi/roots.json");
         fs::create_dir_all(roots.parent().unwrap()).unwrap();
-        let folder = path.join("cortexkit/thalamus-harness/pi-sessions/worker-one");
+        let folder = path
+            .join("cortexkit/thalamus-harness/pi-sessions")
+            .join(name);
         fs::create_dir_all(&folder).unwrap();
         Self {
             roots,
@@ -87,6 +93,9 @@ impl Fixture {
         }).unwrap();
     }
 }
+
+#[path = "pi_thalamus_vector_tests.rs"]
+mod recorded_vector;
 
 #[test]
 fn missing_roots_is_absent_and_health_unchanged() {

@@ -3,3 +3,6 @@
 # Windows CI runner converts LF to CRLF for text files by default).
 crates/*/tests/vectors/** -text
 crates/*/test-vectors/** -text
+
+# Keep the recorded THALAMUS Pi folder byte-exact even if the generic rules change.
+crates/astrocyte-module/tests/vectors/thalamus-pi-session-folder-v1/** -text

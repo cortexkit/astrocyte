@@ -1,0 +1,14 @@
+{
+  "roots": [
+    {
+      "done_at_ms": null,
+      "owner_principal": "prefrontal-core",
+      "owner_session": "ses_core_bound_conversation",
+      "path": "/example/cortexkit/thalamus-harness/pi-sessions/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "session": "26e7281d-b7a2-4dec-a019-a523175d101d",
+      "session_ref": "pi-session-ref-example",
+      "state": "active"
+    }
+  ],
+  "version": 1
+}

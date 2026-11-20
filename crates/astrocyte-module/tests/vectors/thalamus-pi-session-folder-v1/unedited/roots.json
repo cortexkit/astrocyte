@@ -1,0 +1,14 @@
+{
+  "roots": [
+    {
+      "done_at_ms": null,
+      "owner_principal": "prefrontal-core",
+      "owner_session": "ses_core_bound_conversation",
+      "path": "/motor-home/tmp/.tmph5JF3A/thalamus-harness/pi-sessions/52c29ba0358c7b511a4b7f07fc1d0b994b3f67ed76d629d6b22b7c6df7e4e293",
+      "session": "01a1fa25-a68e-725e-9e24-4850ae7f2ab6",
+      "session_ref": "7f5f3e87e4666c62a291269ad5148cc9",
+      "state": "active"
+    }
+  ],
+  "version": 1
+}
