@@ -404,10 +404,10 @@ fn gateway_without_request_id_keys_the_call_by_message_id_and_joins_it() {
 
     gateway.price(AT + PAYER_WAIT + 2);
     // The third call was recorded before its payer row said who paid, so it
-    // keeps an unknown charge basis and none of its charge rows is priced.
+    // keeps an unknown charge basis and never gets automatic charge rows.
     assert_eq!(
         gateway.charges("claude-code"),
-        vec![priced(first), priced(second), (third.into(), 5, 0, 0)]
+        vec![priced(first), priced(second)]
     );
 }
 

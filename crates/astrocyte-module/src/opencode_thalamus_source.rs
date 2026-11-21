@@ -1149,33 +1149,75 @@ mod tests {
         assert_eq!(f.degraded(), None);
 
         for reference in ["listed-call", "unlisted-call"] {
-            f.state.with_conn(|conn| {
-                let mut stmt = conn.prepare("SELECT m.role,m.source,m.quantity_units,m.quantity_exponent,m.unit
+            f.state
+                .with_conn(|conn| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT m.role,m.source,m.quantity_units,m.quantity_exponent,m.unit
                     FROM measurement m JOIN usage_event e USING(event_key)
-                    WHERE e.producer_ref=?1 ORDER BY m.role").unwrap();
-                let measurements = stmt.query_map([reference], |r| Ok((
-                    r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?,
-                    r.get::<_,i64>(3)?, r.get::<_,String>(4)?
-                ))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-                assert_eq!(measurements, vec![
-                    ("cache_read".into(), "usage.cacheRead".into(), 7, 0, "token".into()),
-                    ("cache_write".into(), "usage.cacheWrite".into(), 11, 0, "token".into()),
-                    ("input".into(), "usage.input".into(), 3, 0, "token".into()),
-                    ("output".into(), "usage.output".into(), 5, 0, "token".into()),
-                    ("reasoning".into(), "usage.reasoning".into(), 2, 0, "token".into()),
-                ]);
-                let unpriced: i64 = conn.query_row("SELECT COUNT(*) FROM priced_charge p
-                    JOIN usage_event e USING(event_key) WHERE e.producer_ref=?1
-                    AND p.outcome='unpriced' AND p.unpriced_reason='charge_basis_unknown'
-                    AND NOT EXISTS(SELECT 1 FROM priced_charge child WHERE child.supersedes=p.charge_key)",
-                    [reference], |r| r.get(0)).unwrap();
-                assert_eq!(unpriced, 5);
-                Ok(())
-            }).unwrap();
+                    WHERE e.producer_ref=?1 ORDER BY m.role",
+                        )
+                        .unwrap();
+                    let measurements = stmt
+                        .query_map([reference], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, i64>(2)?,
+                                r.get::<_, i64>(3)?,
+                                r.get::<_, String>(4)?,
+                            ))
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    assert_eq!(
+                        measurements,
+                        vec![
+                            (
+                                "cache_read".into(),
+                                "usage.cacheRead".into(),
+                                7,
+                                0,
+                                "token".into()
+                            ),
+                            (
+                                "cache_write".into(),
+                                "usage.cacheWrite".into(),
+                                11,
+                                0,
+                                "token".into()
+                            ),
+                            ("input".into(), "usage.input".into(), 3, 0, "token".into()),
+                            ("output".into(), "usage.output".into(), 5, 0, "token".into()),
+                            (
+                                "reasoning".into(),
+                                "usage.reasoning".into(),
+                                2,
+                                0,
+                                "token".into()
+                            ),
+                        ]
+                    );
+                    Ok(())
+                })
+                .unwrap();
 
             // OpenCode does not attest who paid. Explicit API-key evidence is
             // required to price these otherwise unpriced, unknown-basis calls.
             let id = astrocyte_core::fact::event_id("opencode", None, reference).unwrap();
+            let reply =
+                crate::ops::dispatch(&f.state, "spend.charge.explain", json!({"event_id":id}))
+                    .unwrap();
+            let unpriced = reply["measurements"].as_array().unwrap();
+            assert_eq!(unpriced.len(), 5);
+            for measurement in unpriced {
+                assert_eq!(measurement["charges"], json!([]));
+                assert_eq!(
+                    measurement["derived_charge"]["unpriced_reason"],
+                    "charge_basis_unknown"
+                );
+            }
             crate::ops::dispatch(
                 &f.state,
                 crate::ops::OP_BASIS_CORRECT,

@@ -2584,25 +2584,17 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
             .drain(&state, 100, &NEVER_STOP)
             .unwrap();
         assert_eq!(outcome.rows_recorded, 1);
-        price_unpriced_events(&state, 200, &NEVER_STOP).unwrap();
-
-        let stored: (Option<i64>, String, String) = state
+        let stored: Option<i64> = state
             .with_conn(|conn| {
                 conn.query_row(
-                    "SELECT event.occurred_at_ms,MIN(charge.outcome),MIN(charge.unpriced_reason)
-                     FROM usage_event AS event
-                     JOIN priced_charge AS charge ON charge.event_key=event.event_key
-                     WHERE event.producer='pi'",
+                    "SELECT occurred_at_ms FROM usage_event WHERE producer='pi'",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| row.get(0),
                 )
                 .map_err(|error| error.to_string())
             })
             .unwrap();
-        assert_eq!(
-            stored,
-            (None, "unpriced".to_string(), "undated_event".to_string())
-        );
+        assert_eq!(stored, None);
     }
 
     /// A full re-read of an unchanged file whose mtime moved (a restart does
@@ -2901,23 +2893,33 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
         );
         let state = test_state();
         drain_file_without_cache(&state, &path, 100).unwrap();
-        assert_eq!(price_unpriced_events(&state, 200, &NEVER_STOP).unwrap(), 1);
-
-        let result: (i64, String, String) = state
+        assert_eq!(price_unpriced_events(&state, 200, &NEVER_STOP).unwrap(), 0);
+        let id: String = state
             .with_conn(|conn| {
                 conn.query_row(
-                    "SELECT COUNT(*),MIN(outcome),MIN(unpriced_reason)
-                     FROM priced_charge
-                     WHERE event_key=(SELECT event_key FROM usage_event WHERE producer='pi')",
+                    "SELECT event_id FROM usage_event WHERE producer='pi'",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| row.get(0),
                 )
                 .map_err(|error| error.to_string())
             })
             .unwrap();
-        assert!(result.0 > 0);
-        assert_eq!(result.1, "unpriced");
-        assert_eq!(result.2, "charge_basis_unknown");
+        let reply = crate::ops::dispatch(
+            &state,
+            "spend.charge.explain",
+            serde_json::json!({"event_id":id}),
+        )
+        .unwrap();
+        let measurements = reply["measurements"].as_array().unwrap();
+        assert!(!measurements.is_empty());
+        for measurement in measurements {
+            assert_eq!(measurement["charges"], serde_json::json!([]));
+            assert_eq!(measurement["derived_charge"]["outcome"], "unpriced");
+            assert_eq!(
+                measurement["derived_charge"]["unpriced_reason"],
+                "charge_basis_unknown"
+            );
+        }
     }
 
     #[test]

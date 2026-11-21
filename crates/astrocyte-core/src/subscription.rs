@@ -712,6 +712,12 @@ pub struct SubscriptionRepricePlan {
     coverage: CoverageExpectation,
 }
 
+impl SubscriptionRepricePlan {
+    pub fn charge_basis(&self) -> ChargeBasis {
+        self.pricing.subscription_coverage_identity().charge_basis
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSubscriptionReprice {
     pricing: ResolvedReprice,

@@ -416,7 +416,13 @@ mod tests {
         let state = test_state();
         state
             .ordered_write(|tx| {
-                insert_account_event(tx, "ev-a-headed", 1_800_000_000_000, "unknown", "claude")?;
+                insert_account_event(
+                    tx,
+                    "ev-a-headed",
+                    1_800_000_000_000,
+                    "metered_api",
+                    "claude",
+                )?;
                 Ok(((), true))
             })
             .unwrap();
@@ -430,12 +436,12 @@ mod tests {
                         PROVIDER,
                         ACCOUNT,
                         1_800_000_000_000,
-                        "unknown",
+                        "metered_api",
                         "claude",
                     )?;
                 }
                 for event_id in ["ev-c-queued", "ev-e-queued"] {
-                    insert_account_event(tx, event_id, 1_800_000_000_000, "unknown", "claude")?;
+                    insert_account_event(tx, event_id, 1_800_000_000_000, "metered_api", "claude")?;
                 }
                 Ok(((), true))
             })
@@ -479,7 +485,7 @@ mod tests {
                     PROVIDER,
                     ACCOUNT,
                     1_800_000_000_000,
-                    "unknown",
+                    "metered_api",
                     "claude",
                 )?;
                 Ok(((), true))
@@ -527,7 +533,7 @@ mod tests {
                     PROVIDER,
                     ACCOUNT,
                     1_800_000_000_000,
-                    "unknown",
+                    "metered_api",
                     "claude",
                 )?;
                 Ok(((), true))
@@ -650,7 +656,7 @@ mod tests {
                         tx,
                         &format!("ev-{index:02}-queued"),
                         1_800_000_000_000,
-                        "unknown",
+                        "metered_api",
                         "claude",
                     )?;
                 }
@@ -660,7 +666,7 @@ mod tests {
                     PROVIDER,
                     ACCOUNT,
                     1_800_000_000_000,
-                    "unknown",
+                    "metered_api",
                     "claude",
                 )?;
                 Ok(((), true))
@@ -740,7 +746,13 @@ mod tests {
         let state = test_state();
         state
             .ordered_write(|tx| {
-                insert_account_event(tx, "ev-01-headed", 1_800_000_000_000, "unknown", "claude")?;
+                insert_account_event(
+                    tx,
+                    "ev-01-headed",
+                    1_800_000_000_000,
+                    "metered_api",
+                    "claude",
+                )?;
                 Ok(((), true))
             })
             .unwrap();
@@ -759,12 +771,12 @@ mod tests {
                         PROVIDER,
                         ACCOUNT,
                         1_800_000_000_000,
-                        "unknown",
+                        "metered_api",
                         "claude",
                     )?;
                 }
                 for event_id in ["ev-02-queued", "ev-05-queued", "ev-08-queued"] {
-                    insert_account_event(tx, event_id, 1_800_000_000_000, "unknown", "claude")?;
+                    insert_account_event(tx, event_id, 1_800_000_000_000, "metered_api", "claude")?;
                 }
                 Ok(((), true))
             })

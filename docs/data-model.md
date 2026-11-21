@@ -452,14 +452,17 @@ when they are the only measurements on an event, or in runs' unpriced counts.
 | `unknown` | The producer cannot say who paid | `unpriced` with `charge_basis_unknown` |
 
 Every harness reader records `unknown`, because no transcript says how the
-call was paid for. An event with no `occurred_at_ms` is `unpriced` with
-`undated_event` whatever its basis. A metered event whose model the catalog does not cover is stored `unpriced` with `no_catalog_coverage`, including when the catalog refuses the historical read as outside its coverage. BROCA states a basis per fact, and pushing peers state it
-in `spend.event.ingest`. An operator changes an event's basis with
+call was paid for. A pricing act that examines an event with no `occurred_at_ms`
+records `undated_event`. The automatic pass skips calls whose basis is unknown.
+A metered event whose model the catalog does not cover is stored `unpriced` with
+`no_catalog_coverage`, including when the catalog refuses the historical read as
+outside its coverage. BROCA states a basis per fact, and callers of
+`spend.event.ingest` state it in the request. An operator changes an event's basis with
 `spend.basis.correct`; see [operations](operations.md).
 
 ## The priced-charge chain
 
-Each measurement has one chain of `priced_charge` rows. A row's `outcome` is
+Each billed measurement can have one chain of `priced_charge` rows. A row's `outcome` is
 `priced` (has `currency` and `charge_nanos`), `covered` (zero, with the
 plan's currency) or `unpriced` (has `unpriced_reason` and no money). The
 `origin` names the act that wrote it: `pricing_pass`, `operator_reprice`,
@@ -489,8 +492,8 @@ report, the verdict and pricing read heads with `NOT EXISTS`. Tests:
 `basis_correction_supersedes_every_head_preserving_every_prior_column`,
 `mixed_reprice_preserves_priced_head_and_supersedes_only_unpriced_head`.
 
-`pricing_pending` holds every event with a measurement that has no head. An
-event is queued in the transaction that records it and dequeued in the
+`pricing_pending` holds calls of known basis with billed measurements that have no head.
+An event is queued in the transaction that records it and dequeued in the
 transaction that heads its last measurement. A periodic reconciliation
 re-checks the queue against the full ledger. Its final chunk commits
 `pricing_selection_state.last_queue_reconcile_completed_ms` in the same
@@ -517,6 +520,14 @@ lookups jump between identities through their primary keys instead (see
 `docs/subscription-multiplier.md`).
 
 ## Money
+
+A billed measurement with no current charge head and a recorded basis of
+`unknown` is already unpriced with reason `charge_basis_unknown`; it is not
+waiting for a price. Automatic pricing does not store a row for this decision.
+A stored head always wins, including a head appended by basis correction or
+operator repricing. `spend.charge.explain` reports the headless decision as a
+`derived_charge` sourced from the call's recorded charge basis, with no pricing
+generation or catalog metadata.
 
 ### Catalog rate units and quantities
 

@@ -92,8 +92,7 @@ transaction as the good calls and the cursor, and coverage counts them.
 3. Read insula quota: commit queued quota events, and call `usage.get` when the
    event stream cannot be trusted or the freshness horizon is near.
 4. Price queued calls (`run_pricing_walk`), bounded per tick by time and count.
-5. Spend up to two seconds on the daily check that every unpriced call is queued
-   for pricing (`QUEUE_RECONCILE_INTERVAL`).
+5. Spend up to two seconds on the daily pricing-queue check.
 
 Then the loop rebuilds dirty summary hours for up to 1.5 seconds and runs the
 multiplier stage. Between full ticks it applies quota events every 250 ms and,
@@ -111,17 +110,14 @@ every tick while events are not flowing. The same reader follows runners' live
 
 ## Pricing
 
-Each measurement uses the catalog entry in force at the call.
-`parse_rate_key` in `catalog_client.rs` is the one rate-key grammar,
-shared with the multiplier. Token keys are `rate.<role>` per million tokens,
-optionally conditioned on prompt size (`above_context`), `mode` or `ttl`. Unit
-keys add a denominator after the role, such as `per_second`, and may carry
-selectors. Unknown roles and units are refused.
+Pricing uses the catalog entry in force at the call. `parse_rate_key` in
+`catalog_client.rs` is the rate-key grammar shared with the multiplier.
 Providers in `reasoning_billed_as_output` price reasoning at the output rate;
 otherwise reasoning needs its own rate.
 
 A charge records which catalog fact priced it, or why the measurement is
-unpriced. Repricing
+unpriced. A call with an unknown basis records no charge rows; its measurements
+read as unpriced for that reason. Repricing
 (`spend.event.reprice`) and basis correction (`spend.basis.correct`) append new
 heads. The [data model](docs/data-model.md#money) covers units, rounding and the
 charge chain.

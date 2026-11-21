@@ -385,12 +385,14 @@ fn event_key(
 }
 
 fn base_sql(filter: &str, index: &str) -> String {
+    use crate::report::DERIVED_UNPRICED_SQL;
     let quantity = crate::report::reported_quantity_sql();
     format!("WITH selected AS MATERIALIZED (SELECT * FROM usage_event INDEXED BY {index} WHERE {filter})
         SELECT e.event_key,e.producer,e.session,e.run_ref,e.flow_ref,e.producer_ref,e.occurred_at_ms,e.provider,e.model,e.work_class,
         m.role,m.unit,m.quantity_units,m.quantity_exponent,h.outcome,h.charge_nanos,h.currency,h.unpriced_reason,m.kind,
         CASE WHEN e.producer='broca' THEN EXISTS(SELECT 1 FROM broca_attempt_detail a WHERE a.event_key=e.event_key) ELSE 0 END,
-        CASE WHEN m.role='output' AND m.unit='token' THEN {quantity} END
+        CASE WHEN m.role='output' AND m.unit='token' THEN {quantity} END,
+        {DERIVED_UNPRICED_SQL}
         FROM selected e LEFT JOIN measurement m ON m.event_key=e.event_key
         LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit
             AND NOT EXISTS(SELECT 1 FROM priced_charge child WHERE child.supersedes=h.charge_key)
@@ -430,9 +432,13 @@ fn visit(
             });
         }
         if let Some(role) = row.get::<_, Option<String>>(10)? {
+            use crate::report::DERIVED_UNKNOWN_CHARGE;
             let observed = row.get::<_, String>(18)? == "observed";
+            let derived: bool = row.get(21)?;
             let state: String = if observed {
                 "unpriced".into()
+            } else if derived {
+                DERIVED_UNKNOWN_CHARGE.outcome.into()
             } else {
                 row.get::<_, Option<String>>(14)?
                     .unwrap_or_else(|| "pending".into())
@@ -460,6 +466,8 @@ fn visit(
                 currency: if priced { row.get(16)? } else { None },
                 reason: if observed {
                     Some("observed_only".into())
+                } else if derived {
+                    Some(DERIVED_UNKNOWN_CHARGE.unpriced_reason.into())
                 } else if state == "unpriced" {
                     row.get(17)?
                 } else {

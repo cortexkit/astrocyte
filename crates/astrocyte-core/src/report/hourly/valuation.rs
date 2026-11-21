@@ -175,7 +175,15 @@ pub(crate) fn reduce(
 
 fn measurement_sql(filter: &str) -> String {
     let quantity = reported_quantity_sql();
-    format!("SELECT m.event_key,m.role,m.unit,m.source,m.quantity_units,m.quantity_exponent,h.outcome,{quantity} FROM measurement m LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit AND NOT EXISTS(SELECT 1 FROM priced_charge s WHERE s.supersedes=h.charge_key) WHERE m.event_key IN (SELECT event_key FROM usage_event WHERE {filter}) ORDER BY m.event_key,m.role,m.unit")
+    format!(
+        "SELECT m.event_key,m.role,m.unit,m.source,m.quantity_units,m.quantity_exponent,
+         CASE WHEN {DERIVED_UNPRICED_SQL} THEN 'unpriced' ELSE h.outcome END,{quantity}
+         FROM measurement m JOIN usage_event e ON e.event_key=m.event_key
+         LEFT JOIN priced_charge h ON h.event_key=m.event_key AND h.role=m.role AND h.unit=m.unit
+         AND NOT EXISTS(SELECT 1 FROM priced_charge s WHERE s.supersedes=h.charge_key)
+         WHERE m.event_key IN (SELECT event_key FROM usage_event WHERE {filter})
+         ORDER BY m.event_key,m.role,m.unit"
+    )
 }
 
 fn reduce_with_book(

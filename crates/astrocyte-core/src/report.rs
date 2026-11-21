@@ -34,6 +34,20 @@ use crate::subscription::{plan_lookup_key, recurring_cost_nanos, PlanLedger, Sub
 
 const INGEST_FRESHNESS_REASON: &str = "producer_relationship_state_unavailable";
 
+// Use with the event (e), measurement (m), and a left join to its current head (h).
+pub(crate) const DERIVED_UNPRICED_SQL: &str =
+    "e.charge_basis='unknown' AND m.kind<>'observed' AND h.charge_key IS NULL";
+
+pub(crate) const DERIVED_UNKNOWN_CHARGE: DerivedCharge = DerivedCharge {
+    outcome: "unpriced",
+    unpriced_reason: crate::pricing::UnpricedReason::ChargeBasisUnknown.as_str(),
+    source: "the call's recorded charge basis",
+};
+
+fn derived_unpriced(basis: ChargeBasis, observed: bool, has_head: bool) -> Option<DerivedCharge> {
+    (basis == ChargeBasis::Unknown && !observed && !has_head).then_some(DERIVED_UNKNOWN_CHARGE)
+}
+
 // On the 6.5 GiB store copy, a 2 GiB mapping and 64 MiB page cache cut the
 // release parity harness's subscription scan from 10.7s to 5.3s and the
 // month spend scan from 106.5s to 95.6s under heavy host load. Mapping is
@@ -565,9 +579,11 @@ struct LedgerEvent {
     /// Only billed measurements participate in the pricing verdict.
     measurements: u32,
     observed_measurements: u32,
-    /// Measurements that have a current charge head, i.e. that some pricing
-    /// pass has examined.
+    /// Measurements with a stored or derived charge decision.
     examined: u32,
+    /// Possible derived declines, and the subset whose stated quantity is zero.
+    /// Real heads cancel these candidates as they are read.
+    derived: (u32, u32),
     /// True when at least one billed measurement states a quantity of exactly zero;
     /// only such events need the per-measurement zero lookup.
     has_stated_zero: bool,
@@ -585,6 +601,28 @@ struct LedgerEvent {
 }
 
 impl LedgerEvent {
+    fn observe_declines(
+        &mut self,
+        reason: u32,
+        count: u64,
+        blocks: bool,
+    ) -> Result<(), ReportError> {
+        match self.declined.iter_mut().find(|(id, _)| *id == reason) {
+            Some((_, previous)) => add_count(previous, count)?,
+            None => self.declined.push((reason, count)),
+        }
+        if blocks {
+            // Stored reasons are a closed list, so a well-formed store fits the mask.
+            if reason >= 64 {
+                return Err(ReportError::Integrity(
+                    "decline reasons exceed the ledger reason mask",
+                ));
+            }
+            self.blocking_reasons |= 1_u64 << reason;
+        }
+        Ok(())
+    }
+
     fn measurement_rows(&self) -> u64 {
         u64::from(self.measurements) + u64::from(self.observed_measurements)
     }
@@ -930,6 +968,7 @@ fn load_scoped_ledger_bound(
             measurements: 0,
             observed_measurements: 0,
             examined: 0,
+            derived: (0, 0),
             has_stated_zero: false,
             blocking_reasons: 0,
             declined: Vec::new(),
@@ -977,7 +1016,8 @@ fn load_scoped_ledger_bound(
             measurements_total = measurements_total
                 .checked_add(1)
                 .ok_or(ReportError::Arithmetic)?;
-            if required_text_column(row, 4)? == "observed" {
+            let observed = required_text_column(row, 4)? == "observed";
+            if observed {
                 event.observed_measurements = event
                     .observed_measurements
                     .checked_add(1)
@@ -988,7 +1028,12 @@ fn load_scoped_ledger_bound(
                 .measurements
                 .checked_add(1)
                 .ok_or(ReportError::Arithmetic)?;
-            if row.get::<_, Option<i64>>(3)? == Some(0) {
+            let stated = row.get::<_, Option<i64>>(3)? == Some(0);
+            if derived_unpriced(event.charge_basis, observed, false).is_some() {
+                event.derived.0 += 1; // Bounded by the checked billed measurement count.
+                event.derived.1 += u32::from(stated);
+            }
+            if stated {
                 event.has_stated_zero = true;
                 stated_zero.insert((
                     position,
@@ -1024,6 +1069,11 @@ fn load_scoped_ledger_bound(
     let mut oldest_resolved_at_ms: Option<i64> = None;
     {
         let mut lookup = EventLookup::new(&index);
+        // Both large scans stay sequential. Only heads on mixed observed/billed
+        // unknown-basis calls need to look up which kind they belong to.
+        let mut kind = conn.prepare_cached(
+            "SELECT kind FROM measurement WHERE event_key=?1 AND role=?2 AND unit=?3",
+        )?;
         let mut statement = conn.prepare(&format!(
             "SELECT event_key,role,unit,outcome,charge_nanos,unpriced_reason,resolved_at_ms,
                     charge_key
@@ -1043,6 +1093,28 @@ fn load_scoped_ledger_bound(
             let unpriced_reason = text_column(row, 5)?;
             let resolved_at_ms: Option<i64> = row.get(6)?;
             let event = &mut events[position];
+            let is_stated_zero = event.has_stated_zero
+                && match (
+                    roles.get(required_text_column(row, 1)?),
+                    units.get(required_text_column(row, 2)?),
+                ) {
+                    (Some(role), Some(unit)) => stated_zero.contains(&(position, role, unit)),
+                    _ => false,
+                };
+            if event.derived.0 != 0
+                && (event.observed_measurements == 0
+                    || kind.query_row(
+                        params![
+                            event.key,
+                            required_text_column(row, 1)?,
+                            required_text_column(row, 2)?
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )? != "observed")
+            {
+                event.derived.0 -= 1;
+                event.derived.1 -= u32::from(is_stated_zero);
+            }
             event.examined = event
                 .examined
                 .checked_add(1)
@@ -1074,37 +1146,25 @@ fn load_scoped_ledger_bound(
                 "covered" => add_count(&mut event.covered_measurements, 1)?,
                 _ => {
                     let reason = reasons.intern(declined_reason(unpriced_reason))?;
-                    match event
-                        .declined
-                        .iter_mut()
-                        .find(|(declined, _)| *declined == reason)
-                    {
-                        Some((_, count)) => add_count(count, 1)?,
-                        None => event.declined.push((reason, 1)),
-                    }
-                    let is_stated_zero = event.has_stated_zero
-                        && match (
-                            roles.get(required_text_column(row, 1)?),
-                            units.get(required_text_column(row, 2)?),
-                        ) {
-                            (Some(role), Some(unit)) => {
-                                stated_zero.contains(&(position, role, unit))
-                            }
-                            _ => false,
-                        };
-                    if blocks_event_total(Some(outcome), is_stated_zero) {
-                        // The unpriced_reason column is closed by a CHECK to a
-                        // short list, so the mask cannot run out of bits on a
-                        // well-formed store.
-                        if reason >= 64 {
-                            return Err(ReportError::Integrity(
-                                "decline reasons exceed the ledger reason mask",
-                            ));
-                        }
-                        event.blocking_reasons |= 1_u64 << reason;
-                    }
+                    event.observe_declines(
+                        reason,
+                        1,
+                        blocks_event_total(Some(outcome), is_stated_zero),
+                    )?;
                 }
             }
+        }
+    }
+
+    for event in &mut events {
+        let (count, zero) = event.derived;
+        if count != 0 {
+            event.examined = event
+                .examined
+                .checked_add(count)
+                .ok_or(ReportError::Arithmetic)?;
+            let reason = reasons.intern(DERIVED_UNKNOWN_CHARGE.unpriced_reason)?;
+            event.observe_declines(reason, u64::from(count), count != zero)?;
         }
     }
 
@@ -2519,6 +2579,15 @@ pub struct ExplainedCharge {
 pub struct ExplainedMeasurement {
     pub measurement: Measurement,
     pub charges: Vec<ExplainedCharge>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_charge: Option<DerivedCharge>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DerivedCharge {
+    pub outcome: &'static str,
+    pub unpriced_reason: &'static str,
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2562,7 +2631,7 @@ pub fn explain_charge(
     let event = load_event(conn, &request.event_id)?.ok_or_else(|| {
         ReportError::Refused(ReportRefusal::EventNotFound(request.event_id.clone()))
     })?;
-    let measurements = load_explained_measurements(conn, &request.event_id)?;
+    let measurements = load_explained_measurements(conn, &request.event_id, event.charge_basis)?;
     let adjustments = load_explained_adjustments(conn, &request.event_id)?;
     let transition = conn
         .query_row(
@@ -2591,6 +2660,7 @@ pub fn explain_charge(
 fn load_explained_measurements(
     conn: &Connection,
     event_id: &str,
+    basis: ChargeBasis,
 ) -> Result<Vec<ExplainedMeasurement>, ReportError> {
     let mut measurement_statement = conn.prepare(
         "SELECT event.event_id,m.role,m.unit,m.kind,m.source,m.quantity_units,m.quantity_exponent,m.event_key
@@ -2649,6 +2719,11 @@ fn load_explained_measurements(
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         output.push(ExplainedMeasurement {
+            derived_charge: derived_unpriced(
+                basis,
+                measurement.kind == "observed",
+                charges.iter().any(|charge| charge.current),
+            ),
             measurement,
             charges,
         });
@@ -2886,6 +2961,61 @@ mod tests {
             100,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn unknown_basis_derived_and_stored_heads_have_identical_coverage() {
+        let legacy = conn();
+        let headless = conn();
+        for db in [&legacy, &headless] {
+            event(db, "unknown", None, Some(100), "unknown");
+            measurement(db, "unknown", "input", "token", 2);
+            measurement(db, "unknown", "output", "token", 0);
+            observed_measurement(db, "unknown", 12);
+        }
+        for role in ["input", "output"] {
+            unpriced_head(&legacy, "unknown", role, "token", "charge_basis_unknown");
+        }
+        let coverage = |db| {
+            let reply = ledger_coverage_base(db, &LedgerCoverageRequest {}, 100).unwrap();
+            serde_json::to_vec(&reply).unwrap()
+        };
+        assert_eq!(coverage(&legacy), coverage(&headless));
+    }
+
+    #[test]
+    fn unknown_basis_stored_head_wins_even_with_another_headless_measurement() {
+        let conn = conn();
+        event(&conn, "mixed", None, None, "unknown");
+        measurement(&conn, "mixed", "input", "token", 2);
+        measurement(&conn, "mixed", "output", "token", 0);
+        unpriced_head(&conn, "mixed", "input", "token", "undated_event");
+        let coverage = ledger_coverage_base(&conn, &LedgerCoverageRequest {}, 100).unwrap();
+        assert_eq!(
+            coverage.unpriced_measurements_by_reason,
+            BTreeMap::from([
+                ("charge_basis_unknown".into(), 1),
+                ("undated_event".into(), 1),
+            ])
+        );
+        let explained = explain_charge(
+            &conn,
+            &ChargeExplainRequest {
+                event_id: "mixed".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            explained.measurements[0].charges[0]
+                .unpriced_reason
+                .as_deref(),
+            Some("undated_event")
+        );
+        assert!(explained.measurements[0].derived_charge.is_none());
+        assert_eq!(
+            explained.measurements[1].derived_charge,
+            Some(DERIVED_UNKNOWN_CHARGE)
+        );
     }
 
     #[test]
@@ -3264,7 +3394,7 @@ mod tests {
             )
         };
         assert_eq!(registered, rusqlite::ffi::SQLITE_OK);
-        let measurements = load_explained_measurements(&conn, "explain");
+        let measurements = load_explained_measurements(&conn, "explain", ChargeBasis::MeteredApi);
         let removed =
             unsafe { rusqlite::ffi::sqlite3_set_authorizer(handle, None, std::ptr::null_mut()) };
         assert_eq!(removed, rusqlite::ffi::SQLITE_OK);
@@ -3392,7 +3522,8 @@ mod tests {
         }
         let start = Instant::now();
         for _ in 0..20 {
-            let measurements = load_explained_measurements(&conn, "explain").unwrap();
+            let measurements =
+                load_explained_measurements(&conn, "explain", ChargeBasis::MeteredApi).unwrap();
             assert_eq!(measurements.len(), 1000);
             assert!(measurements
                 .iter()

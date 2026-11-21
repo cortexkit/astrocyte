@@ -68,6 +68,232 @@ fn request(extra: serde_json::Value) -> ReportRequest {
     serde_json::from_value(value).unwrap()
 }
 
+fn basis_parity_store(stored: bool) -> (Connection, String, String) {
+    let mut db = conn();
+    plan(&db, PlanLedger::Account, "provider", "account", 0, None);
+    let record = |db: &mut Connection, id: &str, at: i64, input: i64| {
+        let mut request: ingest::EventRecordRequest = serde_json::from_value(json!({
+            "producer":"opencode", "producer_ref":id, "provider":"provider", "model":"a",
+            "account_ref":"account", "harness":"opencode", "session":"session-a",
+            "occurred_at_ms":at, "charge_basis":"unknown",
+            "measurements":[
+                {"role":"input","unit":"token","kind":"billed","source":"fixture","quantity_units":input,"quantity_exponent":0},
+                {"role":"output","unit":"token","kind":"billed","source":"fixture","quantity_units":0,"quantity_exponent":0},
+                {"role":"duration","unit":"second","kind":"observed","source":"fixture","quantity_units":1,"quantity_exponent":0}]
+        })).unwrap();
+        request.runner = Some("thalamus".into());
+        ingest::record_event(db, &request, 1).unwrap().event_id
+    };
+    let unknown = record(&mut db, "unknown", 1, 12);
+    let zero = record(&mut db, "zero", 2, 0);
+    let corrected = record(&mut db, "corrected", HOUR_MS + 1, 42);
+    for id in [&unknown, &zero] {
+        // Removing a redundant head does not rewrite the event's generation.
+        db.execute(
+            "UPDATE usage_event SET pricing_generation=1 WHERE event_id=?1",
+            [id],
+        )
+        .unwrap();
+        if stored {
+            db.execute("INSERT INTO priced_charge(event_key,role,unit,pricing_generation,outcome,charge_basis,basis_covered,unpriced_reason,origin,recorded_at_ms)
+                        SELECT m.event_key,m.role,m.unit,1,'unpriced','unknown',0,'charge_basis_unknown','pricing_pass',1
+                        FROM measurement m JOIN usage_event e USING(event_key) WHERE e.event_id=?1 AND m.kind='billed'", [id]).unwrap();
+        }
+    }
+    let plan = crate::subscription::read_basis_correction(
+        &db,
+        &ingest::BasisCorrectRequest {
+            event_id: corrected.clone(),
+            corrected_basis: ChargeBasis::SubscriptionIncluded,
+            reason: "payer evidence".into(),
+        },
+    )
+    .unwrap();
+    let resolved = crate::subscription::resolve_reprice_without_catalog(&plan).unwrap();
+    let tx = db.transaction().unwrap();
+    ingest::correct_basis_in_tx(&tx, &plan, &resolved, 2).unwrap();
+    tx.commit().unwrap();
+
+    facts(&mut db);
+    rate(&db, "a", 1_000_000_000);
+    (db, unknown, corrected)
+}
+
+fn same_bytes<T: Serialize>(left: T, right: T) {
+    assert_eq!(
+        serde_json::to_string(&left).unwrap(),
+        serde_json::to_string(&right).unwrap()
+    );
+}
+
+#[test]
+fn unknown_basis_derived_and_stored_heads_have_identical_reader_replies() {
+    use crate::{multiplier, runs, verdict};
+    let (mut legacy, unknown, corrected) = basis_parity_store(true);
+    let (mut headless, _, _) = basis_parity_store(false);
+    let config = config();
+    let read = |old: &Connection, new: &Connection, rebuilt: bool| {
+        for (group, zone) in [
+            (json!([]), "UTC"),
+            (
+                json!(["provider", "model", "charge_basis"]),
+                "Asia/Kathmandu",
+            ),
+            (json!(["harness", "work_class"]), "America/New_York"),
+        ] {
+            let request = request(json!({"grouping":group, "timezone":zone}));
+            same_bytes(
+                spend_report(old, &request, DAY_MS).unwrap(),
+                spend_report(new, &request, DAY_MS).unwrap(),
+            );
+            same_bytes(
+                spend_report_base(old, &request, DAY_MS, None).unwrap(),
+                spend_report_base(new, &request, DAY_MS, None).unwrap(),
+            );
+        }
+        same_bytes(
+            ledger_coverage(old, &LedgerCoverageRequest {}, DAY_MS).unwrap(),
+            ledger_coverage(new, &LedgerCoverageRequest {}, DAY_MS).unwrap(),
+        );
+        same_bytes(
+            work_class_report(old, &WorkClassReportRequest {}).unwrap(),
+            work_class_report(new, &WorkClassReportRequest {}).unwrap(),
+        );
+        same_bytes(
+            subscription_report(old, &SubscriptionReportRequest {}).unwrap(),
+            subscription_report(new, &SubscriptionReportRequest {}).unwrap(),
+        );
+        let verdict = serde_json::from_value(json!({})).unwrap();
+        same_bytes(
+            verdict::evaluate(old, &verdict).unwrap(),
+            verdict::evaluate(new, &verdict).unwrap(),
+        );
+        same_bytes(
+            verdict::evaluate_base(old, &verdict).unwrap(),
+            verdict::evaluate_base(new, &verdict).unwrap(),
+        );
+        let list = runs::ListRequest {
+            from_ms: 0,
+            to_ms: DAY_MS,
+            harness: None,
+            limit: None,
+            after: None,
+        };
+        let detail = runs::DetailRequest {
+            key: runs::RunKey::Session {
+                harness: "opencode".into(),
+                session: "session-a".into(),
+            },
+            limit: None,
+            after: None,
+        };
+        let listed = runs::list(new, &list).unwrap();
+        assert!(!listed.rows.is_empty());
+        same_bytes(runs::list(old, &list).unwrap(), listed);
+        same_bytes(
+            runs::detail(old, &detail).unwrap(),
+            runs::detail(new, &detail).unwrap(),
+        );
+        if rebuilt {
+            for grouping in [json!(["alfonso"]), json!(["plan"])] {
+                let request = request(json!({"grouping":grouping}));
+                let derived = spend_report(new, &request, DAY_MS).unwrap();
+                assert!(!derived.rows.is_empty());
+                same_bytes(spend_report(old, &request, DAY_MS).unwrap(), derived);
+            }
+        }
+    };
+    read(&legacy, &headless, false);
+    let explain = |db, id: &str| {
+        explain_charge(
+            db,
+            &ChargeExplainRequest {
+                event_id: id.into(),
+            },
+        )
+        .unwrap()
+    };
+    let mut old = explain(&legacy, &unknown);
+    let mut new = explain(&headless, &unknown);
+    for (recorded, derived) in old.measurements.iter_mut().zip(&mut new.measurements) {
+        let wire = serde_json::to_value(&*derived).unwrap();
+        if recorded.measurement.kind == "observed" {
+            assert!(wire.get("derived_charge").is_none());
+        } else {
+            assert_eq!(recorded.charges.len(), 1);
+            assert!(derived.charges.is_empty());
+            assert_eq!(
+                wire["derived_charge"],
+                json!({"outcome":"unpriced", "unpriced_reason":"charge_basis_unknown", "source":"the call's recorded charge basis"})
+            );
+        }
+        recorded.charges.clear();
+        derived.derived_charge = None;
+    }
+    same_bytes(old, new);
+    let corrected_reply = explain(&headless, &corrected);
+    assert_eq!(
+        corrected_reply.event.charge_basis,
+        ChargeBasis::SubscriptionIncluded
+    );
+    assert!(corrected_reply
+        .measurements
+        .iter()
+        .all(|row| row.derived_charge.is_none()));
+    assert_eq!(
+        corrected_reply
+            .measurements
+            .iter()
+            .flat_map(|row| &row.charges)
+            .map(|charge| (charge.outcome.as_str(), charge.origin.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("covered", "basis_correction"),
+            ("covered", "basis_correction")
+        ]
+    );
+    same_bytes(explain(&legacy, &corrected), corrected_reply);
+
+    for db in [&mut legacy, &mut headless] {
+        summaries(db);
+        assert!(!drain(db, &config).is_empty());
+    }
+    read(&legacy, &headless, true);
+    for table in [
+        "summary_cell",
+        "summary_quantity",
+        "summary_money",
+        "summary_run_cell",
+        "valuation_cell",
+        "attribution_cell",
+        "attribution_valuation_cell",
+    ] {
+        let cells = |db: &Connection| {
+            let mut stmt = db
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2,3"))
+                .unwrap();
+            let width = stmt.column_count();
+            stmt.query_map([], |row| {
+                (0..width)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let derived = cells(&headless);
+        assert!(!derived.is_empty(), "{table}");
+        assert_eq!(cells(&legacy), derived, "{table}");
+    }
+    let inputs = |db| multiplier::plan_observation(db, &config, "pool", 0, DAY_MS).unwrap();
+    let derived = inputs(&headless);
+    assert!(derived
+        .models
+        .contains(&("provider".into(), Some("a".into()))));
+    assert_eq!(inputs(&legacy), derived);
+}
+
 #[test]
 fn attribution_report_real_split_rows_keep_unattributed_and_all_metric_totals() {
     let mut conn = conn();

@@ -78,9 +78,10 @@ pub(crate) fn evaluate_base(
     // Split signed amounts into base-2^32 limbs before summing so an intermediate
     // total above i64 can still be cancelled by refunds, then narrow only once.
     const LIMB_BASE: i128 = 4_294_967_296;
-    let mut statement = conn.prepare(
+    use crate::report::DERIVED_UNPRICED_SQL;
+    let mut statement = conn.prepare(&format!(
         "WITH events AS MATERIALIZED (
-            SELECT event_key,currency FROM usage_event
+            SELECT event_key,currency,charge_basis FROM usage_event
             WHERE (?1 IS NULL OR project_root=?1)
               AND (?2 IS NULL OR provider=?2)
               AND (?3 IS NULL OR model=?3)
@@ -94,10 +95,17 @@ pub(crate) fn evaluate_base(
             SELECT event_key,MAX(outcome='unpriced') AS unpriced
             FROM heads GROUP BY event_key
         ), contributions AS (
-            SELECT events.currency,NULL AS amount_nanos,1 AS events_total,
+            SELECT e.currency,NULL AS amount_nanos,1 AS events_total,
                    CASE WHEN head_state.event_key IS NULL OR head_state.unpriced=1
+                         OR (e.charge_basis='unknown' AND EXISTS (
+                             SELECT 1 FROM measurement m
+                             LEFT JOIN priced_charge h ON h.event_key=m.event_key
+                                 AND h.role=m.role AND h.unit=m.unit
+                                 AND NOT EXISTS (SELECT 1 FROM priced_charge child WHERE child.supersedes=h.charge_key)
+                             WHERE m.event_key=e.event_key AND {DERIVED_UNPRICED_SQL}
+                         ))
                         THEN 1 ELSE 0 END AS unpriced_events
-            FROM events LEFT JOIN head_state ON head_state.event_key=events.event_key
+            FROM events e LEFT JOIN head_state ON head_state.event_key=e.event_key
             UNION ALL
             SELECT currency,charge_nanos,0,0 FROM heads WHERE charge_nanos IS NOT NULL
             UNION ALL
@@ -106,8 +114,8 @@ pub(crate) fn evaluate_base(
         )
         SELECT currency,SUM(amount_nanos / 4294967296),SUM(amount_nanos % 4294967296),
                SUM(events_total),SUM(unpriced_events)
-        FROM contributions GROUP BY currency",
-    )?;
+         FROM contributions GROUP BY currency"
+    ))?;
     let rows = statement.query_map(
         params![request.project_root, request.provider, request.model],
         |row| {

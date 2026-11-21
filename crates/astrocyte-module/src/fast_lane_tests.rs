@@ -901,10 +901,17 @@ fn fast_lane_event_bytes_match_full_drain() {
         "step_detail",
         "pricing_pending",
     ] {
-        assert!(
-            !rows(&fast, table).is_empty(),
-            "fixture must exercise {table}"
-        );
+        if table == "pricing_pending" {
+            assert!(
+                rows(&fast, table).is_empty(),
+                "none of these calls has a known basis"
+            );
+        } else {
+            assert!(
+                !rows(&fast, table).is_empty(),
+                "fixture must exercise {table}"
+            );
+        }
         assert_eq!(
             rows(&fast, table),
             rows(&full, table),

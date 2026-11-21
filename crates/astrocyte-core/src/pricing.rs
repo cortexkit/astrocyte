@@ -89,7 +89,7 @@ const CATALOG_COVERAGE_GAPS: &[(&str, UnpricedReason, &str, i64)] = &[(
 )];
 
 impl UnpricedReason {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::UndatedEvent => "undated_event",
             Self::ChargeBasisUnknown => "charge_basis_unknown",
@@ -950,9 +950,11 @@ macro_rules! billed_measurement_has_no_head {
     };
 }
 
-/// True when event `?1` has a billed measurement needing a current charge head.
+/// True when event `?1` needs automatic pricing for a headless billed measurement.
 const EVENT_HAS_HEADLESS_BILLED_MEASUREMENT: &str = concat!(
-    "EXISTS (SELECT 1 FROM measurement WHERE measurement.event_key = (SELECT event_key FROM usage_event WHERE event_id=?1) AND ",
+    "EXISTS (SELECT 1 FROM measurement WHERE measurement.event_key = (
+       SELECT event_key FROM usage_event WHERE event_id=?1 AND charge_basis <> 'unknown'
+     ) AND ",
     billed_measurement_has_no_head!(),
     ")"
 );
@@ -975,7 +977,7 @@ pub fn enqueue_if_unpriced_in_tx(conn: &Connection, event_id: &str) -> rusqlite:
 }
 
 /// Remove a queued event only when no billed measurement still needs a head.
-/// Observed readings never need heads, so an observed-only event can leave too.
+/// Observed readings and calls with unknown basis never need automatic heads.
 /// Call inside the pricing write transaction to recheck the current measurements.
 pub fn dequeue_if_fully_headed(conn: &Connection, event_id: &str) -> rusqlite::Result<usize> {
     conn.execute(
@@ -1097,9 +1099,10 @@ pub fn reconcile_pending_range_in_tx(
             "INSERT OR IGNORE INTO pricing_pending (event_key)
              SELECT DISTINCT measurement.event_key
              FROM usage_event event JOIN measurement USING(event_key)
-             WHERE event.event_id {lower} ?1
-               {upper}
-               AND {headless}"
+              WHERE event.event_id {lower} ?1
+                {upper}
+                AND event.charge_basis <> 'unknown'
+                AND {headless}"
         ),
         params![lower_value, through],
     )
@@ -4024,9 +4027,8 @@ mod tests {
     /// measurement to appear between reading the plan and committing it; the
     /// test inserts one there directly. That commit must leave the event
     /// queued, since one of its measurements still needs pricing. The next
-    /// commit heads that one and takes the event out. An unpriced head counts
-    /// as a head: the event recorded with an unknown basis leaves the queue on
-    /// its first commit even though nothing was priced.
+    /// commit heads that one and takes the event out. A stored unpriced head
+    /// also takes a known-basis event out of the queue.
     #[test]
     fn pricing_the_last_headless_measurement_dequeues_and_a_partially_headed_event_stays() {
         let mut conn = conn();
@@ -4037,14 +4039,14 @@ mod tests {
             Some(777),
             vec![measurement("input", Some(1_000_000))],
         );
-        let unknown = record(
+        let declined = record(
             &mut conn,
-            "unknown-basis",
-            ChargeBasis::Unknown,
+            "catalog-unconfigured",
+            ChargeBasis::MeteredApi,
             Some(777),
             vec![measurement("input", Some(1_000_000))],
         );
-        let mut expected = vec![partial.clone(), unknown.clone()];
+        let mut expected = vec![partial.clone(), declined.clone()];
         expected.sort();
         assert_eq!(queued(&conn), expected);
 
@@ -4082,7 +4084,7 @@ mod tests {
             "heading the last headless measurement dequeues the event"
         );
 
-        let plan = read_reprice(&conn, &unknown).unwrap();
+        let plan = read_reprice(&conn, &declined).unwrap();
         let resolved = resolve_reprice_without_catalog(&plan).unwrap();
         let tx = conn.transaction().unwrap();
         commit_reprice_in_tx(&tx, &plan, &resolved, 1_000, PricingOrigin::PricingPass).unwrap();

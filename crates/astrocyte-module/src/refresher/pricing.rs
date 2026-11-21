@@ -262,6 +262,10 @@ fn resolve_event<'a>(
             ) => EventResolutionError::NoMeasurementsToPrice,
             error => EventResolutionError::Failed(format!("{}: {}", error.code(), error.message())),
         })?;
+    // A queue row left by an older binary is not a request to reprice by hand.
+    if plan.charge_basis() == astrocyte_core::fact::ChargeBasis::Unknown {
+        return Err(EventResolutionError::NoMeasurementsToPrice);
+    }
     if deadline.is_some_and(|deadline| now() >= deadline) {
         return Ok(None);
     }
@@ -1123,6 +1127,38 @@ pub(super) mod tests {
                 Ok((outcome.event_id, true))
             })
             .unwrap()
+    }
+
+    #[test]
+    fn unknown_basis_never_queues_or_writes_automatic_charge_heads() {
+        let state = test_state();
+        let id = "unknown-basis";
+        seed_account_event(&state, id, 1_800_000_000_000, "unknown", "claude");
+        let after_recording = queued_event_ids(&state);
+        let reconciled = state.ordered_write(|tx| {
+            tx.execute("DELETE FROM pricing_pending", []).map_err(|error| error.to_string())?;
+            let reconciled = astrocyte_core::pricing::reconcile_pending_range_in_tx(tx, None, None)
+                .map_err(|error| error.to_string())?;
+            tx.execute("INSERT OR IGNORE INTO pricing_pending (event_key) SELECT event_key FROM usage_event WHERE event_id=?1", [id])
+                .map_err(|error| error.to_string())?;
+            Ok((reconciled, true))
+        }).unwrap();
+        let pass = run_pricing_pass(&state, 1_800_000_000_300, &NEVER_STOP).unwrap();
+        assert!(after_recording.is_empty());
+        assert_eq!(reconciled, 0);
+        assert_eq!(pass.priced, 0);
+        assert!(queued_event_ids(&state).is_empty());
+        assert_eq!(priced_charge_rows(&state), 0);
+        let reprice = crate::ops::dispatch(
+            &state,
+            "spend.event.reprice",
+            serde_json::json!({"event_id": id}),
+        );
+        assert!(reprice.is_ok(), "{reprice:?}");
+        assert_eq!(
+            charge_rows_by_origin(&state, id),
+            [("operator_reprice".into(), 1)]
+        );
     }
 
     #[test]
@@ -2057,7 +2093,7 @@ pub(super) mod tests {
                         tx,
                         &format!("ev-{ordinal:05}"),
                         1_800_000_000_000,
-                        "unknown",
+                        "metered_api",
                         "claude",
                     )?;
                 }
@@ -2087,7 +2123,7 @@ pub(super) mod tests {
                         tx,
                         &format!("ev-{ordinal:02}"),
                         1_800_000_000_000,
-                        "unknown",
+                        "metered_api",
                         "claude",
                     )?;
                 }
@@ -2507,7 +2543,7 @@ pub(super) mod tests {
                             tx,
                             &format!("ev-{ordinal:05}"),
                             1_800_000_000_000,
-                            "unknown",
+                            "metered_api",
                             "claude",
                         )?;
                     }
