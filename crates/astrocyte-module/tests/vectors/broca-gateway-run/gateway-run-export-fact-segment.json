@@ -1,0 +1,31 @@
+{
+  "run_id": "gateway",
+  "session": {
+    "project_root": "/motor-home/tmp/broca-tests/1134-000000000000000018e9f3206580aea1/broca-vault-gateway-key-1134",
+    "harness": "test",
+    "session": "session"
+  },
+  "segment_ordinal": 0,
+  "fact_id": "24ad6360fe7570884a15d9c6a0ac5d2ba090483f0e3c3a208c4b7a75ce2caf15",
+  "provider": "anthropic",
+  "model": "claude-haiku-4-5",
+  "auth_selection": "gateway:anthropic-gw-acme",
+  "resolved_credential_id": "apikey:anthropic-gw-acme",
+  "vault_request": {
+    "min_ttl_ms": 600000,
+    "op": "get_scoped"
+  },
+  "charge_basis": "unknown",
+  "charge_basis_mapping_version": 5,
+  "charge_basis_overrides": "none",
+  "usage": {
+    "input_tokens": 1,
+    "output_tokens": 1
+  },
+  "retries_used": 0,
+  "pricing_at_ms": 1795233246984,
+  "pricing_at_precision": "exact",
+  "occurred_at_ms": 1795233247011,
+  "occurred_at_precision": "terminal",
+  "terminal_reason": "completed"
+}

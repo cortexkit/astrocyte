@@ -1,0 +1,10 @@
+POST /v1/messages HTTP/1.1
+anthropic-version: 2023-06-01
+content-type: application/json
+accept: application/json
+user-agent: broca/0.4.85
+authorization: Bearer gateway-key
+x-team: engineering
+host: 127.0.0.1:42795
+content-length: 181
+

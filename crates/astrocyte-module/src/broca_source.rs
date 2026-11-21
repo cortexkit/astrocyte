@@ -1421,6 +1421,56 @@ mod tests {
         );
     }
 
+    /// A run through a company gateway key records the Anthropic call it served,
+    /// the gateway login it was routed through and the gateway key that paid. Its
+    /// charge basis stays as broca's mapping states it.
+    #[test]
+    fn broca_gateway_run_records_the_gateway_credential() {
+        let wire =
+            include_str!("../tests/vectors/broca-gateway-run/gateway-run-export-fact-segment.json");
+        let fact = "24ad6360fe7570884a15d9c6a0ac5d2ba090483f0e3c3a208c4b7a75ce2caf15";
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("run-index.db");
+        create_store(&path, "instance-a", 1);
+        add_segment(&path, 1, fact, wire.trim_end());
+        let state = test_state();
+        let outcome =
+            drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
+        assert_eq!(outcome.events_recorded, 1);
+        assert!(set_aside_rows(&state).is_empty());
+        state
+            .with_conn(|conn| {
+                let row: (String, String, String, String, Option<String>) = conn
+                    .query_row(
+                        "SELECT provider,model,charge_basis,auth_selection,resolved_credential
+                     FROM usage_event WHERE producer='broca' AND producer_ref=?1",
+                        [fact],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(
+                    row,
+                    (
+                        "anthropic".into(),
+                        "claude-haiku-4-5".into(),
+                        "unknown".into(),
+                        "gateway:anthropic-gw-acme".into(),
+                        Some("apikey:anthropic-gw-acme".into()),
+                    )
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[test]
     fn broca_pool_route_records_the_paying_credential() {
         let wire =
