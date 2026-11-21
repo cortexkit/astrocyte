@@ -46,11 +46,11 @@ fn decode_listing(value: Value, now: i64) -> Snapshot {
     if !listing.undecodable_credentials.is_empty() || !listing.undecodable_grants.is_empty() {
         return Err("invalid_listing".into());
     }
-    if !listing.grant_tuples.iter().any(|grant| {
-        grant.selector_kind == "category"
-            && grant.selector == "llm-provider"
-            && grant.operation == "list"
-    }) {
+    if !listing
+        .grant_tuples
+        .iter()
+        .any(|grant| grant.operation == "list")
+    {
         return Err("list_grant_missing".into());
     }
     let raw = value["result"]["credentials"]

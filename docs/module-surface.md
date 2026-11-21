@@ -1278,7 +1278,8 @@ stored unpriced with reason `catalog_unconfigured`; with no QTA connection,
 capacity is `disabled`.
 
 Claustrum uses the module's daemon connection and launch identity, as colliculus
-does, under `reserved:astrocyte`'s category `llm-provider` `list` grant. No `read`
+does, under `reserved:astrocyte`'s `list` grants on the `llm-provider` category or
+on exact credential IDs. Astrocyte uses only `llm-provider` records. No `read`
 grant or `credential.get_scoped` call is needed. The published
 `cortexkit-claustrum-client` 0.9.0 decoder and watch types validate replies;
 Astrocyte's SDK consumer connections use the serving connection's claim when

@@ -48,7 +48,8 @@ latest row before the end, and a counter's reading range stops at its first
 reading after the interval rather than reading all later history.
 
 The vault reader uses only `credential.list_scoped` and `auth.watch_scoped`
-under the reserved module's `list` grant on `llm-provider`; it never fetches
+under the reserved module's `list` grants on the `llm-provider` category or on
+exact credential IDs. It uses only `llm-provider` records and never fetches
 secrets. It lists at startup, after every notice and daily as a backstop.
 `unknown_method` on the watch switches to polling on full ticks only. Network
 work runs outside startup and recording transactions, and a notice's new plan

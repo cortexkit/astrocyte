@@ -959,6 +959,17 @@ fn key_only_listing(credentials: &[(&str, &str)], observed: i64) -> Value {
         "view":"opaque"}})
 }
 
+fn exact_listing(credentials: &[(&str, &str)], observed: i64) -> Value {
+    let mut reply = key_only_listing(credentials, observed);
+    let grants: Vec<Value> = credentials
+        .iter()
+        .map(|(id, _)| json!({"selector_kind":"exact","selector":id,"operation":"list"}))
+        .collect();
+    reply["result"]["grants"] = json!(grants.len());
+    reply["result"]["grant_tuples"] = json!(grants);
+    reply
+}
+
 /// Records an account-less subscription call with the stated credential facts,
 /// the way the BROCA store reader does: `resolved_credential` is not part of the
 /// pushed ingest operation's schema.
@@ -996,6 +1007,126 @@ type CredentialRow = (String, String, i64, Option<i64>, i64, Option<String>);
 fn credential_plans(state: &SharedState) -> Vec<CredentialRow> {
     state.with_conn(|conn| conn.prepare("SELECT credential_ref,plan_name,effective_from_ms,effective_to_ms,recurring_cost_minor,operator FROM credential_subscription ORDER BY credential_ref,effective_from_ms")
         .and_then(|mut stmt| stmt.query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))?.collect()).map_err(|e|e.to_string())).unwrap()
+}
+
+#[test]
+fn vault_exact_list_grants_record_both_plans() {
+    let state = test_state();
+    ingest_key(&state, "first", 10, Some("apikey:one"), None);
+    ingest_key(&state, "second", 20, Some("apikey:two"), None);
+    let mut stage = stage();
+    stage.apply(
+        &state,
+        vec![decode_listing(
+            exact_listing(&[("apikey:one", "go"), ("apikey:two", "pro")], 100),
+            101,
+        )],
+        Some(&Prices(vec![("go", 1_000), ("pro", 3_000)])),
+        101,
+    );
+    assert_eq!(
+        credential_plans(&state),
+        vec![
+            (
+                "apikey:one".into(),
+                "openai/go".into(),
+                10,
+                None,
+                1_000,
+                Some("vault".into()),
+            ),
+            (
+                "apikey:two".into(),
+                "openai/pro".into(),
+                20,
+                None,
+                3_000,
+                Some("vault".into()),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn vault_exact_grant_requires_list_operation() {
+    let state = test_state();
+    ingest_key(&state, "call", 10, Some("apikey:one"), None);
+    let mut stage = stage();
+    let prices = Prices(vec![("go", 1_000)]);
+    let list_reply = exact_listing(&[("apikey:one", "go")], 100);
+    let mut read_reply = list_reply.clone();
+    read_reply["result"]["grant_tuples"][0]["operation"] = json!("read");
+    stage.apply(
+        &state,
+        vec![decode_listing(read_reply, 101)],
+        Some(&prices),
+        101,
+    );
+    assert_eq!(
+        state.vault_report()["vault_read_status"],
+        json!({"status":"unavailable","reason":"list_grant_missing"})
+    );
+    assert!(credential_plans(&state).is_empty());
+
+    stage.apply(
+        &state,
+        vec![decode_listing(list_reply, 102)],
+        Some(&prices),
+        102,
+    );
+    assert_eq!(
+        credential_plans(&state).len(),
+        1,
+        "the list grant allows the plan"
+    );
+}
+
+#[test]
+fn vault_exact_list_does_not_close_omitted_credential_plan() {
+    let state = test_state();
+    ingest_key(&state, "first", 10, Some("apikey:one"), None);
+    ingest_key(&state, "second", 20, Some("apikey:two"), None);
+    let mut stage = stage();
+    let prices = Prices(vec![("go", 1_000), ("pro", 3_000)]);
+    stage.apply(
+        &state,
+        vec![decode_listing(
+            key_only_listing(&[("apikey:one", "go"), ("apikey:two", "go")], 100),
+            101,
+        )],
+        Some(&prices),
+        101,
+    );
+    let before = credential_plans(&state);
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0].3, None);
+
+    stage.apply(
+        &state,
+        vec![decode_listing(
+            exact_listing(&[("apikey:two", "pro")], 200),
+            201,
+        )],
+        Some(&prices),
+        201,
+    );
+    let mut closed = before[1].clone();
+    closed.3 = Some(200);
+    assert_eq!(
+        credential_plans(&state),
+        vec![
+            before[0].clone(),
+            closed,
+            (
+                "apikey:two".into(),
+                "openai/pro".into(),
+                200,
+                None,
+                3_000,
+                Some("vault".into()),
+            ),
+        ]
+    );
 }
 
 /// The outcome and unpriced reason of the event's current charge head.
