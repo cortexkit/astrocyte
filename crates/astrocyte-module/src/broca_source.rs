@@ -1422,13 +1422,15 @@ mod tests {
     }
 
     /// A run through a company gateway key records the Anthropic call it served,
-    /// the gateway login it was routed through and the gateway key that paid. Its
-    /// charge basis stays as broca's mapping states it.
+    /// the gateway login it was routed through and the gateway key that paid.
+    /// Broca's charge-basis mapping (version 6 onward) marks gateway runs
+    /// `metered_api`, so it waits for pricing at Anthropic's rates like any paid
+    /// Anthropic call.
     #[test]
     fn broca_gateway_run_records_the_gateway_credential() {
         let wire =
             include_str!("../tests/vectors/broca-gateway-run/gateway-run-export-fact-segment.json");
-        let fact = "24ad6360fe7570884a15d9c6a0ac5d2ba090483f0e3c3a208c4b7a75ce2caf15";
+        let fact = "a6c56fa7981d4f08f301757fad32b09fd1139d05a6140cbb61caa27d30be31ff";
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("run-index.db");
         create_store(&path, "instance-a", 1);
@@ -1438,6 +1440,7 @@ mod tests {
             drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
         assert_eq!(outcome.events_recorded, 1);
         assert!(set_aside_rows(&state).is_empty());
+        assert_eq!(count(&state, "pricing_pending"), 1);
         state
             .with_conn(|conn| {
                 let row: (String, String, String, String, Option<String>) = conn
@@ -1461,7 +1464,7 @@ mod tests {
                     (
                         "anthropic".into(),
                         "claude-haiku-4-5".into(),
-                        "unknown".into(),
+                        "metered_api".into(),
                         "gateway:anthropic-gw-acme".into(),
                         Some("apikey:anthropic-gw-acme".into()),
                     )

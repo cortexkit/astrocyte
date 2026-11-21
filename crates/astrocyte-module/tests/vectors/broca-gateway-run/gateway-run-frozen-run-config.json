@@ -18,7 +18,7 @@
   "context_epoch": 0,
   "renderer_version": 2,
   "frozen_render_config": {
-    "base_url": "http://127.0.0.1:42795",
+    "base_url": "http://127.0.0.1:33401",
     "cache": {
       "class": "markers",
       "lookback_blocks": 20,
