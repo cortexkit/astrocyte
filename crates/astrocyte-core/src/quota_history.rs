@@ -523,7 +523,7 @@ mod tests {
     fn quota_reset_projection_backfill_normalizes_and_guards_periods() {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::initialize_connection(&conn).unwrap();
-        let (last, previous) = crate::store::MIGRATIONS.split_last().unwrap();
+        let (previous, migration) = crate::store::migration_parts(63);
         for migration in previous {
             conn.execute_batch(migration.statements).unwrap();
         }
@@ -534,7 +534,7 @@ mod tests {
                 SELECT 'claude','account','primary', i*{NANOS_PER_MS},80,'1970-01-02T23:59:00.0009+23:59',300 FROM n")).unwrap();
         }
         let started = std::time::Instant::now();
-        conn.execute_batch(last.statements).unwrap();
+        conn.execute_batch(migration.statements).unwrap();
         let count = conn
             .query_row("SELECT count(*) FROM quota_reset_period", [], |r| {
                 r.get::<_, i64>(0)

@@ -358,3 +358,33 @@ CREATE TRIGGER credential_window_sample_reset_period AFTER INSERT ON credential_
         AND p.identity=s.identity AND p.pool_key=s.pool_key AND p.reset_ms=s.reset_ms);
 END;
 "#;
+
+pub(in crate::store) const V64: &str = r#"
+-- These isolated declines repeat the call's basis and carry no money. A row
+-- that names or is named by another charge is evidence of a pricing change.
+DROP TRIGGER priced_charge_no_delete;
+
+DELETE FROM priced_charge AS charge
+WHERE charge.outcome = 'unpriced'
+  AND charge.unpriced_reason = 'charge_basis_unknown'
+  AND charge.supersedes IS NULL
+  AND EXISTS (
+      SELECT 1 FROM usage_event AS event
+      WHERE event.event_key = charge.event_key AND event.charge_basis = 'unknown'
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM priced_charge AS child WHERE child.supersedes = charge.charge_key
+  );
+
+CREATE TRIGGER priced_charge_no_delete
+BEFORE DELETE ON priced_charge
+BEGIN
+    SELECT RAISE(ABORT, 'priced_charge_no_delete');
+END;
+
+DELETE FROM pricing_pending
+WHERE EXISTS (
+    SELECT 1 FROM usage_event AS event
+    WHERE event.event_key = pricing_pending.event_key AND event.charge_basis = 'unknown'
+);
+"#;

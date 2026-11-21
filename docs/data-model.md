@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 61. A schema change appends a migration; an applied
+currently version 64. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -528,6 +528,12 @@ A stored head always wins, including a head appended by basis correction or
 operator repricing. `spend.charge.explain` reports the headless decision as a
 `derived_charge` sourced from the call's recorded charge basis, with no pricing
 generation or catalog metadata.
+
+Migration 64 removes isolated `charge_basis_unknown` declines on calls whose
+recorded basis is still `unknown`, and removes those calls from the pricing
+queue. Charges linked to a predecessor or successor are preserved. The migration
+restores the delete guard in the same transaction. It does not vacuum the store;
+compaction runs separately while the module is offline.
 
 ### Catalog rate units and quantities
 

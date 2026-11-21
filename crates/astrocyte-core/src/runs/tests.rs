@@ -917,7 +917,7 @@ fn runs_list_of_an_old_range_skips_later_summary_cells() {
 fn ledger_regression_legacy_broca_inclusive_output_is_counted_once() {
     let mut conn = Connection::open_in_memory().unwrap();
     crate::store::initialize_connection(&conn).unwrap();
-    let (migration, previous) = crate::store::MIGRATIONS.split_last().unwrap();
+    let (previous, migration) = crate::store::migration_parts(63);
     for step in previous {
         conn.execute_batch(step.statements).unwrap();
     }

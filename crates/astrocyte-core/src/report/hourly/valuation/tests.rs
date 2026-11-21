@@ -128,7 +128,7 @@ fn drain(conn: &mut Connection, config: &MultiplierConfig) -> Vec<i64> {
 fn valuation_migration_requeues_existing_media_and_unavailable_rate_hours_only() {
     let mut conn = Connection::open_in_memory().unwrap();
     crate::store::initialize_connection(&conn).unwrap();
-    let (migration, previous) = crate::store::MIGRATIONS.split_last().unwrap();
+    let (previous, migration) = crate::store::migration_parts(63);
     for step in previous {
         conn.execute_batch(step.statements).unwrap();
     }
@@ -254,7 +254,7 @@ fn ledger_regression_media_list_value_uses_unit_pricing_and_dated_rates() {
 fn broca_attempt_migration_dirties_only_its_valuation_and_attribution_hours() {
     let conn = Connection::open_in_memory().unwrap();
     crate::store::initialize_connection(&conn).unwrap();
-    let (last, previous) = crate::store::MIGRATIONS.split_last().unwrap();
+    let (previous, migration) = crate::store::migration_parts(63);
     for migration in previous {
         conn.execute_batch(migration.statements).unwrap();
     }
@@ -266,7 +266,7 @@ fn broca_attempt_migration_dirties_only_its_valuation_and_attribution_hours() {
         DELETE FROM summary_dirty_hour;
         UPDATE valuation_hour SET state='built';
         UPDATE attribution_hour SET valuation_revision=1;")).unwrap();
-    conn.execute_batch(last.statements).unwrap();
+    conn.execute_batch(migration.statements).unwrap();
     let hours = conn.prepare("SELECT v.hour_number,v.state,a.valuation_revision,s.built_revision=s.revision FROM valuation_hour v JOIN attribution_hour a USING(kind,hour_number) JOIN summary_hour s USING(kind,hour_number) ORDER BY v.hour_number").unwrap()
         .query_map([], |r| Ok((r.get::<_, i64>(0)?,r.get::<_, String>(1)?,r.get::<_, Option<i64>>(2)?,r.get::<_, bool>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
     assert_eq!(

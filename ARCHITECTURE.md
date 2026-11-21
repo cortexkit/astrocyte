@@ -7,8 +7,8 @@ against fusiform. It serves spend and usage diagnostics over subc.
 
 ## Rules the design keeps
 
-- **Append-only.** Recorded calls, measurements and charges are never deleted or
-  rewritten; a correction appends a new generation.
+- **Append-only.** Runtime writes never delete or rewrite recorded facts. A
+  correction appends a new charge generation.
 - **Absent is not zero.** An unreported count stays unknown, and an unpriced
   quantity stays unpriced with a reason.
 - **Stable identity.** `fact.rs` hashes the producer, lineage and verbatim
@@ -46,7 +46,7 @@ against fusiform. It serves spend and usage diagnostics over subc.
 ## Durable state
 
 The leased SQLite store uses WAL, FULL synchronization and foreign keys, with a
-5000 ms busy timeout. `store.rs` owns `MIGRATIONS`, now at version 63; an older
+5000 ms busy timeout. `store.rs` owns `MIGRATIONS`, now at version 64; an older
 binary refuses a newer store. Immutable-table triggers reject rewrites even
 through `INSERT OR REPLACE`. Integer keys are never served. The
 [data model](docs/data-model.md#tables) describes the tables.

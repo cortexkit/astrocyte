@@ -483,7 +483,19 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 63,
         statements: migrations::v60_v79::V63,
     },
+    Migration {
+        version: 64,
+        statements: migrations::v60_v79::V64,
+    },
 ];
+
+#[cfg(test)]
+pub(crate) fn migration_parts(version: u32) -> (&'static [Migration], &'static Migration) {
+    let (previous, rest) = MIGRATIONS.split_at(MIGRATIONS.partition_point(|m| m.version < version));
+    let migration = &rest[0];
+    assert_eq!(migration.version, version);
+    (previous, migration)
+}
 
 /// Counts the SQLite virtual-machine instructions a connection runs between
 /// `start` and `steps`. Tests compare the count for the same work at two
@@ -541,6 +553,7 @@ mod tests {
     include!("store_v58_tests.rs");
     include!("store_v59_tests.rs");
     include!("store_v33_tests.rs");
+    include!("store_v64_tests.rs");
 
     #[test]
     fn lookup_index_migration_adds_two_indexes_and_changes_no_rows() {
