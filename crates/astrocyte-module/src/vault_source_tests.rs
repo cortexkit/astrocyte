@@ -730,8 +730,11 @@ fn regression_vault_failed_watch_reread_retries_on_full_tick() {
     });
     *peer.value.lock().unwrap() = listing(&["openai"], Some("plus"), Some(200));
     assert!(reader.tick(&state).iter().any(Result::is_err));
+    // Production ticks every poll interval, so keep ticking: one list call can
+    // fail on a transient socket error (seen on Windows), and the next tick
+    // must retry it. No watch notice is sent from here on.
     crate::test_support::wait_until("successful list without another watch notice", || {
-        reader.snapshots.lock().unwrap().iter().any(|result| {
+        reader.tick(&state).iter().any(|result| {
             result.as_ref().is_ok_and(|listing| {
                 listing
                     .plans
