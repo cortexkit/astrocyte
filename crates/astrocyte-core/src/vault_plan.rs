@@ -623,9 +623,11 @@ pub fn append_in_tx(tx: &Transaction<'_>, plan: &VaultPlan) -> rusqlite::Result<
 /// Compare a listing without starting a write transaction for an unchanged plan.
 ///
 /// A source change alone, such as an operator tier giving way to the same
-/// detected tier, appends a row. The exception is a config seed that the vault
-/// restates unchanged: it stays the newest row, so `prepare_reconciliation`
-/// keeps treating it as a confirmed seed.
+/// detected tier, appends a row. The exception is a row seeded from an older
+/// config (`source = "config"`) that the vault now states with the same tier.
+/// It stays the newest row, so `prepare_reconciliation` keeps its seed rules:
+/// the vault confirmed the seed, and its plan opens from the credential's
+/// first recorded call only when the credential has no ledger plan yet.
 pub fn differs_from_latest(conn: &Connection, plan: &VaultPlan) -> rusqlite::Result<bool> {
     Ok(latest(conn, &plan.credential_id)?.is_none_or(|previous| {
         !previous.same_facts(plan)

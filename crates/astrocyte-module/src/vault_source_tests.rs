@@ -221,7 +221,8 @@ fn vault_since_missing_timestamps_keep_first_observation_until_key_changes() {
 /// With no start date, a changed tier or account under an unchanged plan key
 /// appends a row starting at that listing, and a change only to who stated
 /// the tier appends a row that keeps the recorded start. A repeated listing
-/// appends nothing. The record has no provider, so it has no key at all.
+/// appends nothing. The record lists no provider, and a plan key needs exactly
+/// one provider, so its key stays empty throughout.
 #[test]
 fn regression_vault_fact_change_under_same_key_appends_at_listing_time() {
     let state = test_state();
@@ -772,16 +773,34 @@ fn regression_vault_failed_watch_reread_retries_on_full_tick() {
     // Production ticks every poll interval, so keep ticking: one list call can
     // fail on a transient socket error (seen on Windows), and the next tick
     // must retry it. No watch notice is sent from here on.
-    crate::test_support::wait_until("successful list without another watch notice", || {
-        reader.tick(&state).iter().any(|result| {
-            result.as_ref().is_ok_and(|listing| {
-                listing
-                    .plans
-                    .iter()
-                    .any(|plan| plan.plan_key.as_deref() == Some("openai/plus"))
-            })
-        })
-    });
+    let mut failures = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let mut listed = false;
+        for result in reader.tick(&state) {
+            match result {
+                Ok(listing) => {
+                    listed |= listing
+                        .plans
+                        .iter()
+                        .any(|plan| plan.plan_key.as_deref() == Some("openai/plus"));
+                }
+                Err(error) => failures.push(error),
+            }
+        }
+        if listed {
+            break;
+        }
+        // Name what the retries returned, so a slow Windows run can be read.
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no successful list within 60s; {} failed lists, last: {:?}; requests seen: {}",
+            failures.len(),
+            failures.last(),
+            peer.requests.lock().unwrap().len(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert_eq!(peer.count("auth.watch_scoped"), 1);
     reader.join();
 }
