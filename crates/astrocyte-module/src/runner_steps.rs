@@ -1166,6 +1166,123 @@ mod tests {
         }
     }
 
+    /// Broca's step bodies with the rewrite-cause facts
+    /// (`tests/vectors/broca-step-rewrite-facts/SHA256SUMS`, broca's publisher on
+    /// llm-runner 0.8.55, 22 Nov 2026). Each fact the body carries reaches the
+    /// cause evidence unchanged, a fact it leaves out stays unknown, and a
+    /// stated `view_version` of 0 stays 0. Steps 7 and 8 are one run whose
+    /// account moved between them, so both are served under that session.
+    #[test]
+    fn brocas_rewrite_cause_facts_decode_into_evidence() {
+        const VECTORS: [(&str, &[u8]); 8] = [
+            (
+                "completed-store-encrypted",
+                include_bytes!(
+                    "../tests/vectors/broca-step-rewrite-facts/completed-store-encrypted.json"
+                ),
+            ),
+            (
+                "completed-store-plain",
+                include_bytes!(
+                    "../tests/vectors/broca-step-rewrite-facts/completed-store-plain.json"
+                ),
+            ),
+            (
+                "interrupted-store-encrypted",
+                include_bytes!(
+                    "../tests/vectors/broca-step-rewrite-facts/interrupted-store-encrypted.json"
+                ),
+            ),
+            (
+                "interrupted-store-plain",
+                include_bytes!(
+                    "../tests/vectors/broca-step-rewrite-facts/interrupted-store-plain.json"
+                ),
+            ),
+            (
+                "keep-warm-store-encrypted",
+                include_bytes!(
+                    "../tests/vectors/broca-step-rewrite-facts/keep-warm-store-encrypted.json"
+                ),
+            ),
+            (
+                "keep-warm-store-plain",
+                include_bytes!(
+                    "../tests/vectors/broca-step-rewrite-facts/keep-warm-store-plain.json"
+                ),
+            ),
+            (
+                "rewrite-facts-step-7",
+                include_bytes!(
+                    "../tests/vectors/broca-step-rewrite-facts/rewrite-facts-step-7.json"
+                ),
+            ),
+            (
+                "rewrite-facts-step-8",
+                include_bytes!(
+                    "../tests/vectors/broca-step-rewrite-facts/rewrite-facts-step-8.json"
+                ),
+            ),
+        ];
+        let subject = names().live_subject("broca", STEP_EVENT, 1).unwrap();
+        for (name, bytes) in VECTORS {
+            let sent: Value = serde_json::from_slice(bytes).unwrap();
+            let event = decode_step_finished(&subject, bytes)
+                .unwrap_or_else(|error| panic!("{name} does not decode: {error:?}"));
+            let step = feed_step(event).unwrap_or_else(|| panic!("{name} has no row identity"));
+            let evidence = &step.evidence;
+            assert_eq!(
+                evidence.account_ref.as_deref(),
+                sent["account_ref"].as_str(),
+                "{name}"
+            );
+            assert_eq!(evidence.warm_up, sent["warm_up"].as_bool(), "{name}");
+            assert!(evidence.warm_up.is_some(), "{name} states warm_up");
+            assert_eq!(
+                evidence.view_version,
+                sent["view_version"].as_u64(),
+                "{name}"
+            );
+            assert_eq!(
+                evidence.tools_digest.as_deref(),
+                sent["tools_digest"].as_str(),
+                "{name}"
+            );
+            assert_eq!(
+                evidence.system_digest.as_deref(),
+                sent["system_digest"].as_str(),
+                "{name}"
+            );
+            assert_eq!(
+                evidence.signed_floor.as_deref(),
+                sent["signed_floor"].as_str(),
+                "{name}"
+            );
+        }
+
+        let state = test_state();
+        let start = u64::try_from(now_ms()).unwrap() - 60_000;
+        for (offset, (name, bytes)) in VECTORS[6..].iter().enumerate() {
+            let mut recent: Value = serde_json::from_slice(bytes).unwrap();
+            let length = recent["finished_at_ms"].as_u64().unwrap()
+                - recent["started_at_ms"].as_u64().unwrap();
+            let at = start + u64::try_from(offset).unwrap() * 10_000;
+            recent["started_at_ms"] = json!(at);
+            recent["finished_at_ms"] = json!(at + length);
+            admit(&state, &subject, &serde_json::to_vec(&recent).unwrap());
+            assert!(
+                state.step_feed().runner_counts().appended > offset as u64,
+                "{name}"
+            );
+        }
+        let served = rows(&state, json!({"harness": "broca", "session": "session_a"}));
+        assert_eq!(served.len(), 2);
+        assert_ne!(served[0]["account_ref"], served[1]["account_ref"]);
+        assert_eq!(served[0]["view_version"], 3);
+        assert_eq!(served[1]["view_version"], 0);
+        assert_eq!(served[0]["tools_digest"], served[1]["tools_digest"]);
+    }
+
     /// Every pinned broca body decodes on broca's live subject exactly as
     /// sent, keyed by runner and attempt id since broca sends no host record.
     /// Moved into the feed's window, each is served as its own runner row:
