@@ -10,7 +10,6 @@ use astrocyte_core::multiplier::PlanPriceSource;
 use astrocyte_core::vault_plan::{self, VaultPlan};
 use cortexkit_claustrum_client::{decode_list_scoped_reply, WatchNotice};
 use fusiform_protocol::PlanPricesRequest;
-use rusqlite::OptionalExtension;
 use serde::Serialize;
 use serde_json::{json, Value};
 use subc_client_rs::{CallOptions, ConsumerOptions, RouteHandle, SubcConsumer, SubscribeOptions};
@@ -423,18 +422,20 @@ impl Stage {
         let changed = state.with_conn(|conn| {
             let mut changed = false;
             for plan in &mut plans {
+                // With no start date from the vault, an unchanged plan keeps
+                // its recorded start, so a later listing does not restamp it;
+                // that includes a change only to who stated the tier. A changed
+                // provider, account, tier or key starts at this listing's
+                // observation time.
                 if listing.start_date_unspecified.contains(&plan.credential_id) {
-                    let previous: Option<(Option<String>, i64)> = conn.query_row(
-                        "SELECT plan_key,effective_from_ms FROM vault_plan_history WHERE credential_id=?1 ORDER BY history_id DESC LIMIT 1",
-                        [&plan.credential_id], |row| Ok((row.get(0)?, row.get(1)?)),
-                    ).optional().map_err(|error| error.to_string())?;
-                    if let Some((key, effective)) = previous {
-                        if key == plan.plan_key {
-                            plan.effective_from_ms = effective;
-                        }
+                    let previous = vault_plan::latest(conn, &plan.credential_id)
+                        .map_err(|error| error.to_string())?;
+                    if let Some(previous) = previous.filter(|previous| previous.same_facts(plan)) {
+                        plan.effective_from_ms = previous.effective_from_ms;
                     }
                 }
-                changed |= vault_plan::differs_from_latest(conn, plan).map_err(|error| error.to_string())?;
+                changed |= vault_plan::differs_from_latest(conn, plan)
+                    .map_err(|error| error.to_string())?;
             }
             Ok(changed)
         })?;

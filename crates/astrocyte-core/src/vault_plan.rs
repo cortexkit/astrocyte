@@ -594,8 +594,20 @@ pub fn seed_config_in_tx(
     Ok(())
 }
 
-/// A changed plan key or explicit start date appends new evidence.
-/// Repeated observations of the same key and start do not append a row.
+impl VaultPlan {
+    /// True when both rows describe the same plan: provider, account, tier
+    /// and plan key. Who stated the tier (`source`) and the start and
+    /// observation times are compared separately by `differs_from_latest`.
+    pub fn same_facts(&self, other: &VaultPlan) -> bool {
+        self.provider == other.provider
+            && self.account_id == other.account_id
+            && self.plan_tier == other.plan_tier
+            && self.plan_key == other.plan_key
+    }
+}
+
+/// A change to the plan, to who stated its tier, or to its start date appends
+/// new evidence. A repeated observation of the same row does not.
 pub fn append_in_tx(tx: &Transaction<'_>, plan: &VaultPlan) -> rusqlite::Result<bool> {
     if !differs_from_latest(tx, plan)? {
         return Ok(false);
@@ -609,15 +621,34 @@ pub fn append_in_tx(tx: &Transaction<'_>, plan: &VaultPlan) -> rusqlite::Result<
 }
 
 /// Compare a listing without starting a write transaction for an unchanged plan.
+///
+/// A source change alone, such as an operator tier giving way to the same
+/// detected tier, appends a row. The exception is a config seed that the vault
+/// restates unchanged: it stays the newest row, so `prepare_reconciliation`
+/// keeps treating it as a confirmed seed.
 pub fn differs_from_latest(conn: &Connection, plan: &VaultPlan) -> rusqlite::Result<bool> {
-    let previous: Option<(Option<String>, i64)> = conn
-        .query_row(LATEST_PLAN_SQL, [&plan.credential_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .optional()?;
-    Ok(previous.as_ref().is_none_or(|(key, effective)| {
-        key != &plan.plan_key || *effective != plan.effective_from_ms
+    Ok(latest(conn, &plan.credential_id)?.is_none_or(|previous| {
+        !previous.same_facts(plan)
+            || previous.effective_from_ms != plan.effective_from_ms
+            || (previous.source != plan.source && previous.source != "config")
     }))
+}
+
+/// The newest recorded row of one credential, by history ID.
+pub fn latest(conn: &Connection, credential_id: &str) -> rusqlite::Result<Option<VaultPlan>> {
+    conn.query_row(LATEST_PLAN_SQL, [credential_id], |row| {
+        Ok(VaultPlan {
+            credential_id: row.get(0)?,
+            provider: row.get(1)?,
+            account_id: row.get(2)?,
+            plan_tier: row.get(3)?,
+            plan_key: row.get(4)?,
+            source: row.get(5)?,
+            effective_from_ms: row.get(6)?,
+            observed_at_ms: row.get(7)?,
+        })
+    })
+    .optional()
 }
 
 const AT_SQL: &str = "WITH RECURSIVE credential(id) AS (
@@ -637,7 +668,8 @@ const AT_SQL: &str = "WITH RECURSIVE credential(id) AS (
 /// Newest row of one credential by history ID, read through
 /// `vault_plan_credential_latest` so an unchanged listing costs one seek.
 const LATEST_PLAN_SQL: &str =
-    "SELECT plan_key,effective_from_ms FROM vault_plan_history WHERE credential_id=?1 ORDER BY history_id DESC LIMIT 1";
+    "SELECT credential_id,provider,account_id,plan_tier,plan_key,source,effective_from_ms,observed_at_ms
+       FROM vault_plan_history WHERE credential_id=?1 ORDER BY history_id DESC LIMIT 1";
 
 /// Newest recorded row for each credential that starts before the instant.
 /// A backdated correction replaces older evidence from its own start onward.
@@ -946,6 +978,48 @@ mod tests {
             plan,
             "SEARCH vault_plan_history USING INDEX vault_plan_credential_latest (credential_id=?)"
         );
+    }
+
+    /// A change to the tier, provider, account or tier source appends a row
+    /// even when the plan key stays the same, so the newest row always agrees
+    /// with the vault. Restamping only the observation time appends nothing.
+    #[test]
+    fn regression_vault_plan_history_records_every_fact_change_under_one_key() {
+        let mut conn = crate::test_support::conn();
+        let mut plan = VaultPlan {
+            credential_id: "cred".into(),
+            provider: None,
+            account_id: Some("account-a".into()),
+            plan_tier: Some("ultra".into()),
+            plan_key: None,
+            source: "operator".into(),
+            effective_from_ms: 100,
+            observed_at_ms: 100,
+        };
+        let tx = conn.transaction().unwrap();
+        assert!(append_in_tx(&tx, &plan).unwrap());
+        let changes: [fn(&mut VaultPlan); 4] = [
+            |plan| plan.plan_tier = Some("max_20x".into()),
+            |plan| plan.source = "detected".into(),
+            |plan| plan.account_id = Some("account-b".into()),
+            |plan| plan.provider = Some("anthropic".into()),
+        ];
+        for (step, change) in changes.into_iter().enumerate() {
+            change(&mut plan);
+            plan.observed_at_ms += 1;
+            assert!(append_in_tx(&tx, &plan).unwrap(), "change {step} appends");
+            assert_eq!(latest(&tx, "cred").unwrap().unwrap(), plan, "change {step}");
+            plan.observed_at_ms += 1;
+            assert!(
+                !append_in_tx(&tx, &plan).unwrap(),
+                "repeat {step} appends nothing"
+            );
+        }
+        tx.commit().unwrap();
+        let current = &at(&conn, 101).unwrap()[0];
+        assert_eq!(current.account_id.as_deref(), Some("account-b"));
+        assert_eq!(current.plan_tier.as_deref(), Some("max_20x"));
+        assert_eq!(current.source, "detected");
     }
 
     #[test]

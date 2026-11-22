@@ -218,6 +218,45 @@ fn vault_since_missing_timestamps_keep_first_observation_until_key_changes() {
     );
 }
 
+/// With no start date, a changed tier or account under an unchanged plan key
+/// appends a row starting at that listing, and a change only to who stated
+/// the tier appends a row that keeps the recorded start. A repeated listing
+/// appends nothing. The record has no provider, so it has no key at all.
+#[test]
+fn regression_vault_fact_change_under_same_key_appends_at_listing_time() {
+    let state = test_state();
+    let mut stage = stage();
+    let mut apply = |reply: Value, now: i64| {
+        stage.apply(&state, vec![decode_listing(reply, now)], None, now);
+    };
+    let mut operator = listing(&[], Some("ultra"), None);
+    operator["result"]["credentials"][0]["plan_tier_source"] = json!("operator");
+    apply(operator.clone(), 100);
+    apply(operator, 150);
+    apply(listing(&[], Some("max_20x"), None), 200);
+    apply(listing(&[], Some("max_20x"), None), 220);
+    let mut restated = listing(&[], Some("max_20x"), None);
+    restated["result"]["credentials"][0]["plan_tier_source"] = json!("operator");
+    apply(restated.clone(), 250);
+    apply(restated, 260);
+    let mut moved = listing(&[], Some("max_20x"), None);
+    moved["result"]["credentials"][0]["account_id"] = json!("acct-2");
+    apply(moved.clone(), 300);
+    apply(moved, 350);
+    assert_eq!(history_starts(&state), vec![100, 200, 200, 300]);
+    let newest = state
+        .with_conn(|conn| {
+            vault_plan::latest(conn, "oauth:login").map_err(|error| error.to_string())
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(newest.plan_tier.as_deref(), Some("max_20x"));
+    assert_eq!(newest.source, "detected");
+    assert_eq!(newest.account_id.as_deref(), Some("acct-2"));
+    assert_eq!(newest.effective_from_ms, 300);
+    assert_eq!(newest.plan_key, None);
+}
+
 struct Prices(Vec<(&'static str, i64)>);
 impl PlanPriceSource for Prices {
     fn plan_prices(&self, _: PlanPricesRequest) -> Result<PlanPricesResponse, CatalogCallError> {
