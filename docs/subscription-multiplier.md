@@ -53,8 +53,12 @@ exact credential IDs. It uses only `llm-provider` records and never fetches
 secrets. It lists at startup, after every notice and daily as a backstop.
 `unknown_method` on the watch switches to polling on full ticks only. Network
 work runs outside startup and recording transactions, and a notice's new plan
-applies on the next full tick. The key is exactly `<provider_ids[0]>/<plan_tier>`
-when exactly one provider and a tier are present. Otherwise it is unknown.
+applies on the next full tick. The key is `<provider_ids[0]>/<plan_tier>` when
+exactly one provider and a tier are present. Otherwise it is unknown. Provider
+`anthropic` has one exception. Anthropic renamed its plans on 2026-10-30, and
+`ultra` is the new name of Max 20x, so its key is `anthropic/max_20x`. `max`
+keeps its text and has no curated price, because before 2026-10-30 "Max" named
+both plans. The stored tier keeps the vault's text.
 Effective time uses `plan_tier_since_ms` when it is a non-negative integer no
 later than the row's `plan_tier_observed_at_ms` (when that timestamp is present).
 Otherwise it uses `plan_tier_observed_at_ms`, falling back to the first observation

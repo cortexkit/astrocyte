@@ -258,6 +258,91 @@ fn regression_vault_fact_change_under_same_key_appends_at_listing_time() {
     assert_eq!(newest.plan_key, None);
 }
 
+/// 2026-10-31T00:00:00Z, one day after Anthropic renamed its plans.
+const AFTER_RENAME_MS: i64 = 1_793_318_400_000 + DAY_MS;
+
+/// Decodes one record observed at `observed` and returns its
+/// (plan_tier, plan_key).
+fn decoded_plan(
+    provider: &str,
+    tier: &str,
+    observed: i64,
+    now: i64,
+) -> (Option<String>, Option<String>) {
+    let reply = listing(&[provider], Some(tier), Some(observed));
+    let plan = decode_listing(reply, now).unwrap().plans.remove(0);
+    (plan.plan_tier, plan.plan_key)
+}
+
+fn some(text: &str) -> Option<String> {
+    Some(text.into())
+}
+
+/// `ultra` is the new name of Max 20x, so it gets the curated `max_20x` key.
+/// The tier stays as the vault reported it.
+#[test]
+fn regression_renamed_anthropic_ultra_gets_max_20x_key() {
+    // "Ultra" did not exist before the rename, so it names one plan at any date.
+    for observed in [100, AFTER_RENAME_MS] {
+        assert_eq!(
+            decoded_plan("anthropic", "ultra", observed, AFTER_RENAME_MS + 1),
+            (some("ultra"), some("anthropic/max_20x")),
+            "observed {observed}"
+        );
+    }
+}
+
+/// Old Anthropic tier names, `max` at any date and other providers keep the
+/// tier in the key. Before the rename, "Max" named both plans, so `max` is
+/// not mapped.
+#[test]
+fn regression_other_tiers_and_providers_keep_verbatim_plan_keys() {
+    for (provider, tier, observed) in [
+        ("anthropic", "max", 100),
+        ("anthropic", "max", AFTER_RENAME_MS),
+        ("anthropic", "max_20x", AFTER_RENAME_MS),
+        ("anthropic", "max_5x", 100),
+        ("anthropic", "pro", AFTER_RENAME_MS),
+        ("google", "ultra", AFTER_RENAME_MS),
+        ("google", "max", AFTER_RENAME_MS),
+    ] {
+        assert_eq!(
+            decoded_plan(provider, tier, observed, AFTER_RENAME_MS + 1),
+            (some(tier), Some(format!("{provider}/{tier}"))),
+            "{provider} {tier} observed {observed}"
+        );
+    }
+}
+
+fn latest_plan(state: &SharedState) -> VaultPlan {
+    state
+        .with_conn(|conn| {
+            vault_plan::latest(conn, "oauth:login").map_err(|error| error.to_string())
+        })
+        .unwrap()
+        .unwrap()
+}
+
+/// A move from `max_20x` to `ultra` keeps the plan key and appends a row
+/// with the new tier.
+#[test]
+fn regression_renamed_anthropic_ultra_in_plan_history() {
+    let state = test_state();
+    let mut vault = stage();
+    for (tier, now) in [("max_20x", 100), ("ultra", 200)] {
+        let reply = listing(&["anthropic"], Some(tier), None);
+        vault.apply(&state, vec![decode_listing(reply, now)], None, now);
+        assert_eq!(
+            latest_plan(&state).plan_key.as_deref(),
+            Some("anthropic/max_20x")
+        );
+    }
+    assert_eq!(history_starts(&state), vec![100, 200]);
+    let newest = latest_plan(&state);
+    assert_eq!(newest.plan_tier.as_deref(), Some("ultra"));
+    assert_eq!(newest.plan_key.as_deref(), Some("anthropic/max_20x"));
+}
+
 struct Prices(Vec<(&'static str, i64)>);
 impl PlanPriceSource for Prices {
     fn plan_prices(&self, _: PlanPricesRequest) -> Result<PlanPricesResponse, CatalogCallError> {

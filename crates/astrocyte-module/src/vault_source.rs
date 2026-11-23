@@ -39,6 +39,26 @@ struct InvalidPlanTierSince {
     reason: &'static str,
 }
 
+/// Builds the plan key that prices a vault tier, normally the tier verbatim.
+///
+/// Anthropic renamed its consumer plans on 2026-10-30: "Max 5x" became "Max"
+/// and "Max 20x" became "Ultra", at the same prices. Sources: The Verge,
+/// 2026-10-30,
+/// <https://www.theverge.com/ai-artificial-intelligence/1023576/max-ultra-claude>,
+/// and the Claude Help Center article "What is the Ultra plan?",
+/// <https://support.claude.com/en/articles/17728952-what-is-the-ultra-plan>.
+/// `ultra` is the new name of Max 20x and did not exist before, so it maps to
+/// the curated `max_20x`. `max` is not mapped: before the rename "Max" named
+/// both plans, so a `max` tier names one plan only with a start date that the
+/// backfill rule respects, and the vault does not always give one.
+fn vault_plan_key(provider: &str, tier: &str) -> String {
+    let tier = match (provider, tier) {
+        ("anthropic", "ultra") => "max_20x",
+        (_, tier) => tier,
+    };
+    format!("{provider}/{tier}")
+}
+
 fn decode_listing(value: Value, now: i64) -> Snapshot {
     let listing =
         decode_list_scoped_reply(value.clone()).map_err(|error| error.code().to_string())?;
@@ -100,8 +120,8 @@ fn decode_listing(value: Value, now: i64) -> Snapshot {
             let plan_key = if record.provider_ids.len() == 1 {
                 record
                     .plan_tier
-                    .as_ref()
-                    .map(|tier| format!("{}/{tier}", record.provider_ids[0]))
+                    .as_deref()
+                    .map(|tier| vault_plan_key(&record.provider_ids[0], tier))
             } else {
                 None
             };
