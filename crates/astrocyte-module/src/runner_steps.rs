@@ -1121,6 +1121,39 @@ mod tests {
         }
     }
 
+    /// Thalamus's Claude Code body once its gateway records each request's
+    /// cause facts (`tests/vectors/thalamus-step-cause-claude-code-v1`, 23 Nov
+    /// 2026). All five facts reach the evidence as sent, as on OpenCode 2 and
+    /// Pi, so a Claude Code cache bust can be named a tool or system change.
+    #[test]
+    fn agent_runner_claude_code_step_carries_every_cause_fact() {
+        let bytes: &[u8] =
+            include_bytes!("../tests/vectors/thalamus-step-cause-claude-code-v1/claude-code.json");
+        let subject = names()
+            .live_subject("thalamus-harness", STEP_EVENT, 1)
+            .unwrap();
+        let sent: Value = serde_json::from_slice(bytes).unwrap();
+        let event = decode_step_finished(&subject, bytes).expect("the Claude Code body decodes");
+        let step = feed_step(event).expect("the Claude Code body has a row identity");
+        assert_eq!(step.harness, "claude-code");
+        let evidence = &step.evidence;
+        assert_eq!(
+            evidence.account_ref.as_deref(),
+            sent["account_ref"].as_str()
+        );
+        assert_eq!(evidence.view_version, Some(7));
+        assert_eq!(
+            evidence.tools_digest.as_deref(),
+            sent["tools_digest"].as_str()
+        );
+        assert_eq!(
+            evidence.system_digest.as_deref(),
+            sent["system_digest"].as_str()
+        );
+        assert_eq!(evidence.signed_floor.as_deref(), Some("previous-reply"));
+        assert!(evidence.tools_digest.is_some() && evidence.system_digest.is_some());
+    }
+
     /// Thalamus's bodies for unasked steps
     /// (`tests/vectors/thalamus-step-cause-unasked`, 16 Nov 2026). A step that
     /// went out without asking the module carries the facts in force for its
