@@ -1,0 +1,30 @@
+{
+  "eras": [],
+  "fact_key": "rate.input.mode.fast",
+  "model_id": "kimi-k3.1-pro",
+  "provider_id": "moonshotai",
+  "served": [
+    {
+      "from_ms": 1000,
+      "state": "absent",
+      "until_ms": 1792782357000
+    },
+    {
+      "from_ms": 1792782357000,
+      "source": "speed_twin",
+      "state": "value",
+      "until_ms": null,
+      "value": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 4000000000
+      }
+    }
+  ],
+  "source": "models.dev"
+}

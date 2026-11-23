@@ -175,6 +175,76 @@ fn rate_era_pinned_live_replies_decode_and_select_lifetime_boundary_and_context_
     assert!(count > 50);
 }
 
+/// Fusiform `601c0e5` projects a speed twin's dated rates onto the base row
+/// with the history source `speed_twin` (`test-vectors/fusiform-601c0e5`).
+/// The served timeline decodes, and a call recorded in fast mode is valued at
+/// the twin's rate from the twin's own start, with no fast rate (and no
+/// fallback to the base rate) before it. A standard call keeps the base rate.
+#[test]
+fn rate_era_speed_twin_history_values_fast_calls_from_the_twins_start() {
+    let bytes = include_bytes!(
+        "../../test-vectors/fusiform-601c0e5/history-moonshotai-kimi-k3.1-pro-rate.input.mode.fast.json"
+    );
+    let checksums = include_str!("../../test-vectors/fusiform-601c0e5/SHA256SUMS");
+    let hash = hex::encode(Sha256::digest(bytes));
+    assert!(checksums.lines().any(|line| line
+        == format!("{hash}  history-moonshotai-kimi-k3.1-pro-rate.input.mode.fast.json")));
+    let golden: HistoryResponse = serde_json::from_slice(bytes).unwrap();
+    let served = serde_json::to_value(&golden).unwrap()["served"].clone();
+    assert_eq!(served[1]["source"], "speed_twin");
+
+    let conn = conn();
+    let model = synthetic(
+        "moonshotai",
+        "kimi-k3.1-pro",
+        serde_json::json!({
+            "rate.input": [{"from_ms": 1000, "until_ms": null, "state": "value",
+                "source": "upstream",
+                "value": {"state": "priced", "units": 2_000_000_000_i64, "exponent": 9, "currency": "USD",
+                    "unit_provenance": {"kind": "assumed_by_policy", "policy": "models-dev-usd-v1"}}}],
+            "rate.input.mode.fast": served.clone(),
+        }),
+    );
+    publish(&conn, &model, 1).unwrap();
+    let start = 1_792_782_357_000;
+    let value = |at_ms: i64, mode: Option<&str>| {
+        let event = EventTokens {
+            producer: "broca".into(),
+            provider: "moonshotai".into(),
+            model: Some("kimi-k3.1-pro".into()),
+            mode: mode.map(str::to_owned),
+            broca_attempt: false,
+            roles: vec![(
+                "input".into(),
+                "token".into(),
+                "fixture".into(),
+                Some(1_000_000),
+                Some(0),
+            )],
+        };
+        let config = multiplier::MultiplierConfig {
+            api_twins: BTreeMap::new(),
+            plan_price_overrides: BTreeMap::new(),
+            quota_providers: BTreeMap::new(),
+        };
+        let resolution = resolve(&conn, "moonshotai", "kimi-k3.1-pro", at_ms)
+            .unwrap()
+            .expect("fetched");
+        let value = value_event(
+            &ValuationRules::from_config(&config, &[]),
+            Some(&resolution),
+            &event,
+        )
+        .unwrap();
+        let reasons: Vec<String> = value.unpriced.into_iter().map(|row| row.reason).collect();
+        (value.numerator, reasons)
+    };
+    // The numerator is tokens times the per-million rate in nanodollars.
+    assert_eq!(value(start, Some("fast")), (4_000_000_000_000_000, vec![]));
+    assert_eq!(value(start - 1, Some("fast")), (0, vec!["no_rate".into()]));
+    assert_eq!(value(start, None), (2_000_000_000_000_000, vec![]));
+}
+
 #[test]
 fn rate_era_revert_within_hour_refused_and_non_usd_are_distinct() {
     let conn = conn();
