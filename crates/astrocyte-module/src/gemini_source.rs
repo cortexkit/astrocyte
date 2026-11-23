@@ -29,11 +29,11 @@ use astrocyte_readers::sessions::gemini::{
 };
 
 use crate::refresher::harness_drain::{
-    derived_measurement, files_below, health_reason, present_root_in_lane, record_requests_in_lane,
-    verbatim_measurement, DrainMode, FileStat, HarnessSource, ResumeCache,
-    SourceRoot as GeminiRoot, WindowSchedule,
+    derived_measurement, files_below, health_reason, present_root_in_lane,
+    record_requests_and_evidence_in_lane, verbatim_measurement, DrainMode, FileStat, HarnessSource,
+    ResumeCache, SourceRoot as GeminiRoot, WindowSchedule,
 };
-use crate::refresher::SourceDrainError;
+use crate::refresher::{SetAsideRecord, SourceDrainError};
 use crate::state::SharedState;
 
 pub(crate) const GEMINI_SOURCE_KEY: &str = "gemini";
@@ -56,6 +56,7 @@ pub(crate) struct GeminiDrainOutcome {
     /// Skipped lines or messages per file, for every file that had any.
     pub skipped_lines_by_file: BTreeMap<PathBuf, u64>,
     pub calls_emitted: usize,
+    pub calls_set_aside: u64,
     pub rows_recorded: usize,
     pub exact_redeliveries: usize,
     pub quarantined_redeliveries: usize,
@@ -206,12 +207,13 @@ impl GeminiSource {
             ..GeminiDrainOutcome::default()
         };
         let mut next = GeminiCache::default();
-        let mut calls = Vec::new();
+        let mut requests = Vec::new();
+        let mut evidence = Vec::new();
         for path in files {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            let counts = if path
+            let (calls, counts) = if path
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
             {
@@ -279,8 +281,7 @@ impl GeminiSource {
                 if let Some(point) = parse.resume {
                     next.jsonl.resume.insert(path.clone(), point);
                 }
-                calls.extend(parse.calls);
-                parse.counts
+                (parse.calls, parse.counts)
             } else {
                 if !mode.is_full() {
                     continue;
@@ -293,15 +294,9 @@ impl GeminiSource {
                 ) {
                     Some((mark, parsed)) => {
                         next.documents.insert(path.clone(), mark);
-                        match parsed {
-                            Some((document_calls, counts)) => {
-                                calls.extend(document_calls);
-                                counts
-                            }
-                            None => GeminiParseCounts::default(),
-                        }
+                        parsed.unwrap_or_default()
                     }
-                    None => GeminiParseCounts::default(),
+                    None => DocumentCalls::default(),
                 }
             };
             outcome.counts.add(&counts);
@@ -310,17 +305,24 @@ impl GeminiSource {
                     .skipped_lines_by_file
                     .insert(path.clone(), counts.skipped_lines);
             }
+            outcome.calls_emitted += calls.len();
+            for call in calls {
+                let locator = format!("{path:?}:message:{:?}", call.message_id);
+                match map_call(call) {
+                    Ok(request) => requests.push(request),
+                    Err(reason) => {
+                        evidence.push(SetAsideRecord { locator, reason });
+                        outcome.calls_set_aside += 1;
+                    }
+                }
+            }
         }
-        outcome.calls_emitted = calls.len();
-        let requests = calls
-            .into_iter()
-            .map(map_call)
-            .collect::<Result<Vec<_>, _>>()?;
 
-        let tally = record_requests_in_lane(
+        let tally = record_requests_and_evidence_in_lane(
             state,
             GEMINI_SOURCE_KEY,
             &requests,
+            &evidence,
             recorded_at_ms,
             &|| stop.load(Ordering::Relaxed),
             mode,
@@ -426,7 +428,7 @@ impl HarnessSource for GeminiSource {
         Ok(health_reason(
             "Gemini CLI",
             outcome.quarantined_redeliveries,
-            outcome.counts.usage_not_ingested(),
+            outcome.counts.usage_not_ingested() + outcome.calls_set_aside,
         ))
     }
 }
@@ -620,6 +622,56 @@ mod tests {
             })
             .unwrap();
         assert_eq!((lineage.as_str(), provider.as_str()), (SESSION, "google"));
+    }
+
+    #[test]
+    fn oversized_gemini_call_keeps_other_calls_and_commits_the_file_cache() {
+        let temp = TempDir::new().unwrap();
+        let oversized = u64::try_from(i64::MAX).unwrap() + 1;
+        let path = write_file(
+            temp.path(),
+            DOC,
+            &document(&[
+                message("oversized", [oversized, 1, 0, 0, 0]),
+                message("good-document", [10, 2, 0, 0, 0]),
+            ]),
+        );
+        write_file(
+            temp.path(),
+            LINES,
+            &recording(&[message("good-recording", [20, 2, 0, 0, 0])]),
+        );
+
+        let state = test_state();
+        let source = GeminiSource::at(temp.path());
+        assert_eq!(drain(&source, &state, 100).rows_recorded, 2);
+        assert_eq!(quantities(&state, "good-document")["input"], Some(10));
+        assert_eq!(quantities(&state, "good-recording")["input"], Some(20));
+        assert!(quantities(&state, "oversized").is_empty());
+        let (locator, reason): (String, String) = state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT locator,reason FROM set_aside_record WHERE source_key='gemini'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert!(locator.contains(&format!("{path:?}")), "{locator}");
+        assert!(locator.contains("oversized"), "{locator}");
+        assert!(reason.contains("exceeds stored integer range"), "{reason}");
+
+        let unchanged = drain(&source, &state, 200);
+        assert_eq!(unchanged.documents_unchanged, 1);
+        assert_eq!(unchanged.calls_emitted, 0);
+        assert_eq!(
+            count(
+                &state,
+                "SELECT last_seen_ms FROM set_aside_record WHERE source_key='gemini'"
+            ),
+            100
+        );
     }
 
     #[test]

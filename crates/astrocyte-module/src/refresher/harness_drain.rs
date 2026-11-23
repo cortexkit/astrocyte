@@ -683,7 +683,7 @@ pub(crate) fn record_requests_in_lane(
     )
 }
 
-fn record_requests_and_evidence_in_lane(
+pub(crate) fn record_requests_and_evidence_in_lane(
     state: &SharedState,
     key: &str,
     requests: &[EventRecordRequest],

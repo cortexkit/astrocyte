@@ -126,7 +126,8 @@ deferral. Cold starts read every archive again.
 Records a reader cannot use are counted, not guessed at. The BROCA, Claude
 Code, Codex, OpenCode and Pi sources also store them as `set_aside_record`
 rows (source key, locator, reason), committed together with the good events
-and the resume position. `spend.ledger.coverage` reports them.
+and the resume position; Gemini CLI does the same for calls with a quantity
+that cannot be stored. `spend.ledger.coverage` reports them.
 
 ## 2. Sources
 
