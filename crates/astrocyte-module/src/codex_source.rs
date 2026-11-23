@@ -866,6 +866,59 @@ mod tests {
     }
 
     #[test]
+    fn distinct_requests_are_recorded_when_other_counters_differ() {
+        assert_distinct_requests("same", [100, 20, 0, 30, 4]);
+    }
+
+    #[test]
+    fn distinct_requests_are_recorded_when_response_ids_differ() {
+        assert_distinct_requests("different", [100, 60, 0, 30, 12]);
+    }
+
+    fn assert_distinct_requests(request_id: &str, usage: [u64; 5]) {
+        for request_first in [true, false] {
+            let temp = TempDir::new().unwrap();
+            let native_usage = [100, 60, 0, 30, 12];
+            let native = token_count(3, native_usage, native_usage).replacen(
+                "\"type\":\"token_count\",",
+                "\"type\":\"token_count\",\"response_id\":\"same\",",
+                1,
+            );
+            let request = request_usage(request_id, usage);
+            let pair = if request_first {
+                request + &native
+            } else {
+                native + &request
+            };
+            write_file(
+                temp.path(),
+                "sessions/a.jsonl",
+                &(session_meta(THREAD, None)
+                    + &turn(1, TURN)
+                    + &pair
+                    + "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n"),
+            );
+            let state = test_state();
+            drain(&CodexSource::at(temp.path()), &state, 100);
+            let supplemental = format!("{THREAD}:request:response:{request_id}");
+            assert_eq!(
+                event_refs(&state),
+                BTreeSet::from([format!("{TURN}:1"), supplemental.clone()]),
+                "request first: {request_first}"
+            );
+            let quantities = quantities(&state, &supplemental);
+            assert_eq!(
+                quantities["cache_read"],
+                Some(i64::try_from(usage[1]).unwrap())
+            );
+            assert_eq!(
+                quantities["reasoning"],
+                Some(i64::try_from(usage[4]).unwrap())
+            );
+        }
+    }
+
+    #[test]
     fn compaction_eof_waits_for_confirmation_and_replays_identically() {
         let temp = TempDir::new().unwrap();
         let contents = session_meta(THREAD, None)

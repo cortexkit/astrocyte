@@ -289,8 +289,9 @@ Rules that affect what is recorded:
   trailing junk or an exceeded decoded-size limit fail the whole drain without
   committing partial usage or advancing success. Activity without supported usage
   produces a visible set-aside record; its token quantities remain unknown.
-- Codex request records are matched to native token counts by reported input and
-  output, regardless of which record appears first. A terminal event, new turn or
+- Codex request records are matched to native token counts when input and output
+  agree, as do any other counters and response IDs reported by both records,
+  regardless of which record appears first. A terminal event, new turn or
   subsequent request settles an unconfirmed request under its supplementary key.
   A compaction record marks the pending request; a later token count confirms it
   or settles it separately. EOF alone leaves it pending across drains, so appends

@@ -440,8 +440,8 @@ struct CodexParseState {
     previous_total: Option<CodexTokenUsage>,
     responses_in_turn: std::sync::Arc<std::sync::Mutex<TurnHistory>>,
     pending: Option<PendingRequest>,
-    confirmations: VecDeque<(Option<String>, CodexTokenUsage)>,
-    settled: VecDeque<(Option<String>, CodexTokenUsage)>,
+    confirmations: VecDeque<(Option<String>, ResponseUsage)>,
+    settled: VecDeque<(Option<String>, ResponseUsage)>,
     activity: bool,
 }
 
@@ -485,36 +485,50 @@ fn begin_turn_history(
 #[derive(Debug, Clone)]
 struct PendingRequest {
     call: CodexCall,
-    usage: CodexTokenUsage,
+    response: ResponseUsage,
     compacted: bool,
 }
 
-fn same_response(left: &CodexTokenUsage, right: &CodexTokenUsage) -> bool {
-    matches!((left.input_tokens, left.output_tokens, right.input_tokens, right.output_tokens),
+#[derive(Debug, Clone)]
+struct ResponseUsage {
+    response_id: Option<String>,
+    usage: CodexTokenUsage,
+}
+
+fn same_response(left: &ResponseUsage, right: &CodexTokenUsage, right_id: Option<&str>) -> bool {
+    let left_usage = &left.usage;
+    matches!((left_usage.input_tokens, left_usage.output_tokens, right.input_tokens, right.output_tokens),
         (Some(li), Some(lo), Some(ri), Some(ro)) if li == ri && lo == ro)
+        && !matches!((left.response_id.as_deref(), right_id), (Some(l), Some(r)) if l != r)
+        && left_usage
+            .fields()
+            .into_iter()
+            .zip(right.fields())
+            .all(|(l, r)| !matches!((l, r), (Some(l), Some(r)) if l != r))
 }
 
 fn take_confirmation(
-    records: &mut VecDeque<(Option<String>, CodexTokenUsage)>,
+    records: &mut VecDeque<(Option<String>, ResponseUsage)>,
     turn: &Option<String>,
     usage: &CodexTokenUsage,
+    response_id: Option<&str>,
 ) -> bool {
-    let found = records.iter().position(|(record_turn, record_usage)| {
-        record_turn == turn && same_response(record_usage, usage)
+    let found = records.iter().position(|(record_turn, response)| {
+        record_turn == turn && same_response(response, usage, response_id)
     });
     found.is_some_and(|index| records.remove(index).is_some())
 }
 
 fn remember_response(
-    records: &mut VecDeque<(Option<String>, CodexTokenUsage)>,
+    records: &mut VecDeque<(Option<String>, ResponseUsage)>,
     turn: Option<String>,
-    usage: CodexTokenUsage,
+    response: ResponseUsage,
 ) {
     // Late confirmations are local to recent requests, not a transcript-sized cache.
     if records.len() == 256 {
         records.pop_front();
     }
-    records.push_back((turn, usage));
+    records.push_back((turn, response));
 }
 
 fn settle_pending(
@@ -526,7 +540,7 @@ fn settle_pending(
         remember_response(
             &mut state.settled,
             pending.call.turn_id.clone(),
-            pending.usage,
+            pending.response,
         );
         counts.supplementary_requests += 1;
         calls.push(pending.call);
@@ -640,6 +654,7 @@ fn parse_line(
         settle_pending(state, counts, calls);
     }
     let mut suppress_token_count = false;
+    let response_id = payload.response_id.as_deref().filter(|id| !id.is_empty());
     if entry.entry_type == "event_msg" && payload.payload_type.as_deref() == Some("token_count") {
         let accepted_last = payload.info.as_ref().and_then(|info| {
             let total = info.total_token_usage.as_ref()?;
@@ -656,16 +671,21 @@ fn parse_line(
         });
         if let Some(last) = accepted_last {
             if state.pending.as_ref().is_some_and(|pending| {
-                pending.call.turn_id == state.current_turn && same_response(&pending.usage, last)
+                pending.call.turn_id == state.current_turn
+                    && same_response(&pending.response, last, response_id)
             }) {
                 state.pending = None;
-            } else if take_confirmation(&mut state.settled, &state.current_turn, last) {
+            } else if take_confirmation(&mut state.settled, &state.current_turn, last, response_id)
+            {
                 suppress_token_count = true;
             } else {
                 remember_response(
                     &mut state.confirmations,
                     state.current_turn.clone(),
-                    last.clone(),
+                    ResponseUsage {
+                        response_id: response_id.map(str::to_owned),
+                        usage: last.clone(),
+                    },
                 );
             }
         }
@@ -705,12 +725,10 @@ fn parse_line(
             if usage.fields().iter().all(Option::is_none) {
                 return;
             }
-            if take_confirmation(&mut state.confirmations, &turn, &usage) {
+            if take_confirmation(&mut state.confirmations, &turn, &usage, response_id) {
                 return;
             }
-            let request_id = payload
-                .response_id
-                .filter(|id| !id.is_empty())
+            let request_id = response_id
                 .map(|id| format!("response:{id}"))
                 .or_else(|| entry.ordinal.map(|ordinal| format!("ordinal:{ordinal}")));
             let Some(request_id) = request_id else {
@@ -740,7 +758,10 @@ fn parse_line(
             settle_pending(state, counts, calls);
             state.pending = Some(PendingRequest {
                 call,
-                usage,
+                response: ResponseUsage {
+                    response_id: response_id.map(str::to_owned),
+                    usage,
+                },
                 compacted: false,
             });
         }
