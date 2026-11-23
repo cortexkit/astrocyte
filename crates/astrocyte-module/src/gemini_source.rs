@@ -658,7 +658,10 @@ mod tests {
                 .map_err(|error| error.to_string())
             })
             .unwrap();
-        assert!(locator.contains(&format!("{path:?}")), "{locator}");
+        // The file name, not the whole path: Windows may spell the temporary
+        // folder differently in the locator than in the test's own path.
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        assert!(locator.contains(file_name), "{locator}");
         assert!(locator.contains("oversized"), "{locator}");
         assert!(reason.contains("exceeds stored integer range"), "{reason}");
 

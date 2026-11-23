@@ -102,6 +102,30 @@ mod session_refs {
                     .filter(|(table, _)| table != "cortexkit_schema_version")
                     .cloned()
                     .collect();
+                // Later migrations may append nullable columns to an existing
+                // table. An existing row then gains only trailing NULLs, which
+                // is not a change to it, so compare the columns it had before.
+                assert_eq!(others.len(), before.len());
+                let others: Vec<_> = others
+                    .into_iter()
+                    .zip(&before)
+                    .map(|((table, rows), (_, old_rows))| {
+                        assert_eq!(rows.len(), old_rows.len(), "{table}");
+                        let rows = rows
+                            .into_iter()
+                            .zip(old_rows)
+                            .map(|(mut row, old)| {
+                                let added = row.split_off(old.len());
+                                assert!(
+                                    added.iter().all(|v| *v == rusqlite::types::Value::Null),
+                                    "{table}: an appended column is not NULL"
+                                );
+                                row
+                            })
+                            .collect::<Vec<_>>();
+                        (table, rows)
+                    })
+                    .collect();
                 assert_eq!(others, before);
                 Ok(())
             })

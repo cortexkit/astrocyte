@@ -295,7 +295,8 @@ Rules that affect what is recorded:
 - Codex request records are matched to native token counts when input and output
   agree, as do any other counters and response IDs reported by both records,
   regardless of which record appears first. A terminal event, new turn or
-  subsequent request settles an unconfirmed request under its supplementary key.
+  subsequent request records an unconfirmed request on its own, keyed by its
+  response ID, or by its line position when it has none.
   A compaction record marks the pending request; a later token count confirms it
   or settles it separately. EOF alone leaves it pending across drains, so appends
   and full replays agree. Late confirmations of settled requests are not counted

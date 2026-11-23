@@ -1055,7 +1055,8 @@ mod tests {
         assert_eq!(source.drain(&state, 100, &STOP).unwrap().recorded, 2);
         assert_eq!(stored_floor(&state), Some(3));
         // A shrink can renumber rowids. Force the size hint without changing
-        // the file's identity, then check both the floor and time cursor.
+        // the file's identity, then check both the stored open-row floor (the
+        // lowest rowid of an unfinished call) and the time cursor.
         conn.execute(
             "UPDATE session_message SET type='assistant' WHERE id='restored'",
             [],
