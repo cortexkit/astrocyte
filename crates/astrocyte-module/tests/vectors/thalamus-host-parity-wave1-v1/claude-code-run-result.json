@@ -1,0 +1,14 @@
+{
+  "final_message": {
+    "mid": "thalamus-final-4a39fef7ab434d0484037547",
+    "ordinal": 3,
+    "text": ""
+  },
+  "run_id": "facts-run",
+  "state": "completed",
+  "usage": {
+    "by_model": [],
+    "steps": 0,
+    "unreported_steps": 0
+  }
+}

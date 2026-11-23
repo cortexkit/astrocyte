@@ -1,0 +1,15 @@
+{
+  "final_message": {
+    "mid": "thalamus-final-db2c4836edbc379ebbaaf0fa",
+    "ordinal": 2,
+    "text": ""
+  },
+  "finish": "stop",
+  "run_id": "pi-final-without-host-row",
+  "state": "completed",
+  "usage": {
+    "by_model": [],
+    "steps": 0,
+    "unreported_steps": 0
+  }
+}

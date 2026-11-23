@@ -1,0 +1,40 @@
+{
+  "history_version": 0,
+  "incarnation": "inc_759be3f4103d432a8155dc5f5e52ab16",
+  "messages": [
+    {
+      "mid": "m0003",
+      "ordinal": 1,
+      "row": {
+        "parts": [
+          {
+            "part": "0",
+            "text": "hello",
+            "type": "text"
+          }
+        ],
+        "role": "user",
+        "sender": "prefrontal-core",
+        "text": "hello"
+      },
+      "written_at": 3
+    },
+    {
+      "mid": "thalamus-final-db163ae759dd943dd1bf6ace",
+      "ordinal": 2,
+      "row": {
+        "output_refs": {
+          "count": 0,
+          "dialect": "rich-ui/1",
+          "digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "mid": "thalamus-final-db163ae759dd943dd1bf6ace",
+          "set_id": "empty-reply:thalamus-final-db163ae759dd943dd1bf6ace"
+        },
+        "parts": [],
+        "role": "assistant",
+        "text": ""
+      },
+      "written_at": 2000
+    }
+  ]
+}

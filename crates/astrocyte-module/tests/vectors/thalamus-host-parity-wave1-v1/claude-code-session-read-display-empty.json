@@ -1,0 +1,69 @@
+{
+  "head": {
+    "session": "e64aa76bf68e4d15",
+    "sub_index": 3,
+    "wal_seq": 1
+  },
+  "history_version": 0,
+  "incarnation": "inc_0bfe569536e24f749d7032d14d64dc24",
+  "messages": [
+    {
+      "message": {
+        "content": "synthetic please",
+        "role": "user"
+      },
+      "mid": "54bf3ed8c413cdede37731043978760b6d9f207bb89233ec26346c0cf6953abf",
+      "ordinal": 1,
+      "role": "user",
+      "run": {
+        "episode": "1",
+        "final": false,
+        "run_id": "facts-run"
+      },
+      "time": null,
+      "tool_calls": [],
+      "written_at": 1000000
+    },
+    {
+      "completed_at": 1767225601000,
+      "message": {
+        "content": [
+          {
+            "text": "No response requested.",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      "mid": "c5d33e5a837fcfbd74c4136d69de118287b5d28538b032c28ee879f5747d6cea",
+      "ordinal": 2,
+      "role": "assistant",
+      "run": {
+        "episode": "1",
+        "final": false,
+        "run_id": "facts-run"
+      },
+      "time": null,
+      "tool_calls": [],
+      "written_at": 1000000
+    },
+    {
+      "message": {
+        "content": [],
+        "cortexkit_runner_entry": true,
+        "role": "assistant"
+      },
+      "mid": "thalamus-final-4a39fef7ab434d0484037547",
+      "ordinal": 3,
+      "role": "assistant",
+      "run": {
+        "episode": "1",
+        "final": true,
+        "run_id": "facts-run"
+      },
+      "time": null,
+      "tool_calls": [],
+      "written_at": 2000
+    }
+  ]
+}

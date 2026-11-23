@@ -1,0 +1,22 @@
+{
+  "final_message": {
+    "mid": "m0004",
+    "ordinal": 2,
+    "text": "answer from the last step"
+  },
+  "finish": "stop",
+  "run_id": "run_8805bd9457d3cf412f16d1bd",
+  "state": "completed",
+  "usage": {
+    "by_model": [
+      {
+        "model": "",
+        "provider": "",
+        "steps": 1,
+        "unreported_steps": 1
+      }
+    ],
+    "steps": 1,
+    "unreported_steps": 1
+  }
+}

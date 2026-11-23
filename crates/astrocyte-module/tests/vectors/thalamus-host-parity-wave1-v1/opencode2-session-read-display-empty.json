@@ -1,0 +1,71 @@
+{
+  "head": {
+    "session": "00e01c18b76c0892",
+    "sub_index": 1,
+    "wal_seq": 3
+  },
+  "history_version": 0,
+  "incarnation": "inc_759be3f4103d432a8155dc5f5e52ab16",
+  "messages": [
+    {
+      "created_at": 3,
+      "delivered_as": {
+        "mode": "idle_start"
+      },
+      "message": {
+        "id": "m0003",
+        "text": "hello",
+        "time": {
+          "created": 3
+        },
+        "type": "user"
+      },
+      "mid": "m0003",
+      "ordinal": 1,
+      "role": "user",
+      "run": {
+        "episode": "1",
+        "final": false,
+        "run_id": "run_7791bf3c0a275720ca3e256d"
+      },
+      "send_id": "final-without-row",
+      "sender": "prefrontal-core",
+      "time": {
+        "created": 3
+      },
+      "tool_calls": [],
+      "written_at": 3
+    },
+    {
+      "completed_at": 2000,
+      "created_at": 2000,
+      "message": {
+        "content": [],
+        "finish": "stop",
+        "id": "thalamus-final-db163ae759dd943dd1bf6ace",
+        "metadata": {
+          "cortexkit_runner_entry": true
+        },
+        "time": {
+          "completed": 2000,
+          "created": 2000
+        },
+        "type": "assistant"
+      },
+      "mid": "thalamus-final-db163ae759dd943dd1bf6ace",
+      "ordinal": 2,
+      "role": "assistant",
+      "run": {
+        "episode": "1",
+        "final": true,
+        "run_id": "run_7791bf3c0a275720ca3e256d"
+      },
+      "time": {
+        "completed": 2000,
+        "created": 2000
+      },
+      "tool_calls": [],
+      "written_at": 2000
+    }
+  ]
+}

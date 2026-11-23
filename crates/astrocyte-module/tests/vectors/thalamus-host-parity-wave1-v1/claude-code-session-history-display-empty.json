@@ -1,0 +1,48 @@
+{
+  "history_version": 0,
+  "incarnation": "inc_0bfe569536e24f749d7032d14d64dc24",
+  "messages": [
+    {
+      "mid": "54bf3ed8c413cdede37731043978760b6d9f207bb89233ec26346c0cf6953abf",
+      "ordinal": 1,
+      "row": {
+        "parts": [
+          {
+            "part": "0",
+            "text": "synthetic please",
+            "type": "text"
+          }
+        ],
+        "role": "user",
+        "text": "synthetic please"
+      },
+      "written_at": 1000000
+    },
+    {
+      "mid": "c5d33e5a837fcfbd74c4136d69de118287b5d28538b032c28ee879f5747d6cea",
+      "ordinal": 2,
+      "row": {
+        "parts": [
+          {
+            "part": "0",
+            "text": "No response requested.",
+            "type": "text"
+          }
+        ],
+        "role": "assistant",
+        "text": "No response requested."
+      },
+      "written_at": 1000000
+    },
+    {
+      "mid": "thalamus-final-4a39fef7ab434d0484037547",
+      "ordinal": 3,
+      "row": {
+        "parts": [],
+        "role": "assistant",
+        "text": ""
+      },
+      "written_at": 2000
+    }
+  ]
+}

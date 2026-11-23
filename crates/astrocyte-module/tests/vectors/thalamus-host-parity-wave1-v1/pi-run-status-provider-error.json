@@ -1,0 +1,16 @@
+{
+  "error": {
+    "class": "transient",
+    "message": "429: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+    "provider_code": "rate_limit",
+    "provider_detail_code": "rate_limit_error",
+    "status": 429
+  },
+  "state": "error",
+  "undelivered_steers": [],
+  "usage": {
+    "by_model": [],
+    "steps": 0,
+    "unreported_steps": 0
+  }
+}

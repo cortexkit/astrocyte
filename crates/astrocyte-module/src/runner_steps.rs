@@ -1154,6 +1154,35 @@ mod tests {
         assert!(evidence.tools_digest.is_some() && evidence.system_digest.is_some());
     }
 
+    /// Thalamus's Pi step body once Pi keeps stated zero counts
+    /// (`tests/vectors/thalamus-host-parity-wave1-v1`, 23 Nov 2026). A zero
+    /// cache write and a zero reasoning count arrive as stated zeros, never as
+    /// unknown, and the output stays whole because reasoning is zero.
+    #[test]
+    fn agent_runner_pi_step_keeps_stated_zero_counts() {
+        let bytes: &[u8] = include_bytes!(
+            "../tests/vectors/thalamus-host-parity-wave1-v1/pi-step-finished-zero.json"
+        );
+        let subject = names()
+            .live_subject("thalamus-harness", STEP_EVENT, 1)
+            .unwrap();
+        let event = decode_step_finished(&subject, bytes).expect("the Pi body decodes");
+        let step = feed_step(event).expect("the Pi body has a row identity");
+        assert_eq!(step.harness, "pi");
+        let row = &step.step;
+        assert_eq!(
+            (
+                row.input,
+                row.cache_read,
+                row.cache_write,
+                row.output,
+                row.reasoning
+            ),
+            (Some(11), Some(900), Some(0), Some(7), Some(0))
+        );
+        assert_eq!(step.evidence.view_version, Some(0));
+    }
+
     /// Thalamus's bodies for unasked steps
     /// (`tests/vectors/thalamus-step-cause-unasked`, 16 Nov 2026). A step that
     /// went out without asking the module carries the facts in force for its
