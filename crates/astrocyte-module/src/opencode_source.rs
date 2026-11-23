@@ -82,40 +82,45 @@ impl CursorHome {
     pub(crate) fn read_cursor(
         &self,
         state: &SharedState,
+        file_identity: Option<&str>,
     ) -> Result<Option<OpenCodeCursor>, String> {
-        self.read_cursor_with_open_row_floor(state)
+        self.read_cursor_with_open_row_floor(state, file_identity)
             .map(|(cursor, _)| cursor)
     }
 
     pub(crate) fn read_cursor_with_open_row_floor(
         &self,
         state: &SharedState,
+        file_identity: Option<&str>,
     ) -> Result<(Option<OpenCodeCursor>, Option<i64>), String> {
         use rusqlite::OptionalExtension;
         let row = state.with_conn(|connection| {
             match self {
                 Self::Runtime(key) => connection.query_row(
-                    "SELECT lineage,consumed_ordinal,open_row_floor FROM source_runtime WHERE source_key=?1",
+                    "SELECT lineage,consumed_ordinal,open_row_floor,file_identity FROM source_runtime WHERE source_key=?1",
                     [key],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, Option<String>>(3)?)),
                 ),
                 Self::Declared {
                     source_key,
                     store,
                     layout,
                 } => connection.query_row(
-                    "SELECT lineage,consumed_ordinal,open_row_floor FROM declared_store_cursor
+                    "SELECT lineage,consumed_ordinal,open_row_floor,file_identity FROM declared_store_cursor
                      WHERE source_key=?1 AND store_path=?2 AND layout=?3",
                     params![source_key, store, layout],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, Option<String>>(3)?)),
                 ),
             }
             .optional()
             .map_err(|error| format!("read OpenCode durable cursor: {error}"))
         })?;
-        let Some((Some(lineage), Some(ordinal), floor)) = row else {
+        let Some((Some(lineage), Some(ordinal), floor, stored_identity)) = row else {
             return Ok((None, None));
         };
+        if known_identity_changed(file_identity, stored_identity.as_deref()) {
+            return Ok((None, None));
+        }
         Ok((Some(OpenCodeCursor { lineage, ordinal }), floor))
     }
 
@@ -159,7 +164,8 @@ impl CursorHome {
             (Self::Runtime(key), Some(cursor)) => tx.execute(
                 "UPDATE source_runtime
                  SET lineage=?2,consumed_ordinal=?3,high_water_ordinal=?4,
-                     last_success_ms=?5,pending_known=0,pending_unknown=?6
+                     last_success_ms=?5,pending_known=0,pending_unknown=?6,
+                      file_identity=COALESCE(?7,file_identity)
                  WHERE source_key=?1",
                 params![
                     key,
@@ -168,6 +174,7 @@ impl CursorHome {
                     cursor.high_water_ordinal,
                     recorded_at_ms,
                     i64::from(cursor.consumed_ordinal < cursor.high_water_ordinal),
+                    cursor.file_identity,
                 ],
             ),
             (Self::Runtime(key), None) => tx.execute(
@@ -183,11 +190,12 @@ impl CursorHome {
                 Some(cursor),
             ) => tx.execute(
                 "INSERT INTO declared_store_cursor
-                 (source_key,store_path,layout,lineage,consumed_ordinal,high_water_ordinal)
-                 VALUES (?1,?2,?3,?4,?5,?6)
+                 (source_key,store_path,layout,lineage,consumed_ordinal,high_water_ordinal,file_identity)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)
                  ON CONFLICT(source_key,store_path,layout) DO UPDATE SET
                      lineage=excluded.lineage,consumed_ordinal=excluded.consumed_ordinal,
-                     high_water_ordinal=excluded.high_water_ordinal",
+                     high_water_ordinal=excluded.high_water_ordinal,
+                      file_identity=COALESCE(excluded.file_identity,declared_store_cursor.file_identity)",
                 params![
                     source_key,
                     store,
@@ -195,6 +203,7 @@ impl CursorHome {
                     cursor.lineage,
                     cursor.consumed_ordinal,
                     cursor.high_water_ordinal,
+                    cursor.file_identity,
                 ],
             ),
             (Self::Declared { .. }, None) => Ok(1),
@@ -318,29 +327,52 @@ enum OpenCodeRoot {
     Unresolved(String),
 }
 
-/// The database file's identity and size. This is only a hint that the store
-/// was replaced: it can fire early, but it can also stay silent, because a
-/// file system may give a recreated file the inode number just freed and the
-/// same size. The front-row fingerprint read from the content is what a
-/// replacement is actually detected by; this only adds a trigger.
+fn known_identity_changed<T: PartialEq>(current: Option<T>, previous: Option<T>) -> bool {
+    matches!((current, previous), (Some(current), Some(previous)) if current != previous)
+}
+
+/// The database file's identity and size. Comparing the first row's message
+/// ID can still detect an overwrite that leaves the file identity unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileSignature {
+pub(crate) struct FileSignature {
     identity: Option<(u64, u64)>,
     db_len: u64,
 }
 
 impl FileSignature {
-    fn capture(database: &fs::File, metadata: &fs::Metadata) -> Self {
+    pub(crate) fn capture(database: &fs::File, metadata: &fs::Metadata) -> Self {
         Self {
             identity: file_identity(database, metadata),
             db_len: metadata.len(),
         }
     }
 
-    /// A different file now sits at the path, or the file got smaller. Either
-    /// can change which row is oldest and can renumber rowids.
-    fn replaces(&self, previous: &Self) -> bool {
+    /// Rowids and the open connection cannot be trusted after a replacement
+    /// or shrink. A SQLite VACUUM can shrink a file in place, so a shrink alone
+    /// does not reset the time cursor and replay history.
+    pub(crate) fn replaces(&self, previous: &Self) -> bool {
         !same_identity(self.identity, previous.identity) || self.db_len < previous.db_len
+    }
+
+    pub(crate) fn identity_changed(&self, previous: &Self) -> bool {
+        known_identity_changed(self.identity, previous.identity)
+    }
+
+    pub(crate) fn identity_key(&self) -> Option<String> {
+        // Unix and Windows can use all 64 bits of either component; SQLite's
+        // INTEGER is signed. Fixed-width hex preserves both numbers.
+        self.identity
+            .map(|(device, inode)| format!("{device:016x}:{inode:016x}"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_shrink(&mut self) {
+        self.db_len = u64::MAX;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forget_identity(&mut self) {
+        self.identity = None;
     }
 }
 
@@ -927,7 +959,15 @@ impl OpenCodeSource {
         stop: &AtomicBool,
         options: ReadOptions<'_>,
     ) -> Result<OpenCodeDrainOutcome, SourceDrainError> {
-        let stored = self.home.read_cursor(state)?;
+        let identity = signature.identity_key();
+        let stored = if cache
+            .signature
+            .is_some_and(|previous| signature.identity_changed(&previous))
+        {
+            None
+        } else {
+            self.home.read_cursor(state, identity.as_deref())?
+        };
         // A stop during the read abandons the page before anything is
         // written: no event, no cursor advance, no runtime failure. Every
         // OpenCode event has a content-derived identity, so the next start
@@ -953,6 +993,7 @@ impl OpenCodeSource {
                 lineage: &page.lineage,
                 consumed_ordinal: page.consumed_ordinal,
                 high_water_ordinal: page.high_water_ordinal,
+                file_identity: identity.as_deref(),
             }),
             recorded_at_ms,
             &|| stop.load(Ordering::Relaxed),
@@ -1081,6 +1122,7 @@ pub(crate) struct PageCursor<'a> {
     pub lineage: &'a str,
     pub consumed_ordinal: i64,
     pub high_water_ordinal: i64,
+    pub file_identity: Option<&'a str>,
 }
 
 /// Ingest one page and, for a full pass, advance the cursor, in a single
@@ -1826,6 +1868,137 @@ mod tests {
             .unwrap();
         assert_eq!(tied_b, 1, "the second tied message must be ingested");
         assert_eq!(later, 1, "the cursor must pass a tie that fills a page");
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn changed_opencode_file_identity_replays_below_the_cursor() {
+        for restart in [true, false] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("opencode.db");
+            let conn = create_database(&path);
+            insert_message(&conn, "front", "session", 10, 10);
+            insert_message(&conn, "tail", "session", 30, 30);
+            drop(conn);
+            let state = test_state();
+            let mut source = OpenCodeSource::at(&path);
+            assert_eq!(
+                source
+                    .drain(&state, 100, &NEVER_STOP)
+                    .unwrap()
+                    .rows_recorded,
+                2
+            );
+
+            let staged = temp.path().join("replacement.db");
+            let conn = create_database(&staged);
+            insert_message(&conn, "front", "session", 10, 10);
+            insert_message(&conn, "restored", "session", 20, 20);
+            insert_message(&conn, "tail", "session", 30, 30);
+            drop(conn);
+            fs::rename(&path, temp.path().join("original.db")).unwrap();
+            fs::rename(&staged, &path).unwrap();
+            if restart {
+                source = OpenCodeSource::at(&path);
+            }
+
+            let result = source.drain(&state, 200, &NEVER_STOP).unwrap();
+            assert_eq!(result.pass, Some(OpenCodePass::Full));
+            assert_eq!(result.rows_recorded, 1, "restart: {restart}");
+            assert_eq!(result.exact_redeliveries, 2);
+            assert_eq!(
+                ledger_count(
+                    &state,
+                    "SELECT COUNT(*) FROM usage_event WHERE producer_ref='restored'"
+                ),
+                1
+            );
+            assert_eq!(runtime_cursor(&state), ("front".to_string(), 30, 30));
+        }
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn opencode_shrink_and_legacy_cursor_keep_the_time_position() {
+        for legacy in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("opencode.db");
+            let conn = create_database(&path);
+            insert_message(&conn, "front", "session", 10, 10);
+            insert_message(&conn, "tail", "session", 30, 30);
+            let state = test_state();
+            let mut source = OpenCodeSource::at(&path);
+            source.drain(&state, 100, &NEVER_STOP).unwrap();
+            insert_message(&conn, "below-cursor", "session", 20, 20);
+            if legacy {
+                state.with_conn(|conn| {
+                    conn.execute("UPDATE source_runtime SET file_identity=NULL WHERE source_key='opencode'", [])
+                        .map_err(|e| e.to_string())
+                }).unwrap();
+                source = OpenCodeSource::at(&path);
+            } else {
+                source
+                    .cache
+                    .lock()
+                    .unwrap()
+                    .signature
+                    .as_mut()
+                    .unwrap()
+                    .simulate_shrink();
+            }
+            let outcome = source.drain(&state, 200, &NEVER_STOP).unwrap();
+            assert_eq!(outcome.pass, Some(OpenCodePass::Full));
+            assert_eq!(outcome.rows_recorded, 0, "legacy cursor: {legacy}");
+            assert_eq!(outcome.exact_redeliveries, 1);
+            assert_eq!(runtime_cursor(&state).1, 30);
+            assert_eq!(ledger_count(&state,
+                "SELECT COUNT(*) FROM source_runtime WHERE source_key='opencode' AND file_identity IS NOT NULL"
+            ), 1);
+        }
+    }
+
+    #[test]
+    fn opencode_cursor_write_without_identity_keeps_known_identity_in_both_homes() {
+        let state = test_state();
+        super::super::harness_drain::ensure_runtime_row(&state, OPENCODE_SOURCE_KEY).unwrap();
+        for home in [
+            CursorHome::Runtime(OPENCODE_SOURCE_KEY),
+            CursorHome::Declared {
+                source_key: "declared-test",
+                store: "store".into(),
+                layout: "v1",
+            },
+        ] {
+            DrainMode::Full
+                .write(&state, |tx| {
+                    let mut cursor = PageCursor {
+                        lineage: "front",
+                        consumed_ordinal: 10,
+                        high_water_ordinal: 10,
+                        file_identity: Some("0000000000000000:ffffffffffffffff"),
+                    };
+                    home.record_read_in_tx(tx, Some(&cursor), 100)
+                        .map_err(|e| e.to_string())?;
+                    cursor.consumed_ordinal = 20;
+                    cursor.high_water_ordinal = 20;
+                    cursor.file_identity = None;
+                    home.record_read_in_tx(tx, Some(&cursor), 200)
+                        .map_err(|e| e.to_string())?;
+                    Ok(((), true))
+                })
+                .unwrap();
+            assert_eq!(
+                home.read_cursor(&state, Some("0000000000000000:ffffffffffffffff"))
+                    .unwrap()
+                    .unwrap()
+                    .ordinal,
+                20
+            );
+            assert!(home
+                .read_cursor(&state, Some("0000000000000000:fffffffffffffffe"))
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[test]
@@ -2640,6 +2813,7 @@ mod tests {
             lineage: &page.lineage,
             consumed_ordinal: page.consumed_ordinal,
             high_water_ordinal: page.high_water_ordinal,
+            file_identity: None,
         };
         let requests = page
             .messages

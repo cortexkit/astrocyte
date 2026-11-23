@@ -42,7 +42,7 @@ fn schema_v64_removes_only_redundant_unknown_basis_heads_and_stale_queue_rows() 
         guard(conn)
     }).unwrap();
 
-    let migrated = migrate_store(&store).unwrap();
+    let migrated = store.migrate("astrocyte", &MIGRATIONS[..=before]).unwrap();
     store
         .with_conn(|conn| {
             let mut statement = conn

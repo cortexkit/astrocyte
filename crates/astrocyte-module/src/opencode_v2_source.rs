@@ -9,17 +9,16 @@ use std::sync::Mutex;
 
 use astrocyte_core::fact::{event_id, ChargeBasis};
 use astrocyte_core::ingest::{EventRecordRequest, RecordDisposition, StepDetail};
+use astrocyte_readers::read_io;
 use astrocyte_readers::sessions::opencode::{
     OpenCodeMessage, OpenCodeReadError, OpenCodeScanCost, OpenCodeTailRequest,
 };
 use astrocyte_readers::sessions::opencode_v2::{self, Page, SessionPolicy, TailReader};
-use astrocyte_readers::{
-    file_identity::{file_identity, same_identity},
-    read_io,
-};
 
 use super::harness_drain::{self, DrainMode, HarnessSource};
-use super::opencode_source::{resolve_payer_in_tx, CursorHome, PageCursor, ReadOptions};
+use super::opencode_source::{
+    resolve_payer_in_tx, CursorHome, FileSignature, PageCursor, ReadOptions,
+};
 use super::thalamus_payer_join::{self, WaitQueue, WaitingCall};
 use super::{SetAsideRecord, SourceDrainError};
 use crate::state::SharedState;
@@ -34,25 +33,13 @@ pub(crate) const PAGE_LIMIT: usize = 2_000;
 #[derive(Default)]
 struct Cache {
     reader: Option<TailReader>,
-    signature: Option<Signature>,
+    signature: Option<FileSignature>,
     marker_present: bool,
     last_full: Option<i64>,
     backlog: bool,
     front: Option<String>,
     tail: Option<i64>,
     open: BTreeMap<i64, i64>,
-}
-
-#[derive(Clone, Copy)]
-struct Signature {
-    identity: Option<(u64, u64)>,
-    len: u64,
-}
-
-impl Signature {
-    fn replaces(self, previous: Self) -> bool {
-        !same_identity(self.identity, previous.identity) || self.len < previous.len
-    }
 }
 
 #[derive(Debug, Default)]
@@ -158,7 +145,7 @@ impl OpenCodeV2Source {
             state,
             &self.home,
             None,
-            false,
+            None,
             now,
             stop,
             mode,
@@ -254,10 +241,7 @@ impl OpenCodeV2Source {
             };
             let metadata = read_io::file_metadata(&file)
                 .map_err(|error| format!("inspect OpenCode 2: {error}"))?;
-            Signature {
-                identity: file_identity(&file, &metadata),
-                len: metadata.len(),
-            }
+            FileSignature::capture(&file, &metadata)
         } else if let Some(signature) = cache.signature {
             signature
         } else {
@@ -266,7 +250,11 @@ impl OpenCodeV2Source {
         let replaced = mode.is_full()
             && cache
                 .signature
-                .is_some_and(|previous| signature.replaces(previous));
+                .is_some_and(|previous| signature.replaces(&previous));
+        let identity_changed = replaced
+            && cache
+                .signature
+                .is_some_and(|previous| signature.identity_changed(&previous));
         if replaced {
             cache.reader = None;
             cache.tail = None;
@@ -286,8 +274,31 @@ impl OpenCodeV2Source {
             settled: options.session_settled(session),
             imported_through_seq: imported_through_seq(session),
         };
+        let identity = if mode.is_full() {
+            signature.identity_key()
+        } else {
+            None
+        };
+        let full_page = |reset_floor: bool| {
+            let (cursor, floor) = if identity_changed {
+                (None, None)
+            } else {
+                self.home
+                    .read_cursor_with_open_row_floor(state, identity.as_deref())?
+            };
+            opencode_v2::read_page_with_sessions(
+                path,
+                cursor.as_ref(),
+                floor.filter(|_| !reset_floor),
+                PAGE_LIMIT,
+                now,
+                stop,
+                &sessions,
+            )
+            .map_err(read_error)
+        };
         let page = if full {
-            self.full_page(state, path, now, stop, &sessions, replaced)?
+            full_page(replaced)?
         } else {
             if cache.reader.is_none() {
                 let Some(reader) = TailReader::open(path, stop).map_err(read_error)? else {
@@ -339,7 +350,7 @@ impl OpenCodeV2Source {
                         });
                     }
                     full = true;
-                    self.full_page(state, path, now, stop, &sessions, true)?
+                    full_page(true)?
                 }
                 page => page,
             }
@@ -355,7 +366,12 @@ impl OpenCodeV2Source {
             state,
             &self.home,
             Some(&page),
-            full,
+            full.then_some(PageCursor {
+                lineage: &page.lineage,
+                consumed_ordinal: page.consumed,
+                high_water_ordinal: page.high_water,
+                file_identity: identity.as_deref(),
+            }),
             now,
             stop,
             mode,
@@ -402,28 +418,6 @@ impl OpenCodeV2Source {
             absent: true,
             ..Outcome::default()
         })
-    }
-
-    fn full_page(
-        &self,
-        state: &SharedState,
-        path: &std::path::Path,
-        now: i64,
-        stop: &AtomicBool,
-        sessions: &dyn Fn(&str) -> SessionPolicy,
-        reset_floor: bool,
-    ) -> Result<Option<Page>, SourceDrainError> {
-        let (cursor, floor) = self.home.read_cursor_with_open_row_floor(state)?;
-        opencode_v2::read_page_with_sessions(
-            path,
-            cursor.as_ref(),
-            floor.filter(|_| !reset_floor),
-            PAGE_LIMIT,
-            now,
-            stop,
-            sessions,
-        )
-        .map_err(read_error)
     }
 }
 
@@ -474,7 +468,7 @@ fn commit(
     state: &SharedState,
     home: &CursorHome,
     page: Option<&Page>,
-    full: bool,
+    cursor: Option<PageCursor<'_>>,
     now: i64,
     stop: &AtomicBool,
     mode: DrainMode,
@@ -482,7 +476,7 @@ fn commit(
     waiting: &mut WaitQueue,
 ) -> Result<Outcome, SourceDrainError> {
     let initial = Outcome {
-        full,
+        full: cursor.is_some(),
         cost: page.map(|page| page.cost).unwrap_or_default(),
         #[cfg(test)]
         incomplete_cost: page.map(|page| page.incomplete_cost).unwrap_or_default(),
@@ -574,18 +568,10 @@ fn commit(
         let newly_seen =
             harness_drain::record_set_aside_in_tx(tx, home.source_key(), &evidence, now)?;
         if let Some(page) = page.filter(|_| mode.is_full()) {
-            let cursor = PageCursor {
-                lineage: &page.lineage,
-                consumed_ordinal: page.consumed,
-                high_water_ordinal: page.high_water,
-            };
-            home.record_read_in_tx(
-                tx,
-                (full && resolution.next.is_empty()).then_some(&cursor),
-                now,
-            )
-            .map_err(|e| e.to_string())?;
-            if full && resolution.next.is_empty() {
+            let cursor = cursor.as_ref().filter(|_| resolution.next.is_empty());
+            home.record_read_in_tx(tx, cursor, now)
+                .map_err(|e| e.to_string())?;
+            if cursor.is_some() {
                 home.record_open_row_floor_in_tx(tx, page.open_row_floor)
                     .map_err(|e| e.to_string())?;
             }
@@ -968,7 +954,93 @@ mod tests {
     }
 
     #[test]
-    fn v2_detected_replacement_rediscovers_below_the_old_floor() {
+    #[cfg(any(unix, windows))]
+    fn changed_opencode_v2_file_identity_replays_below_the_cursor_and_floor() {
+        for restart in [true, false] {
+            let (temp, path, conn) = database();
+            insert(&conn, "front", 10, &payload(10, true));
+            insert(&conn, "removed", 25, &payload(25, true));
+            insert(&conn, "tail", 30, &payload(30, true));
+            drop(conn);
+            let state = test_state();
+            let mut source = OpenCodeV2Source::at(&path);
+            assert_eq!(source.drain(&state, 100, &STOP).unwrap().recorded, 3);
+            assert_eq!(stored_floor(&state), Some(3));
+
+            let (_staged_temp, staged, conn) = database();
+            insert(&conn, "front", 10, &payload(10, true));
+            insert(&conn, "restored-open", 15, &payload(15, false));
+            insert(&conn, "restored", 20, &payload(20, true));
+            insert(&conn, "tail", 30, &payload(30, true));
+            drop(conn);
+            std::fs::rename(&path, temp.path().join("original.db")).unwrap();
+            std::fs::rename(&staged, &path).unwrap();
+            if restart {
+                source = OpenCodeV2Source::at(&path);
+            }
+
+            let result = source.drain(&state, 200, &STOP).unwrap();
+            assert!(result.full);
+            assert_eq!(result.recorded, 1, "restart: {restart}");
+            assert_eq!(result.skipped_recorded, 2);
+            assert_eq!(count(&state, "usage_event"), 4);
+            assert_eq!(runtime(&state).1, 30);
+            assert_eq!(stored_floor(&state), Some(2));
+            assert!(source.cache.lock().unwrap().open.contains_key(&2));
+        }
+    }
+
+    #[test]
+    fn opencode_v2_legacy_cursor_keeps_the_time_position_and_floor() {
+        let (_temp, path, conn) = database();
+        insert(&conn, "front", 10, &payload(10, true));
+        insert(&conn, "old-open", 15, &payload(15, false));
+        conn.execute(
+            "UPDATE session_message SET type='user' WHERE id='old-open'",
+            [],
+        )
+        .unwrap();
+        insert(&conn, "tail", 30, &payload(30, true));
+        let state = test_state();
+        OpenCodeV2Source::at(&path)
+            .drain(&state, 100, &STOP)
+            .unwrap();
+        assert_eq!(stored_floor(&state), Some(3));
+        conn.execute(
+            "UPDATE session_message SET type='assistant' WHERE id='old-open'",
+            [],
+        )
+        .unwrap();
+        insert(&conn, "below-cursor", 20, &payload(20, true));
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE source_runtime SET file_identity=NULL WHERE source_key='opencode-v2'",
+                    [],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let source = OpenCodeV2Source::at(&path);
+        let outcome = source.drain(&state, 200, &STOP).unwrap();
+        assert!(outcome.full);
+        assert_eq!(outcome.recorded, 0);
+        assert_eq!(outcome.skipped_recorded, 1);
+        assert_eq!(runtime(&state).1, 30);
+        assert!(source.cache.lock().unwrap().open.is_empty());
+        assert_eq!(stored_floor(&state), Some(4));
+        #[cfg(any(unix, windows))]
+        assert_eq!(
+            count(
+                &state,
+                "source_runtime WHERE source_key='opencode-v2' AND file_identity IS NOT NULL"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn opencode_v2_shrink_rediscovers_open_rows_but_keeps_the_time_cursor() {
         let (_temp, path, conn) = database();
         insert(&conn, "front", 10, &payload(10, true));
         insert(&conn, "restored", 20, &payload(20, false));
@@ -982,15 +1054,22 @@ mod tests {
         let source = OpenCodeV2Source::at(path);
         assert_eq!(source.drain(&state, 100, &STOP).unwrap().recorded, 2);
         assert_eq!(stored_floor(&state), Some(3));
-        // A replacement may retain the front identity while restoring older
-        // incomplete calls. Force the size-shrink replacement hint without
-        // depending on a platform's file-identity implementation.
+        // A shrink can renumber rowids. Force the size hint without changing
+        // the file's identity, then check both the floor and time cursor.
         conn.execute(
             "UPDATE session_message SET type='assistant' WHERE id='restored'",
             [],
         )
         .unwrap();
-        source.cache.lock().unwrap().signature.as_mut().unwrap().len = u64::MAX;
+        insert(&conn, "below-cursor", 21, &payload(21, true));
+        source
+            .cache
+            .lock()
+            .unwrap()
+            .signature
+            .as_mut()
+            .unwrap()
+            .simulate_shrink();
         assert_eq!(
             source
                 .drain(&state, 20 + QUIET_WINDOW, &STOP)
@@ -999,7 +1078,7 @@ mod tests {
             1
         );
         assert_eq!(runtime(&state).1, 30);
-        assert_eq!(stored_floor(&state), Some(3));
+        assert_eq!(stored_floor(&state), Some(4));
         assert_eq!(count(&state, "usage_event"), 3);
         assert_eq!(quantity(&state, "output"), 39);
     }
@@ -1636,7 +1715,7 @@ mod tests {
             assert!(cache.tail.is_some());
             // Simulate a previously unavailable file identity. Fast cycles must
             // keep the connection; only a full tick may re-inspect the path.
-            cache.signature.as_mut().unwrap().identity = None;
+            cache.signature.as_mut().unwrap().forget_identity();
         }
         read_io::reset_counts();
         source.drain_fast(&state, 102, &STOP).unwrap();

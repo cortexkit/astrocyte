@@ -79,7 +79,9 @@ A fast read uses the same event mapping, identities and commit ordering as a ful
 drain, so later full reads deduplicate it normally. BROCA advances its durable
 fact cursor with new facts; each OpenCode reader retains its own in-memory rowid cursor.
 After startup or a detected store replacement, OpenCode waits for a full pass to
-establish the store identity. An idle fast cycle commits nothing, including when
+compare the file identity with the one stored alongside its cursor and restart
+from the beginning if the identity changed.
+An idle fast cycle commits nothing, including when
 OpenCode's initial tail seed returns only exact redeliveries. Fast reads never
 advance `last_success_ms` or clear degraded health for transcript sources. Committed events refresh the
 recent-steps memory through the normal post-commit path. Both lanes run on the

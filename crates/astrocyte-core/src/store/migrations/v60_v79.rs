@@ -388,3 +388,8 @@ WHERE EXISTS (
     WHERE event.event_key = pricing_pending.event_key AND event.charge_basis = 'unknown'
 );
 "#;
+
+pub(in crate::store) const V65: &str = r#"
+ALTER TABLE source_runtime ADD COLUMN file_identity TEXT;
+ALTER TABLE declared_store_cursor ADD COLUMN file_identity TEXT;
+"#;

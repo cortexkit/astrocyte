@@ -48,7 +48,7 @@ copies that timeout without running the table-creating probes.
 | `match_attempt` | Each row records a statement-line match attempt and the amounts captured for that attempt. | insert only |
 | `statement_import` | Each row records CSV import provenance and its content digest for idempotency. | insert only |
 | `desired_config` | The row records the committed desired-configuration generation. | one row |
-| `source_runtime` | Each row records a producer's cursor, lineage, last successful drain and pending disclosure. | upsert |
+| `source_runtime` | Each row records a producer's cursor, lineage, last successful drain and pending disclosure. OpenCode stores its file identity in `file_identity`. | upsert |
 | `media_feed_cursor` | The row records colliculus's committed unsigned feed sequence and skipped-local count. | upsert with each page |
 | `thalamus_payer_cursor` | The row records the payer store incarnation and committed sequence. | upsert with each mirror page |
 | `thalamus_payer_session` | Each row preserves the declared owner of a THALAMUS session. | insert once per harness and session |
@@ -56,7 +56,7 @@ copies that timeout without running the table-creating probes.
 | `thalamus_payer_first_seen` | Each row preserves when an undated transcript call first waited for its payer. | insert once per event |
 | `thalamus_payer_coverage` | Each row identifies one payer coverage exception, so replay cannot count it twice. | insert once per kind and identity |
 | `set_aside_record` | Each row records an unreadable producer record by source and locator, including its reason and observation times. | upsert |
-| `declared_store_cursor` | Each row records the durable read position of one store that another module declared, per source and on-disk layout. | upsert; deleted when the store is no longer declared |
+| `declared_store_cursor` | Each row records the durable read position of one store that another module declared, per source and on-disk layout. OpenCode stores its file identity in `file_identity`. | upsert; deleted when the store is no longer declared |
 | `read_watermark` | Each row records a reader source's read watermark, the time before which everything in its declared stores is recorded. | upsert that only moves forward |
 | `capacity_runtime` | The row records whether the capacity axis is disabled, configured but unavailable, or active. | upsert |
 | `capacity_window` | Each row records a provider account's latest QTA quota window. | upsert |
