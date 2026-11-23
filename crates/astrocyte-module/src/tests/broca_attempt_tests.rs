@@ -251,6 +251,80 @@ fn broca_attempt_vectors_bill_attempts_without_double_billing() {
     }
 }
 
+/// Broca's fast run on a route that serves fast as its own model
+/// (`tests/vectors/broca-speed-twin-1123`, from broca's attempt serializer).
+/// The attempt names the base row with `served_speed: fast` and no served
+/// tier, and prices only at that row's fast rates. The sample's charge basis
+/// is `unknown` because broca's test resolver maps no Kimi key; it is set to
+/// `metered_api` here so the pricing pass runs.
+#[test]
+fn broca_speed_twin_attempt_prices_the_base_row_at_its_fast_rate() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/broca-speed-twin-1123");
+    let bytes = std::fs::read(dir.join("speed-twin-served-fast.jsonl")).unwrap();
+    let checksums = std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap();
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    assert!(checksums
+        .lines()
+        .any(|line| line == format!("{hash}  speed-twin-served-fast.jsonl")));
+    for fast_rates in [false, true] {
+        let mut rows: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for row in &mut rows {
+            row["charge_basis"] = json!("metered_api");
+        }
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("run-index.db");
+        create_store(&path, "speed-twin", 1);
+        append_values(&path, &rows);
+        let state = test_state();
+        drain(&state, &path);
+        price(&state, fast_rates, false);
+        let priced = read_rows(
+            &state,
+            "SELECT e.provider,e.model,a.mode,a.served_service_tier,p.role,p.unpriced_reason,
+                    p.charge_nanos,json_extract(p.catalog_entry,'$.fact_key')
+             FROM priced_charge p JOIN usage_event e USING(event_key)
+             JOIN broca_attempt_detail a USING(event_key) ORDER BY p.role",
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            },
+        );
+        // $4 per million fast: 30 input tokens cost 120,000 nanodollars and
+        // 120 output tokens 480,000. With no fast rate the call stays unpriced.
+        let charge = |role: &str, nanos: i64| {
+            (
+                "kimi-code-plan-global".to_string(),
+                "k3.1-pro".to_string(),
+                "fast".to_string(),
+                None,
+                role.to_string(),
+                (!fast_rates).then(|| "no_rate".to_string()),
+                fast_rates.then_some(nanos),
+                Some(format!("rate.{role}.mode.fast")),
+            )
+        };
+        assert_eq!(
+            priced,
+            [charge("input", 120_000), charge("output", 480_000)],
+            "fast rates served: {fast_rates}"
+        );
+        // The run total is covered by its attempt, so it is not priced again.
+        assert_eq!(count(&state, "priced_charge"), 2);
+    }
+}
+
 #[test]
 fn broca_attempt_fast_mode_uses_only_fast_rates_and_retains_payer_and_split() {
     for fast_rates in [false, true] {
