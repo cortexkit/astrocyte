@@ -769,12 +769,13 @@ fn regression_vault_failed_watch_reread_retries_on_full_tick() {
         reader.snapshots.lock().unwrap().iter().any(Result::is_err)
     });
     *peer.value.lock().unwrap() = listing(&["openai"], Some("plus"), Some(200));
-    // The first tick can return the failed reread and its successful retry together.
+    // A tick sends to the reader before it takes the results, so this first
+    // tick can return the failed reread and its successful retry together.
+    // After a success the reader lists again only daily, so this batch must be
+    // checked rather than dropped. Later ticks retry a list that failed; no
+    // watch notice is sent from here on.
     let mut snapshots = reader.tick(&state);
     assert!(snapshots.iter().any(Result::is_err));
-    // Production ticks every poll interval, so keep ticking: one list call can
-    // fail on a transient socket error (seen on Windows), and the next tick
-    // must retry it. No watch notice is sent from here on.
     let mut failures = Vec::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
