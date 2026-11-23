@@ -769,7 +769,9 @@ fn regression_vault_failed_watch_reread_retries_on_full_tick() {
         reader.snapshots.lock().unwrap().iter().any(Result::is_err)
     });
     *peer.value.lock().unwrap() = listing(&["openai"], Some("plus"), Some(200));
-    assert!(reader.tick(&state).iter().any(Result::is_err));
+    // The first tick can return the failed reread and its successful retry together.
+    let mut snapshots = reader.tick(&state);
+    assert!(snapshots.iter().any(Result::is_err));
     // Production ticks every poll interval, so keep ticking: one list call can
     // fail on a transient socket error (seen on Windows), and the next tick
     // must retry it. No watch notice is sent from here on.
@@ -777,7 +779,7 @@ fn regression_vault_failed_watch_reread_retries_on_full_tick() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let mut listed = false;
-        for result in reader.tick(&state) {
+        for result in snapshots {
             match result {
                 Ok(listing) => {
                     listed |= listing
@@ -800,6 +802,7 @@ fn regression_vault_failed_watch_reread_retries_on_full_tick() {
             peer.requests.lock().unwrap().len(),
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
+        snapshots = reader.tick(&state);
     }
     assert_eq!(peer.count("auth.watch_scoped"), 1);
     reader.join();
