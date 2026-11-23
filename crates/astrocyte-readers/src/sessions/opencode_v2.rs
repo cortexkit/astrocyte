@@ -184,7 +184,8 @@ pub fn read_page_with_sessions(
         page.high_water = counted_query_row(
             connection,
             &mut page.cost,
-            "SELECT COALESCE(MAX(time_updated),0) FROM session_message",
+            "SELECT COALESCE(MAX(time_updated),0) FROM session_message
+             WHERE typeof(time_updated)='integer'",
             [],
             |row| row.get(0),
         )
@@ -219,7 +220,8 @@ pub fn read_page_with_sessions(
         page.consumed = counted_query_row(
             connection,
             &mut page.cost,
-            "SELECT time_updated FROM session_message WHERE time_updated>=?1
+            "SELECT time_updated FROM session_message
+             WHERE typeof(time_updated)='integer' AND time_updated>=?1
              ORDER BY time_updated,seq LIMIT 1 OFFSET ?2",
             params![lower, offset],
             |row| row.get(0),
@@ -237,7 +239,8 @@ pub fn read_page_with_sessions(
             page.consumed = counted_query_row(
                 connection,
                 &mut page.cost,
-                "SELECT MIN(time_updated) FROM session_message WHERE time_updated>?1",
+                "SELECT MIN(time_updated) FROM session_message
+                 WHERE typeof(time_updated)='integer' AND time_updated>?1",
                 params![lower],
                 |row| row.get::<_, Option<i64>>(0),
             )
@@ -251,7 +254,8 @@ pub fn read_page_with_sessions(
         let mut incomplete = connection
             .prepare(
                 "SELECT rowid FROM session_message
-                 WHERE rowid>=?3 AND type='assistant' AND time_updated<?1 AND time_updated<=?2
+                 WHERE rowid>=?3 AND type='assistant' AND typeof(time_updated)='integer'
+                   AND time_updated<?1 AND time_updated<=?2
                    AND CASE WHEN typeof(data)='text' AND json_valid(data)
                      THEN json_extract(data,'$.time.completed') IS NULL ELSE 0 END",
             )
@@ -266,11 +270,14 @@ pub fn read_page_with_sessions(
         page.cost.add_assign_saturating(&page.incomplete_cost);
         let old_open = serde_json::to_string(&old_open)
             .map_err(|e| format!("encode OpenCode 2 incomplete rowids: {e}"))?;
+        // Malformed timestamps cannot enter the paging bounds, but must
+        // still reach the row decoder so the ledger records their evidence.
         let mut statement = connection
             .prepare(
                 "SELECT rowid,id,session_id,time_updated,data,seq FROM session_message
-             WHERE type='assistant' AND time_updated<=?2 AND
-               (time_updated>=?1 OR rowid IN (SELECT value FROM json_each(?3)))
+             WHERE typeof(time_updated)!='integer' OR
+               (type='assistant' AND time_updated<=?2 AND
+                (time_updated>=?1 OR rowid IN (SELECT value FROM json_each(?3))))
              ORDER BY seq",
             )
             .map_err(|e| sqlite_error(stop, "prepare OpenCode 2 page", e))?;
@@ -481,6 +488,7 @@ fn take_row(
         .get(1)
         .map_err(|e| sqlite_error(stop, "read OpenCode 2 id", e))?;
     let decoded = (|| -> Result<Option<OpenCodeMessage>, String> {
+        let updated_at_ms = row.get(3).map_err(|e| format!("read update time: {e}"))?;
         let session_id: String = row.get(2).map_err(|e| format!("read session: {e}"))?;
         let policy = sessions(&session_id);
         if let Some(through) = policy.imported_through_seq {
@@ -492,7 +500,6 @@ fn take_row(
                 return Ok(None);
             }
         }
-        let updated_at_ms = row.get(3).map_err(|e| format!("read update time: {e}"))?;
         let mut bytes = row
             .get::<_, String>(4)
             .map_err(|e| format!("read data: {e}"))?

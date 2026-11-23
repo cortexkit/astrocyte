@@ -1451,6 +1451,36 @@ mod tests {
     }
 
     #[test]
+    fn noninteger_opencode_v2_update_time_records_evidence_and_all_good_rows() {
+        let (_temp, path, conn) = database();
+        for (id, time) in [("before", 10), ("bad", 20), ("after", 30)] {
+            insert(&conn, id, time, &payload(time, true));
+        }
+        conn.execute(
+            "UPDATE session_message SET time_updated='unknown' WHERE id='bad'",
+            [],
+        )
+        .unwrap();
+        let state = test_state();
+        let source = OpenCodeV2Source::at(path);
+        assert_eq!(source.drain(&state, 100, &STOP).unwrap().recorded, 2);
+        assert_eq!(count(&state, "usage_event"), 2);
+        assert_eq!(runtime(&state).1, 30);
+        super::super::harness_drain::assert_set_aside(&state, SOURCE_KEY, 1);
+        let reason: String = state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT reason FROM set_aside_record WHERE locator='session_message:bad'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert!(reason.contains("update time"), "{reason}");
+    }
+
+    #[test]
     fn v2_only_calls_reach_served_cache_steps_and_sessions_once() {
         let (_temp, path, conn) = database();
         let now = crate::state::now_ms();

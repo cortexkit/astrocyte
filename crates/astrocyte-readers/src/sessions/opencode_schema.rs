@@ -442,7 +442,7 @@ fn read_snapshot(
     let high_water_ordinal = counted_query_row(
         connection,
         &mut cost,
-        "SELECT COALESCE(MAX(time_updated),0) FROM message",
+        "SELECT COALESCE(MAX(time_updated),0) FROM message WHERE typeof(time_updated)='integer'",
         [],
         |row| row.get::<_, i64>(0),
     )
@@ -450,31 +450,10 @@ fn read_snapshot(
 
     let represented = since.filter(|cursor| cursor.lineage == lineage);
     let lower_bound = represented.map_or(0, |cursor| cursor.ordinal);
-    if represented.is_some_and(|cursor| cursor.ordinal > high_water_ordinal) {
-        // OpenCode deletes sessions. When the deleted sessions held every row
-        // at or above the cursor, the maximum falls below the cursor while the
-        // front row (and so the lineage) is unchanged. The store then holds no
-        // row newer than the cursor, so this is an empty page that keeps the
-        // cursor instead of a failure. Both ordinals stay at the cursor: the
-        // stored cursor row requires high water to cover the cursor, and the
-        // cursor itself never moves backwards, so rows already read are not
-        // re-read. A later write stamps a fresh wall-clock time at or above
-        // the cursor and is read normally.
-        let front_row_id = read_front_row_id(connection, &mut cost, stop)?;
-        return Ok(OpenCodePage {
-            set_aside: Vec::new(),
-            lineage,
-            consumed_ordinal: lower_bound,
-            high_water_ordinal: lower_bound,
-            raw: OpenCodeTotals::default(),
-            raw_after_cursor: OpenCodeTotals::default(),
-            emitted: OpenCodeTotals::default(),
-            emitted_after_cursor: OpenCodeTotals::default(),
-            messages: Vec::new(),
-            front_row_id,
-            cost,
-        });
-    }
+    // Deleting a session can leave every timestamp below the cursor. Keep
+    // both ordinals at the cursor rather than re-reading history, but still
+    // collect malformed timestamps, which have no position on that cursor.
+    let high_water_ordinal = high_water_ordinal.max(lower_bound);
     // The two lower bounds below must use the same comparison. `time_updated`
     // is not unique: on 2026-09-20 the live store had 1,241,262 messages but
     // only 1,235,249 distinct update timestamps, so 6,013 rows shared an
@@ -517,7 +496,7 @@ fn read_snapshot(
         &mut cost,
         "SELECT time_updated
          FROM message
-         WHERE time_updated>=?1 AND time_updated<=?2
+         WHERE typeof(time_updated)='integer' AND time_updated>=?1 AND time_updated<=?2
          ORDER BY time_updated,id
          LIMIT 1 OFFSET ?3",
         params![lower_bound, high_water_ordinal, page_offset],
@@ -536,7 +515,8 @@ fn read_snapshot(
         counted_query_row(
             connection,
             &mut cost,
-            "SELECT MIN(time_updated) FROM message WHERE time_updated>?1",
+            "SELECT MIN(time_updated) FROM message
+             WHERE typeof(time_updated)='integer' AND time_updated>?1",
             params![lower_bound],
             |row| row.get::<_, Option<i64>>(0),
         )
@@ -573,13 +553,14 @@ fn read_snapshot(
     //   Re-check the cited lines when upgrading OpenCode.
     //
     // The predicate text is shared with the tail read (`TOKENS_FINAL`), so
-    // both paths select exactly the same rows as final.
+    // both paths select exactly the same rows as final. Invalid timestamps
+    // bypass the time range so they reach the set-aside path.
     let mut statement = connection
         .prepare(&format!(
             "SELECT id,session_id,time_updated,data
              FROM message
-             WHERE time_updated>=?1 AND time_updated<=?2
-               AND {}
+             WHERE typeof(time_updated)!='integer'
+                OR (time_updated>=?1 AND time_updated<=?2 AND {})
              ORDER BY time_updated,id",
             eligible_row(true)
         ))
@@ -620,9 +601,16 @@ fn read_snapshot(
         let session_id = row
             .get::<_, String>(1)
             .map_err(|error| format!("read OpenCode session id for {id}: {error}"))?;
-        let updated_at_ms = row
-            .get::<_, i64>(2)
-            .map_err(|error| format!("read OpenCode update time for {id}: {error}"))?;
+        let updated_at_ms = match row.get::<_, i64>(2) {
+            Ok(time) => time,
+            Err(error) => {
+                page.set_aside.push(OpenCodeSetAside {
+                    id,
+                    reason: format!("read OpenCode update time: {error}"),
+                });
+                continue;
+            }
+        };
         let data = match row.get::<_, String>(3) {
             Ok(data) => data,
             Err(error) => {
@@ -744,7 +732,7 @@ fn read_tail_snapshot(
         connection,
         &format!(
             "{columns}
-             WHERE rowid>?1 AND rowid<=?2 AND {}
+             WHERE rowid>?1 AND rowid<=?2 AND (typeof(time_updated)!='integer' OR {})
              ORDER BY rowid
              LIMIT ?3",
             eligible_row(false)
@@ -775,7 +763,10 @@ fn read_tail_snapshot(
     {
         let mut lookup = crate::read_io::prepare_cached(
             connection,
-            &format!("{columns} WHERE rowid=?1 AND {}", eligible_row(false)),
+            &format!(
+                "{columns} WHERE rowid=?1 AND (typeof(time_updated)!='integer' OR {})",
+                eligible_row(false)
+            ),
         )
         .map_err(|error| sqlite_error(stop, "prepare OpenCode open-row lookup", error))?;
         // Rows above the start were already examined by the range scan above.
@@ -821,9 +812,16 @@ fn take_tail_row(
     let session_id = row
         .get::<_, String>(2)
         .map_err(|error| format!("read OpenCode session id for {id}: {error}"))?;
-    let updated_at_ms = row
-        .get::<_, i64>(3)
-        .map_err(|error| format!("read OpenCode update time for {id}: {error}"))?;
+    let updated_at_ms = match row.get::<_, i64>(3) {
+        Ok(time) => time,
+        Err(error) => {
+            page.set_aside.push(OpenCodeSetAside {
+                id,
+                reason: format!("read OpenCode update time: {error}"),
+            });
+            return Ok(rowid);
+        }
+    };
     let data = match row.get::<_, String>(4) {
         Ok(data) => data,
         Err(error) => {

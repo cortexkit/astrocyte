@@ -1405,6 +1405,43 @@ mod tests {
     }
 
     #[test]
+    fn noninteger_opencode_update_time_records_evidence_and_all_good_rows() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("opencode.db");
+        let conn = create_database(&path);
+        for (id, time) in [("before", 10), ("bad", 20), ("after", 30)] {
+            insert_message(&conn, id, "session", time, time);
+        }
+        conn.execute(
+            "UPDATE message SET time_updated='unknown' WHERE id='bad'",
+            [],
+        )
+        .unwrap();
+        let state = test_state();
+        let source = OpenCodeSource::at(&path);
+        let outcome = source.drain(&state, 100, &NEVER_STOP).unwrap();
+        assert_eq!(outcome.rows_recorded, 2);
+        assert_eq!(ledger_count(&state, "SELECT COUNT(*) FROM usage_event"), 2);
+        assert_eq!(runtime_cursor(&state).1, 30);
+        crate::refresher::harness_drain::assert_set_aside(&state, "opencode", 1);
+        assert_eq!(ledger_count(&state,
+            "SELECT COUNT(*) FROM set_aside_record WHERE locator LIKE '%:message:bad' AND reason LIKE '%update time%'"
+        ), 1);
+
+        insert_message(&conn, "bad-tail", "session", 40, 40);
+        conn.execute(
+            "UPDATE message SET time_updated='unknown' WHERE id='bad-tail'",
+            [],
+        )
+        .unwrap();
+        insert_message(&conn, "good-tail", "session", 50, 50);
+        let tail = source.drain(&state, 200, &NEVER_STOP).unwrap();
+        assert_eq!(tail.pass, Some(OpenCodePass::Tail));
+        assert_eq!(tail.rows_recorded, 1);
+        crate::refresher::harness_drain::assert_set_aside(&state, "opencode", 2);
+    }
+
+    #[test]
     fn set_aside_good_opencode_rows_are_byte_identical() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("opencode.db");
