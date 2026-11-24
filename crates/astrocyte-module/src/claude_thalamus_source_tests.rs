@@ -126,7 +126,6 @@ fn recorded_claude_refusal_and_retry_join_payer_rows_and_acknowledge_done_once()
                      JOIN usage_event USING(event_key) WHERE producer_ref=?1 ORDER BY role, unit",
                 )
                 .unwrap();
-            let mut retry_writes = Vec::new();
             for (request, stop_reason, cache_read) in
                 [(REFUSED, "refusal", 12), (RETRY, "end_turn", 0)]
             {
@@ -175,27 +174,21 @@ fn recorded_claude_refusal_and_retry_join_payer_rows_and_acknowledge_done_once()
                         .map(|(role, quantity)| (role.to_owned(), "token".to_owned(), quantity, 0)),
                     "{request}"
                 );
-                assert!(
-                    writes.iter().all(|(_, _, _, exponent)| *exponent == 0),
-                    "{request}: {writes:?}"
-                );
                 if request == REFUSED {
-                    assert_eq!(
-                        writes.iter().map(|(_, _, quantity, _)| quantity).sum::<i64>(),
-                        0
+                    assert!(
+                        writes
+                            .iter()
+                            .all(|(_, _, quantity, exponent)| *quantity == 0 && *exponent == 0),
+                        "{request}: {writes:?}"
                     );
                 } else {
-                    retry_writes = writes;
+                    assert_eq!(
+                        writes,
+                        [("cache_write".to_owned(), "token".to_owned(), 12, 0)],
+                        "{request}: aggregate cache writes must not acquire a lifetime"
+                    );
                 }
             }
-            assert_eq!(
-                retry_writes
-                    .iter()
-                    .map(|(_, _, quantity, _)| quantity)
-                    .sum::<i64>(),
-                12,
-                "{RETRY} cache-write measurements (role, unit, quantity, exponent): {retry_writes:?}"
-            );
             Ok(())
         })
         .unwrap();
