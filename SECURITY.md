@@ -42,9 +42,9 @@ regular file of at most 64 MiB that its user can read, by naming it as a
 `spend.statement.import` path. The file is parsed as a statement and its
 content is not returned, but parse errors name line numbers and fields.
 
-The subc connection file the supervisor passes to the module with `--subc`,
+The daemon connection file the supervisor passes to the module with `--subc`,
 and the one passed to `spend_drive`, let their holder authenticate to the
-daemon. Keep them owner-only and out of repositories and shared directories.
+subc daemon. Keep them owner-only and out of repositories and shared directories.
 
 These boundaries are not a sandbox against a compromised local user account.
 A process running as the same user can read the ledger and the harness stores

@@ -210,8 +210,8 @@ spend_drive <connection-file> spend.multiplier.recompute '{"observation_day":"20
 ```
 
 Omit `quota_provider` to recompute every configured provider in one
-transaction. Each new row supersedes the day's head; a day with no row gets
-its original. Recompute needs a connected fusiform price catalog.
+transaction. Each new row supersedes the day's newest observation; a day
+whose recompute produces no row keeps the observation it had. Recompute needs a connected fusiform price catalog.
 
 Verify with `spend.multiplier.report` over a range that includes the day:
 the day's entry in `series` is the new row, and the reply's `observation_id`
