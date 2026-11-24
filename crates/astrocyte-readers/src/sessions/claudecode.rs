@@ -134,11 +134,12 @@ struct EntryTypeProbe {
 /// Token counters of one call, as Claude Code reported them.
 ///
 /// Cache writes are kept by lifetime because the two are priced differently.
-/// When a record has the `cache_creation` split, only the split is used: the
-/// flat `cache_creation_input_tokens` is not a reliable sum of it (measured
-/// 2026-09-23: 8 of 2,671 records report a flat 0 beside a non-zero 1h
-/// split). When a record has only the flat field, it lands in
-/// `cache_write_unsplit` and is stored without a lifetime, because
+/// A non-zero `cache_creation` split wins over the flat
+/// `cache_creation_input_tokens`, which is not a reliable sum of the split
+/// (measured 2026-09-23: 8 of 2,671 records report a flat 0 beside a non-zero
+/// 1h split). If both split parts are zero or absent and the flat count is
+/// positive, keep the flat count rather than lose those reported tokens.
+/// As with a record without a split, store it in `cache_write_unsplit`:
 /// attributing it to 5m or 1h would be a guess.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeCallUsage {
@@ -152,13 +153,20 @@ pub struct ClaudeCallUsage {
 
 impl ClaudeCallUsage {
     fn from_usage(usage: &ClaudeUsage) -> Self {
+        let flat = usage.cache_creation_input_tokens;
         let (cache_write_5m, cache_write_1h, cache_write_unsplit) = match &usage.cache_creation {
-            Some(split) => (
-                split.ephemeral_5m_input_tokens,
-                split.ephemeral_1h_input_tokens,
-                None,
-            ),
-            None => (None, None, usage.cache_creation_input_tokens),
+            Some(split)
+                if split.ephemeral_5m_input_tokens.unwrap_or_default() > 0
+                    || split.ephemeral_1h_input_tokens.unwrap_or_default() > 0
+                    || flat.unwrap_or_default() == 0 =>
+            {
+                (
+                    split.ephemeral_5m_input_tokens,
+                    split.ephemeral_1h_input_tokens,
+                    None,
+                )
+            }
+            _ => (None, None, flat),
         };
         Self {
             input: usage.input_tokens,
@@ -1318,6 +1326,54 @@ mod tests {
             ),
             (None, None, Some(9))
         );
+    }
+
+    #[test]
+    fn flat_cache_write_with_zero_or_missing_split_parts_is_kept_unsplit() {
+        for split in [
+            r#"{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}"#,
+            r#"{"ephemeral_5m_input_tokens":0}"#,
+            r#"{"ephemeral_1h_input_tokens":0}"#,
+            "{}",
+        ] {
+            let text = format!(
+                r#"{{"type":"assistant","requestId":"r1","message":{{"model":"claude-opus-5","stop_reason":"end_turn","usage":{{"input_tokens":3,"cache_creation_input_tokens":12,"cache_creation":{split}}}}}}}"#
+            ) + "\n";
+            let (_dir, path) = file_with(&text);
+            let usage = &parse(&path, None, 0).calls[0].usage;
+            assert_eq!(
+                (
+                    usage.cache_write_5m,
+                    usage.cache_write_1h,
+                    usage.cache_write_unsplit
+                ),
+                (None, None, Some(12)),
+                "{split}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_cache_write_split_wins_over_disagreeing_flat_count() {
+        for flat in [0, 12] {
+            let (_dir, path) = file_with(&live_record(
+                "r1",
+                "2026-09-25T10:40:42.064Z",
+                "claude-opus-5",
+                [3, 6, 0, flat],
+                7,
+            ));
+            let usage = &parse(&path, None, 0).calls[0].usage;
+            assert_eq!(
+                (
+                    usage.cache_write_5m,
+                    usage.cache_write_1h,
+                    usage.cache_write_unsplit
+                ),
+                (Some(0), Some(7), None),
+                "flat count {flat}"
+            );
+        }
     }
 
     #[test]
