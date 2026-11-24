@@ -502,6 +502,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_state(super::super::thalamus_payer_join::test_state_without_payer_source())
+        }
+
+        fn with_state(state: SharedState) -> Self {
             let temp = TempDir::new().unwrap();
             let home = fs::canonicalize(temp.path()).unwrap();
             let folder = home.join("cortexkit/thalamus-harness/claude-code");
@@ -512,9 +516,7 @@ mod tests {
                 source: ClaudeThalamusSource::from_data_home(home),
                 temp,
                 folder,
-                state: Arc::new(
-                    super::super::thalamus_payer_join::test_state_without_payer_source(),
-                ),
+                state: Arc::new(state),
             }
         }
 

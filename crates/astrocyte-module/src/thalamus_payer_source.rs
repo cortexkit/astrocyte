@@ -651,30 +651,10 @@ mod gateway_tests;
 mod tests {
     use super::*;
     use crate::state::test_state;
+    pub(super) use crate::test_support::thalamus_payer::fixture;
+    use crate::test_support::thalamus_payer::{insert_recorded_row, open_pi_store};
     use rusqlite::Connection;
     use tempfile::TempDir;
-
-    const DDL: &str = r#"
-CREATE TABLE payer_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE payer_session (harness TEXT NOT NULL, session TEXT NOT NULL,
- owner_principal TEXT, declared_at_ms INTEGER NOT NULL, PRIMARY KEY(harness,session));
-CREATE TABLE payer_record (seq INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT NOT NULL UNIQUE,
- harness TEXT NOT NULL, session TEXT NOT NULL, request_kind TEXT NOT NULL, step_ref TEXT,
- recorded_at_ms INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, charge_basis TEXT,
- auth_selection TEXT NOT NULL, account_ref TEXT, outcome TEXT, provider_request_id TEXT,
- provider_response_id TEXT, usage_json TEXT);
-INSERT INTO payer_meta VALUES ('schema_version','1'),('incarnation','first');
-INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
-"#;
-
-    pub(super) fn fixture() -> (TempDir, ThalamusPayerSource, Connection, SharedState) {
-        let home = TempDir::new().unwrap();
-        let source = ThalamusPayerSource::from_data_home(home.path().to_path_buf());
-        std::fs::create_dir_all(source.path.parent().unwrap()).unwrap();
-        let store = Connection::open(&source.path).unwrap();
-        store.execute_batch(DDL).unwrap();
-        (home, source, store, test_state())
-    }
 
     fn insert(store: &Connection, attempt: &str) {
         store.execute("INSERT INTO payer_record(attempt_id,harness,session,request_kind,recorded_at_ms,provider,model,charge_basis,auth_selection,account_ref,usage_json) VALUES (?1,'pi','session-a','keep_warm',1000,'anthropic','model-a','metered_api','login-a','account-a',?2)", params![attempt,r#"{"usage":{"input_tokens":17,"output_tokens":11,"reasoning_tokens":4,"cache_write_tokens":12},"cache_write_5m_tokens":5,"cache_write_1h_tokens":7,"reasoning_included_in_output":true}"#]).unwrap();
@@ -847,9 +827,7 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
             .drain_for_health(&state, 100_000, &AtomicBool::new(false))
             .unwrap();
         assert_eq!(served_watermark(&state), serde_json::json!(40_000));
-        std::fs::create_dir_all(source.path.parent().unwrap()).unwrap();
-        let store = Connection::open(&source.path).unwrap();
-        store.execute_batch(DDL).unwrap();
+        let store = open_pi_store(home.path());
         store.execute("INSERT INTO payer_record(attempt_id,harness,session,request_kind,step_ref,recorded_at_ms,provider,model,auth_selection) VALUES ('first','pi','session-a','main',NULL,150000,'anthropic','model-a','login')",[]).unwrap();
         assert_eq!(served_watermark(&state), serde_json::json!(40_000));
         state.ordered_write(|tx| {
@@ -992,32 +970,7 @@ INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000);
             .unwrap();
         for bytes in rows {
             let row: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-            let text = |name: &str| row[name].as_str().map(str::to_owned);
-            store
-                .execute(
-                    "INSERT INTO payer_record(attempt_id,harness,session,request_kind,step_ref,
-                     recorded_at_ms,provider,model,charge_basis,auth_selection,account_ref,outcome,
-                     provider_request_id,provider_response_id,usage_json)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-                    params![
-                        text("attempt_id"),
-                        text("harness"),
-                        text("session"),
-                        text("request_kind"),
-                        text("step_ref"),
-                        row["recorded_at_ms"].as_i64(),
-                        text("provider"),
-                        text("model"),
-                        text("charge_basis"),
-                        text("auth_selection"),
-                        text("account_ref"),
-                        text("outcome"),
-                        text("provider_request_id"),
-                        text("provider_response_id"),
-                        text("usage_json"),
-                    ],
-                )
-                .unwrap();
+            insert_recorded_row(&store, &row);
         }
         source
             .drain_for_health(&state, 1_700_000_100_000, &AtomicBool::new(false))

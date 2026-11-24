@@ -1,0 +1,48 @@
+{
+  "payer_record": [
+    {
+      "account_ref": "acct-2",
+      "attempt_id": "8680e59a-3b3d-4e9d-b8dc-3d35d12c00b8",
+      "auth_selection": "oauth:anthropic:two",
+      "charge_basis": null,
+      "harness": "claude-code",
+      "model": "claude-fable-5-2",
+      "outcome": "completed",
+      "provider": "anthropic",
+      "provider_request_id": "req_sample_refused",
+      "provider_response_id": "msg_sample_refused",
+      "recorded_at_ms": 1795516045936,
+      "request_kind": "main",
+      "seq": 1,
+      "session": "2429aff9-395a-49bb-b765-65abf134e042",
+      "step_ref": "req_sample_refused",
+      "usage_json": null
+    },
+    {
+      "account_ref": "acct-2",
+      "attempt_id": "d127fdd2-ad9c-4e24-85e7-790f58346e7b",
+      "auth_selection": "oauth:anthropic:two",
+      "charge_basis": null,
+      "harness": "claude-code",
+      "model": "claude-fable-5-2",
+      "outcome": "completed",
+      "provider": "anthropic",
+      "provider_request_id": "req_sample_retry",
+      "provider_response_id": "msg_sample_retry",
+      "recorded_at_ms": 1795516046134,
+      "request_kind": "main",
+      "seq": 2,
+      "session": "2429aff9-395a-49bb-b765-65abf134e042",
+      "step_ref": "req_sample_retry",
+      "usage_json": null
+    }
+  ],
+  "payer_session": [
+    {
+      "declared_at_ms": 1795516045311,
+      "harness": "claude-code",
+      "owner_principal": "prefrontal-core",
+      "session": "2429aff9-395a-49bb-b765-65abf134e042"
+    }
+  ]
+}

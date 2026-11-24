@@ -21,6 +21,83 @@ pub const HANG_GUARD: Duration = Duration::from_secs(60);
 /// enough not to burn a core on a loaded runner.
 const POLL: Duration = Duration::from_millis(10);
 
+#[cfg(test)]
+pub(crate) mod thalamus_payer {
+    use crate::refresher::thalamus_payer_source::ThalamusPayerSource;
+    use crate::state::{test_state, SharedState};
+    use rusqlite::{params, Connection};
+    use serde_json::Value;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    const DDL: &str = r#"
+CREATE TABLE payer_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE payer_session (harness TEXT NOT NULL, session TEXT NOT NULL,
+ owner_principal TEXT, declared_at_ms INTEGER NOT NULL, PRIMARY KEY(harness,session));
+CREATE TABLE payer_record (seq INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT NOT NULL UNIQUE,
+ harness TEXT NOT NULL, session TEXT NOT NULL, request_kind TEXT NOT NULL, step_ref TEXT,
+ recorded_at_ms INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, charge_basis TEXT,
+ auth_selection TEXT NOT NULL, account_ref TEXT, outcome TEXT, provider_request_id TEXT,
+ provider_response_id TEXT, usage_json TEXT);
+INSERT INTO payer_meta VALUES ('schema_version','1'),('incarnation','first');
+"#;
+
+    pub(crate) fn open_store(home: &Path) -> Connection {
+        let path = home.join("cortexkit/thalamus-harness/payer/payer.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = Connection::open(path).unwrap();
+        store.execute_batch(DDL).unwrap();
+        store
+    }
+
+    pub(crate) fn open_pi_store(home: &Path) -> Connection {
+        let store = open_store(home);
+        store
+            .execute(
+                "INSERT INTO payer_session VALUES ('pi','session-a','owner-a',1000)",
+                [],
+            )
+            .unwrap();
+        store
+    }
+
+    pub(crate) fn fixture() -> (TempDir, ThalamusPayerSource, Connection, SharedState) {
+        let home = TempDir::new().unwrap();
+        let source = ThalamusPayerSource::from_data_home(home.path().to_path_buf());
+        let store = open_pi_store(home.path());
+        (home, source, store, test_state())
+    }
+
+    pub(crate) fn insert_recorded_row(store: &Connection, row: &Value) {
+        let text = |name: &str| row[name].as_str().map(str::to_owned);
+        store
+            .execute(
+                "INSERT INTO payer_record(attempt_id,harness,session,request_kind,step_ref,
+                     recorded_at_ms,provider,model,charge_basis,auth_selection,account_ref,outcome,
+                     provider_request_id,provider_response_id,usage_json)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![
+                    text("attempt_id"),
+                    text("harness"),
+                    text("session"),
+                    text("request_kind"),
+                    text("step_ref"),
+                    row["recorded_at_ms"].as_i64(),
+                    text("provider"),
+                    text("model"),
+                    text("charge_basis"),
+                    text("auth_selection"),
+                    text("account_ref"),
+                    text("outcome"),
+                    text("provider_request_id"),
+                    text("provider_response_id"),
+                    text("usage_json"),
+                ],
+            )
+            .unwrap();
+    }
+}
+
 /// Bind a fake daemon and publish its connection file before starting the peer
 /// thread, so client setup never races fixture publication.
 pub(crate) fn fake_daemon(

@@ -1,6 +1,206 @@
 const PAYER_COMPLETION_MS: i64 = 1_788_220_801_000;
 const OWNER_SESSION: &str = "ses_core_bound_conversation";
 
+#[test]
+fn recorded_claude_refusal_and_retry_join_payer_rows_and_acknowledge_done_once() {
+    use crate::refresher::thalamus_payer_source::ThalamusPayerSource;
+    use crate::test_support::thalamus_payer::{insert_recorded_row, open_store};
+    use sha2::{Digest, Sha256};
+
+    const FIRST_DRAIN_MS: i64 = 1_795_516_046_200;
+    const OWNER: &str = "cc-payer-refusal-sample";
+    const REFUSED: &str = "req_sample_refused";
+    const RETRY: &str = "req_sample_retry";
+    let vector = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/vectors/thalamus-payer-refusal-claude-code-v1"
+    ));
+    let manifest = fs::read_to_string(vector.join("SHA256SUMS")).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(manifest.as_bytes())),
+        "6d78c751a92a376c4ff6c714682f3ea02df27d5c8df8dfd83d14fb06d7aaa70d"
+    );
+    let f = Fixture::with_state(test_state());
+    let mut roots: Value =
+        serde_json::from_slice(&fs::read(vector.join("claude-session/roots.json")).unwrap())
+            .unwrap();
+    let session = roots["roots"][0]["session"].as_str().unwrap().to_owned();
+    let config = f.config(&session);
+    for line in manifest.lines() {
+        let (expected, file) = line.split_once("  ").unwrap();
+        let bytes = fs::read(vector.join(file)).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), expected, "{file}");
+        if let Some(relative) = file.strip_prefix("claude-session/config/") {
+            let dest = config.join(relative);
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::write(dest, bytes).unwrap();
+        }
+    }
+    assert_eq!(roots["roots"][0]["state"], "active");
+    roots["roots"][0]["path"] = json!(config);
+    fs::write(&f.roots, roots.to_string()).unwrap();
+
+    let home = fs::canonicalize(f.temp.path()).unwrap();
+    let store = open_store(&home);
+    let payer = ThalamusPayerSource::from_data_home(home);
+    let captured: Value =
+        serde_json::from_slice(&fs::read(vector.join("payer-rows.json")).unwrap()).unwrap();
+    let declaration = &captured["payer_session"][0];
+    store
+        .execute(
+            "INSERT INTO payer_session(harness,session,owner_principal,declared_at_ms) \
+             VALUES (?1,?2,?3,?4)",
+            rusqlite::params![
+                declaration["harness"].as_str(),
+                declaration["session"].as_str(),
+                declaration["owner_principal"].as_str(),
+                declaration["declared_at_ms"].as_i64(),
+            ],
+        )
+        .unwrap();
+    let stop = AtomicBool::new(false);
+    let drain = |source: &dyn HarnessSource, at| {
+        assert_eq!(source.drain_for_health(&f.state, at, &stop).unwrap(), None);
+    };
+
+    // Let the refusal's payer arrive first so the retry must wait for its own row.
+    insert_recorded_row(&store, &captured["payer_record"][0]);
+    drain(&payer, FIRST_DRAIN_MS);
+    drain(&f.source, FIRST_DRAIN_MS);
+    let refused_only = [(REFUSED.to_owned(), OWNER.to_owned())];
+    assert_eq!(f.event_sessions(), refused_only);
+    assert_eq!(f.state.payer_waiting().get(SOURCE_KEY), Some(&1));
+    assert_eq!(f.acks()["read_through"], json!([]));
+
+    // The capture is active. Mark only the working copy done while the retry is pending.
+    let done_at = FIRST_DRAIN_MS + 1;
+    roots["roots"][0]["state"] = json!("done");
+    roots["roots"][0]["done_at_ms"] = json!(done_at);
+    fs::write(&f.roots, roots.to_string()).unwrap();
+    drain(&f.source, done_at);
+    assert_eq!(f.event_sessions(), refused_only);
+    assert_eq!(f.acks()["read_through"], json!([]));
+
+    let joined_at = done_at + 1;
+    insert_recorded_row(&store, &captured["payer_record"][1]);
+    drain(&payer, joined_at);
+    drain(&f.source, joined_at);
+    assert_eq!(f.state.payer_waiting().get(SOURCE_KEY), Some(&0));
+    assert_eq!(
+        f.acks(),
+        json!({"version":1,"read_through":[{"session":session,"at_ms":joined_at}]})
+    );
+    let ack = fs::read(&f.ack).unwrap();
+    drain(&payer, joined_at + 1);
+    drain(&f.source, joined_at + 1);
+    assert_eq!(fs::read(&f.ack).unwrap(), ack);
+
+    assert_eq!(
+        f.event_sessions(),
+        [REFUSED, RETRY].map(|request| (request.to_owned(), OWNER.to_owned()))
+    );
+    assert_eq!(
+        f.payer_facts(),
+        [REFUSED, RETRY].map(|request| (
+            request.to_owned(),
+            "unknown".to_owned(),
+            Some("oauth:anthropic:two".to_owned()),
+            Some("acct-2".to_owned())
+        ))
+    );
+    f.state
+        .with_conn(|conn| {
+            for table in [
+                "rejected_delivery",
+                "set_aside_record",
+                "thalamus_payer_coverage",
+            ] {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 0, "{table}");
+            }
+            let mut measurements = conn
+                .prepare(
+                    "SELECT role, unit, quantity_units, quantity_exponent FROM measurement \
+                     JOIN usage_event USING(event_key) WHERE producer_ref=?1 ORDER BY role, unit",
+                )
+                .unwrap();
+            let mut retry_writes = Vec::new();
+            for (request, stop_reason, cache_read) in
+                [(REFUSED, "refusal", 12), (RETRY, "end_turn", 0)]
+            {
+                let event = conn
+                    .query_row(
+                        "SELECT vendor_request_id, provider, model, terminal_status, resolved_credential \
+                         FROM usage_event WHERE producer_ref=?1",
+                        [request],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, Option<String>>(4)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                // The payer rows name the selected login, not a separate resolved credential.
+                assert_eq!(
+                    event,
+                    (
+                        request.to_owned(),
+                        "anthropic".to_owned(),
+                        "claude-fable-5-2".to_owned(),
+                        stop_reason.to_owned(),
+                        None,
+                    )
+                );
+                let (writes, other): (Vec<_>, Vec<_>) = measurements
+                    .query_map([request], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .partition(|(role, ..)| role == "cache_write");
+                assert_eq!(
+                    other,
+                    [("cache_read", cache_read), ("input", 17), ("output", 6)]
+                        .map(|(role, quantity)| (role.to_owned(), "token".to_owned(), quantity, 0)),
+                    "{request}"
+                );
+                assert!(
+                    writes.iter().all(|(_, _, _, exponent)| *exponent == 0),
+                    "{request}: {writes:?}"
+                );
+                if request == REFUSED {
+                    assert_eq!(
+                        writes.iter().map(|(_, _, quantity, _)| quantity).sum::<i64>(),
+                        0
+                    );
+                } else {
+                    retry_writes = writes;
+                }
+            }
+            assert_eq!(
+                retry_writes
+                    .iter()
+                    .map(|(_, _, quantity, _)| quantity)
+                    .sum::<i64>(),
+                12,
+                "{RETRY} cache-write measurements (role, unit, quantity, exponent): {retry_writes:?}"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
 impl Fixture {
     fn live_call(&self, request: &str) {
         self.call(SESSION, request, true);
