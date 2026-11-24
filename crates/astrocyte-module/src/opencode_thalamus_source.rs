@@ -2457,7 +2457,7 @@ mod tests {
         f.declare(vec![f.entry(ONE, true)]);
         f.tick(T0);
         let config = f.temp.path().join("astrocyte.jsonc");
-        fs::write(&config,r#"{"poll_interval_secs":30,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":["opencode-thalamus"]}}"#).unwrap();
+        fs::write(&config,r#"{"poll_interval_secs":30,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":["opencode-thalamus"]}}"#).unwrap();
         crate::refresher::reload_config(&f.state, Ok(config)).unwrap();
         f.call(ONE, Layout::V2, "two", true, CREATED);
         f.tick(T0 + TICK);

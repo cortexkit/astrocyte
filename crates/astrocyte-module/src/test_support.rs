@@ -129,7 +129,7 @@ pub(crate) fn fake_daemon(
         key: vec![key_byte; KEY_LEN],
         daemon_id: [daemon_byte; 16],
         pid: std::process::id(),
-        daemon_ver: "test".into(),
+        daemon_ver: "0.39.0".into(),
     };
     connection_file::write_atomic(&path, &connection).unwrap();
     (listener, path, connection)
@@ -303,4 +303,34 @@ pub mod opencode {
         opencode_runtime_row, slow_page_database, wait_until_drain_reaches_the_page_statement,
         STOP_BOUND,
     };
+}
+
+/// Read a fixture request, answering the SDK's optional description probe without counting it as a peer call.
+pub async fn read_peer_request<S>(stream: &mut S) -> Option<subc_protocol::Frame>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use subc_protocol::{Frame, FrameType};
+    use tokio::io::AsyncWriteExt;
+    loop {
+        let request = subc_transport::read_frame(stream).await.ok()??;
+        if request.header.ty != FrameType::Request {
+            continue;
+        }
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        if body["op"] != "server.describe" {
+            return Some(request);
+        }
+        let response = Frame::build(
+            FrameType::Error,
+            request.header.flags,
+            0,
+            0,
+            request.header.corr,
+            br#"{"code":"unknown_op","message":"fixture has no description"}"#.to_vec(),
+        )
+        .unwrap();
+        subc_transport::write_frame(stream, &response).await.ok()?;
+        stream.flush().await.ok()?;
+    }
 }

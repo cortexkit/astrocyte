@@ -337,10 +337,8 @@ fn publish_desired_transaction(
         config::multiplier_column(&desired.config).map_err(|error| error.to_string())?;
     let ingest =
         config::harness_ingest_column(&desired.config).map_err(|error| error.to_string())?;
-    // `broca_connection_file` is a column the store still has but the
-    // configuration no longer carries (BROCA is read from its store), so each
-    // generation records it as NULL.
-    tx.execute("UPDATE desired_config SET generation=?1,canonical_bytes=?2,content_hash=?3,poll_interval_secs=?4,qta_connection_file=?5,broca_connection_file=NULL,fusiform_connection_file=?6,updated_at_ms=?7,subscription_multiplier=?8,harness_ingest=?9 WHERE id=1", params![generation, desired.canonical_bytes, desired.content_hash, i64::try_from(desired.config.poll_interval_secs).map_err(|_| "poll interval exceeds SQLite integer".to_string())?, desired.config.qta_connection_file, desired.config.fusiform_connection_file, now_ms, multiplier, ingest]).map_err(|error| error.to_string())?;
+    // Keep the legacy path columns in the schema but never publish paths.
+    tx.execute("UPDATE desired_config SET generation=?1,canonical_bytes=?2,content_hash=?3,poll_interval_secs=?4,qta_connection_file=NULL,broca_connection_file=NULL,fusiform_connection_file=NULL,updated_at_ms=?5,subscription_multiplier=?6,harness_ingest=?7 WHERE id=1", params![generation, desired.canonical_bytes, desired.content_hash, i64::try_from(desired.config.poll_interval_secs).map_err(|_| "poll interval exceeds SQLite integer".to_string())?, now_ms, multiplier, ingest]).map_err(|error| error.to_string())?;
     tx.execute(
         "UPDATE source_runtime SET desired_generation=?1",
         [generation],
@@ -386,10 +384,9 @@ fn refresher_broca_source(stop: &Arc<AtomicBool>) -> broca_source::BrocaSource {
 pub(crate) fn configured_capacity(
     state: &SharedState,
     config: &config::AstrocyteConfig,
+    access: Option<crate::peer_exchange::PeerAccess>,
 ) -> Result<Option<Arc<dyn CapacitySource>>, String> {
-    let source = config
-        .qta_connection_file
-        .as_ref()
+    let source = access
         .map(crate::qta_client::QtaClient::new)
         .transpose()?
         .map(|client| Arc::new(client) as Arc<dyn CapacitySource>);
@@ -709,8 +706,9 @@ fn spawn_refresher(
                     let pi_source = Arc::new(pi_source);
                     let claude_code_source = Arc::new(claude_code_source);
                     let codex_source = Arc::new(codex_source);
-                    let capacity = configured_capacity(&state, &config)?;
-                    let (pending_catalog, plan_prices) = configure_catalog(&state, &config, &stop)?;
+                    let capacity = configured_capacity(&state, &config, state.peer_access())?;
+                    let (pending_catalog, plan_prices) =
+                        configure_catalog(&state, state.catalog_access(), &stop)?;
                     Ok((
                         producers,
                         opencode_source,
@@ -739,11 +737,19 @@ fn spawn_refresher(
                     plan_prices,
                     poll_interval_secs,
                 ) = startup?;
-                // The bus reader always runs: runner step events need only the
-                // bus, and quota notices are read too when insula is configured.
+                // The starter has already returned readiness to the serving
+                // loop. Run the first quota poll and catalog probe as soon as
+                // HELLO_ACK releases the routes, not one full interval later.
+                while state.quota_bus().has_staged_access() && !state.quota_bus().hello_acked() {
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                // Use separate clients/runtimes for quota events and fallback snapshots.
                 let bus_reader = crate::quota_events::Reader::start(
                     Arc::clone(&state),
-                    state.desired_config().qta_connection_file.map(Into::into),
+                    state.peer_access(),
                     Arc::clone(&stop),
                 );
                 run_loop_full(
@@ -1626,9 +1632,8 @@ mod tests {
         );
         let state = test_state();
         seed_unpriced_event(&state);
-        let mut config = config::intentional_empty().config;
-        config.fusiform_connection_file = Some(peer.path.to_string_lossy().into_owned());
-        let (mut pending, _) = configure_catalog(&state, &config, &NEVER_STOP).unwrap();
+        let access = Some(crate::peer_exchange::PeerAccess::Fixture(peer.path.clone()));
+        let (mut pending, _) = configure_catalog(&state, access, &NEVER_STOP).unwrap();
         assert!(
             pending.is_some(),
             "boot must stay pending after status fails"
@@ -1705,9 +1710,8 @@ mod tests {
             CatalogPeer::start_with_status(34_567, 9, 66_666, StatusMode::Refused("bad_request"));
         let state = test_state();
         seed_unpriced_event(&state);
-        let mut config = config::intentional_empty().config;
-        config.fusiform_connection_file = Some(peer.path.to_string_lossy().into_owned());
-        let (mut pending, _) = configure_catalog(&state, &config, &NEVER_STOP).unwrap();
+        let access = Some(crate::peer_exchange::PeerAccess::Fixture(peer.path.clone()));
+        let (mut pending, _) = configure_catalog(&state, access, &NEVER_STOP).unwrap();
         assert!(pending.is_some());
         assert!(state.catalog_client().is_none());
         run_tick(
@@ -1774,9 +1778,7 @@ mod tests {
             std::env::temp_dir().join(format!("astrocyte-late-catalog-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("subc-connection.json");
-        let mut config = crate::config::intentional_empty().config;
-        config.fusiform_connection_file = Some(path.to_string_lossy().into_owned());
-        // FusiformClient::new reads the file at construction; write an unroutable endpoint.
+        let access = Some(crate::peer_exchange::PeerAccess::Fixture(path.clone()));
         subc_transport::connection_file::write_atomic(
             &path,
             &subc_transport::connection_file::ConnectionInfo {
@@ -1793,7 +1795,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (pending, plan_prices) = configure_catalog(&state, &config, &NEVER_STOP)
+        let (pending, plan_prices) = configure_catalog(&state, access, &NEVER_STOP)
             .expect("unreachable peer is not a startup error");
         assert!(pending.is_some(), "discovery deferred, handle returned");
         assert!(
@@ -2215,14 +2217,12 @@ mod loop_tests {
         let state = test_state();
         let config = config::AstrocyteConfig {
             poll_interval_secs: 11,
-            qta_connection_file: None,
-            fusiform_connection_file: None,
             reasoning_billed_as_output: Vec::new(),
             subscription_multiplier: config::intentional_empty().config.subscription_multiplier,
             harness_ingest: config::HarnessIngest::all_on(),
         };
 
-        let capacity = configured_capacity(&state, &config).unwrap();
+        let capacity = configured_capacity(&state, &config, None).unwrap();
         run_iteration_with_capacity(&state, &[], capacity.as_deref(), &AtomicBool::new(false));
 
         assert!(capacity.is_none());
@@ -2339,12 +2339,8 @@ mod loop_tests {
     #[test]
     fn a_fully_configured_tick_drains_exactly_broca_pi_and_opencode() {
         let temp = tempfile::TempDir::new().unwrap();
-        let connection = temp.path().join("subc-connection.json");
-        let connection = connection.to_string_lossy().into_owned();
         let desired = config::canonicalize(config::AstrocyteConfig {
             poll_interval_secs: 60,
-            qta_connection_file: Some(connection.clone()),
-            fusiform_connection_file: Some(connection),
             reasoning_billed_as_output: Vec::new(),
             subscription_multiplier: config::intentional_empty().config.subscription_multiplier,
             harness_ingest: config::HarnessIngest::all_on(),
@@ -2670,7 +2666,7 @@ mod multiplier_stage_tests {
         else {
             unreachable!("a decoded document records the member");
         };
-        let client = Arc::new(crate::fusiform_client::FusiformClient::new(subc).unwrap());
+        let client = Arc::new(crate::fusiform_client::FusiformClient::for_test(subc).unwrap());
         let connection: Arc<dyn CatalogConnection> = client.clone();
         let catalog = CatalogClient::connect(connection).unwrap();
         let mut conn = rusqlite::Connection::open(database).unwrap();

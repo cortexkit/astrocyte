@@ -34,26 +34,38 @@ the next start of the module; nothing watches the file. At startup:
 | File state | Result |
 |---|---|
 | Valid | Committed as a new configuration generation when its content differs from the committed one. |
-| Missing | The intentional empty configuration is committed: poll every 60 seconds, no QTA or fusiform connection, no quota providers, every source ingested. |
+| Missing | The intentional empty configuration is committed: poll every 60 seconds, no quota providers for the multiplier, every source ingested. |
 | Unreadable or invalid, a generation was committed before | The committed generation keeps running and health reports the configuration as degraded. |
 | Unreadable or invalid, no generation was ever committed | The module stops at startup. |
 
 A missing file is not an error. Removing the file and restarting commits the
-intentional empty configuration, which drops both peer connections. Test:
+intentional empty configuration. Test:
 `malformed_file_retains_the_committed_generation_through_the_production_path`.
 
 Configuration and binary move together. The format is closed, so a file
 written for a newer binary (an added member) is refused by an older one, and
 a file without a member a newer binary requires is refused by it. Deploy the
 binary and its matching file together, and check the file with the binary
-you are about to run.
+you are about to run. Remove the old Fusiform and insula connection-path members
+before deploying: both peers now use the daemon location supplied by the supervisor.
+
+## Peer connections
+
+Astrocyte calls Fusiform and insula after the daemon accepts its startup
+handshake. Pricing waits while Fusiform's catalog is unreachable. Insula serves
+`usage.get` snapshots and `events_get` quota bodies. A separate reader binds the
+existing durable quota consumer without creating it. Bus failures retain one
+snapshot per tick; a healthy reader backs up event delivery with snapshots at the earlier of ten minutes or the
+freshness horizon minus one cadence. At the default 30-second cadence, the horizon
+stays 120 seconds and quiet readings are refreshed after 90 seconds. Events update
+accounts between ticks and reset freshness; empty pulls do not. Owed recovery
+snapshots run on the next tick. Capacity is advisory and never blocks spend recording.
 
 ## Members
 
 The root is a closed JSONC object (comments and trailing commas allowed).
-All six members are required. An unknown, missing or repeated member is
-refused, at every level. `null` means "not configured"; a present string must
-not be empty.
+All four members are required. An unknown, missing or repeated member is
+refused, at every level.
 
 ### `poll_interval_secs`
 
@@ -61,25 +73,6 @@ Integer, at least 1. How often the refresher runs: drains, capacity recovery,
 pricing and the daily multiplier stage. A source with no successful drain
 within four intervals makes health degraded, and capacity freshness uses four
 times the capacity cadence.
-
-### `qta_connection_file`
-
-String or `null`. The subc connection file used to reach insula, the quota
-module, for `usage.get` snapshots and `events_get` quota bodies. `null` disables
-capacity ingestion. When configured, a separate reader binds the bus durable
-without creating it. Bus failures retain one snapshot per tick; a healthy reader
-backs up event delivery with snapshots at the earlier of ten minutes or the
-freshness horizon minus one cadence. At the default 30-second cadence, the horizon
-stays 120 seconds and quiet readings are refreshed after 90 seconds. Events update
-accounts between ticks and reset freshness; empty pulls do not. Owed recovery
-snapshots run on the next tick. Capacity is advisory and never blocks spend recording.
-
-### `fusiform_connection_file`
-
-String or `null`. The subc connection file used to reach the fusiform price
-catalog. With `null`, every event is stored unpriced with reason
-`catalog_unconfigured`, and `spend.multiplier.recompute` refuses with
-`catalog_unavailable`.
 
 ### `harness_ingest`
 
@@ -250,8 +243,8 @@ Restore the previous file, check it with `--check-config`, and restart the
 module. A start whose file differs from the committed one commits it as a new
 generation, so reverting is a forward change, not a rollback of the store.
 Ledger rows written while
-the other configuration ran stay: an excluded source's events, unpriced rows
-written while no catalog was configured (reprice them with
+the other configuration ran stay: an excluded source's events, historical
+unpriced rows (reprice them with
 `spend.event.reprice`; see [operations](operations.md)), and multiplier days
 recorded under other declarations (recompute them with
 `spend.multiplier.recompute`).

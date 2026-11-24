@@ -96,10 +96,17 @@ impl Control {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).hello_acked
     }
 
+    pub(crate) fn has_staged_access(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .access
+            .is_some()
+    }
+
     pub(crate) fn access(&self) -> Option<Access> {
         let inner = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        // Both attested consumers wait here, so neither can race the serving
-        // connection's HELLO with an independent route-open connection.
+        // A consumer cannot open an attested route until registration is accepted.
         inner.hello_acked.then(|| inner.access.clone()).flatten()
     }
 
@@ -453,11 +460,10 @@ impl Reader {
     /// Start the module's one bus reader. It holds the module's one ckbus
     /// credential and NATS connection, because a fresh credential revokes the
     /// module's previous one. It always follows runners' live step events,
-    /// and also pulls quota notices when `insula_path` yields a usable
-    /// insula client.
+    /// and also pulls quota notices when the module has access to insula.
     pub fn start(
         state: Arc<SharedState>,
-        insula_path: Option<PathBuf>,
+        insula_access: Option<crate::peer_exchange::PeerAccess>,
         stop: Arc<AtomicBool>,
     ) -> Option<Self> {
         let thread_stop = stop.clone();
@@ -475,7 +481,7 @@ impl Reader {
                 // Both runtimes are dropped on the OS thread, outside an async context.
                 // Without a usable insula client only runner step events are read.
                 let insula =
-                    insula_path.and_then(|path| crate::qta_client::QtaClient::new(path).ok());
+                    insula_access.and_then(|access| crate::qta_client::QtaClient::new(access).ok());
                 let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()

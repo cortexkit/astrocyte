@@ -1,6 +1,5 @@
 //! Acknowledged media usage, drained only on full refresher ticks.
 
-use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,11 +12,12 @@ use cortexkit_role_media::usage::{
 use rusqlite::{params, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use subc_client_rs::{
-    CallError, CallOptions, ConsumerOptions, NotSentCause, RouteHandle, SubcConsumer,
-};
-use subc_protocol::{error_codes, RouteTarget, SUBC_MODULE_ID_ENV};
+use subc_client_rs::{CallError, CallOptions, NotSentCause, RouteHandle, SubcConsumer};
+#[cfg(test)]
+use subc_protocol::SUBC_MODULE_ID_ENV;
+use subc_protocol::{error_codes, RouteTarget};
 
+use crate::peer_exchange::{open_route, PeerAccess};
 use crate::refresher::{harness_drain, SetAsideRecord, SourceDrainError};
 use crate::state::SharedState;
 
@@ -151,30 +151,21 @@ struct Route {
 }
 
 impl Route {
-    async fn open(path: &Path, stop: &AtomicBool) -> Result<Self, FeedError> {
-        let consumer = tokio::time::timeout(
-            BUDGET,
-            SubcConsumer::connect(path, ConsumerOptions::default()),
-        )
-        .await
-        .map_err(|_| "colliculus connection timeout".to_string())?
-        .map_err(|_| "colliculus daemon connection unavailable".to_string())?;
+    async fn open(access: &PeerAccess, stop: &AtomicBool) -> Result<Self, FeedError> {
+        let consumer = access.connect(BUDGET).await.map_err(str::to_string)?;
         if stop.load(Ordering::Relaxed) {
             return Err(FeedError::Stopped);
         }
-        let identity =
-            serde_json::from_value(json!({"harness":"ck-astrocyte","session":"media-usage"}))
-                .map_err(|_| "colliculus route identity invalid".to_string())?;
-        let handle = consumer
-            .open_route(
-                RouteTarget::ManagementSurface {
-                    module_id: SOURCE_KEY.into(),
-                },
-                identity,
-                call_options(),
-            )
-            .await
-            .map_err(sdk_error)?;
+        let handle = open_route(
+            &consumer,
+            RouteTarget::ManagementSurface {
+                module_id: SOURCE_KEY.into(),
+            },
+            "media-usage",
+            call_options(),
+        )
+        .await
+        .map_err(sdk_error)?;
         Ok(Self { consumer, handle })
     }
 
@@ -270,24 +261,12 @@ impl ColliculusSource {
     async fn open(&self, state: &SharedState, stop: &AtomicBool) -> Result<Route, FeedError> {
         #[cfg(test)]
         if let Some(path) = &self.fixture_connection {
-            return Route::open(path, stop).await;
+            return Route::open(&PeerAccess::Fixture(path.clone()), stop).await;
         }
         let access = state
-            .quota_bus()
-            .access()
+            .peer_access()
             .ok_or("colliculus attested module identity unavailable".to_string())?;
-        let nonce = subc_os::launch_nonce()
-            .map_err(|_| "colliculus launch identity unavailable".to_string())?;
-        // The SDK derives implicit identity from the same process cache as HELLO.
-        // Refuse before connecting if it cannot attest the identity we staged.
-        if std::env::var(SUBC_MODULE_ID_ENV).ok().as_deref() != Some(access.module_id.as_str())
-            || nonce.as_ref().map(|value| value.value()) != Some(access.nonce.as_str())
-        {
-            return Err(FeedError::Failed(
-                "colliculus attested module identity unavailable".into(),
-            ));
-        }
-        Route::open(&access.path, stop).await
+        Route::open(&access, stop).await
     }
 
     async fn drain(

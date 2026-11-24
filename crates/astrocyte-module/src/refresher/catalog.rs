@@ -77,21 +77,26 @@ pub(super) type ConfiguredFusiform = (Option<PendingCatalog>, Option<Arc<dyn Pla
 
 pub(super) fn configure_catalog(
     state: &SharedState,
-    config: &config::AstrocyteConfig,
+    access: Option<crate::peer_exchange::PeerAccess>,
     stop: &AtomicBool,
 ) -> Result<ConfiguredFusiform, String> {
-    let Some(path) = &config.fusiform_connection_file else {
+    let Some(access) = access else {
         state.install_catalog(None)?;
         return Ok((None, None));
     };
     // Constructing the transport reads no socket; only discovery does.
-    let client = Arc::new(crate::fusiform_client::FusiformClient::new(path)?);
+    let client = Arc::new(crate::fusiform_client::FusiformClient::new(access.clone())?);
     let plan_prices: Arc<dyn PlanPriceSource> = client.clone();
     let connection: Arc<dyn CatalogConnection> = client;
     let pending = PendingCatalog { connection };
-    // First attempt now so a healthy fleet prices from the first tick; a
-    // refusal here is the retry case, not a startup failure.
-    if pending.try_connect(state, stop)? {
+    // Only fixtures may connect during initialization; the supervised first
+    // attempt runs on the refresher after HELLO_ACK, never before serving.
+    let can_probe = match access {
+        crate::peer_exchange::PeerAccess::Module(_) => false,
+        #[cfg(any(test, feature = "test-support"))]
+        crate::peer_exchange::PeerAccess::Fixture(_) => true,
+    };
+    if can_probe && pending.try_connect(state, stop)? {
         return Ok((None, Some(plan_prices)));
     }
     Ok((Some(pending), Some(plan_prices)))

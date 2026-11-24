@@ -1267,20 +1267,18 @@ Samples, generated through the real handler and pinned by test, are in
 
 | Peer | Route | Calls | On failure |
 |---|---|---|---|
-| fusiform (price catalog) | `tool_provider`, module `fusiform` | `catalog.status`, `catalog.get`, `plan.prices` as `{"name", "arguments"}` tool calls | A failed pricing call writes no head; the event stays queued and a later pass retries it. Recompute refuses. Route death and `module_reloading` are retried once within the call's deadline. |
-| insula (the quota module, QTA) | `management_surface`, module `insula` | `usage.get` with empty params; `events_get` with `event_key` and `event_name: "quota_sampled"` | Invalid or missing event bodies owe a snapshot. A failed snapshot records the attempt and keeps the last windows. Capacity is advisory and never blocks spend. |
+| fusiform (price catalog) | Attested `tool_provider`, module `fusiform` | `catalog.status`, `catalog.get`, `catalog.history`, `plan.prices` as `{"name", "arguments"}` tool calls | A failed pricing call writes no head; the event stays queued and a later pass retries it. Recompute refuses. Route death and `module_reloading` are retried once within the call's deadline. |
+| insula (quota) | Attested `management_surface`, module `insula` | `usage.get` with empty params; `events_get` with `event_key` and `event_name: "quota_sampled"` | Invalid or missing event bodies owe a snapshot. A failed snapshot records the attempt and keeps the last windows. Capacity is advisory and never blocks spend. |
 | colliculus (media usage) | `management_surface`, module `colliculus` | `usage.read` pages and `usage.ack` after each committed page | Keep the committed cursor and retry. An absent module does not degrade health; transient route refusals (the module warming or reloading) defer the drain. `feed_not_admitted` means colliculus is not configured to let astrocyte read its usage feed; that won't fix itself, so it degrades health immediately. |
 | ckbus | Attested `management_surface`, module `ckbus` | `ckbus.credential`, `ckbus.credential_renew`, `ckbus.nonce_sign` | Retain per-tick insula polling and retry with exponential backoff (250 ms to 30 s). Never fail the module or change broker topology. |
 | claustrum (credential vault) | Attested `management_surface`, module `claustrum` | `credential.list_scoped` and held `auth.watch_scoped`, with empty params | Startup never waits for the peer. Missing vault or grant changes no history or ledger plans, is logged on transition and is shown in `spend.subscription.report`. `unknown_method` on watch enables full-tick-only list polling. |
 | prefrontal, basal, magic-context | Attested `management_surface` of each publisher | `attribution.read` with optional opaque `after` and page `limit` | Keep the committed cursor and health unchanged on refusal, module absence or routing failure; retry next scheduled refresh. |
 | entorhinal | Attested `management_surface`, module `entorhinal` | `placement.read` with optional opaque `after` and page `limit` | The same optional-reader behavior as attribution publishers. |
 
-Fusiform and insula use the connection files named in the
-[configuration](configuration.md). The ckbus route uses the module's daemon
-connection file and the daemon-validated `consumer_identity` shared with HELLO,
-not the un-attested peer clients. With no fusiform connection, events are
-stored unpriced with reason `catalog_unconfigured`; with no QTA connection,
-capacity is `disabled`.
+Fusiform, insula and ckbus use the module's daemon connection file supplied by
+the supervisor, not paths in desired configuration. Their routes use the
+module's daemon-validated identity after HELLO. If Fusiform is not reachable,
+events wait for pricing; if insula is not reachable, capacity remains advisory.
 
 Claustrum uses the module's daemon connection and launch identity, as colliculus
 does, under `reserved:astrocyte`'s `list` grants on the `llm-provider` category or

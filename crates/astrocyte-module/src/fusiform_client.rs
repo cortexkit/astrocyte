@@ -6,6 +6,7 @@
 //! subc connection and tool-provider route are opened lazily, reused while
 //! healthy, and evicted after transport timeouts or route-death errors.
 
+#[cfg(test)]
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -16,16 +17,20 @@ use fusiform_protocol::{
     PlanPricesResponse, StatusRequest, StatusResponse,
 };
 use serde_json::{json, Value};
+use subc_client_rs::SubcConsumer;
+#[cfg(test)]
 use subc_protocol::ErrorBody as WireError;
-use subc_protocol::{error_codes, Frame, FrameType};
+use subc_protocol::RouteTarget;
 #[cfg(any(test, feature = "test-support"))]
-use subc_protocol::{Flags, Priority};
-use subc_transport::{authenticate_client, connection_file};
+use subc_protocol::{Flags, Frame, FrameType, Priority};
+#[cfg(test)]
+use subc_transport::read_frame;
 #[cfg(any(test, feature = "test-support"))]
-use subc_transport::{read_frame, write_frame};
+use subc_transport::write_frame;
 #[cfg(any(test, feature = "test-support"))]
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+
+use crate::peer_exchange::{read_peer, PeerAccess, ReadError};
 
 // Copied sibling facts; nothing links them to fusiform's source, so a rename
 // on their side fails here at the first call rather than at build. Re-derive
@@ -38,36 +43,30 @@ const OP_CATALOG_STATUS: &str = "catalog.status";
 // below pins this copy to it, so a rename there fails the build's tests
 // rather than the first call.
 const OP_PLAN_PRICES: &str = "plan.prices";
+#[cfg(test)]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-struct Live {
-    stream: TcpStream,
-    route_channel: u16,
-    route_epoch: u32,
-    next_corr: u64,
-}
-
 pub struct FusiformClient {
-    connection_file_path: PathBuf,
+    access: PeerAccess,
     request_timeout: Duration,
     runtime: tokio::runtime::Runtime,
-    live: std::sync::Mutex<Option<Live>>,
+    live: std::sync::Mutex<Option<SubcConsumer>>,
 }
 
 impl FusiformClient {
-    pub fn new(connection_file_path: impl Into<PathBuf>) -> Result<Self, String> {
-        Self::build(connection_file_path.into(), REQUEST_TIMEOUT)
+    pub(crate) fn new(access: PeerAccess) -> Result<Self, String> {
+        Self::build(access, REQUEST_TIMEOUT)
     }
 
-    fn build(connection_file_path: PathBuf, request_timeout: Duration) -> Result<Self, String> {
+    fn build(access: PeerAccess, request_timeout: Duration) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
             .build()
             .map_err(|error| format!("client runtime: {error}"))?;
         Ok(Self {
-            connection_file_path,
+            access,
             request_timeout,
             runtime,
             live: std::sync::Mutex::new(None),
@@ -75,87 +74,16 @@ impl FusiformClient {
     }
 
     #[cfg(test)]
+    pub fn for_test(path: impl Into<PathBuf>) -> Result<Self, String> {
+        Self::new(PeerAccess::Fixture(path.into()))
+    }
+
+    #[cfg(test)]
     fn new_with_request_timeout(
-        connection_file_path: impl Into<PathBuf>,
+        path: impl Into<PathBuf>,
         request_timeout: Duration,
     ) -> Result<Self, String> {
-        Self::build(connection_file_path.into(), request_timeout)
-    }
-
-    async fn open(&self) -> Result<Live, String> {
-        let metadata = connection_file::read(&self.connection_file_path)
-            .map_err(|error| format!("connection file: {error:?}"))?;
-        let endpoint = metadata
-            .endpoints
-            .first()
-            .ok_or_else(|| "no endpoint in connection file".to_string())?;
-        let mut stream = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            crate::peer_exchange::connect_endpoint(&endpoint.host, endpoint.port),
-        )
-        .await
-        .map_err(|_| "connect timeout".to_string())?
-        .map_err(|error| format!("connect: {error}"))?;
-        authenticate_client(&mut stream, &metadata, CONNECT_TIMEOUT)
-            .await
-            .map_err(|error| format!("auth: {error:?}"))?;
-
-        let mut live = Live {
-            stream,
-            route_channel: 0,
-            route_epoch: 0,
-            next_corr: 1,
-        };
-        // Fusiform is a TOOL PROVIDER, not a management surface: its manifest
-        // declares catalog.get as a tool and the daemon refuses a
-        // management_surface target with `target_unavailable`. Broca, the one
-        // live consumer, opens the same kind.
-        let body = serde_json::to_vec(&json!({
-            "op": "route.open",
-            "target": { "kind": "tool_provider", "module_id": FUSIFORM_MODULE_ID },
-            "identity": {
-                "harness": "ck-astrocyte",
-                "session": "catalog-pricing",
-            },
-        }))
-        .map_err(|error| error.to_string())?;
-        let response = self.roundtrip_on(&mut live, 0, 0, body).await?;
-        let value: Value =
-            serde_json::from_slice(&response.body).map_err(|error| error.to_string())?;
-        if response.header.ty == FrameType::Error {
-            return Err(format!("route.open error: {value}"));
-        }
-        live.route_channel = value
-            .get("route_channel")
-            .and_then(Value::as_u64)
-            .and_then(|value| u16::try_from(value).ok())
-            .ok_or("route_channel missing")?;
-        live.route_epoch = value
-            .get("route_epoch")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or("route_epoch missing")?;
-        Ok(live)
-    }
-
-    async fn roundtrip_on(
-        &self,
-        live: &mut Live,
-        channel: u16,
-        epoch: u32,
-        body: Vec<u8>,
-    ) -> Result<Frame, String> {
-        let corr = live.next_corr;
-        live.next_corr += 1;
-        crate::peer_exchange::exchange(
-            &mut live.stream,
-            channel,
-            epoch,
-            corr,
-            body,
-            crate::peer_exchange::ExchangeMode::Peer,
-        )
-        .await
+        Self::build(PeerAccess::Fixture(path.into()), request_timeout)
     }
 
     fn call_catalog(
@@ -252,125 +180,45 @@ impl FusiformClient {
                 }
             }
         };
-        self.runtime.block_on(async {
-            // Setup, writes, Pongs and both attempts share one deadline. A
-            // peer sending unrelated frames must not extend the call's life.
-            let mut last_error: Option<CatalogCallError> = None;
-            let result = tokio::time::timeout_at(deadline, async {
-                for _attempt in 0..2 {
-                    if guard.is_none() {
-                        match self.open().await {
-                            Ok(live) => *guard = Some(live),
-                            Err(error) => {
-                                let previous = last_error
-                                    .as_ref()
-                                    .map(|error: &CatalogCallError| {
-                                        format!(
-                                            "; previous exchange: {}: {}",
-                                            error.code, error.message
-                                        )
-                                    })
-                                    .unwrap_or_default();
-                                return Err(CatalogCallError {
-                                    code: "unavailable".into(),
-                                    message: format!("fusiform connect: {error}{previous}"),
-                                });
-                            }
-                        }
-                    }
-                    let live = guard.as_mut().expect("connection was just established");
-                    let (channel, epoch) = (live.route_channel, live.route_epoch);
-                    let response = match self.roundtrip_on(live, channel, epoch, body.clone()).await
-                    {
-                        Ok(response) => response,
-                        Err(error) => {
-                            *guard = None;
-                            last_error = Some(CatalogCallError {
-                                code: "unavailable".into(),
-                                message: format!("fusiform exchange: {error}"),
-                            });
-                            continue;
-                        }
-                    };
-                    if response.header.ty == FrameType::Error {
-                        let error: WireError =
-                            serde_json::from_slice(&response.body).map_err(|decode| {
-                                CatalogCallError {
-                                    code: "undecodable".into(),
-                                    message: format!("fusiform error body: {decode}"),
-                                }
-                            })?;
-                        if error_codes::is_established_route_dead(
-                            response.header.flags,
-                            &error.code,
-                        ) {
-                            *guard = None;
-                            last_error = Some(CatalogCallError {
-                                code: error.code,
-                                message: error.message,
-                            });
-                            continue;
-                        }
-                        // Reloading is transient but does not invalidate the route.
-                        if error.code == "module_reloading" {
-                            last_error = Some(CatalogCallError {
-                                code: error.code,
-                                message: error.message,
-                            });
-                            continue;
-                        }
-                        return Err(CatalogCallError {
-                            code: error.code,
-                            message: error.message,
-                        });
-                    }
-                    // Fusiform serializes the untagged `ToolResponse` directly: the
-                    // body IS the tool's response, with no `result` wrapper.
-                    // Accept the direct shape first. Broca's decoder additionally
-                    // accepts a CallToolResult text envelope; fusiform's serve loop
-                    // does not emit one today, so a `result` key here is decoded
-                    // only as a defensive second arm and never assumed.
-                    let envelope: Value =
-                        serde_json::from_slice(&response.body).map_err(|error| {
-                            CatalogCallError {
-                                code: "undecodable".into(),
-                                message: format!("fusiform response: {error}"),
-                            }
-                        })?;
-                    return if envelope.get(payload_key).is_some() {
-                        Ok(envelope)
-                    } else {
-                        envelope
-                            .get("result")
-                            .cloned()
-                            .ok_or_else(|| CatalogCallError {
-                                code: "missing_result".into(),
-                                message: envelope.to_string(),
-                            })
-                    };
-                }
-                Err(last_error.take().unwrap_or(CatalogCallError {
+        let response = self
+            .runtime
+            .block_on(read_peer(
+                &self.access,
+                &mut guard,
+                RouteTarget::ToolProvider {
+                    module_id: FUSIFORM_MODULE_ID.into(),
+                },
+                "catalog-pricing",
+                body,
+                deadline,
+            ))
+            .map_err(|error| match error {
+                ReadError::Unavailable(reason) => CatalogCallError {
                     code: "unavailable".into(),
-                    message: "fusiform attempts exhausted".into(),
-                }))
-            })
-            .await;
-            match result {
-                Ok(result) => result,
-                Err(_) => {
-                    *guard = None;
-                    let previous = last_error
-                        .map(|error| {
-                            format!("; previous exchange: {}: {}", error.code, error.message)
-                        })
-                        .unwrap_or_default();
-                    Err(CatalogCallError {
-                        code: "unavailable".into(),
-                        message: format!("fusiform exchange: response timeout{previous}"),
-                    })
-                }
-            }
-        })
+                    message: format!("fusiform exchange: {reason}"),
+                },
+                ReadError::Refused(error) => CatalogCallError {
+                    code: error.code,
+                    message: error.message,
+                },
+            })?;
+        // Fusiform sends the response directly, but accept a result wrapper too.
+        let envelope: Value =
+            serde_json::from_slice(&response).map_err(|error| CatalogCallError {
+                code: "undecodable".into(),
+                message: format!("fusiform response: {error}"),
+            })?;
+        if envelope.get(payload_key).is_some() {
+            Ok(envelope)
+        } else {
+            envelope
+                .get("result")
+                .cloned()
+                .ok_or_else(|| CatalogCallError {
+                    code: "missing_result".into(),
+                    message: envelope.to_string(),
+                })
+        }
     }
 }
 
@@ -475,6 +323,7 @@ pub(crate) mod tests {
 
     use astrocyte_core::ingest::EventRecordRequest;
     use subc_transport::auth::authenticate_server;
+    use subc_transport::connection_file;
     use subc_transport::connection_file::{ConnectionInfo, Endpoint, KEY_LEN, SCHEMA_VERSION};
 
     use super::*;
@@ -516,7 +365,8 @@ pub(crate) mod tests {
         state: &crate::state::SharedState,
         path: &PathBuf,
     ) -> astrocyte_core::catalog_client::CatalogClient {
-        let connection: Arc<dyn CatalogConnection> = Arc::new(FusiformClient::new(path).unwrap());
+        let connection: Arc<dyn CatalogConnection> =
+            Arc::new(FusiformClient::for_test(path).unwrap());
         let catalog = refresher::connect_catalog(connection).unwrap();
         state.install_catalog(Some(catalog.clone())).unwrap();
         catalog
@@ -636,9 +486,7 @@ pub(crate) mod tests {
         let boundary = event_at + i64::from(std::process::id() % 97) + 1;
         let peer = CatalogPeer::start(boundary, 9, 66_666);
         let state = Arc::new(test_state());
-        let mut config = crate::config::intentional_empty().config;
-        config.fusiform_connection_file = Some(peer.path.to_string_lossy().into_owned());
-        state.publish_desired(config, 0);
+        state.install_test_catalog_path(peer.path.clone());
         let stop = Arc::new(AtomicBool::new(false));
         // The live refresher loop runs its own pricing pass on this state. If
         // it prices the drained event first, the test's own pass then finds
@@ -727,7 +575,7 @@ pub(crate) mod tests {
     #[test]
     fn rate_era_wire_history_decodes_the_pinned_live_reply() {
         let peer = CatalogPeer::start_with_status(1, 9, 66_666, fixtures::StatusMode::Present);
-        let client = FusiformClient::new(&peer.path).unwrap();
+        let client = FusiformClient::for_test(&peer.path).unwrap();
         let history = client
             .catalog_history(
                 HistoryRequest {
@@ -756,7 +604,8 @@ pub(crate) mod tests {
     #[test]
     fn rate_era_budget_includes_waiting_for_the_shared_route() {
         let directory = tempfile::tempdir().unwrap();
-        let client = Arc::new(FusiformClient::new(directory.path().join("absent.json")).unwrap());
+        let client =
+            Arc::new(FusiformClient::for_test(directory.path().join("absent.json")).unwrap());
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let held = Arc::clone(&client);
@@ -849,7 +698,7 @@ pub(crate) mod tests {
             key: vec![7; KEY_LEN],
             daemon_id: [9; 16],
             pid: std::process::id(),
-            daemon_ver: "test".into(),
+            daemon_ver: "0.39.0".into(),
         };
         connection_file::write_atomic(&path, &connection).unwrap();
         // One entry per accepted connection, in accept order: whether the
@@ -895,15 +744,17 @@ pub(crate) mod tests {
                             )
                             .await
                             .ok()?;
-                            let open = read_frame(&mut stream).await.ok()??;
+                            let open = crate::test_support::read_peer_request(&mut stream).await?;
                             let response = Frame::build(
                                 FrameType::Response,
                                 Flags::new(false, Priority::Passive, false),
                                 0,
                                 0,
                                 open.header.corr,
-                                serde_json::to_vec(&json!({"route_channel":7,"route_epoch":1}))
-                                    .unwrap(),
+                                serde_json::to_vec(
+                                    &json!({"op":"route.open","route_channel":7,"route_epoch":1}),
+                                )
+                                .unwrap(),
                             )
                             .unwrap();
                             write_frame(&mut stream, &response).await.ok()?;
@@ -980,7 +831,7 @@ pub(crate) mod tests {
                 "overridden": []
             }),
         );
-        let client = FusiformClient::new(&peer.connection_file_path).unwrap();
+        let client = FusiformClient::for_test(&peer.connection_file_path).unwrap();
         let request = || CatalogGetRequest {
             paged: false,
             page_token: None,
@@ -1017,19 +868,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fusiform_module_reloading_retries_on_the_live_route() {
+    fn fusiform_module_reloading_reopens_the_route_and_retries() {
         let peer = DeadlinePeer::start(vec![
             PeerReply::opened(Duration::ZERO),
             PeerReply::error("module_reloading", "provider restarting"),
+            PeerReply::opened(Duration::ZERO),
             PeerReply::Frame(Duration::ZERO, FrameType::Response, json!({"models":{}})),
         ]);
-        let client = FusiformClient::new(&peer.path).unwrap();
+        let client = FusiformClient::for_test(&peer.path).unwrap();
         assert_eq!(deadline_call(&client).unwrap(), json!({"models":{}}));
         let requests = peer.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert_eq!(
-            requests[1], requests[2],
-            "retry the same operation, not route.open"
+            requests[1], requests[3],
+            "retry the same operation after reopening"
         );
     }
 
@@ -1038,13 +890,14 @@ pub(crate) mod tests {
         let peer = DeadlinePeer::start(vec![
             PeerReply::opened(Duration::ZERO),
             PeerReply::error("module_reloading", "first refusal"),
+            PeerReply::opened(Duration::ZERO),
             PeerReply::error("module_reloading", "last refusal"),
         ]);
-        let client = FusiformClient::new(&peer.path).unwrap();
+        let client = FusiformClient::for_test(&peer.path).unwrap();
         let error = deadline_call(&client).unwrap_err();
         assert_eq!(error.code, "module_reloading");
         assert_eq!(error.message, "last refusal");
-        assert_eq!(peer.requests.lock().unwrap().len(), 3);
+        assert_eq!(peer.requests.lock().unwrap().len(), 4);
     }
 
     pub(crate) enum PeerReply {
@@ -1057,7 +910,7 @@ pub(crate) mod tests {
             Self::Frame(
                 delay,
                 FrameType::Response,
-                json!({"route_channel":7,"route_epoch":1}),
+                json!({"op":"route.open","route_channel":7,"route_epoch":1}),
             )
         }
 
@@ -1105,10 +958,9 @@ pub(crate) mod tests {
                                 )
                                 .await
                                 .ok()?;
-                                while let Some(request) = read_frame(&mut stream).await.ok()? {
-                                    if request.header.ty != FrameType::Request {
-                                        continue;
-                                    }
+                                while let Some(request) =
+                                    crate::test_support::read_peer_request(&mut stream).await
+                                {
                                     received
                                         .lock()
                                         .unwrap()
@@ -1229,21 +1081,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fusiform_reconnect_failure_keeps_the_exchange_error() {
+    fn fusiform_route_reopen_refusal_does_not_expose_daemon_error_text() {
         let peer = DeadlinePeer::start(vec![
             PeerReply::opened(Duration::ZERO),
             PeerReply::error("unknown_channel", "last exchange detail"),
-            PeerReply::error("target_unavailable", "route refusal detail"),
+            PeerReply::error("unknown_module", "route refusal echoes launch secret"),
         ]);
-        let client = FusiformClient::new(&peer.path).unwrap();
+        let client = FusiformClient::for_test(&peer.path).unwrap();
         let error = deadline_call(&client).unwrap_err();
         assert_eq!(error.code, "unavailable");
-        assert!(error.message.contains("last exchange detail"), "{error:?}");
-        assert!(
-            error.message.contains("target_unavailable")
-                && error.message.contains("route refusal detail"),
-            "{error:?}"
-        );
+        assert!(error.message.contains("unknown_module"), "{error:?}");
+        assert!(!error.message.contains("launch secret"), "{error:?}");
         assert_eq!(peer.requests.lock().unwrap().len(), 3);
     }
 }
@@ -1253,6 +1101,7 @@ pub(crate) mod fixtures {
     use super::*;
     use crate::test_support::{Background, HANG_GUARD};
     use astrocyte_core::ingest::EventRecordRequest;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use subc_transport::auth::authenticate_server;
     use subc_transport::connection_file::ConnectionInfo;
@@ -1433,7 +1282,7 @@ pub(crate) mod fixtures {
             {
                 return;
             }
-            let Ok(Some(open)) = read_frame(&mut stream).await else {
+            let Some(open) = crate::test_support::read_peer_request(&mut stream).await else {
                 return;
             };
             let open_body: Value = serde_json::from_slice(&open.body).unwrap_or(Value::Null);
@@ -1444,13 +1293,16 @@ pub(crate) mod fixtures {
                 0,
                 0,
                 open.header.corr,
-                serde_json::to_vec(&json!({"route_channel": 7, "route_epoch": 1})).unwrap(),
+                serde_json::to_vec(
+                    &json!({"op":"route.open", "route_channel": 7, "route_epoch": 1}),
+                )
+                .unwrap(),
             )
             .unwrap();
             if write_frame(&mut stream, &opened).await.is_err() || stream.flush().await.is_err() {
                 return;
             }
-            while let Ok(Some(request)) = read_frame(&mut stream).await {
+            while let Some(request) = crate::test_support::read_peer_request(&mut stream).await {
                 let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
                 self.requests.lock().unwrap().push(body.clone());
                 let (ty, response_body) = self.answer(&body);

@@ -13,7 +13,7 @@ fn check_config_rejects_removed_claude_workers_source() {
     let config = directory.path().join("astrocyte.jsonc");
     std::fs::write(
         &config,
-        r#"{"poll_interval_secs":30,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":["claude-code-workers"]}}"#,
+        r#"{"poll_interval_secs":30,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":["claude-code-workers"]}}"#,
     )
     .unwrap();
     let output = output_within_guard(

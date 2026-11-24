@@ -2028,7 +2028,7 @@ pub(super) mod tests {
             })
             .unwrap();
         if let Ok(subc) = std::env::var("PRICING_REHEARSAL_SUBC") {
-            let client = Arc::new(crate::fusiform_client::FusiformClient::new(subc).unwrap());
+            let client = Arc::new(crate::fusiform_client::FusiformClient::for_test(subc).unwrap());
             let connection: Arc<dyn CatalogConnection> = client;
             state
                 .install_catalog(Some(CatalogClient::connect(connection).unwrap()))

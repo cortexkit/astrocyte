@@ -1,8 +1,6 @@
 // ck-astrocyte v2 — production config example.
-// The paths below are placeholders; replace them before use.
-//
-// The desired format is closed: every member below is required, a null is a
-// legal "not configured", and an unknown or missing member is a parse failure.
+// The desired format is closed: every member below is required, and an
+// unknown or missing member is a parse failure.
 // Config and binary move together in both directions.
 {
   // Steady-state metering cadence. The capacity staleness horizon derives from
@@ -11,16 +9,6 @@
 
   // Broca needs no member: its usage is read from its own store,
   // <data home>/cortexkit/broca/run-index.db, like the harness readers'.
-
-  // Insula serves capacity windows over the same connection. Advisory only:
-  // a failing poll records a dated attempt and never blocks the spend drain.
-  "qta_connection_file": "/path/to/insula/subc-connection.json",
-
-  // Fusiform is the price catalog. Absent (null) means every event is stored
-  // unpriced with reason catalog_unconfigured -- distinct from fusiform's own
-  // no_catalog_coverage, so a report can tell "nobody looked" from "looked and
-  // found nothing".
-  "fusiform_connection_file": "/path/to/fusiform/subc-connection.json",
 
   // Vendors that bill reasoning (including extended thinking) as output.
   // Shared by ledger pricing and multiplier valuation, even if a reasoning

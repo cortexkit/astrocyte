@@ -1282,10 +1282,9 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
         .build()
 }
 
-/// The modules astrocyte calls under `desired`, and no others. ckbus is
-/// always called, through an attested route on the daemon connection file:
-/// the bus reader authenticates with it to follow runners' step events in
-/// every configuration, and to read quota notices when insula is configured.
+/// The modules astrocyte calls under `desired`, and no others. Fusiform, insula
+/// and ckbus use attested routes in every configuration. The bus reader
+/// authenticates with ckbus to follow runners' step events and quota notices.
 /// BROCA never is: its usage is read from its store, not over subc.
 /// Claustrum is always called for subscription tiers with a list-only grant.
 /// Colliculus is called when its media source is ingested.
@@ -1294,8 +1293,8 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
 /// an absent or refusing publisher does not degrade ledger health.
 fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
     let of: Vec<String> = [
-        ("fusiform", desired.fusiform_connection_file.is_some()),
-        ("insula", desired.qta_connection_file.is_some()),
+        ("fusiform", true),
+        ("insula", true),
         ("ckbus", true),
         ("claustrum", true),
         ("colliculus", desired.harness_ingest.ingests("colliculus")),
@@ -1328,7 +1327,7 @@ fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignal
         source: "desired_config.poll_interval_secs".to_string(),
     };
     let mut declarations = Vec::new();
-    if desired.qta_connection_file.is_some() {
+    {
         // insula is the module that tells self-generated traffic from real
         // traffic, so this poll is the entry it most needs to see.
         declarations.push(SelfSignalDeclaration {
@@ -1354,8 +1353,7 @@ fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignal
             ),
         });
     }
-    // The bus reader runs in every configuration: it follows runners' step
-    // events, and quota notices too when insula is configured.
+    // The bus reader follows runners' step events and quota notices.
     declarations.push(SelfSignalDeclaration {
         name: "astrocyte-ckbus-credentials".to_string(),
         kind: SelfSignalKind::Poller,
@@ -1363,9 +1361,9 @@ fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignal
         anchored_to: SignalAnchor::Event { event: "quota_bus_session".to_string() },
         cadence: None,
         domain: Some("ckbus".to_string()),
-        note: Some("ckbus.credential, ckbus.credential_renew and ckbus.nonce_sign authenticate the bus reader (runner step events, and quota notices when insula is configured); failures retry with bounded backoff.".to_string()),
+        note: Some("ckbus.credential, ckbus.credential_renew and ckbus.nonce_sign authenticate the bus reader for runner step events and quota notices; failures retry with bounded backoff.".to_string()),
     });
-    if desired.fusiform_connection_file.is_some() {
+    {
         // Rate lookups are reads (Observe) driven by events, not by a clock,
         // so the anchor is the event and there is no cadence to declare.
         //
@@ -2238,9 +2236,7 @@ mod tests {
         let resolved_at_ms = 45_678;
         let peer = CatalogPeer::start(event_at - 1, 9, resolved_at_ms);
         let state = Arc::new(test_state());
-        let mut config = crate::config::intentional_empty().config;
-        config.fusiform_connection_file = Some(peer.path.to_string_lossy().into_owned());
-        state.publish_desired(config, 0);
+        state.install_test_catalog_path(peer.path.clone());
         let stop = Arc::new(AtomicBool::new(false));
         // The refresher's first loop iteration prices whatever is queued. If
         // the background pass priced this event first, the frame would find it
@@ -2410,12 +2406,9 @@ mod tests {
         );
     }
 
-    fn desired(qta: bool, fusiform: bool) -> config::AstrocyteConfig {
-        let file = |set: bool| set.then(|| "/tmp/peer.json".to_string());
+    fn desired() -> config::AstrocyteConfig {
         config::AstrocyteConfig {
             poll_interval_secs: 45,
-            qta_connection_file: file(qta),
-            fusiform_connection_file: file(fusiform),
             reasoning_billed_as_output: Vec::new(),
             subscription_multiplier: config::intentional_empty().config.subscription_multiplier,
             harness_ingest: config::HarnessIngest::all_on(),
@@ -2475,7 +2468,7 @@ mod tests {
 
     #[test]
     fn attribution_manifest_declares_four_unconditional_read_pollers() {
-        let manifest = manifest("astrocyte", &desired(false, false));
+        let manifest = manifest("astrocyte", &desired());
         let wire = serde_json::to_value(&manifest).unwrap();
         for (module, name) in [
             ("prefrontal", "astrocyte-prefrontal-attribution-read"),
@@ -2507,8 +2500,8 @@ mod tests {
     /// makes against another module under this configuration must be in it
     /// by name, and the consumers must be exactly the modules it calls.
     #[test]
-    fn manifest_declares_every_peer_call_when_all_peers_are_configured() {
-        let manifest = manifest("astrocyte", &desired(true, true));
+    fn manifest_declares_every_peer_call_with_default_ingestion() {
+        let manifest = manifest("astrocyte", &desired());
         assert_eq!(manifest.registration_channel, Some(true));
         assert_eq!(
             self_signal_names(&manifest),
@@ -2555,7 +2548,7 @@ mod tests {
     /// calls, plan.prices and its rate lookups, on a literal daily cadence.
     #[test]
     fn manifest_declares_the_daily_multiplier_calls_when_a_quota_provider_is_declared() {
-        let mut desired = desired(false, true);
+        let mut desired = desired();
         let decoded =
             config::decode(include_str!("../../../docs/prod-config/astrocyte-v2.jsonc")).unwrap();
         desired.subscription_multiplier = decoded.config.subscription_multiplier;
@@ -2563,6 +2556,8 @@ mod tests {
         assert_eq!(
             self_signal_names(&manifest),
             expected_signals(&[
+                "astrocyte-insula-usage-poll",
+                "astrocyte-insula-quota-body",
                 "astrocyte-ckbus-credentials",
                 "astrocyte-fusiform-catalog-lookup",
                 "astrocyte-fusiform-history-status",
@@ -2589,25 +2584,31 @@ mod tests {
         assert_eq!(plan_prices["domain"], "fusiform");
     }
 
-    /// Disabling insula, fusiform and colliculus does not suppress the four
-    /// attribution publishers, the bus reader or subscription-tier reads.
+    /// Excluding Colliculus does not suppress any of the unconditional peers.
     #[test]
-    fn manifest_keeps_attribution_readers_when_optional_peers_are_unconfigured() {
-        let mut desired = desired(false, false);
+    fn manifest_keeps_unconditional_peers_when_colliculus_is_excluded() {
+        let mut desired = desired();
         desired.harness_ingest.exclude.push("colliculus".into());
         let manifest = manifest("astrocyte", &desired);
         assert_eq!(
             self_signal_names(&manifest),
-            expected_signals(&["astrocyte-ckbus-credentials"])
+            expected_signals(&[
+                "astrocyte-insula-usage-poll",
+                "astrocyte-insula-quota-body",
+                "astrocyte-ckbus-credentials",
+                "astrocyte-fusiform-catalog-lookup",
+                "astrocyte-fusiform-history-status",
+                "astrocyte-fusiform-history-probe",
+            ])
         );
         assert_eq!(
             consumed_modules(&manifest),
-            expected_modules(&["ckbus", "claustrum"])
+            expected_modules(&["fusiform", "insula", "ckbus", "claustrum"])
         );
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire["consumes"],
-            json!([{"role": "service_client", "of": expected_modules(&["ckbus", "claustrum"])}])
+            json!([{"role": "service_client", "of": expected_modules(&["fusiform", "insula", "ckbus", "claustrum"])}])
         );
     }
 
@@ -2633,7 +2634,7 @@ mod tests {
                 false,
             ),
         ] {
-            let mut desired = desired(true, true);
+            let mut desired = desired();
             desired.harness_ingest = ingest.clone();
             let manifest = manifest("astrocyte", &desired);
             let mut signals = vec![
@@ -2662,29 +2663,11 @@ mod tests {
         }
     }
 
-    /// Quota ingestion declares its fallback poll, event-body fetch and attested
-    /// credential lifecycle; no catalog calls are introduced.
+    /// The quota fallback poll is a periodic observation, not a mutation.
     #[test]
-    fn manifest_declares_quota_poll_events_and_credentials_when_only_qta_is_configured() {
-        let manifest = manifest("astrocyte", &desired(true, false));
-        assert_eq!(
-            self_signal_names(&manifest),
-            expected_signals(&[
-                "astrocyte-insula-usage-poll",
-                "astrocyte-insula-quota-body",
-                "astrocyte-ckbus-credentials",
-                "astrocyte-colliculus-usage-read",
-            ])
-        );
-        assert_eq!(
-            consumed_modules(&manifest),
-            expected_modules(&["insula", "ckbus", "claustrum", "colliculus"])
-        );
+    fn manifest_declares_the_quota_poll_cadence() {
+        let manifest = manifest("astrocyte", &desired());
         let wire = serde_json::to_value(&manifest).unwrap();
-        assert_eq!(
-            wire["consumes"],
-            json!([{"role": "service_client", "of": expected_modules(&["insula", "ckbus", "claustrum", "colliculus"])}])
-        );
         let poll = &wire["self_signals"][0];
         assert_eq!(poll["name"], "astrocyte-insula-usage-poll");
         assert_eq!(poll["kind"], "poller");
@@ -2723,11 +2706,18 @@ mod tests {
                 false,
             ),
         ] {
-            let mut desired = desired(false, false);
+            let mut desired = desired();
             desired.harness_ingest = ingest.clone();
             let manifest = manifest("astrocyte", &desired);
-            let mut modules = vec!["ckbus", "claustrum"];
-            let mut signals = vec!["astrocyte-ckbus-credentials"];
+            let mut modules = vec!["fusiform", "insula", "ckbus", "claustrum"];
+            let mut signals = vec![
+                "astrocyte-insula-usage-poll",
+                "astrocyte-insula-quota-body",
+                "astrocyte-ckbus-credentials",
+                "astrocyte-fusiform-catalog-lookup",
+                "astrocyte-fusiform-history-status",
+                "astrocyte-fusiform-history-probe",
+            ];
             if enabled {
                 modules.push("colliculus");
                 signals.push("astrocyte-colliculus-usage-read");
@@ -2770,8 +2760,7 @@ mod tests {
     fn check_config_accepts_the_closed_live_document() {
         let path =
             std::env::temp_dir().join(format!("astrocyte-check-{}.jsonc", std::process::id()));
-        let mut document = json!({"poll_interval_secs":60,"qta_connection_file":null,
-            "fusiform_connection_file":null,"reasoning_billed_as_output":[],
+        let mut document = json!({"poll_interval_secs":60,"reasoning_billed_as_output":[],
             "subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},
                 "quota_providers":{"antigravity":{
                     "window":{"pool_key":"extra:13:gemini-weekly","window_minutes":10080},
@@ -2804,7 +2793,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            br#"{"poll_interval_secs":60,"catalog_file":null,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
+            br#"{"poll_interval_secs":60,"catalog_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
         )
         .unwrap();
         assert!(check_config(&path, &mut Vec::new()).is_err());
@@ -2821,7 +2810,7 @@ mod tests {
         ));
         let document = |ingest: &str| {
             format!(
-                r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{{"api_twins":{{}},"plan_price_overrides":{{}},"quota_providers":{{}}}}{ingest}}}"#
+                r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{{"api_twins":{{}},"plan_price_overrides":{{}},"quota_providers":{{}}}}{ingest}}}"#
             )
         };
         for (ingest, needle) in [

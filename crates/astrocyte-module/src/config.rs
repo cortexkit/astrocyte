@@ -1,4 +1,4 @@
-//! Desired-configuration decoding for the live producer connections.
+//! Desired-configuration decoding for metering.
 
 use astrocyte_core::canon::{canonical_hash, jcs_serialize};
 use astrocyte_core::multiplier::MultiplierConfig;
@@ -11,8 +11,6 @@ pub(crate) const MAX_POLL_INTERVAL_SECS: u64 = 2_305_843_009_213_693;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AstrocyteConfig {
     pub poll_interval_secs: u64,
-    pub qta_connection_file: Option<String>,
-    pub fusiform_connection_file: Option<String>,
     /// Providers whose reasoning tokens use output rates in ledger pricing and valuation.
     pub reasoning_billed_as_output: Vec<String>,
     pub subscription_multiplier: MultiplierSetting,
@@ -173,8 +171,6 @@ impl std::fmt::Display for ConfigError {
 #[serde(deny_unknown_fields)]
 struct DecodedConfig {
     poll_interval_secs: u64,
-    qta_connection_file: Option<String>,
-    fusiform_connection_file: Option<String>,
     reasoning_billed_as_output: Vec<String>,
     subscription_multiplier: MultiplierConfig,
     harness_ingest: HarnessIngest,
@@ -184,8 +180,6 @@ impl From<DecodedConfig> for AstrocyteConfig {
     fn from(decoded: DecodedConfig) -> Self {
         Self {
             poll_interval_secs: decoded.poll_interval_secs,
-            qta_connection_file: decoded.qta_connection_file,
-            fusiform_connection_file: decoded.fusiform_connection_file,
             reasoning_billed_as_output: decoded.reasoning_billed_as_output,
             subscription_multiplier: MultiplierSetting::Recorded(decoded.subscription_multiplier),
             harness_ingest: decoded.harness_ingest,
@@ -373,10 +367,8 @@ pub fn decode(contents: &str) -> Result<DesiredContent, ConfigError> {
 }
 
 fn validate_closed_shape(value: &serde_json::Value) -> Result<(), ConfigError> {
-    const MEMBERS: [&str; 6] = [
+    const MEMBERS: [&str; 4] = [
         "poll_interval_secs",
-        "qta_connection_file",
-        "fusiform_connection_file",
         "subscription_multiplier",
         "harness_ingest",
         "reasoning_billed_as_output",
@@ -418,8 +410,6 @@ pub(crate) fn canonicalize(config: AstrocyteConfig) -> Result<DesiredContent, Co
 pub fn intentional_empty() -> DesiredContent {
     canonicalize(AstrocyteConfig {
         poll_interval_secs: 60,
-        qta_connection_file: None,
-        fusiform_connection_file: None,
         reasoning_billed_as_output: Vec::new(),
         subscription_multiplier: MultiplierSetting::Recorded(MultiplierConfig {
             api_twins: Default::default(),
@@ -433,11 +423,6 @@ pub fn intentional_empty() -> DesiredContent {
 
 fn validate_config(config: &AstrocyteConfig) -> Result<(), ConfigError> {
     validate_poll_interval(config.poll_interval_secs)?;
-    validate_nullable_nonempty("qta_connection_file", config.qta_connection_file.as_deref())?;
-    validate_nullable_nonempty(
-        "fusiform_connection_file",
-        config.fusiform_connection_file.as_deref(),
-    )?;
     config.harness_ingest.validate()?;
     validate_reasoning_providers(&config.reasoning_billed_as_output)?;
     match &config.subscription_multiplier {
@@ -474,16 +459,6 @@ fn validate_poll_interval(value: u64) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_nullable_nonempty(name: &str, value: Option<&str>) -> Result<(), ConfigError> {
-    if value.is_some_and(str::is_empty) {
-        Err(ConfigError::Validation(format!(
-            "{name} must be null or a non-empty string"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,8 +476,6 @@ mod tests {
         format!(
             r#"{{
         "poll_interval_secs": 60,
-        "qta_connection_file": null,
-        "fusiform_connection_file": null,
         "reasoning_billed_as_output": [],
         "subscription_multiplier": {NO_MULTIPLIER},
         "harness_ingest": {INGEST_ON}
@@ -514,7 +487,7 @@ mod tests {
     /// `subscription_multiplier` member.
     fn with_multiplier(multiplier: &str) -> String {
         format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{multiplier},"harness_ingest":{INGEST_ON}}}"#
+            r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{multiplier},"harness_ingest":{INGEST_ON}}}"#
         )
     }
 
@@ -531,10 +504,8 @@ mod tests {
     fn desired_jsonc_comments_and_trailing_commas_are_accepted() {
         let desired = decode(&format!(
             r#"{{
-                // Connections are optional until their clients are configured.
+                // Set the metering cadence in seconds.
                 "poll_interval_secs": 60,
-                "qta_connection_file": null,
-                "fusiform_connection_file": null,
                 "reasoning_billed_as_output": [],
                 "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON},
@@ -550,8 +521,6 @@ mod tests {
             r#"{{
                 "poll_interval_secs": 60,
                 "catalog_file": null,
-                "qta_connection_file": null,
-                "fusiform_connection_file": null,
                 "reasoning_billed_as_output": [],
                 "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON}
@@ -569,9 +538,7 @@ mod tests {
         let error = decode(&format!(
             r#"{{
                 "poll_interval_secs": 60,
-                "qta_connection_file": null,
                 "thalamus_connection_file": null,
-                "fusiform_connection_file": null,
                 "reasoning_billed_as_output": [],
                 "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON}
@@ -594,9 +561,7 @@ mod tests {
         let error = decode(&format!(
             r#"{{
                 "poll_interval_secs": 60,
-                "qta_connection_file": null,
                 "broca_connection_file": null,
-                "fusiform_connection_file": null,
                 "reasoning_billed_as_output": [],
                 "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON}
@@ -612,13 +577,24 @@ mod tests {
     }
 
     #[test]
+    fn retired_fusiform_and_quota_connection_files_are_refused_by_name() {
+        for member in ["fusiform_connection_file", "qta_connection_file"] {
+            let document = empty().replacen('{', &format!(r#"{{"{member}":null,"#), 1);
+            assert_eq!(
+                decode(&document).unwrap_err(),
+                ConfigError::Decode(format!("desired root contains unknown member '{member}'"))
+            );
+        }
+    }
+
+    #[test]
     fn unknown_and_duplicate_members_are_rejected_before_canonicalization() {
         assert!(decode(&format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON},"future":null}}"#
+            r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON},"future":null}}"#
         ))
         .is_err());
         let error = decode(&format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"qta_connection_file":"other","fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
+            r#"{{"poll_interval_secs":60,"poll_interval_secs":30,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
         ))
         .unwrap_err();
         assert!(error.to_string().contains("duplicate field"));
@@ -626,24 +602,20 @@ mod tests {
 
     #[test]
     fn required_members_and_value_bounds_are_enforced() {
-        assert!(decode(r#"{"poll_interval_secs":60,"qta_connection_file":null}"#).is_err());
+        assert!(decode(r#"{"poll_interval_secs":60}"#).is_err());
         assert!(decode(&format!(
-            r#"{{"poll_interval_secs":0,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
-        ))
-        .is_err());
-        assert!(decode(&format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":"","fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
+            r#"{{"poll_interval_secs":0,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
         ))
         .is_err());
     }
 
     #[test]
-    fn canonical_content_is_stable_and_explicitly_nullable() {
+    fn canonical_content_is_stable() {
         let desired = decode(&empty()).unwrap();
         assert_eq!(desired.config, intentional_empty().config);
         assert_eq!(
             String::from_utf8(desired.canonical_bytes).unwrap(),
-            r#"{"fusiform_connection_file":null,"harness_ingest":{"enabled":true,"exclude":[]},"poll_interval_secs":60,"qta_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}}}"#
+            r#"{"harness_ingest":{"enabled":true,"exclude":[]},"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}}}"#
         );
     }
 
@@ -651,10 +623,7 @@ mod tests {
     /// written before it existed is refused by name, never given a default.
     #[test]
     fn a_document_without_the_multiplier_member_is_refused_by_name() {
-        let error = decode(
-            r#"{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null}"#,
-        )
-        .unwrap_err();
+        let error = decode(r#"{"poll_interval_secs":60}"#).unwrap_err();
         assert_eq!(
             error,
             ConfigError::Decode("desired root is missing member 'subscription_multiplier'".into())
@@ -903,7 +872,7 @@ mod tests {
     /// `harness_ingest` member.
     fn with_ingest(ingest: &str) -> String {
         format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{ingest}}}"#
+            r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{ingest}}}"#
         )
     }
 
@@ -963,7 +932,7 @@ mod tests {
     #[test]
     fn a_document_without_the_ingest_member_is_refused_by_name() {
         let error = decode(&format!(
-            r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER}}}"#
+            r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER}}}"#
         ))
         .unwrap_err();
         assert_eq!(

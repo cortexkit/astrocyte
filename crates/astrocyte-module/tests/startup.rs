@@ -1,6 +1,9 @@
 //! What the real binary does at startup before it ever reaches the daemon.
 
 mod common;
+#[cfg(unix)]
+#[path = "startup/supervised_peers.rs"]
+mod supervised_peers;
 
 use common::{ckdev_binary, entries_under, output_within_guard};
 use std::process::Command;
@@ -9,7 +12,7 @@ use std::process::Command;
 fn vault_check_config_accepts_scope_only_and_refuses_removed_identity_maps() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("desired.json");
-    let mut document = serde_json::json!({"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,
+    let mut document = serde_json::json!({"poll_interval_secs":60,
         "reasoning_billed_as_output":[],"harness_ingest":{"enabled":true,"exclude":[]},
         "subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{"codex":{
             "window":{"pool_key":"primary","window_minutes":10080},"scope":[{"producer":"broca","provider":"openai","charge_basis":null,"model_prefix":null}]}}}});

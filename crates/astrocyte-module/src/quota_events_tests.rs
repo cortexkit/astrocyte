@@ -496,7 +496,12 @@ fn quota_reader_shutdown_cancels_mid_session_and_joins_within_the_drain_guard() 
     );
     state.acknowledge_module_hello();
     let stop = Arc::new(AtomicBool::new(false));
-    let reader = Reader::start(state.clone(), Some(peer.path.clone()), stop.clone()).unwrap();
+    let reader = Reader::start(
+        state.clone(),
+        Some(crate::peer_exchange::PeerAccess::Fixture(peer.path.clone())),
+        stop.clone(),
+    )
+    .unwrap();
     let stopped = stop.clone();
     let (ended, joined) = std::sync::mpsc::channel();
     let joining = std::thread::spawn(move || {
@@ -744,7 +749,12 @@ fn quota_real_reader_credentials_attach_and_shutdown_mid_pull() {
     );
     state.acknowledge_module_hello();
     let stop = Arc::new(AtomicBool::new(false));
-    let reader = Reader::start(state.clone(), Some(peer.path.clone()), stop.clone()).unwrap();
+    let reader = Reader::start(
+        state.clone(),
+        Some(crate::peer_exchange::PeerAccess::Fixture(peer.path.clone())),
+        stop.clone(),
+    )
+    .unwrap();
     let stopping = stop.clone();
     let (ended, joined) = std::sync::mpsc::channel();
     let joining = Background::new(
@@ -817,7 +827,8 @@ fn assert_runner_delivery(configure_insula: bool) {
     );
     state.acknowledge_module_hello();
     let stop = Arc::new(AtomicBool::new(false));
-    let insula = configure_insula.then(|| peer.path.clone());
+    let insula =
+        configure_insula.then(|| crate::peer_exchange::PeerAccess::Fixture(peer.path.clone()));
     let reader = Reader::start(state.clone(), insula, stop.clone()).unwrap();
     let (subject, body) = crate::runner_steps::test_event(&names, "minimal", "thalamus", |_| {});
     runtime().block_on(async {
@@ -891,7 +902,7 @@ fn event_wakes_quota_real_durable_survives_refused_catalog_and_never_creates_top
     let peer = Peer::start(Arc::new(move |_| {
         Some((subc_protocol::FrameType::Response, response.clone()))
     }));
-    let insula = crate::qta_client::QtaClient::new(&peer.path).unwrap();
+    let insula = crate::qta_client::QtaClient::for_test(&peer.path).unwrap();
     runtime().block_on(async {
         let admin = tokio::time::timeout(Duration::from_secs(10), async {
             loop {

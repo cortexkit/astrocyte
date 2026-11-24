@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 use subc_transport::auth::authenticate_server;
 
-use subc_transport::{read_frame, write_frame};
+use subc_transport::write_frame;
 use tokio::io::AsyncWriteExt;
 
 use crate::test_support::{Background, HANG_GUARD};
@@ -19,7 +19,7 @@ use crate::test_support::{Background, HANG_GUARD};
 /// and rebinds the same channel.
 pub(crate) const ROUTE_CHANNEL: u16 = 7;
 
-/// Accepts any number of connections and opens one route on each. The
+/// Accepts connections and reopens routes on the same connection. The
 /// Nth `route.open` (counting from 1) binds epoch N, so the epoch a
 /// request carries says which `route.open` it is using. The first request
 /// of the whole session is answered with an ERROR frame carrying the
@@ -69,38 +69,27 @@ impl RouteDeathPeer {
                             )
                             .await
                             .ok()?;
-                            let open = read_frame(&mut stream).await.ok()??;
-                            let open_body: Value = serde_json::from_slice(&open.body).ok()?;
-                            let epoch = {
-                                let mut opens = server_route_opens.lock().unwrap();
-                                opens.push(
-                                    open_body["target"]["module_id"]
-                                        .as_str()
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                );
-                                u32::try_from(opens.len()).unwrap()
-                            };
-                            let opened = Frame::build(
-                                FrameType::Response,
-                                Flags::new(false, Priority::Passive, false),
-                                0,
-                                0,
-                                open.header.corr,
-                                serde_json::to_vec(&json!({
-                                    "op": "route.open",
-                                    "route_channel": ROUTE_CHANNEL,
-                                    "route_epoch": epoch,
-                                }))
-                                .unwrap(),
-                            )
-                            .unwrap();
-                            write_frame(&mut stream, &opened).await.ok()?;
-                            stream.flush().await.ok()?;
-
-                            // Answer requests on this connection until the client
-                            // drops it (after evicting the route) or the test ends.
-                            while let Some(request) = read_frame(&mut stream).await.ok()? {
+                            while let Some(request) = crate::test_support::read_peer_request(&mut stream).await {
+                                if request.header.channel == 0 {
+                                    let open: Value = serde_json::from_slice(&request.body).ok()?;
+                                    assert_eq!(open["op"], "route.open");
+                                    let epoch = {
+                                        let mut opens = server_route_opens.lock().unwrap();
+                                        opens.push(open["target"]["module_id"].as_str().unwrap().into());
+                                        u32::try_from(opens.len()).unwrap()
+                                    };
+                                    let opened = Frame::build(
+                                        FrameType::Response,
+                                        Flags::new(false, Priority::Passive, false),
+                                        0, 0, request.header.corr,
+                                        serde_json::to_vec(&json!({
+                                            "op":"route.open", "route_channel":ROUTE_CHANNEL, "route_epoch":epoch,
+                                        })).unwrap(),
+                                    ).unwrap();
+                                    write_frame(&mut stream, &opened).await.ok()?;
+                                    stream.flush().await.ok()?;
+                                    continue;
+                                }
                                 server_requests
                                     .lock()
                                     .unwrap()

@@ -504,7 +504,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            br#"{"poll_interval_secs":45,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
+            br#"{"poll_interval_secs":45,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
         )
         .unwrap();
         reload_config(&state, Ok(path.clone())).unwrap();
@@ -544,6 +544,24 @@ mod tests {
         .expect("an unresolvable path retains too");
         assert_eq!(state.desired_generation(), committed);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn startup_configuration_clears_legacy_peer_path_columns_when_publishing() {
+        let state = Arc::new(test_state());
+        state.ordered_write(|tx| {
+            tx.execute("UPDATE desired_config SET qta_connection_file='old-insula', fusiform_connection_file='old-fusiform' WHERE id=1", [])
+                .map_err(|error| error.to_string())?;
+            Ok(((), true))
+        }).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        reload_config(&state, Ok(directory.path().join("missing.jsonc"))).unwrap();
+        let paths: (Option<String>, Option<String>) = state.with_conn(|conn| {
+            conn.query_row("SELECT qta_connection_file, fusiform_connection_file FROM desired_config WHERE id=1", [], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|error| error.to_string())
+        }).unwrap();
+        assert!(state.has_committed_desired_generation());
+        assert_eq!(paths, (None, None));
     }
 
     #[test]
@@ -895,7 +913,7 @@ mod harness_ingest_tests {
         std::fs::write(
             &path,
             format!(
-                r#"{{"poll_interval_secs":60,"qta_connection_file":null,"fusiform_connection_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{{"api_twins":{{}},"plan_price_overrides":{{}},"quota_providers":{{}}}},"harness_ingest":{ingest}}}"#
+                r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{{"api_twins":{{}},"plan_price_overrides":{{}},"quota_providers":{{}}}},"harness_ingest":{ingest}}}"#
             ),
         )
         .unwrap();

@@ -9,9 +9,8 @@ fn event_wakes_catalog_coalesces_and_retries_failed_discovery() {
     let peer =
         CatalogPeer::start_with_status(100, 9, 66_666, StatusMode::Transient { failures: 2 });
     let state = test_state();
-    let mut config = config::intentional_empty().config;
-    config.fusiform_connection_file = Some(peer.path.to_string_lossy().into_owned());
-    let (mut pending, _) = configure_catalog(&state, &config, &AtomicBool::new(false)).unwrap();
+    let access = Some(crate::peer_exchange::PeerAccess::Fixture(peer.path.clone()));
+    let (mut pending, _) = configure_catalog(&state, access, &AtomicBool::new(false)).unwrap();
     assert!(pending.is_some());
     state.event_wakes().attached(&[Source::Catalog], true);
     let mut multiplier = MultiplierStage::new(None);
@@ -57,9 +56,8 @@ fn event_wakes_new_model_gets_rates_on_next_full_tick_without_status_rpc() {
     use crate::fusiform_client::fixtures::CatalogPeer;
     let peer = CatalogPeer::start(100, 9, 66_666);
     let state = test_state();
-    let mut config = config::intentional_empty().config;
-    config.fusiform_connection_file = Some(peer.path.to_string_lossy().into_owned());
-    let (mut pending, _) = configure_catalog(&state, &config, &AtomicBool::new(false)).unwrap();
+    let access = Some(crate::peer_exchange::PeerAccess::Fixture(peer.path.clone()));
+    let (mut pending, _) = configure_catalog(&state, access, &AtomicBool::new(false)).unwrap();
     state.event_wakes().attached(&[Source::Catalog], true);
     let mut multiplier = MultiplierStage::new(None);
     catalog_wake_tick(

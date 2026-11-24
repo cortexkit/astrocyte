@@ -1,4 +1,5 @@
 //! Read attribution on scheduled refreshes, not the shorter pricing-only cycles.
+use crate::peer_exchange::open_route;
 use crate::state::SharedState;
 use astrocyte_core::attribution::{self, Page, Publisher};
 use rusqlite::{params, OptionalExtension};
@@ -6,8 +7,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use subc_client_rs::{CallOptions, ConsumerOptions, RouteHandle, SubcConsumer};
-use subc_protocol::{RouteTarget, SUBC_MODULE_ID_ENV};
+use subc_client_rs::{CallOptions, RouteHandle, SubcConsumer};
+use subc_protocol::RouteTarget;
 
 const LIMIT: usize = 128;
 const BUDGET: Duration = Duration::from_secs(10);
@@ -28,30 +29,24 @@ struct Route {
 }
 impl Route {
     async fn open(state: &SharedState, publisher: Publisher) -> Result<Self, ()> {
-        let access = state.quota_bus().access().ok_or(())?;
-        let nonce = subc_os::launch_nonce().map_err(|_| ())?;
-        if std::env::var(SUBC_MODULE_ID_ENV).ok().as_deref() != Some(access.module_id.as_str())
-            || nonce.as_ref().map(|value| value.value()) != Some(access.nonce.as_str())
-        {
-            return Err(());
-        }
-        let consumer = tokio::time::timeout(
-            BUDGET,
-            SubcConsumer::connect(&access.path, ConsumerOptions::default()),
-        )
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
+        let access = state.peer_access().ok_or(())?;
+        let consumer = access.connect(BUDGET).await.map_err(|_| ())?;
         // Prefrontal answers under its new id after its rename and its old id
         // before it. A refused open for an id not installed is cheap, so each
         // refresh tries the preferred id first rather than remembering one.
         let mut opened = None;
         for module in publisher.modules() {
-            let identity=serde_json::from_value(json!({"harness":"ck-astrocyte","session":format!("attribution/{}",publisher.key())})).map_err(|_|())?;
             let route = RouteTarget::ManagementSurface {
                 module_id: (*module).into(),
             };
-            if let Ok(handle) = consumer.open_route(route, identity, options()).await {
+            if let Ok(handle) = open_route(
+                &consumer,
+                route,
+                &format!("attribution/{}", publisher.key()),
+                options(),
+            )
+            .await
+            {
                 opened = Some(handle);
                 break;
             }

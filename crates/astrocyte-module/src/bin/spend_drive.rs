@@ -140,7 +140,6 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         epoch,
         corr,
         serde_json::to_vec(&body).map_err(|error| error.to_string())?,
-        astrocyte_module::peer_exchange::ExchangeMode::Management,
     )
     .await
 }

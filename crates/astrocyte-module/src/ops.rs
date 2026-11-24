@@ -851,7 +851,7 @@ fn op_multiplier_pace(state: &SharedState, params: Value) -> OpResult {
 /// Computes a multiplier day, superseding its head or creating its first row.
 ///
 /// The daily stage's plan-price source lives on the refresher thread, so this
-/// operation opens its own fusiform client from the committed configuration.
+/// operation opens its own fusiform client with the module's attested access.
 /// Construction reads no socket; a call is made only when some account has no
 /// configured price override. The client is dropped here, inside the
 /// blocking section the transport runs dispatch in.
@@ -863,9 +863,9 @@ fn op_multiplier_recompute(state: &SharedState, params: Value) -> OpResult {
                 format!("multiplier recompute params: {error}"),
             )
         })?;
-    let plan_prices = match &state.desired_config().fusiform_connection_file {
-        Some(path) => Some(
-            crate::fusiform_client::FusiformClient::new(path)
+    let plan_prices = match state.catalog_access() {
+        Some(access) => Some(
+            crate::fusiform_client::FusiformClient::new(access)
                 .map_err(|error| ("plan_prices_unavailable".to_string(), error))?,
         ),
         None => None,

@@ -7,24 +7,25 @@
 //! advisory: every failure is `PullError::Unavailable` so the refresher marks
 //! the axis stale and keeps the last-known windows — nothing blocks.
 
+#[cfg(test)]
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use subc_protocol::{error_codes, Frame, FrameType};
+use subc_client_rs::SubcConsumer;
+use subc_protocol::RouteTarget;
 #[cfg(test)]
-use subc_protocol::{Flags, Priority};
-use subc_transport::{authenticate_client, connection_file};
+use subc_protocol::{Flags, Frame, FrameType, Priority};
 #[cfg(test)]
 use subc_transport::{read_frame, write_frame};
 #[cfg(test)]
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 
 use astrocyte_core::capacity::CapacitySnapshot;
 use cortexkit_provider_usage::ProviderUsage;
 
 use crate::capacity_map::map_usage_array;
+use crate::peer_exchange::{read_peer, PeerAccess, ReadError};
 use crate::refresher::{CapacitySource, PullError};
 
 // Copied sibling facts. This pair was WRONG for three days in August: the
@@ -35,137 +36,48 @@ use crate::refresher::{CapacitySource, PullError};
 // CREDENTIALS_MODULE_ID beside it, which is their client to the vault) and
 // the op the surface matches on. Last re-derived 2026-09-06 at insula 9b7ba5c.
 const QTA_MODULE_ID: &str = "insula";
+#[cfg(test)]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const OP_USAGE_GET: &str = "usage.get";
 
-/// One established, authenticated connection with an open QTA route.
-struct Live {
-    stream: TcpStream,
-    route_channel: u16,
-    route_epoch: u32,
-    next_corr: u64,
-}
-
 pub struct QtaClient {
-    connection_file_path: PathBuf,
+    access: PeerAccess,
     request_timeout: Duration,
-    /// The session identity this client presents on route.open, so the
-    /// connection names itself in daemon logs ("capacity-poll").
-    session: String,
     runtime: tokio::runtime::Runtime,
-    live: tokio::sync::Mutex<Option<Live>>,
+    live: tokio::sync::Mutex<Option<SubcConsumer>>,
 }
 
 impl QtaClient {
-    pub fn new(connection_file_path: impl Into<PathBuf>) -> Result<Self, String> {
-        Self::build(
-            connection_file_path.into(),
-            "capacity-poll".into(),
-            REQUEST_TIMEOUT,
-        )
+    pub(crate) fn new(access: PeerAccess) -> Result<Self, String> {
+        Self::build(access, REQUEST_TIMEOUT)
     }
 
-    fn build(
-        connection_file_path: PathBuf,
-        session: String,
-        request_timeout: Duration,
-    ) -> Result<Self, String> {
+    fn build(access: PeerAccess, request_timeout: Duration) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
             .build()
             .map_err(|e| format!("qta client runtime: {e}"))?;
         Ok(Self {
-            connection_file_path,
+            access,
             request_timeout,
-            session,
             runtime,
             live: tokio::sync::Mutex::new(None),
         })
     }
 
     #[cfg(test)]
+    pub(crate) fn for_test(path: impl Into<PathBuf>) -> Result<Self, String> {
+        Self::new(PeerAccess::Fixture(path.into()))
+    }
+
+    #[cfg(test)]
     fn new_with_request_timeout(
-        connection_file_path: impl Into<PathBuf>,
+        path: impl Into<PathBuf>,
         request_timeout: Duration,
     ) -> Result<Self, String> {
-        Self::build(
-            connection_file_path.into(),
-            "capacity-poll".to_string(),
-            request_timeout,
-        )
-    }
-
-    async fn open(&self) -> Result<Live, String> {
-        let metadata = connection_file::read(&self.connection_file_path)
-            .map_err(|e| format!("connection file: {e:?}"))?;
-        let endpoint = metadata
-            .endpoints
-            .first()
-            .ok_or_else(|| "no endpoint in connection file".to_string())?;
-        let mut stream = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            crate::peer_exchange::connect_endpoint(&endpoint.host, endpoint.port),
-        )
-        .await
-        .map_err(|_| "connect timeout".to_string())?
-        .map_err(|e| format!("connect: {e}"))?;
-        authenticate_client(&mut stream, &metadata, CONNECT_TIMEOUT)
-            .await
-            .map_err(|e| format!("auth: {e:?}"))?;
-
-        let mut live = Live {
-            stream,
-            route_channel: 0,
-            route_epoch: 0,
-            next_corr: 1,
-        };
-        let body = serde_json::to_vec(&json!({
-            "op": "route.open",
-            "target": { "kind": "management_surface", "module_id": QTA_MODULE_ID },
-            "identity": {
-                "harness": "ck-astrocyte",
-                "session": self.session,
-            },
-        }))
-        .map_err(|e| e.to_string())?;
-        let response = self.roundtrip_on(&mut live, 0, 0, body).await?;
-        let value: Value = serde_json::from_slice(&response.body).map_err(|e| e.to_string())?;
-        if response.header.ty == FrameType::Error {
-            return Err(format!("route.open error: {value}"));
-        }
-        live.route_channel = value
-            .get("route_channel")
-            .and_then(Value::as_u64)
-            .and_then(|v| u16::try_from(v).ok())
-            .ok_or("route_channel missing")?;
-        live.route_epoch = value
-            .get("route_epoch")
-            .and_then(Value::as_u64)
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or("route_epoch missing")?;
-        Ok(live)
-    }
-
-    async fn roundtrip_on(
-        &self,
-        live: &mut Live,
-        channel: u16,
-        epoch: u32,
-        body: Vec<u8>,
-    ) -> Result<Frame, String> {
-        let corr = live.next_corr;
-        live.next_corr += 1;
-        crate::peer_exchange::exchange(
-            &mut live.stream,
-            channel,
-            epoch,
-            corr,
-            body,
-            crate::peer_exchange::ExchangeMode::Peer,
-        )
-        .await
+        Self::build(PeerAccess::Fixture(path.into()), request_timeout)
     }
 
     fn fetch_inner(&self) -> Result<CapacitySnapshot, PullError> {
@@ -184,93 +96,35 @@ impl QtaClient {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Vec<u8>, PullError> {
-        let mut cached = self.live.lock().await;
-        // A cancelled bus session must drop any partly consumed frame, not cache its socket.
-        let mut guard = cached.take();
-        // A retry and all setup/I/O spend the original call's budget;
-        // neither Pings nor unrelated replies grant another timeout.
         let deadline = tokio::time::Instant::now() + self.request_timeout;
-        let result = tokio::time::timeout_at(deadline, async {
-            // Up to two attempts, as for fusiform: a dead route
-            // surfaces as a daemon ERROR FRAME on a healthy connection. A
-            // module restart removes its channel, not its connection. Every
-            // transport error evicts the cached connection. A socket killed
-            // without FIN/RST reports no
-            // transport error, only a timeout. Leaving that socket cached
-            // would make every later call reuse the dead connection while
-            // health reads green. Retry only while the deadline permits it.
-            let mut last_err: Option<PullError> = None;
-            for _attempt in 0..2 {
-                if guard.is_none() {
-                    match self.open().await {
-                        Ok(live) => guard = Some(live),
-                        Err(e) => return Err(PullError::Unavailable(format!("qta connect: {e}"))),
-                    }
-                }
-                let live = guard.as_mut().expect("just ensured");
-                let body = match serde_json::to_vec(&json!({ "method": method, "params": params }))
-                {
-                    Ok(b) => b,
-                    Err(e) => return Err(PullError::Unavailable(format!("params encode: {e}"))),
-                };
-                let (channel, epoch) = (live.route_channel, live.route_epoch);
-                let response = match self.roundtrip_on(live, channel, epoch, body).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        guard = None;
-                        last_err = Some(PullError::Unavailable(format!("qta exchange: {e}")));
-                        continue;
-                    }
-                };
-                match self.classify(response, &mut guard) {
-                    Ok(reply) => return Ok(reply),
-                    Err(ClassifiedError::Retry(e)) => {
-                        last_err = Some(e); // route death evicts; reloading keeps the route
-                        continue;
-                    }
-                    Err(ClassifiedError::Final(e)) => return Err(e),
-                }
+        let mut cached = tokio::time::timeout_at(deadline, self.live.lock())
+            .await
+            .map_err(|_| PullError::Unavailable("qta exchange: response timeout".into()))?;
+        // A cancelled bus session drops the route rather than caching an unfinished request.
+        let mut guard = cached.take();
+        let body = serde_json::to_vec(&json!({ "method": method, "params": params }))
+            .map_err(|e| PullError::Unavailable(format!("params encode: {e}")))?;
+        let result = read_peer(
+            &self.access,
+            &mut guard,
+            RouteTarget::ManagementSurface {
+                module_id: QTA_MODULE_ID.into(),
+            },
+            "capacity-poll",
+            body,
+            deadline,
+        )
+        .await
+        .map_err(|error| match error {
+            ReadError::Unavailable(reason) => {
+                PullError::Unavailable(format!("qta exchange: {reason}"))
             }
-            Err(last_err.unwrap_or_else(|| PullError::Unavailable("exhausted attempts".into())))
-        })
-        .await;
-        let result = match result {
-            Ok(result) => result,
-            Err(_) => {
-                guard = None;
-                Err(PullError::Unavailable(
-                    "qta exchange: response timeout".into(),
-                ))
+            ReadError::Refused(error) => {
+                PullError::Unavailable(format!("{method} error: {}: {}", error.code, error.message))
             }
-        };
+        });
         *cached = guard;
         result
-    }
-
-    fn classify(
-        &self,
-        response: Frame,
-        guard: &mut Option<Live>,
-    ) -> Result<Vec<u8>, ClassifiedError> {
-        if response.header.ty == FrameType::Error {
-            let err: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
-            let code = err.get("code").and_then(Value::as_str).unwrap_or("");
-            if error_codes::is_established_route_dead(response.header.flags, code) {
-                *guard = None;
-                return Err(ClassifiedError::Retry(PullError::Unavailable(format!(
-                    "route dead ({code})"
-                ))));
-            }
-            if code == "module_reloading" {
-                return Err(ClassifiedError::Retry(PullError::Unavailable(format!(
-                    "usage.get error: {err}"
-                ))));
-            }
-            return Err(ClassifiedError::Final(PullError::Unavailable(format!(
-                "usage.get error: {err}"
-            ))));
-        }
-        Ok(response.body)
     }
 }
 
@@ -300,11 +154,6 @@ impl CapacitySource for QtaClient {
     fn poll(&self) -> Result<CapacitySnapshot, PullError> {
         self.fetch_inner()
     }
-}
-
-enum ClassifiedError {
-    Retry(PullError),
-    Final(PullError),
 }
 
 #[cfg(test)]
@@ -390,7 +239,9 @@ mod tests {
                                 {
                                     return Some(());
                                 }
-                                let Ok(Some(route_open)) = read_frame(&mut stream).await else {
+                                let Some(route_open) =
+                                    crate::test_support::read_peer_request(&mut stream).await
+                                else {
                                     return Some(());
                                 };
                                 received_types.lock().unwrap().push(route_open.header.ty);
@@ -419,7 +270,9 @@ mod tests {
                                 {
                                     return Some(());
                                 }
-                                if let Ok(Some(request)) = read_frame(&mut stream).await {
+                                if let Some(request) =
+                                    crate::test_support::read_peer_request(&mut stream).await
+                                {
                                     received_types.lock().unwrap().push(request.header.ty);
                                     server_connections.lock().unwrap()[index] = true;
                                     // Keep the stream open after receiving the request. The
@@ -590,7 +443,7 @@ mod tests {
         {
             return;
         }
-        let Ok(Some(route_open)) = read_frame(&mut stream).await else {
+        let Some(route_open) = crate::test_support::read_peer_request(&mut stream).await else {
             return;
         };
         let route_response = Frame::build(
@@ -611,7 +464,7 @@ mod tests {
         {
             return;
         }
-        while let Ok(Some(request)) = read_frame(&mut stream).await {
+        while let Some(request) = crate::test_support::read_peer_request(&mut stream).await {
             let method = serde_json::from_slice::<Value>(&request.body)
                 .map(|body| body["method"].clone())
                 .unwrap_or(Value::Null);
@@ -658,14 +511,13 @@ mod tests {
             &state,
             &AstrocyteConfig {
                 poll_interval_secs: 3,
-                qta_connection_file: Some(peer.connection_file_path.to_string_lossy().into_owned()),
-                fusiform_connection_file: None,
                 reasoning_billed_as_output: Vec::new(),
                 subscription_multiplier: crate::config::intentional_empty()
                     .config
                     .subscription_multiplier,
                 harness_ingest: crate::config::HarnessIngest::all_on(),
             },
+            Some(PeerAccess::Fixture(peer.connection_file_path.clone())),
         )
         .unwrap();
 
@@ -712,7 +564,7 @@ mod tests {
                 Ok(((), true))
             })
             .unwrap();
-        let client = QtaClient::new(&peer.connection_file_path).unwrap();
+        let client = QtaClient::for_test(&peer.connection_file_path).unwrap();
 
         run_iteration_with_capacity(&state, &[], Some(&client), &AtomicBool::new(false));
 
@@ -776,6 +628,24 @@ mod tests {
     /// A timed-out request must evict its connection, so the following fetch
     /// reconnects. Open the route outside the short response-wait budget so
     /// runner load cannot turn this into a route-opening timeout test.
+    fn open_fixture_route(client: &QtaClient) -> SubcConsumer {
+        use crate::test_support::HANG_GUARD;
+        client.runtime.block_on(async {
+            let consumer = client.access.connect(HANG_GUARD).await.unwrap();
+            crate::peer_exchange::open_route(
+                &consumer,
+                RouteTarget::ManagementSurface {
+                    module_id: QTA_MODULE_ID.into(),
+                },
+                "capacity-poll",
+                crate::peer_exchange::options(HANG_GUARD),
+            )
+            .await
+            .unwrap();
+            consumer
+        })
+    }
+
     #[test]
     fn qta_timeouts_evict_cached_connections_for_fetches() {
         let peer = SilentPeer::start(Duration::ZERO);
@@ -788,7 +658,7 @@ mod tests {
             {
                 let mut live = client.live.blocking_lock();
                 assert!(live.is_none(), "a timeout must evict the cached socket");
-                *live = Some(client.runtime.block_on(client.open()).unwrap());
+                *live = Some(open_fixture_route(&client));
             }
             assert!(client.fetch_inner().is_err());
             // The request's bytes can be buffered even if the peer thread is
@@ -809,8 +679,8 @@ mod tests {
     #[test]
     fn qta_cancelled_event_fetch_does_not_cache_a_partly_consumed_socket() {
         let peer = SilentPeer::start(Duration::ZERO);
-        let client = QtaClient::new(&peer.connection_file_path).unwrap();
-        *client.live.blocking_lock() = Some(client.runtime.block_on(client.open()).unwrap());
+        let client = QtaClient::for_test(&peer.connection_file_path).unwrap();
+        *client.live.blocking_lock() = Some(open_fixture_route(&client));
         client.runtime.block_on(async {
             let key = "a".repeat(64);
             let mut request = Box::pin(client.event_body(&key));
@@ -858,7 +728,7 @@ mod tests {
     fn assert_route_death_evicts_the_cached_route(death_code: &'static str) {
         use crate::route_death_peer::RouteDeathPeer;
         let peer = RouteDeathPeer::start(death_code, json!({"result": []}));
-        let client = QtaClient::new(&peer.connection_file_path).unwrap();
+        let client = QtaClient::for_test(&peer.connection_file_path).unwrap();
 
         let first = client.fetch_inner();
         let second = client.fetch_inner();
@@ -884,20 +754,21 @@ mod tests {
     }
 
     #[test]
-    fn qta_module_reloading_retries_on_the_live_route() {
+    fn qta_module_reloading_reopens_the_route_and_retries() {
         use crate::fusiform_client::tests::{DeadlinePeer, PeerReply};
         let peer = DeadlinePeer::start(vec![
             PeerReply::opened(Duration::ZERO),
             PeerReply::error("module_reloading", "provider restarting"),
+            PeerReply::opened(Duration::ZERO),
             PeerReply::Frame(Duration::ZERO, FrameType::Response, json!({"result":[]})),
         ]);
-        let client = QtaClient::new(&peer.path).unwrap();
+        let client = QtaClient::for_test(&peer.path).unwrap();
         assert!(client.poll().unwrap().windows.is_empty());
         let requests = peer.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert_eq!(
-            requests[1], requests[2],
-            "retry the same operation, not route.open"
+            requests[1], requests[3],
+            "retry the same operation after reopening"
         );
     }
 
@@ -907,12 +778,13 @@ mod tests {
         let peer = DeadlinePeer::start(vec![
             PeerReply::opened(Duration::ZERO),
             PeerReply::error("module_reloading", "first refusal"),
+            PeerReply::opened(Duration::ZERO),
             PeerReply::error("module_reloading", "last refusal"),
         ]);
-        let client = QtaClient::new(&peer.path).unwrap();
+        let client = QtaClient::for_test(&peer.path).unwrap();
         let error = client.poll().unwrap_err();
         assert!(format!("{error:?}").contains("last refusal"), "{error:?}");
-        assert_eq!(peer.requests.lock().unwrap().len(), 3);
+        assert_eq!(peer.requests.lock().unwrap().len(), 4);
     }
 
     #[test]

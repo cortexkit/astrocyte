@@ -66,7 +66,9 @@ struct Inner {
     /// its runtime row so the change is logged only once.
     source_discovery: Mutex<HashMap<String, bool>>,
     payer_waiting: Mutex<BTreeMap<String, usize>>,
-    quota_bus: crate::quota_events::Control,
+    quota_bus: Arc<crate::quota_events::Control>,
+    #[cfg(any(test, feature = "test-support"))]
+    catalog_fixture: std::sync::Mutex<Option<std::path::PathBuf>>,
     event_wakes: crate::event_wakes::Control,
     runs_feed: crate::runs_feed::Hub,
     vault_report: RwLock<serde_json::Value>,
@@ -335,7 +337,9 @@ impl SharedState {
             }),
             source_discovery: Mutex::new(HashMap::new()),
             payer_waiting: Mutex::new(BTreeMap::new()),
-            quota_bus: crate::quota_events::Control::default(),
+            quota_bus: Arc::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            catalog_fixture: std::sync::Mutex::default(),
             event_wakes: crate::event_wakes::Control::default(),
             runs_feed: crate::runs_feed::Hub::default(),
             vault_report: RwLock::new(
@@ -649,6 +653,26 @@ impl SharedState {
 
     pub(crate) fn quota_bus(&self) -> &crate::quota_events::Control {
         &self.0.quota_bus
+    }
+
+    pub(crate) fn peer_access(&self) -> Option<crate::peer_exchange::PeerAccess> {
+        self.0
+            .quota_bus
+            .has_staged_access()
+            .then(|| crate::peer_exchange::PeerAccess::Module(Arc::clone(&self.0.quota_bus)))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_test_catalog_path(&self, path: std::path::PathBuf) {
+        *self.0.catalog_fixture.lock().unwrap() = Some(path);
+    }
+
+    pub(crate) fn catalog_access(&self) -> Option<crate::peer_exchange::PeerAccess> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(path) = self.0.catalog_fixture.lock().unwrap().clone() {
+            return Some(crate::peer_exchange::PeerAccess::Fixture(path));
+        }
+        self.peer_access()
     }
 
     pub(crate) fn vault_report(&self) -> serde_json::Value {
@@ -1214,8 +1238,7 @@ fn hydrate_config(conn: &Connection) -> Result<(AstrocyteConfig, u64), String> {
         Vec<u8>,
     ) = conn
         .query_row(
-            "SELECT generation,poll_interval_secs,qta_connection_file,
-                    fusiform_connection_file,subscription_multiplier,harness_ingest,canonical_bytes
+            "SELECT generation,poll_interval_secs,subscription_multiplier,harness_ingest,canonical_bytes
              FROM desired_config WHERE id=1",
             [],
             |row| {
@@ -1223,15 +1246,13 @@ fn hydrate_config(conn: &Connection) -> Result<(AstrocyteConfig, u64), String> {
                     row.get(0)?,
                     AstrocyteConfig {
                         poll_interval_secs: row.get(1)?,
-                        qta_connection_file: row.get(2)?,
-                        fusiform_connection_file: row.get(3)?,
                         reasoning_billed_as_output: Vec::new(),
                         subscription_multiplier: config::MultiplierSetting::NotRecorded,
                         harness_ingest: config::HarnessIngest::all_on(),
                     },
+                    row.get(2)?,
+                    row.get(3)?,
                     row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
                 ))
             },
         )

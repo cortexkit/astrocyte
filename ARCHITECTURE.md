@@ -85,7 +85,7 @@ transaction as the good calls and the cursor, and coverage counts them.
 
 `start_refresher` runs one OS thread. A full tick, every `poll_interval_secs`:
 
-1. Connect a configured fusiform catalog and learn its history boundary from
+1. Connect to fusiform after registration and learn its history boundary from
    `catalog.status`. Until then, pricing waits and calls stay queued.
 2. Drain every source that `harness_ingest` allows. An excluded source is not read
    and loses its `source_runtime` row, like an absent one.
@@ -176,7 +176,7 @@ reply. EOF and GOODBYE exit 0. On Unix, SIGTERM stops cleanly and then re-raises
 
 ## Configuration
 
-The closed JSONC config has six required members, detailed in
+The closed JSONC config has four required members, detailed in
 [configuration](docs/configuration.md). Config and binary deploy together;
 unknown or missing members fail decoding. Accepted files become stored
 generations. An invalid first file refuses startup; later failures retain the

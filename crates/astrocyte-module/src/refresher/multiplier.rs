@@ -1126,8 +1126,6 @@ mod multiplier_stage_tests {
 
     const DESIRED: &str = r#"{
         "poll_interval_secs": 60,
-        "qta_connection_file": null,
-        "fusiform_connection_file": null,
         "reasoning_billed_as_output": ["openai"],
         "subscription_multiplier": {
             "api_twins": {},
