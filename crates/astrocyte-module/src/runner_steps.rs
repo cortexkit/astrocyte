@@ -20,7 +20,7 @@ use astrocyte_core::step_feed::RunnerStep;
 use cortexkit_bus_naming::{AccountNames, EVENT_CONSUMERS};
 use cortexkit_bus_nats::NatsConnection;
 use cortexkit_bus_trait::BusError;
-use cortexkit_role_llm_runner::step_events::{decode_step_finished, StepFinished};
+use cortexkit_role_llm_runner::step_events::{decode_step_finished, RefusedAttempt, StepFinished};
 use futures_util::StreamExt;
 
 use crate::state::SharedState;
@@ -73,12 +73,35 @@ pub(crate) fn feed_step(event: StepFinished) -> Option<RunnerStep> {
     // message creation time, for example). The file row that later replaces
     // this one then sorts at the same place in the feed.
     let occurred_at_ms = i64::try_from(event.started_at_ms).ok()?;
+    let refused_attempts = event
+        .fallback
+        .as_ref()
+        .and_then(|fallback| fallback.refused_attempts.as_deref())
+        .unwrap_or_default();
+    let answering = |total: Option<u64>, count: fn(&RefusedAttempt) -> Option<u64>| {
+        let total = total?;
+        // An omitted attempt counter makes the answering count unknown. Sum
+        // in u128 so even inconsistent u64 counters cannot overflow the sum.
+        let refused = refused_attempts.iter().try_fold(0_u128, |sum, attempt| {
+            Some(sum + u128::from(count(attempt)?))
+        })?;
+        // If the refused usage alone exceeds the reported step total, the
+        // producer's counters are inconsistent. Keep the original total.
+        Some(
+            u64::try_from(refused)
+                .ok()
+                .and_then(|refused| total.checked_sub(refused))
+                .unwrap_or(total),
+        )
+    };
+    let output = answering(event.output_tokens, |attempt| attempt.output_tokens);
+    let reasoning = answering(event.reasoning_tokens, |attempt| attempt.reasoning_tokens);
     // The ledger stores output without reasoning and the served row adds
     // reasoning back (`served_output`). An event that does not say reasoning
     // is outside output is read as including it, the feed's own convention;
     // a reasoning count above such an output cannot be a breakdown of it and
     // is left out rather than served as one.
-    let (output, reasoning) = match (event.output_tokens, event.reasoning_tokens) {
+    let (output, reasoning) = match (output, reasoning) {
         (Some(output), Some(reasoning)) if event.reasoning_included_in_output != Some(false) => {
             match output.checked_sub(reasoning) {
                 Some(rest) => (Some(rest), Some(reasoning)),
@@ -109,9 +132,13 @@ pub(crate) fn feed_step(event: StepFinished) -> Option<RunnerStep> {
             cursor: i64::MAX,
             step_ref,
             occurred_at_ms,
-            input: event.input_tokens,
-            cache_read: event.cached_input_tokens,
-            cache_write: event.cache_write_tokens,
+            input: answering(event.input_tokens, |attempt| attempt.input_tokens),
+            cache_read: answering(event.cached_input_tokens, |attempt| {
+                attempt.cached_input_tokens
+            }),
+            cache_write: answering(event.cache_write_tokens, |attempt| {
+                attempt.cache_write_tokens
+            }),
             output,
             reasoning,
             provider: Some(event.provider),
@@ -123,8 +150,12 @@ pub(crate) fn feed_step(event: StepFinished) -> Option<RunnerStep> {
                 .and_then(|limit| i64::try_from(limit).ok()),
             request_body_len: event.request_body_bytes,
         },
-        cache_write_5m: event.cache_write_5m_tokens,
-        cache_write_1h: event.cache_write_1h_tokens,
+        cache_write_5m: answering(event.cache_write_5m_tokens, |attempt| {
+            attempt.cache_write_5m_tokens
+        }),
+        cache_write_1h: answering(event.cache_write_1h_tokens, |attempt| {
+            attempt.cache_write_1h_tokens
+        }),
         // Served only as the runner sent it: a step id is not a message id.
         message_id: event.message_id,
     })
@@ -234,6 +265,108 @@ mod tests {
     use serde_json::{json, Value};
 
     const RUNNERS: [&str; 3] = ["broca", "thalamus-harness", "thalamus"];
+
+    #[test]
+    fn refusal_fallback_row_uses_answering_attempt_counters() {
+        let (subject, body) = event("refusal_fallback", "broca", |body| {
+            // Keep only the attempt with complete counters in this case.
+            body["fallback"]["refused_attempts"]
+                .as_array_mut()
+                .unwrap()
+                .truncate(1);
+        });
+        let fallback = decode_step_finished(&subject, &body).expect("decode refusal fallback step");
+        let state = test_state();
+        admit_event(
+            &state,
+            &event("minimal", "broca", |previous| {
+                previous["started_at_ms"] = json!(fallback.started_at_ms - 1_000);
+                previous["finished_at_ms"] = json!(fallback.started_at_ms);
+                // A baseline of 50 would be stable against the combined
+                // counters, but the answer alone retains only 45 tokens.
+                previous["cached_input_tokens"] = json!(49);
+                previous["cache_write_tokens"] = json!(1);
+            }),
+        );
+        admit(&state, &subject, &body);
+        let served = rows(&state, json!({}));
+        assert_eq!(served.len(), 2);
+        let row = &served[1];
+        assert_eq!(row["source"], "runner");
+        assert_eq!(row["model"], "model_b");
+        assert_eq!(row["input"], 88);
+        assert_eq!(row["cache_read"], 45);
+        assert_eq!(row["cache_write"], 27);
+        assert_eq!(row["cache_write_5m"], 9);
+        assert_eq!(row["cache_write_1h"], 18);
+        assert_eq!(row["output"], 18);
+        assert_eq!(row["reasoning"], 7);
+        assert_eq!(row["prompt"], 160);
+        assert_eq!(row["verdict"], "warning");
+        assert_eq!(row["cause"], "account_or_model_changed");
+    }
+
+    #[test]
+    fn refusal_fallback_row_omits_unknown_counters() {
+        let state = test_state();
+        admit_event(
+            &state,
+            &event("refusal_fallback", "broca", |body| {
+                let second = &mut body["fallback"]["refused_attempts"][1];
+                second["cached_input_tokens"] = json!(10);
+                second["cache_write_1h_tokens"] = json!(0);
+                second["output_tokens"] = json!(1);
+                body.as_object_mut()
+                    .unwrap()
+                    .remove("cache_write_1h_tokens");
+            }),
+        );
+        let served = rows(&state, json!({}));
+        let row = &served[0];
+        for unknown in ["input", "cache_write", "cache_write_1h", "reasoning"] {
+            assert_eq!(row.get(unknown), None, "{unknown}");
+        }
+        assert_eq!(row["cache_read"], 35);
+        assert_eq!(row["output"], 17);
+    }
+
+    #[test]
+    fn refusal_fallback_row_keeps_inconsistent_step_totals() {
+        let state = test_state();
+        admit_event(
+            &state,
+            &event("refusal_fallback", "broca", |body| {
+                let second = &mut body["fallback"]["refused_attempts"][1];
+                second["input_tokens"] = json!(89);
+                second["cached_input_tokens"] = json!(u64::MAX);
+            }),
+        );
+        let served = rows(&state, json!({}));
+        assert_eq!(served[0]["input"], 100);
+        assert_eq!(served[0]["cache_read"], 50);
+    }
+
+    #[test]
+    fn refusal_fallback_round_row_keeps_step_counters() {
+        let state = test_state();
+        admit_event(
+            &state,
+            &event("refusal_fallback", "broca", |body| {
+                let fallback = body["fallback"].as_object_mut().unwrap();
+                fallback.insert("cause".into(), json!("round"));
+                fallback.remove("refused_attempts");
+            }),
+        );
+        let served = rows(&state, json!({}));
+        let row = &served[0];
+        assert_eq!(row["input"], 100);
+        assert_eq!(row["cache_read"], 50);
+        assert_eq!(row["cache_write"], 30);
+        assert_eq!(row["cache_write_5m"], 10);
+        assert_eq!(row["cache_write_1h"], 20);
+        assert_eq!(row["output"], 20);
+        assert_eq!(row["reasoning"], 7);
+    }
 
     #[test]
     fn rewrite_facts_0855_decode_with_every_new_member_and_without_them() {

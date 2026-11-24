@@ -70,7 +70,7 @@ dependencies = [
  "async-nats",
  "base64",
  "chrono",
- "cortexkit-bus-naming",
+ "cortexkit-bus-naming 0.4.4",
  "cortexkit-bus-nats",
  "cortexkit-bus-trait",
  "cortexkit-claustrum-client",
@@ -289,6 +289,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80ef546ce7b3c9796810c1ffe36a7daf23d82a4af8772f7336704c248beddcfe"
 
 [[package]]
+name = "cortexkit-bus-naming"
+version = "0.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f9ffd4a70e8607c853b2a1f24c3ef06a877ca49932d0beda3c9cbb4934ca67"
+
+[[package]]
 name = "cortexkit-bus-nats"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -297,7 +303,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "bytes",
- "cortexkit-bus-naming",
+ "cortexkit-bus-naming 0.4.4",
  "cortexkit-bus-trait",
  "futures-util",
  "tokio",
@@ -377,9 +383,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.8.55"
+version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b612fcca16f27e92a8ce0b3de58a1af7eaf5a3ee97b3d3c438c579f84cd4ac41"
+checksum = "d433207ff9e497db318616adf5b854a068f78b04fea66cd5133db2af5f1e08c0"
 dependencies = [
  "cortexkit-rich-ui-syntax",
  "cortexkit-role-tool-provider",
@@ -403,9 +409,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-display"
-version = "0.1.6"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73ba4cec0564b072acf1b853e66ddee383decf3dce87b713041da8364956afaa"
+checksum = "b747316be66c224ba1ff89d35edd6747de28a8d53dc56ac469e575d84d239a40"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -416,10 +422,11 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.15.8"
+version = "0.15.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6001f2f9e5643b5d64a2a03059031608b3b5926419089c95c746ed4eae3f1e2"
+checksum = "885e17314cc76d5f317abfff451176f487e712ed6a1029bca6c3924c0f56c60d"
 dependencies = [
+ "cortexkit-bus-naming 0.5.9",
  "cortexkit-role-tool-display",
  "serde",
  "serde_jcs",

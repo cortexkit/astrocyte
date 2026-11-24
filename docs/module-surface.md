@@ -868,10 +868,10 @@ is served as `opencode`), and `step_ref` is `harness_step_ref`, so
 astrocyte's later read of the harness store replaces the row. An unmapped
 host is counted and dropped. Without `harness_step_ref`,
 `harness` is the event's `runner` and `step_ref` is the event's `attempt_id`, a
-random id per provider attempt. There is one row per provider request actually
-sent, retries included, matching astrocyte's read of that runner's durable step
-log. A step with no durable record stays a live-only row with
-`source: "runner"`.
+random id per provider attempt. Retries reported as separate steps have their
+own rows, matching astrocyte's read of that runner's durable step log. Refused
+attempts listed in a step's `fallback` do not create separate runner rows. A
+step with no durable record stays a live-only row with `source: "runner"`.
 
 - `source` is `file` for a step astrocyte read from a harness store or a
   runner's durable log, and `runner` for a step known so far only from a
@@ -925,9 +925,9 @@ log. A step with no durable record stays a live-only row with
 
 Synthetic samples for `usage.cache.steps` and `usage.steps.read` are pinned in
 `crates/astrocyte-module/test-vectors/usage-cache-causes-v1/` with SHA256SUMS.
-They cover every cause and a row without one. The strict step-event decoder
-accepts llm-runner 0.8.55 events both with and without the new optional facts;
-older pinned runner events remain valid.
+They cover every cause and a row without one. The strict llm-runner 0.9.6
+step-event decoder accepts the optional `fallback` record; older pinned runner
+events remain valid.
 - `message_id` is a content-free message identifier: on a file row the host's
   own, on a runner row the one the runner serves for that message. It is
   present only when the host or runner has one and is never invented. Consumers join on `harness` plus
@@ -991,12 +991,17 @@ detail `{"through": "<newest cursor>"}`: reload per-session history with
   from an event reaches the spend ledger.
 - A runner row's `prompt`, `retention`, `verdict`, `prompt_dropped` and
   `request_size` are computed by the same rules as a file row's, over the
-  session's recorded steps and its other runner rows. A runner's first positive
+  session's recorded steps and its other runner rows. When an event reports a
+  refusal fallback, the row keeps the answering model and subtracts refused
+  attempts from each token counter before computing prompt and cache diagnostics.
+  A counter is omitted if the step or any refused attempt omits it. If the sum
+  of refused attempts exceeds the step's counter, the row keeps the reported
+  step value for that counter. A fallback without refused attempts
+  (`cause: "round"`) leaves the counters unchanged. A runner's first positive
   cache read in a session can append corrected verdicts for earlier retained
-  runner rows. `run_id`, and
-  `cache_write_5m` and `cache_write_1h` when the event split them, are sent
-  only on runner rows. `output` includes `reasoning` unless the event says
-  reasoning is outside it.
+  runner rows.
+  `run_id`, `cache_write_5m` and `cache_write_1h` are sent only on runner rows.
+  `output` includes `reasoning` unless the event says reasoning is outside it.
 - When the feed's newest row for the identity is a file row, astrocyte drops
   the runner event, because the durable read is the step's record. When it is
   the same runner row, the event is a duplicate and is also dropped. A later
