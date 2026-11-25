@@ -94,6 +94,37 @@ pub struct CatalogSnapshot {
     pub alias_target: Option<CatalogModel>,
 }
 
+impl CatalogSnapshot {
+    pub(crate) fn reasoning_billed_as_output(&self) -> bool {
+        let fact_key = "rate.reasoning";
+        !self.withheld_facts.contains_key(fact_key)
+            && !self.uncertain_facts.contains_key(fact_key)
+            && self.facts.get(fact_key).is_some_and(|entry| {
+                matches!(serde_json::from_value::<RateValue>(entry.clone()),
+                    Ok(RateValue::BilledAs { key }) if bills_reasoning_as_output(fact_key, &key))
+            })
+    }
+}
+
+pub(crate) fn bills_reasoning_as_output(fact_key: &str, target_key: &str) -> bool {
+    fact_key == "rate.reasoning" && target_key == "rate.output"
+}
+
+pub(crate) fn reasoning_uses_output(
+    served_rule: bool,
+    has_reasoning_variant: bool,
+    provider: Option<&str>,
+    legacy_providers: &[String],
+) -> bool {
+    // A catalog declaration fills gaps in the catalog's own reasoning rates.
+    // In its absence the legacy setting still overrides the reasoning price.
+    if served_rule {
+        !has_reasoning_variant
+    } else {
+        provider.is_some_and(|provider| legacy_providers.iter().any(|item| item == provider))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogModel {
     pub provider_id: String,
@@ -465,6 +496,7 @@ fn alias_target_from_rates(facts: &BTreeMap<String, Value>) -> Option<CatalogMod
             RateValue::Priced { inherited_from, .. }
             | RateValue::StatedZero { inherited_from }
             | RateValue::Unpriced { inherited_from, .. } => inherited_from?,
+            // A billing rule relates rate keys, not model identities.
             RateValue::BilledAs { .. } => return None,
         };
         if origin.basis != "alias" {

@@ -1,0 +1,32 @@
+{
+  "source": "models.dev",
+  "resolved_at_ms": 1795640287924,
+  "catalog_version": 1795629090351,
+  "models": {
+    "opencode-go/kimi-k3.1-pro": {
+      "model.canonical_id": "moonshotai/kimi-k3.1-pro",
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "inherited_from": {
+          "basis": "quota_proxy",
+          "family": "kimi-pro",
+          "provider_id": "opencode-go"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10000000000
+      }
+    }
+  },
+  "plane": {
+    "provider_id": "opencode-go",
+    "auth_method": "apikey",
+    "kind": "quota_proxy",
+    "source_ref": "https://opencode.ai/v2/docs/console/go/",
+    "review_by_ms": 1797811200000
+  }
+}

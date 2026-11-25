@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog_client::{cache_write_ttl, stated_mode_condition, token_rate_key, RATE_ROLES};
+use crate::catalog_client::{
+    cache_write_ttl, reasoning_uses_output, stated_mode_condition, token_rate_key, RATE_ROLES,
+};
 use crate::money::MoneyError;
 use crate::multiplier::{
     ModelResolution, MultiplierConfig, MultiplierError, RateState, RoleTokens,
@@ -412,19 +414,7 @@ pub fn value_event(
             .ok_or(MoneyError::OutOfRange)?;
     }
     let mode_rates = stated_mode.map(|mode| model_rates.modes.get(mode));
-    let reasoning_as_output = rules
-        .reasoning_billed_as_output
-        .iter()
-        .any(|provider| provider == api_provider);
-    for ((role, ttl), quantity) in quantities {
-        if quantity == 0 {
-            continue;
-        }
-        let rate_role = if role == "reasoning" && reasoning_as_output {
-            "output"
-        } else {
-            role
-        };
+    let select_rate = |rate_role: &str, ttl: Option<&str>| {
         let tier = if per_request {
             prompt.and_then(|prompt| model_rates.context_tier_for_role(rate_role, prompt))
         } else {
@@ -443,31 +433,54 @@ pub fn value_event(
         let exact = model_rates
             .conditional
             .get(&token_rate_key(rate_role, &selectors));
-        let state = if ttl.is_some() {
+        if ttl.is_some() {
             // A lifetime is a measurement dimension, never a hint to use the
             // vendor's default write price or a less-specific condition set.
-            exact
+            Ok(exact)
         } else {
             match mode_rates {
                 // Without a complete mode/tier rate, neither condition's
                 // price alone describes the recorded request.
-                Some(_) if tier.is_some() && exact.is_none() => {
-                    count_quantity("mode_rate_above_tier", role, ttl, quantity)?;
-                    continue;
-                }
+                Some(_) if tier.is_some() && exact.is_none() => Err("mode_rate_above_tier"),
                 // A stated mode is priced at its own rate or not at all.
-                Some(_) if tier.is_some() => exact,
-                Some(rates) => rates.and_then(|rates| rates.get(rate_role)),
+                Some(_) if tier.is_some() => Ok(exact),
+                Some(rates) => Ok(rates.and_then(|rates| rates.get(rate_role))),
                 // A role without a crossed tier uses its base rate. Conditional
                 // tiers alone do not supply an unconditional tier price.
-                None => tier
+                None => Ok(tier
                     .and_then(|threshold| model_rates.tiers.get(&threshold))
                     .and_then(|tier_rates| tier_rates.get(rate_role))
-                    .or_else(|| model_rates.base.get(rate_role)),
+                    .or_else(|| model_rates.base.get(rate_role))),
             }
+        }
+    };
+    let served_rule = matches!(
+        model_rates.base.get("reasoning"),
+        Some(RateState::BilledAs { .. })
+    );
+    for ((role, ttl), quantity) in quantities {
+        if quantity == 0 {
+            continue;
+        }
+        let state = if role == "reasoning" {
+            let reasoning = served_rule.then(|| select_rate(role, ttl));
+            // Only a complete selector match is a more specific verdict.
+            let has_variant = matches!(reasoning, Some(Ok(Some(state))) if !matches!(state, RateState::BilledAs { .. }));
+            if reasoning_uses_output(
+                served_rule,
+                has_variant,
+                Some(api_provider),
+                rules.reasoning_billed_as_output,
+            ) {
+                select_rate("output", ttl)
+            } else {
+                reasoning.unwrap_or_else(|| select_rate(role, ttl))
+            }
+        } else {
+            select_rate(role, ttl)
         };
         match state {
-            Some(RateState::Priced { units_per_million }) => {
+            Ok(Some(RateState::Priced { units_per_million })) => {
                 let product = i128::from(*units_per_million)
                     .checked_mul(i128::from(quantity))
                     .ok_or(MoneyError::OutOfRange)?;
@@ -476,8 +489,13 @@ pub fn value_event(
                     .checked_add(product)
                     .ok_or(MoneyError::OutOfRange)?;
             }
-            Some(RateState::Unpriced { reason }) => count_quantity(reason, role, ttl, quantity)?,
-            None => count_quantity("no_rate", role, ttl, quantity)?,
+            Ok(Some(RateState::Unpriced { reason })) => {
+                count_quantity(reason, role, ttl, quantity)?
+            }
+            Err(reason) => count_quantity(reason, role, ttl, quantity)?,
+            Ok(Some(RateState::BilledAs { .. }) | None) => {
+                count_quantity("no_rate", role, ttl, quantity)?
+            }
         }
     }
     Ok(value)

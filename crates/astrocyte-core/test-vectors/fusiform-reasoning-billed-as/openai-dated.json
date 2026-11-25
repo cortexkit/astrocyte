@@ -1,0 +1,82 @@
+{
+  "source": "models.dev",
+  "resolved_at_ms": 1795629090352,
+  "catalog_version": 1795629090351,
+  "models": {
+    "openai/gpt-6.1-sol": {
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10000000000
+      },
+      "rate.output.above_context.272000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 15000000000
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20000000000
+      },
+      "rate.output.mode.flex": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 5000000000
+      },
+      "rate.output.mode.ultrafast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 60000000000
+      },
+      "rate.reasoning": {
+        "key": "rate.output",
+        "state": "billed_as"
+      }
+    }
+  },
+  "fact_overrides": [
+    {
+      "model": "openai/gpt-6.1-sol",
+      "provider_id": "openai",
+      "model_id": "*",
+      "fact_key": "rate.reasoning",
+      "value": {
+        "key": "rate.output",
+        "state": "billed_as"
+      },
+      "replaces": null,
+      "reason": "OpenAI bills generated reasoning tokens at the output price.",
+      "source_ref": "https://developers.openai.com/api/docs/guides/reasoning (accessed 2026-11-25)",
+      "quote": "While reasoning tokens are not visible via the API, they still occupy space in the model's context window and are billed as output tokens.",
+      "established_by": "fusiform",
+      "established_at_ms": 1795564800000,
+      "review_by_ms": 1800748800000
+    }
+  ]
+}

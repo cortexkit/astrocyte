@@ -17,8 +17,8 @@ use serde_json::{json, Value};
 
 use crate::canon::CanonError;
 use crate::catalog_client::{
-    cache_write_ttl, parse_rate_key, stated_mode_condition, tier_thresholds, CatalogClient,
-    CatalogClientError, CatalogLookup, CatalogSnapshot, RATE_ROLES, RATE_UNITS,
+    cache_write_ttl, parse_rate_key, reasoning_uses_output, stated_mode_condition, tier_thresholds,
+    CatalogClient, CatalogClientError, CatalogLookup, CatalogSnapshot, RATE_ROLES, RATE_UNITS,
 };
 use crate::fact::ChargeBasis;
 use crate::ingest::INCLUSIVE_OUTPUT_SOURCE;
@@ -1162,14 +1162,18 @@ fn resolve_catalog_snapshot(
         }
     }
 
-    // This is an explicit billing declaration, not a fallback for a missing
-    // reasoning rate. Keep the measurement's role while recording the rate key used.
-    let reasoning_as_output = plan
-        .provider
-        .as_ref()
-        .is_some_and(|provider| reasoning_billed_as_output.contains(provider));
+    // Keep the measurement's role while recording the rate key actually used.
+    let served_rule = snapshot.reasoning_billed_as_output();
     let mut measurements = Vec::with_capacity(plan.targets.len());
     for measurement in &plan.targets {
+        let token_rule = served_rule && measurement.unit == "token";
+        let reasoning_as_output = measurement.role == "reasoning"
+            && reasoning_uses_output(
+                token_rule,
+                token_rule && has_reasoning_variant(snapshot, measurement, plan.mode.as_deref()),
+                plan.provider.as_deref(),
+                reasoning_billed_as_output,
+            );
         let decision = match priced_quantity(plan, measurement) {
             None => ChargeDecision::Unpriced {
                 reason: UnpricedReason::MissingQuantity,
@@ -1180,7 +1184,7 @@ fn resolve_catalog_snapshot(
             Some((quantity_units, quantity_exponent)) => resolve_measurement(
                 snapshot,
                 measurement,
-                if measurement.role == "reasoning" && reasoning_as_output {
+                if reasoning_as_output {
                     "output"
                 } else {
                     &measurement.role
@@ -1199,6 +1203,29 @@ fn resolve_catalog_snapshot(
     }
     resolved_currency(plan.currency.as_deref(), &measurements)?;
     Ok(ResolvedReprice::for_plan(plan, measurements))
+}
+
+fn has_reasoning_variant(
+    snapshot: &CatalogSnapshot,
+    measurement: &MeasurementPlan,
+    mode: Option<&str>,
+) -> bool {
+    let Some(key) = measurement_rate_key(snapshot, measurement, "reasoning", mode) else {
+        // An ambiguous selection is a refusal, not an absent price.
+        return true;
+    };
+    key != "rate.reasoning"
+        && (snapshot.withheld_facts.contains_key(&key)
+            || snapshot.uncertain_facts.contains_key(&key)
+            || snapshot.facts.get(&key).is_some_and(|entry| {
+                !matches!(
+                    serde_json::from_value::<RateValue>(entry.clone()),
+                    Ok(RateValue::Unpriced {
+                        reason: ProtocolUnpricedReason::MissingRate,
+                        ..
+                    })
+                )
+            }))
 }
 
 pub(crate) fn unit_list_nanos(
@@ -1353,8 +1380,8 @@ fn resolve_measurement(
         }
     }
     match rate {
-        // Astrocyte reads the ordinary catalog, not a billing plane. Keep
-        // refusing plane-only values rather than interpreting them as charges.
+        // The supported reasoning rule is resolved before selecting the rate.
+        // No other billed-as entry can be interpreted as a charge.
         RateValue::BilledAs { .. } => Err(CatalogClientError::InvalidRate {
             reason: "billing-plane rate is unsupported on an ordinary catalog read".into(),
             entry: entry.clone(),
@@ -1904,6 +1931,7 @@ fn stored_integrity_error(column: usize, kind: Type, detail: String) -> rusqlite
 mod tests {
     include!("pricing_unit_billing_tests.rs");
     include!("media_pricing_tests.rs");
+    include!("pricing_reasoning_billed_as_tests.rs");
 
     #[test]
     fn corrupt_head_outcome_names_the_stored_value() {

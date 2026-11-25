@@ -34,12 +34,12 @@ use rusqlite::{
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
+use crate::catalog_client::{
+    bills_reasoning_as_output, parse_rate_key, token_rate_key, CatalogCallError, CatalogClient,
+    CatalogClientError, CatalogLookup, CatalogModel, CatalogSnapshot, RATE_FACT_PREFIX,
+};
 #[cfg(test)]
 use crate::catalog_client::{cache_write_ttl, stated_mode_condition, RATE_ROLES};
-use crate::catalog_client::{
-    parse_rate_key, token_rate_key, CatalogCallError, CatalogClient, CatalogClientError,
-    CatalogLookup, CatalogModel, CatalogSnapshot, RATE_FACT_PREFIX,
-};
 use crate::fact::ChargeBasis;
 use crate::money::{round_nano_num, round_nano_ratio, MoneyError};
 use crate::pricing::PromptSize;
@@ -932,6 +932,17 @@ pub enum RateState {
     Unpriced {
         reason: String,
     },
+    /// Only the base reasoning fact can refer to another rate.
+    BilledAs {
+        key: BillingRateKey,
+    },
+}
+
+/// The only rate target supported for cross-role token billing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BillingRateKey {
+    #[serde(rename = "rate.output")]
+    Output,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1195,17 +1206,21 @@ pub(crate) fn lookup_without_prices(lookup: &Result<CatalogLookup, CatalogClient
         .filter(|(key, _)| key.starts_with(RATE_FACT_PREFIX))
         .peekable();
     rates.peek().is_some()
-        && rates.all(|(_, value)| {
-            matches!(
-                serde_json::from_value::<RateValue>(value.clone()),
+        && rates.all(|(fact_key, value)| {
+            match serde_json::from_value::<RateValue>(value.clone()) {
+                // A billing rule is not a price and does not preclude finding
+                // the dated public API card for this quota proxy.
+                Ok(RateValue::BilledAs { key }) => bills_reasoning_as_output(fact_key, &key),
                 Ok(RateValue::StatedZero { .. })
-                    | Ok(RateValue::Unpriced {
-                        reason: ProtocolUnpricedReason::MissingRate
-                            | ProtocolUnpricedReason::NoCatalogCoverage
-                            | ProtocolUnpricedReason::UnknownChargeBasis,
-                        ..
-                    })
-            )
+                | Ok(RateValue::Unpriced {
+                    reason:
+                        ProtocolUnpricedReason::MissingRate
+                        | ProtocolUnpricedReason::NoCatalogCoverage
+                        | ProtocolUnpricedReason::UnknownChargeBasis,
+                    ..
+                }) => true,
+                _ => false,
+            }
         })
 }
 
@@ -1221,6 +1236,8 @@ pub(crate) fn quota_proxy_target(snapshot: &CatalogSnapshot) -> Option<CatalogMo
             RateValue::Priced { inherited_from, .. }
             | RateValue::StatedZero { inherited_from }
             | RateValue::Unpriced { inherited_from, .. } => inherited_from?,
+            // The public API reference comes from an inherited rate, not a
+            // rule for choosing between the model's own rate keys.
             RateValue::BilledAs { .. } => return None,
         };
         (origin.basis == "quota_proxy").then_some(CatalogModel {
@@ -1262,6 +1279,7 @@ pub(crate) fn rates_from_snapshot(snapshot: &CatalogSnapshot) -> ModelResolution
             reason: "no_catalog_coverage".into(),
         };
     }
+    let served_rule = snapshot.reasoning_billed_as_output();
     let mut rates = ModelRates::default();
     for key in keys {
         let Ok(parsed) = parse_rate_key(key) else {
@@ -1285,6 +1303,15 @@ pub(crate) fn rates_from_snapshot(snapshot: &CatalogSnapshot) -> ModelResolution
         }
         let role = parsed.role.to_string();
         let selectors = &parsed.selectors;
+        // An explicit missing rate does not establish a reasoning variant.
+        // Keep other verdicts, including ambiguous condition sets below.
+        if served_rule
+            && role == "reasoning"
+            && !selectors.is_empty()
+            && matches!(&state, RateState::Unpriced { reason } if reason == "no_rate")
+        {
+            continue;
+        }
         // Unknown selectors have no measurement producer and never apply.
         if !parsed.has_only_known_token_selectors() {
             continue;
@@ -1359,8 +1386,11 @@ fn rate_state(snapshot: &CatalogSnapshot, key: &str) -> RateState {
     match serde_json::from_value::<RateValue>(entry.clone()) {
         Err(_) => unpriced(RATE_UNDECODABLE),
         Ok(RateValue::Priced { per: Some(_), .. }) => unpriced(RATE_UNDECODABLE),
-        // Billing-plane claims are not API reference rates. This consumer
-        // makes ordinary catalog reads and does not resolve plane rules.
+        Ok(RateValue::BilledAs { key: target }) if bills_reasoning_as_output(key, &target) => {
+            RateState::BilledAs {
+                key: BillingRateKey::Output,
+            }
+        }
         Ok(RateValue::BilledAs { .. }) => unpriced(RATE_UNDECODABLE),
         Ok(RateValue::Priced {
             inherited_from: Some(_),

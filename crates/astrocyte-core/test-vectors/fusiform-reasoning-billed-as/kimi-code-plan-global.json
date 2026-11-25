@@ -1,0 +1,83 @@
+{
+  "source": "models.dev",
+  "resolved_at_ms": 1795640287923,
+  "catalog_version": 1795629090351,
+  "models": {
+    "kimi-code-plan-global/k3.1-pro": {
+      "model.canonical_id": "moonshotai/kimi-k3.1-pro",
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "inherited_from": {
+          "basis": "quota_proxy",
+          "family": "kimi-pro",
+          "model_id": "kimi-k3.1-pro",
+          "provider_id": "moonshotai"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10000000000
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "inherited_from": {
+          "basis": "quota_proxy",
+          "family": "kimi-pro",
+          "model_id": "kimi-k3.1-pro-highspeed",
+          "provider_id": "moonshotai"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20000000000
+      },
+      "rate.reasoning": {
+        "key": "rate.output",
+        "state": "billed_as"
+      }
+    }
+  },
+  "speed_twins": [
+    {
+      "model": "kimi-code-plan-global/k3.1-pro",
+      "twin": "kimi-code-plan-global/k3.1-pro-highspeed",
+      "mode": "fast",
+      "label": "Highspeed",
+      "source_ref": "https://platform.moonshot.ai/docs/guide/kimi-k3-1-pro-quickstart ; https://www.kimi.com/code/docs/en/kimi-code/models.html ; https://www.kimi.com/code/docs/en/kimi-code/membership.html ; https://www.kimi.ai/resources/kimi-k3-1-pro-pricing",
+      "review_by_ms": 1799884800000
+    }
+  ],
+  "fact_overrides": [
+    {
+      "model": "kimi-code-plan-global/k3.1-pro",
+      "provider_id": "moonshotai",
+      "model_id": "*",
+      "fact_key": "rate.reasoning",
+      "value": {
+        "key": "rate.output",
+        "state": "billed_as"
+      },
+      "replaces": null,
+      "reason": "Kimi's API includes reasoning tokens in its output token count and bills output by usage.",
+      "source_ref": "https://platform.kimi.com/docs/api/messages.md; https://platform.kimi.com/docs/pricing/chat.md (accessed 2026-11-25)",
+      "quote": "Messages API: \"输出 Token 数（含推理 Token）\". Model pricing: \"模型推理接口对 Input 和 Output 均实行按量计费。\"",
+      "notes": "The quoted text says ‘Output token count (including reasoning tokens)’ and ‘The model inference API bills both Input and Output by usage.’",
+      "established_by": "fusiform",
+      "established_at_ms": 1795564800000,
+      "review_by_ms": 1800748800000
+    }
+  ],
+  "plane": {
+    "provider_id": "kimi-code-plan-global",
+    "auth_method": "apikey",
+    "kind": "quota_proxy",
+    "source_ref": "https://www.kimi.com/code/docs/en/kimi-code/membership.html",
+    "review_by_ms": 1797552000000
+  }
+}

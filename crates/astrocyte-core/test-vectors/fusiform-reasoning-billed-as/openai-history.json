@@ -1,0 +1,23 @@
+{
+  "source": "models.dev",
+  "provider_id": "openai",
+  "model_id": "gpt-6.1-sol",
+  "fact_key": "rate.reasoning",
+  "served": [
+    {
+      "from_ms": 1795629090351,
+      "until_ms": null,
+      "state": "value",
+      "value": {
+        "key": "rate.output",
+        "state": "billed_as"
+      },
+      "source": "override",
+      "override": {
+        "source_ref": "https://developers.openai.com/api/docs/guides/reasoning (accessed 2026-11-25)",
+        "replaces": null
+      }
+    }
+  ],
+  "eras": []
+}

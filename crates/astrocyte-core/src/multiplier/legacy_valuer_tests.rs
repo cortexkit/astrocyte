@@ -298,7 +298,7 @@ fn legacy_value_event(
                     .ok_or(MoneyError::OutOfRange)?;
             }
             Some(RateState::Unpriced { reason }) => count_unpriced(reason, role, quantity)?,
-            None => count_unpriced("no_rate", role, quantity)?,
+            Some(RateState::BilledAs { .. }) | None => count_unpriced("no_rate", role, quantity)?,
         }
     }
     Ok(())

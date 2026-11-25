@@ -554,8 +554,10 @@ row is `no_rate`, never a fallback to another lifetime or plain `rate.cache_writ
 A plain `token` write still uses the plain rate (or its stated mode). Unknown
 token selectors parse but never apply.
 Without a stored mode, multiplier rows count `mode_unrecorded_tokens` and
-`base_rate_tier_untested_tokens`. Both pricing paths honor
-`reasoning_billed_as_output`; unlisted reasoning needs its own rate. Ledger
+`base_rate_tier_untested_tokens`. A served `rate.reasoning` billed as `rate.output`
+uses the selected output rate, including mode and context tiers where supported,
+unless an applicable reasoning variant states its own verdict. Without that rule,
+reasoning needs its own rate unless the provider is in `reasoning_billed_as_output`. Ledger
 coverage and whole-event `rate_tiered` refusals precede selection.
 
 Unit rates use `rate.<role>.per_<unit>` followed by zero or more selector/value

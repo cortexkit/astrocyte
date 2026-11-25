@@ -1,0 +1,52 @@
+{
+  "source": "models.dev",
+  "resolved_at_ms": 1795640287921,
+  "catalog_version": 1795629090351,
+  "models": {
+    "anthropic/claude-opus-5-5": {
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20000000000
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 40000000000
+      },
+      "rate.reasoning": {
+        "key": "rate.output",
+        "state": "billed_as"
+      }
+    }
+  },
+  "fact_overrides": [
+    {
+      "model": "anthropic/claude-opus-5-5",
+      "provider_id": "anthropic",
+      "model_id": "*",
+      "fact_key": "rate.reasoning",
+      "value": {
+        "key": "rate.output",
+        "state": "billed_as"
+      },
+      "replaces": null,
+      "reason": "Claude bills generated thinking tokens at the output price.",
+      "source_ref": "https://platform.claude.com/docs/en/build-with-claude/context-windows (accessed 2026-11-25)",
+      "quote": "Thinking tokens are billed as output tokens once, when they are generated.",
+      "established_by": "fusiform",
+      "established_at_ms": 1795564800000,
+      "review_by_ms": 1800748800000
+    }
+  ]
+}
