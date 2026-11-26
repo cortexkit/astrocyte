@@ -19,6 +19,33 @@ returns `allow`: cap enforcement is not built.
 
 See the [architecture overview](ARCHITECTURE.md) and the [code map](STRUCTURE.md).
 
+## Install
+
+Once astrocyte is published in the CortexKit release index, use the CortexKit CLI:
+
+```sh
+ck setup astrocyte                  # installs and registers the module with subc
+ck module status astrocyte --json   # checks the running module
+ck upgrade                         # upgrades managed CortexKit components
+```
+
+No settings file or OS permissions are required. A missing
+`~/.config/cortexkit/astrocyte.jsonc` is a valid empty configuration. Fusiform
+is the only peer needed for pricing. Insula, the vault, Colliculus and the
+attribution publishers are optional. To import subscription plan tiers, give
+astrocyte's vault identity (`reserved:astrocyte`) a `list` grant on the
+`llm-provider` category. It does not need permission to read secrets.
+
+For a source build, use a current stable Rust toolchain:
+
+```sh
+cargo build --locked --release -p astrocyte-module --bin ck-astrocyte
+```
+
+For a development install, set `modules.astrocyte.program` in subc's config
+to the absolute path to `target/release/ck-astrocyte` (`ck-astrocyte.exe` on
+Windows). Subc supplies the connection file and starts the module.
+
 ## Build and test
 
 Use a current stable Rust toolchain. Every dependency resolves from crates.io

@@ -120,6 +120,9 @@ tests; samples pinned from peers are in `tests/vectors/`.
   internal `.cortexkit/` file tracked, CI fit for trains.
 - `scripts/train-push.sh`, `scripts/watch-ci.sh`, `scripts/lib/`: landing on
   master through CI.
+- `scripts/release.sh`, `scripts/release-ci-gate.sh`, `scripts/release/`:
+  release driver, exact-commit CI gate, and packaging and verification helpers.
+- `.github/workflows/release.yml`: stages and verifies a draft on a release tag.
 
 ## Docs
 

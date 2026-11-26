@@ -1,0 +1,301 @@
+name: Release
+
+# Stages the installable assets for `ck setup astrocyte` and `ck upgrade`.
+# The release stays a draft for the operator to review and publish.
+#
+# THE TAG AND THE CRATE VERSION MUST AGREE, and this workflow refuses to build
+# when they do not. `ck upgrade` verifies an installed binary by running its
+# `--version` and comparing that against the release it just fetched, so a
+# disagreement does not fail once -- it reads as a failed upgrade on every run,
+# forever, for every user who installed that version. That is a permanent,
+# silent-to-us break produced by a one-character mismatch, which is exactly the
+# kind of thing that must be a gate rather than a habit.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: CI gate (ci.yml green on this commit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Fetch landed master
+        run: git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
+      - name: Require exact-commit push CI and all required checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release-ci-gate.sh "$GITHUB_SHA"
+
+  verify:
+    name: Verify tag, core floor and release notes
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: astrocyte
+
+      # Read the version from the manifest rather than from anywhere it is
+      # restated. `cargo metadata` resolves the same value the binary compiles
+      # into itself via CARGO_PKG_VERSION, so agreement here IS agreement with
+      # what `--version` will print -- a grep of Cargo.toml would only agree with
+      # the file, and would read nothing at all if the version ever moved to
+      # workspace inheritance.
+      - name: Compare tag against the crate version
+        working-directory: astrocyte
+        run: |
+          set -euo pipefail
+          python3 scripts/release/release.py tag "$GITHUB_REF_NAME"
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(cargo metadata --locked --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="astrocyte-module"))')
+          echo "tag: ${tag}   crate: ${crate}"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match crate version ${crate}."
+            echo "::error::ck upgrade compares the binary's --version against the release tag;"
+            echo "::error::shipping this would read as a failed upgrade for every user, permanently."
+            exit 1
+          fi
+
+      - name: Check release manifest and curated notes
+        working-directory: astrocyte
+        run: |
+          set -euo pipefail
+          python3 scripts/release/release.py floor release-manifest.json
+          notes=".cortexkit/release-notes/${GITHUB_REF_NAME}.md"
+          if [ ! -s "$notes" ]; then
+            echo "::error::missing or empty $notes; write the release notes before tagging"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: [gate, verify]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Every target builds to completion. A Windows packaging failure and a
+      # macOS one have different causes, and cancelling the matrix on the first
+      # hides whichever would have finished second.
+      fail-fast: false
+      matrix:
+        include:
+          - asset: ck-astrocyte-darwin-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+            runnable: true
+          - asset: ck-astrocyte-linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+            runnable: true
+          - asset: ck-astrocyte-linux-arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            # An x64 Linux runner cannot execute this ARM64 binary natively.
+            runnable: false
+          - asset: ck-astrocyte-windows-x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            cross: false
+            runnable: true
+          - asset: ck-astrocyte-windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            cross: false
+            runnable: true
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: astrocyte
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: astrocyte
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross for Linux ARM64
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+
+      - name: Build release binary
+        if: '!matrix.cross'
+        run: cargo build --locked --release -p astrocyte-module --bin ck-astrocyte --target ${{ matrix.target }}
+
+      - name: Cross-build release binary
+        if: matrix.cross
+        run: cross build --locked --release -p astrocyte-module --bin ck-astrocyte --target ${{ matrix.target }}
+
+      # Push CI runs the full Windows suite on x64. Exercise the installer-facing
+      # commands on a native ARM64 runner too before packaging that target.
+      - name: Test native Windows ARM64 placement commands
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        run: cargo test --workspace --locked --target ${{ matrix.target }} --test version
+
+      # RUN THE BINARY, DO NOT ASSUME IT RUNS. An asset that cannot execute on
+      # the platform it is named for is indistinguishable from a good one until a
+      # user installs it, and `--version` is the first thing the installer asks --
+      # so exercising exactly that call is both the liveness check and a rehearsal
+      # of the installer's own step.
+      - name: Verify the binary self-reports its version
+        if: matrix.runnable
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/ck-astrocyte"
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
+          reported=$("$bin" --version)
+          reported=${reported%$'\r'}
+          echo "reported: ${reported}"
+          expected="ck-astrocyte ${GITHUB_REF_NAME#v} (commit ${GITHUB_SHA})"
+          if [ "$reported" != "$expected" ]; then
+            echo "::error::binary reports '${reported}', release is '${expected}'"
+            exit 1
+          fi
+
+      # DARWIN SIGNS AND NOTARIZES BEFORE PACKAGING, and the ordering is the
+      # whole point -- see scripts/release/macos-sign-notarize.sh. Signing mutates
+      # the binary and stapling mutates the ZIP, so the checksum step below must
+      # stay AFTER this or the published sidecar describes bytes nobody receives.
+      #
+      # A missing secret fails the release. CLI download checks do not set the
+      # quarantine attribute that makes unsigned binaries unusable for browser
+      # downloads.
+      - name: Import Developer ID certificate
+        if: runner.os == 'macOS'
+        env:
+          DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
+          DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64" ] || [ -z "$DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD" ]; then
+            echo "::error::Developer ID secrets are absent; an unsigned macOS asset cannot ship."
+            exit 1
+          fi
+          KEYCHAIN_PATH="$RUNNER_TEMP/developer-id.keychain-db"
+          KEYCHAIN_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          export CERTIFICATE_PATH DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64
+          python3 -c 'import base64, os; open(os.environ["CERTIFICATE_PATH"], "wb").write(base64.b64decode(os.environ["DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64"]))'
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" \
+            -P "$DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD" -A
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          rm -f "$CERTIFICATE_PATH"
+
+      - name: Write App Store Connect API key
+        if: runner.os == 'macOS'
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APP_STORE_CONNECT_API_KEY" ] || [ -z "$APP_STORE_CONNECT_API_KEY_ID" ] || [ -z "$APP_STORE_CONNECT_API_ISSUER_ID" ]; then
+            echo "::error::App Store Connect API credentials are absent; notarization cannot run."
+            exit 1
+          fi
+          printf '%s' "$APP_STORE_CONNECT_API_KEY" > "$RUNNER_TEMP/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+
+      - name: Sign, notarize, and package (darwin)
+        if: runner.os == 'macOS'
+        env:
+          APP_STORE_CONNECT_API_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}.p8
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: bash scripts/release/macos-sign-notarize.sh "target/${{ matrix.target }}/release" "${{ matrix.asset }}.zip"
+
+      # Binary at the archive ROOT, per the installer contract -- no directory
+      # prefix, so extraction yields the executable directly. Darwin is already
+      # packaged by the signing step above, which must own the ordering.
+      - name: Package
+        shell: bash
+        if: runner.os != 'macOS'
+        run: |
+          set -euo pipefail
+          cd "target/${{ matrix.target }}/release"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "../../../${{ matrix.asset }}.zip" ck-astrocyte.exe
+          else
+            zip -j "../../../${{ matrix.asset }}.zip" ck-astrocyte
+          fi
+
+      # shasum format (`<hex>  <filename>`), over the ZIP bytes, so a consumer can
+      # verify with `shasum -a 256 -c` without reformatting.
+      - name: Checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v shasum >/dev/null; then
+            shasum -a 256 "${{ matrix.asset }}.zip" > "${{ matrix.asset }}.zip.sha256"
+          else
+            sha256sum "${{ matrix.asset }}.zip" > "${{ matrix.asset }}.zip.sha256"
+          fi
+          cat "${{ matrix.asset }}.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          if-no-files-found: error
+          path: |
+            astrocyte/${{ matrix.asset }}.zip
+            astrocyte/${{ matrix.asset }}.zip.sha256
+
+  draft:
+    name: Stage and verify release draft
+    needs: [gate, verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: astrocyte
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Check complete inventory and digests
+        run: |
+          set -euo pipefail
+          cp astrocyte/release-manifest.json assets/
+          python3 astrocyte/scripts/release/release.py assets assets
+
+      - name: Create an unpublished draft and verify the uploaded bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          python3 astrocyte/scripts/release/release.py check-new-draft "$GITHUB_REPOSITORY" "$tag"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "$tag" --notes-file "astrocyte/.cortexkit/release-notes/${tag}.md" assets/*
+          python3 astrocyte/scripts/release/release.py verify-draft "$GITHUB_REPOSITORY" "$tag" assets

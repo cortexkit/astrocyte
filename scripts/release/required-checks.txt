@@ -1,0 +1,3 @@
+# Match the Linux and native Windows job names in .github/workflows/ci.yml.
+Test (ubuntu)
+Test (windows)
