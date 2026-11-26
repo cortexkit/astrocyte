@@ -1,5 +1,10 @@
 # astrocyte
 
+> [!WARNING]
+> **Alpha.** Astrocyte is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 astrocyte meters the AI usage on one machine. It reads the session stores of
 local coding harnesses and broca's run index store directly, accepts usage pushed by peer
 modules, and records each request as an immutable usage event. It prices
