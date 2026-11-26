@@ -330,6 +330,12 @@ impl Reader {
     }
 }
 
+#[derive(Default)]
+struct SnapshotChanges {
+    history: bool,
+    seed_confirmed: bool,
+}
+
 pub(crate) struct Stage {
     reader: Reader,
     available: bool,
@@ -386,7 +392,7 @@ impl Stage {
                     self.failure(state, code);
                 }
                 Ok(listing) => {
-                    let result = self.append_snapshot(state, &listing).and_then(|changed| {
+                    let result = self.append_snapshot(state, &listing).and_then(|changes| {
                         self.invalid_plan_tier_since = listing.invalid_plan_tier_since;
                         self.vault_tiers = listing
                             .plans
@@ -397,7 +403,7 @@ impl Stage {
                             })
                             .collect();
                         self.available = true;
-                        self.process(state, source, now, changed)?;
+                        self.process(state, source, now, changes)?;
                         self.publish(state);
                         Ok(())
                     });
@@ -409,7 +415,7 @@ impl Stage {
             }
         }
         if self.available {
-            match self.process(state, source, now, false) {
+            match self.process(state, source, now, SnapshotChanges::default()) {
                 Ok(true) => self.publish(state),
                 Ok(false) => {}
                 Err(error) => self.failure(state, error),
@@ -417,10 +423,14 @@ impl Stage {
         }
     }
 
-    fn append_snapshot(&self, state: &SharedState, listing: &Listing) -> Result<bool, String> {
+    fn append_snapshot(
+        &self,
+        state: &SharedState,
+        listing: &Listing,
+    ) -> Result<SnapshotChanges, String> {
         let mut plans = listing.plans.clone();
-        let changed = state.with_conn(|conn| {
-            let mut changed = false;
+        let mut changes = state.with_conn(|conn| {
+            let mut changes = SnapshotChanges::default();
             for plan in &mut plans {
                 // With no start date from the vault, an unchanged plan keeps
                 // its recorded start, so a later listing does not restamp it;
@@ -432,23 +442,31 @@ impl Stage {
                         .map_err(|error| error.to_string())?;
                     if let Some(previous) = previous.filter(|previous| previous.same_facts(plan)) {
                         plan.effective_from_ms = previous.effective_from_ms;
+                        // An unchanged credential-only seed stays in history,
+                        // but its first Vault confirmation can open coverage.
+                        changes.seed_confirmed |= previous.source == "config"
+                            && plan.source != "config"
+                            && plan.account_id.is_none()
+                            && plan.plan_key.is_some()
+                            && self.vault_tiers.get(&plan.credential_id) != plan.plan_key.as_ref();
                     }
                 }
-                changed |= vault_plan::differs_from_latest(conn, plan)
+                changes.history |= vault_plan::differs_from_latest(conn, plan)
                     .map_err(|error| error.to_string())?;
             }
-            Ok(changed)
+            Ok(changes)
         })?;
-        if !changed {
-            return Ok(false);
+        if changes.history {
+            changes.history = state.ordered_tail_write(|tx| {
+                let mut changed = false;
+                for plan in &plans {
+                    changed |=
+                        vault_plan::append_in_tx(tx, plan).map_err(|error| error.to_string())?;
+                }
+                Ok((changed, changed))
+            })?;
         }
-        state.ordered_tail_write(|tx| {
-            let mut changed = false;
-            for plan in &plans {
-                changed |= vault_plan::append_in_tx(tx, plan).map_err(|error| error.to_string())?;
-            }
-            Ok((changed, changed))
-        })
+        Ok(changes)
     }
 
     fn process(
@@ -456,18 +474,19 @@ impl Stage {
         state: &SharedState,
         source: Option<&dyn PlanPriceSource>,
         now: i64,
-        history_changed: bool,
+        changes: SnapshotChanges,
     ) -> Result<bool, String> {
         let interval = if self.diagnostics.unpriced_plans.is_empty() {
             DAY_MS
         } else {
             UNPRICED_RETRY_MS
         };
-        let reconcile = history_changed
+        let reconcile = changes.history
+            || changes.seed_confirmed
             || self
                 .last_reconcile_ms
                 .is_none_or(|at| now.saturating_sub(at) >= interval);
-        let mismatches = history_changed
+        let mismatches = changes.history
             || self
                 .last_mismatch_ms
                 .is_none_or(|at| now.saturating_sub(at) >= DAY_MS);
@@ -496,8 +515,8 @@ impl Stage {
         now: i64,
     ) -> Result<(), String> {
         self.last_reconcile_ms = Some(now);
-        // Only a scheduled reconciliation asks the plan-price source
-        // (fusiform's `plan.prices`), and it does so before any writer
+        // Only reconciliation asks the plan-price source (Fusiform's
+        // `plan.prices`), and it does so before any writer
         // transaction starts. Plans it can't price stay listed as unpriced
         // and are retried hourly.
         let result = source

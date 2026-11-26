@@ -648,7 +648,7 @@ pub fn mark_coverage_backfill_drained_in_tx(
     Ok(updated == 1)
 }
 
-fn read_subscription(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountSubscription> {
+pub(crate) fn read_subscription(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountSubscription> {
     let amount_exponent =
         u32::try_from(row.get::<_, i64>(5)?).map_err(|_| rusqlite::Error::InvalidQuery)?;
     let period = SubscriptionPeriod::parse(&row.get::<_, String>(6)?)

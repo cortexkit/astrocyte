@@ -244,35 +244,54 @@ fn reconcile_key(
         PlanLedger::Account => ("account_subscription", "account_ref"),
         PlanLedger::Credential => ("credential_subscription", "credential_ref"),
     };
-    let open: Option<(String, i64, Option<String>)> = conn
+    let open = conn
         .query_row(
             &format!(
-                "SELECT plan_name,effective_from_ms,operator FROM {table}
+                "SELECT {key_column},provider,plan_name,recurring_cost_minor,currency,
+                        amount_exponent,period,effective_from_ms,effective_to_ms,operator FROM {table}
              WHERE provider=?1 AND {key_column}=?2 AND effective_to_ms IS NULL"
             ),
             params![provider, key],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            subscription::read_subscription,
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    if let Some((ledger_plan, _, operator)) = &open {
-        if operator.as_deref() != Some(VAULT_OPERATOR) {
-            if plan.plan_key.as_ref() != Some(ledger_plan) {
+    if let Some(open) = &open {
+        let same_key = plan.plan_key.as_ref() == Some(&open.plan_name);
+        if open.operator.as_deref() != Some(VAULT_OPERATOR) {
+            if !same_key {
                 diagnostics.hand_vault_differences.push(HandDifference {
                     provider: provider.to_string(),
                     account_id: key.to_string(),
-                    ledger_plan: ledger_plan.clone(),
+                    ledger_plan: open.plan_name.clone(),
                     vault_plan: plan.plan_key.clone(),
                 });
             }
             return Ok(());
         }
-    }
-    if open
-        .as_ref()
-        .is_some_and(|(open_key, _, _)| plan.plan_key.as_ref() == Some(open_key))
-    {
-        return Ok(());
+        if same_key {
+            // A successor bounds the old interval without changing its fee.
+            // A boundary at or before its start cannot bound it without erasing it.
+            if let Some(price) = ledger_price(plan, prices, now)
+                .filter(|price| price.boundary_at_ms > open.effective_from)
+            {
+                let unchanged = price.currency == open.currency
+                    && price.period == open.period
+                    && open.recurring_cost_nanos().ok() == Some(price.nanos);
+                if !unchanged {
+                    changes.push(LedgerChange::Set(
+                        ledger,
+                        price.set_request(
+                            provider,
+                            key,
+                            open.plan_name.clone(),
+                            price.boundary_at_ms,
+                        ),
+                    ));
+                }
+            }
+            return Ok(());
+        }
     }
     let has_history: bool = conn
         .query_row(
@@ -324,16 +343,7 @@ fn reconcile_key(
     };
     changes.push(LedgerChange::Set(
         ledger,
-        SetSubscriptionRequest {
-            provider: provider.to_string(),
-            account_ref: key.to_string(),
-            plan_name: plan.plan_key.clone().unwrap(),
-            recurring_cost_minor: price.minor_units,
-            currency: price.currency.into(),
-            amount_exponent: price.exponent,
-            period: price.period,
-            effective_from: from,
-        },
+        price.set_request(provider, key, plan.plan_key.clone().unwrap(), from),
     ));
     Ok(())
 }
@@ -451,6 +461,29 @@ struct LedgerPrice<'a> {
     exponent: u32,
     currency: &'a str,
     period: SubscriptionPeriod,
+    nanos: i64,
+    boundary_at_ms: i64,
+}
+
+impl LedgerPrice<'_> {
+    fn set_request(
+        &self,
+        provider: &str,
+        key: &str,
+        plan_name: String,
+        from: i64,
+    ) -> SetSubscriptionRequest {
+        SetSubscriptionRequest {
+            provider: provider.into(),
+            account_ref: key.into(),
+            plan_name,
+            recurring_cost_minor: self.minor_units,
+            currency: self.currency.into(),
+            amount_exponent: self.exponent,
+            period: self.period,
+            effective_from: from,
+        }
+    }
 }
 
 fn ledger_price<'a>(
@@ -458,7 +491,7 @@ fn ledger_price<'a>(
     prices: &'a PlanPricesResponse,
     now: i64,
 ) -> Option<LedgerPrice<'a>> {
-    let price = plan
+    let row = plan
         .plan_key
         .as_ref()
         .and_then(|key| {
@@ -471,8 +504,8 @@ fn ledger_price<'a>(
                 })
                 .max_by_key(|price| price.boundary_at_ms)
         })
-        .filter(|price| price.refusal_reason.is_none())
-        .and_then(|price| price.price.as_ref())?;
+        .filter(|price| price.refusal_reason.is_none())?;
+    let price = row.price.as_ref()?;
     if price.minor_units < 0
         || price.currency.len() != 3
         || !price.currency.bytes().all(|byte| byte.is_ascii_uppercase())
@@ -506,12 +539,14 @@ fn ledger_price<'a>(
         }
         (minor, exponent)
     };
-    subscription::recurring_cost_nanos(minor_units, exponent).ok()?;
+    let nanos = subscription::recurring_cost_nanos(minor_units, exponent).ok()?;
     Some(LedgerPrice {
         minor_units,
         exponent,
         currency: &price.currency,
         period,
+        nanos,
+        boundary_at_ms: row.boundary_at_ms,
     })
 }
 

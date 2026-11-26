@@ -74,14 +74,17 @@ changed in the window is listed in `accounts_excluded` as `vault_plan_changed`.
 Its quota and usage do not calibrate either plan. The first known plan still
 applies from the login's first recorded call.
 The lookup seeks backwards in recording order and stops at the first eligible
-row, skipping future-start rows if needed. Date-only edits to an already open,
-vault-owned ledger plan with the same key leave its existing ledger interval
-unchanged. Plan history determines the multiplier's historical tier; ledger
-intervals record subscription costs and are not backdated for the same key.
+row, skipping future-start rows if needed. Date-only edits to an open,
+vault-owned ledger plan with the same key leave its fee interval unchanged.
+A valid changed catalog fee for the same key starts a successor at the catalog
+boundary if it follows the open interval's start. The earlier interval keeps
+its fee. Plan history determines the multiplier's tier; ledger intervals
+record subscription costs.
 
 Ledger reconciliation runs once after the first successful startup list, when
-a snapshot appends history, and on a scheduled retry. Unpriced keys retry
-at most hourly; otherwise the backstop is daily. Only those reconciles ask
+a snapshot appends history or first confirms a credential-only seed without a
+start date, and on a scheduled retry. Unpriced keys retry at most hourly;
+otherwise the backstop is daily. Only those reconciles ask
 Fusiform for prices, and only ledger changes enter a writer transaction.
 Diagnostics are cached between reconciles. ChatGPT mismatches refresh on a
 changed snapshot or daily; their query is not part of an idle tick or an hourly price retry.
@@ -91,9 +94,11 @@ source `config` rows effective at zero, preserving old day recomputation. Live
 maps and per-account price overrides are removed; stored non-null per-account
 overrides refuse hydration instead of being discarded. Plan-key overrides stay.
 Multiple records for one account/provider use the latest effective observation;
-equal-time disagreements have no winner. An account spanning two known vault
-providers is unmeasurable. An unknown provider is not a second provider, and a
-record with neither a provider nor a plan cannot hide the account's planned record.
+equal-time disagreements have no winner. Config seeds are a fallback for
+accounts for which Vault has not stated a provider or plan. An account spanning
+two known Vault providers is unmeasurable. An unknown provider is not a second
+provider, and a record with neither a provider nor a plan cannot hide the
+account's planned record.
 If both identity namespaces have usable histories for one quota provider, the
 day's row names `mixed_identity_namespaces` and has null ratios.
 

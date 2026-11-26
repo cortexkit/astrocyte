@@ -77,6 +77,47 @@ fn vault_account_membership_ignores_newer_providerless_planless_record() {
 }
 
 #[test]
+fn vault_regression_real_provider_overrides_config_seed_for_the_same_account() {
+    let mut conn = conn();
+    let declaration = QuotaProviderConfig {
+        window: window(),
+        scope: vec![rule("broca", "openai", None)],
+    };
+    conn.execute(
+        "INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,
+             used_percent,window_minutes) VALUES('codex','acct','primary',0,1,10080)",
+        [],
+    )
+    .unwrap();
+    let tx = conn.transaction().unwrap();
+    for (credential, provider, tier, source, effective) in [
+        ("config:acct", "anthropic", "max", "config", 0),
+        ("oauth:acct", "openai", "pro", "operator", 1),
+    ] {
+        crate::vault_plan::append_in_tx(
+            &tx,
+            &crate::vault_plan::VaultPlan {
+                credential_id: credential.into(),
+                provider: Some(provider.into()),
+                account_id: Some("acct".into()),
+                plan_tier: Some(tier.into()),
+                plan_key: Some(format!("{provider}/{tier}")),
+                source: source.into(),
+                effective_from_ms: effective,
+                observed_at_ms: effective,
+            },
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let seed = resolve_membership(&conn, &declaration, "codex", 1).unwrap();
+    assert_eq!(seed.accounts["acct"].plan, "anthropic/max");
+    let corrected = resolve_membership(&conn, &declaration, "codex", 2).unwrap();
+    assert!(corrected.unknown_reasons.is_empty(), "{corrected:?}");
+    assert_eq!(corrected.accounts["acct"].plan, "openai/pro");
+}
+
+#[test]
 fn vault_account_membership_two_known_providers_are_ambiguous() {
     let resolved =
         vault_account_membership_with_secondary(Some("anthropic"), Some("anthropic/max"), 2);

@@ -706,6 +706,31 @@ fn membership_from_history(
     credentials: &BTreeSet<String>,
     history: &[crate::vault_plan::VaultPlan],
 ) -> ResolvedQuotaProvider {
+    // Config supplies an account's membership only until Vault supplies usable
+    // facts for it, even when Vault states a different provider.
+    let stated: BTreeSet<_> = history
+        .iter()
+        .filter(|row| row.source != "config" && (row.provider.is_some() || row.plan_key.is_some()))
+        .filter_map(|row| row.account_id.as_ref())
+        .collect();
+    let shadowed = |row: &crate::vault_plan::VaultPlan| {
+        row.source == "config"
+            && row
+                .account_id
+                .as_ref()
+                .is_some_and(|id| stated.contains(id))
+    };
+    let history = if history.iter().any(shadowed) {
+        std::borrow::Cow::Owned(
+            history
+                .iter()
+                .filter(|row| !shadowed(row))
+                .cloned()
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(history)
+    };
     let usable_accounts = accounts.iter().any(|id| {
         history
             .iter()
@@ -719,7 +744,7 @@ fn membership_from_history(
     let credential_keyed =
         usable_credentials && !usable_accounts || accounts.is_empty() && !credentials.is_empty();
     let mixed = usable_accounts && usable_credentials;
-    let (winners, differences) = crate::vault_plan::account_winners(history);
+    let (winners, differences) = crate::vault_plan::account_winners(&history);
     let mut resolved = ResolvedQuotaProvider {
         window: declaration.window.clone(),
         scope: declaration.scope.clone(),

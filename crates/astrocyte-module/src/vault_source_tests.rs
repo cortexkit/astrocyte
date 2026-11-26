@@ -1361,6 +1361,139 @@ fn vault_key_only_tier_change_closes_and_opens_at_effective_time() {
 }
 
 #[test]
+fn vault_regression_same_key_price_change_appends_a_fee_interval() {
+    struct DatedPrices;
+    impl PlanPriceSource for DatedPrices {
+        fn plan_prices(
+            &self,
+            request: PlanPricesRequest,
+        ) -> Result<PlanPricesResponse, CatalogCallError> {
+            let mut response = Prices(vec![("go", 1_000), ("go", 2_000)]).plan_prices(request)?;
+            response.prices[1].boundary_at_ms = 200;
+            Ok(response)
+        }
+    }
+    let state = test_state();
+    ingest_key(&state, "first-call", 10, Some("apikey:kimi"), None);
+    let mut stage = stage();
+    stage.apply(
+        &state,
+        vec![decode_listing(
+            key_only_listing(&[("apikey:kimi", "go")], 100),
+            101,
+        )],
+        Some(&DatedPrices),
+        101,
+    );
+    assert_eq!(
+        credential_plans(&state),
+        vec![(
+            "apikey:kimi".into(),
+            "openai/go".into(),
+            10,
+            None,
+            1_000,
+            Some("vault".into())
+        )]
+    );
+    for now in [DAY_MS + 101, 2 * DAY_MS + 101] {
+        stage.apply(&state, vec![], Some(&DatedPrices), now);
+        assert_eq!(
+            credential_plans(&state),
+            vec![
+                (
+                    "apikey:kimi".into(),
+                    "openai/go".into(),
+                    10,
+                    Some(200),
+                    1_000,
+                    Some("vault".into())
+                ),
+                (
+                    "apikey:kimi".into(),
+                    "openai/go".into(),
+                    200,
+                    None,
+                    2_000,
+                    Some("vault".into())
+                )
+            ]
+        );
+    }
+}
+
+#[test]
+fn vault_regression_first_seed_confirmation_reconciles_before_daily_tick() {
+    let state = test_state();
+    state
+        .ordered_tail_write(|tx| {
+            vault_plan::append_in_tx(
+                tx,
+                &VaultPlan {
+                    credential_id: "apikey:kimi".into(),
+                    provider: Some("openai".into()),
+                    account_id: None,
+                    plan_tier: Some("go".into()),
+                    plan_key: Some("openai/go".into()),
+                    source: "config".into(),
+                    effective_from_ms: 0,
+                    observed_at_ms: 1,
+                },
+            )
+            .map_err(|err| err.to_string())
+            .map(|changed| ((), changed))
+        })
+        .unwrap();
+    let event = ingest_key(&state, "first-call", 10, Some("apikey:kimi"), None);
+    let stop = AtomicBool::new(false);
+    let prices = Prices(vec![("go", 1_000)]);
+    let mut stage = stage();
+    stage.apply(
+        &state,
+        vec![decode_listing(key_only_listing(&[], 100), 101)],
+        Some(&prices),
+        101,
+    );
+    assert!(credential_plans(&state).is_empty());
+    refresher::run_pricing_pass(&state, 500, &stop).unwrap();
+    assert_eq!(
+        head(&state, &event),
+        ("unpriced".into(), Some("no_subscription_in_force".into()))
+    );
+
+    stage.apply(
+        &state,
+        vec![decode_listing(
+            key_only_listing(&[("apikey:kimi", "go")], 200),
+            201,
+        )],
+        Some(&prices),
+        201,
+    );
+    refresher::run_pricing_pass(&state, 500, &stop).unwrap();
+    assert_eq!(head(&state, &event), ("covered".into(), None));
+    assert_eq!(
+        credential_plans(&state),
+        vec![(
+            "apikey:kimi".into(),
+            "openai/go".into(),
+            10,
+            None,
+            1_000,
+            Some("vault".into())
+        )]
+    );
+    let history = state
+        .with_conn(|conn| vault_plan::latest(conn, "apikey:kimi").map_err(|err| err.to_string()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        history.source, "config",
+        "confirmation does not append history"
+    );
+}
+
+#[test]
 fn vault_config_seed_counts_only_when_the_vault_states_the_same_tier() {
     let state = test_state();
     state
