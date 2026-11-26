@@ -148,6 +148,8 @@ pub struct GeminiParseCounts {
     /// whose fields do not decode (a negative counter, a wrong type).
     /// Reading continues past them.
     pub skipped_lines: u64,
+    /// Token messages with a non-null `tokens` value that could not decode.
+    pub unreadable_usage: u64,
     /// JSON documents read.
     pub documents: u64,
     /// JSON documents that are not a readable chat recording (not JSON, or
@@ -174,12 +176,16 @@ impl GeminiParseCounts {
     /// Usage the reader saw and did not ingest for a reason other than a
     /// benign repeat.
     pub fn usage_not_ingested(&self) -> u64 {
-        self.conflicting_messages + self.messages_unidentifiable + self.unreadable_documents
+        self.conflicting_messages
+            + self.messages_unidentifiable
+            + self.unreadable_documents
+            + self.unreadable_usage
     }
 
     super::utils::add_parse_counts!(
         lines,
         skipped_lines,
+        unreadable_usage,
         documents,
         unreadable_documents,
         token_messages,
@@ -207,12 +213,13 @@ impl GeminiParseState {
         counts: &mut GeminiParseCounts,
         calls: &mut Vec<GeminiCall>,
     ) {
-        if value.get("tokens").is_none() {
+        let Some(tokens_value) = value.get("tokens") else {
             return;
-        }
+        };
         counts.token_messages += 1;
         let Ok(message) = GeminiMessage::deserialize(value) else {
             counts.skipped_lines += 1;
+            counts.unreadable_usage += u64::from(!tokens_value.is_null());
             return;
         };
         let Some(tokens) = message.tokens else {

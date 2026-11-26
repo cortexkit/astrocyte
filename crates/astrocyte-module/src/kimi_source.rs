@@ -293,6 +293,28 @@ mod tests {
     }
 
     #[test]
+    fn dropped_usage_degrades_kimi_health_without_stopping_ingest() {
+        let temp = TempDir::new().unwrap();
+        let good = status("good", [7, 3, 0, 0]);
+        let bad = status("bad", [7, 3, 0, 0]).replace("\"input_other\": 7", "\"input_other\": -1");
+        write_file(temp.path(), WIRE, &(good + &bad));
+        let state = test_state();
+        run_iteration_with_harness(&state, &[], &KimiSource::at(temp.path()), &NEVER_STOP);
+        state.with_conn(|conn| {
+            let (reference, input): (String, i64) = conn.query_row(
+                "SELECT producer_ref,quantity_units FROM usage_event JOIN measurement USING(event_key) WHERE role='input'", [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!((reference.as_str(), input), ("good", 7));
+            Ok(())
+        }).unwrap();
+        assert!(
+            state.producer_degraded_reason("kimi").is_some(),
+            "Kimi dropped usage without degrading"
+        );
+    }
+
+    #[test]
     fn regression_kimi_out_of_range_counter_is_set_aside_and_resume_advances() {
         let temp = TempDir::new().unwrap();
         let path = write_file(

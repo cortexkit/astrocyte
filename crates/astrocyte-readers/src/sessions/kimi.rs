@@ -123,6 +123,8 @@ pub struct KimiParseCounts {
     /// whose payload does not decode (a negative counter, a wrong type).
     /// Reading continues past them.
     pub skipped_lines: u64,
+    /// `StatusUpdate` records with non-null `token_usage` that could not decode.
+    pub unreadable_usage: u64,
     /// `StatusUpdate` records seen.
     pub status_updates: u64,
     /// `StatusUpdate` records without `token_usage`.
@@ -146,12 +148,13 @@ impl KimiParseCounts {
     /// Usage records the reader saw and did not emit for a reason other than
     /// a benign repeat: a shape nobody measured.
     pub fn usage_not_ingested(&self) -> u64 {
-        self.conflicting_updates + self.updates_without_message_id
+        self.conflicting_updates + self.updates_without_message_id + self.unreadable_usage
     }
 
     super::utils::add_parse_counts!(
         lines,
         skipped_lines,
+        unreadable_usage,
         status_updates,
         status_updates_without_usage,
         repeated_updates,
@@ -220,11 +223,14 @@ fn parse_line(
         return;
     }
     counts.status_updates += 1;
-    let Some(status) = message
-        .get("payload")
-        .and_then(|payload| StatusPayload::deserialize(payload).ok())
-    else {
+    let payload = message.get("payload");
+    let Some(status) = payload.and_then(|payload| StatusPayload::deserialize(payload).ok()) else {
         counts.skipped_lines += 1;
+        counts.unreadable_usage += u64::from(
+            payload
+                .and_then(|payload| payload.get("token_usage"))
+                .is_some_and(|usage| !usage.is_null()),
+        );
         return;
     };
     let Some(usage) = status.token_usage else {

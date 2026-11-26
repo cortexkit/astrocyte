@@ -47,6 +47,10 @@ pub(crate) struct FileStat {
 }
 
 impl FileStat {
+    pub(crate) fn same_file_and_size(&self, other: &Self) -> bool {
+        self.len == other.len && self.same_file(other)
+    }
+
     pub(crate) fn fast_changed(&self, previous: Option<&WindowSchedule>, _now_ms: i64) -> bool {
         previous.is_none_or(|window| !self.same(&window.stat))
     }

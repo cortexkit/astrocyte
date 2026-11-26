@@ -174,6 +174,8 @@ pub struct OmpParseCounts {
     /// `message` record whose fields do not decode (a negative counter, a
     /// wrong type). Reading continues past them.
     pub skipped_lines: u64,
+    /// Assistant messages with non-null `usage` that could not decode.
+    pub unreadable_usage: u64,
     /// Assistant messages with usage.
     pub usage_records: u64,
     /// Usage records before any `session` header, or without an entry id.
@@ -190,12 +192,13 @@ pub struct OmpParseCounts {
 impl OmpParseCounts {
     /// Usage records the reader saw and did not emit.
     pub fn usage_not_ingested(&self) -> u64 {
-        self.records_unidentifiable
+        self.records_unidentifiable + self.unreadable_usage
     }
 
     super::utils::add_parse_counts!(
         lines,
         skipped_lines,
+        unreadable_usage,
         usage_records,
         records_unidentifiable,
         gross_outputs,
@@ -218,6 +221,7 @@ pub(crate) struct OmpParseState {
 struct EntryTypeProbe {
     #[serde(rename = "type")]
     entry_type: Option<String>,
+    message: Option<serde_json::Value>,
 }
 
 fn parse_line(
@@ -239,8 +243,15 @@ fn parse_line(
         Ok(entry) => entry,
         Err(probe) => {
             match probe {
-                Some(EntryTypeProbe { entry_type })
+                Some(EntryTypeProbe { entry_type, .. })
                     if !matches!(entry_type.as_deref(), Some("session") | Some("message")) => {}
+                Some(probe) if probe.entry_type.as_deref() == Some("message") => {
+                    counts.skipped_lines += 1;
+                    counts.unreadable_usage += u64::from(probe.message.is_some_and(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                            && message.get("usage").is_some_and(|usage| !usage.is_null())
+                    }));
+                }
                 _ => counts.skipped_lines += 1,
             }
             return;

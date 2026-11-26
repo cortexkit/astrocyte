@@ -585,6 +585,30 @@ mod tests {
     /// One event per token message in either format, in disjoint roles; a
     /// provider inferred from the model; logs and other files ignored.
     #[test]
+    fn dropped_usage_degrades_gemini_health_without_stopping_ingest() {
+        for jsonl in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let messages = [
+                message("good", [10, 4, 2, 1, 0]),
+                message("bad", [10, 4, 2, 1, 0]).replace("\"input\":10", "\"input\":-1"),
+            ];
+            if jsonl {
+                write_file(temp.path(), LINES, &recording(&messages));
+            } else {
+                write_file(temp.path(), DOC, &document(&messages));
+            }
+            let state = test_state();
+            run_iteration_with_harness(&state, &[], &GeminiSource::at(temp.path()), &NEVER_STOP);
+            assert_eq!(quantities(&state, "good")["input"], Some(8));
+            assert!(quantities(&state, "bad").is_empty());
+            assert!(
+                state.producer_degraded_reason("gemini").is_some(),
+                "Gemini dropped usage without degrading"
+            );
+        }
+    }
+
+    #[test]
     fn each_token_message_is_one_event_in_disjoint_roles() {
         let temp = TempDir::new().unwrap();
         write_file(

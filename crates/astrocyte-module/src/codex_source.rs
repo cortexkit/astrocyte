@@ -54,6 +54,13 @@ pub(crate) struct CodexDrainOutcome {
     /// steady-state cost counter, O(window + appended) per file.
     pub hashed_bytes: u64,
     pub decompressed_bytes: u64,
+    archive_retries: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FailedArchive {
+    stat: crate::refresher::harness_drain::FileStat,
+    handled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +73,7 @@ struct CodexCache {
     /// When each file's consumed prefix was last verified end to end.
     prefix_verified_ms: HashMap<PathBuf, i64>,
     windows: crate::refresher::harness_drain::WindowSchedules,
+    failed_archives: HashMap<PathBuf, FailedArchive>,
 }
 
 #[derive(Debug, Clone)]
@@ -232,7 +240,7 @@ impl CodexSource {
             mode.ensure_runtime(state, CODEX_SOURCE_KEY)?;
         }
         let mut outcome = CodexDrainOutcome::default();
-        let (mut previous_points, previous_verified, previous_windows, files) = {
+        let (mut previous_points, previous_verified, previous_windows, previous_failures, files) = {
             use crate::refresher::harness_drain::select_files;
             let cache = self
                 .cache
@@ -258,6 +266,7 @@ impl CodexSource {
                 select_files(&cache.resume, &files),
                 select_files(&cache.prefix_verified_ms, &files),
                 cache.windows.select(&files),
+                select_files(&cache.failed_archives, &files),
                 files,
             )
         };
@@ -265,6 +274,7 @@ impl CodexSource {
         let mut resume_points = HashMap::with_capacity(files.len());
         let mut verified_ms = HashMap::with_capacity(files.len());
         let mut windows = crate::refresher::harness_drain::WindowSchedules::default();
+        let mut failed_archives = HashMap::new();
         if !mode.is_full() {
             resume_points.clone_from(&previous_points);
             verified_ms.clone_from(&previous_verified);
@@ -276,17 +286,34 @@ impl CodexSource {
             if stop.load(Ordering::Relaxed) {
                 return Err(SourceDrainError::Stopped);
             }
-            let stat = crate::refresher::harness_drain::FileStat::read_in_lane(&path, mode)
-                .map_err(|error| format!("stat Codex session {}: {error}", path.display()))?;
-            if !mode.is_full()
-                && (is_codex_archive(&path)
-                    || !stat.fast_changed(previous_windows.get(&path), recorded_at_ms))
-            {
+            let archive = is_codex_archive(&path);
+            if archive && !mode.is_full() {
+                continue;
+            }
+            let stat = match crate::refresher::harness_drain::FileStat::read_in_lane(&path, mode) {
+                Ok(stat) => stat,
+                Err(error) if archive => {
+                    outcome
+                        .archive_retries
+                        .push(format!("inspect Codex archive {}: {error}", path.display()));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!("stat Codex session {}: {error}", path.display()).into())
+                }
+            };
+            if !mode.is_full() && !stat.fast_changed(previous_windows.get(&path), recorded_at_ms) {
                 continue;
             }
             resume_points.remove(&path);
             let previous = previous_points.remove(&path);
-            let archive = is_codex_archive(&path);
+            let previous_failure = previous_failures
+                .get(&path)
+                .filter(|failure| stat.same_file_and_size(&failure.stat));
+            if let Some(failure) = previous_failure.filter(|failure| failure.handled) {
+                failed_archives.insert(path, failure.clone());
+                continue;
+            }
             let window = previous_windows.get(&path);
             let check = if mode.prefix_check(
                 &path,
@@ -326,10 +353,29 @@ impl CodexSource {
                 previous.map(|point| (*point).clone()),
                 check,
             );
-            transactions.push(transaction);
             if let Some(reason) = parse.io_error {
+                transaction.rollback();
+                if archive {
+                    // A truncated frame may still be growing. Retry after the
+                    // first failure; if the same file still fails at the same
+                    // size, keep evidence and stop retrying until it changes.
+                    let handled = previous_failure.is_some();
+                    if handled {
+                        set_aside.push(crate::refresher::SetAsideRecord {
+                            locator: format!("{path:?}:archive"),
+                            reason,
+                        });
+                    } else {
+                        outcome
+                            .archive_retries
+                            .push(format!("read Codex archive {}: {reason}", path.display()));
+                    }
+                    failed_archives.insert(path, FailedArchive { stat, handled });
+                    continue;
+                }
                 return Err(format!("read Codex session file {}: {reason}", path.display()).into());
             }
+            transactions.push(transaction);
             let offset = parse.resume.as_ref().map(CodexResumePoint::offset);
             windows.insert(
                 path.clone(),
@@ -401,6 +447,7 @@ impl CodexSource {
             cache.resume = resume_points;
             cache.prefix_verified_ms = verified_ms;
             cache.windows = windows;
+            cache.failed_archives = failed_archives;
         } else {
             for path in files {
                 cache.resume.remove(&path);
@@ -435,11 +482,13 @@ impl crate::refresher::harness_drain::HarnessSource for CodexSource {
         stop: &AtomicBool,
     ) -> Result<Option<String>, SourceDrainError> {
         let outcome = self.drain(state, recorded_at_ms, stop)?;
-        Ok(crate::refresher::harness_drain::health_reason(
+        let mut problems = outcome.archive_retries;
+        problems.extend(crate::refresher::harness_drain::health_reason(
             "Codex",
             outcome.quarantined_redeliveries,
             outcome.counts.usage_not_ingested(),
-        ))
+        ));
+        Ok((!problems.is_empty()).then(|| problems.join("; ")))
     }
 }
 
@@ -598,7 +647,7 @@ fn record_requests(
             stop_requested,
             &mut stopped,
         )?;
-        if mode.is_full() {
+        if mode.is_full() && outcome.archive_retries.is_empty() {
             mark_current_in_tx(tx, CODEX_SOURCE_KEY, "Codex", recorded_at_ms)?;
         }
         Ok(((dispositions, newly_seen), true))
@@ -652,6 +701,60 @@ mod tests {
     }
 
     #[test]
+    fn damaged_archive_does_not_hold_back_healthy_codex_rollouts() {
+        let temp = TempDir::new().unwrap();
+        let broken = write_archive(temp.path(), "a-broken.jsonl.zst", &parent_rollout());
+        let mut bytes = fs::read(&broken).unwrap();
+        bytes.pop().unwrap();
+        fs::write(&broken, bytes).unwrap();
+        write_archive(
+            temp.path(),
+            "b-archive.jsonl.zst",
+            &parent_rollout()
+                .replace(THREAD, "archive-thread")
+                .replace(TURN, "archive-turn"),
+        );
+        write_file(
+            temp.path(),
+            "archived_sessions/c-plain.jsonl",
+            &parent_rollout()
+                .replace(THREAD, "plain-thread")
+                .replace(TURN, "plain-turn"),
+        );
+        let state = test_state();
+        let source = CodexSource::at(temp.path());
+        run_iteration_with_codex(&state, &[], &source, &NEVER_STOP);
+        assert_eq!(
+            event_refs(&state),
+            BTreeSet::from([
+                "archive-turn:1".into(),
+                "archive-turn:2".into(),
+                "plain-turn:1".into(),
+                "plain-turn:2".into()
+            ]),
+            "a damaged archive must not abort the pass or commit its partial calls"
+        );
+        assert!(state
+            .producer_degraded_reason("codex")
+            .unwrap()
+            .contains("a-broken.jsonl.zst"));
+        assert_eq!(
+            count(
+                &state,
+                "SELECT count(*) FROM set_aside_record WHERE source_key='codex'"
+            ),
+            0
+        );
+        run_iteration_with_codex(&state, &[], &source, &NEVER_STOP);
+        crate::refresher::harness_drain::assert_set_aside(&state, "codex", 1);
+        assert!(state.producer_degraded_reason("codex").is_none());
+        fs::write(&broken, raw_zstd(&parent_rollout())).unwrap();
+        run_iteration_with_codex(&state, &[], &source, &NEVER_STOP);
+        assert_eq!(event_refs(&state).len(), 6);
+        assert!(state.producer_degraded_reason("codex").is_none());
+    }
+
+    #[test]
     fn archive_discovery_preserves_plain_twin_identity_and_measurements() {
         let temp = TempDir::new().unwrap();
         write_file(temp.path(), "sessions/a.jsonl", &parent_rollout());
@@ -697,9 +800,12 @@ mod tests {
             );
         }
         append(&path, "broken");
-        assert!(source
-            .drain(&state, start + 3_601_001, &NEVER_STOP)
-            .is_err());
+        assert_eq!(
+            drain(&source, &state, start + 3_601_001)
+                .archive_retries
+                .len(),
+            1
+        );
         fs::write(&path, raw_zstd(&parent_rollout())).unwrap();
         assert!(drain(&source, &state, start + 3_601_002).decompressed_bytes > 0);
         let replacement = write_archive(temp.path(), "replacement.tmp", &parent_rollout());
@@ -715,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_corruption_never_commits_partial_usage_or_success() {
+    fn archive_corruption_holds_success_once_then_sets_aside_unchanged_damage() {
         let temp = TempDir::new().unwrap();
         fs::create_dir_all(temp.path().join("sessions")).unwrap();
         let source = CodexSource::at(temp.path());
@@ -727,23 +833,46 @@ mod tests {
         checksum.extend_from_slice(&[0; 4]);
         let mut trailing = good.clone();
         trailing.extend_from_slice(b"garbage");
+        let mut previous_success = 100;
         for bytes in [
             &good[..good.len() - 1],
             checksum.as_slice(),
             trailing.as_slice(),
         ] {
             let path = temp.path().join("sessions/a.jsonl.zst");
-            fs::write(path, bytes).unwrap();
-            assert!(source.drain(&state, 200, &NEVER_STOP).is_err());
+            fs::write(&path, bytes).unwrap();
+            // A first failure may be an archive still being written; a second
+            // failure on the same file at the same size leaves coverage evidence
+            // instead of holding Codex health back indefinitely. Neither pass
+            // may record usage from a partially decoded archive.
+            assert_eq!(
+                drain(&source, &state, previous_success + 1)
+                    .archive_retries
+                    .len(),
+                1
+            );
             assert!(event_refs(&state).is_empty());
             assert_eq!(
                 count(
                     &state,
                     "SELECT last_success_ms FROM source_runtime WHERE source_key='codex'"
                 ),
-                100
+                previous_success
             );
             assert!(source.cache.lock().unwrap().windows.is_empty());
+            assert!(drain(&source, &state, previous_success + 2)
+                .archive_retries
+                .is_empty());
+            assert!(event_refs(&state).is_empty());
+            crate::refresher::harness_drain::assert_set_aside(&state, "codex", 1);
+            previous_success += 2;
+            assert_eq!(
+                count(
+                    &state,
+                    "SELECT last_success_ms FROM source_runtime WHERE source_key='codex'"
+                ),
+                previous_success
+            );
         }
         write_archive(temp.path(), "a.jsonl.zst", &parent_rollout());
         assert_eq!(drain(&source, &state, 300).rows_recorded, 2);

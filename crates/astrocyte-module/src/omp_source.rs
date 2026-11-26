@@ -340,6 +340,24 @@ mod tests {
     /// apart when reasoning is reported, gross output (named as such) when
     /// it is not, and the header's session and cwd on every event.
     #[test]
+    fn dropped_usage_degrades_omp_health_without_stopping_ingest() {
+        let temp = TempDir::new().unwrap();
+        let path = write_file(temp.path(), FILE, &session());
+        append(
+            &path,
+            &assistant("bad", r#"{"input":-1,"output":3,"totalTokens":3}"#),
+        );
+        let state = test_state();
+        run_iteration_with_harness(&state, &[], &OmpSource::at(temp.path()), &NEVER_STOP);
+        assert_eq!(measurements(&state, "a1")["input"].0, Some(858));
+        assert!(measurements(&state, "bad").is_empty());
+        assert!(
+            state.producer_degraded_reason("omp").is_some(),
+            "Oh My Pi dropped usage without degrading"
+        );
+    }
+
+    #[test]
     fn each_assistant_message_is_one_event_in_disjoint_roles() {
         let temp = TempDir::new().unwrap();
         write_file(temp.path(), FILE, &session());

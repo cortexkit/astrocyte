@@ -295,9 +295,14 @@ Rules that affect what is recorded:
   of replacing the first observation. Decoding is bounded to 1 GiB in total, 16 MiB per record and a
   64 MiB decoder window. An oversized record is discarded with set-aside evidence,
   and later records are still read. Corruption, truncation, checksum mismatch,
-  trailing junk or an exceeded decoded-size limit fail the whole drain without
-  committing partial usage or advancing success. Activity without supported usage
-  produces a visible set-aside record; its token quantities remain unknown.
+  trailing junk or an exceeded decoded-size limit cannot commit any usage from
+  that archive; healthy files still commit. A first failure degrades the source
+  without advancing `source_runtime.last_success_ms`. If the same archive fails
+  again at the same size, the drain sets it aside with its location and reason;
+  that failure no longer holds back `last_success_ms`.
+  A change in size or file identity makes the drain try the archive again.
+  Activity without supported usage produces a visible set-aside record; its
+  token quantities remain unknown.
 - Codex request records are matched to native token counts when input and output
   agree, as do any other counters and response IDs reported by both records,
   regardless of which record appears first. A terminal event, new turn or
