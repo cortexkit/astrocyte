@@ -288,6 +288,7 @@ impl PlanPriceSource for Prices {
             resolved_at_ms: 0,
             tier_vocabulary: "vendor".into(),
             unit_policy: "list".into(),
+            quota_pools: Vec::new(),
         })
     }
 }

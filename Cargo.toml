@@ -39,14 +39,14 @@ tracing = "0.1"
 
 cortexkit-store = { version = "=0.2.4", features = ["sqlite"] }
 cortexkit-store-types = "=0.2.2"
-cortexkit-provider-usage = "=0.14.0"
+cortexkit-provider-usage = "=0.17.0"
 cortexkit-bus-naming = "=0.4.4"
 cortexkit-bus-nats = "=0.5.5"
 cortexkit-bus-trait = "=0.3.1"
 async-nats = { version = "=0.50.0", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
 base64 = "=0.22.1"
 futures-util = "0.3"
-fusiform-protocol = "=0.81.0"
+fusiform-protocol = "=0.88.0"
 cortexkit-claustrum-client = { version = "=0.9.0", default-features = false }
 # The `log-read-watermark/v1` wire types (`watermark` module) and the
 # `step.finished.v1` live step event (`step_events`, added in 0.7.5).

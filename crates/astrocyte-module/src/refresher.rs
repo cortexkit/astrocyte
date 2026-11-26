@@ -2065,6 +2065,7 @@ mod loop_tests {
                     raw_used_percent: None,
                     resets_at: None,
                     window_minutes: Some(300),
+                    model_scope: None,
                     used_count: None,
                     total_count: None,
                     source: Some("oauth".into()),

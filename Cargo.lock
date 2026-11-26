@@ -365,9 +365,9 @@ checksum = "57e7ea934b88f1cd195c79fdeb56bda1a4595252a444eba543689fda561ea7a4"
 
 [[package]]
 name = "cortexkit-provider-usage"
-version = "0.14.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fbb4e0942770cee9a2755519f76a94136071fd68ec8b8314f684ae8be5a5676"
+checksum = "5f878f8d1a2e626555c21763b61d884cb767a4f033d7f099987dc1b2419afca0"
 dependencies = [
  "serde",
 ]
@@ -660,9 +660,9 @@ dependencies = [
 
 [[package]]
 name = "fusiform-protocol"
-version = "0.81.0"
+version = "0.88.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70e31e9c496e8dba1356f9a2f1e474aff9f460ecd4289401ad969589f65ad97b"
+checksum = "25132fb11feeb8942daf4c337a9b1e615beb35e40cf888dd5072cb31c8709a9b"
 dependencies = [
  "serde",
  "serde_json",

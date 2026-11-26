@@ -614,6 +614,69 @@ mod tests {
     }
 
     #[test]
+    fn usage_get_decodes_model_scope_from_pinned_insula_sample() {
+        use astrocyte_core::capacity::WindowModelScope;
+        use sha2::{Digest, Sha256};
+
+        const PAYLOAD: &[u8] = include_bytes!("../test-vectors/insula-31e13281/usage-get.json");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(PAYLOAD)),
+            "82067311fb0a487b46279b187b73220cd2cffe1c3477936747c6226562eb14ef"
+        );
+        let snapshot = decode_usage_response(PAYLOAD).unwrap();
+        let scope = |provider: &str, account: &str, pool: &str| {
+            snapshot
+                .windows
+                .iter()
+                .find(|w| w.provider == provider && w.account_ref == account && w.pool_key == pool)
+                .unwrap()
+                .model_scope
+        };
+        assert_eq!(
+            scope("claude", "stale@example.com", "secondary"),
+            Some(WindowModelScope::All)
+        );
+        assert_eq!(
+            scope(
+                "antigravity",
+                "named-windows@example.com",
+                "extra:10:gemini-pro"
+            ),
+            Some(WindowModelScope::Subset)
+        );
+        assert_eq!(scope("codex", "fresh@example.com", "primary"), None);
+    }
+
+    #[test]
+    fn usage_get_preserves_readings_with_unrecognised_model_scope() {
+        use astrocyte_core::capacity::WindowModelScope;
+
+        let snapshot = decode_usage_response(
+            br#"{"result":[
+                {"provider":"codex","account":"named","usage":{
+                    "primary":{"usedPercent":20.0,"modelScope":"per_region"}}},
+                {"provider":"codex","credentialRef":"cred","usage":{
+                    "primary":{"usedPercent":10.0,"modelScope":"subset"},
+                    "secondary":{"usedPercent":30.0,"modelScope":"per_region"}}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].model_scope, None);
+        assert_eq!(snapshot.provider_readings.len(), 2);
+        let scope = |pool: &str| {
+            snapshot
+                .provider_readings
+                .iter()
+                .find(|w| w.credential_ref.as_deref() == Some("cred") && w.pool_key == pool)
+                .unwrap()
+                .model_scope
+        };
+        assert_eq!(scope("secondary"), None);
+        assert_eq!(scope("primary"), Some(WindowModelScope::Subset));
+    }
+
+    #[test]
     fn malformed_completion_or_usage_produces_no_snapshot() {
         let malformed_completion =
             decode_usage_response(br#"{"result":[],"completeProviders":"codex"}"#);

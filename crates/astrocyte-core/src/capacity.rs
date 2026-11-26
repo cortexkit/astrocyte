@@ -15,6 +15,13 @@
 use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
+/// The model coverage stated by the quota producer, not inferred from a window's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowModelScope {
+    All,
+    Subset,
+}
+
 /// One observed quota window with its complete durable pool identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapacityWindow {
@@ -34,6 +41,9 @@ pub struct CapacityWindow {
     pub raw_used_percent: Option<f64>,
     pub resets_at: Option<String>,
     pub window_minutes: Option<i64>,
+    // Scope is a reading input, not a field of the cached capacity report.
+    #[serde(skip)]
+    pub model_scope: Option<WindowModelScope>,
     pub used_count: Option<i64>,
     pub total_count: Option<i64>,
     pub source: Option<String>,
@@ -89,6 +99,7 @@ pub struct CapacityProviderReading {
     pub raw_used_percent: Option<f64>,
     pub resets_at: Option<String>,
     pub window_minutes: Option<i64>,
+    pub model_scope: Option<WindowModelScope>,
     pub used_count: Option<i64>,
     pub total_count: Option<i64>,
     pub source: Option<String>,
@@ -531,6 +542,7 @@ pub fn windows(conn: &Connection) -> rusqlite::Result<Vec<CapacityWindow>> {
             raw_used_percent: row.get(10)?,
             resets_at: row.get(11)?,
             window_minutes: row.get(12)?,
+            model_scope: None,
             used_count: row.get(13)?,
             total_count: row.get(14)?,
             source: row.get(15)?,
@@ -635,6 +647,7 @@ mod tests {
             raw_used_percent: None,
             resets_at: None,
             window_minutes: None,
+            model_scope: None,
             used_count: None,
             total_count: None,
             source: None,
@@ -946,6 +959,7 @@ mod tests {
             raw_used_percent: None,
             resets_at: None,
             window_minutes: Some(300),
+            model_scope: None,
             used_count: Some(20),
             total_count: Some(100),
             source: None,
@@ -1251,6 +1265,7 @@ mod tests {
             raw_used_percent: None,
             resets_at: None,
             window_minutes: Some(300),
+            model_scope: None,
             used_count: None,
             total_count: None,
             source: None,

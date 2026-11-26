@@ -15,8 +15,10 @@
 //!     population with no account_ref, so they stay visible but can never join
 //!     to spend attributed to an account. No sentinel account is minted.
 
-use astrocyte_core::capacity::{validate_preserved_reading, CapacitySnapshot, CapacityWindow};
-use cortexkit_provider_usage::{ProviderUsage, RateWindow};
+use astrocyte_core::capacity::{
+    validate_preserved_reading, CapacitySnapshot, CapacityWindow, WindowModelScope,
+};
+use cortexkit_provider_usage::{model_scope, ProviderUsage, RateWindow};
 
 /// Validates and maps one response. Malformed response structure returns an error,
 /// while invalid account windows can be discarded without losing other readings.
@@ -149,6 +151,11 @@ pub fn map_usage_array(
                 .as_ref()
                 .map(|b| serde_json::to_string(b).map_err(|e| format!("serialize breakdown: {e}")))
                 .transpose()?;
+            let model_scope = match window.model_scope.as_deref() {
+                Some(model_scope::ALL) => Some(WindowModelScope::All),
+                Some(model_scope::SUBSET) => Some(WindowModelScope::Subset),
+                _ => None,
+            };
             if let Some(account_ref) = account_ref {
                 windows.push(CapacityWindow {
                     provider: entry.provider.clone(),
@@ -165,6 +172,7 @@ pub fn map_usage_array(
                     raw_used_percent: window.raw_used_percent,
                     resets_at: window.resets_at.clone(),
                     window_minutes: window.window_minutes,
+                    model_scope,
                     used_count,
                     total_count,
                     source: entry.source.clone(),
@@ -187,6 +195,7 @@ pub fn map_usage_array(
                     raw_used_percent: window.raw_used_percent,
                     resets_at: window.resets_at.clone(),
                     window_minutes: window.window_minutes,
+                    model_scope,
                     used_count,
                     total_count,
                     source: entry.source.clone(),
@@ -380,6 +389,7 @@ mod tests {
             window_kind: None,
             // Absent on the basic test helper; breakdown-specific tests provide it.
             breakdown: None,
+            model_scope: None,
         }
     }
 

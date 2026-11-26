@@ -1120,6 +1120,7 @@ mod multiplier_stage_tests {
                 resolved_at_ms: NOW,
                 tier_vocabulary: "vendor".into(),
                 unit_policy: "list".into(),
+                quota_pools: Vec::new(),
             })
         }
     }

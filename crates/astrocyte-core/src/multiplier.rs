@@ -5069,6 +5069,7 @@ mod tests {
             resolved_at_ms: 5_000,
             tier_vocabulary: "vendor".into(),
             unit_policy: "list".into(),
+            quota_pools: Vec::new(),
         });
         let provider = config.quota_providers["codex"].clone();
         let plans = resolve_plans(Some(&served), &config, &provider, 5_000).unwrap();
@@ -6895,6 +6896,7 @@ mod tests {
             resolved_at_ms: 0,
             tier_vocabulary: "vendor".into(),
             unit_policy: "list".into(),
+            quota_pools: Vec::new(),
         });
         let snapshot_at_ms = 1_790_262_183_000; // 2026-09-24T15:03:03Z
         for (name, start, end) in [

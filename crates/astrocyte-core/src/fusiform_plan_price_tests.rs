@@ -1,4 +1,25 @@
 #[test]
+fn plan_prices_decodes_pinned_synthetic_quota_pool() {
+    use sha2::{Digest, Sha256};
+
+    const PAYLOAD: &[u8] =
+        include_bytes!("../test-vectors/fusiform-28bf597d/plan-prices-synthetic-quota-pool.json");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(PAYLOAD)),
+        "869eaeb7b9f22a16a18c1b6b5b82973df9ae3103a2afbb14a1773e1c8bfc09a2"
+    );
+    let response: PlanPricesResponse = serde_json::from_slice(PAYLOAD).unwrap();
+    assert_eq!(response.resolved_at_ms, -1);
+    let [pool] = response.quota_pools.as_slice() else {
+        panic!("expected one quota pool, got {:?}", response.quota_pools);
+    };
+    assert_eq!(pool.provider_id, "google");
+    assert_eq!(pool.pool_id, "Weekly");
+    assert_eq!(pool.models, ["google/antigravity-gemini-4-hydrogen"]);
+    assert_eq!(pool.established_at_ms, 1000);
+}
+
+#[test]
 fn fusiform_071_curated_plan_prices_keep_allegro_fee_without_credit_rate() {
     use sha2::{Digest, Sha256};
 

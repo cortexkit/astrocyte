@@ -23,6 +23,7 @@ fn plan_prices_from_fusiform_90a0531_decode_and_price_every_plan() {
     );
     let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
     let response: PlanPricesResponse = serde_json::from_value(fixture["response"].clone()).unwrap();
+    assert!(response.quota_pools.is_empty());
     let kimi = response
         .prices
         .iter()
@@ -188,6 +189,7 @@ fn credential_rows(conn: &Connection, config: &FixtureConfig) -> Vec<Observation
         resolved_at_ms: 0,
         tier_vocabulary: "vendor".into(),
         unit_policy: "list".into(),
+        quota_pools: Vec::new(),
     });
     let prices = resolve_plans(Some(&source), config, &config.quota_providers["codex"], 0).unwrap();
     compute_plan_observations(
@@ -397,6 +399,7 @@ fn v2_credential_scopes_and_plan_prices_use_their_own_provider_names() {
             resolved_at_ms: 0,
             tier_vocabulary: "vendor".into(),
             unit_policy: "list".into(),
+            quota_pools: Vec::new(),
         });
         let prices =
             resolve_plans(Some(&source), &config, &config.quota_providers[quota], 0).unwrap();

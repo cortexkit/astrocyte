@@ -1,0 +1,35 @@
+{
+  "prices": [
+    {
+      "boundary_at_ms": 1000,
+      "established_at_ms": 1000,
+      "established_by": "fixture",
+      "price": {
+        "currency": "USD",
+        "exponent": 2,
+        "minor_units": 2000,
+        "period": "month"
+      },
+      "provider_id": "google",
+      "review_by_ms": 5184001000,
+      "source_ref": "https://example.invalid/pricing",
+      "tier": "fixture"
+    }
+  ],
+  "quota_pools": [
+    {
+      "established_at_ms": 1000,
+      "models": [
+        "google/antigravity-gemini-4-hydrogen"
+      ],
+      "pool_id": "Weekly",
+      "provider_id": "google",
+      "quote": "Synthetic pool membership",
+      "review_by_ms": 5184001000,
+      "source_ref": "https://example.invalid/quota"
+    }
+  ],
+  "resolved_at_ms": -1,
+  "tier_vocabulary": "The tier is the VENDOR'S OWN TIER NAME, never an API plan string. OpenAI's Pro 100, Pro 200 and Pro 500 are pro_100, pro_200 and pro_500 here. A consumer holding an API string must map it to a tier itself, with knowledge of the account.",
+  "unit_policy": "US list price, monthly-billed, web subscription. An operator on an annual term, in another country, or subscribed through an app store pays something else, and this plane cannot see which."
+}

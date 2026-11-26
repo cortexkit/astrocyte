@@ -535,6 +535,7 @@ impl Stage {
             resolved_at_ms: now,
             tier_vocabulary: String::new(),
             unit_policy: String::new(),
+            quota_pools: Vec::new(),
         });
         let vault_tiers = &self.vault_tiers;
         let prepared = state.with_conn(|conn| {
