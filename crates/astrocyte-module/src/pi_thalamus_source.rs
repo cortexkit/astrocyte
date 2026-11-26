@@ -58,6 +58,14 @@ struct CachedFile {
     blocked: bool,
 }
 
+impl Cache {
+    fn block_copy(&mut self, path: &std::path::Path) -> Option<&str> {
+        let file = self.files.get_mut(path)?;
+        file.blocked = true;
+        Some(&file.owner_session)
+    }
+}
+
 pub(crate) struct PiThalamusSource {
     paths: Result<ClaudeSessionPaths, String>,
     normal_root: Result<PathBuf, String>,
@@ -200,6 +208,7 @@ impl PiThalamusSource {
         let mut set_aside = Vec::new();
         let mut outcome = PiDrainOutcome::default();
         let mut next_files = HashMap::new();
+        let mut reread_files = HashSet::new();
         for (root, canonical) in roots.iter().zip(resolved) {
             let refuse = if root.owner_session.is_empty() {
                 Some("empty owner_session")
@@ -279,6 +288,9 @@ impl PiThalamusSource {
                 }
                 let mut blocked = previous.blocked;
                 if let Some(parsed) = read.parsed {
+                    if !parsed.resumed {
+                        reread_files.insert(path.clone());
+                    }
                     blocked = (previous.blocked && parsed.resumed)
                         || parsed.resume.is_none()
                         || parsed.skipped_lines > 0;
@@ -289,8 +301,22 @@ impl PiThalamusSource {
                         });
                     }
                     for record in parsed.messages {
+                        // An unconsumed final line may change before the next
+                        // read. Only queue records covered by the resume point.
+                        if read.has_unread_tail
+                            && parsed
+                                .resume
+                                .as_ref()
+                                .is_some_and(|resume| record.source_offset >= resume.offset())
+                        {
+                            continue;
+                        }
                         let completed_at_ms = record.occurred_at_ms;
                         let native_session = record.message.session_id.clone();
+                        let location = super::thalamus_payer_join::PiTranscriptLocation {
+                            path: path.clone(),
+                            offset: record.source_offset,
+                        };
                         match pi_source::map_message(record) {
                             Ok(mut request) => {
                                 request.session = Some(root.owner_session.clone());
@@ -300,6 +326,7 @@ impl PiThalamusSource {
                                     request,
                                     completed_at_ms,
                                     native_session: Some(native_session),
+                                    pi_location: Some(location),
                                 });
                             }
                             Err(reason) => {
@@ -314,6 +341,9 @@ impl PiThalamusSource {
                         "unreadable or rejected Pi records in {}",
                         path.display()
                     ));
+                }
+                if root.state == SessionState::Done && read.has_unread_tail {
+                    folder_problems.push(format!("unread tail in {}", path.display()));
                 }
                 folder_files.insert(
                     path,
@@ -351,6 +381,9 @@ impl PiThalamusSource {
         }
         let mut queue = cache.payer_wait.clone();
         queue.retain_recorded_sessions(&accepted);
+        queue.retain_pi_locations(|path| {
+            next_files.contains_key(path) && !reread_files.contains(path)
+        });
         let next = pi_source::record_calls(
             state,
             SOURCE_KEY,
@@ -364,6 +397,15 @@ impl PiThalamusSource {
         )?;
         cache.payer_wait = next;
         cache.files = next_files;
+        for path in &outcome.conflicting_copies {
+            if let Some(owner) = cache.block_copy(path) {
+                ready.remove(owner);
+            }
+            problems.push(format!(
+                "Pi token measurements disagree with a recorded call in {}",
+                path.display()
+            ));
+        }
         #[cfg(test)]
         {
             cache.last_read = (outcome.read_bytes, outcome.hashed_bytes);
@@ -440,6 +482,7 @@ impl HarnessSource for PiThalamusSource {
         if cache.payer_wait.is_empty() {
             return Ok(());
         }
+        let mut outcome = PiDrainOutcome::default();
         cache.payer_wait = pi_source::record_calls(
             state,
             SOURCE_KEY,
@@ -447,10 +490,13 @@ impl HarnessSource for PiThalamusSource {
             &[],
             at,
             false,
-            &mut PiDrainOutcome::default(),
+            &mut outcome,
             &|| stop.load(Ordering::Relaxed),
             &cache.payer_wait,
         )?;
+        for path in &outcome.conflicting_copies {
+            let _ = cache.block_copy(path);
+        }
         state.set_payer_waiting(SOURCE_KEY, cache.payer_wait.len());
         Ok(())
     }

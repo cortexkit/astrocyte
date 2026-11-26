@@ -555,6 +555,7 @@ fn add_counts(total: &mut ClaudeParseCounts, add: &ClaudeParseCounts) {
     total.skipped_lines += add.skipped_lines;
     total.usage_records += add.usage_records;
     total.records_without_request_id += add.records_without_request_id;
+    total.records_with_unidentified_usage += add.records_with_unidentified_usage;
     total.records_keyed_by_message_id += add.records_keyed_by_message_id;
     total.synthetic_records += add.synthetic_records;
     total.calls_refused += add.calls_refused;

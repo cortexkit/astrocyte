@@ -525,6 +525,7 @@ fn commit(
             match map_message(message.clone()) {
                 Ok(request) => {
                     calls.push(WaitingCall {
+                        pi_location: None,
                         request: options.stamp(request),
                         completed_at_ms: message.completed_at_ms,
                         native_session: None,

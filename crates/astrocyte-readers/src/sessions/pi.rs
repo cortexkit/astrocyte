@@ -672,9 +672,6 @@ fn parse_pi_format_file_inner(
     let mut records: Vec<PiUsageRecord> = Vec::with_capacity(64);
     let mut buffer = Vec::with_capacity(4096);
     let mut state = PiParseState::default();
-    // This entry point has no place to report skipped lines; the resumable
-    // reader that feeds ingest reports them.
-    let mut skipped_lines = 0_u64;
     // A header this parser rejects discards the whole transcript, not one
     // record, so the sink stops the scan and nothing is returned.
     let mut malformed_transcript = false;
@@ -686,11 +683,10 @@ fn parse_pi_format_file_inner(
             &mut buffer,
             observer,
             &mut records,
-            &mut skipped_lines,
             line,
         );
         malformed_transcript |= flow.is_break();
-        flow
+        flow.map_continue(|_| ())
     });
 
     if malformed_transcript {
@@ -835,20 +831,18 @@ struct PiParseState {
 /// Parses one non-empty line. `Break` means the transcript's header was
 /// rejected and the whole transcript must be discarded.
 ///
-/// `skipped_lines` is incremented for a line that is dropped on its own while
-/// reading continues: bytes that are not valid UTF-8, text that is not JSON,
-/// or a `message` record whose fields do not decode (a negative counter, a
-/// field of the wrong type). A readable record of another type is not a
-/// skipped line, even when this parser ignores it.
+/// `Continue(Some(reason))` reports an unreadable or rejected record without
+/// stopping the scan. An intentionally ignored record has no skip reason.
 fn parse_pi_line(
     context: &PiLineContext<'_>,
     state: &mut PiParseState,
     buffer: &mut Vec<u8>,
     observer: &mut impl PiFormatObserver,
     messages: &mut Vec<PiUsageRecord>,
-    skipped_lines: &mut u64,
     line: JsonLineBytes<'_>,
-) -> ControlFlow<()> {
+) -> ControlFlow<(), Option<&'static str>> {
+    const UNREADABLE: ControlFlow<(), Option<&str>> =
+        ControlFlow::Continue(Some("Pi record could not be decoded"));
     let options = context.options;
     // Pi, Senpi and Kimchi keep the byte-strict record skipping of
     // `BufRead::lines()`: a record whose bytes are not valid UTF-8 is
@@ -856,8 +850,7 @@ fn parse_pi_line(
     // Reading it lossily would make them emit messages they do not emit
     // today, which is the opt-in `PiParseOptions::standard` defers.
     if !options.lossy_line_reader && !line.valid_utf8 {
-        *skipped_lines += 1;
-        return ControlFlow::Continue(());
+        return UNREADABLE;
     }
     let trimmed = line.trimmed;
 
@@ -865,15 +858,14 @@ fn parse_pi_line(
         let entry_type = match parse_json_line::<PiEntryTypeProbe>(trimmed, buffer) {
             Some(probe) => probe.entry_type,
             None if options.lossy_line_reader && pre_header_line_is_skippable(trimmed, None) => {
-                *skipped_lines += 1;
-                return ControlFlow::Continue(());
+                return UNREADABLE;
             }
             None => return ControlFlow::Break(()),
         };
 
         if entry_type != "session" {
             if PRE_SESSION_METADATA_TYPES.contains(&entry_type.as_str()) {
-                return ControlFlow::Continue(());
+                return ControlFlow::Continue(None);
             }
             return ControlFlow::Break(());
         }
@@ -905,7 +897,7 @@ fn parse_pi_line(
             .as_deref()
             .and_then(workspace_label_from_key);
         state.is_rlm_subagent = header.rlm_depth.unwrap_or(0) > 0;
-        return ControlFlow::Continue(());
+        return ControlFlow::Continue(None);
     }
 
     let entry = if options.retain_extra_fields {
@@ -917,11 +909,10 @@ fn parse_pi_line(
         // ASTROCYTE DIVERGENCE: upstream drops an unreadable line without a
         // trace. It is counted here, as the Claude Code reader counts its
         // own, so a torn write shows up instead of a record vanishing.
-        match parse_json_line::<PiEntryTypeProbe>(trimmed, buffer) {
-            Some(probe) if probe.entry_type != "message" => {}
-            _ => *skipped_lines += 1,
-        }
-        return ControlFlow::Continue(());
+        return match parse_json_line::<PiEntryTypeProbe>(trimmed, buffer) {
+            Some(probe) if probe.entry_type != "message" => ControlFlow::Continue(None),
+            _ => UNREADABLE,
+        };
     };
 
     // Only native Pi operations are covered here. Other clients sharing this
@@ -940,9 +931,9 @@ fn parse_pi_line(
                     }
                 }
             }
-            None => *skipped_lines += 1,
+            None => return UNREADABLE,
         }
-        return ControlFlow::Continue(());
+        return ControlFlow::Continue(None);
     }
 
     #[cfg(test)]
@@ -980,7 +971,7 @@ fn parse_pi_line(
                 .and_then(pi_subagent_name)
         };
         observer.observe_entry(&entry, None);
-        return ControlFlow::Continue(());
+        return ControlFlow::Continue(None);
     }
 
     let Some(PiEmittedRecord {
@@ -990,7 +981,31 @@ fn parse_pi_line(
     }) = pi_emitted_record(&entry, options, state.is_rlm_subagent)
     else {
         observer.observe_entry(&entry, None);
-        return ControlFlow::Continue(());
+        let missing_model = context.client == "pi"
+            && entry.entry_type == "message"
+            && entry.message.as_ref().is_some_and(|message| {
+                message.role.as_deref() == Some("assistant")
+                    && message
+                        .response_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty())
+                    && message.model.is_none()
+                    && message.usage.as_ref().is_some_and(|usage| {
+                        [
+                            usage.input,
+                            usage.output,
+                            usage.cache_read,
+                            usage.cache_write,
+                            usage.total_tokens,
+                            usage.reasoning,
+                        ]
+                        .iter()
+                        .any(Option::is_some)
+                    })
+            });
+        return ControlFlow::Continue(
+            missing_model.then_some("Pi assistant usage is missing model"),
+        );
     };
 
     let model = if !accepts_replacement_field(recorded_model, options.lossy_line_reader) {
@@ -1090,7 +1105,7 @@ fn parse_pi_line(
         operation: None,
         stop_reason: message.stop_reason.clone(),
     });
-    ControlFlow::Continue(())
+    ControlFlow::Continue(None)
 }
 
 #[cfg(test)]
@@ -1321,14 +1336,12 @@ pub fn parse_pi_file_resumable(
             if !trimmed.is_empty() {
                 let previous_len = messages.len();
                 let mut scratch = state.clone();
-                let mut uncounted = 0_u64;
                 let _ = parse_pi_line(
                     &context,
                     &mut scratch,
                     &mut buffer,
                     &mut observer,
                     &mut messages,
-                    &mut uncounted,
                     JsonLineBytes {
                         bytes: payload,
                         trimmed,
@@ -1344,14 +1357,12 @@ pub fn parse_pi_file_resumable(
 
         if !trimmed.is_empty() {
             let previous_len = messages.len();
-            let skipped = skipped_lines;
             let flow = parse_pi_line(
                 &context,
                 &mut state,
                 &mut buffer,
                 &mut observer,
                 &mut messages,
-                &mut skipped_lines,
                 JsonLineBytes {
                     bytes: payload,
                     trimmed,
@@ -1361,8 +1372,9 @@ pub fn parse_pi_file_resumable(
             for record in &mut messages[previous_len..] {
                 record.source_offset = consumed;
             }
-            if skipped_lines > skipped {
-                set_aside.push((consumed, "Pi record could not be decoded".into()));
+            if let ControlFlow::Continue(Some(reason)) = flow {
+                skipped_lines += 1;
+                set_aside.push((consumed, reason.into()));
             }
             if flow.is_break() {
                 // A rejected header discards the whole transcript, exactly as

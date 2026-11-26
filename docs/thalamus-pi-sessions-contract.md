@@ -89,8 +89,10 @@ ordinary Pi payer wait queue under the
 facts up to the existing ten-minute bound; expiry records unknown payer facts
 before the folder becomes eligible for acknowledgement.
 
-If a call identity already exists in the ledger, it counts as recorded. The
-first event's session, work class, measurements and money stand. Copied history
+If a call identity already exists in the ledger, it counts as recorded only when
+its token quantities agree with what's recorded; a disagreement is set aside as
+evidence and withholds that folder's acknowledgement.
+The first event's session, work class, measurements and money stand. Copied history
 is neither rewritten nor quarantined because its new owner differs. The identity
 check runs inside the recording transaction, including across folders in one
 drain.

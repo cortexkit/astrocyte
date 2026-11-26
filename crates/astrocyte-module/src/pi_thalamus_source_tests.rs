@@ -98,6 +98,130 @@ impl Fixture {
 mod recorded_vector;
 
 #[test]
+fn done_pi_torn_tail_blocks_deletion_until_repaired() {
+    let f = Fixture::new();
+    let path = f.folder.join("session.jsonl");
+    let last = TRANSCRIPT.lines().last().unwrap();
+    let incomplete = last.strip_suffix('}').unwrap();
+    let header = TRANSCRIPT.lines().next().unwrap();
+    fs::write(&path, format!("{header}\n{incomplete}")).unwrap();
+    f.declare(vec![f.root()]);
+    for at in [1001, 1002] {
+        f.tick(at);
+        assert_eq!(f.count("usage_event"), 0);
+        assert_eq!(
+            f.acks()["read_through"],
+            json!([]),
+            "the unread tail can contain usage"
+        );
+    }
+
+    f.call();
+    f.tick(1003);
+    assert_eq!(f.count("usage_event"), 1);
+    assert_eq!(
+        f.acks()["read_through"],
+        json!([{"session":"core-conversation","at_ms":1003}])
+    );
+}
+
+#[test]
+fn done_pi_usage_without_model_holds_ack_and_keeps_evidence() {
+    let f = Fixture::new();
+    let path = f.folder.join("session.jsonl");
+    let transcript = TRANSCRIPT.replace(r#""model":"claude-sonnet-4","#, "");
+    fs::write(&path, &transcript).unwrap();
+    f.declare(vec![f.root()]);
+    for at in [1001, 1002] {
+        f.tick(at);
+        assert_eq!(f.count("usage_event"), 0);
+        assert_eq!(
+            f.acks()["read_through"],
+            json!([]),
+            "usage without a model must hold the folder"
+        );
+    }
+    f.state
+        .with_conn(|conn| {
+            let (locator, reason): (String, String) = conn
+                .query_row(
+                    "SELECT locator,reason FROM set_aside_record WHERE source_key='pi-thalamus'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let byte = transcript.find('\n').unwrap() + 1;
+            assert_eq!(locator, format!("{path:?}:byte:{byte}"));
+            assert!(reason.contains("missing model"), "{reason}");
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn done_pi_changed_usage_is_not_an_acknowledgeable_copy() {
+    let f = Fixture::new();
+    f.call();
+    let conflicting = f.folder.with_file_name("worker-two").join("session.jsonl");
+    fs::create_dir(conflicting.parent().unwrap()).unwrap();
+    fs::write(
+        &conflicting,
+        TRANSCRIPT.replace(r#""input":11"#, r#""input":12"#),
+    )
+    .unwrap();
+    let mut other = f.root();
+    other["path"] = json!(conflicting.parent().unwrap());
+    other["owner_session"] = json!("another-conversation");
+    f.declare(vec![f.root(), other]);
+    for at in [1001, 1002] {
+        f.tick(at);
+        assert_eq!(f.count("usage_event"), 1);
+        assert_eq!(
+            f.acks()["read_through"],
+            json!([{"session":"core-conversation","at_ms":1001}]),
+            "only the folder with recorded usage may be deleted"
+        );
+        f.state
+            .with_conn(|conn| {
+                let input: i64 = conn
+                    .query_row(
+                        "SELECT quantity_units FROM measurement WHERE role='input'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(input, 11);
+                Ok(())
+            })
+            .unwrap();
+    }
+    f.state
+        .with_conn(|conn| {
+            let (locator, reason): (String, String) = conn
+                .query_row(
+                    "SELECT locator,reason FROM set_aside_record WHERE source_key='pi-thalamus'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let offset = TRANSCRIPT.find('\n').unwrap() + 1;
+            assert_eq!(locator, format!("{conflicting:?}:byte:{offset}"));
+            assert!(reason.contains("token measurements disagree"), "{reason}");
+            Ok(())
+        })
+        .unwrap();
+    fs::write(&conflicting, TRANSCRIPT).unwrap();
+    f.tick(1003);
+    assert_eq!(
+        f.acks()["read_through"],
+        json!([
+            {"session":"another-conversation","at_ms":1003},
+            {"session":"core-conversation","at_ms":1001},
+        ])
+    );
+}
+
+#[test]
 fn missing_roots_is_absent_and_health_unchanged() {
     let f = Fixture::new();
     assert_eq!(f.tick(1001), None);
@@ -140,6 +264,47 @@ fn pi_payer_cache_split_resolves_a_wait_with_lifetime_measurements() {
     assert_eq!(
         f.acks()["read_through"],
         json!([{"session":"core-conversation","at_ms":1002}])
+    );
+}
+
+#[test]
+fn pi_payer_waits_keep_copy_locations_and_compare_against_split_measurements() {
+    let f = Fixture::new();
+    f.managed();
+    let original = TRANSCRIPT.replace(r#""reasoning":2"#, r#""reasoning":0"#);
+    fs::write(f.folder.join("session.jsonl"), &original).unwrap();
+    let copy_root = |folder: &str, owner: &str, transcript: &str| {
+        let path = f.folder.with_file_name(folder);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("session.jsonl"), transcript).unwrap();
+        let mut root = f.root();
+        root["path"] = json!(path);
+        root["owner_session"] = json!(owner);
+        root
+    };
+    let exact = copy_root("worker-two", "exact-copy", &original);
+    let without_reasoning = original.replace(r#","reasoning":0"#, "");
+    assert_ne!(original, without_reasoning);
+    let conflict = copy_root("worker-three", "conflicting-copy", &without_reasoning);
+    f.declare(vec![f.root(), exact, conflict]);
+    assert_eq!(f.tick(1001), None);
+    assert_eq!(f.acks()["read_through"], json!([]));
+    assert_eq!(f.count("usage_event"), 0);
+
+    f.state.ordered_write(|tx| {
+        tx.execute("INSERT INTO thalamus_payer_record(attempt_id,seq,incarnation,harness,session,request_kind,step_ref,recorded_at_ms,provider,model,charge_basis,auth_selection,usage_json) VALUES ('attempt',1,'first','pi','pi-synthetic-one','main','pi:response:pi-synthetic-response',1002,'anthropic','claude-sonnet-4','metered_api','synthetic-login',?1)", [r#"{"cache_write_5m_tokens":5,"cache_write_1h_tokens":12}"#]).unwrap();
+        Ok(((), true))
+    }).unwrap();
+    f.source.drain_fast(&f.state, 1002, &NEVER_STOP).unwrap();
+    f.tick(1003);
+    assert_eq!(f.count("usage_event"), 1);
+    assert_eq!(f.count("set_aside_record"), 1);
+    assert_eq!(
+        f.acks()["read_through"],
+        json!([
+            {"session":"core-conversation","at_ms":1003},
+            {"session":"exact-copy","at_ms":1003},
+        ])
     );
 }
 

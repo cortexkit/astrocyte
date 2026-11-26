@@ -194,6 +194,10 @@ Each source resolves its store path by these rules, implemented in
   `session` is null, and is retained for the Pi payer join. A non-null session
   disagreement refuses the whole folder by name. Done folders are acknowledged
   only after their calls commit, including calls delayed by payer waits.
+  Copies count as recorded only when their token quantities agree; absent
+  counts are distinct from zero. When payer facts split the cache-write count
+  by lifetime, the reader compares their sum with the transcript's total. A
+  disagreement is set aside by file and record and holds the folder's acknowledgement.
 - broca's store is read only at the default data-home path. A
   `BROCA_STATE_ROOT` elsewhere puts it where astrocyte does not look, and it
   reads as absent.
@@ -275,8 +279,10 @@ Rules that affect what is recorded:
   then has no `vendor_request_id`, and the parse counts these records as
   `records_keyed_by_message_id`. An entry with no `requestId` whose counts are
   all zero or absent is a local notice: it is counted in
-  `records_without_request_id` and records nothing, as is one with no message
-  id. Anthropic request ids start `req_` and message ids `msg_`, so the two
+  `records_without_request_id` and records nothing. A record with nonzero
+  usage but neither usable id is set aside by location; a declared folder
+  cannot be acknowledged while that usage is unrecorded. Anthropic request
+  ids start `req_` and message ids `msg_`, so the two
   kinds of key never collide; a transcript where they do has that call
   refused, not merged. Tests:
   `billed_record_without_request_id_is_keyed_by_its_message_id`,

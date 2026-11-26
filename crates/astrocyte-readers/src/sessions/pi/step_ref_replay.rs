@@ -135,7 +135,6 @@ fn replay_file(
             &mut buffer,
             &mut observer,
             &mut messages,
-            &mut counts.skipped_lines,
             JsonLineBytes {
                 bytes,
                 trimmed,
@@ -145,6 +144,9 @@ fn replay_file(
         if flow.is_break() {
             counts.rejected_files += 1;
             break;
+        }
+        if matches!(flow, std::ops::ControlFlow::Continue(Some(_))) {
+            counts.skipped_lines += 1;
         }
         counts.records += u64::try_from(messages.len()).unwrap();
         let shared = messages

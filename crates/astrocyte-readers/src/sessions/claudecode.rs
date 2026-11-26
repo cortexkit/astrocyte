@@ -666,6 +666,9 @@ pub struct ClaudeParseCounts {
     /// `message.id` to key the call by. Every such record in the measured
     /// corpus is a local notice with zero usage.
     pub records_without_request_id: u64,
+    /// Records with nonzero usage but neither a request nor a message id.
+    /// These cannot be identified and are set aside, unlike local notices.
+    pub records_with_unidentified_usage: u64,
     /// Assistant records with no `requestId` but a `message.id` and at least
     /// one non-zero usage counter, keyed by the message id. A subset of
     /// `usage_records`. These are billed calls whose `request-id` header a
@@ -855,6 +858,9 @@ fn parse_line(
         }
         (None, _) => {
             counts.records_without_request_id += 1;
+            if usage_counts.any_nonzero() {
+                counts.records_with_unidentified_usage += 1;
+            }
             return;
         }
     };
@@ -965,8 +971,14 @@ pub fn parse_claude_file_with_final_tail(
         |state, payload, tail| {
             counts.lines += 1;
             let skipped = counts.skipped_lines;
+            let unidentified = counts.records_with_unidentified_usage;
             parse_line(payload, &mut buffer, &mut state.parse, &mut counts);
-            if counts.skipped_lines > skipped && tail.is_some() {
+            if counts.records_with_unidentified_usage > unidentified {
+                set_aside.push((
+                    state.parse.lines,
+                    "Claude Code record has usage but neither a request id nor a message id".into(),
+                ));
+            } else if counts.skipped_lines > skipped && tail.is_some() {
                 rejected_tail = tail;
             } else if counts.skipped_lines > skipped {
                 set_aside.push((

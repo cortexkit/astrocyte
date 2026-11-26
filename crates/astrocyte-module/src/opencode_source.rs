@@ -1094,6 +1094,7 @@ fn map_messages(
         let completed_at_ms = message.completed_at_ms;
         match map_message(message) {
             Ok(request) => requests.push(WaitingCall {
+                pi_location: None,
                 request: options.stamp(request),
                 completed_at_ms,
                 native_session: None,
@@ -1167,6 +1168,7 @@ fn commit_page_with_evidence(
     let calls = requests
         .iter()
         .map(|request| WaitingCall {
+            pi_location: None,
             request: request.clone(),
             completed_at_ms: None,
             native_session: None,
@@ -1306,6 +1308,7 @@ pub(crate) fn resolve_payer_in_tx(
         waiting.resolve_in_tx(tx, "opencode", calls, now, await_session_snapshot)
     } else {
         Ok(Resolution {
+            declared_pi: Vec::new(),
             ready: calls.iter().map(|call| call.request.clone()).collect(),
             next: waiting.clone(),
             already_recorded: 0,

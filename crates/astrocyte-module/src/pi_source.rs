@@ -1,7 +1,7 @@
 //! Pi's on-disk session producer and `UnifiedMessage` ingest mapping.
 
 use super::harness_drain::DrainMode;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(any(test, feature = "test-support"))]
 use std::ffi::OsString;
 #[cfg(test)]
@@ -22,6 +22,7 @@ use astrocyte_readers::sessions::UnifiedMessage;
 use chrono::DateTime;
 #[cfg(test)]
 use rusqlite::params;
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 
 use crate::refresher::harness_drain::select_files;
@@ -84,6 +85,7 @@ pub(crate) struct PiDrainOutcome {
     pub rows_recorded: usize,
     pub exact_redeliveries: usize,
     pub quarantined_redeliveries: usize,
+    pub conflicting_copies: HashSet<PathBuf>,
     /// Bytes this drain fed to SHA-256 while reading session files. A
     /// steady-state drain is O(window + appended) per grown file, never
     /// O(file); tests assert that bound here instead of measuring wall time.
@@ -158,6 +160,7 @@ pub(crate) struct PiFileState {
 pub(crate) struct PiFileRead {
     pub(crate) state: PiFileState,
     pub(crate) parsed: Option<PiResumableParse>,
+    pub(crate) has_unread_tail: bool,
 }
 
 impl PiFileState {
@@ -181,6 +184,7 @@ impl PiFileState {
             return Ok(PiFileRead {
                 state: self.clone(),
                 parsed: None,
+                has_unread_tail: false,
             });
         }
         let previous = resumable.then_some(self.resume.as_ref()).flatten();
@@ -203,18 +207,23 @@ impl PiFileState {
             return Ok(PiFileRead {
                 state: self.clone(),
                 parsed: None,
+                has_unread_tail: false,
             });
         }
         let parsed = parse_pi_file_resumable(path, previous, check);
+        let offset = parsed.resume.as_ref().map(PiResumePoint::offset);
+        let start = previous
+            .filter(|_| parsed.resumed)
+            .map_or(0, PiResumePoint::offset);
+        let observed_len = stat.len.max(start.saturating_add(parsed.read_bytes));
         let mut state = Self::default();
         if resumable {
-            let offset = parsed.resume.as_ref().map(PiResumePoint::offset);
             state.window = Some(WindowSchedule::after_read(
                 window,
                 stat.clone(),
                 at,
                 parsed.resumed && offset == previous.map(PiResumePoint::offset),
-                offset == Some(stat.len),
+                offset == Some(observed_len),
             ));
             state.resume = parsed.resume.clone();
             state.prefix_verified_ms =
@@ -227,6 +236,7 @@ impl PiFileState {
         Ok(PiFileRead {
             state,
             parsed: Some(parsed),
+            has_unread_tail: offset.is_some_and(|offset| offset < observed_len),
         })
     }
 }
@@ -1024,6 +1034,7 @@ fn record_requests(
             // Pi writes each assistant entry with the completed response.
             completed_at_ms: request.occurred_at_ms,
             native_session: None,
+            pi_location: None,
         })
         .collect::<Vec<_>>();
     record_calls(
@@ -1072,30 +1083,53 @@ pub(crate) fn record_calls(
             stopped = true;
             return Err("Pi ingest stopped".into());
         }
-        let newly_seen = record_set_aside_in_tx(tx, source_key, set_aside, recorded_at_ms)?;
+        let mut newly_seen = record_set_aside_in_tx(tx, source_key, set_aside, recorded_at_ms)?;
         let payer =
             payer_wait.resolve_in_tx(tx, "pi", calls, recorded_at_ms, await_session_snapshot)?;
-        let mut dispositions = Vec::new();
+        let mut dispositions = record_events_in_tx(
+            tx,
+            "Pi",
+            &payer.ready,
+            recorded_at_ms,
+            stop_requested,
+            &mut stopped,
+        )?;
         let mut copied = 0;
-        for request in &payer.ready {
-            if source_key == super::pi_thalamus_source::SOURCE_KEY {
-                let id = astrocyte_core::fact::event_id(
-                    &request.producer,
-                    request.producer_lineage.as_deref(),
-                    &request.producer_ref,
+        let mut conflicting_copies = HashSet::new();
+        let mut conflicts = Vec::new();
+        for call in &payer.declared_pi {
+            let request = &call.request;
+            let id = astrocyte_core::fact::event_id(
+                &request.producer,
+                request.producer_lineage.as_deref(),
+                &request.producer_ref,
+            )
+            .map_err(|e| format!("derive Pi identity: {e:?}"))?;
+            let stored: Option<i64> = tx
+                .query_row(
+                    "SELECT event_key FROM usage_event WHERE event_id=?1",
+                    [&id],
+                    |row| row.get(0),
                 )
-                .map_err(|e| format!("derive Pi identity: {e:?}"))?;
-                let recorded: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM usage_event WHERE event_id=?1)",
-                        [&id],
-                        |r| r.get(0),
-                    )
-                    .map_err(|e| e.to_string())?;
-                if recorded {
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some(event_key) = stored {
+                if copy_tokens_match(tx, event_key, &call.transcript_measurements)
+                    .map_err(|error| error.to_string())?
+                {
                     copied += 1;
-                    continue;
+                } else {
+                    let location = &call.location;
+                    conflicting_copies.insert(location.path.clone());
+                    conflicts.push(super::SetAsideRecord {
+                        locator: format!("{:?}:byte:{}", location.path, location.offset),
+                        reason: format!(
+                            "Pi token measurements disagree with recorded call {}",
+                            request.producer_ref
+                        ),
+                    });
                 }
+                continue;
             }
             dispositions.extend(record_events_in_tx(
                 tx,
@@ -1106,6 +1140,12 @@ pub(crate) fn record_calls(
                 &mut stopped,
             )?);
         }
+        newly_seen.extend(record_set_aside_in_tx(
+            tx,
+            source_key,
+            &conflicts,
+            recorded_at_ms,
+        )?);
         if update_runtime {
             mark_current_in_tx(tx, source_key, "Pi", recorded_at_ms)?;
             tx.execute(
@@ -1114,9 +1154,12 @@ pub(crate) fn record_calls(
             )
             .map_err(|e| e.to_string())?;
         }
-        Ok(((dispositions, newly_seen, payer, copied), true))
+        Ok((
+            (dispositions, newly_seen, payer, copied, conflicting_copies),
+            true,
+        ))
     });
-    let (dispositions, newly_seen, payer, copied) = match committed {
+    let (dispositions, newly_seen, payer, copied, conflicting_copies) = match committed {
         Ok(committed) => committed,
         Err(_) if stopped => return Err(SourceDrainError::Stopped),
         Err(reason) => return Err(SourceDrainError::Failed(reason)),
@@ -1126,8 +1169,58 @@ pub(crate) fn record_calls(
     outcome.rows_recorded = tally.recorded;
     outcome.exact_redeliveries = tally.exact_redeliveries + payer.already_recorded + copied;
     outcome.quarantined_redeliveries = tally.quarantined_redeliveries;
+    outcome.conflicting_copies = conflicting_copies;
     super::thalamus_payer_join::warn_overflow(source_key, payer.overflow_started);
     Ok(payer.next)
+}
+
+fn copy_tokens_match(
+    tx: &rusqlite::Transaction<'_>,
+    event_key: i64,
+    measurements: &[astrocyte_core::ingest::MeasurementInput],
+) -> rusqlite::Result<bool> {
+    let mut query = tx.prepare_cached(
+        "SELECT role,unit,quantity_units,quantity_exponent FROM measurement
+         WHERE event_key=?1 AND kind='billed'",
+    )?;
+    let mut rows = query.query([event_key])?;
+    let mut stored = BTreeMap::new();
+    let mut cache_5m: Option<i64> = None;
+    let mut cache_1h: Option<i64> = None;
+    while let Some(row) = rows.next()? {
+        let role: String = row.get(0)?;
+        let unit: String = row.get(1)?;
+        let quantity: Option<i64> = row.get(2)?;
+        if row.get::<_, Option<i32>>(3)? != Some(0) || quantity.is_none() {
+            return Ok(false);
+        }
+        match (role.as_str(), unit.as_str()) {
+            (_, "token") => {
+                stored.insert(role, quantity);
+            }
+            ("cache_write", "token_cache_5m") => cache_5m = quantity,
+            ("cache_write", "token_cache_1h") => cache_1h = quantity,
+            _ => return Ok(false),
+        }
+    }
+    // The payer may have split a reported total; compare the transcript to
+    // the whole total without changing the ledger's lifetime measurements.
+    match (cache_5m, cache_1h) {
+        (Some(short), Some(long)) => {
+            let Some(total) = short.checked_add(long) else {
+                return Ok(false);
+            };
+            if stored.insert("cache_write".into(), Some(total)).is_some() {
+                return Ok(false);
+            }
+        }
+        (None, None) => {}
+        _ => return Ok(false),
+    }
+    Ok(stored.len() == measurements.len()
+        && measurements
+            .iter()
+            .all(|m| stored.get(&m.role) == Some(&m.quantity_units)))
 }
 
 #[cfg(test)]

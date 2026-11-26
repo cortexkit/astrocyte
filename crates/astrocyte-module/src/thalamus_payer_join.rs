@@ -25,6 +25,13 @@ pub(crate) struct WaitingCall {
     /// `request.session` holds core's bound conversation id. Payer membership
     /// and deletion acknowledgements still use this native id.
     pub(crate) native_session: Option<String>,
+    pub(crate) pi_location: Option<PiTranscriptLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PiTranscriptLocation {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) offset: u64,
 }
 
 impl WaitingCall {
@@ -37,7 +44,7 @@ impl WaitingCall {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WaitQueue {
-    waiting: BTreeMap<String, WaitingCall>,
+    waiting: BTreeMap<(String, Option<PiTranscriptLocation>), WaitingCall>,
     overflow_reported: bool,
 }
 
@@ -46,12 +53,31 @@ pub(crate) struct WaitQueue {
 /// `next`. On any failure keep the original queue and reader resume state.
 pub(crate) struct Resolution {
     pub(crate) ready: Vec<EventRecordRequest>,
+    pub(crate) declared_pi: Vec<DeclaredPiCall>,
     pub(crate) next: WaitQueue,
     pub(crate) already_recorded: usize,
     pub(crate) overflow_started: bool,
 }
 
+pub(crate) struct DeclaredPiCall {
+    pub(crate) location: PiTranscriptLocation,
+    pub(crate) transcript_measurements: Vec<astrocyte_core::ingest::MeasurementInput>,
+    pub(crate) request: EventRecordRequest,
+}
+
 impl Resolution {
+    fn push_ready(&mut self, call: &WaitingCall, request: EventRecordRequest) {
+        if let Some(location) = &call.pi_location {
+            self.declared_pi.push(DeclaredPiCall {
+                location: location.clone(),
+                transcript_measurements: call.request.measurements.clone(),
+                request,
+            });
+        } else {
+            self.ready.push(request);
+        }
+    }
+
     fn wait_for_payer(
         &mut self,
         tx: &Transaction<'_>,
@@ -65,7 +91,9 @@ impl Resolution {
         };
         if now.saturating_sub(started) < PAYER_WAIT_MS {
             if self.next.len() < MAX_WAITING_CALLS {
-                self.next.waiting.insert(id, call.clone());
+                self.next
+                    .waiting
+                    .insert((id, call.pi_location.clone()), call.clone());
                 return Ok(true);
             }
             if !self.next.overflow_reported {
@@ -106,6 +134,14 @@ impl WaitQueue {
                 .session
                 .as_ref()
                 .is_some_and(|owner| owners.contains(owner))
+        });
+    }
+
+    pub(crate) fn retain_pi_locations(&mut self, keep: impl Fn(&std::path::Path) -> bool) {
+        self.waiting.retain(|_, call| {
+            call.pi_location
+                .as_ref()
+                .is_none_or(|location| keep(&location.path))
         });
     }
 
@@ -178,6 +214,7 @@ impl WaitQueue {
             };
         let mut result = Resolution {
             ready: Vec::new(),
+            declared_pi: Vec::new(),
             next: Self {
                 waiting: BTreeMap::new(),
                 overflow_reported: self.overflow_reported,
@@ -201,7 +238,16 @@ impl WaitQueue {
             // A transcript may redeliver a queued call while replaying a held
             // durable cursor. Keep its completion and payload; the roots reader
             // refreshes only the queued session attribution from declarations.
-            if !was_waiting && self.waiting.contains_key(&id) {
+            let key = (id.clone(), call.pi_location.clone());
+            if !was_waiting && self.waiting.contains_key(&key) {
+                continue;
+            }
+            // A Pi folder still needs its own token comparison when the response
+            // is already recorded. It needs neither another payer lookup nor
+            // another event. A location also keeps different copies from
+            // suppressing each other while they wait for payer facts.
+            if call.pi_location.is_some() && event_recorded(tx, &id)? {
+                result.push_ready(call, request.clone());
                 continue;
             }
             let owner: Option<Option<String>> = tx
@@ -220,18 +266,11 @@ impl WaitQueue {
                     };
                     // Equal timestamps don't show whether the call began before the snapshot.
                     if snapshot_begin.is_none_or(|begin| begin <= start) {
-                        let recorded: bool = tx
-                            .query_row(
-                                "SELECT EXISTS(SELECT 1 FROM usage_event WHERE event_id=?1)",
-                                [&id],
-                                |row| row.get(0),
-                            )
-                            .map_err(|error| error.to_string())?;
-                        if recorded {
+                        if call.pi_location.is_none() && event_recorded(tx, &id)? {
                             result.already_recorded += 1;
                             continue;
                         }
-                        if result.next.waiting.contains_key(&id) {
+                        if result.next.waiting.contains_key(&key) {
                             continue;
                         }
                         if result.wait_for_payer(tx, id, call, now_ms)? {
@@ -239,7 +278,7 @@ impl WaitQueue {
                         }
                     }
                 }
-                result.ready.push(request.clone());
+                result.push_ready(call, request.clone());
                 continue;
             }
             let owner = owner.flatten();
@@ -252,14 +291,7 @@ impl WaitQueue {
             }
             // A declaration may arrive after the call was recorded. Keep the
             // first payload, including an absent work class, on transcript replay.
-            let recorded: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM usage_event WHERE event_id=?1)",
-                    [&id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            if recorded {
+            if call.pi_location.is_none() && event_recorded(tx, &id)? {
                 result.already_recorded += 1;
                 continue;
             }
@@ -290,7 +322,7 @@ impl WaitQueue {
                     unknown(&mut ready);
                 }
                 PayerMatch::Missing => {
-                    if result.next.waiting.contains_key(&id) {
+                    if result.next.waiting.contains_key(&key) {
                         continue;
                     }
                     if result.wait_for_payer(tx, id, call, now_ms)? {
@@ -299,13 +331,22 @@ impl WaitQueue {
                     unknown(&mut ready);
                 }
             }
-            result.ready.push(ready);
+            result.push_ready(call, ready);
         }
         if result.next.len() < MAX_WAITING_CALLS {
             result.next.overflow_reported = false;
         }
         Ok(result)
     }
+}
+
+fn event_recorded(tx: &Transaction<'_>, id: &str) -> Result<bool, String> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM usage_event WHERE event_id=?1)",
+        [id],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn apply_cache_split(
@@ -402,7 +443,7 @@ mod tests {
     use serde_json::json;
 
     fn call(reference: &str, completed: Option<i64>) -> WaitingCall {
-        WaitingCall { request: serde_json::from_value(json!({"producer":"pi","producer_ref":reference,"session":"session-a","provider":"anthropic","model":"model-a","occurred_at_ms":100,"charge_basis":"unknown","measurements":[]})).unwrap(),completed_at_ms:completed, native_session:None }
+        WaitingCall { request: serde_json::from_value(json!({"producer":"pi","producer_ref":reference,"session":"session-a","provider":"anthropic","model":"model-a","occurred_at_ms":100,"charge_basis":"unknown","measurements":[]})).unwrap(),completed_at_ms:completed, native_session:None, pi_location:None }
     }
     fn manage(state: &SharedState) {
         state

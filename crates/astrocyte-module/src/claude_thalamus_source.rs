@@ -224,6 +224,7 @@ impl ClaudeThalamusSource {
         }
         let mut resumes = HashMap::new();
         let mut ready = HashSet::new();
+        let mut parser_pending = HashSet::new();
         let mut refs_by_session = HashMap::new();
         let mut blocked = cache.blocked.clone();
         let mut requests = Vec::new();
@@ -285,6 +286,9 @@ impl ClaudeThalamusSource {
             if read.outcome.counts.calls_refused > 0 || !read.set_aside.is_empty() {
                 blocked.insert(root.session.clone());
             }
+            if read.outcome.calls_pending > 0 {
+                parser_pending.insert(root.session.clone());
+            }
             if root.state == SessionState::Done
                 && read.outcome.calls_pending == 0
                 && !blocked.contains(&root.session)
@@ -315,6 +319,7 @@ impl ClaudeThalamusSource {
                         .flatten(),
                     request,
                     native_session,
+                    pi_location: None,
                 }
             }));
             set_aside.extend(read.set_aside);
@@ -363,10 +368,10 @@ impl ClaudeThalamusSource {
         }
         // An acknowledgement entry tells THALAMUS it may delete that session's
         // folder. An unusable roots file can't add entries, but a session with
-        // a call still waiting for its payer row must lose any entry it
-        // already has, so its folder isn't deleted before the call is recorded.
+        // a call still waiting for completion or its payer row must lose any
+        // entry it already has, so its folder isn't deleted before recording.
         let waiting = cache.payer_wait.pending_sessions();
-        if registry_valid || !waiting.is_empty() {
+        if registry_valid || !waiting.is_empty() || !parser_pending.is_empty() {
             let mut entries: BTreeMap<_, _> = cache
                 .ack
                 .as_ref()
@@ -377,6 +382,7 @@ impl ClaudeThalamusSource {
                     (!registry_valid
                         || (accepted.contains(&r.session) && !cache.blocked.contains(&r.session)))
                         && !waiting.contains(&r.session)
+                        && !parser_pending.contains(&r.session)
                 })
                 .map(|r| (r.session.clone(), r.at_ms))
                 .collect();
@@ -592,6 +598,68 @@ mod tests {
             format!("{record}\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn done_claude_usage_without_either_id_blocks_deletion() {
+        let f = Fixture::new();
+        f.call(SESSION, "good", true);
+        let path = f
+            .config(SESSION)
+            .join("projects/encoded-cwd/session/subagents/missing-id.jsonl");
+        let record = json!({"type":"assistant","sessionId":SESSION,
+            "message":{"id":"","model":"claude-opus-5","stop_reason":"end_turn",
+                       "usage":{"input_tokens":11,"output_tokens":5}}});
+        fs::write(&path, format!("{record}\n")).unwrap();
+        f.declare(vec![f.root(SESSION, true)]);
+        for at in [100, 101] {
+            f.tick(at);
+            assert_eq!(f.events().len(), 1);
+            assert_eq!(f.events()[0].0, "good");
+            assert_eq!(
+                f.acks()["read_through"],
+                json!([]),
+                "unidentified usage must hold the folder"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_claude_append_withdraws_an_existing_deletion_ack() {
+        let f = Fixture::new();
+        f.call(SESSION, "good", true);
+        f.declare(vec![f.root(SESSION, true)]);
+        f.tick(100);
+        assert_eq!(
+            f.acks()["read_through"],
+            json!([{"session":SESSION,"at_ms":100}])
+        );
+
+        let path = f
+            .config(SESSION)
+            .join("projects/encoded-cwd/session/subagents/good.jsonl");
+        let pending = json!({"type":"assistant","sessionId":SESSION,"requestId":"pending",
+            "message":{"id":"msg_pending","model":"claude-opus-5",
+                       "usage":{"input_tokens":11,"output_tokens":5}}});
+        let mut transcript = fs::read_to_string(&path).unwrap();
+        transcript.push_str(&format!("{pending}\n"));
+        fs::write(&path, transcript).unwrap();
+        f.tick(101);
+        assert_eq!(f.events().len(), 1);
+        assert_eq!(
+            f.acks()["read_through"],
+            json!([]),
+            "parser-pending usage must withdraw the ack"
+        );
+
+        let settled =
+            101 + astrocyte_readers::sessions::claudecode::CLAUDE_CODE_QUIET_WINDOW_MS + 1;
+        f.tick(settled);
+        assert_eq!(f.events().len(), 2);
+        assert_eq!(
+            f.acks()["read_through"],
+            json!([{"session":SESSION,"at_ms":settled}])
+        );
     }
 
     #[test]
