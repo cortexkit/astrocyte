@@ -1,4 +1,8 @@
 //! Retry intervals for optional publishers the daemon reports absent.
+//!
+//! The daemon counts every refused route open, so asking an absent module on
+//! every tick would log a refusal forever. These publishers keep their records
+//! until astrocyte reads them, so a later first read loses nothing.
 
 const FIRST_RETRY_MS: i64 = 60_000;
 const MAX_RETRY_MS: i64 = 600_000;
