@@ -93,8 +93,9 @@ midnight ending the observation day, including on recompute.
 
 A subset matches the call's own catalog model ID: try an exact row, then
 remove a trailing `-low` or `-high` if the row is missing, then try an alias.
-An unresolved model belongs only to `all` pools. Membership does not use a
-`quota_proxy` target or depend on whether the rates are usable. A listed
+An unresolved model belongs only to `all` pools. Membership ignores a
+`quota_proxy` price link, through which a plan's model borrows another
+model's list prices, and does not depend on whether the rates are usable. A listed
 model with unusable rates is still a member, and its unpriced usage enters
 that pool's diagnostics. List valuation starts from the call's own provider
 and follows catalog references rather than a configured provider alias.

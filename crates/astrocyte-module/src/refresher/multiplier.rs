@@ -657,8 +657,8 @@ fn compute_multiplier_day(
     Ok(observations)
 }
 
-/// Recompute the same seven-day interval as the daily stage. All peer reads
-/// finish before the write transaction; a refusal leaves all requested days
+/// Recompute the same seven-day interval as the daily stage. Fusiform's
+/// plan-price and catalog reads all finish before the write transaction; a refusal leaves all requested days
 /// unchanged. Only chains with a stored pool scope are reconciled.
 pub(crate) fn recompute_multiplier_day(
     state: &SharedState,
