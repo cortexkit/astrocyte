@@ -30,7 +30,7 @@ pub(crate) struct WireModelAttempt {
     charge_basis: ChargeBasis,
     charge_basis_mapping_version: Option<u32>,
     charge_basis_overrides: Option<String>,
-    sent_at_ms: u64,
+    sent_at_ms: Option<u64>,
     recorded_at_ms: u64,
 }
 
@@ -48,7 +48,10 @@ fn stored_integer(value: u64, name: &str) -> Result<i64, String> {
 }
 
 pub(crate) fn map_attempt(wire: WireModelAttempt) -> Result<Attempt, String> {
-    let sent_at = stored_integer(wire.sent_at_ms, "sent_at_ms")?;
+    let occurred_at = match wire.sent_at_ms {
+        Some(sent_at) => stored_integer(sent_at, "sent_at_ms")?,
+        None => stored_integer(wire.recorded_at_ms, "recorded_at_ms")?,
+    };
     let call = |index: usize, share: Option<&WireAttemptShare>| {
         let (provider, model) = share.map_or((&wire.provider, &wire.model), |share| {
             (&share.provider, &share.model)
@@ -77,7 +80,7 @@ pub(crate) fn map_attempt(wire: WireModelAttempt) -> Result<Attempt, String> {
                 flow_ref: None,
                 runner: Some(BROCA_PRODUCER.into()),
                 work_class: None,
-                occurred_at_ms: Some(sent_at),
+                occurred_at_ms: Some(occurred_at),
                 emitted_at_ms: None,
                 terminal_status: None,
                 attempt_ordinal: None,

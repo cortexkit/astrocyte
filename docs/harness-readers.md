@@ -454,7 +454,8 @@ Rules that affect what is recorded:
   `a_cache_write_lifetime_split_is_recorded_per_lifetime`.
 - A BROCA `model_attempt` fact describes one provider request. Each share in
   `usage_by_model` records its own call at `sent_at_ms`, using its provider,
-  model and usage. Even repeated shares of the same model stay distinct. If
+  model and usage. A missing `sent_at_ms` means the request was never sent; the
+  call uses `recorded_at_ms` instead. Even repeated shares of the same model stay distinct. If
   `usage_by_model` is absent, the request is recorded without measurements or
   charges. The outcome is kept verbatim and does not affect pricing. Attempt
   shares use the same credential and cache-write mapping as session facts.

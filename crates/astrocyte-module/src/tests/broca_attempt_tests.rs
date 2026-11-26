@@ -138,6 +138,50 @@ fn check_segments(state: &SharedState, at_ms: i64) -> usize {
 }
 
 #[test]
+fn broca_attempt_never_sent_records_unknown_usage_at_recorded_time() {
+    let mut attempt = sample_rows(RETRIED)
+        .into_iter()
+        .find(|row| row["outcome"] == "connect_failed")
+        .unwrap();
+    assert_eq!(attempt["content_received"], false);
+    assert!(attempt.get("usage_by_model").is_none());
+    let recorded_at = attempt["recorded_at_ms"].as_i64().unwrap();
+    assert!(attempt
+        .as_object_mut()
+        .unwrap()
+        .remove("sent_at_ms")
+        .is_some());
+
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("run-index.db");
+    create_store(&path, "never-sent", 1);
+    append_values(&path, &[attempt]);
+    let state = test_state();
+    drain(&state, &path);
+    let set_aside = set_aside_rows(&state);
+    assert!(set_aside.is_empty(), "set aside: {set_aside:?}");
+    assert_eq!(count(&state, "usage_event"), 1);
+    assert_eq!(count(&state, "measurement"), 0);
+    assert_eq!(
+        read_rows(&state, "SELECT occurred_at_ms FROM usage_event", |row| row
+            .get::<_, i64>(
+            0
+        )),
+        [recorded_at]
+    );
+    price(&state, false, false);
+    assert_eq!(count(&state, "priced_charge"), 0);
+    assert_eq!(
+        read_rows(
+            &state,
+            "SELECT COALESCE(SUM(charge_nanos), 0) FROM priced_charge",
+            |row| row.get::<_, i64>(0)
+        ),
+        [0]
+    );
+}
+
+#[test]
 fn broca_attempt_vectors_match_sha256sums() {
     let directory = vector_dir();
     let checksums = std::fs::read_to_string(directory.join("SHA256SUMS")).unwrap();
