@@ -32,7 +32,185 @@ fn old_members(mut value: serde_json::Value) -> serde_json::Value {
 }
 fn ready(conn: &mut Connection) {
     summaries(conn);
-    drain(conn, &config());
+    drain(conn);
+}
+
+#[test]
+fn report_surface_ledger_plan_labels_ignore_multiplier_scopes() {
+    let mut conn = conn();
+    rate(&conn, "A", 1_000_000_000);
+    plan(&conn, PlanLedger::Account, "provider", "manual", 0, None);
+    for (id, account, basis) in [
+        ("manual", Some("manual"), "subscription_included"),
+        ("unmatched", None, "subscription_included"),
+        ("api", Some("manual"), "metered_api"),
+    ] {
+        let key = event(&mut conn, id, 1, "A", account, None, basis, 100);
+        recorded_price(&conn, key, 0);
+    }
+    ready(&mut conn);
+    let value = report(&conn, &request(&["plan", "plan_account"], 0, DAY_MS));
+    let rows = value["rows"].as_array().unwrap();
+    let actual: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["plan"].as_str().unwrap(),
+                row["plan_account"].as_str(),
+                row["events_total"].as_u64().unwrap(),
+                row["deduced"]["nanos"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            ("api", None, 1, 0),
+            ("none", None, 1, 0),
+            ("provider", Some("manual"), 1, 645_161_290),
+        ]
+    );
+    assert_eq!(value["totals"][0]["deduced"]["nanos"], 645_161_290);
+    assert_eq!(value["totals"][0]["deduced_unspread_nanos"], 0);
+}
+
+#[test]
+fn report_surface_two_measured_pools_share_one_fee_and_ignore_manual_traffic() {
+    use crate::catalog_client::{CatalogCallError, CatalogClient, CatalogConnection};
+    use crate::multiplier::insert_observation_in_tx;
+    use crate::multiplier::pools::{
+        capture_pool_day, compute_pool_observations, plan_pools, resolve_pool_models,
+    };
+    use crate::vault_plan::{append_in_tx, VaultPlan};
+    use fusiform_protocol::{
+        CatalogGetRequest, CatalogGetResponse, PlanPricesResponse, StatusRequest, StatusResponse,
+    };
+    use std::sync::Arc;
+
+    const START: i64 = DAY_MS;
+    const END: i64 = START + 3 * DAY_MS;
+    struct Catalog;
+    impl CatalogConnection for Catalog {
+        fn catalog_status(&self, _: StatusRequest) -> Result<StatusResponse, CatalogCallError> {
+            unreachable!("the fixture supplies the history boundary")
+        }
+
+        fn catalog_get(
+            &self,
+            req: CatalogGetRequest,
+        ) -> Result<CatalogGetResponse, CatalogCallError> {
+            assert_eq!(req.provider_id.as_deref(), Some("provider"));
+            assert_eq!(req.model_id.as_deref(), Some("A"));
+            let rate = |units| {
+                json!({"state":"priced","units":units,"exponent":9,
+                "currency":"USD","unit_provenance":{"kind":"stated"}})
+            };
+            Ok(
+                serde_json::from_value(json!({"source":"fixture","resolved_at_ms":END,
+                "catalog_version":1,"models":{"provider/A":{
+                    "rate.input":rate(1_000_000_000_i64),"rate.output":rate(2_000_000_000_i64)
+                }}}))
+                .unwrap(),
+            )
+        }
+    }
+
+    let mut conn = conn();
+    conn.execute_batch("CREATE TABLE cortexkit_schema_version(namespace TEXT, version INTEGER, applied_at_unix INTEGER);
+        INSERT INTO cortexkit_schema_version VALUES ('astrocyte',68,0)").unwrap();
+    let tx = conn.transaction().unwrap();
+    append_in_tx(
+        &tx,
+        &VaultPlan {
+            credential_id: "oauth:member".into(),
+            provider: Some("provider".into()),
+            account_id: Some("member".into()),
+            plan_tier: Some("plan".into()),
+            plan_key: Some("provider/plan".into()),
+            source: "operator".into(),
+            effective_from_ms: 0,
+            observed_at_ms: 0,
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    for login in ["member", "manual"] {
+        plan(
+            &conn,
+            PlanLedger::Account,
+            "provider",
+            login,
+            START,
+            Some(END),
+        );
+        for day in 0..3 {
+            for step in 0..=48 {
+                for (pool, scope) in [("primary", "all"), ("secondary", "subset")] {
+                    let at = START + day * DAY_MS + step * (HOUR_MS / 6);
+                    conn.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,
+                        used_percent,window_minutes,model_scope,api_provider,resets_at)
+                        VALUES ('provider',?1,?2,?3,?4,10080,?5,'provider','1970-02-01T00:00:00Z')",
+                        params![login, pool, at * 1_000_000, day * 8 + step / 6, scope]).unwrap();
+                }
+            }
+            let key = event(
+                &mut conn,
+                &format!("{login}-{day}"),
+                START + day * DAY_MS + 1,
+                "A",
+                Some(login),
+                None,
+                "subscription_included",
+                24_000,
+            );
+            recorded_price(&conn, key, 0);
+        }
+    }
+    let tx = conn.transaction().unwrap();
+    let capture = capture_pool_day(&tx, "provider", START, END).unwrap();
+    tx.commit().unwrap();
+    let served: PlanPricesResponse = serde_json::from_value(json!({
+        "prices":[{"provider_id":"provider","tier":"plan","price":{"minor_units":20,"exponent":0,
+            "currency":"USD","period":"month"},"boundary_at_ms":0,"established_by":"fixture",
+            "established_at_ms":0,"review_by_ms":END,"source_ref":"https://example.invalid/prices"}],
+        "resolved_at_ms":END,"tier_vocabulary":"vendor","unit_policy":"list",
+        "quota_pools":[{"provider_id":"provider","pool_id":"secondary","models":["provider/A"],
+            "established_at_ms":START,"review_by_ms":END,"quote":"fixture subset",
+            "source_ref":"https://example.invalid/quota"}]
+    })).unwrap();
+    let pools = plan_pools(&capture.readings, &served.quota_pools);
+    let catalog = CatalogClient::new(Arc::new(Catalog), START);
+    let (identities, rates) =
+        resolve_pool_models(&catalog, &capture.models_for_pools(&pools), END).unwrap();
+    let rows =
+        compute_pool_observations(&capture, &pools, &rates, &identities, &served, END).unwrap();
+    assert_eq!(rows.len(), 2);
+    let tx = conn.transaction().unwrap();
+    for row in &rows {
+        assert_eq!(row.plan.as_deref(), Some("provider/plan"));
+        assert!(row.routing_eligible, "{:?}", row.eligibility_reasons);
+        assert_eq!(row.tokens.input, 72_000, "only the vault member counts");
+        insert_observation_in_tx(&tx, row).unwrap();
+    }
+    tx.commit().unwrap();
+
+    rate(&conn, "A", 1_000_000_000);
+    ready(&mut conn);
+    let value = report(
+        &conn,
+        &request(&["plan", "plan_account"], END - DAY_MS, END),
+    );
+    let rows = value["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    for (row, login) in rows.iter().zip(["manual", "member"]) {
+        assert_eq!(row["plan"], "provider");
+        assert_eq!(row["plan_account"], login);
+        assert_eq!(row["events_total"], 1);
+        assert_eq!(row["deduced"]["nanos"], 645_161_290);
+    }
+    assert_eq!(value["totals"][0]["deduced"]["nanos"], 1_290_322_581);
+    assert_eq!(value["totals"][0]["deduced_unspread_nanos"], 0);
+    assert_eq!(value["totals"][0]["deduced_conflict_plans"], 0);
 }
 
 #[test]
@@ -124,7 +302,7 @@ fn report_surface_plan_grouping_filters_and_unfiltered_fee_weights() {
     for (id, at, model, account, quantity) in [
         ("a", 1, "A", Some("account"), 100),
         ("b", 12 * HOUR_MS, "B", Some("account"), 300),
-        ("rule", 2, "A", None, 100),
+        ("unmatched", 2, "A", None, 100),
     ] {
         let key = event(
             &mut conn,
@@ -146,25 +324,32 @@ fn report_surface_plan_grouping_filters_and_unfiltered_fee_weights() {
     let value = report(&conn, &req);
     assert_eq!(value["rows"].as_array().unwrap().len(), 1);
     let row = &value["rows"][0];
-    assert_eq!(row["plan"], "pool");
+    assert_eq!(row["plan"], "provider");
     assert_eq!(row["plan_account"], "account");
     assert_eq!(row["list_value"]["nanos"], 200_000);
     assert_eq!(row["deduced"]["nanos"], 161_290_323);
     assert!(row["deduced"].get("by_rule_share").is_none());
     assert!(value["totals"][0].get("deduced_unspread_nanos").is_none());
     req.filters.clear();
-    req.filters.insert("plan".into(), vec![Some("pool".into())]);
+    req.filters
+        .insert("plan".into(), vec![Some("provider".into())]);
     let all = report(&conn, &req);
     assert_eq!(all["totals"][0]["deduced"]["nanos"], 645_161_290);
     assert_eq!(all["totals"][0]["deduced_unspread_nanos"], 0);
-    // A record with no own calls routes its fee to the rule-matched calls.
+    // A record with no own calls stays unspread, not assigned to another call.
     plan(&conn, PlanLedger::Account, "provider", "unused", 0, None);
     ready(&mut conn);
-    req.filters
-        .insert("plan_account".into(), vec![Some("account_unknown".into())]);
-    let by_rule = report(&conn, &req);
-    assert_eq!(by_rule["rows"][0]["deduced"]["nanos"], 645_161_290);
-    assert_eq!(by_rule["rows"][0]["deduced"]["by_rule_share"], 1.0);
+    let all = report(&conn, &req);
+    assert_eq!(all["totals"][0]["deduced"]["nanos"], 645_161_290);
+    assert_eq!(all["totals"][0]["deduced_unspread_nanos"], 645_161_290);
+    req.filters.insert("plan".into(), vec![Some("none".into())]);
+    let unmatched = report(&conn, &req);
+    assert_eq!(unmatched["rows"].as_array().unwrap().len(), 1);
+    assert!(unmatched["rows"][0]["plan_account"].is_null());
+    assert_eq!(unmatched["rows"][0]["deduced"]["nanos"], 0);
+    assert!(unmatched["rows"][0]["deduced"]
+        .get("by_rule_share")
+        .is_none());
 }
 
 #[test]
@@ -179,7 +364,8 @@ fn audit17_report_plan_filters_also_filter_dated_coverage() {
     let all = report(&conn, &req);
     assert_eq!(all["undated"]["events_report_total"], 1);
     assert_eq!(all["rate_staleness"]["measurements_total"], 2);
-    req.filters.insert("plan".into(), vec![Some("pool".into())]);
+    req.filters
+        .insert("plan".into(), vec![Some("provider".into())]);
     let excluded = report(&conn, &req);
     assert_eq!(excluded["rows"], serde_json::json!([]));
     assert_eq!(excluded["totals"], serde_json::json!([]));
@@ -248,7 +434,7 @@ fn report_surface_pending_hours_preserve_recorded_spend_and_distinct_counts() {
         recorded_price(&conn, key, 123);
     }
     summaries(&mut conn);
-    prepare(&mut conn, &config());
+    prepare(&mut conn);
     let mut req = request(&["plan", "plan_account"], 0, DAY_MS);
     let pending = report(&conn, &req);
     assert_eq!(pending["rows"][0]["plan"], "pending");
@@ -266,7 +452,7 @@ fn report_surface_pending_hours_preserve_recorded_spend_and_distinct_counts() {
     assert_eq!(ordinary["rows"][0]["total_nanos"], 369);
     assert_eq!(ordinary["rows"][0]["list_value"]["nanos"], 0);
     assert_eq!(ordinary["rows"][0]["list_value"]["not_yet_valued_hours"], 2);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     let built = report(&conn, &req);
     assert_eq!(built["rows"][0]["list_value"]["nanos"], 600_000);
     assert_eq!(built["rows"][0]["list_value"]["not_yet_valued_hours"], 0);
@@ -338,7 +524,7 @@ fn report_surface_existing_members_are_byte_identical() {
 }
 
 #[test]
-fn report_surface_uses_stored_config_and_defaults_missing_bundle_counter() {
+fn report_surface_legacy_config_rebuilds_stale_labels_and_defaults_missing_bundle_counter() {
     let mut conn = conn();
     rate(&conn, "A", 1_000_000_000);
     let key = event(
@@ -354,19 +540,34 @@ fn report_surface_uses_stored_config_and_defaults_missing_bundle_counter() {
     recorded_price(&conn, key, 0);
     ready(&mut conn);
     let req = request(&["plan"], 0, DAY_MS);
-    assert_eq!(report(&conn, &req)["rows"][0]["plan"], "pool");
-    let mut freshly_loaded = config();
-    freshly_loaded.quota_providers.clear();
-    assert_ne!(
-        surface::stored_config(&conn).unwrap().0.quota_providers,
-        freshly_loaded.quota_providers
+    assert_eq!(report(&conn, &req)["rows"][0]["plan"], "none");
+    let legacy_key = r#"[{"twin":"provider"},{},["provider"]]"#;
+    conn.execute(
+        "UPDATE valuation_state SET config=?1 WHERE id=1",
+        [legacy_key],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE valuation_cell SET plan='pool',plan_account='account_unknown'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(report(&conn, &req)["rows"][0]["plan"], "pending");
+    let attributed = report(&conn, &request(&["alfonso"], 0, DAY_MS));
+    assert_eq!(
+        attributed["rows"][0]["list_value"]["not_yet_valued_hours"],
+        1
     );
+    assert!(ValuationMaintenance::needs_prepare(&conn).unwrap());
+    assert_eq!(drain(&mut conn), vec![0]);
+    assert_eq!(report(&conn, &req)["rows"][0]["plan"], "none");
+
     conn.execute("UPDATE summary_hour SET revision=revision+1", [])
         .unwrap();
     assert_eq!(
         report(&conn, &req)["rows"][0]["plan"],
-        "pool",
-        "dirty fallback follows the stored builder snapshot"
+        "none",
+        "dirty fallback also uses ledger membership"
     );
     ready(&mut conn);
     conn.execute("UPDATE valuation_cell SET recorded=json_remove(recorded,'$.base_rate_tier_untested_tokens')", []).unwrap();
@@ -555,18 +756,14 @@ fn report_surface_dirty_pool_day_defers_fees_even_when_live_rows_are_valued() {
         .iter()
         .any(|r| r["plan"] == "pending"));
     assert_eq!(pending["totals"][0]["deduced"]["pending_days"], 1);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     assert_eq!(report(&conn, &query), built);
 }
 
 #[test]
 fn report_surface_plan_diagnostics_and_unfetched_hours() {
     let mut conn = conn();
-    let mut config = config();
-    let mut second = config.quota_providers["pool"].clone();
-    second.scope[0].producer = "pi".into();
-    config.quota_providers.insert("second".into(), second);
-    plan(&conn, PlanLedger::Account, "provider", "conflict", 0, None);
+    plan(&conn, PlanLedger::Account, "provider", "unused", 0, None);
     conn.execute("INSERT INTO account_subscription(account_ref,provider,plan_name,recurring_cost_minor,currency,amount_exponent,period,effective_from_ms) VALUES('euro','other','plan',100,'EUR',2,'month',0)", []).unwrap();
     let key = event(
         &mut conn,
@@ -580,7 +777,7 @@ fn report_surface_plan_diagnostics_and_unfetched_hours() {
     );
     recorded_price(&conn, key, 25);
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     let query = request(&["plan"], 0, DAY_MS);
     let value = report(&conn, &query);
     assert_eq!(value["rows"][0]["plan"], "pending");
@@ -589,11 +786,11 @@ fn report_surface_plan_diagnostics_and_unfetched_hours() {
         value["rows"][0]["list_value"]["unvalued"]["measurements"],
         0
     );
-    assert_eq!(value["totals"][0]["deduced_conflict_plans"], 1);
+    assert_eq!(value["totals"][0]["deduced_conflict_plans"], 0);
     assert_eq!(value["totals"][0]["deduced_non_usd_plans"], 1);
     assert_eq!(value["totals"][0]["deduced_unspread_nanos"], 645_161_290);
     rate(&conn, "A", 1_000_000_000);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     let fetched = report(&conn, &query);
     assert_eq!(fetched["rows"][0]["plan"], "api");
     assert_eq!(fetched["rows"][0]["list_value"]["nanos"], 200_000);
@@ -627,10 +824,7 @@ fn report_surface_future_first_call_keeps_recorded_and_list_value_without_fees()
     assert_eq!(value["rows"][0]["list_value"]["nanos"], 200_000);
     assert_eq!(value["rows"][0]["deduced"]["nanos"], 70);
     assert_eq!(value["totals"][0]["deduced_unspread_nanos"], 0);
-    assert!(FeeDays::load(&conn, &config(), 1, 1)
-        .unwrap()
-        .days
-        .is_empty());
+    assert!(FeeDays::load(&conn, 1, 1).unwrap().days.is_empty());
     let mut reversed = query;
     reversed.from_ms = Some(DAY_MS);
     reversed.to_ms = Some(0);
@@ -643,8 +837,6 @@ fn report_surface_future_first_call_keeps_recorded_and_list_value_without_fees()
 #[test]
 fn report_surface_unknown_basis_credential_pool_waits_for_valuation() {
     let mut conn = conn();
-    let mut config = config();
-    config.quota_providers.get_mut("pool").unwrap().scope[0].producer = "pi".into();
     rate(&conn, "A", 1_000_000_000);
     plan(
         &conn,
@@ -670,15 +862,15 @@ fn report_surface_unknown_basis_credential_pool_waits_for_valuation() {
     )
     .unwrap();
     summaries(&mut conn);
-    prepare(&mut conn, &config);
+    prepare(&mut conn);
     let query = request(&["plan", "plan_account"], 0, DAY_MS);
     let pending = report(&conn, &query);
     assert_eq!(pending["rows"][0]["plan"], "pending");
     assert_eq!(pending["rows"][0]["deduced"]["pending_days"], 1);
     assert_eq!(pending["totals"][0]["deduced_unspread_nanos"], 0);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     let built = report(&conn, &query);
-    assert_eq!(built["rows"][0]["plan"], "pool");
+    assert_eq!(built["rows"][0]["plan"], "provider");
     assert_eq!(built["rows"][0]["plan_account"], "resolved");
     assert_eq!(built["rows"][0]["deduced"]["pending_days"], 0);
     assert_eq!(built["rows"][0]["deduced"]["nanos"], 645_161_290);

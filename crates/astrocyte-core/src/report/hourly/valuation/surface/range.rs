@@ -2,47 +2,33 @@ use super::*;
 use crate::report::analytics::UnitQuantity;
 use std::collections::btree_map::Entry;
 
-pub(super) struct RangeFold {
-    bounds: Option<(i64, i64)>,
-    pub(super) shares: Vec<RowShare>,
-}
-
 type Group = (BTreeMap<String, Option<String>>, Option<String>);
 
-impl RangeFold {
-    pub(super) fn new(bounds: Option<(i64, i64)>, rows: usize) -> Self {
-        Self {
-            bounds,
-            shares: Vec::with_capacity(rows),
+pub(super) fn fold(
+    daily: Vec<SpendRow>,
+    bounds: Option<(i64, i64)>,
+) -> Result<Vec<SpendRow>, ReportError> {
+    let (mut start, mut end) = bounds.unwrap_or((i64::MAX, i64::MIN));
+    let mut groups: BTreeMap<Group, RowSum> = BTreeMap::new();
+    for mut row in daily {
+        // Without request edges, all groups use the same envelope of
+        // selected day buckets, including any future-dated buckets.
+        if bounds.is_none() {
+            start = start.min(row.bucket_start_ms);
+            end = end.max(row.bucket_end_ms);
+        }
+        let key = (std::mem::take(&mut row.grouping), row.currency.take());
+        match groups.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(RowSum::new(row)?);
+            }
+            Entry::Occupied(mut slot) => slot.get_mut().merge(row)?,
         }
     }
-
-    pub(super) fn finish(self, daily: Vec<SpendRow>) -> Result<Vec<SpendRow>, ReportError> {
-        if daily.len() != self.shares.len() {
-            return Err(ReportError::Integrity("range day valuation missing"));
-        }
-        let (mut start, mut end) = self.bounds.unwrap_or((i64::MAX, i64::MIN));
-        let mut groups: BTreeMap<Group, RowSum> = BTreeMap::new();
-        for (mut row, share) in daily.into_iter().zip(self.shares) {
-            // Without request edges, all groups use the same envelope of
-            // selected day buckets, including any future-dated buckets.
-            if self.bounds.is_none() {
-                start = start.min(row.bucket_start_ms);
-                end = end.max(row.bucket_end_ms);
-            }
-            let key = (std::mem::take(&mut row.grouping), row.currency.take());
-            match groups.entry(key) {
-                Entry::Vacant(slot) => {
-                    slot.insert(RowSum::new(row, share)?);
-                }
-                Entry::Occupied(mut slot) => slot.get_mut().merge(row, share)?,
-            }
-        }
-        groups
-            .into_iter()
-            .map(|(group, row)| row.finish(group, start, end))
-            .collect()
-    }
+    groups
+        .into_iter()
+        .map(|(group, row)| row.finish(group, start, end))
+        .collect()
 }
 
 #[derive(Default)]
@@ -117,11 +103,10 @@ struct RowSum {
     recorded: i128,
     metered: i128,
     deduced: i128,
-    share: RowShare,
 }
 
 impl RowSum {
-    fn new(mut row: SpendRow, share: RowShare) -> Result<Self, ReportError> {
+    fn new(mut row: SpendRow) -> Result<Self, ReportError> {
         let mut units = Units::default();
         units.merge(std::mem::take(&mut row.usage.units))?;
         row.quantities = Quantities::default();
@@ -135,11 +120,10 @@ impl RowSum {
                 .as_ref()
                 .map_or(0, |d| i128::from(d.nanos)),
             row,
-            share,
         })
     }
 
-    fn merge(&mut self, day: SpendRow, share: RowShare) -> Result<(), ReportError> {
+    fn merge(&mut self, day: SpendRow) -> Result<(), ReportError> {
         let row = &mut self.row;
         sum(&mut self.recorded, i128::from(day.total_nanos))?;
         sum(&mut self.metered, i128::from(day.metered_nanos))?;
@@ -195,8 +179,6 @@ impl RowSum {
                 .as_mut()
                 .ok_or(ReportError::Integrity("range day currency changed"))?;
             count_days(&mut a.pending_days, b.pending_days)?;
-            self.share.fee = self.share.fee.checked_add(&share.fee)?;
-            self.share.by_rule = self.share.by_rule.checked_add(&share.by_rule)?;
         }
         Ok(())
     }
@@ -217,9 +199,6 @@ impl RowSum {
         row.usage.units = self.units.finish()?;
         if let Some(deduced) = &mut row.valuation.deduced {
             deduced.nanos = money(self.deduced)?;
-            // The ratio is weighted by exact fees, not rounded nanos, and
-            // recorded spend is not part of its denominator.
-            deduced.by_rule_share = self.share.by_rule_share()?;
         }
         Ok(self.row)
     }
@@ -228,16 +207,14 @@ impl RowSum {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fees::Fraction;
+    use fees::{Fraction, RowShare};
 
     #[test]
-    fn range_fee_ratio_is_weighted_by_exact_day_fees() {
-        let mut range = RangeFold::new(None, 2);
+    fn range_keeps_daily_fee_rounding_and_sums_pending_days() {
         let mut rows = Vec::new();
-        for (day, fee, by_rule) in [(0, (1, 3), (1, 3)), (1, (2, 5), (0, 1))] {
+        for (day, fee) in [(0, (1, 3)), (1, (2, 5))] {
             let share = RowShare {
                 fee: Fraction::new(fee.0, fee.1).unwrap(),
-                by_rule: Fraction::new(by_rule.0, by_rule.1).unwrap(),
             };
             let key = BucketKey {
                 start_ms: day * DAY_MS,
@@ -248,18 +225,14 @@ mod tests {
             let mut row = render_row(key, &Accumulator::default()).unwrap();
             row.valuation.deduced = share.deduced("USD", 0, 1).unwrap();
             rows.push(row);
-            range.shares.push(share);
         }
-        let rows = range.finish(rows).unwrap();
+        let rows = fold(rows, None).unwrap();
         let deduced = rows[0].valuation.deduced.as_ref().unwrap();
         assert_eq!(
             deduced.nanos, 0,
             "both day fees round down; their sum would round up"
         );
         assert_eq!(deduced.pending_days, 2);
-        assert_eq!(
-            deduced.by_rule_share.unwrap().to_bits(),
-            (5.0_f64 / 11.0).to_bits()
-        );
+        assert!(deduced.by_rule_share.is_none());
     }
 }

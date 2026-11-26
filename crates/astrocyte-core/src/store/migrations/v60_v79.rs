@@ -445,3 +445,74 @@ CREATE TABLE broca_scope_backfill (
     done INTEGER NOT NULL CHECK(done IN (0,1))
 );
 "#;
+
+pub(in crate::store) const V68: &str = r#"
+ALTER TABLE window_sample ADD COLUMN model_scope TEXT CHECK (model_scope IN ('all','subset'));
+ALTER TABLE credential_window_sample ADD COLUMN model_scope TEXT CHECK (model_scope IN ('all','subset'));
+
+ALTER TABLE multiplier_observation ADD COLUMN pool_scope TEXT
+    CHECK (pool_scope IS NULL OR (pool_scope IN ('all','subset','unknown') AND plan IS NOT NULL));
+ALTER TABLE multiplier_observation ADD COLUMN catalog_provider TEXT
+    CHECK (catalog_provider IS NULL OR (pool_scope IS NOT NULL AND catalog_provider <> ''));
+ALTER TABLE multiplier_observation ADD COLUMN pool_models TEXT
+    CHECK (pool_models IS NULL OR (json_valid(pool_models) AND json_type(pool_models)='array'));
+ALTER TABLE multiplier_observation ADD COLUMN pool_models_at_ms INTEGER;
+ALTER TABLE multiplier_observation ADD COLUMN pool_member_models TEXT
+    CHECK (pool_member_models IS NULL OR (pool_models IS NOT NULL
+        AND json_valid(pool_member_models) AND json_type(pool_member_models)='array'));
+
+CREATE TABLE multiplier_provider_day (
+    quota_provider TEXT NOT NULL,
+    observation_day TEXT NOT NULL,
+    recorded_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(quota_provider, observation_day)
+) WITHOUT ROWID;
+CREATE TRIGGER multiplier_provider_day_no_update BEFORE UPDATE ON multiplier_provider_day
+BEGIN SELECT RAISE(ABORT, 'multiplier_provider_day_no_update'); END;
+CREATE TRIGGER multiplier_provider_day_no_delete BEFORE DELETE ON multiplier_provider_day
+BEGIN SELECT RAISE(ABORT, 'multiplier_provider_day_no_delete'); END;
+CREATE TRIGGER multiplier_provider_day_insert_once BEFORE INSERT ON multiplier_provider_day
+WHEN EXISTS (SELECT 1 FROM multiplier_provider_day
+    WHERE quota_provider=NEW.quota_provider AND observation_day=NEW.observation_day)
+BEGIN SELECT RAISE(ABORT, 'multiplier_provider_day_insert_once'); END;
+
+DROP INDEX multiplier_observation_one_original_per_day;
+CREATE UNIQUE INDEX multiplier_observation_one_original_pre_cut
+ON multiplier_observation(quota_provider, observation_day, COALESCE(plan,''))
+WHERE supersedes IS NULL AND pool_scope IS NULL;
+CREATE UNIQUE INDEX multiplier_observation_one_original_post_cut
+ON multiplier_observation(quota_provider, observation_day, plan, window_pool_key)
+WHERE supersedes IS NULL AND pool_scope IS NOT NULL;
+
+-- REPLACE must not delete an existing observation, even with recursive
+-- triggers disabled. The two lineages share the same id and parent space.
+DROP TRIGGER multiplier_observation_insert_once;
+CREATE TRIGGER multiplier_observation_pre_cut_insert_once BEFORE INSERT ON multiplier_observation
+WHEN NEW.pool_scope IS NULL AND (
+     EXISTS (SELECT 1 FROM multiplier_observation WHERE observation_id=NEW.observation_id)
+  OR EXISTS (SELECT 1 FROM multiplier_observation WHERE supersedes=NEW.supersedes)
+  OR (NEW.supersedes IS NULL AND EXISTS (SELECT 1 FROM multiplier_observation
+      WHERE pool_scope IS NULL AND supersedes IS NULL
+        AND quota_provider=NEW.quota_provider AND observation_day=NEW.observation_day
+        AND COALESCE(plan,'')=COALESCE(NEW.plan,''))))
+BEGIN SELECT RAISE(ABORT, 'multiplier_observation_insert_once'); END;
+CREATE TRIGGER multiplier_observation_post_cut_insert_once BEFORE INSERT ON multiplier_observation
+WHEN NEW.pool_scope IS NOT NULL AND (
+     EXISTS (SELECT 1 FROM multiplier_observation WHERE observation_id=NEW.observation_id)
+  OR EXISTS (SELECT 1 FROM multiplier_observation WHERE supersedes=NEW.supersedes)
+  OR (NEW.supersedes IS NULL AND EXISTS (SELECT 1 FROM multiplier_observation
+      WHERE pool_scope IS NOT NULL AND supersedes IS NULL
+        AND quota_provider=NEW.quota_provider AND observation_day=NEW.observation_day
+        AND plan=NEW.plan AND window_pool_key=NEW.window_pool_key)))
+BEGIN SELECT RAISE(ABORT, 'multiplier_observation_insert_once'); END;
+
+-- A plan-wide observation had no recorded scope and its correction could
+-- choose a different window. A pool observation must stay in its own chain.
+DROP TRIGGER multiplier_observation_same_plan;
+CREATE TRIGGER multiplier_observation_same_lineage BEFORE INSERT ON multiplier_observation
+WHEN EXISTS (SELECT 1 FROM multiplier_observation parent WHERE parent.observation_id=NEW.supersedes
+    AND (parent.plan IS NOT NEW.plan
+        OR (parent.pool_scope IS NULL) <> (NEW.pool_scope IS NULL)
+        OR (NEW.pool_scope IS NOT NULL AND parent.window_pool_key IS NOT NEW.window_pool_key)))
+BEGIN SELECT RAISE(ABORT, 'multiplier_observation_same_lineage'); END;
+"#;

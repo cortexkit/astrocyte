@@ -330,6 +330,7 @@ fn operation_params_schema(name: &str) -> Value {
             json!({
                 "quota_provider": string,
                 "plan": optional_string,
+                "pool": optional_string,
                 "from_ms": i64_value,
                 "to_ms": i64_value,
             }),
@@ -513,11 +514,7 @@ fn op_event_reprice(state: &SharedState, params: Value) -> OpResult {
         .map_err(map_subscription_error)?;
     let catalog = state.catalog_client();
     let resolved = match catalog.as_ref() {
-        Some(catalog) => astrocyte_core::subscription::resolve_reprice(
-            &plan,
-            catalog,
-            &state.desired_config().reasoning_billed_as_output,
-        ),
+        Some(catalog) => astrocyte_core::subscription::resolve_reprice(&plan, catalog),
         None => astrocyte_core::subscription::resolve_reprice_without_catalog(&plan),
     }
     .map_err(map_subscription_error)?;
@@ -553,11 +550,7 @@ fn op_basis_correct(state: &SharedState, params: Value) -> OpResult {
         .map_err(map_subscription_error)?;
     let catalog = state.catalog_client();
     let resolved = match catalog.as_ref() {
-        Some(catalog) => astrocyte_core::subscription::resolve_reprice(
-            &plan,
-            catalog,
-            &state.desired_config().reasoning_billed_as_output,
-        ),
+        Some(catalog) => astrocyte_core::subscription::resolve_reprice(&plan, catalog),
         None => astrocyte_core::subscription::resolve_reprice_without_catalog(&plan),
     }
     .map_err(map_subscription_error)?;
@@ -874,8 +867,8 @@ fn op_reconcile(state: &SharedState, params: Value) -> OpResult {
     })
 }
 
-/// The recorded subscription multiplier series: the latest observation per
-/// quota provider and every observation in the requested range.
+/// Current pool heads from each quota provider's newest recorded day, and
+/// historical heads in the requested range.
 fn op_multiplier_report(state: &SharedState, params: Value) -> OpResult {
     let request: astrocyte_core::multiplier::MultiplierReportRequest =
         serde_json::from_value(params).map_err(|error| {
@@ -898,13 +891,8 @@ fn op_multiplier_pace(state: &SharedState, params: Value) -> OpResult {
                 format!("multiplier pace params: {error}"),
             )
         })?;
-    let desired = state.desired_config();
-    let config = match &desired.subscription_multiplier {
-        crate::config::MultiplierSetting::Recorded(config) => Some(config),
-        crate::config::MultiplierSetting::NotRecorded => None,
-    };
     read_value(state, |conn| {
-        astrocyte_core::multiplier::multiplier_pace(conn, config, &request)
+        astrocyte_core::multiplier::multiplier_pace(conn, &request)
             .map_err(|error| (error.code().into(), error.message()))
     })
 }
@@ -1960,8 +1948,8 @@ mod tests {
                 OP_MULTIPLIER_PACE,
                 vec![
                     json!({"quota_provider": "claude", "from_ms": 1, "to_ms": 2}),
-                    json!({"quota_provider": "claude", "plan": "anthropic/max_20x", "from_ms": 1, "to_ms": 2}),
-                    json!({"quota_provider": "claude", "plan": null, "from_ms": 1, "to_ms": 2}),
+                    json!({"quota_provider": "claude", "plan": "anthropic/max_20x", "pool": "primary", "from_ms": 1, "to_ms": 2}),
+                    json!({"quota_provider": "claude", "plan": null, "pool": null, "from_ms": 1, "to_ms": 2}),
                 ],
                 json!({"quota_provider": "claude", "from_ms": 1.5, "to_ms": 2}),
             ),
@@ -2485,21 +2473,12 @@ mod tests {
 
     #[test]
     fn multiplier_pace_is_served_from_recorded_rates_on_the_reader() {
-        use astrocyte_core::multiplier;
         let directory = tempfile::TempDir::new().unwrap();
         let state = crate::state::leased_test_state(&directory);
-        let mut desired = crate::config::intentional_empty().config;
-        let config: multiplier::MultiplierConfig = serde_json::from_value(json!({
-            "api_twins": {}, "plan_price_overrides": {},
-            "quota_providers": {"claude": {"window": {"pool_key": "primary", "window_minutes": 300},
-                "scope": [{"producer": "opencode", "provider": "anthropic", "charge_basis": null, "model_prefix": null}]}}
-        })).unwrap();
-        desired.subscription_multiplier =
-            crate::config::MultiplierSetting::Recorded(config.clone());
-        // No catalog is configured: a successful response must use stored rates.
-        state.publish_desired(desired, 1);
+        // No multiplier configuration or catalog is configured: the operation
+        // reads only the recorded head, vault history, and usage on the reader.
         dispatch(&state, OP_EVENT_INGEST, json!({"producer": "opencode", "producer_lineage": "lineage", "producer_ref": "call",
-            "provider": "anthropic", "model": "model", "charge_basis": "unknown", "occurred_at_ms": 1,
+            "provider": "anthropic", "model": "model", "charge_basis": "subscription_included", "occurred_at_ms": 86399999, "account_ref": "acct",
             "work_class": "head", "measurements": [{"role": "input", "unit": "token", "kind": "billed", "source": "usage", "quantity_units": 100, "quantity_exponent": 0}]})).unwrap();
         state.ordered_write(|tx| {
             astrocyte_core::vault_plan::append_in_tx(tx,&astrocyte_core::vault_plan::VaultPlan {
@@ -2507,38 +2486,29 @@ mod tests {
                 plan_tier:Some("max_20x".into()),plan_key:Some("anthropic/max_20x".into()),source:"detected".into(),
                 effective_from_ms:0,observed_at_ms:0,
             }).map_err(|error|error.to_string())?;
-            tx.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes) VALUES('claude','acct','primary',0,1,300)",[]).map_err(|error|error.to_string())?;
-            let mut plan = multiplier::plan_observation(tx, &config, "claude", 0, 86400000).map_err(|error| error.message())?;
-            plan.token_interval_ms = Some((0, 86400000));
-            let rates = multiplier::ResolvedRates {
-                eras: Default::default(),
-                resolved_at_ms: 86400000,
-                models: std::collections::BTreeMap::from([(("anthropic".into(), "model".into()),
-                    serde_json::from_value(json!({"state": "rates", "base": {"input": {"state": "priced", "units_per_million": 10000000000_i64}}, "tiers": {}})).unwrap())]),
-            };
-            let mut observation = multiplier::compute_observation(tx, &config, &plan, &rates, &Default::default(), 86400000, &[]).map_err(|error| error.message())?;
-            observation.api_nanos = 10_000_000;
-            observation.delta_percent = 2.0;
-            // A manual eligible calibration isolates stored-rate serving from
-            // the separate tests of the calibration quality gate.
-            observation.plan = Some("anthropic/max_20x".into());
-            observation.routing_eligible = true;
-            observation.eligibility_reasons.clear();
-            multiplier::insert_observation_in_tx(tx, &observation).map_err(|error| error.message())?;
+            let rates = json!([{"producer":"opencode","provider":"anthropic","model":"model",
+                "rates":{"state":"rates","base":{"input":{"state":"priced","units_per_million":10000000000_i64}},"tiers":{}}}]);
+            tx.execute("INSERT INTO multiplier_observation(quota_provider,observation_day,snapshot_at_ms,interval_start_ms,interval_end_ms,
+                window_pool_key,window_minutes,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,reasoning_tokens,
+                api_nanos,api_nanos_by_model,unpriced_tokens,tokens_outside_quota_coverage,base_rate_tier_untested_tokens,
+                subscription_nanos,fee_paid_nanos,delta_percent,accounts_included_count,accounts_included,accounts_excluded,
+                excluded_pairs,low_resolution,scope_rules,plan_prices,catalog_resolved_at_ms,api_twins,reasoning_billed_as_output,
+                error_deflating,error_inflating,plan,pool_scope,routing_eligible)
+                VALUES ('claude','1970-01-02',86400000,0,86400000,'primary',300,1000,0,0,0,0,10000000,?1,'[]',0,0,0,0,2,0,'[]','[]','[]',0,'[]','[]',86400000,'{}','[]','','','anthropic/max_20x','all',1)", [rates.to_string()]).map_err(|error|error.to_string())?;
             Ok(((), true))
         }).unwrap();
         let response = dispatch(
             &state,
             OP_MULTIPLIER_PACE,
-            json!({"quota_provider": "claude", "from_ms": 1, "to_ms": 2}),
+            json!({"quota_provider": "claude", "pool": "primary", "from_ms": 86399999, "to_ms": 86400000}),
         )
         .unwrap();
         assert_eq!(
             response,
-            json!({"quota_provider": "claude", "from_ms": 0, "to_ms": 3600000,
-            "basis": "pro_rata_list_value", "routing_eligible": true, "plan": "anthropic/max_20x", "per_point_nanos": 5000000,
+            json!({"quota_provider": "claude", "plan": "anthropic/max_20x", "pool_id": "primary", "from_ms": 82800000, "to_ms": 86400000,
+            "basis": "pro_rata_list_value", "routing_eligible": true, "per_point_nanos": 5000000,
             "observation_day": "1970-01-02", "observation_id": 1, "undated_events": 0,
-            "hours": [{"hour_start_ms": 0, "producers": {"opencode": {"events": 1, "list_nanos": 1000000, "estimated_points": 0.2, "unpriced_tokens": 0,
+            "hours": [{"hour_start_ms": 82800000, "producers": {"opencode": {"events": 1, "list_nanos": 1000000, "estimated_points": 0.2, "unpriced_tokens": 0,
                 "by_work_class": {"head": {"events": 1, "list_nanos": 1000000, "estimated_points": 0.2}}}}}]})
         );
         state

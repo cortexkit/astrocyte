@@ -46,7 +46,7 @@ against fusiform. It serves spend and usage diagnostics over subc.
 ## Durable state
 
 The leased SQLite store uses WAL, FULL synchronization and foreign keys, with a
-5000 ms busy timeout. `store.rs` owns `MIGRATIONS`, now at version 67; an older
+5000 ms busy timeout. `store.rs` owns `MIGRATIONS`, now at version 68; an older
 binary refuses a newer store. Immutable-table triggers reject rewrites even
 through `INSERT OR REPLACE`. Integer keys are never served. The
 [data model](docs/data-model.md#tables) describes the tables.
@@ -136,14 +136,14 @@ spend; a rate or plan change rebuilds only the hours it touches.
 
 ## Subscription multiplier
 
-The multiplier records clean account-hour API list value per quota point, once
-per UTC day, quota provider and plan over a trailing week. It joins day-end vault
-tier history by account or credential ID. `routing_eligible` carries sample-size
+The multiplier records clean login-hour API list value per quota point over a
+trailing week, per UTC day, provider, plan and pool. It joins calls and readings
+to dated vault plans. `routing_eligible` carries sample-size
 and stability results. It retries missing days for a week and appends
 recomputations without changing the ledger. New days take each call's dated
 rates from `rate_era.rs`, a cache of Fusiform's served `catalog.history` that
-the refresher fills outside transactions and re-reads when its rates move. The [subscription multiplier](docs/subscription-multiplier.md)
-explains the thresholds and public API-twin valuation.
+the refresher fills outside transactions. The [subscription multiplier](docs/subscription-multiplier.md)
+explains how served quota coverage determines which calls count.
 
 ## Cache diagnostics and the step feed
 
@@ -176,13 +176,12 @@ reply. EOF and GOODBYE exit 0. On Unix, SIGTERM stops cleanly and then re-raises
 
 ## Configuration
 
-The closed JSONC config has four required members, detailed in
+The closed JSONC config has two required members, detailed in
 [configuration](docs/configuration.md). Config and binary deploy together;
 unknown or missing members fail decoding. Accepted files become stored
 generations. An invalid first file refuses startup; later failures retain the
 committed generation and degrade health. `ck-astrocyte --check-config <path>`
-validates a file offline. Account maps stored from older configs only seed
-plan history.
+validates a file offline. The multiplier reads no settings.
 
 ## Served operations
 

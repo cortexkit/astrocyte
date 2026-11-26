@@ -10,6 +10,16 @@ pub(crate) struct PlanRecord {
     pub period: String,
 }
 
+impl PlanRecord {
+    pub(super) fn member(&self) -> PlanMember {
+        PlanMember {
+            plan: self.id.provider.clone(),
+            plan_account: Some(self.id.identity.clone()),
+            record: Some(self.id.clone()),
+        }
+    }
+}
+
 /// One snapshot of the small subscription ledgers, shared by a build chunk or
 /// report. Identity lookup and interval membership never perform per-call SQL.
 pub struct PlanBook {
@@ -67,8 +77,13 @@ impl PlanBook {
             })
     }
 
-    pub(super) fn possible_credential(&self, provider: &str, from: i64, last: i64) -> bool {
-        self.records.iter().any(|record| {
+    pub(super) fn possible_credentials<'a>(
+        &'a self,
+        provider: &'a str,
+        from: i64,
+        last: i64,
+    ) -> impl Iterator<Item = &'a PlanRecord> + 'a {
+        self.records.iter().filter(move |record| {
             record.id.ledger == PlanLedger::Credential
                 && record.id.provider == provider
                 && record.id.effective_from_ms <= last

@@ -29,11 +29,11 @@ Internal records live in the ignored `.cortexkit/` folder, which tracks only
 - `media.rs`: maps colliculus usage records into calls without rounding.
 - `attempt_usage.rs`: decodes shared attempt usage without inventing counts.
 - `subscription.rs`: effective-dated ledger plans and coverage.
-- `vault_plan.rs` keeps immutable tier history, seeds old config and reconciles
+- `vault_plan.rs` keeps immutable tier history and reconciles
   vault-owned ledger plans.
 - `valuation.rs`: one call's API list value; `rate_era.rs`: dated rates.
-- `multiplier.rs`: the subscription multiplier: config, the daily
-  observation, recompute and report. `multiplier/clean.rs` finds clean
+- `multiplier.rs`: multiplier observations and reports. `multiplier/pools.rs`
+  plans quota coverage; `multiplier/clean.rs` finds clean
   account-hours; `multiplier/calibration.rs` holds the stability checks.
 - `statement.rs`, `statement_import.rs`, `reconcile.rs`: vendor statements, CSV
   import and statement-to-ledger reconciliation.

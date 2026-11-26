@@ -3,7 +3,6 @@ use crate::{
     state::{test_state, SharedState},
 };
 use astrocyte_core::{
-    multiplier::MultiplierConfig,
     rate_era::{fetched, publish},
     report::{valuation::ValuationMaintenance, SummaryMaintenance},
 };
@@ -12,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 const DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/test-vectors/analytics-reads-v6"
+    "/test-vectors/analytics-reads-v7"
 );
 
 fn fixture() -> SharedState {
@@ -95,15 +94,8 @@ fn build_hours(conn: &rusqlite::Connection) {
             tx.commit().unwrap();
         }
     }
-    // Match test_state's empty multiplier config: without configured scope
-    // rules, only an explicit covered account or credential can join a pool.
-    let config = MultiplierConfig {
-        api_twins: Default::default(),
-        plan_price_overrides: Default::default(),
-        quota_providers: Default::default(),
-    };
     let tx = conn.unchecked_transaction().unwrap();
-    ValuationMaintenance::prepare(&tx, &config, &[]).unwrap();
+    ValuationMaintenance::prepare(&tx).unwrap();
     tx.commit().unwrap();
     let mut valuation = ValuationMaintenance::default();
     loop {
@@ -112,7 +104,7 @@ fn build_hours(conn: &rusqlite::Connection) {
             "valuation did not drain"
         );
         let tx = conn.unchecked_transaction().unwrap();
-        let ready = valuation.read_chunk(&tx, &config, &[]).unwrap();
+        let ready = valuation.read_chunk(&tx).unwrap();
         tx.commit().unwrap();
         if ready {
             let tx = conn.unchecked_transaction().unwrap();
@@ -134,12 +126,12 @@ fn attribution_fixture() -> SharedState {
         ],"next":null,"through":2})).unwrap();
         let placement:Page=serde_json::from_value(json!({"facts":[{"fact_id":"fixture-placement","project_id":"project_fixture","workspace_id":"workspace_fixture","effective_from_ms":0,"recorded_at_ms":1,"supersedes":null}],"next":null,"through":1})).unwrap();
         let tx=conn.unchecked_transaction().unwrap();commit_page(&tx,Publisher::Prefrontal,None,&facts,1).unwrap();commit_page(&tx,Publisher::Entorhinal,None,&placement,1).unwrap();tx.commit().unwrap();
-        let mut summaries=SummaryMaintenance::default();let mut valuation=ValuationMaintenance::default();let config=MultiplierConfig{api_twins:Default::default(),plan_price_overrides:Default::default(),quota_providers:Default::default()};
+        let mut summaries=SummaryMaintenance::default();let mut valuation=ValuationMaintenance::default();
         let deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);
         loop {
             assert!(std::time::Instant::now()<deadline,"attribution projections did not drain");
             if summaries.read_chunk(conn,10_000).unwrap() {let tx=conn.unchecked_transaction().unwrap();summaries.publish(&tx,10_000).unwrap();tx.commit().unwrap();}
-            let tx=conn.unchecked_transaction().unwrap();let ready=valuation.read_chunk(&tx,&config,&[]).unwrap();tx.commit().unwrap();
+            let tx=conn.unchecked_transaction().unwrap();let ready=valuation.read_chunk(&tx).unwrap();tx.commit().unwrap();
             if ready {let tx=conn.unchecked_transaction().unwrap();valuation.publish(&tx).unwrap();tx.commit().unwrap();} else if !valuation.has_pending() {break;}
         }
         Ok(())

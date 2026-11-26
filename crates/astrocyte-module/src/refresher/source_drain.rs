@@ -513,7 +513,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            br#"{"poll_interval_secs":45,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
+            br#"{"poll_interval_secs":45,"harness_ingest":{"enabled":true,"exclude":[]}}"#,
         )
         .unwrap();
         reload_config(&state, Ok(path.clone())).unwrap();
@@ -921,9 +921,7 @@ mod harness_ingest_tests {
         let path = directory.path().join("astrocyte.jsonc");
         std::fs::write(
             &path,
-            format!(
-                r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{{"api_twins":{{}},"plan_price_overrides":{{}},"quota_providers":{{}}}},"harness_ingest":{ingest}}}"#
-            ),
+            format!(r#"{{"poll_interval_secs":60,"harness_ingest":{ingest}}}"#),
         )
         .unwrap();
         reload_config(state, Ok(path)).unwrap();

@@ -433,6 +433,58 @@ mod tests {
     }
 
     #[test]
+    fn decoded_model_scope_reaches_account_and_credential_history() {
+        let mut conn = capacity_conn();
+        let credential: ProviderUsage = serde_json::from_str(
+            r#"{
+                "provider": "claude",
+                "credentialRef": "apikey:one",
+                "source": "vault",
+                "fetchedAt": "2026-10-28T00:00:00Z",
+                "usage": {
+                    "primary": {"usedPercent": 20, "modelScope": "all"},
+                    "secondary": {"usedPercent": 30},
+                    "tertiary": {"usedPercent": 40, "modelScope": "future-scope"},
+                    "extraRateWindows": [
+                        {"id": "Fable", "window": {"usedPercent": 50, "modelScope": "subset"}}
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut account = credential.clone();
+        account.account = Some("account-one".into());
+        account.credential_ref = None;
+        persist_entries(&mut conn, &[account, credential]);
+
+        let rows: Vec<(String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT account_ref AS login, pool_key, model_scope FROM window_sample
+                 UNION ALL
+                 SELECT credential_ref, pool_key, model_scope FROM credential_window_sample
+                 ORDER BY login, pool_key",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let expected = ["account-one", "apikey:one"].map(|login| {
+            [
+                (login, "extra:5:Fable", Some("subset")),
+                (login, "primary", Some("all")),
+                (login, "secondary", None),
+                (login, "tertiary", None),
+            ]
+        });
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|(login, pool, scope)| (login.as_str(), pool.as_str(), scope.as_deref()))
+            .collect();
+        assert_eq!(rows, expected.concat());
+    }
+
+    #[test]
     fn credential_history_preserves_distinct_source_instants() {
         let mut conn = capacity_conn();
         for (minute, used) in [(0, 10.0), (5, 15.0), (5, 15.0)] {

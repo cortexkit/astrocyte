@@ -1,6 +1,11 @@
 //! Daily multiplier observations and rate timeline retries are separate from loop scheduling.
 
 use super::*;
+use astrocyte_core::multiplier::{
+    pools,
+    provider_day::{self, ProviderDay},
+};
+use fusiform_protocol::PlanPricesRequest;
 use std::collections::BTreeSet;
 
 pub(super) const DAY_MS: i64 = 86_400_000;
@@ -10,13 +15,13 @@ pub(super) const MULTIPLIER_INTERVAL_MS: i64 = 7 * DAY_MS;
 // may be recorded but stay ineligible until their source backlog is resolved.
 const MULTIPLIER_SOURCE_WAIT_MS: i64 = 2 * 3_600_000;
 
-/// Records one subscription multiplier observation per quota provider per UTC
-/// day, over the trailing seven days. Missing rows are retried for the seven
+/// Records a complete set of pool observations per quota provider per UTC day,
+/// over the trailing seven days. Missing provider days are retried for the seven
 /// most recent completed UTC days, oldest first.
 ///
 /// A computation failure writes nothing and is retried on every later tick
-/// until recorded or outside the look-back. The table's partial unique index
-/// makes original-row retries idempotent, even across restarts. A failure is
+/// until recorded or outside the look-back. The provider-day row makes retries
+/// idempotent, even across restarts or for a day with no pools. A failure is
 /// logged once per day and reason; a configuration-only failure once per reason.
 pub(crate) struct MultiplierStage {
     pub(super) plan_prices: Option<Arc<dyn PlanPriceSource>>,
@@ -25,8 +30,6 @@ pub(crate) struct MultiplierStage {
     /// Provider, day (`None` for configuration-only failures), and reason.
     /// Keep every reason so interleaved retries of missed days do not repeat logs.
     failure_logged: BTreeSet<(String, Option<String>, String)>,
-    /// The UTC day the "member not recorded" skip was last logged.
-    not_recorded_logged: Option<String>,
     /// The rates version whose model timelines are still being read, set
     /// when a full tick's pass ran out of time. Passes then continue between
     /// ticks until every model is read.
@@ -91,7 +94,6 @@ impl MultiplierStage {
             plan_prices,
             recorded: BTreeSet::new(),
             failure_logged: BTreeSet::new(),
-            not_recorded_logged: None,
             rates_pending: None,
             rate_backoff: RateBackoff::default(),
         }
@@ -193,134 +195,75 @@ impl MultiplierStage {
                 return;
             }
         };
-        let (Some((_, oldest_day)), Some((_, day))) = (days.first(), days.last()) else {
+        let Some((_, oldest_day)) = days.first() else {
             return;
         };
-        let (oldest_day, day) = (oldest_day.clone(), day.clone());
-        let config = state.desired_config();
-        let multiplier_config = match &config.subscription_multiplier {
-            config::MultiplierSetting::Recorded(multiplier_config) => multiplier_config,
-            config::MultiplierSetting::NotRecorded => {
-                if self.not_recorded_logged.as_ref() != Some(&day) {
-                    tracing::info!(
-                        target: "multiplier",
-                        %day,
-                        "daily multiplier skipped: the committed desired generation does not record \
-                         the subscription_multiplier member"
-                    );
-                    self.not_recorded_logged = Some(day);
-                }
-                return;
-            }
-        };
-        self.recorded.retain(|(_, day)| day >= &oldest_day);
+        self.recorded.retain(|(_, day)| day >= oldest_day);
         self.failure_logged
-            .retain(|(_, day, _)| day.as_ref().is_none_or(|day| day >= &oldest_day));
-        for quota_provider in multiplier_config.quota_providers.keys() {
+            .retain(|(_, day, _)| day.as_ref().is_none_or(|day| day >= oldest_day));
+        for (end_ms, day) in days {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            for (interval_end_ms, day) in &days {
+            let start_ms = end_ms - MULTIPLIER_INTERVAL_MS;
+            let providers = match state.with_read_op(|conn| {
+                provider_day::providers(conn, &day, start_ms, end_ms).map_err(multiplier_refusal)
+            }) {
+                Ok(providers) => providers,
+                Err((_, error)) => {
+                    tracing::warn!(target: "multiplier", %day, %error, "provider day discovery failed");
+                    continue;
+                }
+            };
+            for quota_provider in providers {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let (interval_end_ms, day) = (*interval_end_ms, day.clone());
                 let recorded_key = (quota_provider.clone(), day.clone());
                 if self.recorded.contains(&recorded_key) {
                     continue;
                 }
-                match state.with_read_op(|conn| {
-                    let provider = multiplier::resolve_membership(
-                        conn,
-                        &multiplier_config.quota_providers[quota_provider],
-                        quota_provider,
-                        interval_end_ms,
-                    )
-                    .map_err(|error| (error.code().to_string(), error.message()))?;
-                    if provider.members().is_empty() {
-                        return Ok(false);
-                    }
-                    for account in provider.members().values() {
-                        if multiplier::observation_plan_head(
-                            conn,
-                            quota_provider,
-                            &day,
-                            Some(&account.plan),
-                        )
-                        .map_err(|error| ("internal".to_string(), error.to_string()))?
-                        .is_none()
-                        {
-                            return Ok(false);
-                        }
-                    }
-                    Ok(true)
-                }) {
+                let provider_day = ProviderDay {
+                    provider: &quota_provider,
+                    day: &day,
+                    interval_start_ms: start_ms,
+                    interval_end_ms: end_ms,
+                };
+                match state
+                    .with_read_op(|conn| provider_day.recorded(conn).map_err(multiplier_refusal))
+                {
                     Ok(true) => {
                         self.recorded.insert(recorded_key);
                         continue;
                     }
                     Ok(false) => {}
-                    Err((_, error)) => {
+                    Err((code, message)) => {
                         self.log_failure(
-                            quota_provider,
+                            &quota_provider,
                             &day,
-                            DayFailure {
-                                reason: format!("existence check: {error}"),
-                                needs_config: false,
-                            },
+                            DayError::from((code, message)).into(),
                         );
                         continue;
                     }
                 }
-                let not_ingested = scoped_producers_not_ingested(&config, quota_provider);
-                if !not_ingested.is_empty() {
-                    self.log_failure(
-                        quota_provider,
-                        &day,
-                        DayFailure {
-                            reason: format!(
-                                "scoped_producer_not_ingested: {}",
-                                not_ingested.join(", ")
-                            ),
-                            needs_config: true,
-                        },
-                    );
-                    continue;
-                }
-                let catalog = state.catalog_client();
-                if catalog.is_none() && catalog_pending {
-                    continue;
-                }
-                let outcome = match catalog {
-                    Some(catalog) => record_multiplier_day(
-                        state,
-                        &catalog,
-                        self.plan_prices.as_deref(),
-                        multiplier_config,
-                        quota_provider,
-                        interval_end_ms,
-                        now_ms,
-                        stop,
-                    ),
-                    None => Err(DayFailure {
-                        reason: "no fusiform catalog is configured, so no API rate can be read"
-                            .into(),
-                        needs_config: true,
-                    }),
-                };
-                // A day that fails, including one whose catalog cannot be read
-                // (`rate_fact_unrecognized`), writes nothing and is retried here
-                // on every later tick; `log_failure` logs it once per day and reason
-                // so a failure that lasts all day is not repeated every minute.
-                match outcome {
-                    Ok(None) => return,
-                    Ok(Some(observations)) => {
+                match record_multiplier_day(
+                    state,
+                    self.plan_prices.as_deref(),
+                    provider_day,
+                    now_ms,
+                    catalog_pending,
+                    stop,
+                ) {
+                    Ok(DailyOutcome::Stopped) => return,
+                    Ok(DailyOutcome::CatalogPending) => continue,
+                    Ok(DailyOutcome::Recorded(observations)) => {
                         self.recorded.insert(recorded_key);
                         for observation in observations {
                             tracing::info!(
                                 target: "multiplier",
                                 quota_provider,
                                 %day,
+                                pool_key = observation.window_pool_key,
                                 multiplier = ?observation.multiplier,
                                 fee_multiplier = ?observation.fee_multiplier,
                                 delta_percent = observation.delta_percent,
@@ -331,7 +274,7 @@ impl MultiplierStage {
                         }
                     }
                     Err(failure) => {
-                        self.log_failure(quota_provider, &day, failure);
+                        self.log_failure(&quota_provider, &day, failure);
                     }
                 }
             }
@@ -364,48 +307,25 @@ impl MultiplierStage {
     }
 }
 
-/// The producers a quota provider's scope names that the configuration in
-/// force does not ingest: excluded by `harness_ingest`, or all of ingestion
-/// off. The quota's used percent still counts their traffic, so a day
-/// computed without their tokens would understate the multiplier with nothing
-/// to show it; the day fails by name instead.
-///
-/// This is checked against the configuration, not against `source_runtime`
-/// rows: a producer whose store is absent (BROCA not installed included) also
-/// has no row, but "nothing on disk to read" loses no tokens, while "told not
-/// to read it" does.
-///
-/// The check reads only the configuration in force now. A producer excluded
-/// for part of the trailing seven days and re-enabled before the day is
-/// computed still leaves a gap in that interval; nothing records when
-/// ingestion was off.
-fn scoped_producers_not_ingested(
-    config: &config::AstrocyteConfig,
-    quota_provider: &str,
-) -> Vec<String> {
-    let config::MultiplierSetting::Recorded(multiplier) = &config.subscription_multiplier else {
-        return Vec::new();
-    };
-    let Some(provider) = multiplier.quota_providers.get(quota_provider) else {
-        return Vec::new();
-    };
-    provider
-        .scope
-        .iter()
-        .map(|rule| rule.producer.as_str())
-        .filter(|producer| !config.harness_ingest.ingests(producer))
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+fn multiplier_refusal(error: multiplier::MultiplierError) -> (String, String) {
+    (error.code().into(), error.message())
 }
 
-/// Why a day's observation could not be computed: a wire code, its message,
-/// and whether only a configuration change can cure it.
-pub(crate) struct DayError {
+/// Why a day could not be computed, and whether retries need a configuration change.
+struct DayError {
     code: String,
     message: String,
     needs_config: bool,
+}
+
+impl From<(String, String)> for DayError {
+    fn from((code, message): (String, String)) -> Self {
+        Self {
+            code,
+            message,
+            needs_config: false,
+        }
+    }
 }
 
 impl From<DayError> for DayFailure {
@@ -417,60 +337,51 @@ impl From<DayError> for DayFailure {
     }
 }
 
-/// A completed day's tokens may still be waiting in any ingested source, not
-/// just a source in this provider's scope. Absent and skipped sources have no
-/// runtime row. Bound the wait so a broken source cannot leave a permanent gap.
+/// Tokens can arrive through any ingest source. Wait for active sources to
+/// drain, but bound the wait so a broken source cannot leave a permanent gap.
 fn multiplier_stale_sources(
-    state: &SharedState,
+    conn: &rusqlite::Connection,
     interval_end_ms: i64,
     snapshot_at_ms: i64,
-    provider: &multiplier::QuotaProviderConfig,
-) -> Result<Vec<String>, DayError> {
-    let sources = state
-        .with_read_op(|conn| {
-            let mut statement = conn
-                .prepare(
-                    "SELECT source_key FROM source_runtime
-                      WHERE last_success_ms IS NULL OR last_success_ms < ?1
-                         OR pending_known > 0 OR pending_unknown != 0
-                     ORDER BY source_key",
-                )
-                .map_err(|error| ("internal".to_string(), error.to_string()))?;
-            let sources = statement
-                .query_map([interval_end_ms], |row| row.get::<_, String>(0))
-                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
-                .map_err(|error| ("internal".to_string(), error.to_string()))?;
-            Ok(sources)
-        })
-        .map_err(|(code, message)| DayError {
-            code,
-            message,
-            needs_config: false,
-        })?;
-    let sources: Vec<_> = sources
-        .into_iter()
-        .filter(|source| multiplier::source_in_scope(provider, source))
-        .collect();
+) -> Result<Vec<String>, (String, String)> {
+    let internal = |error: rusqlite::Error| ("internal".into(), error.to_string());
+    let mut statement = conn
+        .prepare_cached(
+            "SELECT source_key FROM source_runtime
+         WHERE last_success_ms IS NULL OR last_success_ms < ?1
+            OR pending_known > 0 OR pending_unknown != 0
+         ORDER BY source_key",
+        )
+        .map_err(internal)?;
+    let sources = statement
+        .query_map([interval_end_ms], |row| row.get::<_, String>(0))
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        .map_err(internal)?;
     if !sources.is_empty() && snapshot_at_ms < interval_end_ms + MULTIPLIER_SOURCE_WAIT_MS {
-        return Err(DayError {
-            code: "source_reads_pending".into(),
-            message: format!(
+        return Err((
+            "source_reads_pending".into(),
+            format!(
                 "waiting for a successful read after midnight: {}",
                 sources.join(", ")
             ),
-            needs_config: false,
-        });
+        ));
     }
     Ok(sources)
 }
 
-fn disclose_stale_sources(observation: &mut multiplier::Observation, sources: &[String]) {
+fn disclose_stale_sources(
+    observation: &mut multiplier::Observation,
+    sources: &[String],
+    add_reason: bool,
+) {
     if !sources.is_empty() {
         observation.source_backlog = sources.to_vec();
         observation.routing_eligible = false;
-        observation
-            .eligibility_reasons
-            .push("source_backlog".into());
+        if add_reason {
+            observation
+                .eligibility_reasons
+                .push("source_backlog".into());
+        }
         observation.error_deflating.push_str(&format!(
             " stale_sources: {}; source read is stale or backlog remains, so late usage may be missing.",
             sources.join(", ")
@@ -483,7 +394,7 @@ fn disclose_stale_sources(observation: &mut multiplier::Observation, sources: &[
 /// full ticks until none is left, as the summary backlog does.
 const RATE_FETCH_PASS_BUDGET: Duration = Duration::from_millis(1500);
 /// The deadline for one model's read, which is up to three fusiform calls
-/// (current identity, its served history, and an alias or twin target's
+/// (current identity, its served history, and an alias target's
 /// history). Each model gets its own: when models shared the pass deadline,
 /// the first model's calls left the next too little time, and its read timed
 /// out on this side, not fusiform's.
@@ -514,15 +425,9 @@ fn rate_era_refresh(
     backoff: &mut RateBackoff,
 ) -> Result<Option<i64>, String> {
     use astrocyte_core::rate_era;
-    let config = state.desired_config();
-    let empty_twins = std::collections::BTreeMap::new();
-    let twins = match &config.subscription_multiplier {
-        config::MultiplierSetting::Recorded(config) => &config.api_twins,
-        config::MultiplierSetting::NotRecorded => &empty_twins,
-    };
     state.ordered_write(|tx| {
         rate_era::discover(tx, 2000).map_err(|error| error.message())?;
-        rate_era::prepare(tx, version, twins).map_err(|error| error.message())?;
+        rate_era::prepare(tx, version).map_err(|error| error.message())?;
         Ok(((), true))
     })?;
     Ok(rate_era_fill(state, version, backoff)?.then_some(version))
@@ -542,12 +447,6 @@ fn rate_era_fill(
     let Some(catalog) = state.catalog_client() else {
         return Ok(false);
     };
-    let config = state.desired_config();
-    let empty_twins = std::collections::BTreeMap::new();
-    let twins = match &config.subscription_multiplier {
-        config::MultiplierSetting::Recorded(config) => &config.api_twins,
-        config::MultiplierSetting::NotRecorded => &empty_twins,
-    };
     let pending = state
         .with_read_op(|conn| {
             rate_era::pending(conn, 256).map_err(|error| (error.code().into(), error.message()))
@@ -566,7 +465,7 @@ fn rate_era_fill(
         attempted = true;
         let (provider, model) = key;
         let call = catalog.with_budget(RATE_FETCH_MODEL_BUDGET);
-        let fetched = match rate_era::fetch(&call, &provider, &model, twins) {
+        let fetched = match rate_era::fetch(&call, &provider, &model) {
             Ok(fetched) => fetched,
             Err(error) => {
                 if backoff.failed((provider.clone(), model.clone()), std::time::Instant::now()) {
@@ -591,179 +490,182 @@ fn rate_era_fill(
     Ok(found_reference || (at_limit && attempted))
 }
 
-/// Computes one day and appends it as the day's original row.
-#[allow(clippy::too_many_arguments)]
+enum DailyOutcome {
+    Stopped,
+    CatalogPending,
+    Recorded(Vec<multiplier::Observation>),
+}
+
 fn record_multiplier_day(
     state: &SharedState,
-    catalog: &CatalogClient,
     plan_prices: Option<&dyn PlanPriceSource>,
-    config: &MultiplierConfig,
-    quota_provider: &str,
-    interval_end_ms: i64,
+    day: ProviderDay<'_>,
     snapshot_at_ms: i64,
+    catalog_pending: bool,
     stop: &AtomicBool,
-) -> Result<Option<Vec<multiplier::Observation>>, DayFailure> {
+) -> Result<DailyOutcome, DayFailure> {
+    let observations = match compute_multiplier_day(state, plan_prices, day, snapshot_at_ms, true) {
+        Ok(observations) => observations,
+        Err(error) if catalog_pending && error.code == "catalog_unavailable" => {
+            return Ok(DailyOutcome::CatalogPending);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    // A plan-price or catalog read may finish after shutdown starts. Leave the
+    // complete day for the next refresher instead of committing part of it.
     if stop.load(Ordering::Relaxed) {
-        return Ok(None);
-    }
-    let stale_sources = multiplier_stale_sources(
-        state,
-        interval_end_ms,
-        snapshot_at_ms,
-        &config.quota_providers[quota_provider],
-    )?;
-    let mut observations = compute_multiplier_day(
-        state,
-        catalog,
-        plan_prices,
-        config,
-        quota_provider,
-        interval_end_ms,
-        snapshot_at_ms,
-        true,
-    )?;
-    // Plan prices are read outside the writer transaction. If shutdown arrived
-    // during that call, leave the entire provider/day to the next refresher.
-    if stop.load(Ordering::Relaxed) {
-        return Ok(None);
-    }
-    for observation in &mut observations {
-        disclose_stale_sources(observation, &stale_sources);
+        return Ok(DailyOutcome::Stopped);
     }
     let written = state.ordered_write(|tx| {
-        for observation in &observations {
-            if stop.load(Ordering::Relaxed) {
-                return Err("multiplier stopped".into());
-            }
-            if multiplier::observation_plan_head(
-                tx,
-                &observation.quota_provider,
-                &observation.observation_day,
-                observation.plan.as_deref(),
-            )
-            .map_err(|error| error.to_string())?
-            .is_none()
-            {
-                multiplier::insert_observation_in_tx(tx, observation)
-                    .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
-            }
-        }
+        let written = day
+            .record(tx, snapshot_at_ms, &observations)
+            .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
         if stop.load(Ordering::Relaxed) {
             return Err("multiplier stopped".into());
         }
-        Ok(((), true))
+        Ok((written, written))
     });
     if written.is_err() && stop.load(Ordering::Relaxed) {
-        return Ok(None);
+        return Ok(DailyOutcome::Stopped);
     }
-    written.map_err(|reason| DayFailure {
+    if written.map_err(|reason| DayFailure {
         reason,
         needs_config: false,
-    })?;
-    crate::bus_publications::publish_multiplier(state);
-    Ok(Some(observations))
+    })? {
+        crate::bus_publications::publish_multiplier(state);
+        Ok(DailyOutcome::Recorded(observations))
+    } else {
+        Ok(DailyOutcome::Recorded(Vec::new()))
+    }
 }
 
-/// Read an owned plan, resolve fees, then value it without writing. Automatic
-/// days use cached timelines; explicit operator recomputes retain catalog reads.
-/// No network call holds a store transaction, and appending is a separate write.
-#[allow(clippy::too_many_arguments)]
+/// Capture the whole provider day before reading any served facts. Every pool
+/// uses the same readings, vault plans and traffic, including the measurements.
 fn compute_multiplier_day(
     state: &SharedState,
-    catalog: &CatalogClient,
     plan_prices: Option<&dyn PlanPriceSource>,
-    config: &MultiplierConfig,
-    quota_provider: &str,
-    interval_end_ms: i64,
+    day: ProviderDay<'_>,
     snapshot_at_ms: i64,
     cached: bool,
 ) -> Result<Vec<multiplier::Observation>, DayError> {
-    let failed = |error: multiplier::MultiplierError| DayError {
-        code: error.code().to_string(),
-        message: error.message(),
-        needs_config: false,
-    };
-    let read_failed = |(code, message): (String, String)| DayError {
-        code,
-        message,
-        needs_config: false,
-    };
-    let plan = state
+    let (capture, stale_sources) = state
         .with_read_op(|conn| {
-            multiplier::plan_observation(
+            if !day.has_readings(conn).map_err(multiplier_refusal)? {
+                return Ok((None, Vec::new()));
+            }
+            let capture = pools::capture_pool_day(
                 conn,
-                config,
-                quota_provider,
-                interval_end_ms - MULTIPLIER_INTERVAL_MS,
-                interval_end_ms,
+                day.provider,
+                day.interval_start_ms,
+                day.interval_end_ms,
             )
-            .map_err(|error| (error.code().to_string(), error.message()))
+            .map_err(multiplier_refusal)?;
+            let potential_pools = pools::plan_pools(&capture.readings, &[]);
+            if potential_pools.is_empty() {
+                return Ok((None, Vec::new()));
+            }
+            let might_measure = potential_pools.iter().any(|pool| {
+                matches!(
+                    pool.diagnostic,
+                    None | Some(
+                        pools::PoolDiagnostic::WindowTie | pools::PoolDiagnostic::PoolListMissing
+                    )
+                )
+            });
+            let stale_sources = if might_measure {
+                multiplier_stale_sources(conn, day.interval_end_ms, snapshot_at_ms)?
+            } else {
+                Vec::new()
+            };
+            Ok((Some(capture), stale_sources))
         })
-        .map_err(read_failed)?;
-    let plan_prices =
-        multiplier::resolve_plans(plan_prices, config, &plan.provider, snapshot_at_ms).map_err(
-            |error| DayError {
-                needs_config: plan_prices.is_none(),
-                ..failed(error)
+        .map_err(DayError::from)?;
+    let Some(capture) = capture else {
+        return Ok(Vec::new());
+    };
+    let plan_prices = plan_prices.ok_or_else(|| DayError {
+        code: "plan_prices_unavailable".into(),
+        message: "plan prices are needed and fusiform is not configured".into(),
+        needs_config: true,
+    })?;
+    let served = plan_prices
+        .plan_prices(PlanPricesRequest {
+            provider_id: None,
+            at_ms: Some(day.interval_end_ms),
+        })
+        .map_err(|error| {
+            DayError::from(multiplier_refusal(multiplier::MultiplierError::PlanPrices(
+                format!("plan.prices: {}: {}", error.code, error.message),
+            )))
+        })?;
+    let planned = pools::plan_pools(&capture.readings, &served.quota_pools);
+    let models = capture.models_for_pools(&planned);
+    let subset_models = capture.models_for_subsets(&planned);
+    let (identities, rates) = if models.is_empty() {
+        (
+            pools::PoolModelIdentities::default(),
+            multiplier::ResolvedRates {
+                resolved_at_ms: snapshot_at_ms,
+                ..multiplier::ResolvedRates::default()
             },
-        )?;
-    let models = multiplier::catalog_models(config, &plan);
-    let rates = if cached {
-        state
-            .with_read_op(|conn| {
-                astrocyte_core::rate_era::resolved_rates(conn, &models, snapshot_at_ms)
-                    .map_err(|error| (error.code().to_string(), error.message()))
-            })
-            .map_err(read_failed)?
+        )
     } else {
-        multiplier::resolve_rates(catalog, &models, snapshot_at_ms).map_err(failed)?
-    };
-    let observation = state
-        .with_read_op(|conn| {
-            multiplier::compute_plan_observations(
-                conn,
-                config,
-                &plan,
-                &rates,
-                &plan_prices,
-                snapshot_at_ms,
-                &state.desired_config().reasoning_billed_as_output,
+        let catalog = state.catalog_client().ok_or_else(|| DayError {
+            code: "catalog_unavailable".into(),
+            message: "no fusiform catalog is connected, so no API rate can be read".into(),
+            needs_config: true,
+        })?;
+        let resolve = |models| {
+            pools::resolve_pool_models(&catalog, models, snapshot_at_ms)
+                .map_err(multiplier_refusal)
+                .map_err(DayError::from)
+        };
+        if cached {
+            let rates = state
+                .with_read_op(|conn| {
+                    astrocyte_core::rate_era::resolved_rates(conn, &models, snapshot_at_ms)
+                        .map_err(multiplier_refusal)
+                })
+                .map_err(DayError::from)?;
+            (resolve(&subset_models)?.0, rates)
+        } else if subset_models.is_empty() {
+            (
+                pools::PoolModelIdentities::default(),
+                multiplier::resolve_rates(&catalog, &models, snapshot_at_ms)
+                    .map_err(multiplier_refusal)
+                    .map_err(DayError::from)?,
             )
-            .map_err(|error| (error.code().to_string(), error.message()))
-        })
-        .map_err(read_failed)?;
-    Ok(observation)
+        } else {
+            resolve(&models)?
+        }
+    };
+    let mut observations = pools::compute_pool_observations(
+        &capture,
+        &planned,
+        &rates,
+        &identities,
+        &served,
+        snapshot_at_ms,
+    )
+    .map_err(multiplier_refusal)
+    .map_err(DayError::from)?;
+    for (row, pool) in observations.iter_mut().zip(&planned) {
+        if pool.coverage().is_some() {
+            disclose_stale_sources(row, &stale_sources, pool.diagnostic.is_none());
+        }
+    }
+    Ok(observations)
 }
 
-/// `spend.multiplier.recompute`: computes a day over the interval
-/// the daily stage used for it (the seven days ending at its 00:00Z) with the
-/// current configuration and catalog, and appends one row per quota provider
-/// that supersedes that day's head, or creates its original if none exists.
-///
-/// Every refusal writes nothing: an unknown provider, a missing day still
-/// waiting for source reads, or a computation that fails (an unreadable catalog
-/// is the same failure the daily stage retries). All fusiform calls finish
-/// before the write transaction opens, and all providers are appended in that
-/// one transaction or none is.
-///
-/// The request carries no operator identity, as for `spend.event.reprice`:
-/// the caller is whoever the transport admitted, and the request type refuses
-/// any extra field that would let a caller name themselves.
+/// Recompute the same seven-day interval as the daily stage. All peer reads
+/// finish before the write transaction; a refusal leaves all requested days
+/// unchanged. Only chains with a stored pool scope are reconciled.
 pub(crate) fn recompute_multiplier_day(
     state: &SharedState,
     plan_prices: Option<&dyn PlanPriceSource>,
     request: &multiplier::MultiplierRecomputeRequest,
     now_ms: i64,
 ) -> Result<serde_json::Value, (String, String)> {
-    let config = state.desired_config();
-    let config::MultiplierSetting::Recorded(multiplier_config) = &config.subscription_multiplier
-    else {
-        return Err((
-            "multiplier_not_recorded".into(),
-            "the committed desired generation does not record the subscription_multiplier member"
-                .into(),
-        ));
-    };
     let day = &request.observation_day;
     let interval_end_ms = multiplier::utc_day_start_ms(day).ok_or_else(|| {
         (
@@ -771,107 +673,46 @@ pub(crate) fn recompute_multiplier_day(
             format!("observation_day {day:?} is not a YYYY-MM-DD date"),
         )
     })?;
-    let quota_providers: Vec<String> = match &request.quota_provider {
-        Some(quota_provider)
-            if multiplier_config
-                .quota_providers
-                .contains_key(quota_provider) =>
-        {
-            vec![quota_provider.clone()]
+    let interval_start_ms = interval_end_ms - MULTIPLIER_INTERVAL_MS;
+    let quota_providers = state.with_read_op(|conn| {
+        if let Some(provider) = &request.quota_provider {
+            if !provider_day::known(conn, provider).map_err(multiplier_refusal)? {
+                return Err((
+                    "unknown_quota_provider".into(),
+                    format!("no readings or multiplier history for '{provider}'"),
+                ));
+            }
+            Ok(vec![provider.clone()])
+        } else {
+            provider_day::providers(conn, day, interval_start_ms, interval_end_ms)
+                .map_err(multiplier_refusal)
         }
-        Some(quota_provider) => {
-            return Err((
-                "unknown_quota_provider".into(),
-                format!("quota provider '{quota_provider}' is not configured"),
-            ))
-        }
-        None => multiplier_config.quota_providers.keys().cloned().collect(),
-    };
+    })?;
     if quota_providers.is_empty() {
         return Err((
             "unknown_quota_provider".into(),
-            "no quota provider is configured".into(),
+            "no quota provider has readings or a recorded day in range".into(),
         ));
     }
-    // Preflight every requested scope before any catalog call: quota usage
-    // includes excluded producers, but their tokens would be missing.
-    for quota_provider in &quota_providers {
-        let not_ingested = scoped_producers_not_ingested(&config, quota_provider);
-        if !not_ingested.is_empty() {
-            return Err((
-                "scoped_producer_not_ingested".into(),
-                format!(
-                    "quota provider '{quota_provider}': {}",
-                    not_ingested.join(", ")
-                ),
-            ));
-        }
-    }
-    let catalog = state.catalog_client().ok_or_else(|| {
-        (
-            "catalog_unavailable".to_string(),
-            "no fusiform catalog is connected, so no API rate can be read".to_string(),
-        )
-    })?;
-    let mut observations = Vec::new();
-    for quota_provider in &quota_providers {
-        let stale_sources = multiplier_stale_sources(
-            state,
+    let mut calculations = Vec::new();
+    for provider in &quota_providers {
+        let day = ProviderDay {
+            provider,
+            day,
+            interval_start_ms,
             interval_end_ms,
-            now_ms,
-            &multiplier_config.quota_providers[quota_provider],
-        )
-        .map_err(|error| (error.code, error.message))?;
-        let mut rows = compute_multiplier_day(
-            state,
-            &catalog,
-            plan_prices,
-            multiplier_config,
-            quota_provider,
-            interval_end_ms,
-            now_ms,
-            false,
-        )
-        .map_err(|error| (error.code, error.message))?;
-        for observation in &mut rows {
-            disclose_stale_sources(observation, &stale_sources);
-        }
-        observations.extend(rows);
+        };
+        let rows = compute_multiplier_day(state, plan_prices, day, now_ms, false)
+            .map_err(|error| (error.code, error.message))?;
+        calculations.push((day, rows));
     }
     let reply = state.ordered_op_write(|tx| {
         let mut recomputed = Vec::new();
-        for observation in &observations {
-            // Recheck inside the writer transaction: another writer may have
-            // created this day while its catalog calls were in flight.
-            let (observation_id, supersedes) = match multiplier::observation_plan_head(
-                tx,
-                &observation.quota_provider,
-                &observation.observation_day,
-                observation.plan.as_deref(),
-            )
-            .map_err(|error| ("internal".to_string(), error.to_string()))?
-            {
-                Some(_) => {
-                    let superseded =
-                        multiplier::insert_superseding_observation_in_tx(tx, observation)
-                            .map_err(|error| (error.code().to_string(), error.message()))?;
-                    (superseded.observation_id, Some(superseded.supersedes))
-                }
-                None => {
-                    multiplier::insert_observation_in_tx(tx, observation)
-                        .map_err(|error| (error.code().to_string(), error.message()))?;
-                    (tx.last_insert_rowid(), None)
-                }
-            };
-            recomputed.push(serde_json::json!({
-                "quota_provider": observation.quota_provider,
-                "plan": observation.plan,
-                "observation_day": observation.observation_day,
-                "observation_id": observation_id,
-                "supersedes": supersedes,
-                "multiplier": observation.multiplier,
-                "fee_multiplier": observation.fee_multiplier,
-            }));
+        for (day, rows) in &calculations {
+            recomputed.extend(
+                day.reconcile(tx, now_ms, rows)
+                    .map_err(multiplier_refusal)?,
+            );
         }
         Ok((serde_json::json!({ "recomputed": recomputed }), true))
     })?;
@@ -882,6 +723,7 @@ pub(crate) fn recompute_multiplier_day(
 #[cfg(test)]
 mod multiplier_stage_tests {
     include!("stop_multiplier_tests.rs");
+    include!("provider_day_tests.rs");
     include!("../refresher_bus_publications_tests.rs");
     include!("../refresher_multiplier_v2_tests.rs");
     include!("../refresher_rate_era_tests.rs");
@@ -892,7 +734,7 @@ mod multiplier_stage_tests {
     use astrocyte_core::store::MIGRATIONS;
     use fusiform_protocol::{
         CatalogGetRequest, CatalogGetResponse, PlanAmount, PlanPriceWire, PlanPricesRequest,
-        PlanPricesResponse,
+        PlanPricesResponse, QuotaPoolWire,
     };
     use serde_json::json;
 
@@ -910,10 +752,14 @@ mod multiplier_stage_tests {
     struct FakeFusiform {
         catalog_calls: AtomicUsize,
         plan_calls: AtomicUsize,
+        plan_instants: std::sync::Mutex<Vec<Option<i64>>>,
+        quota_pools: std::sync::Mutex<Vec<QuotaPoolWire>>,
+        future_plan_price: AtomicBool,
         plan_prices_fail: std::sync::atomic::AtomicBool,
         input_rate_units: std::sync::atomic::AtomicI64,
         unrecognized_key: std::sync::atomic::AtomicBool,
         unit_billing: std::sync::atomic::AtomicBool,
+        reasoning_billing: AtomicBool,
         cache_write_ttl: std::sync::atomic::AtomicBool,
         uncovered: std::sync::atomic::AtomicBool,
         history_fingerprint: std::sync::atomic::AtomicI64,
@@ -930,10 +776,14 @@ mod multiplier_stage_tests {
             Arc::new(Self {
                 catalog_calls: AtomicUsize::new(0),
                 plan_calls: AtomicUsize::new(0),
+                plan_instants: std::sync::Mutex::default(),
+                quota_pools: std::sync::Mutex::default(),
+                future_plan_price: AtomicBool::new(false),
                 plan_prices_fail: std::sync::atomic::AtomicBool::new(plan_prices_fail),
                 input_rate_units: std::sync::atomic::AtomicI64::new(10_000_000_000),
                 unrecognized_key: std::sync::atomic::AtomicBool::new(false),
                 unit_billing: std::sync::atomic::AtomicBool::new(false),
+                reasoning_billing: AtomicBool::new(false),
                 cache_write_ttl: std::sync::atomic::AtomicBool::new(false),
                 uncovered: std::sync::atomic::AtomicBool::new(false),
                 history_fingerprint: std::sync::atomic::AtomicI64::new(320_000_000_000),
@@ -1027,6 +877,12 @@ mod multiplier_stage_tests {
             let rate = json!({"state":"priced","units":self.input_rate_units.load(Ordering::SeqCst),"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}});
             let mut facts = BTreeMap::from([("rate.input".to_string(), rate.clone())]);
             facts.insert("rate.output".into(), json!({"state":"priced","units":20_000_000_000_i64,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}}));
+            if self.reasoning_billing.load(Ordering::SeqCst) {
+                facts.insert(
+                    "rate.reasoning".into(),
+                    json!({"state":"billed_as","key":"rate.output"}),
+                );
+            }
             if self.unrecognized_key.load(Ordering::SeqCst) {
                 facts.insert("rate.input.above_context.272k".to_string(), rate);
             }
@@ -1088,54 +944,51 @@ mod multiplier_stage_tests {
     impl PlanPriceSource for FakeFusiform {
         fn plan_prices(
             &self,
-            _request: PlanPricesRequest,
+            request: PlanPricesRequest,
         ) -> Result<PlanPricesResponse, CatalogCallError> {
             self.plan_calls.fetch_add(1, Ordering::SeqCst);
+            self.plan_instants.lock().unwrap().push(request.at_ms);
             if self.plan_prices_fail.load(Ordering::SeqCst) {
                 return Err(CatalogCallError {
                     code: "unavailable".into(),
                     message: "fusiform is restarting".into(),
                 });
             }
+            let price = |tier: &str, minor_units, boundary_at_ms| PlanPriceWire {
+                provider_id: "openai".into(),
+                tier: tier.into(),
+                price: Some(PlanAmount {
+                    minor_units,
+                    exponent: 2,
+                    currency: "USD".into(),
+                    period: "month".into(),
+                }),
+                quota_value: None,
+                service_tiers: None,
+                concurrency: None,
+                refusal_reason: None,
+                boundary_at_ms,
+                established_by: "fusiform".into(),
+                established_at_ms: 0,
+                review_by_ms: i64::MAX,
+                source_ref: "https://example.invalid".into(),
+            };
+            let mut prices = vec![price("pro_20x", 20_000, 0), price("pro_100", 10_000, 0)];
+            if self.future_plan_price.load(Ordering::SeqCst) {
+                prices.push(price("pro_20x", 99_000, DAY_START + 1));
+            }
             Ok(PlanPricesResponse {
-                prices: vec![PlanPriceWire {
-                    provider_id: "openai".into(),
-                    tier: "pro_20x".into(),
-                    price: Some(PlanAmount {
-                        minor_units: 20_000,
-                        exponent: 2,
-                        currency: "USD".into(),
-                        period: "month".into(),
-                    }),
-                    quota_value: None,
-                    service_tiers: None,
-                    concurrency: None,
-                    refusal_reason: None,
-                    boundary_at_ms: 0,
-                    established_by: "fusiform".into(),
-                    established_at_ms: 0,
-                    review_by_ms: i64::MAX,
-                    source_ref: "https://example.invalid".into(),
-                }],
+                prices,
                 resolved_at_ms: NOW,
                 tier_vocabulary: "vendor".into(),
                 unit_policy: "list".into(),
-                quota_pools: Vec::new(),
+                quota_pools: self.quota_pools.lock().unwrap().clone(),
             })
         }
     }
 
     const DESIRED: &str = r#"{
         "poll_interval_secs": 60,
-        "reasoning_billed_as_output": ["openai"],
-        "subscription_multiplier": {
-            "api_twins": {},
-            "plan_price_overrides": {},
-            "quota_providers": {"codex": {
-                "window": {"pool_key": "primary", "window_minutes": 10080},
-                "scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null}]
-            }}
-        },
         "harness_ingest": {"enabled": true, "exclude": []}
     }"#;
 
@@ -1144,163 +997,57 @@ mod multiplier_stage_tests {
     }
 
     fn publish_document(state: &Arc<SharedState>, directory: &tempfile::TempDir, document: &str) {
-        let mut document: serde_json::Value = serde_json::from_str(document).unwrap();
-        if let Some(providers) =
-            document["subscription_multiplier"]["quota_providers"].as_object_mut()
-        {
-            for provider in providers.values_mut() {
-                for field in ["accounts", "credentials"] {
-                    if let Some(members) = provider.as_object_mut().unwrap().remove(field) {
-                        for (id, member) in members.as_object().unwrap() {
-                            let key = member["plan"].as_str().unwrap();
-                            let (provider, tier) = key.split_once('/').unwrap();
-                            state
-                                .ordered_write(|tx| {
-                                    astrocyte_core::vault_plan::append_in_tx(
-                                        tx,
-                                        &astrocyte_core::vault_plan::VaultPlan {
-                                            credential_id: if field == "credentials" {
-                                                id.clone()
-                                            } else {
-                                                format!("fixture:{id}")
-                                            },
-                                            provider: Some(provider.into()),
-                                            account_id: (field == "accounts").then(|| id.clone()),
-                                            plan_tier: Some(tier.into()),
-                                            plan_key: Some(key.into()),
-                                            source: "config".into(),
-                                            effective_from_ms: 0,
-                                            observed_at_ms: 0,
-                                        },
-                                    )
-                                    .map_err(|error| error.to_string())?;
-                                    Ok(((), true))
-                                })
-                                .unwrap();
-                        }
-                    }
-                }
-            }
-        }
         let path = directory.path().join("astrocyte.jsonc");
-        std::fs::write(&path, document.to_string()).unwrap();
+        std::fs::write(&path, document).unwrap();
         reload_config(state, Ok(path)).unwrap();
     }
 
-    /// `DESIRED` with its `harness_ingest` member replaced.
-    fn desired_with_ingest(ingest: &str) -> String {
-        DESIRED.replace(
-            r#""harness_ingest": {"enabled": true, "exclude": []}"#,
-            &format!(r#""harness_ingest": {ingest}"#),
-        )
-    }
-
-    /// A reason the stage logged for the `codex` quota provider.
-    fn codex_failure(stage: &MultiplierStage) -> Option<String> {
-        stage
-            .failure_logged
-            .iter()
-            .find(|(provider, _, _)| provider == "codex")
-            .map(|(_, _, reason)| reason.clone())
-    }
-
-    /// A scope naming a producer the configuration excludes would count none
-    /// of its tokens while the quota's used percent still counts its traffic.
-    /// The day fails by name instead, writes nothing, and makes no fusiform
-    /// call; it is recorded once the producer is ingested again.
     #[test]
-    fn a_scope_naming_an_excluded_producer_fails_the_day_by_name() {
+    fn ingest_exclusions_do_not_define_the_day() {
         for ingest in [
             r#"{"enabled": true, "exclude": ["opencode"]}"#,
             r#"{"enabled": false, "exclude": []}"#,
         ] {
             let directory = tempfile::tempdir().unwrap();
             let state = Arc::new(state::leased_test_state(&directory));
-            publish_document(&state, &directory, &desired_with_ingest(ingest));
+            let document = DESIRED.replace(
+                r#""harness_ingest": {"enabled": true, "exclude": []}"#,
+                &format!(r#""harness_ingest": {ingest}"#),
+            );
+            publish_document(&state, &directory, &document);
             let fusiform = FakeFusiform::new(false);
             install_catalog(&state, &fusiform);
             seed_usage(&state);
             let mut stage = MultiplierStage::new(Some(fusiform.clone()));
             stage.tick(&state, false, NOW);
-            assert!(current_day_observations(&state).is_empty(), "{ingest}");
-            assert_eq!(
-                codex_failure(&stage).as_deref(),
-                Some("scoped_producer_not_ingested: opencode"),
-                "{ingest}"
-            );
-            assert_eq!(fusiform.plan_calls.load(Ordering::SeqCst), 0, "{ingest}");
-
-            publish_desired(&state, &directory);
-            stage.tick(&state, false, NOW + 60_000);
             assert_eq!(
                 current_day_observations(&state),
-                [("codex".to_string(), "2024-10-04".to_string(), 10_000_000)],
-                "{ingest}"
+                [("codex".into(), DAY.into(), 10_000_000)]
             );
+            assert!(stage.failure_logged.is_empty());
         }
     }
 
-    /// Excluding a producer the scope does not name changes nothing: the day
-    /// is recorded as before.
-    #[test]
-    fn excluding_a_producer_outside_every_scope_still_records_the_day() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = Arc::new(state::leased_test_state(&directory));
-        publish_document(
-            &state,
-            &directory,
-            &desired_with_ingest(r#"{"enabled": true, "exclude": ["goose", "broca"]}"#),
-        );
-        let fusiform = FakeFusiform::new(false);
-        install_catalog(&state, &fusiform);
-        seed_usage(&state);
-        let mut stage = MultiplierStage::new(Some(fusiform.clone()));
-        stage.tick(&state, false, NOW);
-        assert_eq!(
-            current_day_observations(&state),
-            [("codex".to_string(), "2024-10-04".to_string(), 10_000_000)]
-        );
-        assert_eq!(codex_failure(&stage), None);
-    }
-
-    /// BROCA is read from its store like every other reader and needs no
-    /// configuration, so a scope naming it is refused only when BROCA is
-    /// excluded. An absent store (BROCA not installed) is not a refusal:
-    /// nothing on disk means no BROCA tokens exist to leave out.
-    #[test]
-    fn a_scope_naming_broca_is_refused_only_when_broca_is_excluded() {
-        let with_broca_scope = |document: &str| {
-            document.replace(
-                r#""scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null}]"#,
-                r#""scope": [{"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null}, {"producer": "broca", "provider": "openai", "charge_basis": "subscription_included", "model_prefix": null}]"#,
-            )
-        };
-        let directory = tempfile::tempdir().unwrap();
-        let state = Arc::new(state::leased_test_state(&directory));
-        publish_document(
-            &state,
-            &directory,
-            &with_broca_scope(&desired_with_ingest(
-                r#"{"enabled": true, "exclude": ["broca"]}"#,
-            )),
-        );
-        let fusiform = FakeFusiform::new(false);
-        install_catalog(&state, &fusiform);
-        seed_usage(&state);
-        let mut stage = MultiplierStage::new(Some(fusiform.clone()));
-        stage.tick(&state, false, NOW);
-        assert!(current_day_observations(&state).is_empty());
-        assert_eq!(
-            codex_failure(&stage).as_deref(),
-            Some("scoped_producer_not_ingested: broca")
-        );
-
-        publish_document(&state, &directory, &with_broca_scope(DESIRED));
-        stage.tick(&state, false, NOW + 60_000);
-        assert_eq!(
-            current_day_observations(&state),
-            [("codex".to_string(), "2024-10-04".to_string(), 10_000_000)]
-        );
+    fn add_vault_plan(state: &SharedState, id: &str, account: Option<&str>, tier: &str) {
+        state
+            .ordered_write(|tx| {
+                astrocyte_core::vault_plan::append_in_tx(
+                    tx,
+                    &astrocyte_core::vault_plan::VaultPlan {
+                        credential_id: id.into(),
+                        provider: Some("openai".into()),
+                        account_id: account.map(str::to_owned),
+                        plan_tier: Some(tier.into()),
+                        plan_key: Some(format!("openai/{tier}")),
+                        source: "detected".into(),
+                        effective_from_ms: 0,
+                        observed_at_ms: 0,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(((), true))
+            })
+            .unwrap();
     }
 
     fn install_catalog(state: &SharedState, fusiform: &Arc<FakeFusiform>) {
@@ -1313,6 +1060,14 @@ mod multiplier_stage_tests {
     /// Dense, unsaturated quota history and 1,000 opencode/openai tokens inside
     /// the seven days before `DAY_START`, with no active reader runtime rows.
     fn seed_usage(state: &SharedState) {
+        seed_usage_with(state, true);
+    }
+
+    fn seed_usage_with(state: &SharedState, with_event: bool) {
+        seed_usage_with_window(state, with_event, Some(10080));
+    }
+
+    fn seed_usage_with_window(state: &SharedState, with_event: bool, minutes: Option<i64>) {
         state
             .ordered_write(|tx| {
                 astrocyte_core::vault_plan::append_in_tx(tx,&astrocyte_core::vault_plan::VaultPlan {
@@ -1324,28 +1079,32 @@ mod multiplier_stage_tests {
                 // has no active store reader unless a test adds one explicitly.
                 tx.execute("DELETE FROM source_runtime", [])
                     .map_err(|error| error.to_string())?;
-                for minute in (0..=7 * 24 * 60).step_by(5) {
+                 tx.execute("UPDATE cortexkit_schema_version SET applied_at_unix=0 WHERE namespace='astrocyte' AND version=68", [])
+                     .map_err(|error| error.to_string())?;
+                 for minute in (0..=7 * 24 * 60).step_by(5) {
                     let at_ms = DAY_START - 7 * DAY_MS + minute * 60_000;
                     let used = minute as f64 / 240.0;
                     tx.execute(
-                        "INSERT INTO window_sample (provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at)
-                         VALUES ('codex','acct','primary',?1,?2,10080,'2024-10-10T00:00:00Z')",
-                        params![at_ms * 1_000_000, used],
+                        "INSERT INTO window_sample (provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at,model_scope,api_provider)
+                         VALUES ('codex','acct','primary',?1,?2,?3,'2024-10-10T00:00:00Z','all','openai')",
+                         params![at_ms * 1_000_000, used, minutes],
                     )
                     .map_err(|error| error.to_string())?;
                 }
-                tx.execute(
-                    "INSERT INTO usage_event (event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis)
-                     VALUES ('e1','opencode','lineage','e1',?1,?1,'openai','m','unknown')",
+                 if with_event {
+                 tx.execute(
+                     "INSERT INTO usage_event (event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis,account_ref)
+                      VALUES ('e1','opencode','lineage','e1',?1,?1,'openai','m','subscription_included','acct')",
                     [DAY_START - 2 * DAY_MS],
                 )
                 .map_err(|error| error.to_string())?;
                 tx.execute(
-                    "INSERT INTO measurement (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
-                     VALUES ((SELECT event_key FROM usage_event WHERE event_id='e1'),'input','token','billed','usage.input',1000,0)",
-                    [],
-                )
-                .map_err(|error| error.to_string())?;
+                     "INSERT INTO measurement (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
+                      VALUES ((SELECT event_key FROM usage_event WHERE event_id='e1'),'input','token','billed','usage.input',1000,0)",
+                     [],
+                 )
+                 .map_err(|error| error.to_string())?;
+                 }
                 Ok(((), true))
             })
             .unwrap();
@@ -1408,19 +1167,11 @@ mod multiplier_stage_tests {
     }
 
     #[test]
-    fn multiplier_uses_and_records_top_level_reasoning_billing() {
+    fn multiplier_values_reasoning_only_with_the_served_billing_rule() {
         for declared in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let state = Arc::new(state::leased_test_state(&directory));
-            let document = if declared {
-                DESIRED.to_owned()
-            } else {
-                DESIRED.replace(
-                    "\"reasoning_billed_as_output\": [\"openai\"]",
-                    "\"reasoning_billed_as_output\": []",
-                )
-            };
-            publish_document(&state, &directory, &document);
+            publish_desired(&state, &directory);
             seed_usage(&state);
             state.ordered_write(|tx| {
                 tx.execute("INSERT INTO measurement (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
@@ -1429,6 +1180,7 @@ mod multiplier_stage_tests {
                 Ok(((), true))
             }).unwrap();
             let fusiform = FakeFusiform::new(false);
+            fusiform.reasoning_billing.store(declared, Ordering::SeqCst);
             install_catalog(&state, &fusiform);
             MultiplierStage::new(Some(fusiform)).tick(&state, false, NOW);
             assert_eq!(
@@ -1442,7 +1194,7 @@ mod multiplier_stage_tests {
             let recorded: String = state.with_conn(|conn| conn.query_row(
                 "SELECT reasoning_billed_as_output FROM multiplier_observation WHERE observation_day=?1", [DAY], |row| row.get(0))
                 .map_err(|error| error.to_string())).unwrap();
-            assert_eq!(recorded, if declared { "[\"openai\"]" } else { "[]" });
+            assert_eq!(recorded, "[]");
         }
     }
 
@@ -1590,12 +1342,20 @@ mod multiplier_stage_tests {
         fusiform.plan_calls.store(0, Ordering::SeqCst);
         stage.tick(&state, false, NOW + 8 * DAY_MS);
         assert_eq!(
-            observation_days(&state),
+            recorded_provider_days(&state)
+                .into_iter()
+                .map(|(_, day, _)| day)
+                .collect::<Vec<_>>(),
             (2..=8)
                 .map(|offset| multiplier::utc_day(DAY_START + offset * DAY_MS).unwrap())
                 .collect::<Vec<_>>()
         );
-        assert_eq!(fusiform.plan_calls.load(Ordering::SeqCst), 7);
+        assert_eq!(
+            observation_days(&state).len(),
+            6,
+            "the last day has no in-interval readings"
+        );
+        assert_eq!(fusiform.plan_calls.load(Ordering::SeqCst), 6);
     }
 
     #[test]
@@ -1621,7 +1381,7 @@ mod multiplier_stage_tests {
     }
 
     #[test]
-    fn the_day_waits_for_every_in_scope_source_and_includes_its_late_usage() {
+    fn the_day_waits_for_active_sources_and_includes_their_late_usage() {
         let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(state::leased_test_state(&directory));
         publish_desired(&state, &directory);
@@ -1635,8 +1395,8 @@ mod multiplier_stage_tests {
         assert!(!observation_days(&state).contains(&DAY.to_string()));
         state.ordered_write(|tx| {
             tx.execute(
-                "INSERT INTO usage_event (event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis)
-                 VALUES ('late','opencode','lineage','late',?1,?2,'openai','m','unknown')",
+                "INSERT INTO usage_event (event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis,account_ref)
+                 VALUES ('late','opencode','lineage','late',?1,?2,'openai','m','subscription_included','acct')",
                 params![DAY_START - DAY_MS, NOW],
             ).map_err(|error| error.to_string())?;
             tx.execute(
@@ -1782,13 +1542,8 @@ mod multiplier_stage_tests {
         assert_eq!(all_rows(&state).len(), 2);
     }
 
-    /// A store whose committed generation predates the multiplier column
-    /// boots with the member "not recorded" -- not as an empty declaration --
-    /// and the daily stage writes nothing. The next reload from a valid file
-    /// publishes a generation that records the member, and the stage then
-    /// records the day exactly once, across repeated ticks and a restart.
     #[test]
-    fn a_pre_multiplier_generation_records_nothing_until_a_reload_publishes_the_member() {
+    fn a_pre_multiplier_generation_does_not_gate_the_provider_day() {
         use cortexkit_store::{open_sqlite, Isolation, StorageBackend, StorageDescriptor};
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("ledger.db");
@@ -1825,18 +1580,17 @@ mod multiplier_stage_tests {
         let state = Arc::new(state::leased_test_state(&directory));
         assert_eq!(state.desired_generation(), 3);
         assert_eq!(state.desired_config().poll_interval_secs, 45);
-        assert_eq!(
-            state.desired_config().subscription_multiplier,
-            config::MultiplierSetting::NotRecorded
-        );
         let fusiform = FakeFusiform::new(false);
         install_catalog(&state, &fusiform);
         seed_usage(&state);
 
         let mut stage = MultiplierStage::new(Some(fusiform.clone()));
         stage.tick(&state, false, NOW);
-        assert!(current_day_observations(&state).is_empty());
-        assert_eq!(fusiform.plan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            current_day_observations(&state),
+            [("codex".into(), DAY.into(), 10_000_000)]
+        );
+        assert_eq!(fusiform.plan_calls.load(Ordering::SeqCst), 7);
 
         publish_desired(&state, &directory);
         assert_eq!(state.desired_generation(), 4);
@@ -1852,107 +1606,52 @@ mod multiplier_stage_tests {
     }
 
     #[test]
-    fn stored_generations_lift_reasoning_billing_and_new_generations_keep_it() {
-        for nested in [None, Some(serde_json::json!(["openai", "anthropic"]))] {
-            let directory = tempfile::tempdir().unwrap();
-            let mut old: serde_json::Value = serde_json::from_str(DESIRED).unwrap();
-            old.as_object_mut()
-                .unwrap()
-                .remove("reasoning_billed_as_output");
-            if let Some(providers) = &nested {
-                old["subscription_multiplier"]["reasoning_billed_as_output"] = providers.clone();
-            }
-            {
-                let state = state::leased_test_state(&directory);
-                state.ordered_write(|tx| {
-                    tx.execute("UPDATE desired_config SET generation=3,canonical_bytes=?1,subscription_multiplier=?2 WHERE id=1",
-                        rusqlite::params![old.to_string().as_bytes(), old["subscription_multiplier"].to_string()])
-                        .map_err(|error| error.to_string())?;
-                    tx.execute("UPDATE source_runtime SET desired_generation=3", []).map_err(|error| error.to_string())?;
-                    Ok(((), true))
-                }).unwrap();
-            }
-            let state = Arc::new(state::leased_test_state(&directory));
-            let expected = if nested.is_some() {
-                vec!["openai", "anthropic"]
-            } else {
-                vec![]
-            };
-            assert_eq!(state.desired_config().reasoning_billed_as_output, expected);
-            assert!(matches!(
-                state.desired_config().subscription_multiplier,
-                config::MultiplierSetting::Recorded(_)
-            ));
-            publish_desired(&state, &directory);
-            drop(state);
-            let state = state::leased_test_state(&directory);
-            assert_eq!(
-                state.desired_config().reasoning_billed_as_output,
-                ["openai"]
-            );
-            state
-                .with_conn(|conn| {
-                    let stored: String = conn
-                        .query_row(
-                            "SELECT subscription_multiplier FROM desired_config",
-                            [],
-                            |row| row.get(0),
-                        )
-                        .map_err(|error| error.to_string())?;
-                    assert!(!stored.contains("reasoning_billed_as_output"));
-                    Ok(())
-                })
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn stored_generations_without_model_prefix_hydrate_as_null() {
+    fn stored_generation_hydrates_without_reading_removed_members() {
         let directory = tempfile::tempdir().unwrap();
-        let mut old: serde_json::Value = serde_json::from_str(DESIRED).unwrap();
-        old["subscription_multiplier"]["quota_providers"]["codex"]["scope"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("model_prefix");
+        let old = json!({
+            "poll_interval_secs": 45,
+            "harness_ingest": { "enabled": true, "exclude": ["omp"] },
+            "reasoning_billed_as_output": ["openai"],
+            "subscription_multiplier": {
+                "api_twins": {"openai-codex":"openai"},
+                "plan_price_overrides": {},
+                "quota_providers": {"codex": {"accounts":{"old":{"plan":"openai/pro_20x","price_override":null}}}}
+            }
+        });
+        let bytes = serde_json::to_vec(&old).unwrap();
+        let column = old["subscription_multiplier"].to_string();
         {
             let state = state::leased_test_state(&directory);
             state.ordered_write(|tx| {
-                tx.execute("UPDATE desired_config SET generation=3,canonical_bytes=?1,subscription_multiplier=?2 WHERE id=1",
-                    rusqlite::params![old.to_string().as_bytes(), old["subscription_multiplier"].to_string()])
-                    .map_err(|error| error.to_string())?;
+                tx.execute("UPDATE desired_config SET generation=3,poll_interval_secs=45,harness_ingest=?1,canonical_bytes=?2,subscription_multiplier=?3 WHERE id=1",
+                    params![old["harness_ingest"].to_string(), bytes, column]).map_err(|error| error.to_string())?;
                 tx.execute("UPDATE source_runtime SET desired_generation=3", []).map_err(|error| error.to_string())?;
                 Ok(((), true))
             }).unwrap();
         }
         let state = Arc::new(state::leased_test_state(&directory));
-        let config::MultiplierSetting::Recorded(multiplier) =
-            state.desired_config().subscription_multiplier
-        else {
-            panic!("multiplier expected")
-        };
-        assert_eq!(
-            multiplier.quota_providers["codex"].scope[0].model_prefix,
-            None
-        );
         assert_eq!(state.desired_generation(), 3);
+        assert_eq!(
+            state.desired_config(),
+            config::decode(
+                r#"{"poll_interval_secs":45,"harness_ingest":{"enabled":true,"exclude":["omp"]}}"#
+            )
+            .unwrap()
+            .config
+        );
+        state.with_conn(|conn| {
+            let stored: (Vec<u8>, String) = conn.query_row("SELECT canonical_bytes,subscription_multiplier FROM desired_config WHERE id=1", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            assert_eq!(stored, (bytes, column));
+            assert!(astrocyte_core::vault_plan::at(conn, 1).unwrap().is_empty());
+            Ok(())
+        }).unwrap();
         publish_desired(&state, &directory);
-        state
-            .with_conn(|conn| {
-                let stored: String = conn
-                    .query_row(
-                        "SELECT subscription_multiplier FROM desired_config",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| error.to_string())?;
-                let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
-                assert_eq!(
-                    stored["quota_providers"]["codex"]["scope"][0].get("model_prefix"),
-                    Some(&serde_json::Value::Null)
-                );
-                Ok(())
-            })
-            .unwrap();
+        assert_eq!(state.desired_generation(), 4);
+        state.with_conn(|conn| {
+            let stored: (Vec<u8>, Option<String>) = conn.query_row("SELECT canonical_bytes,subscription_multiplier FROM desired_config WHERE id=1", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            assert_eq!(stored, (config::intentional_empty().canonical_bytes, None));
+            Ok(())
+        }).unwrap();
     }
 
     /// A day whose inputs cannot be read writes nothing and is retried on
@@ -2285,55 +1984,37 @@ mod multiplier_stage_tests {
         );
     }
 
-    /// A recompute must not undercount an excluded producer's tokens. Even
-    /// an all-provider request checks every scope before calling the catalog.
     #[test]
-    fn served_recompute_refuses_excluded_scope_without_calls_or_rows() {
-        for quota_provider in [None, Some("z-excluded")] {
-            let directory = tempfile::tempdir().unwrap();
-            let state = Arc::new(state::leased_test_state(&directory));
-            let mut document: serde_json::Value = serde_json::from_str(DESIRED).unwrap();
-            document["subscription_multiplier"]["plan_price_overrides"]["openai/pro_20x"] =
-                json!({"minor_units": 20000, "exponent": 2, "currency": "USD", "period": "month"});
-            let mut excluded =
-                document["subscription_multiplier"]["quota_providers"]["codex"].clone();
-            excluded["scope"][0]["producer"] = json!("broca");
-            document["subscription_multiplier"]["quota_providers"]["z-excluded"] = excluded;
-            document["harness_ingest"]["exclude"] = json!(["broca"]);
-            publish_document(&state, &directory, &document.to_string());
-            let fusiform = FakeFusiform::new(false);
-            install_catalog(&state, &fusiform);
-            seed_usage(&state);
-            let calls_before = fusiform.catalog_calls.load(Ordering::SeqCst);
-            assert!(all_rows(&state).is_empty());
-
-            let mut params = json!({"observation_day": DAY});
-            if let Some(provider) = quota_provider {
-                params["quota_provider"] = json!(provider);
-            }
-            let (code, message) =
-                crate::ops::dispatch(&state, crate::ops::OP_MULTIPLIER_RECOMPUTE, params)
-                    .unwrap_err();
-            assert_eq!(code, "scoped_producer_not_ingested", "{message}");
-            assert!(
-                message.contains("broca") && message.contains("z-excluded"),
-                "{message}"
-            );
-            assert!(all_rows(&state).is_empty(), "no provider may write a row");
-            assert_eq!(fusiform.catalog_calls.load(Ordering::SeqCst), calls_before);
-            assert_eq!(fusiform.plan_calls.load(Ordering::SeqCst), 0);
-
-            // The excluded scope must not block a request for an ingested one.
-            let reply = crate::ops::dispatch(
-                &state,
-                crate::ops::OP_MULTIPLIER_RECOMPUTE,
-                json!({"observation_day": DAY, "quota_provider": "codex"}),
-            )
+    fn served_recompute_accepts_a_provider_known_only_by_an_empty_day() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state::leased_test_state(&directory);
+        state
+            .ordered_write(|tx| {
+                tx.execute(
+                    "INSERT INTO multiplier_provider_day VALUES ('empty',?1,?2)",
+                    params![DAY, NOW],
+                )
+                .unwrap();
+                Ok(((), true))
+            })
             .unwrap();
-            assert_eq!(reply["recomputed"].as_array().unwrap().len(), 1);
-            assert_eq!(reply["recomputed"][0]["quota_provider"], "codex");
-            assert_eq!(all_rows(&state).len(), 1);
-        }
+        let before = all_rows(&state);
+        let request = |provider| json!({"observation_day": DAY, "quota_provider": provider});
+        let dispatch =
+            |params| crate::ops::dispatch(&state, crate::ops::OP_MULTIPLIER_RECOMPUTE, params);
+        assert_eq!(
+            dispatch(request("missing")).unwrap_err().0,
+            "unknown_quota_provider"
+        );
+        assert_eq!(
+            dispatch(request("empty")).unwrap(),
+            json!({"recomputed": []})
+        );
+        assert_eq!(
+            dispatch(json!({"observation_day": DAY})).unwrap(),
+            json!({"recomputed": []})
+        );
+        assert_eq!(all_rows(&state), before);
     }
 
     /// Each refusal writes nothing: a malformed day, an unknown provider,

@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::conn;
-use crate::valuation::{value_event, EventTokens, ValuationRules};
+use crate::valuation::{value_event, EventTokens};
 use sha2::{Digest, Sha256};
 
 #[test]
@@ -8,7 +8,7 @@ fn regression_caught_up_rate_model_selection_seeks_version_index() {
     let mut costs = Vec::new();
     for models in [1_000, 10_000] {
         let conn = conn();
-        prepare(&conn, 42, &BTreeMap::new()).unwrap();
+        prepare(&conn, 42).unwrap();
         conn.execute(
             "WITH RECURSIVE ids(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM ids WHERE i<?1)
              INSERT INTO rate_model(provider,model,catalog_version)
@@ -72,20 +72,10 @@ fn numerator(
             Some(0),
         )],
     };
-    let config = multiplier::MultiplierConfig {
-        api_twins: BTreeMap::new(),
-        plan_price_overrides: BTreeMap::new(),
-        quota_providers: BTreeMap::new(),
-    };
     let resolution = resolve(conn, provider, model, at_ms)
         .unwrap()
         .expect("fetched");
-    let value = value_event(
-        &ValuationRules::from_config(&config, &[]),
-        Some(&resolution),
-        &event,
-    )
-    .unwrap();
+    let value = value_event(Some(&resolution), &event).unwrap();
     (
         value.numerator,
         value.unpriced.into_iter().map(|row| row.reason).collect(),
@@ -222,20 +212,10 @@ fn rate_era_speed_twin_history_values_fast_calls_from_the_twins_start() {
                 Some(0),
             )],
         };
-        let config = multiplier::MultiplierConfig {
-            api_twins: BTreeMap::new(),
-            plan_price_overrides: BTreeMap::new(),
-            quota_providers: BTreeMap::new(),
-        };
         let resolution = resolve(&conn, "moonshotai", "kimi-k3.1-pro", at_ms)
             .unwrap()
             .expect("fetched");
-        let value = value_event(
-            &ValuationRules::from_config(&config, &[]),
-            Some(&resolution),
-            &event,
-        )
-        .unwrap();
+        let value = value_event(Some(&resolution), &event).unwrap();
         let reasons: Vec<String> = value.unpriced.into_iter().map(|row| row.reason).collect();
         (value.numerator, reasons)
     };
@@ -355,7 +335,7 @@ fn rate_era_first_fetch_and_target_changes_dirty_only_referring_summary_hours() 
     conn.execute("DELETE FROM rate_dirty_hour", []).unwrap();
     mark_dirty(&conn, "p", "m").unwrap();
     assert_eq!(hours(), vec![2], "old target no longer dirties the alias");
-    prepare(&conn, 3, &BTreeMap::new()).unwrap();
+    prepare(&conn, 3).unwrap();
     assert_eq!(pending(&conn, 10).unwrap().len(), 3);
 }
 
@@ -386,7 +366,7 @@ fn rate_era_dirty_lookup_large_summary_measurement() {
 }
 
 #[test]
-fn rate_era_discovery_cursor_follows_new_calls_and_twins_invalidate_references() {
+fn rate_era_discovery_and_prepare_never_serve_old_configured_references() {
     let conn = conn();
     for id in 0..3 {
         conn.execute("INSERT INTO usage_event(event_id,producer,producer_ref,recorded_at_ms,provider,model,charge_basis) VALUES(?1,'opencode',?1,0,'p',?1,'unknown')",[id.to_string()]).unwrap();
@@ -395,19 +375,34 @@ fn rate_era_discovery_cursor_follows_new_calls_and_twins_invalidate_references()
     assert_eq!(pending(&conn, 10).unwrap().len(), 2);
     discover(&conn, 2).unwrap();
     assert_eq!(pending(&conn, 10).unwrap().len(), 3);
-    let fetched = synthetic("p", "0", serde_json::json!({}));
-    publish(&conn, &fetched, 1).unwrap();
-    prepare(&conn, 1, &BTreeMap::new()).unwrap();
-    assert_eq!(pending(&conn, 10).unwrap().len(), 2);
-    prepare(&conn, 1, &BTreeMap::from([("p".into(), "twin".into())])).unwrap();
-    assert_eq!(pending(&conn, 10).unwrap().len(), 3);
+    publish(&conn, &synthetic("p", "1", serde_json::json!({})), 1).unwrap();
+    let mut old = synthetic("p", "0", serde_json::json!({}));
+    old.reference = Some(CatalogModel {
+        provider_id: "p".into(),
+        model_id: "1".into(),
+    });
+    publish(&conn, &old, 1).unwrap();
+    assert!(resolve(&conn, "p", "0", 0).unwrap().is_some());
+    conn.execute(
+        "UPDATE rate_cache_state SET catalog_version=1, twins=?1 WHERE id=1",
+        [r#"{"p":"other"}"#],
+    )
+    .unwrap();
     assert!(resolve(&conn, "p", "0", 0).unwrap().is_none());
+    assert!(resolve(&conn, "p", "1", 0).unwrap().is_some());
+    prepare(&conn, 1).unwrap();
+    assert_eq!(
+        pending(&conn, 10).unwrap(),
+        [("p".into(), "0".into()), ("p".into(), "2".into())]
+    );
+    assert!(resolve(&conn, "p", "0", 0).unwrap().is_none());
+    publish(&conn, &synthetic("p", "0", serde_json::json!({})), 1).unwrap();
+    assert!(resolve(&conn, "p", "0", 0).unwrap().is_some());
 }
 
 #[test]
 fn rate_era_catalog_version_reset_refreshes_cached_timeline() {
     let conn = conn();
-    let twins = BTreeMap::new();
     let timeline = |units| {
         synthetic(
             "p",
@@ -420,7 +415,7 @@ fn rate_era_catalog_version_reset_refreshes_cached_timeline() {
             }]}),
         )
     };
-    prepare(&conn, 12, &twins).unwrap();
+    prepare(&conn, 12).unwrap();
     publish(&conn, &timeline(2_000_000_000), 12).unwrap();
     assert!(pending(&conn, 10).unwrap().is_empty());
     assert_eq!(
@@ -428,7 +423,7 @@ fn rate_era_catalog_version_reset_refreshes_cached_timeline() {
         2_000_000_000
     );
 
-    prepare(&conn, 3, &twins).unwrap();
+    prepare(&conn, 3).unwrap();
     assert_eq!(pending(&conn, 10).unwrap(), vec![("p".into(), "m".into())]);
     publish(&conn, &timeline(1_000_000_000), 3).unwrap();
     assert!(pending(&conn, 10).unwrap().is_empty());

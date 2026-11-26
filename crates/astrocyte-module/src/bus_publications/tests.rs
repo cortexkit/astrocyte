@@ -113,8 +113,11 @@ impl TestBus {
 #[test]
 fn bus_publications_key_components_are_total_and_unambiguous() {
     assert_eq!(key_component("a/_.é"), "x612f5f2ec3a9");
-    assert_eq!(pair_key("a.b", "c"), "x612e62.x63");
-    assert_ne!(pair_key("a.b", "c"), pair_key("a", "b.c"));
+    assert_eq!(multiplier_key("a.b", "c", "d/é"), "x612e62.x63.x642fc3a9");
+    assert_ne!(
+        multiplier_key("a.b", "c", "d"),
+        multiplier_key("a", "b.c", "d")
+    );
     assert_eq!(key_component(""), "x");
 }
 
@@ -126,7 +129,8 @@ async fn bus_publications_failed_put_retries_without_another_change() {
     };
     let before = bus.attempts();
     bus.control.fail_next_put.store(true, Ordering::Relaxed);
-    let latest = json!({"quota_provider":"codex", "plan":"synthetic", "multiplier":3});
+    let latest =
+        json!({"quota_provider":"codex", "plan":"synthetic", "pool_id":"primary", "multiplier":3});
     state
         .bus_publications()
         .multiplier(std::slice::from_ref(&latest));
@@ -135,7 +139,7 @@ async fn bus_publications_failed_put_retries_without_another_change() {
         !bus.control.fail_next_put.load(Ordering::Relaxed),
         "test must reach the injected failed put"
     );
-    let key = pair_key("codex", "synthetic");
+    let key = multiplier_key("codex", "synthetic", "primary");
     assert!(bus.multiplier.get(&key).await.unwrap().is_none());
     let failed = bus.attempts();
     let generation = bus.control.desired.lock().unwrap().generation;
@@ -463,68 +467,72 @@ async fn bus_publications_outage_never_rolls_back_steps_or_watermarks_or_health(
 }
 
 #[tokio::test]
-async fn bus_publications_multiplier_reconciles_null_plan_and_unchanged_values() {
+async fn bus_publications_multiplier_removes_legacy_and_oversized_keys() {
     let state = test_state();
     let Some(bus) = TestBus::start(&state).await else {
         return;
     };
-    let before = bus.attempts();
-    state
-        .bus_publications()
-        .multiplier(&[json!({"quota_provider":"codex","plan":null,"multiplier":2})]);
-    bus.after(before).await;
-    assert_eq!(
-        bus.multiplier
-            .get("x636f646578.n")
-            .await
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        br#"{"multiplier":2,"plan":null,"quota_provider":"codex"}"#
-    );
-    let latest = json!({"quota_provider":"codex","plan":"openai/pro_20x","multiplier":3});
+    let old_key = "x636f646578.x6f70656e61692f70726f5f323078";
+    bus.multiplier
+        .put(old_key, b"{}".to_vec().into())
+        .await
+        .unwrap();
+    let latest = json!({"quota_provider":"codex","plan":"openai/pro_20x","pool_id":"a.b","window_pool_key":"extra:3:a.b","multiplier":3});
     let before = bus.attempts();
     state
         .bus_publications()
         .multiplier(std::slice::from_ref(&latest));
     bus.after(before).await;
-    assert!(bus.multiplier.get("x636f646578.n").await.unwrap().is_none());
-    let key = "x636f646578.x6f70656e61692f70726f5f323078";
+    assert!(bus.multiplier.get(old_key).await.unwrap().is_none());
+    let key = "x636f646578.x6f70656e61692f70726f5f323078.x612e62";
     let entry = bus.multiplier.entry(key).await.unwrap().unwrap();
     assert_eq!(entry.value.as_ref(), serde_json::to_vec(&latest).unwrap());
     let before = bus.attempts();
     state
         .bus_publications()
         .multiplier(std::slice::from_ref(&latest));
-    assert_eq!(bus.attempts(), before);
+    bus.after(before).await;
     assert_eq!(
         bus.multiplier.entry(key).await.unwrap().unwrap().revision,
         entry.revision
     );
-    // A real Codex plan entry runs to about 16 KiB with its per-model rates; it
-    // fits under the bucket's declared 64 KiB and must be published.
-    let large = json!({"quota_provider":"codex","plan":"openai/pro_20x","samples":vec![0;8192]});
-    assert!(serde_json::to_vec(&large).unwrap().len() > 16_000);
+    let mut large = latest.clone();
+    large["samples"] = json!("");
+    let envelope = serde_json::to_vec(&large).unwrap().len();
+    let cap = declared_value_cap("multiplier");
+    // Real Codex plan values exceed 8 KiB. Publish a 16 KiB row as well as one
+    // at the declared limit, then verify that one byte over revokes the key.
+    for size in [16 * 1024, cap] {
+        large["samples"] = json!("a".repeat(size - envelope));
+        let bytes = serde_json::to_vec(&large).unwrap();
+        assert_eq!(bytes.len(), size);
+        let before = bus.attempts();
+        state
+            .bus_publications()
+            .multiplier(std::slice::from_ref(&large));
+        bus.after(before).await;
+        let published = bus.multiplier.get(key).await.unwrap();
+        assert_eq!(
+            published.as_deref(),
+            Some(bytes.as_slice()),
+            "{size}-byte row"
+        );
+    }
     let before = bus.attempts();
-    state
-        .bus_publications()
-        .multiplier(std::slice::from_ref(&large));
-    bus.after(before).await;
-    assert_eq!(
-        bus.multiplier.get(key).await.unwrap().unwrap().as_ref(),
-        serde_json::to_vec(&large).unwrap()
-    );
-    let before = bus.attempts();
-    state.bus_publications().multiplier(&[
-        json!({"quota_provider":"codex","plan":"openai/pro_20x","samples":vec![0;40_000]}),
-    ]);
+    large["samples"] = json!("a".repeat(cap + 1 - envelope));
+    state.bus_publications().multiplier(&[large]);
     bus.after(before).await;
     assert!(bus.multiplier.get(key).await.unwrap().is_none());
+    assert!(bus.control.warnings.lock().unwrap().oversized["multiplier"].contains(key));
     let before = bus.attempts();
     state.bus_publications().multiplier(&[latest]);
     bus.after(before).await;
     assert!(bus.multiplier.get(key).await.unwrap().is_some());
-    let longest = pair_key("kimi-for-coding", "kimi-code-plan-global/allegro");
+    let longest = multiplier_key(
+        "kimi-for-coding",
+        "kimi-code-plan-global/allegro",
+        "long.opaque/pool",
+    );
     bus.multiplier
         .put(&longest, b"{}".to_vec().into())
         .await

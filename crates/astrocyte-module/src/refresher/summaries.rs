@@ -14,18 +14,13 @@ pub(super) fn valuation_tick(
     if stop.load(Ordering::Relaxed) {
         return;
     }
-    let desired = state.desired_config();
-    let config::MultiplierSetting::Recorded(config) = &desired.subscription_multiplier else {
-        return;
-    };
     let needed = state.with_read_op(|conn| {
-        ValuationMaintenance::needs_prepare(conn, config, &desired.reasoning_billed_as_output)
-            .map_err(|error| {
-                (
-                    "internal".into(),
-                    format!("valuation prepare check: {error:?}"),
-                )
-            })
+        ValuationMaintenance::needs_prepare(conn).map_err(|error| {
+            (
+                "internal".into(),
+                format!("valuation prepare check: {error:?}"),
+            )
+        })
     });
     let needed = match needed {
         Ok(needed) => needed,
@@ -36,7 +31,7 @@ pub(super) fn valuation_tick(
     };
     let result = if needed {
         state.ordered_write(|tx| {
-            ValuationMaintenance::prepare(tx, config, &desired.reasoning_billed_as_output)
+            ValuationMaintenance::prepare(tx)
                 .map_err(|error| format!("valuation prepare: {error:?}"))?;
             Ok(((), false))
         })
@@ -50,11 +45,9 @@ pub(super) fn valuation_tick(
     let started = std::time::Instant::now();
     while !stop.load(Ordering::Relaxed) && started.elapsed() < budget {
         let result = state.with_read_op(|conn| {
-            interrupt_on_stop(conn, stop, || {
-                Ok(valuations.read_chunk(conn, config, &desired.reasoning_billed_as_output))
-            })
-            .map_err(|error| ("internal".into(), error.to_string()))?
-            .map_err(|error| ("internal".into(), format!("valuation read: {error:?}")))
+            interrupt_on_stop(conn, stop, || Ok(valuations.read_chunk(conn)))
+                .map_err(|error| ("internal".into(), error.to_string()))?
+                .map_err(|error| ("internal".into(), format!("valuation read: {error:?}")))
         });
         let ready = match result {
             Ok(ready) => ready,

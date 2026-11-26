@@ -25,22 +25,14 @@ fn stop_during_multiplier_peer_call_leaves_whole_days_for_retry() {
     for pause_at in [1, 2, 8] {
         let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(state::leased_test_state(&directory));
-        let mut document: serde_json::Value = serde_json::from_str(DESIRED).unwrap();
-        document["subscription_multiplier"]["plan_price_overrides"]["openai/pro_100"] =
-            json!({"minor_units":10000,"exponent":2,"currency":"USD","period":"month"});
-        document["subscription_multiplier"]["quota_providers"]["codex"]["accounts"]["acct2"] =
-            json!({"plan":"openai/pro_100","price_override":null});
-        document["subscription_multiplier"]["quota_providers"]["second"] =
-            document["subscription_multiplier"]["quota_providers"]["codex"].clone();
-        document["subscription_multiplier"]["quota_providers"]["second"]["scope"][0]["provider"] =
-            json!("anthropic");
-        publish_document(&state, &directory, &document.to_string());
+        publish_desired(&state, &directory);
+        add_vault_plan(&state, "fixture:acct2", Some("acct2"), "pro_100");
         let fusiform = FakeFusiform::new(false);
         install_catalog(&state, &fusiform);
         seed_usage(&state);
         state.ordered_write(|tx| {
-        tx.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at) SELECT provider,'acct2',pool_key,fetched_at_instant,used_percent,window_minutes,resets_at FROM window_sample", []).map_err(|error| error.to_string())?;
-        tx.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at) SELECT 'second',account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at FROM window_sample", []).map_err(|error| error.to_string())?;
+        tx.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at,model_scope,api_provider) SELECT provider,'acct2',pool_key,fetched_at_instant,used_percent,window_minutes,resets_at,model_scope,api_provider FROM window_sample", []).map_err(|error| error.to_string())?;
+        tx.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at,model_scope,api_provider) SELECT 'second',account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at,model_scope,api_provider FROM window_sample", []).map_err(|error| error.to_string())?;
         Ok(((), true))
     }).unwrap();
         let (entered, waiting) = mpsc::sync_channel(1);

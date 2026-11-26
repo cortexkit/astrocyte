@@ -133,7 +133,7 @@ fn attribution_report_broca_scope_agent_uses_stamped_run_parent() {
     );
     rate(&conn, "a", 1_000_000_000);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     let workload = request(json!({"grouping":["alfonso","workload"]}));
     let result = spend_report(&conn, &workload, DAY_MS).unwrap();
     assert!(result
@@ -200,7 +200,7 @@ fn attribution_report_broca_scope_flow_joins_publisher_flow() {
     );
     rate(&conn, "a", 1_000_000_000);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     let query = request(json!({"grouping":["alfonso","workload"]}));
     let before = spend_report(&conn, &query, DAY_MS).unwrap();
     assert_eq!(before.attribution_coverage.unwrap().unattributed_calls, 1);
@@ -253,7 +253,7 @@ fn attribution_report_broca_scope_publisher_wins_and_counts_disagreement() {
     );
     rate(&conn, "a", 1_000_000_000);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     let result = spend_report(
         &conn,
         &request(json!({"grouping":["alfonso","workload"]})),
@@ -374,7 +374,6 @@ fn unknown_basis_derived_and_stored_heads_have_identical_reader_replies() {
     use crate::{multiplier, runs, verdict};
     let (mut legacy, unknown, corrected) = basis_parity_store(true);
     let (mut headless, _, _) = basis_parity_store(false);
-    let config = config();
     let read = |old: &Connection, new: &Connection, rebuilt: bool| {
         for (group, zone) in [
             (json!([]), "UTC"),
@@ -499,7 +498,7 @@ fn unknown_basis_derived_and_stored_heads_have_identical_reader_replies() {
 
     for db in [&mut legacy, &mut headless] {
         summaries(db);
-        assert!(!drain(db, &config).is_empty());
+        assert!(!drain(db).is_empty());
     }
     read(&legacy, &headless, true);
     for table in [
@@ -529,11 +528,34 @@ fn unknown_basis_derived_and_stored_heads_have_identical_reader_replies() {
         assert!(!derived.is_empty(), "{table}");
         assert_eq!(cells(&legacy), derived, "{table}");
     }
-    let inputs = |db| multiplier::plan_observation(db, &config, "pool", 0, DAY_MS).unwrap();
+    let inputs = |db: &Connection| {
+        db.execute_batch("CREATE TABLE cortexkit_schema_version(namespace TEXT, version INTEGER, applied_at_unix INTEGER); INSERT INTO cortexkit_schema_version VALUES ('astrocyte',68,0);").unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        crate::vault_plan::append_in_tx(
+            &tx,
+            &crate::vault_plan::VaultPlan {
+                credential_id: "fixture:account".into(),
+                provider: Some("provider".into()),
+                account_id: Some("account".into()),
+                plan_tier: Some("plan".into()),
+                plan_key: Some("provider/plan".into()),
+                source: "detected".into(),
+                effective_from_ms: 0,
+                observed_at_ms: 0,
+            },
+        )
+        .unwrap();
+        tx.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,model_scope)
+            VALUES('pool','account','primary',0,0,10080,'all'),('pool','account','primary',7200000000000,1,10080,'all')", []).unwrap();
+        tx.commit().unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        let captured = multiplier::pools::capture_pool_day(&tx, "pool", 0, DAY_MS).unwrap();
+        tx.commit().unwrap();
+        let pools = multiplier::pools::plan_pools(&captured.readings, &[]);
+        captured.models_for_pools(&pools)
+    };
     let derived = inputs(&headless);
-    assert!(derived
-        .models
-        .contains(&("provider".into(), Some("a".into()))));
+    assert!(derived.contains(&("provider".into(), "a".into())));
     assert_eq!(inputs(&legacy), derived);
 }
 
@@ -572,7 +594,7 @@ fn attribution_report_real_split_rows_keep_unattributed_and_all_metric_totals() 
     rate(&conn, "a", 1_000_000_000);
     rate(&conn, "b", 2_000_000_000);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     let ordinary = spend_report(&conn, &request(json!({"grouping":[]})), DAY_MS).unwrap();
     let split = spend_report(&conn, &request(json!({})), DAY_MS).unwrap();
     assert_eq!(
@@ -613,7 +635,7 @@ fn attribution_report_filter_coverage_ignores_attribution_but_keeps_model_filter
     rate(&conn, "a", 1_000_000_000);
     rate(&conn, "b", 1_000_000_000);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     let split = spend_report(
         &conn,
         &request(json!({"where":{"alfonso":["agent-a"],"model":["a"]}})),
@@ -643,7 +665,7 @@ fn attribution_report_unbounded_keeps_future_calls_like_the_ordinary_report() {
     facts(&mut conn);
     rate(&conn, "a", 1_000_000_000);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     let ordinary = spend_report(
         &conn,
         &request(json!({"grouping":[],"from_ms":null,"to_ms":null})),
@@ -707,7 +729,7 @@ fn spend_report_deduced_rows_include_null_currency_covered_calls() {
     facts(&mut conn);
     rate(&conn, "a", 1_000_000_000);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
 
     for grouping in [json!([]), json!(["alfonso"])] {
         for grain in ["day", "range"] {
@@ -734,11 +756,7 @@ fn spend_report_deduced_rows_include_null_currency_covered_calls() {
                 "one day of the $20 January plan"
             );
             assert_eq!(deduced.pending_days, 0);
-            assert_eq!(
-                deduced.by_rule_share,
-                (grain == "range").then_some(0.0),
-                "{query}"
-            );
+            assert!(deduced.by_rule_share.is_none(), "{query}");
             let api = report
                 .rows
                 .iter()
@@ -802,7 +820,7 @@ fn attribution_report_randomized_groups_sum_to_ordinary_totals_with_identical_mo
     rate(&conn, "a", 1_000_000_000);
     rate(&conn, "b", 2_000_000_000);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     for grouping in [
         vec!["alfonso"],
         vec!["alfonso", "model"],
@@ -1059,9 +1077,9 @@ fn attribution_report_stale_summary_valuation_and_fact_windows_match_ordinary_me
     };
     assert_parity(&conn, "summary dirty");
     summaries(&mut conn);
-    prepare(&mut conn, &config());
+    prepare(&mut conn);
     assert_parity(&conn, "valuation pending");
-    drain(&mut conn, &config());
+    drain(&mut conn);
     assert_parity(&conn, "cached");
     let page:crate::attribution::Page=serde_json::from_value(json!({"facts":[{"fact_id":"corrected-a","supersedes":"a","subject":{"kind":"session","runner":"thalamus-harness","harness":"opencode2","session":"session-a"},"alfonso":"new-agent","parent":null,"workload":"head","task":null,"project_id":"project-a","effective_from_ms":0,"recorded_at_ms":2}],"next":null,"through":3})).unwrap();
     let tx = conn.transaction().unwrap();
@@ -1095,7 +1113,7 @@ fn attribution_report_stale_summary_valuation_and_fact_windows_match_ordinary_me
 
     broca_call(&mut conn, "historical-broca", 2, "broca-run");
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     let revision = |conn: &Connection| {
         conn.query_row(
         "SELECT a.revision,s.revision FROM attribution_hour a JOIN summary_hour s USING(kind,hour_number)
@@ -1124,7 +1142,7 @@ fn attribution_report_stale_summary_valuation_and_fact_windows_match_ordinary_me
         .any(|row| row.grouping["alfonso"].as_deref() == Some("backfilled-owner")));
     assert_parity(&conn, "stamped attribution stale");
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     same_bytes(live, spend_report(&conn, &query, DAY_MS).unwrap());
 }
 
@@ -1148,7 +1166,7 @@ fn attribution_report_no_range_filters_undated_separately_from_dated_coverage() 
     facts(&mut conn);
     rate(&conn, "a", 1_000_000_000);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     let split = spend_report(
         &conn,
         &request(json!({"from_ms":null,"to_ms":null,"where":{"alfonso":["agent-a"]}})),
@@ -1204,7 +1222,7 @@ fn attribution_report_hour_and_fractional_offset_day_seams_match_ordinary_totals
     facts(&mut conn);
     rate(&conn, "a", 1_000_000_000);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     for (grain, zone, to) in [
         ("hour", "UTC", 2 * HOUR_MS),
         ("day", "Asia/Kolkata", DAY_MS),
@@ -1325,7 +1343,7 @@ fn spend_report_range_matches_daily_values_across_dst() {
     rate(&conn, "a", 400_000);
     rate(&conn, "excluded", 400_000);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     let now = at(12, 12);
     for grouping in [vec!["alfonso", "workload"], vec!["model", "plan"]] {
         for explicit in [true, false] {

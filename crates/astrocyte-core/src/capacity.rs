@@ -22,6 +22,27 @@ pub enum WindowModelScope {
     Subset,
 }
 
+impl WindowModelScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Subset => "subset",
+        }
+    }
+}
+
+/// Recovers the producer's pool identity from a stored window key.
+/// An extra window's array position is not an identity: its counter can change between polls.
+pub fn pool_identity(pool_key: &str) -> Option<&str> {
+    match pool_key {
+        "primary" | "secondary" | "tertiary" => Some(pool_key),
+        _ => {
+            let (byte_len, id) = pool_key.strip_prefix("extra:")?.split_once(':')?;
+            (!id.is_empty() && byte_len.parse::<usize>().ok()? == id.len()).then_some(id)
+        }
+    }
+}
+
 /// One observed quota window with its complete durable pool identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapacityWindow {
@@ -276,8 +297,8 @@ fn apply_readings_in_tx(
         let mut sample = tx.prepare(
             "INSERT INTO window_sample
              (provider,api_provider,account_ref,pool_key,fetched_at_instant,used_percent,
-              raw_used_percent,resets_at,window_minutes,source,breakdown)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+              raw_used_percent,resets_at,window_minutes,source,breakdown,model_scope)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
              ON CONFLICT(provider,account_ref,pool_key,fetched_at_instant) DO NOTHING",
         )?;
         for window in &snapshot.windows {
@@ -313,6 +334,7 @@ fn apply_readings_in_tx(
                 window.window_minutes,
                 window.source,
                 window.breakdown,
+                window.model_scope.map(WindowModelScope::as_str),
             ])?;
         }
     }
@@ -380,13 +402,14 @@ fn apply_readings_in_tx(
                     tx.execute(
                         "INSERT INTO credential_window_sample
                          (provider,credential_ref,api_provider,pool_key,fetched_at_instant,
-                          used_percent,raw_used_percent,resets_at,window_minutes,source)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                          used_percent,raw_used_percent,resets_at,window_minutes,source,model_scope)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
                          ON CONFLICT(provider,credential_ref,pool_key,fetched_at_instant) DO NOTHING",
                         params![reading.provider, credential_ref, reading.api_provider,
                             reading.pool_key, instant, reading.used_percent,
                             reading.raw_used_percent, reading.resets_at,
-                            reading.window_minutes, reading.source],
+                            reading.window_minutes, reading.source,
+                            reading.model_scope.map(WindowModelScope::as_str)],
                     )?;
                 }
                 continue;
@@ -747,6 +770,17 @@ mod tests {
             }),
             degraded_entries: 0,
         }
+    }
+
+    #[test]
+    fn pool_identity_recovers_named_slots_and_raw_extra_ids() {
+        for slot in ["primary", "secondary", "tertiary"] {
+            assert_eq!(pool_identity(slot), Some(slot));
+        }
+        assert_eq!(pool_identity("extra:5:Fable"), Some("Fable"));
+        assert_eq!(pool_identity("extra:4:é:x"), Some("é:x"));
+        assert_eq!(pool_identity("extra:ordinal:3"), None);
+        assert_eq!(pool_identity("extra:3:é:x"), None);
     }
 
     #[test]
@@ -1228,6 +1262,7 @@ mod tests {
                  window_minutes INTEGER,
                  source TEXT NOT NULL,
                  breakdown TEXT,
+                 model_scope TEXT,
                  PRIMARY KEY (provider, account_ref, pool_key, fetched_at_instant)
              );",
         )

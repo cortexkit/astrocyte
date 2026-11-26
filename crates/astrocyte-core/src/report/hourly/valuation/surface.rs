@@ -1,13 +1,10 @@
 //! Additive spend-report valuations from hourly caches and bounded hour reductions.
 use super::*;
 use crate::money::round_nano_num;
-use crate::multiplier::{QuotaProviderConfig, WindowSelector};
-use fees::{Allocation, DayMember, DayWeights, FeeDays, PoolDay, RowShare, Weights, DAY_MS};
+use fees::{Allocation, DayMember, DayWeights, FeeDays, PoolDay, Weights, DAY_MS};
 
 pub(crate) mod attribution_report;
 mod range;
-
-use range::RangeFold;
 
 fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, ReportError> {
     serde_json::from_str(value).map_err(|_| ReportError::Integrity("invalid valuation payload"))
@@ -58,17 +55,8 @@ impl Accumulator {
         currency: Option<&str>,
         recorded: i64,
     ) -> Result<RowValuation, ReportError> {
-        self.value_with_share(allocation, currency, recorded)
-            .map(|(value, _)| value)
-    }
-    fn value_with_share(
-        &self,
-        allocation: &Allocation,
-        currency: Option<&str>,
-        recorded: i64,
-    ) -> Result<(RowValuation, RowShare), ReportError> {
         let (share, pending) = allocation.row(&self.weights)?;
-        let value = RowValuation {
+        Ok(RowValuation {
             list_value: ListValue {
                 currency: "USD",
                 nanos: round_nano_num(self.numerator).map_err(|_| ReportError::Arithmetic)?,
@@ -77,8 +65,7 @@ impl Accumulator {
                 base_rate_tier_untested_tokens: self.base_tokens,
             },
             deduced: share.deduced(currency.unwrap_or_default(), recorded, pending.len())?,
-        };
-        Ok((value, share))
+        })
     }
     fn observe(
         &mut self,
@@ -132,16 +119,11 @@ fn value_row(
     row: &mut SpendRow,
     acc: &Accumulator,
     allocation: &Allocation,
-    range: &mut Option<RangeFold>,
 ) -> Result<(), ReportError> {
     // Covered usage can have no recorded currency but still earns a USD fee
     // share. Keep the recorded currency and the separate currency totals intact.
     let currency = row.currency.as_deref().unwrap_or("USD");
-    let (value, share) = acc.value_with_share(allocation, Some(currency), row.total_nanos)?;
-    row.valuation = value;
-    if let Some(range) = range {
-        range.shares.push(share);
-    }
+    row.valuation = acc.value(allocation, Some(currency), row.total_nanos)?;
     Ok(())
 }
 fn day_start(at: i64) -> i64 {
@@ -209,51 +191,12 @@ fn bucket(
             .collect(),
     })
 }
-pub(super) fn stored_config(
-    conn: &Connection,
-) -> Result<(MultiplierConfig, Vec<String>), ReportError> {
-    let encoded: String =
-        conn.query_row("SELECT config FROM valuation_state WHERE id=1", [], |r| {
-            r.get(0)
-        })?;
-    if encoded.is_empty() {
-        return Ok((
-            MultiplierConfig {
-                api_twins: BTreeMap::new(),
-                plan_price_overrides: BTreeMap::new(),
-                quota_providers: BTreeMap::new(),
-            },
-            Vec::new(),
-        ));
-    }
-    // Use the builder's stored snapshot, not a freshly loaded module config: it
-    // keeps built cells, dirty-hour reductions and the fee pool map consistent.
-    type ConfigSnapshot = (
-        BTreeMap<String, String>,
-        BTreeMap<String, Vec<ScopeRule>>,
-        Vec<String>,
-    );
-    let (api_twins, scopes, reasoning): ConfigSnapshot = decode(&encoded)?;
-    let config = MultiplierConfig {
-        api_twins,
-        quota_providers: scopes
-            .into_iter()
-            .map(|(pool, scope)| {
-                (
-                    pool,
-                    QuotaProviderConfig {
-                        scope,
-                        window: WindowSelector {
-                            pool_key: String::new(),
-                            window_minutes: 0,
-                        },
-                    },
-                )
-            })
-            .collect(),
-        plan_price_overrides: BTreeMap::new(),
-    };
-    Ok((config, reasoning))
+fn valuation_cache_current(conn: &Connection) -> Result<bool, ReportError> {
+    Ok(conn.query_row(
+        "SELECT config=?1 FROM valuation_state WHERE id=1",
+        [VALUATION_FORMAT],
+        |row| row.get(0),
+    )?)
 }
 fn stored_cells(conn: &Connection, hour: Hour) -> Result<Cells, ReportError> {
     let mut stmt = conn.prepare("SELECT summary_key,plan,plan_account,plan_record,recorded,list_numerator,unvalued FROM valuation_cell WHERE kind=?1 AND hour_number=?2")?;
@@ -300,80 +243,45 @@ fn pending_cells(data: Data) -> Cells {
     }
     cells
 }
-fn live(
-    conn: &Connection,
-    filter: &str,
-    config: &MultiplierConfig,
-    reasoning: &[String],
-    book: &PlanBook,
-) -> Result<(Cells, bool), ReportError> {
+fn live(conn: &Connection, filter: &str, book: &PlanBook) -> Result<(Cells, bool), ReportError> {
     let mut cells = Cells::new();
-    let (_, fetched) = reduce_with_book(conn, filter, config, reasoning, book, &mut cells)?;
+    let (_, fetched) = reduce_with_book(conn, filter, book, &mut cells)?;
     Ok((cells, fetched))
 }
 
 fn summary_members(
     book: &PlanBook,
-    config: &MultiplierConfig,
     key: &Key,
     hour: Hour,
     record_starts: &BTreeSet<i64>,
 ) -> Result<BTreeSet<PlanMember>, ReportError> {
     let (from, to) = interval(hour)?;
-    let tokens = EventTokens {
-        producer: key.0[Grouping::Producer as usize]
-            .clone()
-            .unwrap_or_default(),
-        provider: key.0[Grouping::Provider as usize]
-            .clone()
-            .unwrap_or_default(),
-        model: key.0[Grouping::Model as usize].clone(),
-        mode: None,
-        broca_attempt: false,
-        roles: Vec::new(),
-    };
+    let provider = key.0[Grouping::Provider as usize]
+        .as_deref()
+        .unwrap_or_default();
+    let basis = key.0[Grouping::ChargeBasis as usize]
+        .as_deref()
+        .unwrap_or_default();
+    let account = key.0[Grouping::Account as usize].as_deref();
     let instants = [from, to]
         .into_iter()
         .chain(record_starts.range(from..=to).copied());
     let mut members: BTreeSet<_> = instants
-        .map(|at| {
-            plan_member(
-                book,
-                config,
-                &tokens,
-                key.0[Grouping::ChargeBasis as usize]
-                    .as_deref()
-                    .unwrap_or_default(),
-                key.0[Grouping::Account as usize].as_deref(),
-                key.2.as_deref(),
-                Some(at),
-            )
-        })
-        .collect::<Result<_, _>>()?;
-    if key.0[Grouping::Account as usize].is_none()
-        && key.2.is_none()
-        && key.0[Grouping::ChargeBasis as usize].as_deref() != Some("metered_api")
-        && book.possible_credential(&tokens.provider, from, to)
-    {
+        .map(|at| plan_member(book, provider, basis, account, key.2.as_deref(), Some(at)))
+        .collect();
+    if account.is_none() && key.2.is_none() && basis != "metered_api" {
         // Summaries retain the resolved payer only for subscription-included
         // calls. Other non-metered calls may still match a credential plan.
-        // Conservatively defer that provider's pool until valuation catches up:
-        // delaying a spread cannot assign money to the wrong calls.
-        let pools = pools_for_provider(&tokens.provider, config);
-        if pools.len() == 1 {
-            for pool in pools {
-                members.insert(PlanMember {
-                    plan: pool,
-                    plan_account: Some("account_unknown".into()),
-                    record: None,
-                });
-            }
-        }
+        // Defer those candidate fees until the valuation knows the exact payer.
+        members.extend(
+            book.possible_credentials(provider, from, to)
+                .map(plans::PlanRecord::member),
+        );
     }
     Ok(members)
 }
 fn add_pending(day: &mut DayWeights, at: i64, member: &PlanMember) {
-    if member.plan_account.is_some() && member.plan != "pool_conflict" {
+    if member.record.is_some() {
         day.not_current.insert(PoolDay {
             day_start_ms: day_start(at),
             pool: member.plan.clone(),
@@ -475,7 +383,7 @@ pub(crate) fn report(
         .filters
         .retain(|name, _| name != "plan" && name != "plan_account");
     let mut report = recorded_spend_report(conn, &recorded_request, now_ms)?;
-    let (config, reasoning) = stored_config(conn)?;
+    let cache_current = valuation_cache_current(conn)?;
     let (from, to) = if let Some(range) = parsed.range {
         range
     } else {
@@ -497,7 +405,7 @@ pub(crate) fn report(
         )
     };
     let plans = PlanBook::load(conn)?;
-    let book = FeeDays::from_book(&plans, &config, from, to)?;
+    let book = FeeDays::from_book(&plans, from, to)?;
     let record_starts = book
         .days
         .iter()
@@ -530,11 +438,12 @@ pub(crate) fn report(
         let (start, last) = interval(hour)?;
         let end = last.checked_add(1).ok_or(ReportError::Calendar)?;
         let summary_clean = eligible(row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?);
-        let current = summary_clean && row.get::<_, Option<bool>>(5)?.unwrap_or(false);
+        let current =
+            cache_current && summary_clean && row.get::<_, Option<bool>>(5)?.unwrap_or(false);
         let (cells, fetched) = if current {
             (stored_cells(conn, hour)?, true)
         } else if !summary_clean {
-            live(conn, &hour.filter(), &config, &reasoning, &plans)?
+            live(conn, &hour.filter(), &plans)?
         } else {
             (
                 pending_cells(stored_recorded(conn, hour, &mut dictionary)?.0),
@@ -551,7 +460,7 @@ pub(crate) fn report(
         let mut inferred: BTreeMap<Key, BTreeSet<PlanMember>> = BTreeMap::new();
         for ((key, member), cell) in &cells {
             let members = if member.plan == "pending" {
-                summary_members(&plans, &config, key, hour, &record_starts)?
+                summary_members(&plans, key, hour, &record_starts)?
             } else {
                 BTreeSet::from([member.clone()])
             };
@@ -589,7 +498,7 @@ pub(crate) fn report(
                         data.observe(conn, &filter)?;
                         pending_cells(data)
                     } else {
-                        live(conn, &filter, &config, &reasoning, &plans)?.0
+                        live(conn, &filter, &plans)?.0
                     };
                     &split
                 };
@@ -647,13 +556,12 @@ pub(crate) fn report(
         };
         report.rate_staleness = population.staleness(now_ms);
     }
-    let mut range = fold_range.then(|| RangeFold::new(parsed.range, report.rows.len()));
     let empty = Accumulator::default();
     for row in &mut report.rows {
         let acc = buckets
             .get(&row_key(row, &parsed.grouping))
             .unwrap_or(&empty);
-        value_row(row, acc, &allocation, &mut range)?;
+        value_row(row, acc, &allocation)?;
     }
     if !report
         .totals
@@ -684,8 +592,8 @@ pub(crate) fn report(
             total.valuation.deduced_conflict_plans = Some(fee_totals.deduced_conflict_plans);
         }
     }
-    if let Some(range) = range {
-        report.rows = range.finish(report.rows)?;
+    if fold_range {
+        report.rows = range::fold(report.rows, parsed.range)?;
     }
     Ok(report)
 }

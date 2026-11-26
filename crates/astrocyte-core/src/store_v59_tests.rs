@@ -99,6 +99,7 @@ mod session_refs {
                                 | "broca_scope_stamp"
                                 | "broca_scope_backfill"
                                 | "quota_reset_period"
+                                | "multiplier_provider_day"
                         )
                     })
                     .collect();

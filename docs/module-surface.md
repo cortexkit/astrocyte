@@ -82,7 +82,7 @@ Test: `every_operation_name_reaches_its_own_handler`.
 | `spend.charge.explain` | read | `event_id` |
 | `spend.reconcile` | read | `statement_id` |
 | `spend.multiplier.report` | read | `from_ms`, `to_ms` |
-| `spend.multiplier.pace` | read | `quota_provider`, `from_ms`, `to_ms` |
+| `spend.multiplier.pace` | read | `quota_provider`, `from_ms`, `to_ms`, `plan?`, `pool?` |
 | `usage.cache.sessions` | read | `since_ms?`, `harness?`, `limit?` |
 | `usage.cache.steps` | read | `harness`, `session`, `limit?`, `after_cursor?` |
 | `usage.runs.list` | read | `from_ms`, `to_ms`, `harness?`, `limit?`, `after?` |
@@ -285,24 +285,24 @@ Tests: `op_event_reprice_routes_subscription_included_through_coverage`,
 
 ### 3.7 `spend.multiplier.recompute`
 
-Recomputes one UTC day (`observation_day`, `YYYY-MM-DD`) for one configured
-quota provider, or for all of them when `quota_provider` is absent, over the
-seven days ending at that day's 00:00Z. One row per configured plan supersedes
-that provider/plan/day's head, or
-is the day's original when none exists. All rows append in one transaction or
-none does. Reply: `{"recomputed": [{quota_provider, plan, observation_day,
+Recomputes the seven days ending at `observation_day` (`YYYY-MM-DD`) at 00:00Z.
+Name a `quota_provider` or omit it to recompute providers with readings in
+that interval or a record for that day. Each new row supersedes its own
+provider/plan/pool head for the day, or starts a chain if none exists. For a
+pool that drops out, recompute appends a `pool_retired` row: the old head no
+longer appears in the report. Pre-migration chains are not superseded.
+All rows and provider-day records commit in one transaction or none does.
+Reply: `{"recomputed": [{quota_provider, plan, observation_day,
 observation_id, supersedes, multiplier, fee_multiplier}]}`.
 
 | Code | Condition |
 |---|---|
 | `malformed` | `observation_day` is not a date. |
-| `multiplier_not_recorded` | The committed configuration has no `subscription_multiplier` member. |
-| `unknown_quota_provider` | The named provider is not configured, or none is. |
-| `scoped_producer_not_ingested` | A requested provider's scope names producers not ingested by the configuration. The message names them; all requested providers are checked before any call or write. |
+| `unknown_quota_provider` | The named provider has no readings, observations or provider-day record, or no providers qualify when the name is omitted. |
 | `catalog_unavailable` | No fusiform catalog is connected, or a catalog call failed. |
 | `plan_prices_unavailable` | Plan prices were needed and could not be read. |
 | `rate_fact_unrecognized` | The catalog served a rate this build cannot read. |
-| `source_reads_pending` | An in-scope source is stale or has pending known/unknown backlog, and two hours have not passed. Recompute checks this even for an existing day. After the bound, rows are appended with `source_backlog` and are routing-ineligible. |
+| `source_reads_pending` | A pool may be measurable, but a tracked source is stale or has backlog and two hours have not passed since the interval ended. Recompute checks this even for an existing day. After the bound, measured rows with `source_backlog` are routing-ineligible. |
 | `arithmetic_out_of_range` | An exact computation overflowed. |
 
 Tests: `a_recompute_supersedes_the_day_and_the_report_serves_it`,
@@ -356,8 +356,7 @@ Reads never write. A refusal on a read is one of the codes below.
   selected usage, including future-dated days if the day report shows them.
   The range has no rows if the equivalent day report has none. Counts and
   money sum the day rows, retaining their daily rounding and fee allocation.
-  `deduced.by_rule_share` is the ratio of the summed exact rule-allocated fee
-  to the summed exact allocated fee, omitted if the denominator is zero.
+  `deduced.by_rule_share` is never present because fees are not assigned by rule.
   `totals` and `attribution_coverage` match the equivalent day report.
   Test: `spend_report_range_matches_daily_values_across_dst`.
 
@@ -452,9 +451,9 @@ Reads never write. A refusal on a read is one of the codes below.
   `analytics_tokens_and_exact_media_units_are_additive`,
   `analytics_widened_range_caps_and_calendar_edges`,
   `analytics_refusals_are_specific_and_read_only`. Handler samples for range
-  grain and `reply_too_large` are in `crates/astrocyte-module/test-vectors/analytics-reads-v5`,
-  pinned by `analytics_vectors_range_match_real_dispatch_and_sha256sums`.
-  The published `analytics-reads-v3` and `analytics-reads-v4` sets are unchanged.
+  grain and `reply_too_large` are in `crates/astrocyte-module/test-vectors/analytics-reads-v7`,
+  pinned by `analytics_vectors_match_real_dispatch_and_sha256sums`.
+  The published `analytics-reads-v3` through `analytics-reads-v6` sets are unchanged.
 
   Every row and currency total also carries `list_value`, with
   `{currency: "USD", nanos, unvalued: {measurements, tokens, by_reason},
@@ -475,14 +474,17 @@ Reads never write. A refusal on a read is one of the codes below.
   and is omitted when zero, on rows and totals. `tiered_bundle` is not an
   unvalued reason.
 
-  `plan` names a configured quota pool, or the plan's provider when it maps to
-  no configured pool. Metered calls are `api`. Non-metered calls use ledger
-  coverage's account-first `plan_lookup_key`, with the resolved credential
-  preferred to the selected credential when there is no account. A matching
-  plan record supplies `plan_account` (its account or credential); scope-rule
-  matches without a record use `account_unknown`. No membership is `none`;
-  ambiguous pool membership is `pool_conflict`, still valued but never a fee
-  weight. Those non-pool values have null `plan_account`. Both dimensions work
+  `plan` names the active subscription fee record's provider, including for
+  a hand-recorded plan. `plan_account` is that record's account or credential.
+  Calls with charge basis `metered_api` are `api`. Other calls look up fee
+  records by account first, or by paying credential when there is no account,
+  preferring the resolved credential to the selected credential. No active
+  record gives `none`;
+  more than one active record gives `pool_conflict`, still valued but never a
+  fee weight. Those labels have null `plan_account`. `account_unknown` is no
+  longer used. A plan with multiple quota pools still has one membership
+  and its fee is counted once. Unlike the multiplier, hourly grouping uses
+  fee records rather than vault plan history. Both dimensions work
   in `grouping` and `where`, including null filters. When grouping or filtering
   by either dimension, unbuilt or stale valuation hours retain recorded spend
   under `plan: "pending"`, `plan_account: null`. Otherwise their recorded rows
@@ -496,19 +498,17 @@ Reads never write. A refusal on a read is one of the codes below.
   `{currency: "USD", nanos, pending_days}`. It is recorded spend plus the row's
   exact share of USD subscription fees, rounded once half-even. Fees come only
   from account/credential plan records, prorated over UTC calendar days of the
-  plan's month or year and over partial-day membership. Each record first
-  spreads its fee over its own calls' list value; fees without positive weight
-  then spread over the pool's `account_unknown` calls. Day denominators always
-  cover the whole UTC day, unfiltered; row numerators cover only matching calls.
-  Optional `by_rule_share` is the fraction of the row's fee share assigned by
-  that second stage. Outside `range`, it is omitted when zero or when no fee
-  was assigned. A day is pending if it has not ended or if any hour holding
-  pool calls has an unbuilt or stale valuation. Pending fees are neither spread
-  nor unspread. `pending_days` counts distinct pending UTC days touching the
-  row. A dirty summary is never a built valuation hour even when its live row
-  can be valued. While an hour awaits valuation,
+  plan's month or year and over partial-day membership. Each record spreads
+  its fee over its own calls' list value. Without positive weight the fee
+  stays unspread; it is not allocated to calls lacking a matching record.
+  Day denominators always cover the whole UTC day, unfiltered; row numerators
+  cover only matching calls. A day is pending if it has not ended or an hour
+  holding the record's calls is not current;
+  pending fees are neither spread nor unspread. `pending_days` counts distinct
+  pending UTC days touching the row. A dirty summary is never a built valuation
+  hour even when its live row can be valued. While an hour awaits valuation,
   non-metered NULL-account summary cells without a retained resolved payer
-  conservatively defer their provider's unique pool if a credential plan could
+  conservatively defer a fee spread if a credential plan could
   match. This can delay a spread until the builder reaches the hour, but cannot
   assign a fee to the wrong calls.
 
@@ -623,26 +623,55 @@ Reads never write. A refusal on a read is one of the codes below.
   local keys are served. Refusals: `malformed` (empty `event_id`), `not_found`.
 - `spend.reconcile`: `statement`, `lines`, `summary`. Refusals: `malformed`,
   `statement_not_found`; a store failure is `store_error`.
-- `spend.multiplier.report`: `latest` contains each provider/plan's newest head,
-  ordered by `(quota_provider, plan)`. A legacy pooled row (`plan: null`) appears
-  there only when its provider has no plan-specific observation at all.
-  Each `latest` row also carries `last_eligible`, the newest unsuperseded
-  eligible head for that provider/plan as `{day, interval_end_ms, multiplier,
-  fee_multiplier}`; it is absent when the plan has never had an eligible head.
-  `series` keeps every head in the requested day range, including both legacy
-  pooled and plan-specific heads. Refusal: `invalid_range` (`from_ms`
-  negative or not before `to_ms`). Test:
-  `multiplier_report_refuses_a_malformed_range`. Rows add `plan`,
-  `routing_eligible`, `eligibility_reasons`, `clean_hours_share`,
-  `saturated_share`, `gap_share`, `unpriced_share`, `unconfigured_accounts`
-  and `source_backlog`, plus `unattributed_event_share`,
+- `spend.multiplier.report`: migration 68 introduced per-pool observations.
+  For each quota provider, `latest` shows the
+  unsuperseded, unretired pool rows of its newest recorded day, one per
+  `(quota_provider, plan, pool_id)`. An empty day yields no rows for that
+  provider. An unmeasured row still appears; `latest` does not fall back to
+  an older day. `last_eligible`, when available, gives the newest eligible,
+  unsuperseded head for the same provider, plan and pool as `{day,
+  interval_end_ms, multiplier, fee_multiplier}`. This value can come from
+  before migration 68, but those rows never appear in `latest` themselves.
+  `series` shows unsuperseded, unretired rows with `interval_end_ms` in
+  `[from_ms, to_ms)`. Historical rows appear there only for keys without pool
+  observations since migration 68. Refusal: `invalid_range` (`from_ms`
+  negative or not before `to_ms`).
+
+  `pool_id` is insula's slot name (`primary`, `secondary`, `tertiary`) or
+  the raw ID of an extra window, not its stored `window_pool_key`. A historical
+  row can have a null `pool_id` if its stored key has no stable identity.
+  `pool_scope` is `all`, `subset`, or `unknown` when there is no single stated
+  scope; it is null on historical rows. `catalog_provider` is the catalog
+  provider the readings agree on, or null; it is distinct from the insula
+  `quota_provider`. `pool_models` is the served subset list as `provider/model`
+  IDs, or null when there is no list. `pool_models_at_ms` is the day-ending
+  `plan.prices` lookup instant for a subset, even if its list is missing;
+  otherwise it is null. `pool_member_models` records raw IDs admitted through
+  suffix removal or alias resolution; it is null if `pool_models` is null.
+  `window_minutes` is the newest stated duration (the larger duration if
+  readings share that instant).
+
+  Reasons `scope_unstated`, `scope_changed`, `window_changed` and
+  `pool_list_missing` mark rows whose ratios are null and whose
+  `routing_eligible` is false. Their zero token counts, `api_nanos`,
+  `subscription_nanos`, `fee_paid_nanos`, `delta_percent`, quality shares and
+  usage and login counts, and empty usage and login diagnostics are
+  placeholders, not measured zero usage. `window_tie` also has null ratios and
+  is ineligible, but its other measurements are computed normally. A recompute
+  uses `pool_retired` to supersede a pool that dropped out of that day. Retirement
+  heads are not served in `latest`, `series`, `last_eligible`, pace or the bus.
+
+  Rows retain `routing_eligible`, `eligibility_reasons`, `clean_hours_share`,
+  `saturated_share`, `gap_share`, `unpriced_share`, `unconfigured_accounts`,
+  `source_backlog`, `unattributed_event_share`,
   `zero_measurement_events`, `missing_quantity_events` and the derived
   `unknown_quantity_measurements` count. Missing-quantity and no-measurement
   usage exclude account-hours; neither their counts nor their share independently
   veto a row. Retained sample adequacy and stability govern eligibility.
-  Saturation keeps its separate veto. Quality shares are fractions of all configured account-hours in
-  the row's plan; unpriced diagnostics also include excluded hours. Legacy rows
-  retain their old values with null plan and ineligible legacy defaults.
+  Saturation keeps its separate veto. Quality shares are fractions of the
+  login-hours under consideration for the row's plan and pool; unpriced
+  diagnostics also include excluded hours. Historical rows retain their old
+  values, including a null plan on older rows pooled across plans.
   `api_nanos_by_model[].rates` may include an optional `conditional` map for
   complete token condition sets, including lifetime-only rows and combined
   lifetime, mode and context-tier rows. Its keys are rate keys with selectors
@@ -655,14 +684,24 @@ Reads never write. A refusal on a read is one of the codes below.
   older rows without calibration inputs return null there. Adequacy uses clean
   hours/points, active days and interval width, not a clean-, gap- or unknown-share floor.
 - `spend.multiplier.pace`: hourly usage by producer and work class, valued at
-  the latest **eligible**, unsuperseded head's recorded rates without a catalog
-  call. Accepts optional `plan`; it is required when configured plans differ.
-  Replies include the selected `plan` and `routing_eligible: true`. Eligible
-  heads must end no more than two days before `to_ms`; an older eligible row
-  does not authorize a stale estimate. Refusals: `plan_required`,
-  `unknown_quota_provider`, `invalid_range`, `range_too_large` (over 192
-  aligned hours), `no_multiplier_observation`. Test:
-  `pace_refuses_unknown_provider_invalid_or_excessive_range_and_missing_head`.
+  the selected head's recorded rates without a catalog call. Optional `plan`
+  and `pool` select a plan key and a `pool_id`. Candidates are eligible,
+  unsuperseded pool heads ending in `[to_ms − 2 days, to_ms]`; historical and
+  retirement rows do not qualify. Without `plan`, candidates spanning more
+  than one plan refuse `plan_required`. Without `pool`, candidates in the
+  selected plan spanning more than one pool refuse `pool_required`. A pool
+  can qualify even if it is absent from the provider's newest day. The newest
+  candidate of the selected plan and pool supplies the estimate; the reply
+  names `plan` and `pool_id` and sets `routing_eligible: true`.
+
+  Pace counts only subscription-included calls attributed to the selected
+  plan. An `all` pool includes every such call. A `subset` pool includes only
+  raw `provider/model` IDs in the head's `pool_models` or `pool_member_models`.
+  Pace cannot resolve new aliases or strip suffixes offline: a raw ID that
+  only matches by such a step must already be in `pool_member_models`.
+  Other refusals: `unknown_quota_provider` (no observation since migration
+  68), `no_multiplier_observation` (no eligible candidate for the selection),
+  `invalid_range` and `range_too_large` (over 192 aligned hours).
 
 Absent values are `null` or omitted, never zero. A total that cannot be
 priced is reported with its unpriced population, not as a smaller number.
@@ -1433,29 +1472,27 @@ The existing `usage.steps.subscribe` stream is unchanged.
 
 The `astrocyte.multiplier` bucket is written by Astrocyte and read by Striatum.
 `AccountNames::module_bucket_name("astrocyte", "multiplier")` derives its
-account-specific name. Values are limited to 8 KiB, with history 1 and no TTL.
-Each key identifies one `(quota_provider, plan)` pair and its value is the exact
-compact JSON serialization of that pair's entry in `spend.multiplier.report`'s
-`latest` list. Astrocyte stages a fresh list after every daily multiplier commit,
-after an operator recompute and at startup. Unchanged entries are not put again;
-keys absent from a later list are deleted. The current report retains historical
-entries independently of configuration, so removing a provider from config alone
-does not delete its key. A legacy pooled entry with a null plan disappears when
-the report starts serving plan-specific entries for that provider.
+account-specific name. Values are limited to the bucket's declared size (64 KiB
+today, from `cortexkit-bus-naming`), with history 1 and no TTL.
+Each key identifies one `(quota_provider, plan, pool_id)` and its value is
+the whole `spend.multiplier.report` `latest` row in compact JSON. The key is
+`x<provider-hex>.x<plan-hex>.x<pool-hex>`: each `x` is followed by the lowercase
+hexadecimal of that component's UTF-8 bytes, even for ASCII IDs. Dots only
+separate the three components. All three IDs are retained in the value; the
+pool component encodes the raw `pool_id`, not `window_pool_key`. To join the
+row to a served subset list, use the value's `catalog_provider` and `pool_id`.
 
-Every non-null key component is `x` followed by lowercase hexadecimal of its
-UTF-8 bytes. Both components are always encoded, including ASCII ids that would
-already be valid NATS tokens. Dots therefore separate components only, and `/`,
-`_`, `.`, empty strings and non-ASCII ids cannot collide with escape spellings.
-The reserved component `n` denotes a null plan; an empty string is `x`, not `n`.
-For example, `(codex, openai/pro_20x)` maps to
-`x636f646578.x6f70656e61692f70726f5f323078`; `(codex, null)` maps to
-`x636f646578.n`. Values retain the readable `quota_provider` and `plan` fields.
+Astrocyte reconciles the bucket to the current `latest` rows after a daily
+provider-day commit, after an operator recompute and at startup. Unchanged
+values are not put again. Keys absent from the new set, including old
+two-part keys, are deleted even when `latest` is empty. A failed day's write
+does not evict that provider's older rows; a failed report read leaves the
+bucket unchanged.
 
-An entry larger than 8 KiB has no key: an existing value is deleted rather than
-left stale. Astrocyte never truncates or reshapes the report to fit the bucket.
-A fixed warning records the key and byte count once per oversize streak, never
-the value. A missing key sends a reader back to the existing report poll.
+Values larger than the declared size are omitted without stopping publication of other
+rows. An earlier value for an omitted key is deleted rather than left stale.
+The warning records the key and byte count, not the value. Astrocyte never
+truncates a report row to fit. An absent key means no estimate from the bucket.
 
 ### THALAMUS read-marks KV
 

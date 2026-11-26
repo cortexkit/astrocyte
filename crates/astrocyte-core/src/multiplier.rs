@@ -1,25 +1,4 @@
-//! Derived subscription multiplier: what a subscription's quota is worth at
-//! API list prices, per quota provider and plan, recorded once a day.
-//!
-//! For one quota provider over an interval:
-//!
-//! ```text
-//! subscription_nanos = Σ accounts: monthly_price × (window_minutes / 43200) × Δused% / 100
-//! api_nanos          = Σ in-scope events, Σ measurements: tokens × list rate
-//! multiplier         = api_nanos / subscription_nanos
-//! fee_paid_nanos     = Σ accounts: monthly_price × (token interval length / 30 days)
-//! fee_multiplier     = api_nanos / fee_paid_nanos
-//! ```
-//!
-//! The computation is split so no network call happens inside a store
-//! transaction: [`plan_observation`] captures quota and scoped events in one
-//! snapshot, [`resolve_rates`] and [`resolve_plans`] ask fusiform, then
-//! [`compute_plan_observations`] prices the captured clean account-hours.
-//! [`insert_observation_in_tx`] appends each plan row with rates and diagnostics.
-//! Recompute rereads history using current configuration and prices.
-//!
-//! Display only: nothing here writes to the spend ledger, and a failed day
-//! records nothing rather than a guessed row.
+//! Pool observations value subscription calls against served catalog facts.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,23 +18,24 @@ use crate::catalog_client::{
     billed_as_target, parse_rate_key, token_rate_key, CatalogCallError, CatalogClient,
     CatalogClientError, CatalogLookup, CatalogModel, CatalogSnapshot, RATE_FACT_PREFIX,
 };
-#[cfg(test)]
-use crate::catalog_client::{cache_write_ttl, stated_mode_condition, RATE_ROLES};
-use crate::fact::ChargeBasis;
 use crate::money::{round_nano_num, round_nano_ratio, MoneyError};
 use crate::pricing::PromptSize;
-#[cfg(test)]
-use crate::pricing::{effective_output, prompt_size, EffectiveOutput};
-use crate::valuation::{event_quantities, EventTokens, MeasuredRole, ValuationRules};
+use crate::valuation::{event_quantities, EventTokens, MeasuredRole};
 
 mod calibration;
 pub(crate) mod clean;
-pub use clean::compute_plan_observations;
+mod measurement;
+mod pace;
+pub mod pools;
+pub mod provider_day;
+use measurement::value_event;
+pub use pace::{multiplier_pace, MultiplierPaceRequest};
 
 /// Minutes in the 30-day month plan prices are quoted over.
 const MINUTES_PER_MONTH: i64 = 43_200;
 const MS_PER_MONTH: i64 = MINUTES_PER_MONTH * 60_000;
 const NANOS_PER_MS: i64 = 1_000_000;
+const HOUR_MS: i64 = 3_600_000;
 
 fn millis_to_nanos(ms: i64) -> i128 {
     i128::from(ms) * i128::from(NANOS_PER_MS)
@@ -84,318 +64,6 @@ const ERROR_DEFLATING: &str = "Reads low: tokens left out of api_nanos lower bot
      accounts from a client astrocyte doesn't read (claude.ai chat, Claude desktop, the ChatGPT \
      apps). That unread usage also raises Δused%, which lowers `multiplier` further.";
 
-/// What makes the stored figures read HIGH, by figure as above.
-const ERROR_INFLATING: &str = "Reads high: tokens of accounts excluded from the denominator \
-     still count in api_nanos, because usage is pooled per provider; this raises both figures. \
-     `multiplier` only: usage between the last reading before a reset and the reset itself is \
-     never observed (1-3 points per reset when the last reading is near 100%), and redemption \
-     zeroing, windows dropped as unreadable and non-continuous drop records lose Δused%.";
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-/// The operator's declarations the multiplier is computed under. Closed: every
-/// member is required (a nullable member must be written as `null`), unknown
-/// members and duplicate map keys are refused, and nothing is defaulted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MultiplierConfig {
-    /// Plan-plane provider id → the API provider id whose list prices value
-    /// its tokens, with the model id unchanged (`openai-codex` → `openai`).
-    #[serde(deserialize_with = "unique_map")]
-    pub api_twins: BTreeMap<String, String>,
-    /// Monthly price per plan key (`openai/pro_20x`), overriding fusiform.
-    #[serde(deserialize_with = "unique_map")]
-    pub plan_price_overrides: BTreeMap<String, PriceOverride>,
-    /// Quota provider (the `window_sample.provider` value) → its declarations.
-    #[serde(deserialize_with = "unique_map")]
-    pub quota_providers: BTreeMap<String, QuotaProviderConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QuotaProviderConfig {
-    /// The one quota window Δused% is read from.
-    pub window: WindowSelector,
-    /// The traffic counted as this provider's subscription usage. Declared,
-    /// never inferred: most events carry no credential attribution.
-    pub scope: Vec<ScopeRule>,
-}
-
-/// Membership captured from the vault history alongside the day's counters.
-/// Unlike the declared quota-provider configuration, this is an observation
-/// input, not an operator declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolvedQuotaProvider {
-    pub window: WindowSelector,
-    pub scope: Vec<ScopeRule>,
-    /// Account ref → the plan it holds.
-    pub accounts: BTreeMap<String, AccountPlan>,
-    /// Vault credential ref → plan, for providers whose counters have no account.
-    /// Never combined with accounts.
-    pub credentials: BTreeMap<String, AccountPlan>,
-    #[serde(skip)]
-    credential_keyed: bool,
-    #[serde(skip)]
-    unknown_reasons: BTreeMap<String, String>,
-    #[serde(skip)]
-    membership_reason: Option<String>,
-}
-
-impl ResolvedQuotaProvider {
-    /// A provider uses one identity namespace, so equal account and credential
-    /// strings can never alias in the estimator's counter maps.
-    pub fn members(&self) -> &BTreeMap<String, AccountPlan> {
-        if !self.credential_keyed {
-            &self.accounts
-        } else {
-            &self.credentials
-        }
-    }
-
-    fn members_mut(&mut self) -> &mut BTreeMap<String, AccountPlan> {
-        if !self.credential_keyed {
-            &mut self.accounts
-        } else {
-            &mut self.credentials
-        }
-    }
-
-    fn identity_field(&self) -> &'static str {
-        if !self.credential_keyed {
-            "account_ref"
-        } else {
-            "credential_ref"
-        }
-    }
-}
-
-/// Reader keys can differ from their ledger producer names.
-pub fn source_in_scope(provider: &QuotaProviderConfig, source: &str) -> bool {
-    provider.scope.iter().any(|rule| {
-        source == rule.producer
-            || source.starts_with(&format!("{}:", rule.producer))
-            || (rule.producer == "opencode" && source == "opencode-v2")
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WindowSelector {
-    pub pool_key: String,
-    pub window_minutes: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ScopeRule {
-    pub producer: String,
-    pub provider: String,
-    /// `null` counts every charge basis; a value counts only that basis.
-    #[serde(deserialize_with = "required_nullable")]
-    pub charge_basis: Option<String>,
-    /// `null` counts every model; a value selects a literal, case-sensitive prefix.
-    #[serde(deserialize_with = "required_nullable")]
-    pub model_prefix: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccountPlan {
-    /// A fusiform plan key, `<provider>/<tier>`, matched exactly.
-    pub plan: String,
-}
-
-/// A monthly price in minor units: `20000` at exponent `2` is 200.00.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PriceOverride {
-    pub minor_units: i64,
-    pub exponent: i32,
-    pub currency: String,
-    pub period: String,
-}
-
-/// Present-but-nullable: `deserialize_with` makes serde report a missing
-/// member instead of silently reading it as `None`.
-fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer)
-}
-
-/// A JSON object into a map, refusing a repeated key: the default map decode
-/// keeps the last value, so a second account entry would silently replace the
-/// first.
-fn unique_map<'de, D, V>(deserializer: D) -> Result<BTreeMap<String, V>, D::Error>
-where
-    D: Deserializer<'de>,
-    V: Deserialize<'de>,
-{
-    struct UniqueMap<V>(std::marker::PhantomData<V>);
-    impl<'de, V: Deserialize<'de>> de::Visitor<'de> for UniqueMap<V> {
-        type Value = BTreeMap<String, V>;
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("an object with unique member names")
-        }
-        fn visit_map<A: de::MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
-            let mut map = BTreeMap::new();
-            while let Some((key, value)) = access.next_entry::<String, V>()? {
-                if map.contains_key(&key) {
-                    return Err(de::Error::custom(format!("duplicate member '{key}'")));
-                }
-                map.insert(key, value);
-            }
-            Ok(map)
-        }
-    }
-    deserializer.deserialize_map(UniqueMap(std::marker::PhantomData))
-}
-
-impl MultiplierConfig {
-    /// Semantic checks serde cannot express. Every refusal names its member.
-    pub fn validate(&self) -> Result<(), String> {
-        for (plan_plane, api) in &self.api_twins {
-            if plan_plane.is_empty() || api.is_empty() || plan_plane == api {
-                return Err(format!(
-                    "subscription_multiplier.api_twins entry '{plan_plane}' must map a non-empty \
-                     provider to a different non-empty provider"
-                ));
-            }
-        }
-        for (plan, price) in &self.plan_price_overrides {
-            validate_plan_key(plan).map_err(|error| {
-                format!("subscription_multiplier.plan_price_overrides: {error}")
-            })?;
-            price.validate().map_err(|error| {
-                format!("subscription_multiplier.plan_price_overrides '{plan}': {error}")
-            })?;
-        }
-        for (quota_provider, provider) in &self.quota_providers {
-            let at = format!("subscription_multiplier.quota_providers '{quota_provider}'");
-            if quota_provider.is_empty() {
-                return Err(
-                    "subscription_multiplier.quota_providers keys must be non-empty".into(),
-                );
-            }
-            if provider.window.pool_key.is_empty()
-                || !(1..=MINUTES_PER_MONTH).contains(&provider.window.window_minutes)
-            {
-                return Err(format!(
-                    "{at}: window needs a non-empty pool_key and window_minutes in 1..={MINUTES_PER_MONTH}"
-                ));
-            }
-            if provider.scope.is_empty() {
-                return Err(format!("{at}: scope must name at least one rule"));
-            }
-            let mut rules = BTreeSet::new();
-            for rule in &provider.scope {
-                if rule.producer.is_empty() || rule.provider.is_empty() {
-                    return Err(format!("{at}: a scope rule needs producer and provider"));
-                }
-                if rule.model_prefix.as_deref().is_some_and(str::is_empty) {
-                    return Err(format!(
-                        "{at}: scope model_prefix must be non-empty or null"
-                    ));
-                }
-                if let Some(basis) = &rule.charge_basis {
-                    if ChargeBasis::parse(basis).is_none() {
-                        return Err(format!(
-                            "{at}: scope charge_basis '{basis}' is not one of {:?}",
-                            accepted_charge_bases()
-                        ));
-                    }
-                }
-                if !rules.insert((
-                    &rule.producer,
-                    &rule.provider,
-                    &rule.charge_basis,
-                    &rule.model_prefix,
-                )) {
-                    return Err(format!(
-                        "{at}: scope rule {}/{} is listed twice",
-                        rule.producer, rule.provider
-                    ));
-                }
-            }
-        }
-        let pools: Vec<_> = self.quota_providers.iter().collect();
-        for (index, (left_name, left)) in pools.iter().enumerate() {
-            for (right_name, right) in &pools[index + 1..] {
-                if left.scope.iter().any(|a| {
-                    right.scope.iter().any(|b| {
-                        a.producer == b.producer
-                            && a.provider == b.provider
-                            && (a.charge_basis.is_none()
-                                || b.charge_basis.is_none()
-                                || a.charge_basis == b.charge_basis)
-                            && (a.model_prefix.is_none()
-                                || b.model_prefix.is_none()
-                                || a.model_prefix
-                                    .as_ref()
-                                    .zip(b.model_prefix.as_ref())
-                                    .is_some_and(|(a, b)| a.starts_with(b) || b.starts_with(a)))
-                    })
-                }) {
-                    return Err(format!("subscription_multiplier.quota_providers: overlapping scope rules across '{left_name}' and '{right_name}'"));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// The spellings `ChargeBasis::parse` accepts, in declaration order, for
-/// naming them in a config error. Each variant names its successor in a match
-/// with no wildcard arm, so a new variant does not compile until it is placed
-/// in the chain, and every spelling comes from `ChargeBasis::as_str`.
-fn accepted_charge_bases() -> Vec<&'static str> {
-    let mut accepted = Vec::new();
-    let mut next = Some(ChargeBasis::MeteredApi);
-    while let Some(basis) = next {
-        accepted.push(basis.as_str());
-        next = match basis {
-            ChargeBasis::MeteredApi => Some(ChargeBasis::SubscriptionIncluded),
-            ChargeBasis::SubscriptionIncluded => Some(ChargeBasis::Unknown),
-            ChargeBasis::Unknown => None,
-        };
-    }
-    accepted
-}
-
-fn validate_plan_key(plan: &str) -> Result<(), String> {
-    match plan.split_once('/') {
-        Some((provider, tier))
-            if !provider.is_empty() && !tier.is_empty() && !tier.contains('/') =>
-        {
-            Ok(())
-        }
-        _ => Err(format!("plan key '{plan}' must be '<provider>/<tier>'")),
-    }
-}
-
-impl PriceOverride {
-    fn validate(&self) -> Result<(), String> {
-        if self.minor_units <= 0 {
-            return Err("price minor_units must be positive".into());
-        }
-        if self.currency != "USD" || self.period != "month" {
-            return Err(
-                "price must be quoted in USD per month, the currency and period the catalog's \
-                 token rates and the formula use"
-                    .into(),
-            );
-        }
-        amount_to_nanos(self.minor_units, self.exponent)
-            .map(|_| ())
-            .ok_or_else(|| "price exponent must be 0..=9 and the amount must fit".into())
-    }
-}
-
-/// A catalog rate of `units × 10^-exponent` dollars as whole nano-USD, or
-/// `None` when it is not a whole number of nano-USD or does not fit.
 fn rate_nanos_exact(units: i64, exponent: u8) -> Option<i64> {
     if exponent <= NANO_EXPONENT {
         units.checked_mul(10_i64.checked_pow(u32::from(NANO_EXPONENT - exponent))?)
@@ -543,88 +211,6 @@ impl AccountDelta {
     }
 }
 
-/// Measures a reset-aware high-water series and its bounded hourly coverage.
-#[cfg(test)]
-fn account_delta(
-    conn: &Connection,
-    quota_provider: &str,
-    account_ref: &str,
-    window: &WindowSelector,
-    start_ms: i64,
-    end_ms: i64,
-) -> rusqlite::Result<AccountDelta> {
-    clean::counter_delta(
-        conn,
-        quota_provider,
-        (account_ref, false),
-        window,
-        start_ms,
-        end_ms,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Observation plan (first read) and the network resolutions
-// ---------------------------------------------------------------------------
-
-/// Owned quota and usage inputs from one read snapshot, plus their model set.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ObservationPlan {
-    pub(crate) quota_provider: String,
-    pub provider: ResolvedQuotaProvider,
-    pub(crate) interval_start_ms: i64,
-    pub(crate) interval_end_ms: i64,
-    /// One entry per configured account.
-    pub(crate) accounts: Vec<AccountDelta>,
-    /// Accounts with readings in this window that the config does not name.
-    /// Their Δused% is reported and never counted.
-    pub(crate) unconfigured_accounts: Vec<AccountDelta>,
-    /// Identities excluded because their effective plan changed in this window.
-    changed_accounts: Vec<AccountDelta>,
-    /// The interval clipped to the span the quota data covers, or `None` when
-    /// no configured account has a reading in the interval.
-    pub token_interval_ms: Option<(i64, i64)>,
-    /// `(event provider, model)` pairs in scope inside the token interval.
-    pub(crate) models: BTreeSet<(String, Option<String>)>,
-    events: Vec<ScopedEvent>,
-}
-
-/// A reading that makes an identity "seen" inside `[?4, ?5)`. Antigravity
-/// readings from the `vault` source taken before `?6` (the instant insula
-/// started reading the right Google pool for that source) measured a
-/// different pool, so they do not count.
-const SEEN_READING: &str = "s.fetched_at_instant>=?4 AND s.fetched_at_instant<?5
-    AND NOT(s.provider='antigravity' AND s.source IS 'vault' AND s.fetched_at_instant<?6)";
-
-/// The distinct identities of one quota sample table (`window_sample` by
-/// `account_ref`, `credential_window_sample` by `credential_ref`) that have a
-/// reading of provider `?1`, pool `?2` and window `?3` matching `reading`, a
-/// predicate over the sample alias `s`. Ascending identity order.
-///
-/// A `SELECT DISTINCT` over the readings would visit every reading of the
-/// provider, because the primary key `(provider, identity, pool_key,
-/// fetched_at_instant)` puts the identity before the pool and time. Instead
-/// the recursive step jumps from one identity to the next through that key,
-/// and each identity is then checked by one seek on `(provider, identity,
-/// pool_key)` plus its time range. The work follows the number of identities,
-/// not the number of readings. `window_minutes` is not in the key, so the
-/// check still steps over that identity's readings in the time range that
-/// carry a different window, up to the first matching one.
-fn sample_identities_sql(table: &str, field: &str, reading: &str) -> String {
-    format!(
-        "WITH RECURSIVE identity(id) AS (
-             SELECT (SELECT {field} FROM {table} WHERE provider=?1 ORDER BY {field} LIMIT 1)
-             UNION ALL
-             SELECT (SELECT n.{field} FROM {table} n WHERE n.provider=?1 AND n.{field}>identity.id
-                     ORDER BY n.{field} LIMIT 1)
-               FROM identity WHERE identity.id IS NOT NULL)
-         SELECT id FROM identity WHERE id IS NOT NULL AND EXISTS (
-             SELECT 1 FROM {table} s WHERE s.provider=?1 AND s.{field}=identity.id
-                AND s.pool_key=?2 AND s.window_minutes=?3 AND {reading})
-         ORDER BY id"
-    )
-}
-
 /// The SQLite VM instructions `work` runs on `conn`, across every statement,
 /// prepared or cached. Tests use it to show that a read's cost follows its
 /// answer rather than the stored history.
@@ -653,370 +239,6 @@ pub(crate) fn vm_steps<T>(conn: &Connection, work: impl FnOnce() -> T) -> (T, u6
         rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut());
     }
     (result, *steps)
-}
-
-pub fn resolve_membership(
-    conn: &Connection,
-    declaration: &QuotaProviderConfig,
-    quota_provider: &str,
-    end_ms: i64,
-) -> Result<ResolvedQuotaProvider, MultiplierError> {
-    let (accounts, credentials) = sampled_identities(conn, declaration, quota_provider, end_ms)?;
-    let history = crate::vault_plan::at(conn, end_ms)?;
-    Ok(membership_from_history(
-        declaration,
-        &accounts,
-        &credentials,
-        &history,
-    ))
-}
-
-fn sampled_identities(
-    conn: &Connection,
-    declaration: &QuotaProviderConfig,
-    quota_provider: &str,
-    end_ms: i64,
-) -> rusqlite::Result<(BTreeSet<String>, BTreeSet<String>)> {
-    let identities = |table: &str, field: &str| -> rusqlite::Result<BTreeSet<String>> {
-        conn.prepare(&sample_identities_sql(
-            table,
-            field,
-            "s.fetched_at_instant<?4",
-        ))?
-        .query_map(
-            params![
-                quota_provider,
-                declaration.window.pool_key,
-                declaration.window.window_minutes,
-                clamp_nanos(millis_to_nanos(end_ms))
-            ],
-            |row| row.get(0),
-        )?
-        .collect()
-    };
-    Ok((
-        identities("window_sample", "account_ref")?,
-        identities("credential_window_sample", "credential_ref")?,
-    ))
-}
-
-fn membership_from_history(
-    declaration: &QuotaProviderConfig,
-    accounts: &BTreeSet<String>,
-    credentials: &BTreeSet<String>,
-    history: &[crate::vault_plan::VaultPlan],
-) -> ResolvedQuotaProvider {
-    // Config supplies an account's membership only until Vault supplies usable
-    // facts for it, even when Vault states a different provider.
-    let stated: BTreeSet<_> = history
-        .iter()
-        .filter(|row| row.source != "config" && (row.provider.is_some() || row.plan_key.is_some()))
-        .filter_map(|row| row.account_id.as_ref())
-        .collect();
-    let shadowed = |row: &crate::vault_plan::VaultPlan| {
-        row.source == "config"
-            && row
-                .account_id
-                .as_ref()
-                .is_some_and(|id| stated.contains(id))
-    };
-    let history = if history.iter().any(shadowed) {
-        std::borrow::Cow::Owned(
-            history
-                .iter()
-                .filter(|row| !shadowed(row))
-                .cloned()
-                .collect(),
-        )
-    } else {
-        std::borrow::Cow::Borrowed(history)
-    };
-    let usable_accounts = accounts.iter().any(|id| {
-        history
-            .iter()
-            .any(|row| row.account_id.as_ref() == Some(id) && row.plan_key.is_some())
-    });
-    let usable_credentials = credentials.iter().any(|id| {
-        history.iter().any(|row| {
-            row.account_id.is_none() && &row.credential_id == id && row.plan_key.is_some()
-        })
-    });
-    let credential_keyed =
-        usable_credentials && !usable_accounts || accounts.is_empty() && !credentials.is_empty();
-    let mixed = usable_accounts && usable_credentials;
-    let (winners, differences) = crate::vault_plan::account_winners(&history);
-    let mut resolved = ResolvedQuotaProvider {
-        window: declaration.window.clone(),
-        scope: declaration.scope.clone(),
-        accounts: BTreeMap::new(),
-        credentials: BTreeMap::new(),
-        credential_keyed,
-        unknown_reasons: BTreeMap::new(),
-        membership_reason: mixed.then(|| "mixed_identity_namespaces".into()),
-    };
-    if credential_keyed {
-        for id in credentials {
-            if let Some(key) = history
-                .iter()
-                .find(|row| &row.credential_id == id && row.account_id.is_none())
-                .and_then(|row| row.plan_key.as_ref())
-            {
-                resolved
-                    .credentials
-                    .insert(id.clone(), AccountPlan { plan: key.clone() });
-            } else {
-                resolved
-                    .unknown_reasons
-                    .insert(id.clone(), "vault_plan_unknown".into());
-            }
-        }
-    } else {
-        for id in accounts {
-            let providers: BTreeSet<_> = history
-                .iter()
-                .filter(|row| row.account_id.as_ref() == Some(id))
-                .filter_map(|row| row.provider.as_ref())
-                .collect();
-            let ambiguous = providers.len() > 1
-                || differences
-                    .iter()
-                    .any(|difference| &difference.account_id == id && difference.ambiguous);
-            if ambiguous {
-                resolved
-                    .unknown_reasons
-                    .insert(id.clone(), "vault_account_ambiguous".into());
-                continue;
-            }
-            if let Some(key) = winners
-                .iter()
-                .find(|row| {
-                    // A providerless, planless credential carries no membership information.
-                    row.account_id.as_ref() == Some(id)
-                        && (row.provider.is_some() || row.plan_key.is_some())
-                })
-                .and_then(|row| row.plan_key.as_ref())
-            {
-                resolved
-                    .accounts
-                    .insert(id.clone(), AccountPlan { plan: key.clone() });
-            } else {
-                resolved
-                    .unknown_reasons
-                    .insert(id.clone(), "vault_plan_unknown".into());
-            }
-        }
-    }
-    resolved
-}
-
-pub fn plan_observation(
-    conn: &Connection,
-    config: &MultiplierConfig,
-    quota_provider: &str,
-    interval_start_ms: i64,
-    interval_end_ms: i64,
-) -> Result<ObservationPlan, MultiplierError> {
-    let declaration = config
-        .quota_providers
-        .get(quota_provider)
-        .ok_or_else(|| MultiplierError::Refused {
-            code: "unknown_quota_provider",
-            message: format!("quota provider '{quota_provider}' is not configured"),
-        })?
-        .clone();
-    if interval_start_ms >= interval_end_ms {
-        return Err(MultiplierError::Refused {
-            code: "invalid_range",
-            message: "interval start must precede its end".into(),
-        });
-    }
-    let (account_ids, credential_ids) =
-        sampled_identities(conn, &declaration, quota_provider, interval_end_ms)?;
-    let membership_at = |end| -> rusqlite::Result<ResolvedQuotaProvider> {
-        Ok(membership_from_history(
-            &declaration,
-            &account_ids,
-            &credential_ids,
-            &crate::vault_plan::at(conn, end)?,
-        ))
-    };
-    let mut provider = membership_at(interval_end_ms)?;
-    let mut switched = BTreeSet::new();
-    let boundaries =
-        crate::vault_plan::boundaries_between(conn, interval_start_ms, interval_end_ms)?;
-    if let Some((_, earlier_boundaries)) = boundaries.split_last() {
-        let mut known = provider.members().clone();
-        // Check the start and every distinct intermediate membership so a
-        // switch away and back cannot look like a stable end-to-end plan.
-        for at in std::iter::once(interval_start_ms).chain(earlier_boundaries.iter().copied()) {
-            let previous = membership_at(at + 1)?;
-            let earlier = if provider.credential_keyed {
-                &previous.credentials
-            } else {
-                &previous.accounts
-            };
-            // A first known plan covers the login from its first recorded
-            // call; only two different known plans count as a switch.
-            for (id, plan) in earlier {
-                let recorded = known.entry(id.clone()).or_insert_with(|| plan.clone());
-                if recorded != plan {
-                    switched.insert(id.clone());
-                }
-            }
-        }
-    }
-    let mut changed_accounts = Vec::new();
-    for account in &switched {
-        provider.members_mut().remove(account);
-        changed_accounts.push(clean::counter_delta(
-            conn,
-            quota_provider,
-            (account, provider.credential_keyed),
-            &provider.window,
-            interval_start_ms,
-            interval_end_ms,
-        )?);
-    }
-    let mut accounts = Vec::new();
-    for account in provider.members().keys() {
-        accounts.push(clean::counter_delta(
-            conn,
-            quota_provider,
-            (account, provider.credential_keyed),
-            &provider.window,
-            interval_start_ms,
-            interval_end_ms,
-        )?);
-    }
-    let (table, field) = if provider.credential_keyed {
-        ("credential_window_sample", "credential_ref")
-    } else {
-        ("window_sample", "account_ref")
-    };
-    let seen: Vec<String> = conn
-        .prepare(&sample_identities_sql(table, field, SEEN_READING))?
-        .query_map(
-            params![
-                quota_provider,
-                provider.window.pool_key,
-                provider.window.window_minutes,
-                clamp_nanos(millis_to_nanos(interval_start_ms)),
-                clamp_nanos(millis_to_nanos(interval_end_ms)),
-                clean::ANTIGRAVITY_WRONG_VAULT_CUTOFF_NS
-            ],
-            |row| row.get(0),
-        )?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut unconfigured_accounts = Vec::new();
-    for account in seen.iter().filter(|account| {
-        !provider.members().contains_key(*account) && !switched.contains(*account)
-    }) {
-        let measured = clean::counter_delta(
-            conn,
-            quota_provider,
-            (account, provider.credential_keyed),
-            &provider.window,
-            interval_start_ms,
-            interval_end_ms,
-        )?;
-        unconfigured_accounts.push(measured);
-    }
-    let token_interval_ms = accounts
-        .iter()
-        .filter_map(|account| account.coverage_ms)
-        .reduce(|(start_a, end_a), (start_b, end_b)| (start_a.min(start_b), end_a.max(end_b)));
-    // Own both sides before catalog I/O: a concurrent ingest must not change
-    // the usage being valued after model discovery has finished.
-    let mut events = Vec::new();
-    for_scoped_events(
-        conn,
-        &provider.scope,
-        interval_start_ms,
-        interval_end_ms,
-        |event| {
-            if provider.credential_keyed
-                || event
-                    .account_ref
-                    .as_ref()
-                    .is_none_or(|id| !switched.contains(id))
-            {
-                events.push(event);
-            }
-            Ok(())
-        },
-    )?;
-    let models = events
-        .iter()
-        .map(|event| (event.tokens.provider.clone(), event.tokens.model.clone()))
-        .collect();
-    Ok(ObservationPlan {
-        quota_provider: quota_provider.to_string(),
-        provider,
-        interval_start_ms,
-        interval_end_ms,
-        accounts,
-        unconfigured_accounts,
-        changed_accounts,
-        token_interval_ms,
-        models,
-        events,
-    })
-}
-
-/// The scope rules as one SQL predicate over `usage_event e`, with its
-/// parameters in order.
-fn scope_predicate(rules: &[ScopeRule]) -> (String, Vec<SqlValue>) {
-    let mut clauses = Vec::new();
-    let mut values = Vec::new();
-    for rule in rules {
-        values.push(SqlValue::Text(rule.producer.clone()));
-        values.push(SqlValue::Text(rule.provider.clone()));
-        let mut clause = "(e.producer = ? AND e.provider = ?".to_string();
-        if let Some(basis) = &rule.charge_basis {
-            clause.push_str(" AND e.charge_basis = ?");
-            values.push(SqlValue::Text(basis.clone()));
-        }
-        if let Some(prefix) = &rule.model_prefix {
-            clause.push_str(" AND instr(e.model, ?) = 1");
-            values.push(SqlValue::Text(prefix.clone()));
-        }
-        clause.push(')');
-        clauses.push(clause);
-    }
-    (format!("({})", clauses.join(" OR ")), values)
-}
-
-fn scope_interval(rules: &[ScopeRule], from_ms: i64, to_ms: i64) -> (String, Vec<SqlValue>) {
-    let (predicate, mut values) = scope_predicate(rules);
-    values.extend([SqlValue::Integer(from_ms), SqlValue::Integer(to_ms)]);
-    (predicate, values)
-}
-
-/// The API provider an event's tokens are valued under.
-fn catalog_provider<'a>(config: &'a MultiplierConfig, event_provider: &'a str) -> &'a str {
-    config
-        .api_twins
-        .get(event_provider)
-        .map(String::as_str)
-        .unwrap_or(event_provider)
-}
-
-/// The catalog `(provider, model)` pairs [`resolve_rates`] must look up.
-pub fn catalog_models(
-    config: &MultiplierConfig,
-    plan: &ObservationPlan,
-) -> BTreeSet<(String, String)> {
-    plan.models
-        .iter()
-        .filter_map(|(provider, model)| {
-            model.as_ref().map(|model| {
-                (
-                    catalog_provider(config, provider).to_string(),
-                    model.clone(),
-                )
-            })
-        })
-        .collect()
 }
 
 /// The reason a rate fact could not be decoded. It never reaches a written
@@ -1188,6 +410,21 @@ pub fn resolve_rates(
     models: &BTreeSet<(String, String)>,
     at_ms: i64,
 ) -> Result<ResolvedRates, MultiplierError> {
+    resolve_rate_inputs(catalog, models, at_ms, None)
+}
+
+fn reasoning_base_model(model: &str) -> Option<&str> {
+    model
+        .strip_suffix("-low")
+        .or_else(|| model.strip_suffix("-high"))
+}
+
+fn resolve_rate_inputs(
+    catalog: &CatalogClient,
+    models: &BTreeSet<(String, String)>,
+    at_ms: i64,
+    mut identities: Option<&mut pools::PoolModelIdentities>,
+) -> Result<ResolvedRates, MultiplierError> {
     let mut resolved = ResolvedRates {
         resolved_at_ms: at_ms,
         models: BTreeMap::new(),
@@ -1197,23 +434,57 @@ pub fn resolve_rates(
         // Reasoning levels on the wire are not catalog identities. Prefer an
         // exact row, and only retry a missing row for the two supported levels.
         let lookup = catalog.get(provider, model, at_ms);
-        let (lookup_model, mut lookup) = match (
-            lookup_missing(&lookup),
-            model
-                .strip_suffix("-low")
-                .or_else(|| model.strip_suffix("-high")),
-        ) {
-            (true, Some(base)) => (base, catalog.get(provider, base, at_ms)),
-            _ => (model.as_str(), lookup),
-        };
+        let (lookup_model, mut lookup) =
+            match (lookup_missing(&lookup), reasoning_base_model(model)) {
+                (true, Some(base)) => (base, catalog.get(provider, base, at_ms)),
+                _ => (model.as_str(), lookup),
+            };
         let mut reference_model = None;
         let discover_quota_proxy = lookup_without_prices(&lookup);
+        if let Some(identities) = identities.as_deref_mut() {
+            match &lookup {
+                Ok(CatalogLookup::Resolved(_)) if !lookup_missing(&lookup) => {
+                    identities.record(
+                        provider,
+                        model,
+                        provider,
+                        lookup_model,
+                        lookup_model != model,
+                    );
+                }
+                // Before the catalog's history boundary there is no dated
+                // identity to inspect. A current identity can prove pool
+                // membership, but current rates cannot price these tokens.
+                Ok(CatalogLookup::PreHistory { .. }) => {
+                    let current = catalog.get_current(provider, model);
+                    let exact = matches!(&current, Ok(CatalogLookup::Resolved(snapshot))
+                        if snapshot.alias_target.is_none() && !lookup_missing(&current));
+                    let (name, current) = match (exact, reasoning_base_model(model)) {
+                        (false, Some(base)) if current.is_ok() || lookup_missing(&current) => {
+                            (base, catalog.get_current(provider, base))
+                        }
+                        _ => (model.as_str(), current),
+                    };
+                    record_current_pool_identity(identities, provider, model, name, current)?;
+                }
+                _ => {}
+            }
+        }
         if lookup_missing(&lookup) {
             // Aliases exist only on current reads. Discover the public identity
             // there, but use its rates at the original valuation instant.
             match catalog.get_current(provider, lookup_model) {
                 Ok(CatalogLookup::Resolved(snapshot)) => {
                     if let Some(target) = snapshot.alias_target {
+                        if let Some(identities) = identities.as_deref_mut() {
+                            identities.record(
+                                provider,
+                                model,
+                                &target.provider_id,
+                                &target.model_id,
+                                true,
+                            );
+                        }
                         lookup = catalog.get(&target.provider_id, &target.model_id, at_ms);
                         reference_model = Some(target);
                     }
@@ -1300,6 +571,29 @@ pub fn resolve_rates(
             .insert((provider.clone(), model.clone()), resolution);
     }
     Ok(resolved)
+}
+
+fn record_current_pool_identity(
+    identities: &mut pools::PoolModelIdentities,
+    provider: &str,
+    model: &str,
+    looked_up: &str,
+    current: Result<CatalogLookup, CatalogClientError>,
+) -> Result<(), MultiplierError> {
+    if let Ok(CatalogLookup::Resolved(snapshot)) = &current {
+        if let Some(target) = &snapshot.alias_target {
+            identities.record(provider, model, &target.provider_id, &target.model_id, true);
+        } else if !lookup_missing(&current) {
+            identities.record(provider, model, provider, looked_up, model != looked_up);
+        }
+    } else if let Err(error) = &current {
+        if !lookup_missing(&current) {
+            return Err(MultiplierError::Catalog(format!(
+                "catalog.get current {provider}/{looked_up}: {error:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn lookup_without_prices(lookup: &Result<CatalogLookup, CatalogClientError>) -> bool {
@@ -1569,70 +863,6 @@ pub struct PlanPriceUsed {
     pub refusal_text: Option<String>,
 }
 
-pub fn resolve_plans(
-    source: Option<&dyn PlanPriceSource>,
-    config: &MultiplierConfig,
-    provider: &ResolvedQuotaProvider,
-    at_ms: i64,
-) -> Result<BTreeMap<String, PlanPriceUsed>, MultiplierError> {
-    let needs_fusiform = provider
-        .members()
-        .values()
-        .any(|account| !config.plan_price_overrides.contains_key(&account.plan));
-    let served = if needs_fusiform {
-        let source = source.ok_or_else(|| {
-            MultiplierError::PlanPrices(
-                "plan prices are needed and fusiform is not configured".into(),
-            )
-        })?;
-        Some(
-            source
-                .plan_prices(PlanPricesRequest {
-                    provider_id: None,
-                    at_ms: None,
-                })
-                .map_err(|error| {
-                    MultiplierError::PlanPrices(format!(
-                        "plan.prices: {}: {}",
-                        error.code, error.message
-                    ))
-                })?,
-        )
-    } else {
-        None
-    };
-    let mut plans = BTreeMap::new();
-    for (account_ref, account) in provider.members() {
-        let mut used = PlanPriceUsed {
-            account_ref: if !provider.credential_keyed {
-                account_ref.clone()
-            } else {
-                String::new()
-            },
-            credential_ref: provider.credential_keyed.then(|| account_ref.clone()),
-            plan: account.plan.clone(),
-            source: None,
-            monthly_nanos: None,
-            review_by_ms: None,
-            plan_price_overdue: false,
-            source_ref: None,
-            unpriceable_reason: None,
-            refusal_text: None,
-        };
-        let from_override = |price: &PriceOverride, origin: &str, used: &mut PlanPriceUsed| {
-            used.source = Some(origin.to_string());
-            used.monthly_nanos = amount_to_nanos(price.minor_units, price.exponent);
-        };
-        if let Some(price) = config.plan_price_overrides.get(&account.plan) {
-            from_override(price, "plan_override", &mut used);
-        } else if let Some(served) = &served {
-            fusiform_price(served, &account.plan, at_ms, &mut used);
-        }
-        plans.insert(account_ref.clone(), used);
-    }
-    Ok(plans)
-}
-
 fn fusiform_price(served: &PlanPricesResponse, plan: &str, at_ms: i64, used: &mut PlanPriceUsed) {
     let (provider_id, tier) = plan.split_once('/').unwrap_or((plan, ""));
     // Several eras may be served for one key; the one in force is the latest
@@ -1748,6 +978,26 @@ pub struct UnpricedTokens {
     pub measurements: u64,
 }
 
+/// Coverage recorded by a pool observation. Older plan-wide observations
+/// carry no scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolScope {
+    All,
+    Subset,
+    Unknown,
+}
+
+impl PoolScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Subset => "subset",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// One row of `multiplier_observation`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Observation {
@@ -1772,6 +1022,11 @@ pub struct Observation {
     pub token_interval_end_ms: Option<i64>,
     pub window_pool_key: String,
     pub window_minutes: i64,
+    pub pool_scope: Option<PoolScope>,
+    pub pool_models: Option<Vec<String>>,
+    pub pool_models_at_ms: Option<i64>,
+    pub pool_member_models: Option<Vec<String>>,
+    pub catalog_provider: Option<String>,
     /// Input, cache-read, cache-write, output and reasoning counts from plain
     /// and lifetime-specific token units with exponent 0, priced or not,
     /// inside the token interval.
@@ -1791,9 +1046,11 @@ pub struct Observation {
     pub delta_percent: f64,
     pub accounts_included: Vec<Value>,
     pub accounts_excluded: Vec<Value>,
-    pub excluded_pairs: BTreeMap<String, u64>,
+    /// Counts by reason for a measured counter, or an empty array when the
+    /// counter cannot be measured.
+    pub excluded_pairs: Value,
     pub low_resolution: bool,
-    pub scope_rules: Vec<ScopeRule>,
+    pub scope_rules: Vec<Value>,
     pub plan_prices: Vec<PlanPriceUsed>,
     pub catalog_resolved_at_ms: i64,
     pub api_twins: BTreeMap<String, String>,
@@ -1851,18 +1108,16 @@ fn decode_role(row: &Row<'_>) -> rusqlite::Result<MeasuredRole> {
 /// Stream each event once with all its measurements. Time bounds and scope
 /// are shared by valuation, outside-coverage counts and pace; pace alone uses
 /// the event's occurrence time and work class to place it in an hourly bucket.
-fn for_scoped_events(
+fn for_events(
     conn: &Connection,
-    scope: &[ScopeRule],
-    from: i64,
-    to: i64,
-    mut consume: impl FnMut(ScopedEvent) -> Result<(), MultiplierError>,
+    predicate: &str,
+    values: &[SqlValue],
+    mut consume: impl FnMut(ScopedEvent, Option<String>) -> Result<(), MultiplierError>,
 ) -> Result<(), MultiplierError> {
-    let (predicate, values) = scope_interval(scope, from, to);
     let sql = format!(
-        "SELECT e.event_key, e.producer, e.provider, e.model, m.role, m.unit, m.source,
+        "SELECT e.event_key, e.producer, COALESCE(e.provider,''), e.model, m.role, m.unit, m.source,
                 m.quantity_units,m.quantity_exponent,e.occurred_at_ms,e.work_class,e.account_ref,
-                b.event_key IS NOT NULL,b.mode
+                b.event_key IS NOT NULL,b.mode,COALESCE(e.resolved_credential,e.auth_selection)
          FROM usage_event e LEFT JOIN measurement m ON m.event_key=e.event_key
          LEFT JOIN broca_attempt_detail b ON b.event_key=e.event_key
          WHERE {predicate} AND e.occurred_at_ms >= CAST(? AS INTEGER)
@@ -1870,14 +1125,14 @@ fn for_scoped_events(
     );
     let mut statement = conn.prepare(&sql)?;
     let mut rows = statement.query(params_from_iter(values.iter()))?;
-    let mut current: Option<ScopedEvent> = None;
+    let mut current: Option<(ScopedEvent, Option<String>)> = None;
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
-        if current.as_ref().is_none_or(|event| event.id != id) {
-            if let Some(event) = current.take() {
-                consume(event)?;
+        if current.as_ref().is_none_or(|(event, _)| event.id != id) {
+            if let Some((event, credential)) = current.take() {
+                consume(event, credential)?;
             }
-            current = Some(ScopedEvent {
+            let event = ScopedEvent {
                 id,
                 tokens: EventTokens {
                     producer: row.get(1)?,
@@ -1890,16 +1145,17 @@ fn for_scoped_events(
                 occurred_at_ms: row.get(9)?,
                 work_class: row.get(10)?,
                 account_ref: row.get(11)?,
-            });
+            };
+            current = Some((event, row.get(14)?));
         }
-        if let Some(event) = current.as_mut() {
+        if let Some((event, _)) = current.as_mut() {
             if row.get::<_, Option<String>>(4)?.is_some() {
                 event.tokens.roles.push(decode_role(row)?);
             }
         }
     }
-    if let Some(event) = current {
-        consume(event)?;
+    if let Some((event, credential)) = current {
+        consume(event, credential)?;
     }
     Ok(())
 }
@@ -2053,317 +1309,6 @@ fn allocate_subscription(
     Ok(parts)
 }
 
-/// Prices the token side of `plan` and assembles the observation.
-pub fn compute_observation(
-    _conn: &Connection,
-    config: &MultiplierConfig,
-    plan: &ObservationPlan,
-    rates: &ResolvedRates,
-    plan_prices: &BTreeMap<String, PlanPriceUsed>,
-    snapshot_at_ms: i64,
-    reasoning_billed_as_output: &[String],
-) -> Result<Observation, MultiplierError> {
-    let mut lines: BTreeMap<(String, String, Option<String>), ModelLine> = BTreeMap::new();
-    let mut unpriced: BTreeMap<(String, String, String), (i64, u64)> = BTreeMap::new();
-    let mut tokens = RoleTokens::default();
-    let lookup = ModelLookup::new(rates);
-    let rules = ValuationRules::from_config(config, reasoning_billed_as_output);
-    if let Some((from, to)) = plan.token_interval_ms {
-        for scoped in plan
-            .events
-            .iter()
-            .filter(|event| event.occurred_at_ms >= from && event.occurred_at_ms < to)
-        {
-            let event = &scoped.tokens;
-            let resolution = event.model.as_deref().and_then(|model| {
-                lookup.get_at(
-                    rules.catalog_provider(&event.provider),
-                    model,
-                    scoped.occurred_at_ms,
-                )
-            });
-            value_event(
-                &rules,
-                resolution,
-                event,
-                &mut lines,
-                &mut unpriced,
-                &mut tokens,
-            )?;
-        }
-    }
-    let mut tokens_outside_quota_coverage = 0_i64;
-    for event in &plan.events {
-        if plan
-            .token_interval_ms
-            .is_none_or(|(from, to)| event.occurred_at_ms < from || event.occurred_at_ms >= to)
-        {
-            let roles = event_quantities(
-                &event.tokens,
-                &mut RoleTokens::default(),
-                &mut 0,
-                &mut |_, _, _, _| Ok(()),
-            )?;
-            for quantity in roles.values() {
-                tokens_outside_quota_coverage = tokens_outside_quota_coverage
-                    .checked_add(*quantity)
-                    .ok_or(MoneyError::OutOfRange)?;
-            }
-        }
-    }
-
-    let mut api_numerator = 0_i128;
-    let mut base_rate_tier_untested_tokens = 0_i64;
-    let mut api_nanos_by_model = Vec::new();
-    for (_, mut line) in lines {
-        line.api_nanos = round_nano_num(line.numerator)?;
-        api_numerator = api_numerator
-            .checked_add(line.numerator)
-            .ok_or(MoneyError::OutOfRange)?;
-        base_rate_tier_untested_tokens = base_rate_tier_untested_tokens
-            .checked_add(line.base_rate_tier_untested_tokens)
-            .ok_or(MoneyError::OutOfRange)?;
-        line.rates = line
-            .model
-            .as_deref()
-            .and_then(|model| lookup.get(rules.catalog_provider(&line.provider), model))
-            .cloned();
-        api_nanos_by_model.push(line);
-    }
-    let api_nanos = round_nano_num(api_numerator)?;
-
-    // The denominator uses only identified counters whose plan has a price.
-    let token_span_ms = plan
-        .token_interval_ms
-        .map(|(from, to)| to.checked_sub(from).ok_or(MoneyError::OutOfRange))
-        .transpose()?
-        .unwrap_or(0);
-    let window_share = NanoRatio::new(
-        i128::from(plan.provider.window.window_minutes),
-        i128::from(MINUTES_PER_MONTH) * 100,
-    )?;
-    let fee_share = NanoRatio::new(i128::from(token_span_ms), i128::from(MS_PER_MONTH))?;
-    let mut subscription = NanoRatio::new(0, 1)?;
-    let mut fee_paid = NanoRatio::new(0, 1)?;
-    let mut subscription_shares = Vec::new();
-    let mut delta_percent = 0.0;
-    let mut segments = 0;
-    let mut excluded_pairs = ExcludedPairs::default();
-    let mut accounts_included = Vec::new();
-    let mut accounts_excluded = Vec::new();
-    for account in &plan.accounts {
-        excluded_pairs.decrease_boundary += account.decrease_boundaries;
-        excluded_pairs.fetched_at_backwards += account.fetched_at_backwards;
-        let price = plan_prices.get(&account.account_ref);
-        match price.and_then(|price| price.monthly_nanos) {
-            Some(monthly) => {
-                let monthly = NanoRatio::new(i128::from(monthly), 1)?;
-                let account_subscription = monthly
-                    .mul(window_share)?
-                    .mul(NanoRatio::percent(account.delta_percent)?)?;
-                subscription = subscription.add(account_subscription)?;
-                fee_paid = fee_paid.add(monthly.mul(fee_share)?)?;
-                subscription_shares.push((account.account_ref.clone(), account_subscription));
-                delta_percent += account.delta_percent;
-                segments += account.segments();
-                accounts_included.push(json!({
-                    (plan.provider.identity_field()): account.account_ref,
-                    "delta_percent": account.delta_percent,
-                    "subscription_nanos": 0,
-                    "readings": account.readings,
-                    "decrease_boundaries": account.decrease_boundaries,
-                    "fetched_at_backwards": account.fetched_at_backwards,
-                    "stale_reset_readings": account.stale_reset_readings,
-                    "reset_boundaries": account.reset_boundaries,
-                    "coverage_ms": account.coverage_ms,
-                }));
-            }
-            None => accounts_excluded.push(json!({
-                (plan.provider.identity_field()): account.account_ref,
-                "reason": price
-                    .and_then(|price| price.unpriceable_reason.clone())
-                    .unwrap_or_else(|| "plan_price_unresolved".into()),
-                "delta_percent": account.delta_percent,
-                "readings": account.readings,
-            })),
-        }
-    }
-    for account in &plan.unconfigured_accounts {
-        accounts_excluded.push(json!({
-            (plan.provider.identity_field()): account.account_ref,
-            "reason": plan.provider.unknown_reasons.get(&account.account_ref).map(String::as_str).unwrap_or("vault_plan_unknown"),
-            "delta_percent": account.delta_percent,
-            "readings": account.readings,
-        }));
-    }
-    for account in &plan.changed_accounts {
-        accounts_excluded.push(json!({
-            (plan.provider.identity_field()): account.account_ref,
-            "reason": "vault_plan_changed",
-            "delta_percent": account.delta_percent,
-            "readings": account.readings,
-        }));
-    }
-    let subscription_nanos = subscription.round()?;
-    let fee_paid_nanos = fee_paid.round()?;
-    for (account, amount) in accounts_included.iter_mut().zip(allocate_subscription(
-        &subscription_shares,
-        subscription_nanos,
-    )?) {
-        account["subscription_nanos"] = json!(amount);
-    }
-    // A missing list value is not evidence of free usage. Keep both ratios
-    // unknown when unpriced tokens are the only contribution to a zero value.
-    let unmeasurable = !plan.unconfigured_accounts.is_empty()
-        || unpriced
-            .keys()
-            .any(|(reason, _, _)| reason == "missing_quantity")
-        || (api_nanos == 0 && unpriced.values().any(|(tokens, _)| *tokens > 0));
-    let ratio = |denominator: i64| {
-        (denominator > 0 && !unmeasurable).then(|| api_nanos as f64 / denominator as f64)
-    };
-    let low_resolution =
-        delta_percent <= 0.0 || segments as f64 / delta_percent > LOW_RESOLUTION_ERROR_SHARE;
-    Ok(Observation {
-        plan: None,
-        routing_eligible: false,
-        eligibility_reasons: vec!["legacy_estimator".into()],
-        clean_hours_share: 0.0,
-        saturated_share: 0.0,
-        gap_share: 0.0,
-        unpriced_share: 0.0,
-        unconfigured_accounts: plan
-            .unconfigured_accounts
-            .iter()
-            .map(|account| account.account_ref.clone())
-            .collect(),
-        source_backlog: Vec::new(),
-        unattributed_event_share: 0.0,
-        zero_measurement_events: 0,
-        missing_quantity_events: 0,
-        quota_provider: plan.quota_provider.clone(),
-        observation_day: utc_day(plan.interval_end_ms)?,
-        snapshot_at_ms,
-        interval_start_ms: plan.interval_start_ms,
-        interval_end_ms: plan.interval_end_ms,
-        token_interval_start_ms: plan.token_interval_ms.map(|(from, _)| from),
-        token_interval_end_ms: plan.token_interval_ms.map(|(_, to)| to),
-        window_pool_key: plan.provider.window.pool_key.clone(),
-        window_minutes: plan.provider.window.window_minutes,
-        tokens,
-        api_nanos,
-        api_nanos_by_model,
-        // A zero quantity has no value to lose, so it is not listed; a missing
-        // quantity is, since its size is unknown rather than zero.
-        unpriced_tokens: unpriced
-            .into_iter()
-            .filter(|((reason, _, _), (tokens, _))| *tokens > 0 || reason == "missing_quantity")
-            .map(
-                |((reason, model, role), (tokens, measurements))| UnpricedTokens {
-                    reason,
-                    model,
-                    role,
-                    tokens,
-                    measurements,
-                },
-            )
-            .collect(),
-        tokens_outside_quota_coverage,
-        base_rate_tier_untested_tokens,
-        subscription_nanos,
-        fee_paid_nanos,
-        delta_percent,
-        accounts_included,
-        accounts_excluded,
-        excluded_pairs: excluded_pairs.counts(),
-        low_resolution,
-        scope_rules: plan.provider.scope.clone(),
-        plan_prices: plan_prices.values().cloned().collect(),
-        catalog_resolved_at_ms: rates.resolved_at_ms,
-        api_twins: config.api_twins.clone(),
-        reasoning_billed_as_output: reasoning_billed_as_output.to_vec(),
-        error_deflating: ERROR_DEFLATING.into(),
-        error_inflating: ERROR_INFLATING.into(),
-        multiplier: ratio(subscription_nanos),
-        fee_multiplier: ratio(fee_paid_nanos),
-    })
-}
-
-fn value_event(
-    rules: &ValuationRules<'_>,
-    resolution: Option<&ModelResolution>,
-    event: &EventTokens,
-    lines: &mut BTreeMap<(String, String, Option<String>), ModelLine>,
-    unpriced: &mut BTreeMap<(String, String, String), (i64, u64)>,
-    totals: &mut RoleTokens,
-) -> Result<(), MultiplierError> {
-    let value = crate::valuation::value_event(rules, resolution, event)?;
-    let line = lines
-        .entry((
-            event.producer.clone(),
-            event.provider.clone(),
-            event.model.clone(),
-        ))
-        .or_insert_with(|| ModelLine {
-            producer: event.producer.clone(),
-            provider: event.provider.clone(),
-            model: event.model.clone(),
-            ..ModelLine::default()
-        });
-    line.events += 1;
-    line.measured_tokens.merge(&value.measured_tokens)?;
-    totals.merge(&value.tokens)?;
-    macro_rules! add {
-        ($($field:ident),+ $(,)?) => {$(
-            line.$field = line.$field.checked_add(value.$field).ok_or(MoneyError::OutOfRange)?;
-        )+};
-    }
-    add!(
-        numerator,
-        inclusive_output_adjustment,
-        tiered_tokens,
-        base_rate_tier_untested_tokens,
-        mode_unrecorded_tokens
-    );
-    for diagnostic in value.unpriced {
-        let model_label = format!(
-            "{}/{}/{}",
-            event.producer,
-            event.provider,
-            event.model.as_deref().unwrap_or("<none>")
-        );
-        let entry = unpriced
-            .entry((diagnostic.reason, model_label, diagnostic.role))
-            .or_insert((0_i64, 0_u64));
-        entry.0 = entry
-            .0
-            .checked_add(diagnostic.quantity)
-            .ok_or(MoneyError::OutOfRange)?;
-        entry.1 = entry.1.checked_add(1).ok_or(MoneyError::OutOfRange)?;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
-
-/// Whether any row for this provider and day is recorded, original or
-/// superseding. The daily stage asks this, so a day an operator has corrected
-/// is never given a second automatic row.
-pub fn observation_exists(
-    conn: &Connection,
-    quota_provider: &str,
-    observation_day: &str,
-) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM multiplier_observation
-          WHERE quota_provider = ?1 AND observation_day = ?2)",
-        params![quota_provider, observation_day],
-        |row| row.get(0),
-    )
-}
-
 fn to_json<T: Serialize>(value: &T) -> Result<String, MultiplierError> {
     serde_json::to_string(value).map_err(|error| MultiplierError::Encode(error.to_string()))
 }
@@ -2389,21 +1334,79 @@ pub fn observation_head(
     .optional()
 }
 
-pub fn observation_plan_head(
+/// Selects either a plan-wide chain with no recorded scope or a chain for a
+/// specific window pool with recorded scope.
+#[derive(Clone, Copy)]
+pub enum ObservationHeadKey<'a> {
+    PreCut {
+        plan: Option<&'a str>,
+    },
+    PostCut {
+        plan: &'a str,
+        window_pool_key: &'a str,
+    },
+}
+
+impl<'a> From<Option<&'a str>> for ObservationHeadKey<'a> {
+    fn from(plan: Option<&'a str>) -> Self {
+        Self::PreCut { plan }
+    }
+}
+
+impl<'a> From<Option<&'a String>> for ObservationHeadKey<'a> {
+    fn from(plan: Option<&'a String>) -> Self {
+        Self::PreCut {
+            plan: plan.map(String::as_str),
+        }
+    }
+}
+
+pub fn observation_plan_head<'a>(
     conn: &Connection,
     quota_provider: &str,
     day: &str,
-    plan: Option<&str>,
+    key: impl Into<ObservationHeadKey<'a>>,
 ) -> rusqlite::Result<Option<i64>> {
-    conn.query_row("SELECT o.observation_id FROM multiplier_observation o
-        WHERE o.quota_provider=?1 AND o.observation_day=?2 AND o.plan IS ?3
-        AND NOT EXISTS (SELECT 1 FROM multiplier_observation child WHERE child.supersedes=o.observation_id)",
-        params![quota_provider, day, plan], |row| row.get(0)).optional()
+    let (lineage, plan, pool) = match key.into() {
+        ObservationHeadKey::PreCut { plan } => ("o.pool_scope IS NULL", plan, None),
+        ObservationHeadKey::PostCut {
+            plan,
+            window_pool_key,
+        } => (
+            "o.pool_scope IS NOT NULL AND o.window_pool_key=?4",
+            Some(plan),
+            Some(window_pool_key),
+        ),
+    };
+    let sql = format!("SELECT o.observation_id FROM multiplier_observation o
+        WHERE o.quota_provider=?1 AND o.observation_day=?2 AND o.plan IS ?3 AND {lineage}
+        AND NOT EXISTS (SELECT 1 FROM multiplier_observation child WHERE child.supersedes=o.observation_id)");
+    let mut query = conn.prepare_cached(&sql)?;
+    if let Some(pool) = pool {
+        query.query_row(params![quota_provider, day, plan, pool], |row| row.get(0))
+    } else {
+        query.query_row(params![quota_provider, day, plan], |row| row.get(0))
+    }
+    .optional()
 }
 
-/// Appends a day's original observation. A second row for the same provider
-/// and day is refused before the insert (the table's partial unique index
-/// refuses a second original too).
+fn observation_head_key(
+    observation: &Observation,
+) -> Result<ObservationHeadKey<'_>, MultiplierError> {
+    let plan = observation.plan.as_deref();
+    if observation.pool_scope.is_none() {
+        return Ok(ObservationHeadKey::PreCut { plan });
+    }
+    let plan = plan
+        .ok_or_else(|| MultiplierError::InvalidObservation("a scoped pool needs a plan".into()))?;
+    Ok(ObservationHeadKey::PostCut {
+        plan,
+        window_pool_key: &observation.window_pool_key,
+    })
+}
+
+/// Appends a day's original observation. An observation with a recorded
+/// scope belongs to a separate chain for its window pool.
 pub fn insert_observation_in_tx(
     tx: &Transaction<'_>,
     observation: &Observation,
@@ -2412,7 +1415,7 @@ pub fn insert_observation_in_tx(
         tx,
         &observation.quota_provider,
         &observation.observation_day,
-        observation.plan.as_deref(),
+        observation_head_key(observation)?,
     )?
     .is_some()
     {
@@ -2434,10 +1437,9 @@ pub struct Superseded {
     pub supersedes: i64,
 }
 
-/// Appends a recomputed observation that supersedes the day's current head.
-/// The head is read inside the write transaction, so the new row always
-/// replaces the latest one. A day with no row is refused: there is nothing to
-/// correct, and the daily stage owns a day's first row.
+/// Appends a recomputed observation that supersedes the current head of its
+/// own chain. The head is read inside the write transaction. A chain with no
+/// row is refused: there is nothing to correct.
 pub fn insert_superseding_observation_in_tx(
     tx: &Transaction<'_>,
     observation: &Observation,
@@ -2446,7 +1448,7 @@ pub fn insert_superseding_observation_in_tx(
         tx,
         &observation.quota_provider,
         &observation.observation_day,
-        observation.plan.as_deref(),
+        observation_head_key(observation)?,
     )?
     .ok_or_else(|| MultiplierError::NothingToSupersede {
         quota_provider: observation.quota_provider.clone(),
@@ -2558,9 +1560,11 @@ fn insert_row(
             reasoning_billed_as_output, error_deflating, error_inflating, multiplier,
             fee_multiplier, supersedes, plan, routing_eligible, eligibility_reasons,
             clean_hours_share, saturated_share, gap_share, unpriced_share, unconfigured_accounts, source_backlog,
-            unattributed_event_share, zero_measurement_events, missing_quantity_events
+            unattributed_event_share, zero_measurement_events, missing_quantity_events,
+            pool_scope, pool_models, pool_models_at_ms, pool_member_models, catalog_provider
         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
-                  ?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49)",
+                  ?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,
+                   ?50,?51,?52,?53,?54)",
         params![
             observation.quota_provider,
             observation.observation_day,
@@ -2611,6 +1615,11 @@ fn insert_row(
             observation.unattributed_event_share,
             i64::try_from(observation.zero_measurement_events).map_err(|_| MoneyError::OutOfRange)?,
             i64::try_from(observation.missing_quantity_events).map_err(|_| MoneyError::OutOfRange)?,
+            observation.pool_scope.map(PoolScope::as_str),
+            observation.pool_models.as_ref().map(to_json).transpose()?,
+            observation.pool_models_at_ms,
+            observation.pool_member_models.as_ref().map(to_json).transpose()?,
+            observation.catalog_provider,
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -2620,11 +1629,11 @@ fn insert_row(
 // Serving
 // ---------------------------------------------------------------------------
 
-/// `spend.multiplier.report`: the latest day's observation per quota provider,
-/// and one observation per provider and day for every day whose interval ends
-/// in `[from_ms, to_ms)`. Only a day's head row is served: a row an operator
-/// recompute superseded is kept in the table but never reported. Each row
-/// carries `supersedes`, the id of the row it replaced or null.
+/// `spend.multiplier.report`: the scoped plan and pool heads of each provider's
+/// newest recorded day, plus history for intervals ending in `[from_ms, to_ms)`.
+/// History keeps legacy heads for keys without scoped observations. Neither
+/// view includes retired or superseded heads. `supersedes` names the row a
+/// served head replaced, if any.
 ///
 /// Rows are placed by their day, not by `snapshot_at_ms`: a recompute is
 /// taken later than the day it corrects, and must stand in its day's slot
@@ -2648,265 +1657,7 @@ pub struct MultiplierRecomputeRequest {
     pub quota_provider: Option<String>,
 }
 
-/// Hourly usage valued using the latest recorded multiplier's list rates.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MultiplierPaceRequest {
-    pub quota_provider: String,
-    #[serde(default)]
-    pub plan: Option<String>,
-    pub from_ms: i64,
-    pub to_ms: i64,
-}
-
-const HOUR_MS: i64 = 3_600_000;
-// A weekly calibration may describe the current workload for daily routing,
-// but a head older than two days needs a refreshed estimate or fallback.
-const PACE_MAX_HEAD_AGE_MS: i64 = 2 * 24 * HOUR_MS;
-// Bound the read work while allowing a trailing week plus UTC alignment tails.
-const PACE_MAX_RANGE_HOURS: i64 = 192;
-
-#[derive(Deserialize)]
-struct PaceRateLine {
-    producer: String,
-    provider: String,
-    model: Option<String>,
-    rates: Option<ModelResolution>,
-}
-
-struct PaceHead {
-    observation_id: i64,
-    observation_day: String,
-    api_nanos: i64,
-    delta_percent: f64,
-    api_nanos_by_model: String,
-    api_twins: String,
-    reasoning_billed_as_output: String,
-}
-
-type PaceRates<'a> =
-    BTreeMap<&'a str, BTreeMap<&'a str, BTreeMap<Option<&'a str>, Option<&'a ModelResolution>>>>;
-
-fn pace_rates(lines: &[PaceRateLine]) -> PaceRates<'_> {
-    let mut index: PaceRates<'_> = BTreeMap::new();
-    for line in lines {
-        index
-            .entry(&line.producer)
-            .or_default()
-            .entry(&line.provider)
-            .or_default()
-            .insert(line.model.as_deref(), line.rates.as_ref());
-    }
-    index
-}
-
-#[derive(Default)]
-struct PaceClass {
-    lines: BTreeMap<(String, String, Option<String>), ModelLine>,
-    unpriced: BTreeMap<(String, String, String), (i64, u64)>,
-    tokens: RoleTokens,
-}
-
-/// Uses current scope declarations but the head's recorded valuation rules and
-/// rates. No catalog lookup is needed, even for newly encountered models.
-pub fn multiplier_pace(
-    conn: &Connection,
-    config: Option<&MultiplierConfig>,
-    request: &MultiplierPaceRequest,
-) -> Result<Value, MultiplierError> {
-    let refuse = |code, message| MultiplierError::Refused { code, message };
-    let config = config
-        .filter(|config| config.quota_providers.contains_key(&request.quota_provider))
-        .ok_or_else(|| {
-            refuse(
-                "unknown_quota_provider",
-                format!("unknown quota provider '{}'", request.quota_provider),
-            )
-        })?;
-    let provider = resolve_membership(
-        conn,
-        &config.quota_providers[&request.quota_provider],
-        &request.quota_provider,
-        request.to_ms,
-    )?;
-    let plans: BTreeSet<_> = provider
-        .members()
-        .values()
-        .map(|account| account.plan.as_str())
-        .collect();
-    if request.plan.is_none() && plans.len() > 1 {
-        return Err(refuse(
-            "plan_required",
-            "pace requires a plan when provider accounts use different plans".into(),
-        ));
-    }
-    let selected_plan = request.plan.as_deref().or_else(|| plans.first().copied());
-    if request.from_ms >= request.to_ms {
-        return Err(refuse(
-            "invalid_range",
-            "from_ms must be earlier than to_ms".into(),
-        ));
-    }
-    // Euclidean division also aligns times before the Unix epoch correctly.
-    let from = i128::from(request.from_ms).div_euclid(i128::from(HOUR_MS)) * i128::from(HOUR_MS);
-    let to = (i128::from(request.to_ms) + i128::from(HOUR_MS) - 1).div_euclid(i128::from(HOUR_MS))
-        * i128::from(HOUR_MS);
-    if to - from > i128::from(PACE_MAX_RANGE_HOURS) * i128::from(HOUR_MS) {
-        return Err(refuse(
-            "range_too_large",
-            format!("aligned range must not exceed {PACE_MAX_RANGE_HOURS} hours"),
-        ));
-    }
-    let from = i64::try_from(from)
-        .map_err(|_| refuse("invalid_range", "aligned from_ms overflows i64".into()))?;
-    let to = i64::try_from(to)
-        .map_err(|_| refuse("invalid_range", "aligned to_ms overflows i64".into()))?;
-    let head = conn
-        .query_row(
-            "SELECT o.observation_id, o.observation_day, o.api_nanos, o.delta_percent,
-                o.api_nanos_by_model, o.api_twins, o.reasoning_billed_as_output
-         FROM multiplier_observation o WHERE o.quota_provider = ?1 AND o.routing_eligible=1
-            AND (?2 IS NULL OR o.plan=?2)
-            AND o.interval_end_ms >= ?3 - ?4
-           AND NOT EXISTS (SELECT 1 FROM multiplier_observation child
-                           WHERE child.supersedes = o.observation_id)
-         ORDER BY o.observation_day DESC, o.observation_id DESC LIMIT 1",
-            params![
-                request.quota_provider,
-                selected_plan,
-                request.to_ms,
-                PACE_MAX_HEAD_AGE_MS
-            ],
-            |row| {
-                Ok(PaceHead {
-                    observation_id: row.get(0)?,
-                    observation_day: row.get(1)?,
-                    api_nanos: row.get(2)?,
-                    delta_percent: row.get(3)?,
-                    api_nanos_by_model: row.get(4)?,
-                    api_twins: row.get(5)?,
-                    reasoning_billed_as_output: row.get(6)?,
-                })
-            },
-        )
-        .optional()?
-        .ok_or_else(|| {
-            refuse(
-                "no_multiplier_observation",
-                "no multiplier row is recorded for this provider".into(),
-            )
-        })?;
-    let decode_error = |error: serde_json::Error| MultiplierError::Encode(error.to_string());
-    let rate_lines: Vec<PaceRateLine> =
-        serde_json::from_str(&head.api_nanos_by_model).map_err(decode_error)?;
-    let stored_rates = pace_rates(&rate_lines);
-    let api_twins = serde_json::from_str(&head.api_twins).map_err(decode_error)?;
-    let reasoning_billed_as_output: Vec<String> =
-        serde_json::from_str(&head.reasoning_billed_as_output).map_err(decode_error)?;
-    let valuation_rules = ValuationRules {
-        api_twins: &api_twins,
-        reasoning_billed_as_output: &reasoning_billed_as_output,
-    };
-    // Like the report's multipliers, an unusable denominator yields null, not
-    // an invented zero rate. Nanodollars are rounded once to an integer.
-    let per_point_nanos = if head.delta_percent > 0.0 && head.api_nanos > 0 {
-        let percent = NanoRatio::percent(head.delta_percent)?;
-        Some(
-            NanoRatio::new(i128::from(head.api_nanos), 1)?
-                .mul(NanoRatio::new(percent.denominator, percent.numerator)?)?
-                .round()?,
-        )
-        .filter(|nanos| *nanos > 0)
-    } else {
-        None
-    };
-    let points = |nanos: i64| per_point_nanos.map(|per_point| nanos as f64 / per_point as f64);
-    let (predicate, values) =
-        scope_predicate(&config.quota_providers[&request.quota_provider].scope);
-    let undated_events: i64 = conn.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM usage_event e WHERE {predicate} AND e.occurred_at_ms IS NULL"
-        ),
-        params_from_iter(values.iter()),
-        |row| row.get(0),
-    )?;
-    let mut hours: BTreeMap<i64, BTreeMap<String, BTreeMap<String, PaceClass>>> = (from..to)
-        .step_by(usize::try_from(HOUR_MS).expect("one hour in milliseconds fits usize"))
-        .map(|hour| (hour, BTreeMap::new()))
-        .collect();
-    for_scoped_events(
-        conn,
-        &config.quota_providers[&request.quota_provider].scope,
-        from,
-        to,
-        |scoped| {
-            if let Some(account) = scoped
-                .account_ref
-                .as_ref()
-                .and_then(|account| provider.accounts.get(account))
-            {
-                if Some(account.plan.as_str()) != selected_plan {
-                    return Ok(());
-                }
-            } else if plans.len() != 1 || plans.first().copied() != selected_plan {
-                return Ok(());
-            }
-            let event = scoped.tokens;
-            let hour = scoped.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS;
-            let work_class = scoped.work_class.unwrap_or_else(|| "unlabelled".into());
-            // Rates belong to the exact producer/provider/model line. A different
-            // producer's coverage must not hide a missing line in this snapshot.
-            let resolution = stored_rates
-                .get(event.producer.as_str())
-                .and_then(|providers| providers.get(event.provider.as_str()))
-                .and_then(|models| models.get(&event.model.as_deref()))
-                .copied()
-                .flatten();
-            let class = hours
-                .get_mut(&hour)
-                .expect("aligned hour")
-                .entry(event.producer.clone())
-                .or_default()
-                .entry(work_class)
-                .or_default();
-            value_event(
-                &valuation_rules,
-                resolution,
-                &event,
-                &mut class.lines,
-                &mut class.unpriced,
-                &mut class.tokens,
-            )
-        },
-    )?;
-    let hours: Vec<Value> = hours.into_iter().map(|(hour, producers)| -> Result<_, MultiplierError> {
-        let producers: BTreeMap<_, _> = producers.into_iter().map(|(producer, classes)| -> Result<_, MultiplierError> {
-            let mut events = 0_u64;
-            let mut nanos = 0_i64;
-            let mut unpriced = 0_i64;
-            let classes: BTreeMap<_, _> = classes.into_iter().map(|(name, class)| -> Result<_, MultiplierError> {
-                let class_events = class.lines.values().try_fold(0_u64, |sum, line|
-                    sum.checked_add(line.events).ok_or(MoneyError::OutOfRange))?;
-                let class_nanos = class.lines.values().try_fold(0_i64, |sum, line|
-                    sum.checked_add(round_nano_num(line.numerator)?).ok_or(MoneyError::OutOfRange))?;
-                events = events.checked_add(class_events).ok_or(MoneyError::OutOfRange)?;
-                nanos = nanos.checked_add(class_nanos).ok_or(MoneyError::OutOfRange)?;
-                unpriced = class.unpriced.values().try_fold(unpriced, |sum, (tokens, _)|
-                    sum.checked_add(*tokens).ok_or(MoneyError::OutOfRange))?;
-                Ok((name, json!({"events": class_events, "list_nanos": class_nanos, "estimated_points": points(class_nanos)})))
-            }).collect::<Result<_, _>>()?;
-            Ok((producer, json!({"events": events, "list_nanos": nanos, "estimated_points": points(nanos), "unpriced_tokens": unpriced, "by_work_class": classes})))
-        }).collect::<Result<_, _>>()?;
-        Ok(json!({"hour_start_ms": hour, "producers": producers}))
-    }).collect::<Result<_, _>>()?;
-    Ok(
-        json!({"quota_provider": request.quota_provider, "from_ms": from, "to_ms": to,
-        "basis": "pro_rata_list_value", "routing_eligible": true, "plan": selected_plan, "per_point_nanos": per_point_nanos,
-        "observation_id": head.observation_id, "observation_day": head.observation_day, "undated_events": undated_events, "hours": hours}),
-    )
-}
-
-const JSON_COLUMNS: [&str; 12] = [
+const JSON_COLUMNS: [&str; 14] = [
     "eligibility_reasons",
     "unconfigured_accounts",
     "source_backlog",
@@ -2919,6 +1670,8 @@ const JSON_COLUMNS: [&str; 12] = [
     "plan_prices",
     "api_twins",
     "reasoning_billed_as_output",
+    "pool_models",
+    "pool_member_models",
 ];
 
 pub fn multiplier_report(
@@ -2934,94 +1687,120 @@ pub fn multiplier_report(
             ),
         });
     }
-    // A head is the row nothing supersedes. `supersedes IS NULL` would select
-    // each day's original instead, which is exactly the row a correction
-    // replaced.
-    const HEADS: &str = "WITH head AS (
-        SELECT o.* FROM multiplier_observation o
-        WHERE NOT EXISTS (SELECT 1 FROM multiplier_observation child
-                           WHERE child.supersedes = o.observation_id))";
-    // A pooled legacy head is only a fallback until that provider has any
-    // plan-specific observation. The history below still retains every head.
     let mut latest = observation_rows(
         conn,
         &format!(
-            "{HEADS}
-             SELECT * FROM head h
-             WHERE h.observation_id = (
-                 SELECT l.observation_id FROM head l
-                  WHERE l.quota_provider = h.quota_provider
-                    AND l.plan IS h.plan
-                 ORDER BY l.observation_day DESC, l.observation_id DESC LIMIT 1)
-               AND (h.plan IS NOT NULL OR NOT EXISTS (
-                   SELECT 1 FROM multiplier_observation p
-                   WHERE p.quota_provider = h.quota_provider AND p.plan IS NOT NULL))
-             ORDER BY h.quota_provider, h.plan"
+            "WITH newest AS (
+                 SELECT quota_provider, MAX(observation_day) AS day
+                 FROM multiplier_provider_day GROUP BY quota_provider)
+             SELECT o.* FROM newest n JOIN multiplier_observation o
+               ON o.quota_provider=n.quota_provider AND o.observation_day=n.day
+             WHERE o.pool_scope IS NOT NULL AND {UNREPLACED} AND {UNRETIRED}
+             ORDER BY o.quota_provider, o.plan, o.window_pool_key"
         ),
         &[],
     )?;
-    // Read the numbers directly instead of passing them through SQLite's JSON
-    // formatting, which can shorten a REAL and change the served value.
-    let mut eligible_statement = conn.prepare(&format!(
-        "{HEADS}
-         SELECT h.quota_provider, h.plan, h.observation_day, h.interval_end_ms,
-                h.multiplier, h.fee_multiplier
-         FROM head h
-         WHERE h.routing_eligible = 1
-           AND h.observation_id = (
-               SELECT e.observation_id FROM head e
-               WHERE e.quota_provider = h.quota_provider
-                 AND e.plan IS h.plan
-                 AND e.routing_eligible = 1
-               ORDER BY e.observation_day DESC, e.observation_id DESC LIMIT 1)"
-    ))?;
-    let eligible = eligible_statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, Option<f64>>(4)?,
-            row.get::<_, Option<f64>>(5)?,
-        ))
-    })?;
-    let mut last_eligible = BTreeMap::new();
-    for row in eligible {
-        let (provider, plan, day, interval_end_ms, multiplier, fee_multiplier) = row?;
-        if let Some(plan) = plan {
-            last_eligible.insert(
-                (provider, plan),
-                json!({
-                    "day": day,
-                    "interval_end_ms": interval_end_ms,
-                    "multiplier": multiplier,
-                    "fee_multiplier": fee_multiplier,
-                }),
-            );
-        }
-    }
-    for row in &mut latest {
-        let provider = row["quota_provider"].as_str().unwrap_or_default();
-        let Some(plan) = row["plan"].as_str() else {
-            continue;
-        };
-        if let Some(value) = last_eligible.get(&(provider.to_owned(), plan.to_owned())) {
-            row.as_object_mut()
-                .expect("observation row is an object")
-                .insert("last_eligible".into(), value.clone());
-        }
-    }
-    let series = observation_rows(
+    attach_last_eligible(conn, &mut latest)?;
+    let mut series = observation_rows(
         conn,
         &format!(
-            "{HEADS}
-             SELECT * FROM head
-             WHERE interval_end_ms >= ?1 AND interval_end_ms < ?2
-             ORDER BY interval_end_ms, quota_provider"
+            "SELECT o.* FROM multiplier_observation o
+             WHERE o.interval_end_ms >= ?1 AND o.interval_end_ms < ?2
+               AND {UNREPLACED} AND {UNRETIRED}
+             ORDER BY o.interval_end_ms, o.quota_provider, o.plan, o.window_pool_key"
         ),
         &[request.from_ms, request.to_ms],
     )?;
+    keep_legacy_only_keys(conn, &mut series)?;
     Ok(json!({"latest": latest, "series": series}))
+}
+
+const UNREPLACED: &str = "NOT EXISTS (
+    SELECT 1 FROM multiplier_observation child WHERE child.supersedes=o.observation_id)";
+const UNRETIRED: &str = "NOT EXISTS (
+    SELECT 1 FROM json_each(o.eligibility_reasons) WHERE value='pool_retired')";
+
+fn report_pool_key(row: &Value) -> Option<(&str, &str, &str)> {
+    Some((
+        row["quota_provider"].as_str()?,
+        row["plan"].as_str()?,
+        row["pool_id"].as_str()?,
+    ))
+}
+
+fn attach_last_eligible(conn: &Connection, latest: &mut [Value]) -> Result<(), MultiplierError> {
+    if latest.is_empty() {
+        return Ok(());
+    }
+    // Preserve SQLite REALs exactly and match pool identity, not the stored
+    // key spelling. Eligible legacy heads may seed the same pool's fallback.
+    let mut statement = conn.prepare(&format!(
+        "SELECT o.window_pool_key, o.observation_day, o.interval_end_ms,
+                o.multiplier, o.fee_multiplier
+         FROM multiplier_observation o
+         WHERE o.quota_provider=?1 AND o.plan=?2 AND o.routing_eligible=1
+           AND {UNREPLACED} AND {UNRETIRED}
+         ORDER BY o.observation_day DESC, o.observation_id DESC"
+    ))?;
+    for row in latest {
+        let (provider, plan, pool) = report_pool_key(row).ok_or_else(|| {
+            MultiplierError::Encode("scoped head has no plan or pool identity".into())
+        })?;
+        let mut candidates = statement.query(params![provider, plan])?;
+        while let Some(candidate) = candidates.next()? {
+            let key: String = candidate.get(0)?;
+            if crate::capacity::pool_identity(&key) == Some(pool) {
+                let eligible = json!({
+                    "day": candidate.get::<_, String>(1)?,
+                    "interval_end_ms": candidate.get::<_, i64>(2)?,
+                    "multiplier": candidate.get::<_, Option<f64>>(3)?,
+                    "fee_multiplier": candidate.get::<_, Option<f64>>(4)?,
+                });
+                row.as_object_mut()
+                    .expect("observation row is an object")
+                    .insert("last_eligible".into(), eligible);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn keep_legacy_only_keys(
+    conn: &Connection,
+    series: &mut Vec<Value>,
+) -> Result<(), MultiplierError> {
+    if !series
+        .iter()
+        .any(|row| row["pool_scope"].is_null() && report_pool_key(row).is_some())
+    {
+        return Ok(());
+    }
+    // A key with scoped history no longer shows legacy measurements, even
+    // when its scoped rows are outside the range or have been retired.
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT quota_provider, plan, window_pool_key
+         FROM multiplier_observation WHERE pool_scope IS NOT NULL",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut scoped = BTreeSet::new();
+    while let Some(row) = rows.next()? {
+        let key: String = row.get(2)?;
+        if let Some(pool) = crate::capacity::pool_identity(&key) {
+            scoped.insert((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                pool.to_owned(),
+            ));
+        }
+    }
+    series.retain(|row| {
+        !row["pool_scope"].is_null()
+            || report_pool_key(row).is_none_or(|(provider, plan, pool)| {
+                !scoped.contains(&(provider.to_owned(), plan.to_owned(), pool.to_owned()))
+            })
+    });
+    Ok(())
 }
 
 fn observation_rows(
@@ -3067,6 +1846,10 @@ fn observation_rows(
             };
             object.insert(name.clone(), value);
         }
+        let pool_id = object["window_pool_key"]
+            .as_str()
+            .and_then(crate::capacity::pool_identity);
+        object.insert("pool_id".into(), json!(pool_id));
         let unknown_quantity_measurements = object
             .get("unpriced_tokens")
             .and_then(Value::as_array)
@@ -3099,15 +1882,15 @@ fn observation_rows(
 
 #[cfg(test)]
 mod tests {
-    include!("multiplier/legacy_valuer_tests.rs");
     include!("multiplier/shared_valuer_tests.rs");
     include!("multiplier/rate_era_tests.rs");
     include!("multiplier/cache_write_billed_as_tests.rs");
     include!("fusiform_plan_price_tests.rs");
     include!("multiplier/v2_tests.rs");
+    include!("multiplier/pace_tests.rs");
     include!("multiplier/context_tier_tests.rs");
     include!("multiplier/history_scaling_tests.rs");
-    include!("multiplier/membership_tests.rs");
+    include!("multiplier/lineage_tests.rs");
     use super::*;
     use crate::test_support::conn;
 
@@ -3147,203 +1930,15 @@ mod tests {
         );
     }
 
-    #[derive(Clone, Serialize)]
-    struct FixtureConfig {
-        #[serde(flatten)]
-        config: super::MultiplierConfig,
-        #[serde(skip)]
-        quota_providers: BTreeMap<String, ResolvedQuotaProvider>,
-    }
-
-    impl std::ops::Deref for FixtureConfig {
-        type Target = super::MultiplierConfig;
-        fn deref(&self) -> &Self::Target {
-            &self.config
-        }
-    }
-    impl std::ops::DerefMut for FixtureConfig {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.config
-        }
-    }
-    impl FixtureConfig {
-        fn declarations(&self) -> super::MultiplierConfig {
-            let mut config = self.config.clone();
-            config.quota_providers = self
-                .quota_providers
-                .iter()
-                .map(|(id, provider)| {
-                    (
-                        id.clone(),
-                        super::QuotaProviderConfig {
-                            window: provider.window.clone(),
-                            scope: provider.scope.clone(),
-                        },
-                    )
-                })
-                .collect();
-            config
-        }
-    }
-    impl<'de> Deserialize<'de> for FixtureConfig {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            #[derive(Deserialize)]
-            struct Legacy {
-                api_twins: BTreeMap<String, String>,
-                plan_price_overrides: BTreeMap<String, PriceOverride>,
-                quota_providers: BTreeMap<String, ResolvedQuotaProvider>,
-            }
-            let legacy = Legacy::deserialize(deserializer)?;
-            let mut fixture = Self {
-                config: super::MultiplierConfig {
-                    api_twins: legacy.api_twins,
-                    plan_price_overrides: legacy.plan_price_overrides,
-                    quota_providers: BTreeMap::new(),
-                },
-                quota_providers: legacy.quota_providers,
-            };
-            fixture.config = fixture.declarations();
-            Ok(fixture)
-        }
-    }
-
-    fn source_in_scope(provider: &ResolvedQuotaProvider, source: &str) -> bool {
-        super::source_in_scope(
-            &QuotaProviderConfig {
-                window: provider.window.clone(),
-                scope: provider.scope.clone(),
-            },
-            source,
-        )
-    }
-
-    fn resolve_plans(
-        source: Option<&dyn PlanPriceSource>,
-        config: &super::MultiplierConfig,
-        provider: &ResolvedQuotaProvider,
-        at: i64,
-    ) -> Result<BTreeMap<String, PlanPriceUsed>, MultiplierError> {
-        let mut provider = provider.clone();
-        provider.credential_keyed = !provider.credentials.is_empty();
-        super::resolve_plans(source, config, &provider, at)
-    }
-
-    // Existing valuation fixtures describe membership compactly. Install that
-    // input as history before exercising the same planner production uses.
-    fn plan_observation(
-        conn: &Connection,
-        config: &FixtureConfig,
-        provider: &str,
-        start: i64,
-        end: i64,
-    ) -> Result<ObservationPlan, MultiplierError> {
-        let tx = conn.unchecked_transaction()?;
-        for provider in config.quota_providers.values() {
-            for (credential_keyed, members) in
-                [(false, &provider.accounts), (true, &provider.credentials)]
-            {
-                for (id, member) in members {
-                    let (provider, tier) = member.plan.split_once('/').unwrap();
-                    crate::vault_plan::append_in_tx(
-                        &tx,
-                        &crate::vault_plan::VaultPlan {
-                            credential_id: if credential_keyed {
-                                id.clone()
-                            } else {
-                                format!("fixture:{id}")
-                            },
-                            provider: Some(provider.into()),
-                            account_id: (!credential_keyed).then(|| id.clone()),
-                            plan_tier: Some(tier.into()),
-                            plan_key: Some(member.plan.clone()),
-                            source: "config".into(),
-                            effective_from_ms: 0,
-                            observed_at_ms: 0,
-                        },
-                    )?;
-                }
-            }
-        }
-        tx.commit()?;
-        super::plan_observation(conn, &config.declarations(), provider, start, end)
-    }
-
     const DAY: i64 = 86_400_000;
-    /// $200.00 a month, in nanos.
-    const PLAN_200: i64 = 200_000_000_000;
-    /// $10 per million tokens, in nano-USD per million.
     const TEN_PER_M: i64 = 10_000_000_000;
-
-    fn window() -> WindowSelector {
-        WindowSelector {
-            pool_key: "primary".into(),
-            window_minutes: 10080,
-        }
-    }
-
-    fn rule(producer: &str, provider: &str, charge_basis: Option<&str>) -> ScopeRule {
-        ScopeRule {
-            producer: producer.into(),
-            provider: provider.into(),
-            charge_basis: charge_basis.map(str::to_string),
-            model_prefix: None,
-        }
-    }
-
-    fn config(scope: Vec<ScopeRule>) -> FixtureConfig {
-        let mut config = FixtureConfig {
-            config: super::MultiplierConfig {
-                api_twins: BTreeMap::from([("openai-codex".to_string(), "openai".to_string())]),
-                plan_price_overrides: BTreeMap::new(),
-                quota_providers: BTreeMap::new(),
-            },
-            quota_providers: BTreeMap::from([(
-                "codex".to_string(),
-                ResolvedQuotaProvider {
-                    credential_keyed: false,
-                    unknown_reasons: BTreeMap::new(),
-                    membership_reason: None,
-                    credentials: BTreeMap::new(),
-                    window: window(),
-                    scope,
-                    accounts: BTreeMap::from([(
-                        "acct".to_string(),
-                        AccountPlan {
-                            plan: "openai/pro_20x".into(),
-                        },
-                    )]),
-                },
-            )]),
-        };
-        config.config = config.declarations();
-        config
-    }
-
-    #[test]
-    fn unrecognized_scope_charge_basis_error_lists_the_accepted_values() {
-        let error = config(vec![rule("pi", "openai", Some("metered"))])
-            .validate()
-            .unwrap_err();
-        assert!(
-            error.ends_with(
-                "scope charge_basis 'metered' is not one of \
-                 [\"metered_api\", \"subscription_included\", \"unknown\"]"
-            ),
-            "{error}"
-        );
-        for accepted in ["metered_api", "subscription_included", "unknown"] {
-            config(vec![rule("pi", "openai", Some(accepted))])
-                .validate()
-                .unwrap();
-        }
-    }
 
     /// One reading, stored in arrival order. `at_ms` is its `fetched_at`.
     fn reading(conn: &Connection, account: &str, at_ms: i64, used: f64, raw: Option<f64>) {
         conn.execute(
             "INSERT INTO window_sample (provider, account_ref, pool_key, fetched_at_instant,
-                 used_percent, raw_used_percent, resets_at, window_minutes, source)
-             VALUES ('codex', ?1, 'primary', ?2, ?3, ?4, '2026-09-30T00:00:00Z', 10080, 'vault')",
+                 used_percent, raw_used_percent, resets_at, window_minutes, source, model_scope)
+             VALUES ('codex', ?1, 'primary', ?2, ?3, ?4, '2026-09-30T00:00:00Z', 10080, 'vault', 'all')",
             params![account, at_ms * NANOS_PER_MS, used, raw],
         )
         .unwrap();
@@ -3366,6 +1961,59 @@ mod tests {
                  occurred_at_ms, recorded_at_ms, provider, model, charge_basis)
              VALUES (?1, ?2, 'lineage', ?1, ?3, ?3, ?4, ?5, ?6)",
             params![id, producer, at_ms, provider, model, basis],
+        )
+        .unwrap();
+        for (role, source, quantity) in measurements {
+            conn.execute(
+                "INSERT INTO measurement (event_key, role, unit, kind, source, quantity_units,
+                     quantity_exponent) VALUES ((SELECT event_key FROM usage_event WHERE event_id=?1), ?2, 'token', 'billed', ?3, ?4, 0)",
+                params![id, role, source, quantity],
+            )
+            .unwrap();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn account_event(
+        conn: &Connection,
+        id: &str,
+        producer: &str,
+        provider: &str,
+        model: &str,
+        basis: &str,
+        at_ms: i64,
+        measurements: &[(&str, &str, i64)],
+    ) {
+        account_event_in_class(
+            conn,
+            id,
+            producer,
+            provider,
+            model,
+            basis,
+            at_ms,
+            None,
+            measurements,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn account_event_in_class(
+        conn: &Connection,
+        id: &str,
+        producer: &str,
+        provider: &str,
+        model: &str,
+        basis: &str,
+        at_ms: i64,
+        work_class: Option<&str>,
+        measurements: &[(&str, &str, i64)],
+    ) {
+        conn.execute(
+            "INSERT INTO usage_event (event_id, producer, producer_lineage, producer_ref,
+                 occurred_at_ms, recorded_at_ms, provider, model, charge_basis, account_ref, work_class)
+             VALUES (?1, ?2, 'lineage', ?1, ?3, ?3, ?4, ?5, ?6, 'acct', ?7)",
+            params![id, producer, at_ms, provider, model, basis, work_class],
         )
         .unwrap();
         for (role, source, quantity) in measurements {
@@ -3423,200 +2071,137 @@ mod tests {
         }
     }
 
-    fn priced_plan() -> BTreeMap<String, PlanPriceUsed> {
-        BTreeMap::from([(
-            "acct".to_string(),
-            PlanPriceUsed {
-                account_ref: "acct".into(),
-                credential_ref: None,
-                plan: "openai/pro_20x".into(),
-                source: Some("fusiform".into()),
-                monthly_nanos: Some(PLAN_200),
-                review_by_ms: Some(i64::MAX),
-                plan_price_overdue: false,
-                source_ref: None,
-                unpriceable_reason: None,
-                refusal_text: None,
-            },
-        )])
+    fn fixture_pool_schema_at_genesis(conn: &Connection) {
+        conn.execute_batch("CREATE TABLE cortexkit_schema_version(namespace TEXT, version INTEGER, applied_at_unix INTEGER);
+            INSERT INTO cortexkit_schema_version VALUES ('astrocyte',68,0);").unwrap();
     }
 
-    fn observe(
-        conn: &Connection,
-        config: &FixtureConfig,
-        start: i64,
-        end: i64,
-        rates: &ResolvedRates,
-    ) -> Observation {
-        let plan = plan_observation(conn, config, "codex", start, end).unwrap();
-        compute_observation(conn, config, &plan, rates, &priced_plan(), end).unwrap()
+    fn test_plan_price(account: &str, plan: &str, monthly_nanos: Option<i64>) -> PlanPriceUsed {
+        PlanPriceUsed {
+            account_ref: account.into(),
+            credential_ref: None,
+            plan: plan.into(),
+            source: None,
+            monthly_nanos,
+            review_by_ms: None,
+            plan_price_overdue: false,
+            source_ref: None,
+            unpriceable_reason: None,
+            refusal_text: None,
+        }
     }
 
-    fn compute_observation(
-        conn: &Connection,
-        config: &MultiplierConfig,
-        plan: &ObservationPlan,
-        rates: &ResolvedRates,
-        prices: &BTreeMap<String, PlanPriceUsed>,
-        at_ms: i64,
-    ) -> Result<Observation, MultiplierError> {
-        // Valuation fixtures often append events after constructing quota
-        // inputs. Capture those fixtures here; production never refreshes a plan.
-        let mut plan = plan.clone();
-        plan.events.clear();
-        for_scoped_events(
-            conn,
-            &plan.provider.scope,
-            plan.interval_start_ms,
-            plan.interval_end_ms,
-            |event| {
-                plan.events.push(event);
-                Ok(())
-            },
-        )?;
-        let mut row = super::compute_observation(
-            conn,
-            config,
-            &plan,
-            rates,
-            prices,
-            at_ms,
-            &["openai".into()],
-        )?;
-        // These fixtures test pace arithmetic, not the calibration gate.
-        row.plan = Some("openai/pro_20x".into());
-        row.routing_eligible = true;
-        row.eligibility_reasons.clear();
-        Ok(row)
+    fn measure_fixture_quota(
+        prices: &[(&str, f64, i64)],
+        span: (i64, i64),
+    ) -> Result<measurement::QuotaTotals, MultiplierError> {
+        let rows: Vec<_> = prices
+            .iter()
+            .map(|(account, delta, monthly)| {
+                let mut counter = clean::measure_run(account, [], 0, span);
+                counter.delta_percent = *delta;
+                (
+                    counter,
+                    test_plan_price(account, "openai/pro_20x", Some(*monthly)),
+                )
+            })
+            .collect();
+        measurement::measure_quota(
+            MINUTES_PER_MONTH,
+            Some(span),
+            rows.iter().map(|(counter, price)| measurement::CounterFee {
+                counter,
+                identity_field: "account_ref",
+                price: Some(price),
+                segments: 1,
+            }),
+        )
+    }
+
+    #[test]
+    fn money_subscription_and_fee_keep_large_integer_nanos_exact() {
+        let monthly = 9_007_199_254_740_993;
+        let quota = measure_fixture_quota(&[("acct", 100.0, monthly)], (0, MS_PER_MONTH)).unwrap();
+        assert_eq!(quota.subscription_nanos, monthly);
+        assert_eq!(quota.fee_paid_nanos, monthly);
+        assert_eq!(quota.accounts_included[0]["subscription_nanos"], monthly);
+    }
+
+    #[test]
+    fn money_subscription_and_fee_round_exact_ties_to_even() {
+        let quota = measure_fixture_quota(&[("acct", 50.0, 1)], (0, MS_PER_MONTH / 2)).unwrap();
+        assert_eq!(quota.subscription_nanos, 0);
+        assert_eq!(quota.fee_paid_nanos, 0);
+    }
+
+    #[test]
+    fn money_account_parts_sum_to_the_row_with_deterministic_remainders() {
+        for deltas in [
+            [50.0, 50.0, 50.0],
+            [10.0, 60.0, 90.0],
+            [0.0, 0.0, 0.0],
+            [12.5, 12.5, 25.0],
+        ] {
+            let quota = measure_fixture_quota(
+                &[
+                    ("c", deltas[0], 1),
+                    ("b", deltas[1], 1),
+                    ("a", deltas[2], 1),
+                ],
+                (0, MS_PER_MONTH),
+            )
+            .unwrap();
+            let parts: BTreeMap<_, _> = quota
+                .accounts_included
+                .iter()
+                .map(|a| {
+                    (
+                        a["account_ref"].as_str().unwrap(),
+                        a["subscription_nanos"].as_i64().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                parts.values().sum::<i64>(),
+                quota.subscription_nanos,
+                "deltas {deltas:?}"
+            );
+            if deltas.iter().all(|delta| (*delta - 50.0).abs() < 1e-9) {
+                assert_eq!(quota.subscription_nanos, 2);
+                assert_eq!(parts, BTreeMap::from([("a", 1), ("b", 1), ("c", 0)]));
+            }
+        }
+    }
+
+    #[test]
+    fn money_denominator_overflow_is_refused() {
+        assert!(matches!(
+            measure_fixture_quota(
+                &[("a", 100.0, i64::MAX), ("b", 100.0, i64::MAX)],
+                (0, MS_PER_MONTH)
+            ),
+            Err(MultiplierError::ArithmeticOutOfRange)
+        ));
     }
 
     fn delta(conn: &Connection, start: i64, end: i64) -> AccountDelta {
-        account_delta(conn, "codex", "acct", &window(), start, end).unwrap()
-    }
-
-    #[test]
-    fn scoped_stream_keeps_half_open_bounds_and_complete_event_groups() {
-        let conn = conn();
-        let scope = vec![
-            rule("codex", "openai-codex", Some("subscription_included")),
-            rule("pi", "openai", None),
-        ];
-        for (id, producer, provider, basis, at) in [
-            ("a", "codex", "openai-codex", "subscription_included", 10),
-            ("b", "pi", "openai", "metered_api", 19),
-            ("before", "pi", "openai", "metered_api", 9),
-            ("end", "pi", "openai", "metered_api", 20),
-            ("wrong-basis", "codex", "openai-codex", "metered_api", 11),
-            ("wrong-provider", "pi", "anthropic", "metered_api", 11),
-        ] {
-            event(
-                &conn,
-                id,
-                producer,
-                provider,
-                "m",
-                basis,
-                at,
-                &[
-                    ("input", "usage.input", 100),
-                    ("output", "usage.output", 50),
-                ],
-            );
-        }
-        let mut seen = Vec::new();
-        for_scoped_events(&conn, &scope, 10, 20, |mut event| {
-            event.tokens.roles.sort_by(|a, b| a.0.cmp(&b.0));
-            seen.push((event.id, event.occurred_at_ms, event.tokens.roles));
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(seen.len(), 2);
-        assert_eq!((seen[0].0, seen[0].1), (1, 10));
-        assert_eq!((seen[1].0, seen[1].1), (2, 19));
-        for (_, _, roles) in seen {
-            assert_eq!(
-                roles,
-                vec![
-                    (
-                        "input".into(),
-                        "token".into(),
-                        "usage.input".into(),
-                        Some(100),
-                        Some(0)
-                    ),
-                    (
-                        "output".into(),
-                        "token".into(),
-                        "usage.output".into(),
-                        Some(50),
-                        Some(0)
-                    )
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn model_prefix_excludes_third_party_tokens_and_null_keeps_them() {
-        let conn = conn();
-        reading(&conn, "acct", 10, 0.0, None);
-        reading(&conn, "acct", 90, 50.0, None);
-        let gemini = "antigravity-gemini-3.8-flash";
-        let claude = "antigravity-claude-sonnet-5-5";
-        let uppercase = "ANTIGRAVITY-GEMINI-3.8-FLASH";
-        for (id, model, at, tokens) in [
-            ("gemini", gemini, 20, 1_000),
-            ("claude", claude, 20, 2_000),
-            ("uppercase", uppercase, 20, 4_000),
-            ("gemini-before", gemini, 5, 100),
-            ("claude-before", claude, 5, 200),
-        ] {
-            event(
-                &conn,
-                id,
-                "opencode",
-                "google",
-                model,
-                "unknown",
-                at,
-                &[("input", "usage.input", tokens)],
-            );
-        }
-        let rates = rates_for(
-            &[
-                ("google", gemini),
-                ("google", claude),
-                ("google", uppercase),
-            ],
-            TEN_PER_M,
-            None,
-        );
-        let mut config = config(vec![rule("opencode", "google", None)]);
-        let all = observe(&conn, &config, 0, 100, &rates);
-        assert_eq!(all.tokens.input, 7_000);
-        assert_eq!(all.api_nanos, 70_000_000);
-        assert_eq!(all.tokens_outside_quota_coverage, 300);
-        config.quota_providers.get_mut("codex").unwrap().scope[0].model_prefix =
-            Some("antigravity-gemini-".into());
-        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
-        assert_eq!(
-            catalog_models(&config, &plan),
-            BTreeSet::from([("google".into(), gemini.into())])
-        );
-        let filtered = observe(&conn, &config, 0, 100, &rates);
-        assert_eq!(filtered.tokens.input, 1_000);
-        assert_eq!(filtered.api_nanos, 10_000_000);
-        assert_eq!(filtered.tokens_outside_quota_coverage, 100);
-        assert_eq!(filtered.api_nanos_by_model.len(), 1);
-        assert_eq!(
-            filtered.api_nanos_by_model[0].model.as_deref(),
-            Some(gemini)
-        );
-        config.quota_providers.get_mut("codex").unwrap().scope[0].model_prefix =
-            Some("antigravity-gemini-%".into());
-        let literal = observe(&conn, &config, 0, 100, &rates);
-        assert_eq!(literal.tokens.input, 0);
-        assert_eq!(literal.api_nanos, 0);
+        fixture_vault_plan(conn, "openai/pro_20x");
+        fixture_pool_schema_at_genesis(conn);
+        let capture = pools::capture_pool_readings(conn, "codex", start, end).unwrap();
+        let planned = pools::plan_pools(&capture, &[]);
+        let run = &planned[0].reading_runs[0];
+        clean::measure_run(
+            "acct",
+            run.readings.iter().map(|r| {
+                (
+                    r.fetched_at_instant_ns,
+                    r.used_percent,
+                    r.resets_at.as_deref(),
+                )
+            }),
+            clean::reset_tolerance_ms(planned[0].window_minutes),
+            (start, end),
+        )
     }
 
     #[test]
@@ -3637,36 +2222,24 @@ mod tests {
         }
     }
 
-    fn arithmetic_fixture(conn: &Connection) -> (FixtureConfig, ObservationPlan) {
-        let config = config(vec![rule("codex", "openai-codex", None)]);
-        reading(conn, "acct", 10, 0.0, None);
-        reading(conn, "acct", 90, 50.0, None);
-        let plan = plan_observation(conn, &config, "codex", 0, 100).unwrap();
-        (config, plan)
-    }
-
     #[test]
     fn money_api_half_even_and_signed_rates_reach_the_observation() {
         for (rate, expected) in [(500_000, 0), (2_500_000, 2), (-1_000_000, -1)] {
             let conn = conn();
-            let (config, plan) = arithmetic_fixture(&conn);
             event(
                 &conn,
                 "e",
                 "codex",
-                "openai-codex",
+                "openai",
                 "m",
                 "subscription_included",
                 50,
                 &[("input", "usage.input", 1)],
             );
-            let observation = compute_observation(
-                &conn,
-                &config,
-                &plan,
+            let observation = measured_usage(
+                &test_calls(&conn, 0, 100),
+                (0, 100),
                 &rates_for(&[("openai", "m")], rate, None),
-                &priced_plan(),
-                100,
             )
             .unwrap();
             assert_eq!(observation.api_nanos, expected, "rate {rate}");
@@ -3674,22 +2247,44 @@ mod tests {
         }
     }
 
-    fn record_or_fail(
-        conn: &mut Connection,
-        config: &MultiplierConfig,
-        plan: &ObservationPlan,
-        rates: &ResolvedRates,
-        prices: &BTreeMap<String, PlanPriceUsed>,
-    ) -> Option<String> {
-        match compute_observation(conn, config, plan, rates, prices, 100) {
-            Ok(observation) => {
-                let tx = conn.transaction().unwrap();
-                insert_observation_in_tx(&tx, &observation).unwrap();
-                tx.commit().unwrap();
-                None
-            }
-            Err(error) => Some(error.code().into()),
+    #[test]
+    fn money_outside_coverage_counts_the_same_disjoint_tokens_including_lifetime_writes() {
+        let conn = conn();
+        for (id, at) in [("inside", 50), ("outside", 95)] {
+            event(
+                &conn,
+                id,
+                "broca",
+                "openai",
+                "m",
+                "subscription_included",
+                at,
+                &[
+                    ("input", "usage.input", 10),
+                    ("output", "usage.output_tokens", 7),
+                    ("reasoning", "usage.reasoning", 3),
+                ],
+            );
+            conn.execute("INSERT INTO measurement (event_key, role, unit, kind, source, quantity_units, quantity_exponent)
+                VALUES ((SELECT event_key FROM usage_event WHERE event_id=?1), 'cache_write', 'token_cache_5m', 'billed', 'usage.cache_write', 5, 0)", [id]).unwrap();
         }
+        let observation = measured_usage(
+            &test_calls(&conn, 0, 100),
+            (10, 90),
+            &rates_for(&[("openai", "m")], 1_000_000, None),
+        )
+        .unwrap();
+        assert_eq!(
+            observation.tokens,
+            RoleTokens {
+                input: 10,
+                cache_write: 5,
+                output: 4,
+                reasoning: 3,
+                ..RoleTokens::default()
+            }
+        );
+        assert_eq!(observation.tokens_outside_quota_coverage, 22);
     }
 
     fn assert_failed_day(conn: &Connection, reason: Option<String>) {
@@ -3707,33 +2302,31 @@ mod tests {
 
     #[test]
     fn money_api_overflow_does_not_record_a_capped_day() {
-        let mut conn = conn();
-        let (config, plan) = arithmetic_fixture(&conn);
+        let conn = conn();
         event(
             &conn,
             "e",
             "codex",
-            "openai-codex",
+            "openai",
             "m",
             "subscription_included",
             50,
             &[("input", "usage.input", i64::MAX)],
         );
-        let reason = record_or_fail(
-            &mut conn,
-            &config,
-            &plan,
+        let reason = measured_usage(
+            &test_calls(&conn, 0, 100),
+            (0, 100),
             &rates_for(&[("openai", "m")], i64::MAX, None),
-            &priced_plan(),
-        );
+        )
+        .err()
+        .map(|error| error.code().to_owned());
         assert_failed_day(&conn, reason);
     }
 
     #[test]
     fn money_token_overflow_does_not_record_a_wrapped_day() {
         for across_events in [false, true] {
-            let mut conn = conn();
-            let (config, plan) = arithmetic_fixture(&conn);
+            let conn = conn();
             let mut measurements = vec![("input", "usage.input", i64::MAX)];
             if !across_events {
                 measurements.push(("output", "usage.output", 1));
@@ -3742,7 +2335,7 @@ mod tests {
                 &conn,
                 "e",
                 "codex",
-                "openai-codex",
+                "openai",
                 "m",
                 "subscription_included",
                 50,
@@ -3753,193 +2346,32 @@ mod tests {
                     &conn,
                     "e2",
                     "codex",
-                    "openai-codex",
+                    "openai",
                     "m",
                     "subscription_included",
                     50,
                     &[("input", "usage.input", 1)],
                 );
             }
-            let reason = record_or_fail(
-                &mut conn,
-                &config,
-                &plan,
+            let reason = measured_usage(
+                &test_calls(&conn, 0, 100),
+                (0, 100),
                 &rates_for(&[("openai", "m")], 0, None),
-                &priced_plan(),
-            );
+            )
+            .err()
+            .map(|error| error.code().to_owned());
             assert_failed_day(&conn, reason);
         }
     }
 
     #[test]
-    fn money_subscription_and_fee_keep_large_integer_nanos_exact() {
-        let conn = conn();
-        let (config, mut plan) = arithmetic_fixture(&conn);
-        plan.provider.window.window_minutes = MINUTES_PER_MONTH;
-        plan.accounts[0].delta_percent = 100.0;
-        plan.token_interval_ms = Some((0, MS_PER_MONTH));
-        let mut prices = priced_plan();
-        let monthly = 9_007_199_254_740_993;
-        prices.get_mut("acct").unwrap().monthly_nanos = Some(monthly);
-        let observation = compute_observation(
-            &conn,
-            &config,
-            &plan,
-            &ResolvedRates::default(),
-            &prices,
-            100,
-        )
-        .unwrap();
-        assert_eq!(observation.subscription_nanos, monthly);
-        assert_eq!(observation.fee_paid_nanos, monthly);
-        assert_eq!(
-            observation.accounts_included[0]["subscription_nanos"],
-            monthly
-        );
-    }
-
-    #[test]
-    fn money_subscription_and_fee_round_exact_ties_to_even() {
-        let conn = conn();
-        let (config, mut plan) = arithmetic_fixture(&conn);
-        plan.provider.window.window_minutes = MINUTES_PER_MONTH;
-        plan.token_interval_ms = Some((0, MS_PER_MONTH / 2));
-        let mut prices = priced_plan();
-        prices.get_mut("acct").unwrap().monthly_nanos = Some(1);
-        let observation = compute_observation(
-            &conn,
-            &config,
-            &plan,
-            &ResolvedRates::default(),
-            &prices,
-            100,
-        )
-        .unwrap();
-        assert_eq!(observation.subscription_nanos, 0);
-        assert_eq!(observation.fee_paid_nanos, 0);
-    }
-
-    #[test]
-    fn money_account_parts_sum_to_the_row_with_deterministic_remainders() {
-        let conn = conn();
-        let (config, mut plan) = arithmetic_fixture(&conn);
-        plan.provider.window.window_minutes = MINUTES_PER_MONTH;
-        let account = plan.accounts[0].clone();
-        let price = priced_plan()["acct"].clone();
-        for deltas in [
-            [50.0, 50.0, 50.0],
-            [10.0, 60.0, 90.0],
-            [0.0, 0.0, 0.0],
-            [12.5, 12.5, 25.0],
-        ] {
-            let mut prices = BTreeMap::new();
-            plan.accounts = ["c", "b", "a"]
-                .into_iter()
-                .zip(deltas)
-                .map(|(id, delta)| {
-                    prices.insert(
-                        id.into(),
-                        PlanPriceUsed {
-                            account_ref: id.into(),
-                            monthly_nanos: Some(1),
-                            ..price.clone()
-                        },
-                    );
-                    AccountDelta {
-                        account_ref: id.into(),
-                        delta_percent: delta,
-                        ..account.clone()
-                    }
-                })
-                .collect();
-            let observation = compute_observation(
-                &conn,
-                &config,
-                &plan,
-                &ResolvedRates::default(),
-                &prices,
-                100,
-            )
-            .unwrap();
-            let sum: i64 = observation
-                .accounts_included
-                .iter()
-                .map(|a| a["subscription_nanos"].as_i64().unwrap())
-                .sum();
-            assert_eq!(sum, observation.subscription_nanos, "deltas {deltas:?}");
-            if deltas.iter().all(|delta| (*delta - 50.0).abs() < 1e-9) {
-                assert_eq!(observation.subscription_nanos, 2);
-                let parts: BTreeMap<_, _> = observation
-                    .accounts_included
-                    .iter()
-                    .map(|a| {
-                        (
-                            a["account_ref"].as_str().unwrap(),
-                            a["subscription_nanos"].as_i64().unwrap(),
-                        )
-                    })
-                    .collect();
-                assert_eq!(parts, BTreeMap::from([("a", 1), ("b", 1), ("c", 0)]));
-            }
-        }
-    }
-
-    #[test]
-    fn money_outside_coverage_counts_the_same_disjoint_tokens_including_lifetime_writes() {
-        let conn = conn();
-        let (mut config, mut plan) = arithmetic_fixture(&conn);
-        config.quota_providers.get_mut("codex").unwrap().scope =
-            vec![rule("broca", "openai-codex", None)];
-        plan.provider.scope = config.quota_providers["codex"].scope.clone();
-        for (id, at) in [("inside", 50), ("outside", 95)] {
-            event(
-                &conn,
-                id,
-                "broca",
-                "openai-codex",
-                "m",
-                "subscription_included",
-                at,
-                &[
-                    ("input", "usage.input", 10),
-                    ("output", "usage.output_tokens", 7),
-                    ("reasoning", "usage.reasoning", 3),
-                ],
-            );
-            conn.execute("INSERT INTO measurement (event_key, role, unit, kind, source, quantity_units, quantity_exponent)
-                VALUES ((SELECT event_key FROM usage_event WHERE event_id=?1), 'cache_write', 'token_cache_5m', 'billed', 'usage.cache_write', 5, 0)", [id]).unwrap();
-        }
-        let observation = compute_observation(
-            &conn,
-            &config,
-            &plan,
-            &rates_for(&[("openai", "m")], 1_000_000, None),
-            &priced_plan(),
-            100,
-        )
-        .unwrap();
-        assert_eq!(
-            observation.tokens,
-            RoleTokens {
-                input: 10,
-                cache_write: 5,
-                output: 4,
-                reasoning: 3,
-                ..RoleTokens::default()
-            }
-        );
-        assert_eq!(observation.tokens_outside_quota_coverage, 22);
-    }
-
-    #[test]
     fn money_whole_nano_rate_recompute_preserves_the_stored_api_value() {
         let mut conn = conn();
-        let (config, plan) = arithmetic_fixture(&conn);
         event(
             &conn,
             "e",
             "codex",
-            "openai-codex",
+            "openai",
             "m",
             "subscription_included",
             50,
@@ -3949,9 +2381,8 @@ mod tests {
                 ("reasoning", "usage.reasoning", 20),
             ],
         );
-        let rates = rates_for(&[("openai", "m")], TEN_PER_M, None);
-        let original =
-            compute_observation(&conn, &config, &plan, &rates, &priced_plan(), 100).unwrap();
+        let rates = rates_with_reasoning_as_output();
+        let original = storeable_usage(&conn, (0, 100), &rates, 100);
         assert_eq!(original.api_nanos, 1_800_000);
         let tx = conn.transaction().unwrap();
         insert_observation_in_tx(&tx, &original).unwrap();
@@ -3968,9 +2399,8 @@ mod tests {
             to_ms: 101,
         };
         let before = multiplier_report(&conn, &request).unwrap();
-        assert_eq!(before["latest"][0]["api_nanos"], 1_800_000);
-        let recomputed =
-            compute_observation(&conn, &config, &plan, &rates, &priced_plan(), 200).unwrap();
+        assert_eq!(before["series"][0]["api_nanos"], 1_800_000);
+        let recomputed = storeable_usage(&conn, (0, 100), &rates, 200);
         assert_eq!(recomputed.api_nanos, old_row.1);
         let tx = conn.transaction().unwrap();
         insert_superseding_observation_in_tx(&tx, &recomputed).unwrap();
@@ -3980,21 +2410,20 @@ mod tests {
         assert_eq!(unchanged, (old_row.1, old_row.2));
         let after = multiplier_report(&conn, &request).unwrap();
         assert_eq!(
-            after["latest"][0]["api_nanos"],
-            before["latest"][0]["api_nanos"]
+            after["series"][0]["api_nanos"],
+            before["series"][0]["api_nanos"]
         );
     }
 
     #[test]
     fn money_aggregate_and_numerator_overflows_leave_no_observation() {
         for numerator_overflow in [false, true] {
-            let mut conn = conn();
-            let (config, plan) = arithmetic_fixture(&conn);
+            let conn = conn();
             event(
                 &conn,
                 "input",
                 "codex",
-                "openai-codex",
+                "openai",
                 "m",
                 "subscription_included",
                 50,
@@ -4004,7 +2433,7 @@ mod tests {
                 &conn,
                 "output",
                 "codex",
-                "openai-codex",
+                "openai",
                 if numerator_overflow { "m" } else { "other" },
                 "subscription_included",
                 50,
@@ -4019,7 +2448,7 @@ mod tests {
                     &conn,
                     "cache",
                     "codex",
-                    "openai-codex",
+                    "openai",
                     "m",
                     "subscription_included",
                     50,
@@ -4035,27 +2464,11 @@ mod tests {
                 },
                 None,
             );
-            let reason = record_or_fail(&mut conn, &config, &plan, &rates, &priced_plan());
+            let reason = measured_usage(&test_calls(&conn, 0, 100), (0, 100), &rates)
+                .err()
+                .map(|error| error.code().to_owned());
             assert_failed_day(&conn, reason);
         }
-    }
-
-    #[test]
-    fn money_denominator_overflow_leaves_no_observation() {
-        let mut conn = conn();
-        let (config, mut plan) = arithmetic_fixture(&conn);
-        plan.provider.window.window_minutes = MINUTES_PER_MONTH;
-        plan.accounts[0].delta_percent = 200.0;
-        let mut prices = priced_plan();
-        prices.get_mut("acct").unwrap().monthly_nanos = Some(i64::MAX);
-        let reason = record_or_fail(
-            &mut conn,
-            &config,
-            &plan,
-            &ResolvedRates::default(),
-            &prices,
-        );
-        assert_failed_day(&conn, reason);
     }
 
     #[test]
@@ -4104,8 +2517,7 @@ mod tests {
     #[test]
     fn money_pace_uses_half_even_for_list_value_and_per_point_nanos() {
         let mut conn = conn();
-        let config = config(vec![rule("codex", "openai-codex", None)]);
-        let mut head = sample_observation(&conn);
+        let mut head = pace_ready(sample_observation(&conn));
         head.api_nanos = 5;
         head.delta_percent = 2.0;
         head.api_nanos_by_model = vec![ModelLine {
@@ -4120,11 +2532,11 @@ mod tests {
         let tx = conn.transaction().unwrap();
         insert_observation_in_tx(&tx, &head).unwrap();
         tx.commit().unwrap();
-        event(
+        account_event(
             &conn,
             "e",
             "codex",
-            "openai-codex",
+            "openai",
             "m",
             "subscription_included",
             100,
@@ -4132,12 +2544,12 @@ mod tests {
         );
         let report = multiplier_pace(
             &conn,
-            Some(&config),
             &MultiplierPaceRequest {
+                pool: None,
                 plan: None,
                 quota_provider: "codex".into(),
                 from_ms: 0,
-                to_ms: HOUR_MS,
+                to_ms: DAY,
             },
         )
         .unwrap();
@@ -4211,7 +2623,6 @@ mod tests {
     #[test]
     fn the_clip_excludes_tokens_outside_quota_coverage() {
         let conn = conn();
-        let config = config(vec![rule("opencode", "openai", None)]);
         reading(&conn, "acct", 3 * DAY, 0.0, None);
         reading(&conn, "acct", 4 * DAY, 10.0, None);
         event(
@@ -4234,14 +2645,12 @@ mod tests {
             3 * DAY + 5,
             &[("input", "usage.input", 1_000)],
         );
-        let observation = observe(
-            &conn,
-            &config,
-            0,
-            7 * DAY,
+        let observation = measured_usage(
+            &test_calls(&conn, 0, 7 * DAY),
+            (3 * DAY, 4 * DAY),
             &rates_for(&[("openai", "m")], TEN_PER_M, None),
-        );
-        assert_eq!(observation.token_interval_start_ms, Some(3 * DAY));
+        )
+        .unwrap();
         assert_eq!(observation.tokens.input, 1_000);
         assert_eq!(observation.tokens_outside_quota_coverage, 700);
         assert_eq!(observation.api_nanos, 10_000_000, "1,000 tokens at $10/M");
@@ -4254,7 +2663,6 @@ mod tests {
     #[test]
     fn broca_inclusive_output_is_not_double_counted() {
         let conn = conn();
-        let config = config(vec![rule("broca", "openai", Some("subscription_included"))]);
         reading(&conn, "acct", 0, 0.0, None);
         reading(&conn, "acct", 100, 10.0, None);
         event(
@@ -4283,13 +2691,7 @@ mod tests {
                 ("reasoning", "usage.reasoning_tokens", 400),
             ],
         );
-        let observation = observe(
-            &conn,
-            &config,
-            0,
-            200,
-            &rates_for(&[("openai", "m")], TEN_PER_M, None),
-        );
+        let observation = storeable_usage(&conn, (0, 200), &rates_with_reasoning_as_output(), 200);
         // 2 × 1,000 tokens of real work at $10/M.
         assert_eq!(observation.api_nanos, 20_000_000);
         assert_eq!(observation.tokens.output, 1_200);
@@ -4299,112 +2701,8 @@ mod tests {
         assert_eq!(line.measured_tokens.output, 1_600);
     }
 
-    /// Reasoning is valued at the output rate only for providers the config
-    /// declares; elsewhere it needs its own rate and is otherwise unpriced.
-    #[test]
-    fn reasoning_prices_at_output_only_for_declared_providers() {
-        let conn = conn();
-        let config = config(vec![rule("pi", "openai-codex", None)]);
-        reading(&conn, "acct", 0, 0.0, None);
-        reading(&conn, "acct", 100, 10.0, None);
-        event(
-            &conn,
-            "e",
-            "pi",
-            "openai-codex",
-            "m",
-            "unknown",
-            10,
-            &[("reasoning", "usage.reasoning", 500)],
-        );
-        // Pi's openai-codex prices through its openai twin.
-        let rates = rates_for(&[("openai", "m")], TEN_PER_M, None);
-        assert_eq!(observe(&conn, &config, 0, 200, &rates).api_nanos, 5_000_000);
-        let plan = plan_observation(&conn, &config, "codex", 0, 200).unwrap();
-        let observation =
-            super::compute_observation(&conn, &config, &plan, &rates, &priced_plan(), 200, &[])
-                .unwrap();
-        assert_eq!(observation.api_nanos, 0);
-        assert_eq!(observation.unpriced_tokens[0].reason, "no_rate");
-        assert_eq!(observation.unpriced_tokens[0].tokens, 500);
-    }
-
-    /// A model the catalog cannot price is counted by reason and left out of
-    /// api_nanos, never valued at zero.
-    #[test]
-    fn an_unpriced_model_is_counted_and_excluded() {
-        let conn = conn();
-        let config = config(vec![rule("opencode", "openai", None)]);
-        reading(&conn, "acct", 0, 0.0, None);
-        reading(&conn, "acct", 100, 10.0, None);
-        event(
-            &conn,
-            "priced",
-            "opencode",
-            "openai",
-            "known",
-            "unknown",
-            10,
-            &[("input", "usage.input", 1_000)],
-        );
-        event(
-            &conn,
-            "unpriced",
-            "opencode",
-            "openai",
-            "unknown-pro",
-            "unknown",
-            20,
-            &[
-                ("input", "usage.input", 300),
-                ("output", "usage.output", 30),
-            ],
-        );
-        let mut rates = rates_for(&[("openai", "known")], TEN_PER_M, None);
-        rates.models.insert(
-            ("openai".into(), "unknown-pro".into()),
-            ModelResolution::Unpriceable {
-                reason: "no_catalog_coverage".into(),
-            },
-        );
-        let observation = observe(&conn, &config, 0, 200, &rates);
-        assert_eq!(observation.api_nanos, 10_000_000);
-        let unpriced: Vec<_> = observation
-            .unpriced_tokens
-            .iter()
-            .map(|entry| {
-                (
-                    entry.reason.as_str(),
-                    entry.model.as_str(),
-                    entry.role.as_str(),
-                    entry.tokens,
-                )
-            })
-            .collect();
-        assert_eq!(
-            unpriced,
-            [
-                (
-                    "no_catalog_coverage",
-                    "opencode/openai/unknown-pro",
-                    "input",
-                    300
-                ),
-                (
-                    "no_catalog_coverage",
-                    "opencode/openai/unknown-pro",
-                    "output",
-                    30
-                ),
-            ]
-        );
-        // Its tokens are still in scope; only their value is unknown.
-        assert_eq!(observation.tokens.input, 1_300);
-    }
-
     #[test]
     fn cache_write_ttl_multiplier_matches_complete_tier_and_mode_sets() {
-        let config = config(vec![]);
         let rate = |units: i64| json!({"state":"priced","units":units,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}});
         let mut snapshot = CatalogSnapshot {
             alias_target: None,
@@ -4462,7 +2760,6 @@ mod tests {
             let mut unpriced = BTreeMap::new();
             let mut totals = RoleTokens::default();
             value_event(
-                &ValuationRules::from_config(&config, &[]),
                 Some(&resolution),
                 &event,
                 &mut lines,
@@ -4497,7 +2794,6 @@ mod tests {
     #[test]
     fn a_cache_write_split_by_lifetime_is_counted_not_dropped() {
         let conn = conn();
-        let config = config(vec![rule("claude-code", "anthropic", None)]);
         reading(&conn, "acct", 0, 0.0, None);
         reading(&conn, "acct", 100, 10.0, None);
         event(
@@ -4517,12 +2813,11 @@ mod tests {
             [],
         )
         .unwrap();
-        let observation = observe(
+        let observation = storeable_usage(
             &conn,
-            &config,
-            0,
-            200,
+            (0, 200),
             &rates_for(&[("anthropic", "m")], TEN_PER_M, None),
+            200,
         );
         assert_eq!(
             observation.api_nanos, 1_000_000,
@@ -4542,10 +2837,6 @@ mod tests {
     #[test]
     fn tiers_are_decided_per_event_only_where_an_event_is_one_call() {
         let conn = conn();
-        let config = config(vec![
-            rule("opencode", "openai", None),
-            rule("broca", "openai", None),
-        ]);
         reading(&conn, "acct", 0, 0.0, None);
         reading(&conn, "acct", 100, 10.0, None);
         let rates = rates_for(&[("openai", "m")], TEN_PER_M, Some((1_000, 2 * TEN_PER_M)));
@@ -4585,7 +2876,7 @@ mod tests {
             30,
             &[("input", "usage.input", 5_000)],
         );
-        let observation = observe(&conn, &config, 0, 200, &rates);
+        let observation = storeable_usage(&conn, (0, 200), &rates, 200);
         let by_producer: BTreeMap<&str, &ModelLine> = observation
             .api_nanos_by_model
             .iter()
@@ -4606,7 +2897,6 @@ mod tests {
     #[test]
     fn split_cache_writes_count_toward_the_prompt_and_an_unknown_prompt_is_not_priced() {
         let conn = conn();
-        let config = config(vec![rule("claude-code", "anthropic", None)]);
         reading(&conn, "acct", 0, 0.0, None);
         reading(&conn, "acct", 100, 10.0, None);
         let rates = rates_for(
@@ -4648,7 +2938,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let observation = observe(&conn, &config, 0, 200, &rates);
+        let observation = storeable_usage(&conn, (0, 200), &rates, 200);
         // 400 input at the tier rate; the unknown-prompt event adds nothing.
         assert_eq!(observation.api_nanos, 8_000_000);
         assert_eq!(observation.api_nanos_by_model[0].tiered_tokens, 1_100);
@@ -4697,7 +2987,6 @@ mod tests {
     }
 
     fn value_one(rates: &ResolvedRates, mode: Option<&str>) -> (ModelLine, Vec<String>) {
-        let config = config(vec![]);
         let event = EventTokens {
             producer: "claude-code".into(),
             provider: "openai".into(),
@@ -4725,7 +3014,6 @@ mod tests {
         let mut unpriced = BTreeMap::new();
         let mut totals = RoleTokens::default();
         value_event(
-            &ValuationRules::from_config(&config, &["openai".into()]),
             ModelLookup::new(rates).get("openai", "m"),
             &event,
             &mut lines,
@@ -4744,7 +3032,6 @@ mod tests {
     #[test]
     #[ignore = "wall-time probe; run with --ignored --nocapture --test-threads=1"]
     fn performance_repeated_event_valuation() {
-        let config = config(vec![]);
         let rates = fast_mode_rates("m");
         let event = EventTokens {
             producer: "claude-code".into(),
@@ -4773,13 +3060,10 @@ mod tests {
         let mut unpriced = BTreeMap::new();
         let mut totals = RoleTokens::default();
         let lookup = ModelLookup::new(&rates);
-        let reasoning = ["openai".into()];
-        let rules = ValuationRules::from_config(&config, &reasoning);
         let start = std::time::Instant::now();
         let allocations = crate::canon::allocation_probe::count(|| {
             for _ in 0..100_000 {
                 value_event(
-                    &rules,
                     lookup.get("openai", "m"),
                     &event,
                     &mut lines,
@@ -4846,7 +3130,6 @@ mod tests {
     #[test]
     fn stored_events_price_at_base_and_are_counted_only_where_a_mode_rate_exists() {
         let conn = conn();
-        let config = config(vec![rule("opencode", "openai", None)]);
         reading(&conn, "acct", 0, 0.0, None);
         reading(&conn, "acct", 100, 10.0, None);
         event(
@@ -4859,18 +3142,17 @@ mod tests {
             10,
             &[("input", "usage.input", 1_000)],
         );
-        let observation = observe(&conn, &config, 0, 200, &fast_mode_rates("m"));
+        let observation = storeable_usage(&conn, (0, 200), &fast_mode_rates("m"), 200);
         assert_eq!(observation.api_nanos, 10_000_000);
         assert_eq!(
             observation.api_nanos_by_model[0].mode_unrecorded_tokens,
             1_000
         );
-        let plain = observe(
+        let plain = storeable_usage(
             &conn,
-            &config,
-            0,
-            200,
+            (0, 200),
             &rates_for(&[("openai", "m")], TEN_PER_M, None),
+            200,
         );
         assert_eq!(plain.api_nanos, 10_000_000);
         assert_eq!(plain.api_nanos_by_model[0].mode_unrecorded_tokens, 0);
@@ -4964,195 +3246,146 @@ mod tests {
         }
     }
 
-    /// Both ratios from their stated inputs: 10 points of a 7-day window on a
-    /// $200 plan is $200 × 7/30 × 10% = $4.6667, and the fee over a 7-day
-    /// token interval is $200 × 7/30.
-    #[test]
-    fn subscription_and_fee_denominators_follow_the_formula() {
-        let conn = conn();
-        let config = config(vec![rule("opencode", "openai", None)]);
-        reading(&conn, "acct", 0, 50.0, None);
-        reading(&conn, "acct", 10, 60.0, None);
-        reading(&conn, "acct", 7 * DAY, 60.0, None);
-        event(
-            &conn,
-            "e",
-            "opencode",
-            "openai",
-            "m",
-            "unknown",
-            10,
-            &[("input", "usage.input", 1_000_000_000)],
-        );
-        let observation = observe(
-            &conn,
-            &config,
-            0,
-            7 * DAY,
-            &rates_for(&[("openai", "m")], TEN_PER_M, None),
-        );
-        assert_eq!(observation.delta_percent, 10.0);
-        assert_eq!(observation.subscription_nanos, 4_666_666_667);
-        assert_eq!(observation.fee_paid_nanos, 46_666_666_667);
-        // A billion tokens at $10/M is $10,000.
-        assert_eq!(observation.api_nanos, 10_000_000_000_000);
-        let multiplier = observation.multiplier.unwrap();
-        assert!((multiplier - 10_000_000_000_000.0 / 4_666_666_667.0).abs() < 1e-9);
-        // One window segment's ±1 point is 10% of a 10-point Δ: too coarse.
-        assert!(observation.low_resolution);
-        assert_eq!(observation.observation_day, "1970-01-08");
-    }
-
-    fn served_price(
-        tier: &str,
-        price: Option<i64>,
-        refusal: Option<&str>,
-    ) -> fusiform_protocol::PlanPriceWire {
-        fusiform_protocol::PlanPriceWire {
-            provider_id: "openai".into(),
-            tier: tier.into(),
-            price: price.map(|minor_units| fusiform_protocol::PlanAmount {
-                minor_units,
-                exponent: 2,
-                currency: "USD".into(),
-                period: "month".into(),
-            }),
-            quota_value: None,
-            service_tiers: None,
-            concurrency: None,
-            refusal_reason: refusal.map(str::to_string),
-            boundary_at_ms: 0,
-            established_by: "fusiform".into(),
-            established_at_ms: 0,
-            review_by_ms: 1_000,
-            source_ref: "https://example.invalid".into(),
-        }
-    }
-
-    struct Served(PlanPricesResponse);
-
-    impl PlanPriceSource for Served {
-        fn plan_prices(
-            &self,
-            _: PlanPricesRequest,
-        ) -> Result<PlanPricesResponse, CatalogCallError> {
-            Ok(self.0.clone())
-        }
-    }
-
-    /// A plan-key override beats fusiform; a
-    /// key fusiform refuses leaves the account unpriced with the reason, and a
-    /// price past its review date is used but flagged.
-    #[test]
-    fn plan_prices_resolve_by_precedence_and_refusals_are_reasons() {
-        let mut config = config(vec![rule("opencode", "openai", None)]);
-        let provider = config.quota_providers.get_mut("codex").unwrap();
-        let account = |plan: &str| AccountPlan { plan: plan.into() };
-        let usd = |minor_units| PriceOverride {
-            minor_units,
-            exponent: 2,
-            currency: "USD".into(),
-            period: "month".into(),
+    fn sample_observation(conn: &Connection) -> Observation {
+        fixture_vault_plan(conn, "openai/pro_20x");
+        let pool = pools::PlannedPool {
+            quota_provider: "codex",
+            plan: "openai/pro_20x",
+            pool_id: "primary",
+            window_pool_key: "primary",
+            pool_scope: PoolScope::All,
+            catalog_provider: None,
+            pool_models: None,
+            pool_models_at_ms: None,
+            window_minutes: 10080,
+            diagnostic: None,
+            reading_runs: Vec::new(),
         };
-        provider.accounts = BTreeMap::from([
-            ("by-plan".to_string(), account("openai/pro_5x")),
-            ("by-fusiform".to_string(), account("openai/pro_20x")),
-            ("refused".to_string(), account("openai/pro")),
-            ("missing".to_string(), account("openai/team")),
-        ]);
-        config.plan_price_overrides = BTreeMap::from([("openai/pro_5x".to_string(), usd(9_900))]);
-        let served = Served(PlanPricesResponse {
-            prices: vec![
-                served_price("pro_20x", Some(20_000), None),
-                served_price("pro", None, Some("ambiguous: pro_5x or pro_20x")),
-            ],
-            resolved_at_ms: 5_000,
-            tier_vocabulary: "vendor".into(),
-            unit_policy: "list".into(),
-            quota_pools: Vec::new(),
-        });
-        let provider = config.quota_providers["codex"].clone();
-        let plans = resolve_plans(Some(&served), &config, &provider, 5_000).unwrap();
-        let outcome = |account: &str| {
-            let used = &plans[account];
-            (
-                used.source.clone(),
-                used.monthly_nanos,
-                used.unpriceable_reason.clone(),
-            )
-        };
-        assert_eq!(
-            outcome("by-plan"),
-            (Some("plan_override".into()), Some(99_000_000_000), None)
-        );
-        assert_eq!(
-            outcome("by-fusiform"),
-            (Some("fusiform".into()), Some(PLAN_200), None)
-        );
-        assert!(
-            plans["by-fusiform"].plan_price_overdue,
-            "review_by 1,000 < now 5,000"
-        );
-        assert_eq!(
-            outcome("refused"),
-            (None, None, Some("plan_price_refused".into()))
-        );
-        assert_eq!(
-            outcome("missing"),
-            (None, None, Some("plan_price_missing".into()))
-        );
-        // Needed and unreachable: the day cannot be priced, so it fails.
-        assert!(matches!(
-            resolve_plans(None, &config, &provider, 5_000),
-            Err(MultiplierError::PlanPrices(_))
-        ));
+        let mut row = pools::empty_row(&pool, "1970-01-02", (0, DAY), DAY, DAY);
+        row.plan = None;
+        row.pool_scope = None;
+        row.scope_rules = vec![
+            json!({"producer":"opencode","provider":"openai","charge_basis":null,"model_prefix":null}),
+        ];
+        row
     }
 
-    /// An account whose plan has no price is left out of the denominator,
-    /// with its reason and Δused% on the row, never valued at a guess.
-    #[test]
-    fn an_unpriced_account_is_excluded_by_reason() {
-        let conn = conn();
-        let config = config(vec![rule("opencode", "openai", None)]);
-        reading(&conn, "acct", 0, 0.0, None);
-        reading(&conn, "acct", 100, 10.0, None);
-        let plan = plan_observation(&conn, &config, "codex", 0, 200).unwrap();
-        let mut plans = priced_plan();
-        let used = plans.get_mut("acct").unwrap();
-        used.monthly_nanos = None;
-        used.source = None;
-        used.unpriceable_reason = Some("plan_price_refused".into());
-        let observation = compute_observation(
-            &conn,
-            &config,
-            &plan,
-            &ResolvedRates::default(),
-            &plans,
-            200,
+    fn fixture_vault_plan(conn: &Connection, plan: &str) {
+        let (provider, tier) = plan.split_once('/').unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        crate::vault_plan::append_in_tx(
+            &tx,
+            &crate::vault_plan::VaultPlan {
+                credential_id: "fixture-acct".into(),
+                provider: Some(provider.into()),
+                account_id: Some("acct".into()),
+                plan_tier: Some(tier.into()),
+                plan_key: Some(plan.into()),
+                source: "detected".into(),
+                effective_from_ms: 0,
+                observed_at_ms: 0,
+            },
         )
         .unwrap();
-        assert_eq!(observation.subscription_nanos, 0);
-        assert_eq!(observation.multiplier, None);
-        assert_eq!(
-            observation.accounts_excluded[0]["reason"],
-            "plan_price_refused"
+        tx.commit().unwrap();
+    }
+
+    fn test_calls(conn: &Connection, start: i64, end: i64) -> Vec<(EventTokens, i64)> {
+        let mut calls = Vec::new();
+        for_events(
+            conn,
+            "1=1",
+            &[SqlValue::Integer(start), SqlValue::Integer(end)],
+            |call, _| {
+                calls.push((call.tokens, call.occurred_at_ms));
+                Ok(())
+            },
+        )
+        .unwrap();
+        calls
+    }
+
+    fn test_models(conn: &Connection, start: i64, end: i64) -> BTreeSet<(String, String)> {
+        test_calls(conn, start, end)
+            .into_iter()
+            .filter_map(|(event, _)| Some((event.provider, event.model?)))
+            .collect()
+    }
+
+    fn rates_with_reasoning_as_output() -> ResolvedRates {
+        let mut rates = rates_for(&[("openai", "m")], TEN_PER_M, None);
+        let Some(ModelResolution::Rates(model)) =
+            rates.models.get_mut(&("openai".into(), "m".into()))
+        else {
+            unreachable!()
+        };
+        model.base.insert(
+            "reasoning".into(),
+            RateState::BilledAs {
+                key: BillingRateKey::Output,
+            },
         );
-        assert_eq!(observation.accounts_excluded[0]["delta_percent"], 10.0);
+        rates
     }
 
-    fn sample_observation(conn: &Connection) -> Observation {
-        let config = config(vec![rule("opencode", "openai", None)]);
-        reading(conn, "acct", 0, 0.0, None);
-        reading(conn, "acct", 100, 10.0, None);
-        observe(conn, &config, 0, DAY, &ResolvedRates::default())
+    fn measured_usage(
+        calls: &[(EventTokens, i64)],
+        interval: (i64, i64),
+        rates: &ResolvedRates,
+    ) -> Result<measurement::UsageTotals, MultiplierError> {
+        measurement::measure_usage(
+            calls.iter().map(|(tokens, at)| (tokens, *at)),
+            Some(interval),
+            &ModelLookup::new(rates),
+        )
     }
 
-    fn pace_fixture(conn: &mut Connection) -> (FixtureConfig, Observation) {
-        let config = config(vec![
-            rule("opencode", "openai", None),
-            rule("broca", "openai", Some("subscription_included")),
-        ]);
+    fn storeable_usage(
+        conn: &Connection,
+        (start, end): (i64, i64),
+        rates: &ResolvedRates,
+        snapshot: i64,
+    ) -> Observation {
+        let calls = test_calls(conn, start, end);
+        let usage = measured_usage(&calls, (start, end), rates).unwrap();
+        let mut row = sample_observation(conn);
+        row.interval_start_ms = start;
+        row.interval_end_ms = end;
+        row.token_interval_start_ms = Some(start);
+        row.token_interval_end_ms = Some(end);
+        row.observation_day = utc_day(end).unwrap();
+        row.snapshot_at_ms = snapshot;
+        row.catalog_resolved_at_ms = rates.resolved_at_ms;
+        row.multiplier = usage.ratio(1);
+        row.fee_multiplier = usage.ratio(1);
+        row.tokens = usage.tokens;
+        row.api_nanos = usage.api_nanos;
+        row.api_nanos_by_model = usage.api_nanos_by_model;
+        row.unpriced_tokens = usage.unpriced_tokens;
+        row.tokens_outside_quota_coverage = usage.tokens_outside_quota_coverage;
+        row.base_rate_tier_untested_tokens = usage.base_rate_tier_untested_tokens;
+        row
+    }
+
+    fn pace_ready(mut observation: Observation) -> Observation {
+        observation.pool_scope = Some(PoolScope::All);
+        observation
+            .plan
+            .get_or_insert_with(|| "openai/pro_20x".into());
+        observation.routing_eligible = true;
+        observation
+    }
+
+    fn pace_head(conn: &Connection) -> Observation {
         let mut head = sample_observation(conn);
+        head.observation_day = "1970-01-01".into();
+        head.interval_start_ms = 3 * HOUR_MS - 7 * DAY;
+        head.interval_end_ms = 3 * HOUR_MS;
+        head.token_interval_start_ms = Some(0);
+        head.token_interval_end_ms = Some(3 * HOUR_MS);
+        head.pool_scope = Some(PoolScope::All);
+        head.plan = Some("openai/pro_20x".into());
+        head.routing_eligible = true;
         head.api_nanos = 100_000_000;
         head.delta_percent = 10.0;
         head.api_nanos_by_model = [
@@ -5175,23 +3408,42 @@ mod tests {
             ..ModelLine::default()
         })
         .collect();
+        for line in &mut head.api_nanos_by_model {
+            if let Some(ModelResolution::Rates(rates)) = &mut line.rates {
+                rates.base.insert(
+                    "reasoning".into(),
+                    RateState::BilledAs {
+                        key: BillingRateKey::Output,
+                    },
+                );
+            }
+        }
+        head
+    }
+
+    fn insert_pace_observation(conn: &mut Connection, head: &Observation) {
         let tx = conn.transaction().unwrap();
-        insert_observation_in_tx(&tx, &head).unwrap();
+        insert_observation_in_tx(&tx, head).unwrap();
         tx.commit().unwrap();
-        (config, head)
+    }
+
+    fn pace_fixture(conn: &mut Connection) -> Observation {
+        let head = pace_head(conn);
+        insert_pace_observation(conn, &head);
+        head
     }
 
     #[test]
     fn pace_prices_stored_rates_per_hour_producer_and_work_class() {
         let mut conn = conn();
-        let (config, _) = pace_fixture(&mut conn);
-        event(
+        pace_fixture(&mut conn);
+        account_event(
             &conn,
             "long",
             "opencode",
             "openai",
             "large",
-            "unknown",
+            "subscription_included",
             100,
             &[
                 ("input", "usage", 200_000),
@@ -5199,10 +3451,10 @@ mod tests {
                 ("reasoning", "usage", 10),
             ],
         );
-        // Pace receives only the live scope, not the live pricing declarations.
+        // Pace uses only the stored coverage and rates, never live declarations.
         conn.execute("INSERT INTO usage_event (event_id, producer, producer_lineage, producer_ref,
-            occurred_at_ms, recorded_at_ms, provider, model, charge_basis, work_class)
-            VALUES ('worker', 'broca', 'lineage', 'worker', ?1, ?1, 'openai', 'small', 'subscription_included', 'mason')", [2 * HOUR_MS + 10]).unwrap();
+            occurred_at_ms, recorded_at_ms, provider, model, charge_basis, work_class, account_ref)
+            VALUES ('worker', 'broca', 'lineage', 'worker', ?1, ?1, 'openai', 'small', 'subscription_included', 'mason', 'acct')", [2 * HOUR_MS + 10]).unwrap();
         for (role, unit, source, quantity) in [
             ("input", "token", "usage", 1000),
             ("output", "token", "usage.output_tokens", 100),
@@ -5212,23 +3464,23 @@ mod tests {
             conn.execute("INSERT INTO measurement (event_key, role, unit, kind, source, quantity_units, quantity_exponent)
                 VALUES ((SELECT event_key FROM usage_event WHERE event_id='worker'), ?1, ?2, 'billed', ?3, ?4, 0)", params![role, unit, source, quantity]).unwrap();
         }
-        event(
+        account_event(
             &conn,
             "unknown-model",
             "opencode",
             "openai",
             "absent",
-            "unknown",
+            "subscription_included",
             2 * HOUR_MS + 20,
             &[("input", "usage", 17)],
         );
-        event(
+        account_event(
             &conn,
             "short",
             "opencode",
             "openai",
             "large",
-            "unknown",
+            "subscription_included",
             3 * HOUR_MS + 10,
             &[("input", "usage", 100), ("output", "usage", 10)],
         );
@@ -5255,8 +3507,8 @@ mod tests {
             VALUES ((SELECT event_key FROM usage_event WHERE event_id='undated'), 'input', 'token', 'billed', 'usage', 12, 0), ((SELECT event_key FROM usage_event WHERE event_id='undated'), 'output', 'token', 'billed', 'usage', 3, 0);").unwrap();
         let report = multiplier_pace(
             &conn,
-            Some(&config),
             &MultiplierPaceRequest {
+                pool: None,
                 plan: None,
                 quota_provider: "codex".into(),
                 from_ms: 1,
@@ -5267,9 +3519,9 @@ mod tests {
         // Hand valuation: long = (200000 + 20 + 10) * 20000 nanos;
         // worker = (1000 + (100 - 40) + 40) * 2000; short = 110 * 10000.
         // The stored pooled rate is 100000000 / 10 = 10000000 nanos/point.
-        let expected = json!({"quota_provider": "codex", "from_ms": 0, "to_ms": 14400000,
-        "basis": "pro_rata_list_value", "routing_eligible": true, "plan": "openai/pro_20x", "per_point_nanos": 10000000,
-        "observation_day": "1970-01-02", "observation_id": 1, "undated_events": 1,
+        let expected = json!({"quota_provider": "codex", "plan": "openai/pro_20x", "pool_id": "primary", "from_ms": 0, "to_ms": 14400000,
+        "basis": "pro_rata_list_value", "routing_eligible": true, "per_point_nanos": 10000000,
+        "observation_day": "1970-01-01", "observation_id": 1, "undated_events": 0,
         "hours": [
             {"hour_start_ms": 0, "producers": {"opencode": {"events": 1, "list_nanos": 4000600000_i64, "estimated_points": 400.06, "unpriced_tokens": 0,
                 "by_work_class": {"unlabelled": {"events": 1, "list_nanos": 4000600000_i64, "estimated_points": 400.06}}}}},
@@ -5284,10 +3536,12 @@ mod tests {
         ]});
         assert_eq!(report, expected);
         println!("pace example response: {report}");
-        // Consumers pin the replies in tests/vectors: synthetic values laid out
-        // in the served shape. If this reply's shape drifts from theirs, those
-        // pinned bytes no longer describe what is served, so the vectors must
-        // be regenerated in the new shape with it.
+        // Consumers pin synthetic replies in tests/vectors. The comparison
+        // below checks every member those pre-pool samples record.
+        assert_eq!(report["pool_id"], "primary");
+        // The pinned samples predate pool identity, so project out only that new member.
+        let mut served_shape = json_shape(&report);
+        served_shape.remove(".pool_id");
         for (name, bytes) in [
             (
                 "claude",
@@ -5305,7 +3559,7 @@ mod tests {
             let vector: Value = serde_json::from_str(bytes).unwrap();
             assert_eq!(
                 json_shape(&vector["result"]),
-                json_shape(&report),
+                served_shape,
                 "{name} vector shape differs from the served reply"
             );
         }
@@ -5341,44 +3595,42 @@ mod tests {
     #[test]
     fn pace_uses_the_latest_day_head_not_a_superseded_row() {
         let mut conn = conn();
-        let (config, mut head) = pace_fixture(&mut conn);
+        let mut head = pace_fixture(&mut conn);
         head.api_nanos = 200_000_000;
         let tx = conn.transaction().unwrap();
         let recompute = insert_superseding_observation_in_tx(&tx, &head).unwrap();
         tx.commit().unwrap();
         let request = MultiplierPaceRequest {
+            pool: None,
             plan: None,
             quota_provider: "codex".into(),
             from_ms: 0,
-            to_ms: HOUR_MS,
+            to_ms: 3 * HOUR_MS,
         };
-        let report = multiplier_pace(&conn, Some(&config), &request).unwrap();
+        let report = multiplier_pace(&conn, &request).unwrap();
         assert_eq!(report["per_point_nanos"], 20_000_000);
         assert_eq!(report["observation_id"], recompute.observation_id);
         // A later snapshot correcting an older day must not become latest.
-        head.observation_day = "1970-01-01".into();
-        head.interval_end_ms = 0;
-        head.interval_start_ms = -7 * DAY;
+        head.observation_day = "1969-12-31".into();
+        head.interval_end_ms = -DAY;
+        head.interval_start_ms = -8 * DAY;
         // The token interval moves with the observation interval: it is that
         // interval clipped to quota coverage, and the insert refuses a token
         // interval lying outside the observation interval.
-        head.token_interval_start_ms = Some(-DAY);
-        head.token_interval_end_ms = Some(0);
+        head.token_interval_start_ms = Some(-2 * DAY);
+        head.token_interval_end_ms = Some(-DAY);
         head.snapshot_at_ms = 10 * DAY;
         head.api_nanos = 500_000_000;
         let tx = conn.transaction().unwrap();
         insert_observation_in_tx(&tx, &head).unwrap();
         tx.commit().unwrap();
-        assert_eq!(
-            multiplier_pace(&conn, Some(&config), &request).unwrap(),
-            report
-        );
+        assert_eq!(multiplier_pace(&conn, &request).unwrap(), report);
     }
 
     #[test]
     fn pace_refuses_unknown_provider_invalid_or_excessive_range_and_missing_head() {
-        let conn = conn();
-        let config = config(vec![rule("opencode", "openai", None)]);
+        let mut conn = conn();
+        pace_fixture(&mut conn);
         for (provider, from_ms, to_ms, code) in [
             ("absent", 0, 1, "unknown_quota_provider"),
             ("codex", 1, 1, "invalid_range"),
@@ -5391,8 +3643,8 @@ mod tests {
         ] {
             let error = multiplier_pace(
                 &conn,
-                Some(&config),
                 &MultiplierPaceRequest {
+                    pool: None,
                     plan: None,
                     quota_provider: provider.into(),
                     from_ms,
@@ -5411,42 +3663,42 @@ mod tests {
     #[test]
     fn pace_aligns_negative_hours_and_keeps_an_unusable_denominator_null() {
         let mut conn = conn();
-        let (config, mut head) = pace_fixture(&mut conn);
+        let mut head = pace_fixture(&mut conn);
         head.delta_percent = 0.0;
         let tx = conn.transaction().unwrap();
         insert_superseding_observation_in_tx(&tx, &head).unwrap();
         tx.commit().unwrap();
-        event(
+        account_event(
             &conn,
             "negative",
             "opencode",
             "openai",
             "large",
-            "unknown",
-            -1,
+            "subscription_included",
+            0,
             &[("input", "usage", 10)],
         );
         let report = multiplier_pace(
             &conn,
-            Some(&config),
             &MultiplierPaceRequest {
+                pool: None,
                 plan: None,
                 quota_provider: "codex".into(),
                 from_ms: -1,
-                to_ms: 1,
+                to_ms: 3 * HOUR_MS,
             },
         )
         .unwrap();
         assert_eq!(report["from_ms"], -HOUR_MS);
-        assert_eq!(report["to_ms"], HOUR_MS);
-        assert_eq!(report["hours"].as_array().unwrap().len(), 2);
+        assert_eq!(report["to_ms"], 3 * HOUR_MS);
+        assert_eq!(report["hours"].as_array().unwrap().len(), 4);
         assert_eq!(report["per_point_nanos"], Value::Null);
         assert_eq!(
-            report["hours"][0]["producers"]["opencode"]["list_nanos"],
+            report["hours"][1]["producers"]["opencode"]["list_nanos"],
             100_000
         );
         assert_eq!(
-            report["hours"][0]["producers"]["opencode"]["estimated_points"],
+            report["hours"][1]["producers"]["opencode"]["estimated_points"],
             Value::Null
         );
     }
@@ -5652,8 +3904,13 @@ mod tests {
     fn the_report_serves_latest_and_series_and_refuses_a_malformed_range() {
         let mut conn = conn();
         let observation = sample_observation(&conn);
+        let mut scoped = observation.clone();
+        scoped.plan = Some("openai/pro_200".into());
+        scoped.pool_scope = Some(PoolScope::All);
+        scoped.scope_rules.clear();
         let tx = conn.transaction().unwrap();
         insert_observation_in_tx(&tx, &observation).unwrap();
+        record_one(&tx, &scoped);
         tx.commit().unwrap();
         let report = multiplier_report(
             &conn,
@@ -5668,11 +3925,13 @@ mod tests {
             report["latest"][0]["low_resolution"],
             json!(observation.low_resolution)
         );
-        assert_eq!(report["series"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            report["series"][0]["scope_rules"][0]["producer"],
-            "opencode"
-        );
+        let series = report["series"].as_array().unwrap();
+        assert_eq!(series.len(), 2);
+        let legacy = series
+            .iter()
+            .find(|row| row["pool_scope"].is_null())
+            .unwrap();
+        assert_eq!(legacy["scope_rules"][0]["producer"], "opencode");
         let empty = multiplier_report(
             &conn,
             &MultiplierReportRequest {
@@ -5754,7 +4013,6 @@ mod tests {
             (Some("input_audio"), 1_000_000),
         ] {
             let mut conn = conn();
-            let config = config(vec![rule("opencode", "google", None)]);
             reading(&conn, "acct", 10, 0.0, None);
             reading(&conn, "acct", 90, 50.0, None);
             let mut measurements = vec![
@@ -5774,23 +4032,9 @@ mod tests {
                 20,
                 &measurements,
             );
-            let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
-            let rates = resolve_rates(
-                &token_catalog(extra_role),
-                &catalog_models(&config, &plan),
-                100,
-            )
-            .unwrap();
-            let observation = super::compute_observation(
-                &conn,
-                &config,
-                &plan,
-                &rates,
-                &priced_plan(),
-                100,
-                &["google".into()],
-            )
-            .unwrap();
+            let models = test_models(&conn, 0, 100);
+            let rates = resolve_rates(&token_catalog(extra_role), &models, 100).unwrap();
+            let observation = storeable_usage(&conn, (0, 100), &rates, 100);
             assert!(observation.unpriced_tokens.is_empty());
             assert_eq!(observation.api_nanos_by_model.len(), 1);
             assert_eq!(
@@ -5829,7 +4073,6 @@ mod tests {
             Some("output_video"),
         ] {
             let mut conn = conn();
-            let config = config(vec![rule("opencode", "google", None)]);
             reading(&conn, "acct", 10, 0.0, None);
             reading(&conn, "acct", 90, 50.0, None);
             event(
@@ -5845,23 +4088,9 @@ mod tests {
                     ("output", "usage.output", 1_000_000),
                 ],
             );
-            let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
-            let rates = resolve_rates(
-                &token_catalog(extra_role),
-                &catalog_models(&config, &plan),
-                100,
-            )
-            .unwrap();
-            let mut observation = super::compute_observation(
-                &conn,
-                &config,
-                &plan,
-                &rates,
-                &priced_plan(),
-                100,
-                &["google".into()],
-            )
-            .unwrap();
+            let models = test_models(&conn, 0, 100);
+            let rates = resolve_rates(&token_catalog(extra_role), &models, 100).unwrap();
+            let mut observation = storeable_usage(&conn, (0, 100), &rates, 100);
             let tx = conn.transaction().unwrap();
             insert_observation_in_tx(&tx, &observation).unwrap();
             tx.commit().unwrap();
@@ -5887,7 +4116,6 @@ mod tests {
     #[test]
     fn unknown_input_video_catalog_role_fails_the_day_without_rows() {
         let conn = conn();
-        let config = config(vec![rule("opencode", "google", None)]);
         reading(&conn, "acct", 10, 0.0, None);
         reading(&conn, "acct", 90, 50.0, None);
         event(
@@ -5903,13 +4131,8 @@ mod tests {
                 ("output", "usage.output", 1_000_000),
             ],
         );
-        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
-        let error = resolve_rates(
-            &token_catalog(Some("input_video")),
-            &catalog_models(&config, &plan),
-            100,
-        )
-        .unwrap_err();
+        let models = test_models(&conn, 0, 100);
+        let error = resolve_rates(&token_catalog(Some("input_video")), &models, 100).unwrap_err();
         assert_eq!(error.code(), "rate_fact_unrecognized");
         assert!(error.message().contains("rate.input_video"));
         let rows: i64 = conn
@@ -6228,7 +4451,6 @@ mod tests {
                 requests: std::sync::Mutex::new(Vec::new()),
             });
             let catalog = CatalogClient::new(connection.clone(), 0);
-            let config = config(vec![rule("broca", "kimi-code-plan-global", None)]);
             reading(&conn, "acct", 10, 0.0, None);
             reading(&conn, "acct", 90, 50.0, None);
             event(
@@ -6246,9 +4468,9 @@ mod tests {
                     ("cache_write", "usage.cache_write", 1_000),
                 ],
             );
-            let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
-            let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
-            let observation = observe(&conn, &config, 0, 100, &rates);
+            let models = test_models(&conn, 0, 100);
+            let rates = resolve_rates(&catalog, &models, 100).unwrap();
+            let observation = storeable_usage(&conn, (0, 100), &rates, 100);
             assert_eq!(observation.api_nanos, 14_200_000);
             assert!(observation.unpriced_tokens.is_empty());
             assert!(observation.multiplier.is_some_and(|ratio| ratio > 0.0));
@@ -6264,9 +4486,9 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(report["latest"][0]["api_nanos"], 14_200_000);
+            assert_eq!(report["series"][0]["api_nanos"], 14_200_000);
             assert_eq!(
-                report["latest"][0]["api_nanos_by_model"][0]["rates"]["reference_model"],
+                report["series"][0]["api_nanos_by_model"][0]["rates"]["reference_model"],
                 json!({"provider_id":"moonshotai", "model_id":"kimi-k3.1-pro"})
             );
         }
@@ -6281,7 +4503,6 @@ mod tests {
             requests: std::sync::Mutex::new(Vec::new()),
         });
         let catalog = CatalogClient::new(connection.clone(), 0);
-        let config = config(vec![rule("broca", "kimi-code-plan-global", None)]);
         reading(&conn, "acct", 10, 0.0, None);
         reading(&conn, "acct", 90, 50.0, None);
         event(
@@ -6294,9 +4515,9 @@ mod tests {
             20,
             &[("input", "usage.input", 1_000)],
         );
-        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
-        let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
-        let observation = observe(&conn, &config, 0, 100, &rates);
+        let models = test_models(&conn, 0, 100);
+        let rates = resolve_rates(&catalog, &models, 100).unwrap();
+        let observation = storeable_usage(&conn, (0, 100), &rates, 100);
         assert_quota_proxy_requests(&connection);
         assert_eq!(observation.api_nanos, 0);
         assert_eq!(observation.tokens.input, 1_000);
@@ -6315,10 +4536,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(report["latest"].as_array().unwrap().len(), 1);
-        assert_eq!(report["latest"][0]["unpriced_tokens"][0]["tokens"], 1_000);
+        assert_eq!(report["series"].as_array().unwrap().len(), 1);
+        assert_eq!(report["series"][0]["unpriced_tokens"][0]["tokens"], 1_000);
         assert_eq!(
-            report["latest"][0]["unpriced_tokens"][0]["reason"],
+            report["series"][0]["unpriced_tokens"][0]["reason"],
             "no_catalog_coverage"
         );
     }
@@ -6334,7 +4555,6 @@ mod tests {
             requests: std::sync::Mutex::new(Vec::new()),
         });
         let catalog = CatalogClient::new(connection.clone(), 0);
-        let config = config(vec![rule("broca", "kimi-code-plan-global", None)]);
         reading(&conn, "acct", 10, 0.0, None);
         reading(&conn, "acct", 90, 50.0, None);
         event(
@@ -6347,8 +4567,8 @@ mod tests {
             20,
             &[("input", "usage.input", 1_000)],
         );
-        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
-        resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
+        let models = test_models(&conn, 0, 100);
+        resolve_rates(&catalog, &models, 100).unwrap();
         let requests = connection.requests.lock().unwrap();
         assert!(
             requests.iter().all(|request| request.auth_method.is_none()),
@@ -6368,7 +4588,6 @@ mod tests {
                 requests: std::sync::Mutex::new(Vec::new()),
             });
             let catalog = CatalogClient::new(connection.clone(), 0);
-            let config = config(vec![rule("broca", "kimi-code-plan-global", None)]);
             reading(&conn, "acct", 10, 0.0, None);
             reading(&conn, "acct", 90, 50.0, None);
             event(
@@ -6381,9 +4600,9 @@ mod tests {
                 20,
                 &[("input", "usage.input", 1_000)],
             );
-            let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
-            let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
-            let observation = observe(&conn, &config, 0, 100, &rates);
+            let models = test_models(&conn, 0, 100);
+            let rates = resolve_rates(&catalog, &models, 100).unwrap();
+            let observation = storeable_usage(&conn, (0, 100), &rates, 100);
             assert_eq!(observation.api_nanos, units / 1_000);
             assert!(observation.unpriced_tokens.is_empty());
             let requests = connection.requests.lock().unwrap();
@@ -6407,7 +4626,6 @@ mod tests {
             requests: std::sync::Mutex::new(Vec::new()),
         });
         let catalog = CatalogClient::new(connection.clone(), 0);
-        let config = config(vec![rule("opencode", "google", None)]);
         reading(&conn, "acct", 10, 0.0, None);
         reading(&conn, "acct", 90, 50.0, None);
         event(
@@ -6420,9 +4638,9 @@ mod tests {
             20,
             &[("input", "usage.input", 1_000)],
         );
-        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
-        let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
-        let observation = observe(&conn, &config, 0, 100, &rates);
+        let models = test_models(&conn, 0, 100);
+        let rates = resolve_rates(&catalog, &models, 100).unwrap();
+        let observation = storeable_usage(&conn, (0, 100), &rates, 100);
         assert_eq!(
             *connection.requests.lock().unwrap(),
             vec![("new-model".into(), Some(100)), ("new-model".into(), None)]
@@ -6435,7 +4653,7 @@ mod tests {
         assert_eq!(observation.multiplier, None);
         assert_eq!(observation.fee_multiplier, None);
         let known_zero = rates_for(&[("google", "new-model")], 0, None);
-        let zero = observe(&conn, &config, 0, 100, &known_zero);
+        let zero = storeable_usage(&conn, (0, 100), &known_zero, 100);
         assert!(zero.unpriced_tokens.is_empty());
         assert_eq!(zero.multiplier, Some(0.0));
         assert_eq!(zero.fee_multiplier, Some(0.0));
@@ -6473,7 +4691,6 @@ mod tests {
                     requests: std::sync::Mutex::new(Vec::new()),
                 });
                 let catalog = CatalogClient::new(connection.clone(), 0);
-                let config = config(vec![rule("opencode", "google", None)]);
                 reading(&conn, "acct", 10, 0.0, None);
                 reading(&conn, "acct", 90, 50.0, None);
                 for id in ["alias", "alias-again"] {
@@ -6488,9 +4705,9 @@ mod tests {
                         &[("input", "usage.input", 1_000)],
                     );
                 }
-                let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
-                let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
-                let observation = observe(&conn, &config, 0, 100, &rates);
+                let models = test_models(&conn, 0, 100);
+                let rates = resolve_rates(&catalog, &models, 100).unwrap();
+                let observation = pace_ready(storeable_usage(&conn, (0, 100), &rates, 100));
                 assert_eq!(observation.tokens.input, 2_000);
                 assert_eq!(observation.api_nanos, 60_000_000);
                 assert!(observation.unpriced_tokens.is_empty());
@@ -6500,7 +4717,7 @@ mod tests {
                     ("gemini-3.8-flash".into(), Some(100)),
                 ];
                 if !suffix.is_empty() {
-                    expected_requests.insert(0, (event_model, Some(100)));
+                    expected_requests.insert(0, (event_model.clone(), Some(100)));
                 }
                 assert_eq!(*connection.requests.lock().unwrap(), expected_requests);
                 let stored_rates =
@@ -6521,13 +4738,25 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(
-                    report["latest"][0]["api_nanos_by_model"][0]["rates"]["reference_model"],
+                    report["series"][0]["api_nanos_by_model"][0]["rates"]["reference_model"],
                     stored_rates["reference_model"]
                 );
+                for id in ["pace-alias", "pace-alias-again"] {
+                    account_event(
+                        &conn,
+                        id,
+                        "opencode",
+                        "google",
+                        &event_model,
+                        "subscription_included",
+                        20,
+                        &[("input", "usage.input", 1_000)],
+                    );
+                }
                 let pace = multiplier_pace(
                     &conn,
-                    Some(&config),
                     &MultiplierPaceRequest {
+                        pool: None,
                         plan: None,
                         quota_provider: "codex".into(),
                         from_ms: 0,
@@ -6542,7 +4771,7 @@ mod tests {
 
                 let ledger_plan = crate::subscription::read_reprice(&conn, "alias").unwrap();
                 let resolved =
-                    crate::subscription::resolve_reprice(&ledger_plan, &catalog, &[]).unwrap();
+                    crate::subscription::resolve_reprice(&ledger_plan, &catalog).unwrap();
                 let tx = conn.transaction().unwrap();
                 crate::subscription::commit_reprice_in_tx(
                     &tx,
@@ -6590,7 +4819,6 @@ mod tests {
             }),
             0,
         );
-        let config = config(vec![rule("broca", "google", None)]);
         reading(&conn, "acct", 10, 0.0, None);
         reading(&conn, "acct", 90, 50.0, None);
         for model in [
@@ -6611,9 +4839,9 @@ mod tests {
                 &[("input", "usage.input", 1_000)],
             );
         }
-        let plan = plan_observation(&conn, &config, "codex", 0, 100).unwrap();
-        let rates = resolve_rates(&catalog, &catalog_models(&config, &plan), 100).unwrap();
-        let observation = observe(&conn, &config, 0, 100, &rates);
+        let models = test_models(&conn, 0, 100);
+        let rates = resolve_rates(&catalog, &models, 100).unwrap();
+        let observation = storeable_usage(&conn, (0, 100), &rates, 100);
         assert_eq!(observation.tokens.input, 5_000);
         assert_eq!(observation.api_nanos, 60_000_000);
         assert_eq!(observation.unpriced_tokens.len(), 2);
@@ -6641,13 +4869,17 @@ mod tests {
     #[test]
     fn a_correction_replaces_its_day_in_the_report() {
         let mut conn = conn();
-        let original = sample_observation(&conn);
-        let config = config(vec![rule("opencode", "openai", None)]);
-        let next_day = observe(&conn, &config, DAY, 2 * DAY, &ResolvedRates::default());
+        let mut original = sample_observation(&conn);
+        let mut next_day =
+            storeable_usage(&conn, (DAY, 2 * DAY), &ResolvedRates::default(), 2 * DAY);
+        for row in [&mut original, &mut next_day] {
+            row.plan = Some("openai/pro_200".into());
+            row.pool_scope = Some(PoolScope::All);
+        }
         assert_eq!(next_day.observation_day, "1970-01-03");
         let tx = conn.transaction().unwrap();
-        insert_observation_in_tx(&tx, &original).unwrap();
-        insert_observation_in_tx(&tx, &next_day).unwrap();
+        record_one(&tx, &original);
+        record_one(&tx, &next_day);
         let original_id = observation_head(&tx, "codex", "1970-01-02")
             .unwrap()
             .unwrap();
@@ -6708,256 +4940,6 @@ mod tests {
         assert_eq!(report["latest"].as_array().unwrap().len(), 1);
         assert_eq!(report["latest"][0]["observation_day"], "1970-01-03");
         assert_eq!(report["latest"][0]["supersedes"], Value::Null);
-    }
-
-    /// Oracle harness for the observation path over two Codex weeks,
-    /// 2026-09-10..17 and 2026-09-17..24 UTC. It asserts nothing: it opens the
-    /// read-only store copy named by `MULTIPLIER_ORACLE_DB`, computes each
-    /// week's observation through the production path, and prints the quota
-    /// points, subscription, API list value and multiplier. To use it, run it
-    /// against a copy of a real store with that store's Codex account refs
-    /// filled in locally in the `accounts` map below (the committed refs are
-    /// placeholders that match nothing), then compare the printed output with
-    /// a hand computation done on the same copy. The rates are fixed at
-    /// fusiform catalog version 1790261588698 and served by a stand-in catalog,
-    /// so the result does not move when the live catalog does. Ignored by
-    /// default: it needs a store copy.
-    #[test]
-    #[ignore]
-    fn oracle_codex_weeks_on_a_store_copy() {
-        use crate::catalog_client::CatalogConnection;
-        use fusiform_protocol::{CatalogGetRequest, CatalogGetResponse};
-        use std::sync::Arc;
-
-        // Thousandths of a dollar per million tokens, to nano-USD per million.
-        const B: i64 = 1_000_000;
-        // model -> (input, cache_read, cache_write, output), base then above
-        // 272k, in thousandths of a dollar per million tokens.
-        #[allow(clippy::type_complexity)]
-        const RATES: [(&str, [Option<(i64, i64)>; 4]); 7] = [
-            (
-                "gpt-5.4",
-                [
-                    Some((2_500, 5_000)),
-                    Some((250, 500)),
-                    None,
-                    Some((15_000, 22_500)),
-                ],
-            ),
-            (
-                "gpt-5.4-mini",
-                [Some((750, 0)), Some((75, 0)), None, Some((4_500, 0))],
-            ),
-            (
-                "gpt-5.6-luna",
-                [
-                    Some((200, 400)),
-                    Some((20, 40)),
-                    Some((250, 500)),
-                    Some((1_200, 1_800)),
-                ],
-            ),
-            (
-                "gpt-5.6-sol",
-                [
-                    Some((4_000, 8_000)),
-                    Some((400, 800)),
-                    Some((5_000, 10_000)),
-                    Some((20_000, 30_000)),
-                ],
-            ),
-            (
-                "gpt-6-astra",
-                [
-                    Some((10_000, 20_000)),
-                    Some((1_000, 2_000)),
-                    Some((12_500, 25_000)),
-                    Some((50_000, 75_000)),
-                ],
-            ),
-            (
-                "gpt-6-luna",
-                [
-                    Some((100, 200)),
-                    Some((10, 20)),
-                    Some((125, 250)),
-                    Some((500, 750)),
-                ],
-            ),
-            (
-                "gpt-6-sol",
-                [
-                    Some((2_000, 4_000)),
-                    Some((200, 400)),
-                    Some((2_500, 5_000)),
-                    Some((10_000, 15_000)),
-                ],
-            ),
-        ];
-        struct AppendixA;
-        impl CatalogConnection for AppendixA {
-            fn catalog_status(
-                &self,
-                _: fusiform_protocol::StatusRequest,
-            ) -> Result<fusiform_protocol::StatusResponse, crate::catalog_client::CatalogCallError>
-            {
-                Ok(
-                    serde_json::from_value(json!({"source": "fake", "catalog_version": 0,
-                    "model_count": 0, "era_count": 0, "recent_polls": []}))
-                    .unwrap(),
-                )
-            }
-
-            fn catalog_get(
-                &self,
-                request: CatalogGetRequest,
-            ) -> Result<CatalogGetResponse, CatalogCallError> {
-                let refuse = |message: &str| CatalogCallError {
-                    code: "no_coverage".into(),
-                    message: message.into(),
-                };
-                if request.at_ms == Some(0) {
-                    return Err(refuse("fusiform's history begins at 1"));
-                }
-                let provider = request.provider_id.unwrap();
-                let model = request.model_id.unwrap();
-                let Some((_, roles)) = RATES.iter().find(|(id, _)| *id == model) else {
-                    return Err(refuse("unknown model"));
-                };
-                let rate = |units: i64| json!({"state":"priced","units":units,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}});
-                let mut facts = BTreeMap::new();
-                for (role, value) in ["input", "cache_read", "cache_write", "output"]
-                    .iter()
-                    .zip(roles)
-                {
-                    if let Some((base, tier)) = value {
-                        facts.insert(format!("rate.{role}"), rate(base * B));
-                        if *tier > 0 {
-                            facts.insert(
-                                format!("rate.{role}.above_context.272000"),
-                                rate(tier * B),
-                            );
-                        }
-                    }
-                }
-                Ok(CatalogGetResponse {
-                    overrides: Vec::new(),
-                    source: "models.dev".into(),
-                    resolved_at_ms: request.at_ms.unwrap(),
-                    catalog_version: 1_790_261_588_698,
-                    models: BTreeMap::from([(format!("{provider}/{model}"), facts)]),
-                    withheld: vec![],
-                    uncertain: vec![],
-                    next_page_token: None,
-                    curated: vec![],
-                    quality_scores: None,
-                    canonical_links: vec![],
-                    wire_corrections: vec![],
-                    fact_overrides: vec![],
-                    retired: vec![],
-                    aliased: vec![],
-                    plane: None,
-                    billing_rules: vec![],
-                    login_methods: vec![],
-                    speed_twins: vec![],
-                })
-            }
-        }
-        let Ok(path) = std::env::var("MULTIPLIER_ORACLE_DB") else {
-            panic!("set MULTIPLIER_ORACLE_DB to a read-only copy of the live store");
-        };
-        let conn =
-            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        let config: FixtureConfig = serde_json::from_value(json!({
-            "api_twins": {"openai-codex": "openai"},
-            "plan_price_overrides": {},
-            "quota_providers": {"codex": {
-                "window": {"pool_key": "primary", "window_minutes": 10080},
-                "scope": [
-                    {"producer": "pi", "provider": "openai-codex", "charge_basis": null, "model_prefix": null},
-                    {"producer": "opencode", "provider": "openai", "charge_basis": null, "model_prefix": null},
-                    {"producer": "broca", "provider": "openai", "charge_basis": "subscription_included", "model_prefix": null}
-                ],
-                "credentials": {},
-                "accounts": {
-                    "00000000-0000-4000-8000-00000000000a": {"plan": "openai/pro_20x", "price_override": null},
-                    "00000000-0000-4000-8000-00000000000b": {"plan": "openai/pro_20x", "price_override": null}
-                }
-            }}
-        }))
-        .unwrap();
-        config.validate().unwrap();
-        let catalog = CatalogClient::connect(Arc::new(AppendixA)).unwrap();
-        let served = Served(PlanPricesResponse {
-            prices: vec![fusiform_protocol::PlanPriceWire {
-                review_by_ms: 1_797_552_000_000,
-                ..served_price("pro_20x", Some(20_000), None)
-            }],
-            resolved_at_ms: 0,
-            tier_vocabulary: "vendor".into(),
-            unit_policy: "list".into(),
-            quota_pools: Vec::new(),
-        });
-        let snapshot_at_ms = 1_790_262_183_000; // 2026-09-24T15:03:03Z
-        for (name, start, end) in [
-            ("W0", 1_788_998_400_000, 1_789_603_200_000),
-            ("W1", 1_789_603_200_000, 1_790_208_000_000),
-        ] {
-            let plan = plan_observation(&conn, &config, "codex", start, end).unwrap();
-            let rates =
-                resolve_rates(&catalog, &catalog_models(&config, &plan), snapshot_at_ms).unwrap();
-            let plans =
-                resolve_plans(Some(&served), &config, &plan.provider, snapshot_at_ms).unwrap();
-            let observation =
-                compute_observation(&conn, &config, &plan, &rates, &plans, snapshot_at_ms).unwrap();
-            println!(
-                "===== {name} token interval {:?}..{:?}",
-                observation.token_interval_start_ms, observation.token_interval_end_ms
-            );
-            for account in &observation.accounts_included {
-                println!(
-                    "  account {} delta {} boundaries {} backwards {}",
-                    account["account_ref"],
-                    account["delta_percent"],
-                    account["decrease_boundaries"],
-                    account["fetched_at_backwards"]
-                );
-            }
-            for line in &observation.api_nanos_by_model {
-                let t = &line.measured_tokens;
-                println!(
-                    "  {}/{}/{} in={} cr={} cw={} out={} rs={} tiered={} untested={} usd={:.2}",
-                    line.producer,
-                    line.provider,
-                    line.model.as_deref().unwrap_or("-"),
-                    t.input,
-                    t.cache_read,
-                    t.cache_write,
-                    t.output,
-                    t.reasoning,
-                    line.tiered_tokens,
-                    line.base_rate_tier_untested_tokens,
-                    line.api_nanos as f64 / 1e9
-                );
-            }
-            for entry in &observation.unpriced_tokens {
-                println!(
-                    "  unpriced {} {} {} {}",
-                    entry.reason, entry.model, entry.role, entry.tokens
-                );
-            }
-            println!(
-                "  delta% {} subscription ${:.2} fee ${:.2} api ${:.2} multiplier {:?} fee_multiplier {:?} outside_coverage {} low_res {}",
-                observation.delta_percent,
-                observation.subscription_nanos as f64 / 1e9,
-                observation.fee_paid_nanos as f64 / 1e9,
-                observation.api_nanos as f64 / 1e9,
-                observation.multiplier,
-                observation.fee_multiplier,
-                observation.tokens_outside_quota_coverage,
-                observation.low_resolution,
-            );
-        }
     }
 
     /// Catalog facts decode to per-role rates and per-threshold tiers; a

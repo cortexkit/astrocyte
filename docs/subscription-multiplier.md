@@ -9,11 +9,12 @@ list USD per point = clean API list USD / clean points
 ```
 
 An observation day ends a trailing seven-day UTC interval at midnight. Daily
-rows overlap; never add them to recover a week's consumption. Valuation uses the
-attempt's current configuration and catalog snapshot, not event-time invoice
-prices. Recompute can change historical values when prices or scope change.
-Quota readings and scoped events are captured together before catalog calls.
-The spend ledger is not changed.
+rows overlap; never add them to recover a week's consumption. List valuation
+uses catalog rates, not recorded charges. The readings, calls, measurements
+and vault plan history for a provider day are captured together before catalog
+calls; late inputs affect that day only on recompute. The spend ledger is not
+changed. Coverage and pricing do not come from configuration: the only
+configuration members are `poll_interval_secs` and `harness_ingest`.
 
 ## Account and credential identities
 
@@ -25,27 +26,19 @@ share a counter. Readings with neither identity remain latest-only and cannot
 produce a multiplier. Earlier latest-only readings cannot be reconstructed as
 credential history.
 
-Plans come from `vault_plan_history`, not per-account configuration. For each
-day the latest effective observation before its ending midnight supplies the
-plan, joined by account ID or exact vault record ID. Quota provider names need
-not match vault providers. Credential counters use the same reset, high-water,
-clean-hour, saturation and stability rules described below. The report's
-historically named `accounts_included` and `accounts_excluded` lists contain
-`credential_ref` instead of `account_ref` for credential rows; `plan_prices`
-also shows the identity actually priced. Account rows keep their existing shape.
-Unconfigured credential readings are listed in the legacy-named
-`unconfigured_accounts` array and reject the row with `unconfigured_credentials`.
-Their exclusion diagnostics use `credential_ref` and `vault_plan_unknown`.
+Plans come from `vault_plan_history`. A quota-reading pair counts toward a plan
+only if the login holds that plan at both readings. A call counts toward a plan
+only if its current charge basis is `subscription_included` and its login held
+the plan at the call's instant. The call joins by account, or when there is no
+account, by paying credential (resolved credential first, then selected
+credential). No usable login or no plan means the call counts toward no pool.
+There are no producer, provider or model-prefix filters for plan attribution.
+The insula quota provider's name need not match the vault or catalog provider.
 
-Membership counts every identity with a reading of the provider's pool and
-window before the day's end, however old. The quota sample tables' primary keys
-put the identity before the pool and time, so these lookups jump from one
-identity to the next through the key and check each with one seek, instead of
-visiting every reading. The window is not in the key: an identity's readings
-in the same pool under a different window are still stepped over until its
-first matching one. The plan snapshot likewise seeks each vault record's
-latest row before the end, and a counter's reading range stops at its first
-reading after the interval rather than reading all later history.
+Credential counters use the same reset, high-water, clean-hour, saturation
+and stability rules as account counters. The historically named
+`accounts_included` and `accounts_excluded` lists use `credential_ref` for
+credential-keyed logins, and `plan_prices` shows the identity actually priced.
 
 The vault reader uses only `credential.list_scoped` and `auth.watch_scoped`
 under the reserved module's `list` grants on the `llm-provider` category or on
@@ -69,12 +62,9 @@ For each credential, a snapshot uses the last recorded history row whose start
 is before the snapshot's exclusive end. Rows replace earlier recorded evidence
 from their own start onward, even when a correction moves the start backwards
 across an older row's start. A future-start row does not change earlier snapshots.
-Calibration uses the end snapshot, except that an identity whose known plan
-changed in the window is listed in `accounts_excluded` as `vault_plan_changed`.
-Its quota and usage do not calibrate either plan. The first known plan still
-applies from the login's first recorded call.
-The lookup seeks backwards in recording order and stops at the first eligible
-row, skipping future-start rows if needed. Date-only edits to an open,
+The first known plan applies from the login's first recorded call. The lookup
+seeks backwards in recording order and stops at the first eligible row,
+skipping future-start rows if needed. Date-only edits to an open,
 vault-owned ledger plan with the same key leave its fee interval unchanged.
 A valid changed catalog fee for the same key starts a successor at the catalog
 boundary if it follows the open interval's start. The earlier interval keeps
@@ -89,42 +79,49 @@ Fusiform for prices, and only ledger changes enter a writer transaction.
 Diagnostics are cached between reconciles. ChatGPT mismatches refresh on a
 changed snapshot or daily; their query is not part of an idle tick or an hourly price retry.
 
-At the first startup after schema migration 39, the committed config's identity maps seed
-source `config` rows effective at zero, preserving old day recomputation. Live
-maps and per-account price overrides are removed; stored non-null per-account
-overrides refuse hydration instead of being discarded. Plan-key overrides stay.
-Multiple records for one account/provider use the latest effective observation;
-equal-time disagreements have no winner. Config seeds are a fallback for
-accounts for which Vault has not stated a provider or plan. An account spanning
-two known Vault providers is unmeasurable. An unknown provider is not a second
-provider, and a record with neither a provider nor a plan cannot hide the
-account's planned record.
-If both identity namespaces have usable histories for one quota provider, the
-day's row names `mixed_identity_namespaces` and has null ratios.
+## Served pool coverage
 
-With exactly one joined credential, in-scope provider tokens are
-attributed to that credential, in the clean hours only, under the same
-clean-hour rules as account counters. Ledger credential labels are not
-used as a quota identity: some producers omit them and their names need not
-match vault references. More than one joined credential makes every plan
-row ineligible with `multiple_credentials_without_token_attribution`, even when
-the credentials hold the same plan. Those rows have null ratios and no tokens
-assigned to an individual key or plan. Unpriced diagnostics remain visible.
+Insula's `usage.get` supplies each window's `modelScope`. `all` covers every
+call counted toward that login's plan. `subset` covers the models in the
+Fusiform `plan.prices` reply's `quota_pools` list. The lookup uses the catalog
+provider stated by all of that pool's readings and the pool ID. The ID is the
+insula slot name or the raw extra-window ID. For example, an extra window
+stored as `extra:5:Fable` has pool ID `Fable`. An extra window with no ID is
+known only by its position in an array, so it cannot produce a row or compete
+with other windows. Plan prices and subset lists are requested as of the UTC
+midnight ending the observation day, including on recompute.
 
-OpenCode Go uses quota provider `opencodego`, its `tertiary` 43,200-minute pool,
-and plan `opencode-go/go` ($10/month). Kimi for Coding uses quota provider
-`kimi-for-coding`, its `primary` 10,080-minute pool, and plan
-`kimi-code-plan-global/allegro` ($99/month). Plan prices are resolved from the
-catalog, not hard-coded. Their token scopes use ledger providers `opencode-go`
-and `kimi-code-plan-global`, with both `broca` and `opencode` producers. Go's
-paid extra usage cannot be distinguished from included traffic here and would
-distort its ratio; the estimate is not evidence that extra usage is included.
+A subset matches the call's own catalog model ID: try an exact row, then
+remove a trailing `-low` or `-high` if the row is missing, then try an alias.
+An unresolved model belongs only to `all` pools. Membership does not use a
+`quota_proxy` target or depend on whether the rates are usable. A listed
+model with unusable rates is still a member, and its unpriced usage enters
+that pool's diagnostics. List valuation starts from the call's own provider
+and follows catalog references rather than a configured provider alias.
+Reasoning is priced at the selected output rate only when the served reasoning
+rule says so; otherwise it needs a reasoning rate and is unpriced without one.
+
+For each plan and distinct coverage, only the longest window with known
+coverage and one consistent duration is measured. Model lists are compared
+as sets. Two equally long candidates for the same coverage both get
+`window_tie` rows instead of choosing one. Different coverage can overlap:
+a call can count in both an all-models pool and a narrower pool. Excluding
+the call's login from one pool does not exclude it from a sibling pool.
+
+A window with no stated duration anywhere gets no row. Missing or differing
+scopes, inconsistent durations, and missing or empty subset lists produce
+diagnostic rows instead of measurements. A subset list is also treated as
+missing when any reading lacks the catalog provider or the readings disagree
+about it. A `plan.prices` reply without `quota_pools` leaves subset lists
+missing but does not prevent measurement of `all` pools. Historical readings
+can inherit scope at read time under the rules in the [data model](data-model.md#quota-readings-and-multiplier-observations).
+See the [module surface](module-surface.md) for the row members and reason codes.
 
 ## Counter periods and boundaries
 
 Use `COALESCE(raw_used_percent, used_percent)` and sort by fetched timestamp, not
 arrival order. A period ends only when `resets_at` advances by **more than ten
-minutes**, capped at half the configured window length for short pools.
+minutes**, capped at half the stated window length for short pools.
 Codex recomputes its horizon on each read, so small timestamp changes do not
 necessarily mean a new allowance. The tolerance prevents jitter from inventing
 a rollover or making normal readings appear stale, while preserving genuine
@@ -157,55 +154,41 @@ returning the same cached source instant therefore creates no new sample.
 Equal values at distinct fetched instants remain separate rows. Quiet periods
 must not be mistaken for missing consumption just because the history is sparse.
 
-Antigravity `vault` readings before **2026-10-20T19:08Z** are excluded. This is a
-fixed historical correction: that frozen set queried Google's wrong production
-quota pool, not an adjustable source preference. Later `vault` and `oauth`
-readings sample the same counter, although readings can be cached for about
-one hour. Merge those readings using the same reset/high-water rules. Claude
+Antigravity `vault` readings before **2026-10-20T19:08Z** are excluded because
+they measured a different quota pool. This cutoff is not configurable. Later
+`vault` and `oauth` readings sample the same counter, although they can be
+cached for about one hour. Merge them using the same reset/high-water rules. Claude
 readings have no provenance tag; source splitting cannot recover it. An unchanged-reset drop is
 treated as noise, never a new allowance. This includes a reading that briefly
 drops to 0 and returns to its previous percentage with an unchanged reset time.
-Do not choose a source solely by history length: Antigravity's `vault` readings
-before the fixed cutoff queried the wrong production quota pool.
 
 ## Matching numerator and denominator
 
-A configured account-hour is clean only when fully bracketed by short or
-unchanged-period quiet pairs, all bracketing readings are below 100%, reset metadata is usable, and it
-has no positive unpriced quantity. One positive unknown-price token is material:
-premium-model quota burn need not be proportional to token count. Unknown
-measurement quantities and events with no measurements are unknown usage, not
-zero tokens. They exclude the matching account-hour, or every account's hour
-when unattributed, just like unpriced-model usage. Each excluded account-hour
-counts once in the diagnostic `unpriced_share`, not a share-based veto. The retained clean exposure can still
-produce an eligible estimate. No value is fabricated for the excluded usage.
+A login-hour is clean only when fully bracketed by short or unchanged-period
+quiet pairs, all bracketing readings are below 100%, reset metadata is usable,
+and its covered calls have no positive unpriced quantity. One positive
+unknown-price token is material: premium-model quota burn need not be
+proportional to token count. Missing quantities and events with no measurements
+are unknown usage, not zero tokens. Like other unpriced usage, they exclude
+only the corresponding login-hour in this pool. Each such hour counts once
+in `unpriced_share`; the retained clean exposure can still yield an eligible
+estimate. No value is fabricated for the excluded usage.
 
-Attributed events count only in their own configured account's clean hours.
-Unattributed events count only when **every configured account**, across plans,
-is clean. If multiple plans exist, unattributed events are omitted instead of
-inventing a plan allocation. Their omission can lower the measured value; the
-eligibility gate bounds that event fraction. Quota points are summed only over
-the row's plan and its clean account-hours. Unpriced diagnostics retain usage
-from excluded hours so exclusions are visible, even though `tokens` and
-`api_nanos` describe retained hours.
+Each row measures one **(quota provider, plan, pool)**. Its numerator and
+denominator come from the same logins and clean hours. A call can contribute
+only if its login's readings for that pool enter the denominator. The report
+retains unpriced diagnostics from excluded hours even though `tokens` and
+`api_nanos` describe retained hours. Readings without a vault plan do not
+veto other logins' rows. If no readings qualify for any plan, the provider
+day is recorded with no rows. A known plan with no resolved monthly price is
+ineligible and has null ratios. Normalizing fees does not make different
+plans' quota points interchangeable.
 
-Every account with valid readings in the provider's selected pool and window
-must have a known vault plan. Otherwise every plan row names it in
-`unconfigured_accounts`, has null ratios and is ineligible. Observed plans
-without a resolved monthly price likewise have null ratios and cannot be eligible. Events with an
-unknown account reference are treated as unattributed, not silently assigned to
-another configured account.
-
-Measurable rows are per **(quota provider, plan)**. A day with no known plan
-records a diagnostic row with null plan and ratios rather than disappearing.
-Plans can differ in capacity and usage behavior; normalizing their fees does
-not make their quota points interchangeable.
-Historical provider rows remain unchanged; their new fields default to null
-plan, false eligibility and `legacy_estimator`. Schema 35 preserves their
-append-only history and gives each plan an independent supersession chain.
-In the report, `latest` is ordered by quota provider and plan. A legacy pooled
-head appears there only while its provider has no plan-specific observation;
-`series` retains both legacy and plan-specific heads in the requested range.
+The report and bucket use each provider's newest recorded day, even when that
+day contains only unmeasured rows or has no rows at all. A recompute reconciles
+that day's pool set by appending rows and retiring heads for dropped pools;
+it never rewrites older observations. See the [module surface](module-surface.md)
+for how `latest`, `series` and `last_eligible` handle historical rows.
 
 For account-bearing plans the same vault history creates ledger coverage from
 the account's first recorded call, using fusiform's sourced recurring price.
@@ -265,7 +248,7 @@ interval** for priced accounts of the plan, not the price of clean exposure;
 
 All policies are named constants in `multiplier/clean.rs` and
 `multiplier/calibration.rs`; they are deliberately
-not tunable configuration. Shares use all configured account-hours in the plan
+not tunable configuration. Shares use all hours for the pool's priced logins
 as denominator, including unobserved hours. Exclusions may overlap, so shares
 need not sum to one.
 
@@ -274,14 +257,12 @@ need not sum to one.
 | At least 24 clean account-hours total | `insufficient_clean_hours` | Require a minimum matched sample, not a fixed coverage share. |
 | At most 25% saturated account-hours | `saturation` | Capped periods select heavy-use traffic, so excluding too much can bias the estimate. Saturated exposure is censored, not free. |
 | Reset metadata present throughout observed exposure | `unknown_reset` | A percentage drop alone cannot identify a period. |
-| No unconfigured observed account | `unconfigured_accounts` | Numerator/denominator membership must agree. |
 | Every included plan price resolved | `unpriced_plan` | No subscription-cost denominator can be fabricated. |
-| At most 5% unattributed events when plans differ | `unattributed_plan_usage` | Do not assign unattributed events to a guessed plan. This is an event-share budget, not a money bound. |
 | At least 20 clean points | `insufficient_points` | One point of endpoint quantization is 5% of twenty points. |
 | At least 3 active UTC days | `insufficient_stability_days` | Leave-one-day-out evaluation must retain at least two training days. |
 | Conditional day-block 95% interval width at most 50% of pooled USD/point | `unstable_estimate` | Limit uncertainty in the retained estimate rather than requiring a fixed coverage share. |
 | Positive finite multiplier | `nonpositive_ratio` | Missing value or zero burn is not a free routing price. |
-| In-scope sources fresh and drained | `source_backlog` | A successful bounded page can leave older usage pending. |
+| Tracked sources fresh and drained | `source_backlog` | A successful bounded page can leave older usage pending. |
 
 There is no clean-, gap- or unknown-share veto. Excluding hours from both
 value and points reduces sample size but does not itself prove bias. The
@@ -291,36 +272,12 @@ still exclude their hours and are never valued at zero. Saturation keeps its
 25% veto: capped periods select the heaviest-use traffic, so their exclusion
 can bias the retained estimate even when it is numerically stable.
 
-### How the thresholds were chosen
-
-On one development store in October 2026:
-
-- Reset times within one quota period ranged by up to 312 seconds; consecutive
-  changes reached 61 seconds, while separate periods were at least 85,737
-  seconds apart. Ten minutes accommodates that jitter without merging those
-  periods; the half-window cap preserves short-window rollovers.
-- Saturation occupied 19% of Codex account-time and 40.9% of Claude account-time,
-  motivating a 25% limit on heavy-use censoring.
-- About 2.2% of Codex events lacked a matched account, supporting a 5% omission
-  budget without inventing a plan allocation.
-- Conditional interval widths were about 10–15% for pro_200 measurements and
-  about 62–100% for pro_100, Claude and Muse measurements. A 50% width budget
-  separated those stable and variable estimates on that store.
-
-These are dated observations, not universal provider guarantees. To compare
-another store, use seven-day UTC windows and inspect `window_sample` reset
-times, event/account matches, and the shares and stability diagnostics from
-`spend.multiplier.report`. Validation holds out each UTC day and fits on the
-remaining days, as described below.
-
 ### Stability and held-out-day validation
 
 The calculation retains exact rate-times-token numerators, points and clean
-hours in six-hour bins from the same owned snapshot as the observation. Codex
-plan validation is account-matched; a single configured account uses its
-provider scope conditionally, and unattributed multi-account single-plan usage
-uses provider/plan bins without inventing account assignment. Empty zero/zero
-bins do not inflate fit metrics; zero-point bins with list value remain.
+hours in six-hour bins from the same captured inputs as the observation.
+Each bin sums matched login-hour usage and quota points for the pool. Empty
+zero/zero bins do not inflate fit metrics; zero-point bins with list value remain.
 
 Three hundred deterministic resamples draw whole UTC-day blocks, preserving
 all accounts and bins of a day together. Each draw uses a ratio of sums, not an
@@ -336,35 +293,34 @@ held-out UTC days, not the seven highly overlapping rolling-week ratios.
 
 `stability_diagnostics` serves the recorded summary. Its immutable inputs and
 summary are retained as `plan_calibration` alongside each included account's
-JSON diagnostics, explicitly shared at plan level; no table migration or guessed
-allocation of provider-wide value is needed. `account_slot` identifies matched
-bins in sorted configured plan-member order. Exact numerators are decimal
-strings so JSON integer limits and per-bin rounding cannot alter row money.
+JSON diagnostics, shared by the row's included logins. Exact numerators are
+decimal strings so JSON integer limits and per-bin rounding cannot alter row money.
 Legacy observations without those inputs report null stability diagnostics.
 
-Readiness requires `last_success_ms` at/after the interval end **and** no
-`pending_known` or `pending_unknown`. Before two hours after the boundary the
-operation waits; afterwards it may append a diagnostic row, never an eligible
-one. Recompute rechecks the same readiness even for existing rows. The reader alias
-`opencode-v2` inherits its ledger producer's scope.
-Sources absent from `source_runtime` are not independently certified; neither
-this gate nor configuration proves that traffic outside ingestion is visible.
+For pools that can be measured, every tracked source must have
+`last_success_ms` at/after the interval end **and** no `pending_known` or
+`pending_unknown` backlog. Before two hours after the boundary the operation
+waits; afterwards it may append a diagnostic row, never an eligible one.
+Recompute checks the same readiness. Sources absent from `source_runtime`
+are not independently certified; this gate does not prove that traffic
+outside ingestion is visible.
 
-Rows also expose `unattributed_event_share`, `zero_measurement_events` and
-`missing_quantity_events`. The report additionally derives
+Rows expose `zero_measurement_events` and `missing_quantity_events`. The
+historical `unattributed_event_share` field is zero on new rows because calls
+without a usable login and plan are not admitted. The report derives
 `unknown_quantity_measurements` from the persisted missing-quantity diagnostics;
 several missing measurements in one event count separately there. Event and
-measurement counts include excluded hours and apply to the plan's attributed
-events plus provider-wide unattributed events. They distinguish an absent
+measurement counts include excluded hours and apply to the pool's attributed
+events. They distinguish an absent
 quantity from an event with no measurements. Nonzero counts are compatible with
 an eligible row when its retained sample is adequate and stable; neither counts
 nor unknown-hour share are vetoes. No schema change is needed for the derived report count.
 
-`spend.multiplier.report` serves all diagnostics additively. A numeric ratio
-alone is not authorization: consumers must use `routing_eligible` and match the
-plan and model/request mixture. Pace accepts `plan`, requires it when plans
-differ, selects only eligible unsuperseded heads and requires a head ending no
-more than two days before the requested end. It labels the result eligible and
-estimated. It never falls back to a legacy or ineligible head. An eligible
-Spark-only calibration does not supply a Wonder Full tariff or establish a
-quota conversion for a different workload mixture.
+`spend.multiplier.report` serves the diagnostics. A numeric ratio alone is not
+authorization: consumers must use `routing_eligible` and match the plan, pool
+and model/request mixture. Pace reads the recorded coverage and rates from an
+eligible, unsuperseded pool head, without contacting the catalog. It requires
+`plan` or `pool` when bounded candidates are ambiguous at that selection step.
+The [pace contract](module-surface.md) describes the time bound and the limit
+on offline subset membership. An estimate for one workload is not a tariff
+or a quota conversion for a different workload mixture.

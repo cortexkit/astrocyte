@@ -1,7 +1,6 @@
 #[test]
 fn rate_era_multiplier_values_each_call_and_does_not_recompute_stored_observations() {
     let mut conn = conn();
-    let declarations = config(vec![rule("opencode", "openai", None)]);
     for (index, at) in [10, 110, 210, 310].into_iter().enumerate() {
         event(
             &conn,
@@ -14,9 +13,6 @@ fn rate_era_multiplier_values_each_call_and_does_not_recompute_stored_observatio
             &[("input", "fixture", 100)],
         );
     }
-    reading(&conn, "acct", 0, 0.0, None);
-    reading(&conn, "acct", 400, 10.0, None);
-    let plan = plan_observation(&conn, &declarations, "codex", 0, 400).unwrap();
     let history: fusiform_protocol::HistoryResponse = serde_json::from_value(json!({
         "source":"synthetic", "provider_id":"openai", "model_id":"m", "fact_prefix":"rate.", "eras":[],
         "served_by_key":{"rate.input":[
@@ -28,10 +24,8 @@ fn rate_era_multiplier_values_each_call_and_does_not_recompute_stored_observatio
     })).unwrap();
     let fetched = crate::rate_era::fetched(history, "openai", "m", None).unwrap();
     crate::rate_era::publish(&conn, &fetched, 1).unwrap();
-    let rates =
-        crate::rate_era::resolved_rates(&conn, &catalog_models(&declarations, &plan), 400).unwrap();
-    let observation =
-        compute_observation(&conn, &declarations, &plan, &rates, &priced_plan(), 400).unwrap();
+    let rates = crate::rate_era::resolved_rates(&conn, &test_models(&conn, 0, 400), 400).unwrap();
+    let observation = storeable_usage(&conn, (0, 400), &rates, 400);
     assert_eq!(observation.api_nanos, 400_000);
     assert!(observation
         .unpriced_tokens
@@ -50,7 +44,11 @@ fn rate_era_multiplier_values_each_call_and_does_not_recompute_stored_observatio
     let mut changed = fetched;
     changed.segments.clear();
     crate::rate_era::publish(&conn, &changed, 2).unwrap();
-    assert!(observation_exists(&conn, "codex", &observation.observation_day).unwrap());
+    assert!(
+        observation_head(&conn, "codex", &observation.observation_day)
+            .unwrap()
+            .is_some()
+    );
     let unchanged: String = conn
         .query_row(
             "SELECT api_nanos_by_model FROM multiplier_observation",
@@ -97,8 +95,6 @@ fn reasoning_billed_as_history_controls_list_value_and_multiplier_at_call_time()
     let model = "gpt-6.1-sol";
     let fetched = crate::rate_era::fetched(history, "openai", model, None).unwrap();
     crate::rate_era::publish(&conn, &fetched, 1).unwrap();
-    let config = config(vec![rule("opencode", "openai", None)]);
-    let rules = ValuationRules::from_config(&config, &[]);
     let call = EventTokens {
         producer: "opencode".into(),
         provider: "openai".into(),
@@ -123,7 +119,7 @@ fn reasoning_billed_as_history_controls_list_value_and_multiplier_at_call_time()
     .enumerate()
     {
         let resolution = crate::rate_era::resolve(&conn, "openai", model, at).unwrap();
-        let value = crate::valuation::list_value_event(&rules, resolution.as_ref(), &call).unwrap();
+        let value = crate::valuation::list_value_event(resolution.as_ref(), &call).unwrap();
         assert_eq!(
             value.numerator,
             i128::from(charge) * 1_000_000,
@@ -144,15 +140,10 @@ fn reasoning_billed_as_history_controls_list_value_and_multiplier_at_call_time()
             &[("reasoning", "fixture", 1_000_000)],
         );
     }
-    reset_reading(&conn, "acct", from_ms - 50, 0.0, from_ms + DAY);
-    reset_reading(&conn, "acct", from_ms + 150, 10.0, from_ms + DAY);
     let end = from_ms + 150;
-    let plan = plan_observation(&conn, &config, "codex", from_ms - 50, end).unwrap();
-    let rates =
-        crate::rate_era::resolved_rates(&conn, &catalog_models(&config, &plan), end).unwrap();
-    let observation =
-        super::compute_observation(&conn, &config, &plan, &rates, &priced_plan(), end, &[])
-            .unwrap();
+    let rates = crate::rate_era::resolved_rates(&conn, &test_models(&conn, from_ms - 50, end), end)
+        .unwrap();
+    let observation = storeable_usage(&conn, (from_ms - 50, end), &rates, end);
     assert_eq!(observation.api_nanos, 20_000_000_000);
     assert_eq!(observation.tokens.reasoning, 4_000_000);
     assert_eq!(observation.unpriced_tokens.len(), 1);
@@ -175,7 +166,6 @@ fn reasoning_billed_as_history_controls_list_value_and_multiplier_at_call_time()
 fn reasoning_billed_as_valuation(
     facts: BTreeMap<String, Value>,
     mode: Option<&str>,
-    legacy: &[String],
 ) -> crate::valuation::ListValue {
     let conn = conn();
     let segments: BTreeMap<_, _> = facts
@@ -197,8 +187,6 @@ fn reasoning_billed_as_valuation(
     let fetched = crate::rate_era::fetched(history, "openai", "gpt-6.1-sol", None).unwrap();
     crate::rate_era::publish(&conn, &fetched, 1).unwrap();
     let resolution = crate::rate_era::resolve(&conn, "openai", "gpt-6.1-sol", 10).unwrap();
-    let config = config(vec![]);
-    let rules = ValuationRules::from_config(&config, legacy);
     // The sample is filtered to output and reasoning, so the input is
     // unpriced; its quantity is still what selects the tier.
     let call = EventTokens {
@@ -224,7 +212,7 @@ fn reasoning_billed_as_valuation(
             ),
         ],
     };
-    crate::valuation::list_value_event(&rules, resolution.as_ref(), &call).unwrap()
+    crate::valuation::list_value_event(resolution.as_ref(), &call).unwrap()
 }
 
 #[test]
@@ -233,13 +221,13 @@ fn reasoning_billed_as_valuation_follows_the_crossed_output_tier() {
         crate::test_support::reasoning_vector("openai-dated.json");
     let facts = response.models.remove("openai/gpt-6.1-sol").unwrap();
     assert_eq!(
-        reasoning_billed_as_valuation(facts, None, &[]).numerator,
+        reasoning_billed_as_valuation(facts, None).numerator,
         15_000_000_000_000_000
     );
 }
 
 #[test]
-fn reasoning_billed_as_valuation_prefers_the_published_tier_even_with_legacy_setting() {
+fn reasoning_billed_as_valuation_prefers_the_published_tier() {
     let mut response: fusiform_protocol::CatalogGetResponse =
         crate::test_support::reasoning_vector("openai-dated.json");
     let mut facts = response.models.remove("openai/gpt-6.1-sol").unwrap();
@@ -248,7 +236,7 @@ fn reasoning_billed_as_valuation_prefers_the_published_tier_even_with_legacy_set
         reference_rate(7_000_000_000),
     );
     assert_eq!(
-        reasoning_billed_as_valuation(facts.clone(), None, &["openai".into()]).numerator,
+        reasoning_billed_as_valuation(facts.clone(), None).numerator,
         7_000_000_000_000_000
     );
     for (reason, expected) in [
@@ -260,7 +248,7 @@ fn reasoning_billed_as_valuation_prefers_the_published_tier_even_with_legacy_set
             json!({"state":"unpriced", "reason":reason}),
         );
         assert_eq!(
-            reasoning_billed_as_valuation(facts.clone(), None, &[]).numerator,
+            reasoning_billed_as_valuation(facts.clone(), None).numerator,
             expected
         );
     }
@@ -344,20 +332,15 @@ impl crate::catalog_client::CatalogConnection for ReasoningQuotaCatalog {
 fn reasoning_billed_as_kimi_uses_the_dated_quota_donor_but_opencode_does_not() {
     let conn = conn();
     let catalog = CatalogClient::new(std::sync::Arc::new(ReasoningQuotaCatalog), 0);
-    let config = config(vec![
-        rule("opencode", "kimi-code-plan-global", None),
-        rule("opencode", "opencode-go", None),
-    ]);
     let end = 100;
     for (provider, model) in [
         ("opencode-go", "kimi-k3.1-pro"),
         ("kimi-code-plan-global", "k3.1-pro"),
         ("moonshotai", "kimi-k3.1-pro"),
     ] {
-        let fetched = crate::rate_era::fetch(&catalog, provider, model, &config.api_twins).unwrap();
+        let fetched = crate::rate_era::fetch(&catalog, provider, model).unwrap();
         crate::rate_era::publish(&conn, &fetched, 1).unwrap();
     }
-    let rules = ValuationRules::from_config(&config, &[]);
     for (provider, model, units) in [
         ("opencode-go", "kimi-k3.1-pro", 0),
         ("kimi-code-plan-global", "k3.1-pro", 10_000_000_000_i64),
@@ -377,7 +360,7 @@ fn reasoning_billed_as_kimi_uses_the_dated_quota_donor_but_opencode_does_not() {
             )],
         };
         let resolution = crate::rate_era::resolve(&conn, provider, model, 20).unwrap();
-        let value = crate::valuation::list_value_event(&rules, resolution.as_ref(), &call).unwrap();
+        let value = crate::valuation::list_value_event(resolution.as_ref(), &call).unwrap();
         assert_eq!(value.numerator, i128::from(units) * 1_000_000, "{provider}");
         event(
             &conn,
@@ -390,16 +373,11 @@ fn reasoning_billed_as_kimi_uses_the_dated_quota_donor_but_opencode_does_not() {
             &[("reasoning", "fixture", 1_000_000)],
         );
     }
-    reading(&conn, "acct", 10, 0.0, None);
-    reading(&conn, "acct", 90, 10.0, None);
-    let plan = plan_observation(&conn, &config, "codex", 0, end).unwrap();
-    let models = catalog_models(&config, &plan);
+    let models = test_models(&conn, 0, end);
     let cached = crate::rate_era::resolved_rates(&conn, &models, end).unwrap();
     let direct = resolve_rates(&catalog, &models, end).unwrap();
     for rates in [cached, direct] {
-        let observation =
-            super::compute_observation(&conn, &config, &plan, &rates, &priced_plan(), end, &[])
-                .unwrap();
+        let observation = storeable_usage(&conn, (0, end), &rates, end);
         assert_eq!(observation.api_nanos, 10_000_000_000);
         assert_eq!(observation.unpriced_tokens.len(), 1);
         assert_eq!(observation.unpriced_tokens[0].reason, "no_rate");

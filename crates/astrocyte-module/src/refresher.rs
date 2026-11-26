@@ -97,7 +97,7 @@ use astrocyte_core::ingest::EventRecordRequest;
 use astrocyte_core::{
     capacity::{apply_snapshot_in_tx, record_failed_attempt, CapacitySnapshot},
     catalog_client::{CatalogClient, CatalogConnection},
-    multiplier::{self, MultiplierConfig, PlanPriceSource},
+    multiplier::{self, PlanPriceSource},
 };
 use rusqlite::{params, Transaction};
 
@@ -337,12 +337,10 @@ fn publish_desired_transaction(
         .0
         .checked_add(1)
         .ok_or_else(|| "desired generation overflow".to_string())?;
-    let multiplier =
-        config::multiplier_column(&desired.config).map_err(|error| error.to_string())?;
     let ingest =
         config::harness_ingest_column(&desired.config).map_err(|error| error.to_string())?;
-    // Keep the legacy path columns in the schema but never publish paths.
-    tx.execute("UPDATE desired_config SET generation=?1,canonical_bytes=?2,content_hash=?3,poll_interval_secs=?4,qta_connection_file=NULL,broca_connection_file=NULL,fusiform_connection_file=NULL,updated_at_ms=?5,subscription_multiplier=?6,harness_ingest=?7 WHERE id=1", params![generation, desired.canonical_bytes, desired.content_hash, i64::try_from(desired.config.poll_interval_secs).map_err(|_| "poll interval exceeds SQLite integer".to_string())?, now_ms, multiplier, ingest]).map_err(|error| error.to_string())?;
+    // These legacy columns no longer belong to newly published generations.
+    tx.execute("UPDATE desired_config SET generation=?1,canonical_bytes=?2,content_hash=?3,poll_interval_secs=?4,qta_connection_file=NULL,broca_connection_file=NULL,fusiform_connection_file=NULL,updated_at_ms=?5,subscription_multiplier=NULL,harness_ingest=?6 WHERE id=1", params![generation, desired.canonical_bytes, desired.content_hash, i64::try_from(desired.config.poll_interval_secs).map_err(|_| "poll interval exceeds SQLite integer".to_string())?, now_ms, ingest]).map_err(|error| error.to_string())?;
     tx.execute(
         "UPDATE source_runtime SET desired_generation=?1",
         [generation],
@@ -1449,6 +1447,7 @@ mod tests {
         /// Code served while refusing. `unavailable` is the warming peer;
         /// anything non-retryable models a producer this binary cannot talk to.
         refusal_code: &'static str,
+        pub(super) reasoning_rule: bool,
     }
 
     impl LateCatalog {
@@ -1457,6 +1456,7 @@ mod tests {
                 refusals,
                 calls: AtomicUsize::new(0),
                 refusal_code: "unavailable",
+                reasoning_rule: false,
             }
         }
     }
@@ -1491,15 +1491,19 @@ mod tests {
                 });
             }
             let rate = serde_json::json!({"state":"priced","units":3_000,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}});
-            Ok(serde_json::from_value(serde_json::json!({
+            let mut reply = serde_json::json!({
                 "source": "late-fake",
                 "resolved_at_ms": request.at_ms,
                 "catalog_version": 1,
                 "models": {"anthropic/claude": {"rate.input": rate,
                     "rate.output": {"state":"priced","units":6000,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}}}},
                 "withheld": [], "uncertain": [], "overridden": []
-            }))
-            .unwrap())
+            });
+            if self.reasoning_rule {
+                reply["models"]["anthropic/claude"]["rate.reasoning"] =
+                    serde_json::json!({"state":"billed_as","key":"rate.output"});
+            }
+            Ok(serde_json::from_value(reply).unwrap())
         }
     }
 
@@ -1764,6 +1768,7 @@ mod tests {
             refusals: usize::MAX,
             calls: AtomicUsize::new(0),
             refusal_code: "future_code",
+            reasoning_rule: false,
         });
         let pending = PendingCatalog { connection: peer };
         assert_eq!(
@@ -2226,8 +2231,6 @@ mod loop_tests {
         let state = test_state();
         let config = config::AstrocyteConfig {
             poll_interval_secs: 11,
-            reasoning_billed_as_output: Vec::new(),
-            subscription_multiplier: config::intentional_empty().config.subscription_multiplier,
             harness_ingest: config::HarnessIngest::all_on(),
         };
 
@@ -2350,8 +2353,6 @@ mod loop_tests {
         let temp = tempfile::TempDir::new().unwrap();
         let desired = config::canonicalize(config::AstrocyteConfig {
             poll_interval_secs: 60,
-            reasoning_billed_as_output: Vec::new(),
-            subscription_multiplier: config::intentional_empty().config.subscription_multiplier,
             harness_ingest: config::HarnessIngest::all_on(),
         })
         .unwrap();
@@ -2651,92 +2652,5 @@ mod discovery_logging_tests {
                 ),
             "{stdout}\n{stderr}"
         );
-    }
-}
-
-#[cfg(test)]
-mod multiplier_stage_tests {
-    use super::*;
-
-    /// Records today's observation for every quota provider in the production
-    /// config into a COPY of the live store (`MULTIPLIER_REHEARSAL_DB`, already
-    /// migrated), through the real fusiform client on the daemon connection
-    /// file `MULTIPLIER_REHEARSAL_SUBC`: the same read, resolve and append steps
-    /// the daily stage runs. Both fusiform calls are reads. Ignored by default:
-    /// it needs the copy and a live daemon.
-    #[test]
-    #[ignore]
-    fn live_rehearsal_on_a_store_copy() {
-        let database = std::env::var("MULTIPLIER_REHEARSAL_DB").expect("MULTIPLIER_REHEARSAL_DB");
-        let subc = std::env::var("MULTIPLIER_REHEARSAL_SUBC").expect("MULTIPLIER_REHEARSAL_SUBC");
-        let desired =
-            config::decode(include_str!("../../../docs/prod-config/astrocyte-v2.jsonc")).unwrap();
-        let config::MultiplierSetting::Recorded(config) = desired.config.subscription_multiplier
-        else {
-            unreachable!("a decoded document records the member");
-        };
-        let client = Arc::new(crate::fusiform_client::FusiformClient::for_test(subc).unwrap());
-        let connection: Arc<dyn CatalogConnection> = client.clone();
-        let catalog = CatalogClient::connect(connection).unwrap();
-        let mut conn = rusqlite::Connection::open(database).unwrap();
-        let now = current_time_ms();
-        let end = now - now.rem_euclid(DAY_MS);
-        for quota_provider in config.quota_providers.keys() {
-            let plan = multiplier::plan_observation(
-                &conn,
-                &config,
-                quota_provider,
-                end - MULTIPLIER_INTERVAL_MS,
-                end,
-            )
-            .unwrap();
-            let rates = multiplier::resolve_rates(
-                &catalog,
-                &multiplier::catalog_models(&config, &plan),
-                now,
-            )
-            .unwrap();
-            let plans =
-                multiplier::resolve_plans(Some(client.as_ref()), &config, &plan.provider, now)
-                    .unwrap();
-            let observation = multiplier::compute_observation(
-                &conn,
-                &config,
-                &plan,
-                &rates,
-                &plans,
-                now,
-                &["openai".into()],
-            )
-            .unwrap();
-            let tx = conn.transaction().unwrap();
-            multiplier::insert_observation_in_tx(&tx, &observation).unwrap();
-            tx.commit().unwrap();
-            println!(
-                "{quota_provider} {} delta% {} subscription ${:.2} fee ${:.2} api ${:.2} multiplier {:?} fee_multiplier {:?} excluded {} unpriced {} outside {} untested {} low_res {}",
-                observation.observation_day,
-                observation.delta_percent,
-                observation.subscription_nanos as f64 / 1e9,
-                observation.fee_paid_nanos as f64 / 1e9,
-                observation.api_nanos as f64 / 1e9,
-                observation.multiplier,
-                observation.fee_multiplier,
-                serde_json::to_string(&observation.accounts_excluded).unwrap(),
-                serde_json::to_string(&observation.unpriced_tokens).unwrap(),
-                observation.tokens_outside_quota_coverage,
-                observation.base_rate_tier_untested_tokens,
-                observation.low_resolution,
-            );
-            for price in &observation.plan_prices {
-                println!(
-                    "  plan {} {} {:?} {:?} overdue {}",
-                    price.account_ref,
-                    price.plan,
-                    price.source,
-                    price.monthly_nanos,
-                    price.plan_price_overdue
-                );
-            }
-        }
     }
 }

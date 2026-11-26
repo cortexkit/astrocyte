@@ -25,7 +25,7 @@ fn cache_write_billed_as_ledger(
     *fake.response.lock().unwrap() = reply;
     let mut plan = read_reprice(&conn, &id).unwrap();
     plan.mode = mode.map(str::to_owned);
-    let resolved = resolve_reprice(&plan, &client(fake), &[])?;
+    let resolved = resolve_reprice(&plan, &client(fake))?;
     let tx = conn.transaction().unwrap();
     commit_reprice_in_tx(&tx, &plan, &resolved, 1_002, PricingOrigin::PricingPass).unwrap();
     tx.commit().unwrap();

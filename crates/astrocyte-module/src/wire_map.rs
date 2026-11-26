@@ -924,7 +924,7 @@ mod tests {
         state
             .ordered_write(|tx| {
                 let plan = pricing::read_reprice_in_tx(tx, &event_id).unwrap();
-                let resolved = pricing::resolve_reprice(&plan, &catalog, &[]).unwrap();
+                let resolved = pricing::resolve_reprice(&plan, &catalog).unwrap();
                 pricing::commit_reprice_in_tx(
                     tx,
                     &plan,
@@ -1011,7 +1011,7 @@ mod tests {
         state
             .ordered_write(|tx| {
                 let plan = pricing::read_reprice_in_tx(tx, &event_id).unwrap();
-                let resolved = pricing::resolve_reprice(&plan, &catalog, &[]).unwrap();
+                let resolved = pricing::resolve_reprice(&plan, &catalog).unwrap();
                 pricing::commit_reprice_in_tx(
                     tx,
                     &plan,

@@ -1411,53 +1411,39 @@ fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignal
                     .to_string(),
             ),
         });
-        // The daily subscription multiplier reads fusiform on a clock, not per
-        // event: once per quota provider per UTC day, on the first tick after
-        // 00:00Z. It makes no call when no quota provider is declared, or when
-        // the committed generation does not record the member.
-        let multiplier_declared = matches!(
-            &desired.subscription_multiplier,
-            config::MultiplierSetting::Recorded(multiplier)
-                if !multiplier.quota_providers.is_empty()
-        );
-        if multiplier_declared {
-            let daily = || {
-                Some(SignalCadence::Literal {
-                    interval_ms: 86_400_000,
-                })
-            };
-            declarations.push(SelfSignalDeclaration {
-                name: "astrocyte-fusiform-plan-prices".to_string(),
-                kind: SelfSignalKind::Poller,
-                effect: SelfSignalEffect::Observe,
-                anchored_to: SignalAnchor::FixedInterval,
-                cadence: daily(),
-                domain: Some("fusiform".to_string()),
-                note: Some(
-                    "One plan.prices per declared quota provider per UTC day, for the \
-                     subscription multiplier, and one per quota provider a \
-                     spend.multiplier.recompute request recomputes; \
-                     skipped when every account of that provider has a configured price \
-                     override."
-                        .to_string(),
-                ),
-            });
-            declarations.push(SelfSignalDeclaration {
-                name: "astrocyte-fusiform-multiplier-rates".to_string(),
-                kind: SelfSignalKind::Poller,
-                effect: SelfSignalEffect::Observe,
-                anchored_to: SignalAnchor::FixedInterval,
-                cadence: daily(),
-                domain: Some("fusiform".to_string()),
-                note: Some(
-                    "One catalog.get per model in a quota provider's subscription scope, per \
-                     declared quota provider per UTC day, to value that day's multiplier \
-                     observation at list prices, and the same set again for each quota \
-                     provider a spend.multiplier.recompute request recomputes."
-                        .to_string(),
-                ),
-            });
-        }
+        let daily = || {
+            Some(SignalCadence::Literal {
+                interval_ms: 86_400_000,
+            })
+        };
+        declarations.push(SelfSignalDeclaration {
+            name: "astrocyte-fusiform-plan-prices".to_string(),
+            kind: SelfSignalKind::Poller,
+            effect: SelfSignalEffect::Observe,
+            anchored_to: SignalAnchor::FixedInterval,
+            cadence: daily(),
+            domain: Some("fusiform".to_string()),
+            note: Some(
+                "Reads plan.prices for each provider day valued by the daily subscription \
+                 multiplier or by spend.multiplier.recompute."
+                    .to_string(),
+            ),
+        });
+        declarations.push(SelfSignalDeclaration {
+            name: "astrocyte-fusiform-multiplier-rates".to_string(),
+            kind: SelfSignalKind::Poller,
+            effect: SelfSignalEffect::Observe,
+            anchored_to: SignalAnchor::FixedInterval,
+            cadence: daily(),
+            domain: Some("fusiform".to_string()),
+            note: Some(
+                "One catalog.get per model in a quota provider's measured pools, per \
+                 quota provider per UTC day, to value that day's multiplier \
+                 observation at list prices, and the same set again for each quota \
+                 provider a spend.multiplier.recompute request recomputes."
+                    .to_string(),
+            ),
+        });
     }
     if desired.harness_ingest.ingests("colliculus") {
         declarations.push(SelfSignalDeclaration {
@@ -2396,8 +2382,6 @@ mod tests {
     fn desired() -> config::AstrocyteConfig {
         config::AstrocyteConfig {
             poll_interval_secs: 45,
-            reasoning_billed_as_output: Vec::new(),
-            subscription_multiplier: config::intentional_empty().config.subscription_multiplier,
             harness_ingest: config::HarnessIngest::all_on(),
         }
     }
@@ -2499,6 +2483,8 @@ mod tests {
                 "astrocyte-fusiform-catalog-lookup",
                 "astrocyte-fusiform-history-status",
                 "astrocyte-fusiform-history-probe",
+                "astrocyte-fusiform-plan-prices",
+                "astrocyte-fusiform-multiplier-rates",
                 "astrocyte-colliculus-usage-read",
             ])
         );
@@ -2531,29 +2517,9 @@ mod tests {
         assert!(status["note"].as_str().unwrap().contains("catalog.status"));
     }
 
-    /// A declared quota provider adds the daily multiplier's two fusiform
-    /// calls, plan.prices and its rate lookups, on a literal daily cadence.
     #[test]
-    fn manifest_declares_the_daily_multiplier_calls_when_a_quota_provider_is_declared() {
-        let mut desired = desired();
-        let decoded =
-            config::decode(include_str!("../../../docs/prod-config/astrocyte-v2.jsonc")).unwrap();
-        desired.subscription_multiplier = decoded.config.subscription_multiplier;
-        let manifest = manifest("astrocyte", &desired);
-        assert_eq!(
-            self_signal_names(&manifest),
-            expected_signals(&[
-                "astrocyte-insula-usage-poll",
-                "astrocyte-insula-quota-body",
-                "astrocyte-ckbus-credentials",
-                "astrocyte-fusiform-catalog-lookup",
-                "astrocyte-fusiform-history-status",
-                "astrocyte-fusiform-history-probe",
-                "astrocyte-fusiform-plan-prices",
-                "astrocyte-fusiform-multiplier-rates",
-                "astrocyte-colliculus-usage-read",
-            ])
-        );
+    fn manifest_declares_daily_multiplier_calls_without_a_settings_declaration() {
+        let manifest = manifest("astrocyte", &desired());
         let wire = serde_json::to_value(&manifest).unwrap();
         let plan_prices = wire["self_signals"]
             .as_array()
@@ -2586,6 +2552,8 @@ mod tests {
                 "astrocyte-fusiform-catalog-lookup",
                 "astrocyte-fusiform-history-status",
                 "astrocyte-fusiform-history-probe",
+                "astrocyte-fusiform-plan-prices",
+                "astrocyte-fusiform-multiplier-rates",
             ])
         );
         assert_eq!(
@@ -2631,6 +2599,8 @@ mod tests {
                 "astrocyte-fusiform-catalog-lookup",
                 "astrocyte-fusiform-history-status",
                 "astrocyte-fusiform-history-probe",
+                "astrocyte-fusiform-plan-prices",
+                "astrocyte-fusiform-multiplier-rates",
             ];
             let mut modules = vec!["fusiform", "insula", "ckbus", "claustrum"];
             if colliculus_enabled {
@@ -2704,6 +2674,8 @@ mod tests {
                 "astrocyte-fusiform-catalog-lookup",
                 "astrocyte-fusiform-history-status",
                 "astrocyte-fusiform-history-probe",
+                "astrocyte-fusiform-plan-prices",
+                "astrocyte-fusiform-multiplier-rates",
             ];
             if enabled {
                 modules.push("colliculus");
@@ -2744,35 +2716,6 @@ mod tests {
     }
 
     #[test]
-    fn check_config_accepts_the_closed_live_document() {
-        let path =
-            std::env::temp_dir().join(format!("astrocyte-check-{}.jsonc", std::process::id()));
-        let mut document = json!({"poll_interval_secs":60,"reasoning_billed_as_output":[],
-            "subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},
-                "quota_providers":{"antigravity":{
-                    "window":{"pool_key":"extra:13:gemini-weekly","window_minutes":10080},
-                    "scope":[{"producer":"broca","provider":"google","charge_basis":null,"model_prefix":null}]
-                }}}, "harness_ingest":{"enabled":true,"exclude":[]}});
-        let mut output = Vec::new();
-        std::fs::write(&path, document.to_string()).unwrap();
-        check_config(&path, &mut output).unwrap();
-        assert!(output.is_empty());
-        let scope =
-            &mut document["subscription_multiplier"]["quota_providers"]["antigravity"]["scope"][0];
-        scope["model_prefix"] = json!("antigravity-gemini-");
-        std::fs::write(&path, document.to_string()).unwrap();
-        check_config(&path, &mut output).unwrap();
-        document["subscription_multiplier"]["quota_providers"]["antigravity"]["scope"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("model_prefix");
-        std::fs::write(&path, document.to_string()).unwrap();
-        let error = check_config(&path, &mut output).unwrap_err();
-        assert!(error.to_string().contains("model_prefix"), "{error}");
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn check_config_preflight_rejects_retired_catalog_file() {
         let path = std::env::temp_dir().join(format!(
             "astrocyte-check-unknown-{}.jsonc",
@@ -2780,7 +2723,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            br#"{"poll_interval_secs":60,"catalog_file":null,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[]}}"#,
+            br#"{"poll_interval_secs":60,"catalog_file":null,"harness_ingest":{"enabled":true,"exclude":[]}}"#,
         )
         .unwrap();
         assert!(check_config(&path, &mut Vec::new()).is_err());
@@ -2795,11 +2738,7 @@ mod tests {
             "astrocyte-check-ingest-{}.jsonc",
             std::process::id()
         ));
-        let document = |ingest: &str| {
-            format!(
-                r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{{"api_twins":{{}},"plan_price_overrides":{{}},"quota_providers":{{}}}}{ingest}}}"#
-            )
-        };
+        let document = |ingest: &str| format!(r#"{{"poll_interval_secs":60{ingest}}}"#);
         for (ingest, needle) in [
             (
                 r#","harness_ingest":{"enabled":true,"exclude":["cluade-code"]}"#,

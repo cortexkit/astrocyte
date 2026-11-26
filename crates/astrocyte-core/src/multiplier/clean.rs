@@ -1,11 +1,17 @@
 //! Reset-aware, matched account-hour calibration. Do not pool readings across
 //! plans: a point on one plan is not interchangeable with a point on another.
+use crate::subscription::PlanLedger;
+
 use super::calibration::{CalibrationBin, MIN_ACTIVE_DAYS};
+use super::measurement::{
+    measure_quota, measure_usage, record_unpriced, unpriced_tokens, CounterFee,
+};
+use super::pools::{PoolCall, PoolLogin, PoolReadingRun};
 use super::*;
 
 // The ten-minute backstop leaves five minutes of margin for changed-counter
 // pairs. Equal values in the same known period can bridge longer quiet gaps.
-const MAX_GAP_MS: i64 = 15 * 60_000;
+pub(super) const MAX_GAP_MS: i64 = 15 * 60_000;
 pub(super) const ANTIGRAVITY_WRONG_VAULT_CUTOFF_NS: i64 = 1_792_523_280_000_000_000;
 // On one development store in October 2026, within-period reset times varied
 // by up to 312 seconds; separate periods were at least 85,737 seconds apart.
@@ -13,20 +19,16 @@ pub(super) const ANTIGRAVITY_WRONG_VAULT_CUTOFF_NS: i64 = 1_792_523_280_000_000_
 pub(crate) const RESET_TOLERANCE_MS: i64 = 10 * 60_000;
 // A full day of matched account-hours and twenty points are the minimum sample;
 // excluded exposure is reported, not used as an unsupported share floor.
-const MIN_CLEAN_HOURS: usize = 24;
+pub(super) const MIN_CLEAN_HOURS: usize = 24;
 // On one development store in October 2026, saturation occupied 19% of Codex
 // account-time and 40.9% of Claude account-time. The 25% veto limits selected
 // heavy-use exposure; other exclusions use sample adequacy and stability.
-const MAX_SATURATED_SHARE: f64 = 0.25;
+pub(super) const MAX_SATURATED_SHARE: f64 = 0.25;
 // A one-point endpoint error is at most 5% of twenty accumulated points.
-const MIN_POINTS: f64 = 20.0;
+pub(super) const MIN_POINTS: f64 = 20.0;
 // A positive quantity with unknown pricing may represent premium burn even
 // with few tokens. No positive quantity is assumed free.
-const MATERIAL_TOKENS: i64 = 1;
-// On one development store in October 2026, 2.2% of Codex events were unmatched.
-// Allow at most 5% omitted events rather than inventing a plan allocation, and
-// disclose the omission even below the budget; this is not a value bound.
-const MAX_UNATTRIBUTED_SHARE: f64 = 0.05;
+pub(super) const MATERIAL_TOKENS: i64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(super) struct CounterHour {
@@ -46,10 +48,6 @@ fn quiet_pair(previous: &Sample, current: &Sample, tolerance: i64) -> bool {
     previous.used.total_cmp(&current.used).is_eq()
         && matches!((previous.reset, current.reset), (Some(old), Some(new))
             if (i128::from(new) - i128::from(old)).abs() <= i128::from(tolerance))
-}
-
-fn reset_tolerance(window: &WindowSelector) -> i64 {
-    reset_tolerance_ms(window.window_minutes)
 }
 
 /// How far a window's reset time must move forward before the readings belong
@@ -73,95 +71,28 @@ fn calibration_bin(bins: &mut BTreeMap<i64, CalibrationBin>, at_ms: i64) -> &mut
     })
 }
 
-fn account_calibration_bin(
-    bins: &mut BTreeMap<(usize, i64), CalibrationBin>,
-    slot: usize,
-    at_ms: i64,
-) -> &mut CalibrationBin {
-    let start_ms = at_ms.div_euclid(CALIBRATION_BIN_MS) * CALIBRATION_BIN_MS;
-    bins.entry((slot, start_ms)).or_insert(CalibrationBin {
-        start_ms,
-        account_slot: Some(slot),
-        ..CalibrationBin::default()
-    })
+pub(super) fn historical_sample_excluded(provider: &str, source: Option<&str>, at_ns: i64) -> bool {
+    // Before 2026-10-20 19:08Z Antigravity vault queried Google's wrong pool.
+    // Later vault and oauth readings sample the same counter.
+    provider == "antigravity"
+        && source == Some("vault")
+        && at_ns < ANTIGRAVITY_WRONG_VAULT_CUTOFF_NS
 }
 
-/// The readings a counter needs: every matching reading from `?5` through
-/// `?6`, plus the first matching reading after `?6`, which closes the last
-/// interval for coverage interpolation.
-///
-/// The upper bound is that first later reading (or `?6` when none exists), so
-/// the primary key's time range stops there. No matching reading lies between
-/// `?6` and it, so this selects exactly the rows that "through `?6`, or equal
-/// to the first later reading" would. Written as that OR, SQLite could only
-/// bound the range below and would read every later reading of the identity.
-pub(super) fn counter_samples_sql(credential: bool) -> String {
-    let sql =
-        "SELECT fetched_at_instant, COALESCE(raw_used_percent, used_percent), resets_at, source
-         FROM window_sample WHERE provider=?1 AND account_ref=?2 AND pool_key=?3
-         AND window_minutes=?4 AND fetched_at_instant>=?5
-         AND fetched_at_instant<=COALESCE((
-             SELECT MIN(tail.fetched_at_instant) FROM window_sample tail
-             WHERE tail.provider=?1 AND tail.account_ref=?2 AND tail.pool_key=?3
-               AND tail.window_minutes=?4 AND tail.fetched_at_instant>?6), ?6)
-         ORDER BY fetched_at_instant, rowid";
-    if credential {
-        sql.replace("window_sample", "credential_window_sample")
-            .replace("account_ref", "credential_ref")
-    } else {
-        sql.to_string()
-    }
-}
-
-pub(super) fn counter_delta(
-    conn: &Connection,
-    provider: &str,
-    identity: (&str, bool),
-    window: &WindowSelector,
-    start: i64,
-    end: i64,
-) -> rusqlite::Result<AccountDelta> {
-    let (account, credential) = identity;
-    let tolerance = reset_tolerance(window);
-    // Only the identity column and table differ; reset and coverage rules are
-    // shared so a credential counter cannot receive a more permissive estimate.
-    let mut statement = conn.prepare_cached(&counter_samples_sql(credential))?;
-    let rows = statement.query_map(
-        params![
-            provider,
-            account,
-            window.pool_key,
-            window.window_minutes,
-            clamp_nanos(millis_to_nanos(
-                start.saturating_sub(window.window_minutes.saturating_mul(60_000))
-            )),
-            clamp_nanos(millis_to_nanos(end.saturating_add(MAX_GAP_MS)))
-        ],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, f64>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        },
-    )?;
+/// Measure one continuous run. A change of plan ends the counter series, so
+/// neither its high-water mark nor its reset horizon carries into a later run.
+pub(super) fn measure_run<'a>(
+    login: &str,
+    readings: impl IntoIterator<Item = (i64, f64, Option<&'a str>)>,
+    tolerance: i64,
+    (start, end): (i64, i64),
+) -> AccountDelta {
     let mut samples = Vec::new();
     let mut latest_reset: Option<i64> = None;
     let mut stale_reset_readings = 0_u64;
-    for row in rows {
-        let (at_ns, used, reset, source) = row?;
-        // Fixed historical exclusion, not a tuning knob: before 2026-10-20
-        // 19:08Z Antigravity vault queried Google's wrong production pool.
-        // Later vault and oauth readings sample the same counter.
-        if provider == "antigravity"
-            && source.as_deref() == Some("vault")
-            && at_ns < ANTIGRAVITY_WRONG_VAULT_CUTOFF_NS
-        {
-            continue;
-        }
+    for (at_ns, used, reset) in readings {
         let reset = reset
-            .and_then(|text| chrono::DateTime::parse_from_rfc3339(&text).ok())
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
             .map(|at| at.timestamp_millis());
         if let (Some(latest), Some(reset)) = (latest_reset, reset) {
             // A cached reading from the previous allowance cannot raise the
@@ -185,7 +116,7 @@ pub(super) fn counter_delta(
         });
     }
     let mut result = AccountDelta {
-        account_ref: account.into(),
+        account_ref: login.into(),
         delta_percent: 0.0,
         readings: 0,
         decrease_boundaries: 0,
@@ -278,447 +209,276 @@ pub(super) fn counter_delta(
             at = until;
         }
     }
-    Ok(result)
+    result
 }
 
-/// Prices only matched clean account-hours from the owned planning snapshot.
-/// Unknown account plans invalidate every plan row, rather than silently
-/// leaving their list value in the numerator with no denominator.
-pub fn compute_plan_observations(
-    conn: &Connection,
-    config: &MultiplierConfig,
-    plan: &ObservationPlan,
-    rates: &ResolvedRates,
-    prices: &BTreeMap<String, PlanPriceUsed>,
-    snapshot_at_ms: i64,
-    reasoning_billed_as_output: &[String],
-) -> Result<Vec<Observation>, MultiplierError> {
-    let plans: BTreeSet<_> = plan
-        .provider
-        .members()
-        .values()
-        .map(|account| account.plan.clone())
-        .collect();
-    if plans.is_empty() {
-        let mut row = compute_observation(
-            conn,
-            config,
-            plan,
-            rates,
-            prices,
-            snapshot_at_ms,
-            reasoning_billed_as_output,
-        )?;
-        row.eligibility_reasons = plan
-            .provider
-            .unknown_reasons
-            .values()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        if row.eligibility_reasons.is_empty() {
-            row.eligibility_reasons.push("vault_plan_unknown".into());
+struct PoolCounter {
+    delta: AccountDelta,
+    segments: u64,
+}
+
+impl PoolCounter {
+    fn add_run(&mut self, run: AccountDelta) {
+        self.segments += run.segments();
+        let delta = &mut self.delta;
+        delta.delta_percent += run.delta_percent;
+        delta.readings += run.readings;
+        delta.decrease_boundaries += run.decrease_boundaries;
+        delta.fetched_at_backwards += run.fetched_at_backwards;
+        delta.stale_reset_readings += run.stale_reset_readings;
+        delta.reset_boundaries += run.reset_boundaries;
+        if let Some((from, to)) = run.coverage_ms {
+            delta.coverage_ms = Some(delta.coverage_ms.map_or((from, to), |(old_from, old_to)| {
+                (old_from.min(from), old_to.max(to))
+            }));
         }
-        row.eligibility_reasons
-            .push("insufficient_clean_hours".into());
-        row.routing_eligible = false;
-        row.multiplier = None;
-        row.fee_multiplier = None;
-        return Ok(vec![row]);
+        for (hour, next) in run.hours {
+            let counter = delta.hours.entry(hour).or_default();
+            counter.points += next.points;
+            counter.covered_ms += next.covered_ms;
+            counter.saturated |= next.saturated;
+            counter.reset_unknown |= next.reset_unknown;
+        }
     }
+}
+
+#[derive(Default)]
+struct Quality {
+    clean_count: usize,
+    saturated: usize,
+    gaps: usize,
+    unpriced_hours: usize,
+    unknown_reset: bool,
+}
+
+/// Gate and value calls already narrowed to this plan, pool and the logins
+/// with priced counters. Other plans or pools cannot change its calibration.
+pub(super) fn measure_pool(
+    row: &mut Observation,
+    reading_runs: &[PoolReadingRun<'_>],
+    prices: &BTreeMap<&PoolLogin, PlanPriceUsed>,
+    calls: &[&PoolCall],
+    rates: &ResolvedRates,
+) -> Result<(), MultiplierError> {
+    let interval = (row.interval_start_ms, row.interval_end_ms);
     let lookup = ModelLookup::new(rates);
-    let rules = ValuationRules::from_config(config, reasoning_billed_as_output);
     let mut bad_hours = BTreeSet::new();
-    let mut event_numerators = BTreeMap::new();
-    for event in &plan.events {
-        let mut unpriced = BTreeMap::new();
-        let resolution = event.tokens.model.as_deref().and_then(|model| {
-            lookup.get_at(
-                rules.catalog_provider(&event.tokens.provider),
-                model,
-                event.occurred_at_ms,
-            )
-        });
-        let mut event_lines = BTreeMap::new();
-        value_event(
-            &rules,
-            resolution,
-            &event.tokens,
-            &mut event_lines,
-            &mut unpriced,
-            &mut RoleTokens::default(),
-        )?;
-        let numerator = event_lines.values().try_fold(0_i128, |sum, line| {
-            sum.checked_add(line.numerator)
-                .ok_or(MoneyError::OutOfRange)
-        })?;
-        event_numerators.insert(event.id, numerator);
-        let missing = unpriced
-            .keys()
-            .any(|(reason, _, _)| reason == "missing_quantity");
-        let unknown = event.tokens.roles.is_empty() || missing;
-        if unknown
-            || unpriced
-                .values()
-                .any(|(tokens, _)| *tokens >= MATERIAL_TOKENS)
+    let mut diagnostics = BTreeMap::new();
+    let mut numerators = Vec::with_capacity(calls.len());
+    let mut fee_calls = Vec::new();
+    for call in calls {
+        let event = &call.tokens;
+        let resolution = event
+            .model
+            .as_deref()
+            .and_then(|model| lookup.get_at(&event.provider, model, call.occurred_at_ms));
+        let value = crate::valuation::value_event(resolution, event)?;
+        let zero_measurements = event.roles.is_empty();
+        let missing_quantity = value
+            .unpriced
+            .iter()
+            .any(|token| token.reason == "missing_quantity");
+        row.zero_measurement_events += u64::from(zero_measurements);
+        row.missing_quantity_events += u64::from(
+            event
+                .roles
+                .iter()
+                .any(|(_, _, _, quantity, exponent)| quantity.is_none() || exponent.is_none()),
+        );
+        if zero_measurements
+            || missing_quantity
+            || value
+                .unpriced
+                .iter()
+                .any(|token| token.quantity >= MATERIAL_TOKENS)
         {
-            let hour = event.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS;
-            match event.account_ref.as_ref().filter(|account| {
-                !plan.provider.credential_keyed && plan.provider.accounts.contains_key(*account)
-            }) {
-                Some(account) => {
-                    bad_hours.insert((account.clone(), hour));
-                }
-                None => {
-                    for account in plan.provider.members().keys() {
-                        bad_hours.insert((account.clone(), hour));
-                    }
-                }
+            // Each call is keyed by its account or, when it has no account,
+            // its paying credential. A bad hour vetoes only that login.
+            bad_hours.insert((
+                &call.login,
+                call.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS,
+            ));
+        }
+        if !zero_measurements
+            && event
+                .roles
+                .iter()
+                .all(|(_, _, _, quantity, exponent)| quantity.is_some() && exponent.is_some())
+        {
+            fee_calls.push((event, call.occurred_at_ms));
+        }
+        numerators.push(value.numerator);
+        record_unpriced(event, value.unpriced, &mut diagnostics)?;
+    }
+
+    let mut counters = BTreeMap::<_, PoolCounter>::new();
+    for run in reading_runs {
+        let delta = measure_run(
+            &run.login.id,
+            run.readings.iter().map(|r| {
+                (
+                    r.fetched_at_instant_ns,
+                    r.used_percent,
+                    r.resets_at.as_deref(),
+                )
+            }),
+            reset_tolerance_ms(row.window_minutes),
+            interval,
+        );
+        match counters.entry(run.login) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().add_run(delta)
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(PoolCounter {
+                    segments: delta.segments(),
+                    delta,
+                });
             }
         }
     }
-    let first_hour = plan.interval_start_ms.div_euclid(HOUR_MS) * HOUR_MS;
-    let hours: Vec<_> = (first_hour..plan.interval_end_ms)
+
+    let mut quality = Quality::default();
+    let mut bins = BTreeMap::new();
+    let mut clean_hours = BTreeSet::new();
+    let hours: Vec<_> = (interval.0.div_euclid(HOUR_MS) * HOUR_MS..interval.1)
         .step_by(usize::try_from(HOUR_MS).expect("hour fits usize"))
         .collect();
-    let clean = |account: &str, hour: i64| {
-        plan.accounts
-            .iter()
-            .find(|row| row.account_ref == account)
-            .and_then(|row| row.hours.get(&hour))
-            .is_some_and(|counter| {
-                counter.covered_ms == HOUR_MS && !counter.saturated && !counter.reset_unknown
-            })
-            && !bad_hours.contains(&(account.to_string(), hour))
-    };
-    let mut output = Vec::new();
-    for name in &plans {
-        let members: BTreeSet<_> = plan
-            .provider
-            .members()
-            .iter()
-            .filter(|(_, account)| &account.plan == name)
-            .map(|(account, _)| account.clone())
-            .collect();
-        let mut filtered = plan.clone();
-        let member_slots: BTreeMap<_, _> = members
-            .iter()
-            .enumerate()
-            .map(|(slot, account)| (account.clone(), slot))
-            .collect();
-        filtered
-            .accounts
-            .retain(|account| members.contains(&account.account_ref));
-        filtered
-            .provider
-            .members_mut()
-            .retain(|account, _| members.contains(account));
-        // A call with no account can be valued only in an hour where every
-        // counter of a single-plan provider is clean; otherwise it is dropped.
-        // A clean account's points from such an hour would then be counted
-        // without the value that burned them, which drags the ratio down as
-        // other accounts saturate, so those hours count on neither side.
-        let attributed = |account: Option<&String>| {
-            account.is_some_and(|account| {
-                !plan.provider.credential_keyed && plan.provider.accounts.contains_key(account)
-            })
-        };
-        let can_pool = plans.len() == 1 && plan.changed_accounts.is_empty();
-        let pooled_hours: BTreeSet<i64> = plan
-            .events
-            .iter()
-            .filter(|event| !attributed(event.account_ref.as_ref()))
-            .map(|event| event.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS)
-            .filter(|hour| {
-                !can_pool
-                    || !plan
-                        .provider
-                        .members()
-                        .keys()
-                        .all(|account| clean(account, *hour))
-            })
-            .collect();
-        let paired =
-            |account: &str, hour: i64| clean(account, hour) && !pooled_hours.contains(&hour);
-        let mut clean_count = 0_usize;
-        let mut saturated = 0_usize;
-        let mut gaps = 0_usize;
-        let mut unpriced = 0_usize;
-        let mut unknown_reset = false;
-        let mut calibration_bins = BTreeMap::new();
-        let mut account_bins = BTreeMap::new();
-        for account in &mut filtered.accounts {
-            account.delta_percent = 0.0;
-            for hour in &hours {
-                let counter = account.hours.get(hour);
-                saturated += usize::from(counter.is_some_and(|counter| counter.saturated));
-                gaps += usize::from(counter.is_none_or(|counter| counter.covered_ms != HOUR_MS));
-                unknown_reset |= counter.is_some_and(|counter| counter.reset_unknown);
-                unpriced += usize::from(bad_hours.contains(&(account.account_ref.clone(), *hour)));
-                if paired(&account.account_ref, *hour) {
-                    clean_count += 1;
-                    account.delta_percent += counter.map_or(0.0, |counter| counter.points);
-                    if prices
-                        .get(&account.account_ref)
-                        .is_some_and(|price| price.monthly_nanos.is_some())
-                    {
-                        let bin = calibration_bin(&mut calibration_bins, *hour);
-                        bin.clean_account_hours += 1;
-                        bin.points += counter.map_or(0.0, |counter| counter.points);
-                        let bin = account_calibration_bin(
-                            &mut account_bins,
-                            member_slots[&account.account_ref],
-                            *hour,
-                        );
-                        bin.clean_account_hours += 1;
-                        bin.points += counter.map_or(0.0, |counter| counter.points);
-                    }
+    let mut priced_count = 0;
+    for (&login, counter) in &mut counters {
+        if prices[login].monthly_nanos.is_none() {
+            continue;
+        }
+        priced_count += 1;
+        counter.delta.delta_percent = 0.0;
+        for &hour in &hours {
+            let sample = counter.delta.hours.get(&hour);
+            let bad = bad_hours.contains(&(login, hour));
+            quality.unpriced_hours += usize::from(bad);
+            quality.gaps += usize::from(sample.is_none_or(|sample| sample.covered_ms != HOUR_MS));
+            if let Some(sample) = sample {
+                quality.saturated += usize::from(sample.saturated);
+                quality.unknown_reset |= sample.reset_unknown;
+                if !bad
+                    && sample.covered_ms == HOUR_MS
+                    && !sample.saturated
+                    && !sample.reset_unknown
+                {
+                    clean_hours.insert((login, hour));
+                    quality.clean_count += 1;
+                    counter.delta.delta_percent += sample.points;
+                    let bin = calibration_bin(&mut bins, hour);
+                    bin.clean_account_hours += 1;
+                    bin.points += sample.points;
                 }
             }
         }
-        let mut unmatched = 0_usize;
-        let ambiguous_credentials = plan.provider.credentials.len() > 1;
-        // The fee ratio compares the plan's whole list value with its fee, so
-        // it counts every call the plan can be credited with, in any hour.
-        // Only the quota ratio needs clean counter hours. A call whose usage
-        // is unknown is left out, so the ratio is a known-value lower bound;
-        // such calls are counted in `zero_measurement_events` and
-        // `missing_quantity_events`.
-        let mut fee_view = filtered.clone();
-        fee_view.events.retain(|event| {
-            let known = !event.tokens.roles.is_empty()
-                && event
-                    .tokens
-                    .roles
-                    .iter()
-                    .all(|(_, _, _, quantity, exponent)| quantity.is_some() && exponent.is_some());
-            known
-                && !ambiguous_credentials
-                && match event
-                    .account_ref
-                    .as_ref()
-                    .filter(|account| attributed(Some(*account)))
-                {
-                    Some(account) => members.contains(account),
-                    None => can_pool,
-                }
-        });
-        fee_view.token_interval_ms = Some((plan.interval_start_ms, plan.interval_end_ms));
-        filtered.events.retain(|event| {
-            if ambiguous_credentials {
-                return false;
-            }
-            let hour = event.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS;
-            match event.account_ref.as_ref().filter(|account| {
-                !plan.provider.credential_keyed && plan.provider.accounts.contains_key(*account)
-            }) {
-                Some(account) => members.contains(account) && paired(account, hour),
-                None => {
-                    unmatched += 1;
-                    can_pool
-                        && plan
-                            .provider
-                            .members()
-                            .keys()
-                            .all(|account| clean(account, hour))
-                }
-            }
-        });
-        filtered.token_interval_ms = Some((plan.interval_start_ms, plan.interval_end_ms));
-        for event in &filtered.events {
-            let bin = calibration_bin(&mut calibration_bins, event.occurred_at_ms);
+    }
+
+    let mut clean_calls = Vec::new();
+    for (call, numerator) in calls.iter().zip(numerators) {
+        let hour = call.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS;
+        // Each call already names its login, so multiple credentials do not
+        // prevent a call from matching one counter.
+        if clean_hours.contains(&(&call.login, hour)) {
+            let bin = calibration_bin(&mut bins, hour);
             bin.api_numerator = bin
                 .api_numerator
-                .checked_add(event_numerators[&event.id])
+                .checked_add(numerator)
                 .ok_or(MoneyError::OutOfRange)?;
-            let slot = event
-                .account_ref
-                .as_ref()
-                .filter(|_| !plan.provider.credential_keyed)
-                .and_then(|account| member_slots.get(account))
-                .copied()
-                .or_else(|| (members.len() == 1).then_some(0));
-            if let Some(slot) = slot {
-                let bin = account_calibration_bin(&mut account_bins, slot, event.occurred_at_ms);
-                bin.api_numerator = bin
-                    .api_numerator
-                    .checked_add(event_numerators[&event.id])
-                    .ok_or(MoneyError::OutOfRange)?;
-            }
+            clean_calls.push((&call.tokens, call.occurred_at_ms));
         }
-        let plan_prices: BTreeMap<_, _> = prices
-            .iter()
-            .filter(|(account, _)| members.contains(*account))
-            .map(|(account, price)| (account.clone(), price.clone()))
-            .collect();
-        let mut row = compute_observation(
-            conn,
-            config,
-            &filtered,
-            rates,
-            &plan_prices,
-            snapshot_at_ms,
-            reasoning_billed_as_output,
-        )?;
-        row.fee_multiplier = compute_observation(
-            conn,
-            config,
-            &fee_view,
-            rates,
-            &plan_prices,
-            snapshot_at_ms,
-            reasoning_billed_as_output,
-        )?
-        .fee_multiplier;
-        let use_account_bins = plans.len() > 1 || members.len() == 1;
-        let validation_bins: Vec<_> = if use_account_bins {
-            account_bins.into_values().collect()
-        } else {
-            calibration_bins.into_values().collect()
-        };
-        let grain = if plans.len() > 1 {
-            "account_matched_six_hour"
-        } else if members.len() == 1 {
-            "single_account_scope_six_hour"
-        } else {
-            "provider_plan_six_hour"
-        };
-        let stability = super::calibration::assess(&validation_bins, grain);
-        // Each included account shares this plan-level calibration. Repeating
-        // its immutable inputs and summary avoids inventing account attribution
-        // for provider-wide usage or changing an applied table migration.
-        let calibration = json!({"summary": &stability, "bins": &validation_bins});
-        for account in &mut row.accounts_included {
-            account["plan_calibration"] = calibration.clone();
-        }
-        // Preserve diagnostics for excluded hours too. A clean Spark estimate
-        // must not make an unpriced premium model disappear from the report.
-        let mut diagnostics = BTreeMap::new();
-        let mut zero_measurements = 0_u64;
-        let mut missing_quantities = 0_u64;
-        for event in plan.events.iter().filter(|event| {
-            event.account_ref.as_ref().is_none_or(|account| {
-                !!plan.provider.credential_keyed
-                    || !plan.provider.accounts.contains_key(account)
-                    || members.contains(account)
-            })
-        }) {
-            zero_measurements += u64::from(event.tokens.roles.is_empty());
-            missing_quantities += u64::from(
-                event
-                    .tokens
-                    .roles
-                    .iter()
-                    .any(|(_, _, _, quantity, exponent)| quantity.is_none() || exponent.is_none()),
-            );
-            let resolution = event.tokens.model.as_deref().and_then(|model| {
-                lookup.get_at(
-                    rules.catalog_provider(&event.tokens.provider),
-                    model,
-                    event.occurred_at_ms,
-                )
-            });
-            value_event(
-                &rules,
-                resolution,
-                &event.tokens,
-                &mut BTreeMap::new(),
-                &mut diagnostics,
-                &mut RoleTokens::default(),
-            )?;
-        }
-        row.unpriced_tokens = diagnostics
-            .into_iter()
-            .filter(|((reason, _, _), (tokens, _))| *tokens > 0 || reason == "missing_quantity")
-            .map(
-                |((reason, model, role), (tokens, measurements))| UnpricedTokens {
-                    reason,
-                    model,
-                    role,
-                    tokens,
-                    measurements,
-                },
-            )
-            .collect();
-        row.plan = Some(name.clone());
-        row.zero_measurement_events = zero_measurements;
-        row.missing_quantity_events = missing_quantities;
-        row.unattributed_event_share = unmatched as f64 / plan.events.len().max(1) as f64;
-        let total = (members.len() * hours.len()).max(1) as f64;
-        row.clean_hours_share = clean_count as f64 / total;
-        row.saturated_share = saturated as f64 / total;
-        row.gap_share = gaps as f64 / total;
-        row.unpriced_share = unpriced as f64 / total;
-        row.eligibility_reasons.clear();
-        if let Some(reason) = &plan.provider.membership_reason {
-            row.eligibility_reasons.push(reason.clone());
-            row.multiplier = None;
-            row.fee_multiplier = None;
-        }
-        let unresolved_price = row.accounts_excluded.iter().any(|account| {
-            account["reason"] != "account_not_configured"
-                && account["reason"] != "credential_not_configured"
-        });
-        for (bad, reason) in [
-            (
-                ambiguous_credentials,
-                "multiple_credentials_without_token_attribution",
-            ),
-            (
-                !row.unconfigured_accounts.is_empty(),
-                if !plan.provider.credential_keyed {
-                    "unconfigured_accounts"
-                } else {
-                    "unconfigured_credentials"
-                },
-            ),
-            (unresolved_price, "unpriced_plan"),
-            (clean_count < MIN_CLEAN_HOURS, "insufficient_clean_hours"),
-            (row.saturated_share > MAX_SATURATED_SHARE, "saturation"),
-            (unknown_reset, "unknown_reset"),
-            (
-                plans.len() > 1
-                    && unmatched as f64 / plan.events.len().max(1) as f64 > MAX_UNATTRIBUTED_SHARE,
-                "unattributed_plan_usage",
-            ),
-            (row.delta_percent < MIN_POINTS, "insufficient_points"),
-            (
-                stability.active_days < MIN_ACTIVE_DAYS,
-                "insufficient_stability_days",
-            ),
-            (
-                stability.active_days >= MIN_ACTIVE_DAYS && !stability.passes_width_gate(),
-                "unstable_estimate",
-            ),
-            (
-                row.multiplier
-                    .is_none_or(|ratio| !ratio.is_finite() || ratio <= 0.0),
-                "nonpositive_ratio",
-            ),
-        ] {
-            if bad {
-                row.eligibility_reasons.push(reason.into());
-            }
-        }
-        if ambiguous_credentials || unresolved_price || !row.unconfigured_accounts.is_empty() {
-            row.multiplier = None;
-            row.fee_multiplier = None;
-        }
-        // The quota ratio counts only clean hours. With none, the plan's quota
-        // was not measured that day, which is not the same as unused.
-        if clean_count == 0
-            || (row.api_nanos == 0
-                && row
-                    .unpriced_tokens
-                    .iter()
-                    .any(|unpriced| unpriced.tokens > 0 && unpriced.reason != "missing_quantity"))
-        {
-            row.multiplier = None;
-        }
-        row.routing_eligible = row.eligibility_reasons.is_empty();
-        row.error_inflating = "Estimate, not a marginal tariff. Bounded boundary pairs are time-interpolated; unseen pre-reset burn and unrecorded traffic remain unknown. Unattributed usage is omitted when plans differ.".into();
-        output.push(row);
     }
-    Ok(output)
+    let token_interval = Some(interval);
+    let usage = measure_usage(clean_calls, token_interval, &lookup)?;
+    let quota = measure_quota(
+        row.window_minutes,
+        token_interval,
+        counters.iter().map(|(&login, counter)| CounterFee {
+            counter: &counter.delta,
+            identity_field: match login.ledger {
+                PlanLedger::Account => "account_ref",
+                PlanLedger::Credential => "credential_ref",
+            },
+            price: prices.get(login),
+            segments: counter.segments,
+        }),
+    )?;
+    row.multiplier = usage.ratio(quota.subscription_nanos);
+    row.fee_multiplier =
+        measure_usage(fee_calls, token_interval, &lookup)?.ratio(quota.fee_paid_nanos);
+    row.tokens = usage.tokens;
+    row.api_nanos = usage.api_nanos;
+    row.api_nanos_by_model = usage.api_nanos_by_model;
+    row.base_rate_tier_untested_tokens = usage.base_rate_tier_untested_tokens;
+    row.tokens_outside_quota_coverage = usage.tokens_outside_quota_coverage;
+    row.unpriced_tokens = unpriced_tokens(diagnostics);
+    row.subscription_nanos = quota.subscription_nanos;
+    row.fee_paid_nanos = quota.fee_paid_nanos;
+    row.delta_percent = quota.delta_percent;
+    row.accounts_included = quota.accounts_included;
+    row.accounts_excluded = quota.accounts_excluded;
+    row.excluded_pairs = quota.excluded_pairs;
+    row.low_resolution = quota.low_resolution;
+
+    let bins: Vec<_> = bins.into_values().collect();
+    let grain = if priced_count == 1 {
+        "single_account_scope_six_hour"
+    } else {
+        "provider_plan_six_hour"
+    };
+    let stability = super::calibration::assess(&bins, grain);
+    let calibration = json!({"summary": &stability, "bins": &bins});
+    for login in &mut row.accounts_included {
+        login["plan_calibration"] = calibration.clone();
+    }
+    let total = (priced_count * hours.len()).max(1) as f64;
+    row.clean_hours_share = quality.clean_count as f64 / total;
+    row.saturated_share = quality.saturated as f64 / total;
+    row.gap_share = quality.gaps as f64 / total;
+    row.unpriced_share = quality.unpriced_hours as f64 / total;
+    let unresolved_price = !row.accounts_excluded.is_empty();
+    for (bad, reason) in [
+        (unresolved_price, "unpriced_plan"),
+        (
+            quality.clean_count < MIN_CLEAN_HOURS,
+            "insufficient_clean_hours",
+        ),
+        (row.saturated_share > MAX_SATURATED_SHARE, "saturation"),
+        (quality.unknown_reset, "unknown_reset"),
+        (row.delta_percent < MIN_POINTS, "insufficient_points"),
+        (
+            stability.active_days < MIN_ACTIVE_DAYS,
+            "insufficient_stability_days",
+        ),
+        (
+            stability.active_days >= MIN_ACTIVE_DAYS && !stability.passes_width_gate(),
+            "unstable_estimate",
+        ),
+        (
+            row.multiplier
+                .is_none_or(|ratio| !ratio.is_finite() || ratio <= 0.0),
+            "nonpositive_ratio",
+        ),
+    ] {
+        if bad {
+            row.eligibility_reasons.push(reason.into());
+        }
+    }
+    if unresolved_price {
+        row.multiplier = None;
+        row.fee_multiplier = None;
+    }
+    // No clean hours means no measured quota, not zero usage.
+    if quality.clean_count == 0
+        || (row.api_nanos == 0
+            && row
+                .unpriced_tokens
+                .iter()
+                .any(|token| token.tokens > 0 && token.reason != "missing_quantity"))
+    {
+        row.multiplier = None;
+    }
+    row.routing_eligible = row.eligibility_reasons.is_empty();
+    Ok(())
 }

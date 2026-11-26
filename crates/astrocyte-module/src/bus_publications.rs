@@ -20,7 +20,7 @@ struct Desired {
     #[cfg(test)]
     generation: u64,
     steps: Option<String>,
-    multiplier: Option<Values>,
+    multiplier: Option<Arc<Values>>,
     watermark: Option<Option<Vec<u8>>>,
     acknowledgements: BTreeMap<String, Values>,
 }
@@ -53,8 +53,13 @@ pub(crate) fn key_component(value: &str) -> String {
     encoded
 }
 
-fn pair_key(provider: &str, plan: &str) -> String {
-    format!("{}.{}", key_component(provider), key_component(plan))
+fn multiplier_key(provider: &str, plan: &str, pool: &str) -> String {
+    format!(
+        "{}.{}.{}",
+        key_component(provider),
+        key_component(plan),
+        key_component(pool)
+    )
 }
 
 impl Control {
@@ -88,11 +93,11 @@ impl Control {
             .iter()
             .filter_map(|entry| {
                 let provider = entry["quota_provider"].as_str()?;
-                let key = match &entry["plan"] {
-                    Value::Null => format!("{}.n", key_component(provider)),
-                    Value::String(plan) => pair_key(provider, plan),
-                    _ => return None,
-                };
+                let key = multiplier_key(
+                    provider,
+                    entry["plan"].as_str()?,
+                    entry["pool_id"].as_str()?,
+                );
                 Some((
                     key,
                     serde_json::to_vec(entry).expect("JSON value serialization"),
@@ -100,10 +105,7 @@ impl Control {
             })
             .collect();
         self.update(|desired| {
-            if desired.multiplier.as_ref() == Some(&values) {
-                return false;
-            }
-            desired.multiplier = Some(values);
+            desired.multiplier = Some(Arc::new(values));
             true
         });
     }
@@ -163,6 +165,7 @@ impl Control {
             ..Mirror::default()
         };
         let mut sent_cursor = None;
+        let mut multiplier_snapshot = None;
         let mut retry = Duration::from_secs(5);
         loop {
             // A change already included in this snapshot must not consume the
@@ -186,6 +189,15 @@ impl Control {
                 }
             }
             if let Some(values) = desired.multiplier {
+                if !multiplier_snapshot
+                    .as_ref()
+                    .is_some_and(|previous| Arc::ptr_eq(previous, &values))
+                {
+                    // Reload the bucket on each committed snapshot so stale keys
+                    // are removed even if the report's rows did not change.
+                    multiplier.values = None;
+                    multiplier_snapshot = Some(values.clone());
+                }
                 failed |= !multiplier
                     .apply(
                         connection,

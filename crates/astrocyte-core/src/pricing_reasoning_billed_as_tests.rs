@@ -4,7 +4,6 @@ fn reasoning_billed_as_ledger(
     response: CatalogGetResponse,
     mode: Option<&str>,
     prompt: i64,
-    settings: &[String],
 ) -> Result<ReasoningCharge, PricingError> {
     let (provider, model) = response
         .models
@@ -33,7 +32,7 @@ fn reasoning_billed_as_ledger(
     *fake.response.lock().unwrap() = response;
     let mut plan = read_reprice(&conn, &id).unwrap();
     plan.mode = mode.map(str::to_owned);
-    let resolved = resolve_reprice(&plan, &client(fake.clone()), settings)?;
+    let resolved = resolve_reprice(&plan, &client(fake.clone()))?;
     assert_eq!(fake.requests.lock().unwrap()[0].at_ms, Some(at_ms));
     let tx = conn.transaction().unwrap();
     commit_reprice_in_tx(&tx, &plan, &resolved, at_ms + 2, PricingOrigin::PricingPass).unwrap();
@@ -53,7 +52,7 @@ fn reasoning_billed_as_ledger(
 fn assert_reasoning_billed_as_sample(name: &str, mode: Option<&str>, nanos: i64, key: &str) {
     let response = crate::test_support::reasoning_vector(name);
     assert_eq!(
-        reasoning_billed_as_ledger(response, mode, 100, &[]).unwrap(),
+        reasoning_billed_as_ledger(response, mode, 100).unwrap(),
         (Some(nanos), None, Some(key.into())),
     );
 }
@@ -87,7 +86,7 @@ fn reasoning_billed_as_anthropic_dated_ledger() {
 fn reasoning_billed_as_ledger_follows_fast_mode_but_still_refuses_crossed_tiers() {
     let response = crate::test_support::reasoning_vector("openai-dated.json");
     assert_eq!(
-        reasoning_billed_as_ledger(response, Some("fast"), 272_001, &[]).unwrap(),
+        reasoning_billed_as_ledger(response, Some("fast"), 272_001).unwrap(),
         (None, Some("rate_tiered".into()), None),
     );
     assert_reasoning_billed_as_sample(
@@ -105,7 +104,7 @@ fn reasoning_billed_as_ledger_follows_fast_mode_but_still_refuses_crossed_tiers(
 }
 
 #[test]
-fn reasoning_billed_as_ledger_variant_wins_even_with_legacy_setting() {
+fn reasoning_billed_as_ledger_variant_wins_over_base_rule() {
     let mut response: CatalogGetResponse =
         crate::test_support::reasoning_vector("anthropic-dated.json");
     let facts = response
@@ -114,7 +113,7 @@ fn reasoning_billed_as_ledger_variant_wins_even_with_legacy_setting() {
         .unwrap();
     facts.insert("rate.reasoning.mode.fast".into(), rate(7_000_000_000));
     assert_eq!(
-        reasoning_billed_as_ledger(response.clone(), Some("fast"), 100, &["anthropic".into()])
+        reasoning_billed_as_ledger(response.clone(), Some("fast"), 100)
             .unwrap(),
         (
             Some(7_000_000_000),
@@ -149,7 +148,7 @@ fn reasoning_billed_as_ledger_variant_wins_even_with_legacy_setting() {
                 json!({"state":"unpriced", "reason":reason}),
             );
         assert_eq!(
-            reasoning_billed_as_ledger(response.clone(), Some("fast"), 100, &[]).unwrap(),
+            reasoning_billed_as_ledger(response.clone(), Some("fast"), 100).unwrap(),
             expected
         );
     }
@@ -170,14 +169,14 @@ fn reasoning_billed_as_ledger_keeps_other_billing_plane_refusals() {
             .unwrap()
             .insert(rate_key.into(), json!({"state":"billed_as", "key": target}));
         assert!(matches!(
-            reasoning_billed_as_ledger(invalid, None, 100, &[]),
+            reasoning_billed_as_ledger(invalid, None, 100),
             Err(PricingError::Catalog(
                 CatalogClientError::InvalidRate { .. }
             )),
         ));
     }
     assert_eq!(
-        reasoning_billed_as_ledger(response, None, 100, &[]).unwrap(),
+        reasoning_billed_as_ledger(response, None, 100).unwrap(),
         (Some(20_000_000_000), None, Some("rate.output".into())),
     );
 }
@@ -186,7 +185,7 @@ fn reasoning_billed_as_ledger_keeps_other_billing_plane_refusals() {
 fn reasoning_billed_as_ledger_does_not_charge_the_kimi_quota_proxy() {
     let response = crate::test_support::reasoning_vector("kimi-code-plan-global.json");
     assert_eq!(
-        reasoning_billed_as_ledger(response, Some("fast"), 100, &[]).unwrap(),
+        reasoning_billed_as_ledger(response, Some("fast"), 100).unwrap(),
         (
             None,
             Some("rate_inherited".into()),

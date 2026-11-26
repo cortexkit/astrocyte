@@ -5,13 +5,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog_client::{
-    cache_write_ttl, reasoning_uses_output, stated_mode_condition, token_rate_key, BillingRateKey,
-    RATE_ROLES,
+    cache_write_ttl, stated_mode_condition, token_rate_key, BillingRateKey, RATE_ROLES,
 };
 use crate::money::MoneyError;
-use crate::multiplier::{
-    ModelResolution, MultiplierConfig, MultiplierError, RateState, RoleTokens,
-};
+use crate::multiplier::{ModelResolution, MultiplierError, RateState, RoleTokens};
 use crate::pricing::{effective_output, prompt_size, EffectiveOutput};
 
 /// Producers whose usage event is exactly one model call, so a tiered rate
@@ -34,30 +31,6 @@ pub struct EventTokens {
     pub mode: Option<String>,
     pub broca_attempt: bool,
     pub roles: Vec<MeasuredRole>,
-}
-
-pub struct ValuationRules<'a> {
-    pub(crate) api_twins: &'a BTreeMap<String, String>,
-    pub(crate) reasoning_billed_as_output: &'a [String],
-}
-
-impl<'a> ValuationRules<'a> {
-    pub fn from_config(
-        config: &'a MultiplierConfig,
-        reasoning_billed_as_output: &'a [String],
-    ) -> Self {
-        Self {
-            api_twins: &config.api_twins,
-            reasoning_billed_as_output,
-        }
-    }
-
-    pub fn catalog_provider<'b>(&'b self, event_provider: &'b str) -> &'b str {
-        self.api_twins
-            .get(event_provider)
-            .map(String::as_str)
-            .unwrap_or(event_provider)
-    }
 }
 
 /// Exact value and diagnostics for one event, before any row-level rounding.
@@ -156,11 +129,10 @@ pub struct ListValue {
 /// Adapt a shared valuation to report counters after rates have been fetched.
 /// A failed event contributes no partial value and counts all positive measurements.
 pub fn list_value_event(
-    rules: &ValuationRules<'_>,
     resolution: Option<&ModelResolution>,
     event: &EventTokens,
 ) -> Result<ListValue, MoneyError> {
-    let valuation = value_event(rules, resolution, event);
+    let valuation = value_event(resolution, event);
     let mut reasons = vec![None; event.roles.len()];
     let mut result = ListValue::default();
     match valuation {
@@ -302,7 +274,6 @@ fn quantity_measurements(event: &EventTokens, role: &str, ttl: Option<&str>) -> 
 
 /// Value one event without mutating a multiplier line or rounding its numerator.
 pub fn value_event(
-    rules: &ValuationRules<'_>,
     resolution: Option<&ModelResolution>,
     event: &EventTokens,
 ) -> Result<EventValuation, MultiplierError> {
@@ -343,7 +314,6 @@ pub fn value_event(
         }
         return Ok(value);
     }
-    let api_provider = rules.catalog_provider(&event.provider);
     let model_rates = match resolution {
         Some(ModelResolution::Rates(model_rates)) => model_rates,
         Some(ModelResolution::Unpriceable { reason }) => {
@@ -473,19 +443,13 @@ pub fn value_event(
         if quantity == 0 {
             continue;
         }
-        let state = if role == "reasoning" {
-            let reasoning = reasoning_rule.then(|| select_rate(role, ttl));
-            // Only a complete selector match is a more specific verdict.
-            let has_variant = matches!(reasoning, Some(Ok(Some(state))) if !matches!(state, RateState::BilledAs { .. }));
-            if reasoning_uses_output(
-                reasoning_rule,
-                has_variant,
-                Some(api_provider),
-                rules.reasoning_billed_as_output,
-            ) {
-                select_rate("output", ttl)
-            } else {
-                reasoning.unwrap_or_else(|| select_rate(role, ttl))
+        let state = if role == "reasoning" && reasoning_rule {
+            match select_rate(role, ttl) {
+                // A specific reasoning verdict takes precedence over the base rule.
+                selected @ Ok(Some(state)) if !matches!(state, RateState::BilledAs { .. }) => {
+                    selected
+                }
+                _ => select_rate("output", ttl),
             }
         } else if role == "cache_write" && ttl.is_none() {
             match select_rate(role, ttl) {

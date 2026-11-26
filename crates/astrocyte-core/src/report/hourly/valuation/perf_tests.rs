@@ -59,14 +59,14 @@ fn fixture(per_hour: i64, unrelated: i64) -> Connection {
         );
     }
     summaries(&mut conn);
-    prepare(&mut conn, &config());
+    prepare(&mut conn);
     conn
 }
 
 fn build(conn: &Connection, expected: i64) -> (u64, usize) {
     let mut maintenance = ValuationMaintenance::default();
     let (_, statements, steps) = captured(conn, || {
-        assert!(maintenance.read_chunk(conn, &config(), &[]).unwrap());
+        assert!(maintenance.read_chunk(conn).unwrap());
         assert_eq!(maintenance.pending.as_ref().unwrap().hour.number, 0);
         let tx = conn.unchecked_transaction().unwrap();
         assert!(maintenance.publish(&tx).unwrap());
@@ -116,7 +116,7 @@ fn ledger_regression_bounded_report_hour_seek_is_independent_of_history() {
         let from = hour * HOUR_MS;
         calls(&conn, "target", 1, 24, from, false, true);
         summaries(&mut conn);
-        drain(&mut conn, &config());
+        drain(&mut conn);
         conn.execute_batch(&format!(
             "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i+1<{history})
              INSERT INTO summary_hour(kind,hour_number,revision,built_revision,format_version)
@@ -149,7 +149,7 @@ fn ledger_regression_bounded_report_hour_seek_is_independent_of_history() {
 fn ledger_regression_small_valuation_changes_do_not_retag_history() {
     let measure = |history| {
         let mut conn = conn();
-        prepare(&mut conn, &config());
+        prepare(&mut conn);
         conn.execute_batch(&format!(
             "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i+1<{history})
              INSERT INTO summary_hour(kind,hour_number,revision,built_revision,format_version)
@@ -169,7 +169,7 @@ fn ledger_regression_small_valuation_changes_do_not_retag_history() {
         conn.execute_batch("INSERT INTO rate_dirty_hour VALUES(0); UPDATE rate_cache_state SET generation=1 WHERE id=1;").unwrap();
         let rate_counter = VmCounter::start(&conn);
         let tx = conn.unchecked_transaction().unwrap();
-        ValuationMaintenance::prepare(&tx, &config(), &[]).unwrap();
+        ValuationMaintenance::prepare(&tx).unwrap();
         tx.commit().unwrap();
         let rate_steps = rate_counter.steps();
         assert_eq!(
@@ -258,7 +258,7 @@ fn valuation_perf_stale_seven_day_statements_do_not_grow_per_cell() {
         );
         calls(&conn, "report", cells, 7 * 24, 0, true, false);
         summaries(&mut conn);
-        prepare(&mut conn, &config());
+        prepare(&mut conn);
         let request = ReportRequest {
             grouping: vec!["plan".into()],
             grain: "day".into(),
@@ -305,7 +305,7 @@ fn valuation_perf_actual_chunk_queries_pin_bounded_event_searches() {
     let conn = fixture(100, 0);
     let (_, statements, _) = captured(&conn, || {
         let mut maintenance = ValuationMaintenance::default();
-        assert!(maintenance.read_chunk(&conn, &config(), &[]).unwrap());
+        assert!(maintenance.read_chunk(&conn).unwrap());
     });
     let event_reads: Vec<_> = statements
         .iter()
@@ -352,7 +352,7 @@ fn valuation_perf_built_seven_day_report_stays_within_vm_budget() {
     );
     calls(&conn, "built-report", 40, 7 * 24, 0, true, false);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     // Fixed budget for 168 built hours, 40 cells per hour and two quantities
     // per cell. This pins total reader work without embedding an old reader.
     for ranged in [true, false] {

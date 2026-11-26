@@ -49,6 +49,8 @@ fn v2_bounded_drain_waits_for_older_pending_usage() {
     let mut late = crate::wire_map::map_fact(serde_json::from_value(wire).unwrap()).unwrap();
     late.producer = "opencode".into();
     late.producer_lineage = Some("fake-opencode:1".into());
+    late.account_ref = Some("acct".into());
+    late.charge_basis = astrocyte_core::fact::ChargeBasis::SubscriptionIncluded;
     let source = TwoPageSource { late };
     let mut stage = MultiplierStage::new(Some(fusiform));
     assert_eq!(
@@ -81,23 +83,17 @@ fn v2_bounded_drain_waits_for_older_pending_usage() {
 fn v2_served_plan_rows_keep_independent_eligible_heads_on_recompute() {
     let directory = tempfile::tempdir().unwrap();
     let state = Arc::new(state::leased_test_state(&directory));
-    let mut document: serde_json::Value = serde_json::from_str(DESIRED).unwrap();
-    document["subscription_multiplier"]["plan_price_overrides"]["openai/pro_100"] =
-        json!({"minor_units": 10000, "exponent": 2, "currency": "USD", "period": "month"});
-    document["subscription_multiplier"]["quota_providers"]["codex"]["accounts"]["acct2"] =
-        json!({"plan": "openai/pro_100", "price_override": null});
-    publish_document(&state, &directory, &document.to_string());
+    publish_desired(&state, &directory);
+    add_vault_plan(&state, "fixture:acct2", Some("acct2"), "pro_100");
     let fusiform = FakeFusiform::new(false);
     install_catalog(&state, &fusiform);
-    seed_usage(&state);
+    seed_usage_with(&state, false);
     state.ordered_write(|tx| {
-        tx.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at) SELECT provider,'acct2',pool_key,fetched_at_instant,used_percent,window_minutes,resets_at FROM window_sample", []).map_err(|error| error.to_string())?;
-        // Seed account-attributed events initially, without correcting immutable
-        // usage rows. The original unattributed fixture remains disclosed.
+        tx.execute("INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at,model_scope,api_provider) SELECT provider,'acct2',pool_key,fetched_at_instant,used_percent,window_minutes,resets_at,model_scope,api_provider FROM window_sample", []).map_err(|error| error.to_string())?;
         for (prefix, account) in [("a", "acct"), ("b", "acct2")] {
           for index in 0..40 {
             let id = format!("{prefix}-{index}");
-            tx.execute("INSERT INTO usage_event(event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis,account_ref) VALUES (?1,'opencode','lineage',?1,?2,?2,'openai','m','unknown',?3)", params![id, DAY_START - (index % 7 + 1) * DAY_MS + ((index / 7) % 4 * 6 + 3) * 3_600_000, account]).map_err(|error| error.to_string())?;
+            tx.execute("INSERT INTO usage_event(event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis,account_ref) VALUES (?1,'opencode','lineage',?1,?2,?2,'openai','m','subscription_included',?3)", params![id, DAY_START - (index % 7 + 1) * DAY_MS + ((index / 7) % 4 * 6 + 3) * 3_600_000, account]).map_err(|error| error.to_string())?;
             tx.execute("INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent) VALUES ((SELECT event_key FROM usage_event WHERE event_id=?1),'input','token','billed','usage.input',1000,0)", [id]).map_err(|error| error.to_string())?;
           }
         }
@@ -135,22 +131,20 @@ fn v2_served_plan_rows_keep_independent_eligible_heads_on_recompute() {
 fn v2_credential_daily_stage_records_and_serves_the_plan_once() {
     let directory = tempfile::tempdir().unwrap();
     let state = Arc::new(state::leased_test_state(&directory));
-    let mut document: serde_json::Value = serde_json::from_str(DESIRED).unwrap();
-    let provider = &mut document["subscription_multiplier"]["quota_providers"]["codex"];
-    provider["credentials"] =
-        json!({"apikey:one": {"plan":"openai/pro_20x","price_override":null}});
-    provider["accounts"] = json!({});
-    let providers = document["subscription_multiplier"]["quota_providers"]
-        .as_object_mut()
-        .unwrap();
-    let provider = providers.remove("codex").unwrap();
-    providers.insert("credential-pool".into(), provider);
-    publish_document(&state, &directory, &document.to_string());
+    publish_desired(&state, &directory);
+    add_vault_plan(&state, "apikey:one", None, "pro_20x");
     let fusiform = FakeFusiform::new(false);
     install_catalog(&state, &fusiform);
-    seed_usage(&state);
     state.ordered_write(|tx| {
-        tx.execute("INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at) SELECT 'credential-pool','apikey:one',pool_key,fetched_at_instant,used_percent,window_minutes,resets_at FROM window_sample", []).map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM source_runtime", []).map_err(|error| error.to_string())?;
+        tx.execute("UPDATE cortexkit_schema_version SET applied_at_unix=0 WHERE namespace='astrocyte' AND version=68", []).map_err(|error| error.to_string())?;
+        tx.execute("WITH RECURSIVE minutes(n) AS (VALUES (0) UNION ALL SELECT n+5 FROM minutes WHERE n<10080)
+                    INSERT INTO credential_window_sample(provider,credential_ref,pool_key,fetched_at_instant,used_percent,window_minutes,resets_at,model_scope,api_provider)
+                    SELECT 'credential-pool','apikey:one','primary',(?1 + n*60000)*1000000,n/240.0,10080,'2024-10-10T00:00:00Z','all','openai' FROM minutes", [DAY_START - 7 * DAY_MS]).map_err(|error| error.to_string())?;
+        tx.execute("INSERT INTO usage_event (event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis,resolved_credential)
+                    VALUES ('e1','opencode','lineage','e1',?1,?1,'openai','m','subscription_included','apikey:one')", [DAY_START - 2 * DAY_MS]).map_err(|error| error.to_string())?;
+        tx.execute("INSERT INTO measurement (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
+                    VALUES ((SELECT event_key FROM usage_event WHERE event_id='e1'),'input','token','billed','usage.input',1000,0)", []).map_err(|error| error.to_string())?;
         Ok(((), true))
     }).unwrap();
     MultiplierStage::new(Some(fusiform.clone())).tick(&state, false, NOW);

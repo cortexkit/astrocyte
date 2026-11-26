@@ -508,6 +508,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 67,
         statements: migrations::v60_v79::V67,
     },
+    Migration {
+        version: 68,
+        statements: migrations::v60_v79::V68,
+    },
 ];
 
 #[cfg(test)]
@@ -576,6 +580,7 @@ mod tests {
     include!("store_v66_tests.rs");
     include!("store_v33_tests.rs");
     include!("store_v64_tests.rs");
+    include!("store/v68_tests.rs");
 
     #[test]
     fn lookup_index_migration_adds_two_indexes_and_changes_no_rows() {
@@ -2711,7 +2716,7 @@ mod tests {
         );
         let tokens = real_query(
             include_str!("multiplier.rs"),
-            "SELECT e.event_key, e.producer, e.provider, e.model, m.role, m.unit, m.source,",
+            "SELECT e.event_key, e.producer, COALESCE(e.provider,''), e.model, m.role, m.unit, m.source,",
         );
         let mut cases = vec![(
             "backfill",

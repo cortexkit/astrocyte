@@ -167,8 +167,6 @@ impl Dictionary<'_> {
 }
 struct Live<'c> {
     conn: &'c Connection,
-    config: &'c MultiplierConfig,
-    reasoning: &'c [String],
     plans: &'c PlanBook,
     resolver: crate::attribution::Resolver,
 }
@@ -179,8 +177,6 @@ impl Live<'_> {
         let (_, fetched) = reduce_both(
             self.conn,
             filter,
-            self.config,
-            self.reasoning,
             self.plans,
             &mut ordinary,
             Some((&mut projection, &mut self.resolver)),
@@ -207,7 +203,7 @@ fn members(
     }
     let mut members = BTreeSet::new();
     for key in &cell.original_keys {
-        members.extend(summary_members(live.plans, live.config, key, hour, starts)?);
+        members.extend(summary_members(live.plans, key, hour, starts)?);
     }
     if members.is_empty() {
         members.insert(member.clone());
@@ -282,9 +278,9 @@ pub(crate) fn report(
 ) -> Result<SpendReport, ReportError> {
     let request = Request::new(raw)?;
     let (from, to) = request.range(conn, now)?;
-    let (config, reasoning) = stored_config(conn)?;
+    let cache_current = valuation_cache_current(conn)?;
     let plans = PlanBook::load(conn)?;
-    let book = FeeDays::from_book(&plans, &config, from, to)?;
+    let book = FeeDays::from_book(&plans, from, to)?;
     let starts = book
         .days
         .iter()
@@ -309,8 +305,6 @@ pub(crate) fn report(
     };
     let mut live = Live {
         conn,
-        config: &config,
-        reasoning: &reasoning,
         plans: &plans,
         resolver: crate::attribution::Resolver::default(),
     };
@@ -339,7 +333,8 @@ pub(crate) fn report(
         let (start, last) = interval(hour)?;
         let end = last.checked_add(1).ok_or(ReportError::Calendar)?;
         let clean = eligible(row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?);
-        let main_current = clean && row.get::<_, Option<bool>>(5)?.unwrap_or(false);
+        let main_current =
+            cache_current && clean && row.get::<_, Option<bool>>(5)?.unwrap_or(false);
         let split_current = main_current && row.get::<_, Option<bool>>(6)?.unwrap_or(false);
         let cached = if split_current {
             Some(dictionary.cells(conn, hour)?)
@@ -400,10 +395,9 @@ pub(crate) fn report(
     }
     let allocation = book.allocate(&day, now)?;
     let mut rows = Vec::with_capacity(output.buckets.len());
-    let mut range = fold_range.then(|| RangeFold::new(request.parsed.range, output.buckets.len()));
     for (key, acc) in &output.buckets {
         let mut row = render_row(key.clone(), acc)?;
-        value_row(&mut row, acc, &allocation, &mut range)?;
+        value_row(&mut row, acc, &allocation)?;
         rows.push(row);
     }
     let mut totals = recorded_totals(&rows)?;
@@ -452,8 +446,8 @@ pub(crate) fn report(
                 .insert("missing_occurred_at".into(), undated.events_undated);
         }
     }
-    if let Some(range) = range {
-        rows = range.finish(rows)?;
+    if fold_range {
+        rows = range::fold(rows, request.parsed.range)?;
     }
     Ok(SpendReport {
         totals,

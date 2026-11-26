@@ -805,21 +805,19 @@ fn read_plan_in_tx(
 pub fn resolve_reprice(
     plan: &SubscriptionRepricePlan,
     catalog: &CatalogClient,
-    reasoning_billed_as_output: &[String],
 ) -> Result<ResolvedSubscriptionReprice, SubscriptionError> {
-    resolve_reprice_with_catalog(plan, Some(catalog), reasoning_billed_as_output)
+    resolve_reprice_with_catalog(plan, Some(catalog))
 }
 
 pub fn resolve_reprice_without_catalog(
     plan: &SubscriptionRepricePlan,
 ) -> Result<ResolvedSubscriptionReprice, SubscriptionError> {
-    resolve_reprice_with_catalog(plan, None, &[])
+    resolve_reprice_with_catalog(plan, None)
 }
 
 fn resolve_reprice_with_catalog(
     plan: &SubscriptionRepricePlan,
     catalog: Option<&CatalogClient>,
-    reasoning_billed_as_output: &[String],
 ) -> Result<ResolvedSubscriptionReprice, SubscriptionError> {
     // Coverage wins before the catalog is consulted: a subscription in force at
     // the event's instant already answers what the charge was (zero, and the
@@ -834,7 +832,7 @@ fn resolve_reprice_with_catalog(
         (
             CoverageExpectation::NotApplicable | CoverageExpectation::Missing { .. },
             Some(catalog),
-        ) => pricing::resolve_reprice(&plan.pricing, catalog, reasoning_billed_as_output)?,
+        ) => pricing::resolve_reprice(&plan.pricing, catalog)?,
         (CoverageExpectation::NotApplicable | CoverageExpectation::Missing { .. }, None) => {
             pricing::resolve_reprice_without_catalog(&plan.pricing)?
         }
@@ -952,7 +950,7 @@ mod tests {
         origin: pricing::PricingOrigin,
     ) -> Result<RepriceOutcome, SubscriptionError> {
         let plan = read_reprice(conn, event_id)?;
-        let resolved = resolve_reprice(&plan, catalog, &[])?;
+        let resolved = resolve_reprice(&plan, catalog)?;
         let tx = conn.transaction()?;
         let outcome = commit_reprice_in_tx(&tx, &plan, &resolved, recorded_at_ms, origin)?;
         tx.commit()?;
@@ -1855,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_reasoning_is_covered_without_catalog_io() {
+    fn subscription_reasoning_is_covered_without_catalog_io() {
         let mut conn = conn();
         set_subscription(
             &mut conn,
@@ -1868,7 +1866,7 @@ mod tests {
             VALUES ((SELECT event_key FROM usage_event WHERE event_id='covered-thinking'),'reasoning','token','billed','usage.reasoning',1000,0)", []).unwrap();
         let (catalog, connection) = catalog();
         let plan = read_reprice(&conn, "covered-thinking").unwrap();
-        let resolved = resolve_reprice(&plan, &catalog, &["provider-a".into()]).unwrap();
+        let resolved = resolve_reprice(&plan, &catalog).unwrap();
         let tx = conn.transaction().unwrap();
         commit_reprice_in_tx(
             &tx,
@@ -2026,7 +2024,7 @@ mod tests {
         record_subscription_event(&conn, "contended", Some(150));
         let (catalog, _) = catalog();
         let plan = read_reprice(&conn, "contended").unwrap();
-        let resolved = resolve_reprice(&plan, &catalog, &[]).unwrap();
+        let resolved = resolve_reprice(&plan, &catalog).unwrap();
         set_subscription(
             &mut conn,
             &request("late-declaration", "USD", 2, SubscriptionPeriod::Month, 100),

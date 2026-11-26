@@ -17,8 +17,8 @@ use serde_json::{json, Value};
 
 use crate::canon::CanonError;
 use crate::catalog_client::{
-    cache_write_ttl, parse_rate_key, reasoning_uses_output, stated_mode_condition, tier_thresholds,
-    CatalogClient, CatalogClientError, CatalogLookup, CatalogSnapshot, RATE_ROLES, RATE_UNITS,
+    cache_write_ttl, parse_rate_key, stated_mode_condition, tier_thresholds, CatalogClient,
+    CatalogClientError, CatalogLookup, CatalogSnapshot, RATE_ROLES, RATE_UNITS,
 };
 use crate::fact::ChargeBasis;
 use crate::ingest::INCLUSIVE_OUTPUT_SOURCE;
@@ -568,9 +568,8 @@ fn read_plan_in_tx(
 pub fn resolve_reprice(
     plan: &RepricePlan,
     catalog: &CatalogClient,
-    reasoning_billed_as_output: &[String],
 ) -> Result<ResolvedReprice, PricingError> {
-    resolve_reprice_with_catalog(plan, Some(catalog), reasoning_billed_as_output)
+    resolve_reprice_with_catalog(plan, Some(catalog))
 }
 
 /// Resolves a stable plan when no fusiform connection is configured. Local
@@ -579,13 +578,12 @@ pub fn resolve_reprice(
 pub fn resolve_reprice_without_catalog(
     plan: &RepricePlan,
 ) -> Result<ResolvedReprice, PricingError> {
-    resolve_reprice_with_catalog(plan, None, &[])
+    resolve_reprice_with_catalog(plan, None)
 }
 
 fn resolve_reprice_with_catalog(
     plan: &RepricePlan,
     catalog: Option<&CatalogClient>,
-    reasoning_billed_as_output: &[String],
 ) -> Result<ResolvedReprice, PricingError> {
     // Undated events are refused before any coverage gap compares dates.
     let Some(occurred_at_ms) = plan.occurred_at_ms else {
@@ -688,9 +686,7 @@ fn resolve_reprice_with_catalog(
             None,
             None,
         )),
-        CatalogLookup::Resolved(snapshot) => {
-            resolve_catalog_snapshot(plan, &snapshot, reasoning_billed_as_output)
-        }
+        CatalogLookup::Resolved(snapshot) => resolve_catalog_snapshot(plan, &snapshot),
     }
 }
 
@@ -1111,7 +1107,6 @@ pub fn reconcile_pending_range_in_tx(
 fn resolve_catalog_snapshot(
     plan: &RepricePlan,
     snapshot: &CatalogSnapshot,
-    reasoning_billed_as_output: &[String],
 ) -> Result<ResolvedReprice, PricingError> {
     // Tier refusals leave `catalog_entry` NULL. That column holds
     // only what the catalog sent, as on a priced row; an object built here
@@ -1170,15 +1165,11 @@ fn resolve_catalog_snapshot(
     let mut measurements = Vec::with_capacity(plan.targets.len());
     for measurement in &plan.targets {
         let mode = plan.mode.as_deref();
-        let token_rule = reasoning_rule && measurement.unit == "token";
         let rate_role = match measurement.role.as_str() {
             "reasoning"
-                if reasoning_uses_output(
-                    token_rule,
-                    token_rule && has_selected_variant(snapshot, measurement, mode),
-                    plan.provider.as_deref(),
-                    reasoning_billed_as_output,
-                ) =>
+                if reasoning_rule
+                    && measurement.unit == "token"
+                    && !has_selected_variant(snapshot, measurement, mode) =>
             {
                 "output"
             }
@@ -1986,7 +1977,6 @@ mod tests {
                 "rate.input".into(),
                 rate(3_000_000_000),
             )]))),
-            &[],
         )
         .unwrap();
         let tx = conn.transaction().unwrap();
@@ -2060,7 +2050,7 @@ mod tests {
             crate::subscription::read_basis_correction(conn, &correction_request(event_id, basis))
                 .unwrap();
         assert!(conn.is_autocommit());
-        let resolved = crate::subscription::resolve_reprice(&plan, catalog, &[]).unwrap();
+        let resolved = crate::subscription::resolve_reprice(&plan, catalog).unwrap();
         let tx = conn.transaction().unwrap();
         crate::ingest::correct_basis_in_tx(&tx, &plan, &resolved, 1100).unwrap();
         tx.commit().unwrap();
@@ -2346,7 +2336,7 @@ mod tests {
         )
         .unwrap();
         let catalog = client(FakeCatalog::new(BTreeMap::new()));
-        let resolved = crate::subscription::resolve_reprice(&plan, &catalog, &[]).unwrap();
+        let resolved = crate::subscription::resolve_reprice(&plan, &catalog).unwrap();
         reprice_event(&mut conn, &id, &catalog, 1000, PricingOrigin::PricingPass).unwrap();
         let before = charge_rows(&conn);
         {
@@ -2420,7 +2410,7 @@ mod tests {
         origin: PricingOrigin,
     ) -> Result<RepriceOutcome, PricingError> {
         let plan = read_reprice(conn, event_id)?;
-        let resolved = resolve_reprice(&plan, catalog, &[])?;
+        let resolved = resolve_reprice(&plan, catalog)?;
         let tx = conn.transaction()?;
         let outcome = commit_reprice_in_tx(&tx, &plan, &resolved, recorded_at_ms, origin)?;
         tx.commit()?;
@@ -2659,7 +2649,7 @@ mod tests {
                     vec![measurement("input_audio", Some(1_000_000))],
                 );
                 let plan = read_reprice(&conn, &audio_id).unwrap();
-                let resolved = resolve_reprice(&plan, &catalog, &["provider".into()]).unwrap();
+                let resolved = resolve_reprice(&plan, &catalog).unwrap();
                 let tx = conn.transaction().unwrap();
                 commit_reprice_in_tx(&tx, &plan, &resolved, 1_000, PricingOrigin::PricingPass)
                     .unwrap();
@@ -2682,10 +2672,10 @@ mod tests {
     }
 
     #[test]
-    fn declared_reasoning_uses_output_rates_and_records_the_resolved_key() {
+    fn served_reasoning_price_is_not_replaced_by_the_output_price() {
         for (mode, key, nanos) in [
-            (None, "rate.output", 3_000_000),
-            (Some("fast"), "rate.output.mode.fast", 6_000_000),
+            (None, "rate.reasoning", 9_000_000),
+            (Some("fast"), "rate.reasoning.mode.fast", 12_000_000),
         ] {
             let mut conn = conn();
             let event_id = record(
@@ -2695,7 +2685,7 @@ mod tests {
                 Some(700),
                 vec![measurement("reasoning", Some(1_000))],
             );
-            // A reasoning rate must not override the provider's declared billing rule.
+            // A separately priced reasoning role is not billed as output.
             let fake = FakeCatalog::new(BTreeMap::from([
                 ("rate.output".into(), rate(3_000_000_000)),
                 ("rate.output.mode.fast".into(), rate(6_000_000_000)),
@@ -2704,7 +2694,7 @@ mod tests {
             ]));
             let mut plan = read_reprice(&conn, &event_id).unwrap();
             plan.mode = mode.map(str::to_owned);
-            let resolved = resolve_reprice(&plan, &client(fake), &["provider".into()]).unwrap();
+            let resolved = resolve_reprice(&plan, &client(fake)).unwrap();
             let tx = conn.transaction().unwrap();
             commit_reprice_in_tx(&tx, &plan, &resolved, 1_000, PricingOrigin::PricingPass).unwrap();
             tx.commit().unwrap();
@@ -2716,7 +2706,7 @@ mod tests {
     }
 
     #[test]
-    fn unlisted_reasoning_without_its_own_rate_stays_no_rate() {
+    fn reasoning_without_a_served_rate_stays_no_rate() {
         let mut conn = conn();
         let event_id = record(
             &mut conn,
@@ -2730,7 +2720,7 @@ mod tests {
             rate(3_000_000_000),
         )]));
         let plan = read_reprice(&conn, &event_id).unwrap();
-        let resolved = resolve_reprice(&plan, &client(fake), &["another-provider".into()]).unwrap();
+        let resolved = resolve_reprice(&plan, &client(fake)).unwrap();
         let tx = conn.transaction().unwrap();
         commit_reprice_in_tx(&tx, &plan, &resolved, 1_000, PricingOrigin::PricingPass).unwrap();
         tx.commit().unwrap();
@@ -2749,7 +2739,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_reasoning_above_context_is_refused_like_output() {
+    fn reasoning_billed_as_output_above_context_is_refused_like_output() {
         let mut conn = conn();
         let event_id = record(
             &mut conn,
@@ -2765,9 +2755,13 @@ mod tests {
         let fake = FakeCatalog::new(BTreeMap::from([
             ("rate.output".into(), rate(3_000_000_000)),
             ("rate.output.above_context.200".into(), rate(6_000_000_000)),
+            (
+                "rate.reasoning".into(),
+                json!({"state":"billed_as","key":"rate.output"}),
+            ),
         ]));
         let plan = read_reprice(&conn, &event_id).unwrap();
-        let resolved = resolve_reprice(&plan, &client(fake), &["provider".into()]).unwrap();
+        let resolved = resolve_reprice(&plan, &client(fake)).unwrap();
         let tx = conn.transaction().unwrap();
         commit_reprice_in_tx(&tx, &plan, &resolved, 1_000, PricingOrigin::PricingPass).unwrap();
         tx.commit().unwrap();
@@ -3380,7 +3374,7 @@ mod tests {
         drop(tx);
         assert_eq!(plan.mode, None, "the store records no request mode");
         plan.mode = mode.map(str::to_string);
-        resolve_reprice(&plan, &client(fake), &[])
+        resolve_reprice(&plan, &client(fake))
             .unwrap()
             .measurements
             .into_iter()
@@ -3524,7 +3518,7 @@ mod tests {
             (Some("priority"), None),
         ] {
             plan.mode = mode.map(str::to_owned);
-            let resolved = resolve_reprice(&plan, &client(fake.clone()), &[]).unwrap();
+            let resolved = resolve_reprice(&plan, &client(fake.clone())).unwrap();
             let decisions: Vec<_> = resolved
                 .measurements
                 .into_iter()
@@ -3810,7 +3804,7 @@ mod tests {
             uncertain_facts: BTreeMap::new(),
             fact_overrides: BTreeMap::new(),
         };
-        let resolved = resolve_catalog_snapshot(&plan, &snapshot, &[]).unwrap();
+        let resolved = resolve_catalog_snapshot(&plan, &snapshot).unwrap();
         let tx = conn.transaction().unwrap();
         commit_reprice_in_tx(&tx, &plan, &resolved, 1_000, PricingOrigin::PricingPass).unwrap();
         tx.commit().unwrap();
@@ -4099,7 +4093,7 @@ mod tests {
         ]));
         let catalog = client(fake);
         let plan = read_reprice(&conn, &partial).unwrap();
-        let resolved = resolve_reprice(&plan, &catalog, &[]).unwrap();
+        let resolved = resolve_reprice(&plan, &catalog).unwrap();
         conn.execute(
             "INSERT INTO measurement (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
              VALUES ((SELECT event_key FROM usage_event WHERE event_id=?1),'output','token','billed','usage.output',1000000,0)",
@@ -4306,7 +4300,7 @@ mod tests {
         let fake = FakeCatalog::new(BTreeMap::from([("rate.input".into(), rate(3_000_000_000))]));
         let losing_catalog = client(fake.clone());
         let losing_plan = read_reprice(&losing_conn, &event_id).unwrap();
-        let losing_resolution = resolve_reprice(&losing_plan, &losing_catalog, &[]).unwrap();
+        let losing_resolution = resolve_reprice(&losing_plan, &losing_catalog).unwrap();
 
         let winning_path = path.clone();
         let winning_event_id = event_id.clone();

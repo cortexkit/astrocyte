@@ -197,7 +197,6 @@ fn initialize_and_hydrate(conn: &Connection) -> Result<(AstrocyteConfig, u64), S
             "foreign key enforcement did not turn on".to_string()
         }
     })?;
-    config::seed_vault_history(conn)?;
     hydrate_config(conn)
 }
 
@@ -1229,59 +1228,23 @@ pub fn now_ms() -> i64 {
 }
 
 fn hydrate_config(conn: &Connection) -> Result<(AstrocyteConfig, u64), String> {
-    #[allow(clippy::type_complexity)]
-    let (generation, mut config, multiplier_column, ingest_column, canonical_bytes): (
-        i64,
-        AstrocyteConfig,
-        Option<String>,
-        Option<String>,
-        Vec<u8>,
-    ) = conn
+    let (generation, poll_interval_secs, ingest_column): (i64, u64, Option<String>) = conn
         .query_row(
-            "SELECT generation,poll_interval_secs,subscription_multiplier,harness_ingest,canonical_bytes
-             FROM desired_config WHERE id=1",
+            "SELECT generation,poll_interval_secs,harness_ingest FROM desired_config WHERE id=1",
             [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    AstrocyteConfig {
-                        poll_interval_secs: row.get(1)?,
-                        reasoning_billed_as_output: Vec::new(),
-                        subscription_multiplier: config::MultiplierSetting::NotRecorded,
-                        harness_ingest: config::HarnessIngest::all_on(),
-                    },
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|error| error.to_string())?;
     if generation == 0 {
         return Ok((config::intentional_empty().config, 0));
     }
-    config.reasoning_billed_as_output =
-        config::decode_reasoning_generation(&canonical_bytes, multiplier_column.as_deref())
-            .map_err(|error| error.to_string())?;
-    // NULL here is a generation committed before the store had the column.
-    // It boots as "not recorded", never as an empty declaration, and the
-    // next reload from the desired file publishes a generation that has it.
-    config.subscription_multiplier = config::decode_multiplier_column(multiplier_column.as_deref())
+    let harness_ingest = config::decode_harness_ingest_column(ingest_column.as_deref())
         .map_err(|error| error.to_string())?;
-    if config.subscription_multiplier == config::MultiplierSetting::NotRecorded {
-        tracing::info!(
-            target: "multiplier",
-            generation,
-            "committed desired generation predates the subscription_multiplier member; \
-             the daily multiplier is skipped until a reload publishes one that records it"
-        );
-    }
-    // NULL here is a generation committed before the store had this column
-    // either. That generation drained every producer, so it hydrates as all
-    // on and ingests exactly as before; the next reload records the member.
-    config.harness_ingest = config::decode_harness_ingest_column(ingest_column.as_deref())
-        .map_err(|error| error.to_string())?;
-    let validated = config::canonicalize(config).map_err(|error| error.to_string())?;
+    let validated = config::canonicalize(AstrocyteConfig {
+        poll_interval_secs,
+        harness_ingest,
+    })
+    .map_err(|error| error.to_string())?;
     Ok((
         validated.config,
         u64::try_from(generation).map_err(|_| "negative desired generation".to_string())?,

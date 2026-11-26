@@ -1,7 +1,6 @@
 use super::*;
 use crate::ingest;
 use crate::money::round_nano_num;
-use crate::multiplier::{QuotaProviderConfig, WindowSelector};
 use crate::rate_era::{fetched, publish};
 use crate::subscription::PlanLedger;
 use crate::test_support::conn;
@@ -9,28 +8,6 @@ use serde_json::json;
 
 #[path = "attribution_report_tests.rs"]
 mod attribution_report_tests;
-
-fn config() -> MultiplierConfig {
-    MultiplierConfig {
-        api_twins: BTreeMap::new(),
-        plan_price_overrides: BTreeMap::new(),
-        quota_providers: BTreeMap::from([(
-            "pool".into(),
-            QuotaProviderConfig {
-                window: WindowSelector {
-                    pool_key: "primary".into(),
-                    window_minutes: 10080,
-                },
-                scope: vec![ScopeRule {
-                    producer: "opencode".into(),
-                    provider: "provider".into(),
-                    charge_basis: None,
-                    model_prefix: None,
-                }],
-            },
-        )]),
-    }
-}
 
 fn record_id(ledger: PlanLedger, identity: &str, effective_from_ms: i64) -> PlanRecordId {
     PlanRecordId {
@@ -91,14 +68,14 @@ fn plan(
     conn.execute(&format!("INSERT INTO {}({},provider,plan_name,recurring_cost_minor,currency,amount_exponent,period,effective_from_ms,effective_to_ms) VALUES(?1,?2,'plan',2000,'USD',2,'month',?3,?4)",ledger.table(),ledger.key_column()),params![identity,provider,from,to]).unwrap();
 }
 
-fn prepare(conn: &mut Connection, config: &MultiplierConfig) {
+fn prepare(conn: &mut Connection) {
     let tx = conn.transaction().unwrap();
-    ValuationMaintenance::prepare(&tx, config, &[]).unwrap();
+    ValuationMaintenance::prepare(&tx).unwrap();
     tx.commit().unwrap();
 }
 
-fn drain(conn: &mut Connection, config: &MultiplierConfig) -> Vec<i64> {
-    prepare(conn, config);
+fn drain(conn: &mut Connection) -> Vec<i64> {
+    prepare(conn);
     let mut maintenance = ValuationMaintenance::default();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut hours = Vec::new();
@@ -108,7 +85,7 @@ fn drain(conn: &mut Connection, config: &MultiplierConfig) -> Vec<i64> {
             "valuation did not drain"
         );
         let tx = conn.unchecked_transaction().unwrap();
-        let ready = maintenance.read_chunk(&tx, config, &[]).unwrap();
+        let ready = maintenance.read_chunk(&tx).unwrap();
         tx.commit().unwrap();
         if ready {
             let hour = maintenance.pending.as_ref().unwrap().hour.number;
@@ -161,7 +138,7 @@ fn valuation_migration_requeues_existing_media_and_unavailable_rate_hours_only()
     }
     conn.execute("UPDATE rate_model SET reference_provider='provider',reference_model='failed' WHERE model='alias'", []).unwrap();
     summaries(&mut conn);
-    assert_eq!(drain(&mut conn, &config()), [0, 1, 2, 3]);
+    assert_eq!(drain(&mut conn), [0, 1, 2, 3]);
 
     // Simulate a cached media hour with no list value and a rate model whose
     // failed refresh cleared its catalog version.
@@ -191,7 +168,7 @@ fn valuation_migration_requeues_existing_media_and_unavailable_rate_hours_only()
         [0, 2, 3]
     );
     assert_eq!(hours("SELECT hour_number FROM attribution_hour WHERE valuation_revision IS NULL ORDER BY hour_number"),[0,2,3]);
-    assert_eq!(drain(&mut conn, &config()), [0, 2, 3]);
+    assert_eq!(drain(&mut conn), [0, 2, 3]);
     assert_eq!(stored_cells(&conn, 1), original);
     assert_eq!(
         stored_cells(&conn, 0)
@@ -241,7 +218,7 @@ fn ledger_regression_media_list_value_uses_unit_pricing_and_dated_rates() {
     for built in [false, true] {
         if built {
             summaries(&mut conn);
-            drain(&mut conn, &config());
+            drain(&mut conn);
         }
         let value = list(&conn);
         // 0.9 seconds rounds up to 2 and then to the minimum of 3.
@@ -311,11 +288,7 @@ fn ledger_regression_broca_attempt_values_fast_mode_and_own_prompt_tier() {
         conn.execute("INSERT INTO broca_attempt_detail(event_key,fact_id,share_index,attempt_id,step_id,attempt,outcome,content_received,response_bytes,recorded_at_ms,requested_service_tier,mode) VALUES((SELECT event_key FROM usage_event WHERE event_id=?1),?2,0,?2,1,0,'complete',1,1,1,'standard',?3)",params![outcome.event_id,model,mode]).unwrap();
     }
     let mut cells = Cells::new();
-    assert!(
-        reduce(&conn, "occurred_at_ms=1", &config(), &[], &mut cells)
-            .unwrap()
-            .1
-    );
+    assert!(reduce(&conn, "occurred_at_ms=1", &mut cells).unwrap().1);
     let value = |model: &str| {
         cells
             .iter()
@@ -339,7 +312,7 @@ fn ledger_regression_failed_rate_reload_keeps_clean_and_dirty_list_value_equal()
     rate(&conn, "A", 1_000_000_000);
     event(&mut conn, "original", 1, "A", None, None, "unknown", 100);
     summaries(&mut conn);
-    drain(&mut conn, &config());
+    drain(&mut conn);
     let list_value = |conn: &Connection| {
         let request = ReportRequest {
             from_ms: Some(0),
@@ -357,7 +330,7 @@ fn ledger_regression_failed_rate_reload_keeps_clean_and_dirty_list_value_equal()
     };
     let before = list_value(&conn);
     assert_eq!(before.nanos, 200_000);
-    crate::rate_era::prepare(&conn, 2, &config().api_twins).unwrap();
+    crate::rate_era::prepare(&conn, 2).unwrap();
     crate::rate_era::record_failure(
         &conn,
         "provider",
@@ -441,7 +414,6 @@ fn state(conn: &Connection, hour: i64) -> String {
 #[test]
 fn attribution_projection_combines_ordinary_dimensions_without_losing_quantities() {
     let mut conn = conn();
-    let config = config();
     event(
         &mut conn,
         "a",
@@ -464,7 +436,7 @@ fn attribution_projection_combines_ordinary_dimensions_without_losing_quantities
     );
     rate(&conn, "A", 3);
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     assert_eq!(
         conn.query_row("SELECT count(*) FROM summary_cell", [], |r| r
             .get::<_, i64>(0))
@@ -526,10 +498,9 @@ fn attribution_projection_combines_ordinary_dimensions_without_losing_quantities
 #[test]
 fn attribution_changes_do_not_block_in_flight_main_publication() {
     let mut conn = conn();
-    let config = config();
     event(&mut conn, "one", 1, "A", None, None, "metered_api", 4);
     rate(&conn, "A", 3);
-    prepare(&mut conn, &config);
+    prepare(&mut conn);
     let mut summary = SummaryMaintenance::default();
     assert!(summary.read_chunk(&conn, 10_000).unwrap());
     attribution::bump(&conn, Hour { kind: 0, number: 0 });
@@ -538,7 +509,7 @@ fn attribution_changes_do_not_block_in_flight_main_publication() {
     tx.commit().unwrap();
     assert!(summary_current(&conn, Hour { kind: 0, number: 0 }).unwrap());
     let mut valued = ValuationMaintenance::default();
-    assert!(valued.read_chunk(&conn, &config, &[]).unwrap());
+    assert!(valued.read_chunk(&conn).unwrap());
     attribution::bump(&conn, Hour { kind: 0, number: 0 });
     let tx = conn.transaction().unwrap();
     assert!(valued.publish(&tx).unwrap());
@@ -557,11 +528,10 @@ fn attribution_changes_do_not_block_in_flight_main_publication() {
 #[test]
 fn attribution_only_backlog_writes_no_main_summary_or_valuation_rows() {
     let mut conn = conn();
-    let config = config();
     event(&mut conn, "one", 1, "A", None, None, "metered_api", 4);
     rate(&conn, "A", 3);
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     conn.execute("UPDATE summary_audit_state SET next_due_ms=100000", [])
         .unwrap();
     conn.execute_batch("CREATE TEMP TABLE main_writes(table_name TEXT);")
@@ -597,7 +567,7 @@ fn attribution_only_backlog_writes_no_main_summary_or_valuation_rows() {
             break;
         }
     }
-    assert_eq!(drain(&mut conn, &config), vec![0]);
+    assert_eq!(drain(&mut conn), vec![0]);
     assert_eq!(
         conn.query_row("SELECT count(*) FROM main_writes", [], |r| r
             .get::<_, i64>(0))
@@ -640,11 +610,10 @@ fn attribution_only_backlog_writes_no_main_summary_or_valuation_rows() {
 #[test]
 fn attribution_own_revision_fences_summary_and_valuation_publication() {
     let mut conn = conn();
-    let config = config();
     event(&mut conn, "one", 1, "A", None, None, "metered_api", 4);
     rate(&conn, "A", 3);
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     attribution::bump(&conn, Hour { kind: 0, number: 0 });
     let mut summary = SummaryMaintenance::default();
     assert!(summary.read_chunk(&conn, 10_000).unwrap());
@@ -654,7 +623,7 @@ fn attribution_own_revision_fences_summary_and_valuation_publication() {
     tx.commit().unwrap();
     assert!(attribution::next_summary(&conn, None).unwrap().is_some());
     let mut valued = ValuationMaintenance::default();
-    assert!(valued.read_chunk(&conn, &config, &[]).unwrap());
+    assert!(valued.read_chunk(&conn).unwrap());
     attribution::bump(&conn, Hour { kind: 0, number: 0 });
     let tx = conn.transaction().unwrap();
     assert!(!valued.publish(&tx).unwrap());
@@ -671,17 +640,16 @@ fn attribution_own_revision_fences_summary_and_valuation_publication() {
 #[test]
 fn valuation_summary_dirty_propagates_and_fences_publication() {
     let mut conn = conn();
-    let config = config();
     event(&mut conn, "one", 1, "A", None, None, "metered_api", 4);
     rate(&conn, "A", 3);
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     assert_eq!(state(&conn, 0), "built");
     event(&mut conn, "two", 2, "A", None, None, "metered_api", 6);
     assert_eq!(state(&conn, 0), "dirty");
     summaries(&mut conn);
     let mut maintenance = ValuationMaintenance::default();
-    assert!(maintenance.read_chunk(&conn, &config, &[]).unwrap());
+    assert!(maintenance.read_chunk(&conn).unwrap());
     event(
         &mut conn,
         "during-build",
@@ -697,7 +665,7 @@ fn valuation_summary_dirty_propagates_and_fences_publication() {
     tx.commit().unwrap();
     assert_eq!(state(&conn, 0), "dirty");
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     assert_eq!(
         stored_cells(&conn, 0)
             .values()
@@ -710,7 +678,6 @@ fn valuation_summary_dirty_propagates_and_fences_publication() {
 #[test]
 fn valuation_unfetched_models_wait_and_plan_intervals_dirty() {
     let mut conn = conn();
-    let config = config();
     for hour in 0..4 {
         event(
             &mut conn,
@@ -724,11 +691,11 @@ fn valuation_unfetched_models_wait_and_plan_intervals_dirty() {
         );
     }
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     assert_eq!(state(&conn, 0), "not_yet_valued");
     assert!(stored_cells(&conn, 0).is_empty());
     rate(&conn, "A", 3);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     assert_eq!(state(&conn, 0), "built");
     plan(
         &conn,
@@ -742,7 +709,7 @@ fn valuation_unfetched_models_wait_and_plan_intervals_dirty() {
         (state(&conn, 0), state(&conn, 1), state(&conn, 2)),
         ("built".into(), "dirty".into(), "built".into())
     );
-    assert_eq!(drain(&mut conn, &config), vec![1]);
+    assert_eq!(drain(&mut conn), vec![1]);
     plan(
         &conn,
         PlanLedger::Credential,
@@ -751,19 +718,18 @@ fn valuation_unfetched_models_wait_and_plan_intervals_dirty() {
         2 * HOUR_MS + 1,
         None,
     );
-    assert_eq!(drain(&mut conn, &config), vec![2, 3]);
+    assert_eq!(drain(&mut conn), vec![2, 3]);
     conn.execute(
         "UPDATE credential_subscription SET effective_to_ms=?1 WHERE credential_ref='credential'",
         [3 * HOUR_MS],
     )
     .unwrap();
-    assert_eq!(drain(&mut conn, &config), vec![3]);
+    assert_eq!(drain(&mut conn), vec![3]);
 }
 
 #[test]
 fn valuation_selective_invalidation_keeps_unaffected_hours_current_without_retagging() {
     let mut conn = conn();
-    let config = config();
     for (hour, model) in [(0, "A"), (1, "B"), (2, "B"), (3, "B"), (4, "B")] {
         event(
             &mut conn,
@@ -779,7 +745,7 @@ fn valuation_selective_invalidation_keeps_unaffected_hours_current_without_retag
     rate(&conn, "A", 3);
     rate(&conn, "B", 5);
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     // Leave one hour already dirty: a generation change cannot bless it current.
     event(
         &mut conn,
@@ -801,7 +767,7 @@ fn valuation_selective_invalidation_keeps_unaffected_hours_current_without_retag
         2 * HOUR_MS,
         Some(3 * HOUR_MS),
     );
-    prepare(&mut conn, &config);
+    prepare(&mut conn);
     assert_eq!(
         (
             state(&conn, 0),
@@ -819,7 +785,7 @@ fn valuation_selective_invalidation_keeps_unaffected_hours_current_without_retag
         )
     );
     summaries(&mut conn);
-    let rebuilt = drain(&mut conn, &config);
+    let rebuilt = drain(&mut conn);
     assert_eq!(
         rebuilt,
         vec![0, 2, 4],
@@ -834,8 +800,6 @@ fn valuation_selective_invalidation_keeps_unaffected_hours_current_without_retag
                 number: hour,
             }
             .filter(),
-            &config,
-            &[],
             &mut full,
         )
         .unwrap();
@@ -850,18 +814,22 @@ fn valuation_selective_invalidation_keeps_unaffected_hours_current_without_retag
     }
     assert_eq!(stored_cells(&conn, 1), before[1]);
     assert_eq!(stored_cells(&conn, 3), before[3]);
-    let mut changed = config.clone();
-    changed
-        .api_twins
-        .insert("another".into(), "provider".into());
-    assert_eq!(drain(&mut conn, &changed), vec![0, 1, 2, 3, 4]);
+    conn.execute("UPDATE valuation_state SET config='[{},[]]'", [])
+        .unwrap();
+    assert_eq!(drain(&mut conn), vec![0, 1, 2, 3, 4]);
 }
 
 #[test]
-fn valuation_pool_membership_matches_coverage_and_handles_unique_ambiguous_unmapped() {
+fn valuation_plan_membership_uses_active_account_or_credential_record() {
     let mut conn = conn();
-    let config = config();
-    plan(&conn, PlanLedger::Account, "provider", "account", 0, None);
+    plan(
+        &conn,
+        PlanLedger::Account,
+        "provider",
+        "account",
+        0,
+        Some(2),
+    );
     plan(
         &conn,
         PlanLedger::Credential,
@@ -870,69 +838,23 @@ fn valuation_pool_membership_matches_coverage_and_handles_unique_ambiguous_unmap
         0,
         None,
     );
-    let tokens = EventTokens {
-        producer: "opencode".into(),
-        provider: "provider".into(),
-        model: Some("A".into()),
-        mode: None,
-        broca_attempt: false,
-        roles: Vec::new(),
-    };
-    let member = |config: &MultiplierConfig, account, credential, basis| {
+    let member = |account, credential, basis, at| {
         plan_member(
             &PlanBook::load(&conn).unwrap(),
-            config,
-            &tokens,
+            "provider",
             basis,
             account,
             credential,
-            Some(1),
+            at,
         )
-        .unwrap()
     };
     assert_eq!(
         member(
-            &config,
             Some("account"),
             Some("credential"),
-            "subscription_included"
+            "subscription_included",
+            Some(1),
         ),
-        PlanMember {
-            plan: "pool".into(),
-            plan_account: Some("account".into()),
-            record: Some(record_id(PlanLedger::Account, "account", 0)),
-        }
-    );
-    assert_eq!(
-        member(&config, None, Some("credential"), "unknown"),
-        PlanMember {
-            plan: "pool".into(),
-            plan_account: Some("credential".into()),
-            record: Some(record_id(PlanLedger::Credential, "credential", 0)),
-        }
-    );
-    assert_eq!(
-        member(&config, None, Some("Credential"), "unknown")
-            .plan_account
-            .as_deref(),
-        Some("account_unknown")
-    );
-    assert_eq!(
-        member(&config, None, None, "unknown")
-            .plan_account
-            .as_deref(),
-        Some("account_unknown")
-    );
-    assert_eq!(
-        member(&config, Some("account"), Some("credential"), "metered_api"),
-        PlanMember::non_pool("api")
-    );
-    let empty = MultiplierConfig {
-        quota_providers: BTreeMap::new(),
-        ..config.clone()
-    };
-    assert_eq!(
-        member(&empty, Some("account"), None, "unknown"),
         PlanMember {
             plan: "provider".into(),
             plan_account: Some("account".into()),
@@ -940,71 +862,58 @@ fn valuation_pool_membership_matches_coverage_and_handles_unique_ambiguous_unmap
         }
     );
     assert_eq!(
-        member(&empty, None, None, "unknown"),
-        PlanMember::non_pool("none")
+        member(None, Some("credential"), "unknown", Some(1)),
+        PlanMember {
+            plan: "provider".into(),
+            plan_account: Some("credential".into()),
+            record: Some(record_id(PlanLedger::Credential, "credential", 0)),
+        }
     );
-    let mut ambiguous = config.clone();
-    let mut other = ambiguous.quota_providers["pool"].clone();
-    other.scope[0].producer = "other-producer".into();
-    ambiguous.quota_providers.insert("other".into(), other);
-    assert!(
-        ambiguous.validate().is_ok(),
-        "disjoint scopes can still map a plan provider ambiguously"
-    );
+    for (account, credential, at) in [
+        (None, Some("Credential"), Some(1)),
+        (None, None, Some(1)),
+        (Some(""), Some("credential"), Some(1)),
+        (Some("account"), None, None),
+        (Some("account"), None, Some(-1)),
+        (Some("account"), None, Some(2)),
+    ] {
+        assert_eq!(
+            member(account, credential, "unknown", at),
+            PlanMember::non_pool("none")
+        );
+    }
     assert_eq!(
-        member(&ambiguous, Some("account"), None, "unknown"),
-        PlanMember::non_pool("pool_conflict")
+        member(Some("account"), Some("credential"), "metered_api", Some(1)),
+        PlanMember::non_pool("api")
     );
-    // Drive credential precedence and conflict through persisted builder rows too.
+    // A malformed ledger can contain overlapping records; a healthy ledger
+    // refuses the second insert. Do not assign such a call to either record.
+    conn.execute_batch("DROP TRIGGER account_subscription_no_overlap")
+        .unwrap();
+    plan(&conn, PlanLedger::Account, "provider", "account", 1, None);
     event(
         &mut conn,
-        "credential",
+        "overlap",
         1,
         "A",
-        None,
+        Some("account"),
         Some("credential"),
         "unknown",
         10,
     );
-    event(&mut conn, "fallback", 2, "A", None, None, "unknown", 10);
     rate(&conn, "A", 3);
     summaries(&mut conn);
-    drain(&mut conn, &ambiguous);
+    drain(&mut conn);
     let cells = stored_cells(&conn, 0);
-    assert!(cells
-        .iter()
-        .any(|((_, member), cell)| member.plan == "pool_conflict" && cell.numerator == 60));
-    assert!(cells
-        .keys()
-        .any(|(_, member)| member.plan_account.as_deref() == Some("account_unknown")));
-}
-
-#[test]
-fn valuation_config_refuses_cross_pool_scope_intersections() {
-    let config = config();
-    for (prefix, basis, overlaps) in [(None, None, true), (Some("a"), Some("unknown"), true)] {
-        let mut config = config.clone();
-        let mut other = config.quota_providers["pool"].clone();
-        other.scope[0].model_prefix = prefix.map(str::to_string);
-        other.scope[0].charge_basis = basis.map(str::to_string);
-        config.quota_providers.insert("other".into(), other);
-        assert_eq!(config.validate().is_err(), overlaps);
-    }
-    let mut config = config;
-    config.quota_providers.get_mut("pool").unwrap().scope[0].model_prefix = Some("abc".into());
-    let mut other = config.quota_providers["pool"].clone();
-    other.scope[0].model_prefix = Some("abcd".into());
-    config.quota_providers.insert("other".into(), other.clone());
-    assert!(config.validate().is_err());
-    other.scope[0].model_prefix = Some("xyz".into());
-    config.quota_providers.insert("other".into(), other);
-    assert!(config.validate().is_ok());
+    assert_eq!(cells.len(), 1);
+    let ((_, member), cell) = cells.first_key_value().unwrap();
+    assert_eq!(member, &PlanMember::non_pool("pool_conflict"));
+    assert_eq!(cell.numerator, 60);
 }
 
 #[test]
 fn valuation_paying_credential_uses_resolved_else_auth_selection_exactly() {
     let mut conn = conn();
-    let config = config();
     plan(
         &conn,
         PlanLedger::Credential,
@@ -1034,12 +943,12 @@ fn valuation_paying_credential_uses_resolved_else_auth_selection_exactly() {
     }
     rate(&conn, "A", 3);
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     let actual: BTreeMap<_, _> = stored_cells(&conn, 0)
         .into_iter()
         .map(|((_, member), cell)| {
             (
-                member.plan_account.unwrap(),
+                member.plan_account,
                 (cell.recorded.cell.events, cell.numerator),
             )
         })
@@ -1047,10 +956,10 @@ fn valuation_paying_credential_uses_resolved_else_auth_selection_exactly() {
     assert_eq!(
         actual,
         BTreeMap::from([
-            ("credential".into(), (1, 12)),
-            ("selected".into(), (1, 24)),
-            ("account_unknown".into(), (1, 36)),
-            ("account".into(), (1, 48)),
+            (Some("credential".into()), (1, 12)),
+            (Some("selected".into()), (1, 24)),
+            (None, (1, 36)),
+            (Some("account".into()), (1, 48)),
         ])
     );
 }
@@ -1107,7 +1016,6 @@ fn recorded_price(conn: &Connection, key: i64, nanos: i64) -> i64 {
 fn valuation_randomized_cells_equal_per_call_ledger_and_split_recorded_spend() {
     use chrono::TimeZone;
     let mut conn = conn();
-    let config = config();
     let mut seed = 7129_u64;
     let mut next = || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -1158,38 +1066,29 @@ fn valuation_randomized_cells_equal_per_call_ledger_and_split_recorded_spend() {
         let spend = i64::try_from(next() % 10000).unwrap();
         let spend = recorded_price(&conn, key, spend);
         // Plan effective dates can assign an otherwise identical summary key
-        // to a recorded plan member or to account_unknown within the same hour.
+        // to a recorded plan member or to none within the same hour.
         let member = if basis == "metered_api" {
             PlanMember::non_pool("api")
-        } else {
+        } else if (HOUR_MS / 2..36 * HOUR_MS + HOUR_MS / 2).contains(&at) {
             PlanMember {
-                plan: "pool".into(),
-                plan_account: Some(
-                    if (HOUR_MS / 2..36 * HOUR_MS + HOUR_MS / 2).contains(&at) {
-                        "shared"
+                plan: "provider".into(),
+                plan_account: Some("shared".into()),
+                record: Some(record_id(
+                    if account.is_some() {
+                        PlanLedger::Account
                     } else {
-                        "account_unknown"
-                    }
-                    .into(),
-                ),
-                record: (HOUR_MS / 2..36 * HOUR_MS + HOUR_MS / 2)
-                    .contains(&at)
-                    .then(|| {
-                        record_id(
-                            if account.is_some() {
-                                PlanLedger::Account
-                            } else {
-                                PlanLedger::Credential
-                            },
-                            "shared",
-                            if at < 18 * HOUR_MS + HOUR_MS / 2 {
-                                HOUR_MS / 2
-                            } else {
-                                18 * HOUR_MS + HOUR_MS / 2
-                            },
-                        )
-                    }),
+                        PlanLedger::Credential
+                    },
+                    "shared",
+                    if at < 18 * HOUR_MS + HOUR_MS / 2 {
+                        HOUR_MS / 2
+                    } else {
+                        18 * HOUR_MS + HOUR_MS / 2
+                    },
+                )),
             }
+        } else {
+            PlanMember::non_pool("none")
         };
         let unit_rate = if model == "A" { 3_i128 } else { 7 };
         let numerator = unit_rate * (i128::from(quantity) + 2 * i128::from(quantity / 2));
@@ -1224,7 +1123,7 @@ fn valuation_randomized_cells_equal_per_call_ledger_and_split_recorded_spend() {
     rate(&conn, "A", 3);
     rate(&conn, "B", 7);
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     let mut split = false;
     for hour in 0..72 {
         let cells = stored_cells(&conn, hour);
@@ -1329,8 +1228,6 @@ fn valuation_randomized_cells_equal_per_call_ledger_and_split_recorded_spend() {
                 reduce(
                     &conn,
                     &format!("occurred_at_ms>={start} AND occurred_at_ms<{end}"),
-                    &config,
-                    &[],
                     &mut reduced,
                 )
                 .unwrap();
@@ -1352,7 +1249,6 @@ fn valuation_randomized_cells_equal_per_call_ledger_and_split_recorded_spend() {
 #[test]
 fn valuation_event_error_discards_partial_value_without_stopping_hour() {
     let mut conn = conn();
-    let config = config();
     event(&mut conn, "good", 1, "A", None, None, "metered_api", 10);
     event(&mut conn, "bad", 2, "B", None, None, "metered_api", 10);
     rate(&conn, "A", 3);
@@ -1365,7 +1261,7 @@ fn valuation_event_error_discards_partial_value_without_stopping_hour() {
     )
     .unwrap();
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     assert_eq!(state(&conn, 0), "built");
     let cells = stored_cells(&conn, 0);
     assert_eq!(cells.values().map(|c| c.numerator).sum::<i128>(), 60);
@@ -1390,23 +1286,22 @@ fn valuation_event_error_discards_partial_value_without_stopping_hour() {
 #[test]
 fn valuation_waits_for_summary_then_uses_second_rate_change_and_fences_rate_publication() {
     let mut conn = conn();
-    let config = config();
     event(&mut conn, "A", 1, "A", None, None, "metered_api", 10);
     rate(&conn, "A", 3);
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     event(&mut conn, "new-B", 2, "B", None, None, "metered_api", 10);
     rate(&conn, "B", 5);
-    prepare(&mut conn, &config);
+    prepare(&mut conn);
     let mut maintenance = ValuationMaintenance::default();
-    assert!(!maintenance.read_chunk(&conn, &config, &[]).unwrap());
+    assert!(!maintenance.read_chunk(&conn).unwrap());
     assert!(
         !maintenance.has_pending(),
         "valuation cannot get ahead of a dirty summary"
     );
     rate(&conn, "B", 11);
     summaries(&mut conn);
-    drain(&mut conn, &config);
+    drain(&mut conn);
     assert_eq!(
         stored_cells(&conn, 0)
             .values()
@@ -1418,13 +1313,13 @@ fn valuation_waits_for_summary_then_uses_second_rate_change_and_fences_rate_publ
     // the stale build, even before maintenance synchronizes the rate dirty queue.
     event(&mut conn, "another-A", 3, "A", None, None, "metered_api", 2);
     summaries(&mut conn);
-    prepare(&mut conn, &config);
-    assert!(maintenance.read_chunk(&conn, &config, &[]).unwrap());
+    prepare(&mut conn);
+    assert!(maintenance.read_chunk(&conn).unwrap());
     rate(&conn, "A", 13);
     let tx = conn.transaction().unwrap();
     assert!(!maintenance.publish(&tx).unwrap());
     tx.commit().unwrap();
-    drain(&mut conn, &config);
+    drain(&mut conn);
     assert_eq!(
         stored_cells(&conn, 0)
             .values()

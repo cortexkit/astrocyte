@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 67. A schema change appends a migration; an applied
+currently version 68. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -66,6 +66,7 @@ copies that timeout without running the table-creating probes.
 | `capacity_provider_reading` | Each row records the latest capacity reading for a provider without account attribution. | upsert |
 | `window_sample` | Each row preserves a capacity-window observation and its breakdown in the append-only history. | insert |
 | `multiplier_observation` | Each row records a daily subscription multiplier observation or an operator recompute that supersedes an earlier observation. | insert only |
+| `multiplier_provider_day` | Records that a quota provider's complete set of multiplier observations for a UTC day was written, even if the set was empty. | insert only |
 | `credential_window_sample` | Source-instant quota history for readings without an account, identified by provider, vault credential and pool. | insert only |
 | `quota_reset_period` | Rebuildable quota history index: for each provider, account or credential, and pool, stores each reset as a UTC epoch millisecond and the earliest reading that reported it. | insert or lower earliest instant |
 | `attribution_fact` | Each row preserves one publisher's verbatim fact and indexed subject, parent, workload, task and project evidence. | insert only; corrections append with `supersedes` |
@@ -506,22 +507,51 @@ completion; no completion, an overdue completion or a future completion starts
 the check immediately. An interrupted pass leaves the last completion unchanged
 and starts again from the beginning after a restart.
 
-`multiplier_observation` uses the same rule: a day's head is the row no other
-row supersedes, and `multiplier_observation_one_original_per_day` allows one
-original per quota provider and day. Test:
-`pace_uses_the_latest_day_head_not_a_superseded_row`.
+## Quota readings and multiplier observations
 
-That partial index cannot serve a head lookup, because a day's head may be a
-correction rather than its original. Migration 42 adds the full index
-`multiplier_observation_provider_day_plan` on `(quota_provider,
-observation_day, plan)`, so a day's head, its existence check and the pace
-head are seeks rather than scans of every observation. It also adds
-`vault_plan_credential_latest` on `vault_plan_history(credential_id,
-history_id)`, so comparing a vault listing with its credential's newest row
-reads one row instead of sorting that credential's history. Neither table is
-large or written per call. The quota sample tables get no new index: identity
-lookups jump between identities through their primary keys instead (see
-`docs/subscription-multiplier.md`).
+`window_sample` and `credential_window_sample` store nullable `model_scope`
+(`all` or `subset`) with each new reading. After migration 68, a null value
+means the reading stated no recognized scope. Readings fetched before the
+migration keep null in storage. For measurement only, they inherit the scope
+of the earliest reading stored since the migration for the same quota
+provider, login and pool identity, if that reading exists and states a scope.
+No readings are backfilled.
+
+`multiplier_observation` retains `window_pool_key` and `window_minutes`. The
+stored key is a named slot or a length-prefixed extra-window key; the report's
+`pool_id` is the slot name or the raw extra-window ID. The pool columns are:
+
+| Column | Meaning |
+|---|---|
+| `pool_scope` | `all`, `subset` or `unknown` on new rows; null identifies the historical lineage. |
+| `catalog_provider` | The catalog provider agreed on by the pool's readings, or null when no single provider is established. It can differ from `quota_provider`. |
+| `pool_models` | JSON array of `provider/model` catalog IDs in the served subset list, or null when no list applies. |
+| `pool_models_at_ms` | The subset lookup's `plan.prices` instant, including when the list is missing; null for other scopes. It is the observation's `interval_end_ms`. |
+| `pool_member_models` | JSON array of raw `provider/model` IDs of calls admitted to a subset via suffix removal or an alias. It can be set only when `pool_models` is set. |
+
+An observation's unique row ID is `observation_id`; `supersedes` points to its
+predecessor. A chain's head is the row no other row supersedes. Migration 68
+keeps two lineages, with one original per key in each:
+
+- Historical rows (`pool_scope IS NULL`) use `(quota_provider,
+  observation_day, plan)`, with a nullable plan. An existing correction may
+  have a different `window_pool_key` from its parent.
+- Pool rows (`pool_scope IS NOT NULL`) use `(quota_provider, observation_day,
+  plan, window_pool_key)`. The plan is required and a correction stays in the
+  same pool. Recomputing a historical day starts a new pool chain rather than
+  superseding a historical row. If a pool drops out of a recomputed day's set,
+  a `pool_retired` row supersedes its head without deleting history.
+
+Corrections cannot cross lineages. The checks against reusing an observation
+ID or superseding the same parent twice apply across the whole table, including
+under `INSERT OR REPLACE`.
+
+`multiplier_provider_day` is append-only and keyed by `(quota_provider,
+observation_day)`, with `recorded_at_ms` recording the first write. The daily
+stage or a recompute writes the marker and the complete provider-day set in the
+same transaction. A recompute keeps the existing marker and reconciles the set
+by appending observations. An empty set still has a marker, so it can advance
+that provider's `latest` report without carrying older pools forward.
 
 ## Money
 
@@ -560,8 +590,8 @@ token selectors parse but never apply.
 Without a stored mode, multiplier rows count `mode_unrecorded_tokens` and
 `base_rate_tier_untested_tokens`. A served `rate.reasoning` billed as `rate.output`
 uses the selected output rate, including mode and context tiers where supported,
-unless an applicable reasoning variant states its own verdict. Without that rule,
-reasoning needs its own rate unless the provider is in `reasoning_billed_as_output`. Ledger
+unless an applicable reasoning variant states its own verdict. Without that
+rule, reasoning needs its own rate; if none applies it is unpriced. Ledger
 coverage and whole-event `rate_tiered` refusals precede selection.
 A served `rate.cache_write` billed as `rate.input` uses the selected input rate
 for plain writes unless an applicable cache-write variant states its own verdict.

@@ -1,19 +1,16 @@
 //! Desired-configuration decoding for metering.
 
 use astrocyte_core::canon::{canonical_hash, jcs_serialize};
-use astrocyte_core::multiplier::MultiplierConfig;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MODULE_ID: &str = "astrocyte";
 
 pub(crate) const MAX_POLL_INTERVAL_SECS: u64 = 2_305_843_009_213_693;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AstrocyteConfig {
     pub poll_interval_secs: u64,
-    /// Providers whose reasoning tokens use output rates in ledger pricing and valuation.
-    pub reasoning_billed_as_output: Vec<String>,
-    pub subscription_multiplier: MultiplierSetting,
     pub harness_ingest: HarnessIngest,
 }
 
@@ -90,28 +87,6 @@ impl HarnessIngest {
     }
 }
 
-/// The subscription multiplier's declarations as a generation carries them.
-///
-/// A decoded document always yields `Recorded`: the member is required. The
-/// other state exists only for hydration, because a generation committed
-/// before the store could hold the member has none. That is not the same as
-/// an operator declaring no quota providers, so it is its own state and the
-/// daily multiplier stage skips it under its own reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MultiplierSetting {
-    Recorded(MultiplierConfig),
-    NotRecorded,
-}
-
-impl Serialize for MultiplierSetting {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Recorded(config) => config.serialize(serializer),
-            Self::NotRecorded => serializer.serialize_none(),
-        }
-    }
-}
-
 impl AstrocyteConfig {
     /// Validation bounds the seconds value so both conversion to milliseconds
     /// and four consecutive poll intervals fit in a signed database integer.
@@ -167,161 +142,6 @@ impl std::fmt::Display for ConfigError {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DecodedConfig {
-    poll_interval_secs: u64,
-    reasoning_billed_as_output: Vec<String>,
-    subscription_multiplier: MultiplierConfig,
-    harness_ingest: HarnessIngest,
-}
-
-impl From<DecodedConfig> for AstrocyteConfig {
-    fn from(decoded: DecodedConfig) -> Self {
-        Self {
-            poll_interval_secs: decoded.poll_interval_secs,
-            reasoning_billed_as_output: decoded.reasoning_billed_as_output,
-            subscription_multiplier: MultiplierSetting::Recorded(decoded.subscription_multiplier),
-            harness_ingest: decoded.harness_ingest,
-        }
-    }
-}
-
-/// The `desired_config.subscription_multiplier` column value: the member's
-/// canonical JSON, or `None` for a generation that did not record it.
-pub(crate) fn multiplier_column(config: &AstrocyteConfig) -> Result<Option<String>, ConfigError> {
-    match &config.subscription_multiplier {
-        MultiplierSetting::NotRecorded => Ok(None),
-        MultiplierSetting::Recorded(multiplier) => {
-            let value = serde_json::to_value(multiplier)
-                .map_err(|error| ConfigError::Canonical(error.to_string()))?;
-            jcs_serialize(&value)
-                .map(Some)
-                .map_err(|error| ConfigError::Canonical(format!("{error:?}")))
-        }
-    }
-}
-
-/// Reads the column back. NULL is the pre-migration state, never an empty
-/// declaration. Older stored shapes are lifted before closed decoding and
-/// validation; desired documents do not use these compatibility lifts.
-pub(crate) fn decode_multiplier_column(
-    column: Option<&str>,
-) -> Result<MultiplierSetting, ConfigError> {
-    let Some(text) = column else {
-        return Ok(MultiplierSetting::NotRecorded);
-    };
-    // Older generations stored the pricing declaration inside this member.
-    // Hydration lifts it separately; desired documents still reject that shape.
-    let mut value: serde_json::Value = serde_json::from_str(text)
-        .map_err(|error| ConfigError::Decode(format!("subscription_multiplier: {error}")))?;
-    if let Some(object) = value.as_object_mut() {
-        object.remove("reasoning_billed_as_output");
-    }
-    // Generations written before model filtering counted every model.
-    if let Some(providers) = value
-        .get_mut("quota_providers")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        for provider in providers.values_mut() {
-            // Live documents reject the removed identity maps. Stored
-            // generations retain their plans in the seeded vault history.
-            if let Some(provider) = provider.as_object_mut() {
-                for field in ["accounts", "credentials"] {
-                    if let Some(members) = provider.remove(field) {
-                        for plan in members
-                            .as_object()
-                            .ok_or_else(|| {
-                                ConfigError::Decode(format!("stored {field} must be an object"))
-                            })?
-                            .values()
-                        {
-                            if plan
-                                .get("price_override")
-                                .is_some_and(|value| !value.is_null())
-                            {
-                                return Err(ConfigError::Decode("stored per-account price_override is no longer supported; refusing to discard a non-null override".into()));
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(scope) = provider
-                .get_mut("scope")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                for rule in scope {
-                    if let Some(rule) = rule.as_object_mut() {
-                        rule.entry("model_prefix")
-                            .or_insert(serde_json::Value::Null);
-                    }
-                }
-            }
-        }
-    }
-    let config: MultiplierConfig = serde_json::from_value(value)
-        .map_err(|error| ConfigError::Decode(format!("subscription_multiplier: {error}")))?;
-    config.validate().map_err(ConfigError::Validation)?;
-    Ok(MultiplierSetting::Recorded(config))
-}
-
-/// Seed once from the committed generation, before live config replacement
-/// can remove the old maps. The marker and rows commit together.
-pub(crate) fn seed_vault_history(conn: &rusqlite::Connection) -> Result<(), String> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|error| error.to_string())?;
-    let seeded: bool = tx
-        .query_row("SELECT EXISTS(SELECT 1 FROM vault_plan_seed)", [], |row| {
-            row.get(0)
-        })
-        .map_err(|error| error.to_string())?;
-    if seeded {
-        return Ok(());
-    }
-    let column: Option<String> = tx
-        .query_row(
-            "SELECT subscription_multiplier FROM desired_config WHERE id=1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    decode_multiplier_column(column.as_deref()).map_err(|error| error.to_string())?;
-    let value = column
-        .as_deref()
-        .map(serde_json::from_str::<serde_json::Value>)
-        .transpose()
-        .map_err(|error| error.to_string())?
-        .unwrap_or(serde_json::Value::Null);
-    astrocyte_core::vault_plan::seed_config_in_tx(&tx, &value, crate::state::now_ms())?;
-    tx.commit().map_err(|error| error.to_string())
-}
-
-/// Read `reasoning_billed_as_output` from the generation JSON. If absent, use
-/// the old `subscription_multiplier.reasoning_billed_as_output` column member;
-/// generations without either declaration use an empty provider list.
-pub(crate) fn decode_reasoning_generation(
-    canonical_bytes: &[u8],
-    multiplier_column: Option<&str>,
-) -> Result<Vec<String>, ConfigError> {
-    let generation: serde_json::Value = serde_json::from_slice(canonical_bytes)
-        .map_err(|error| ConfigError::Decode(format!("desired generation: {error}")))?;
-    let nested: serde_json::Value = multiplier_column
-        .map(serde_json::from_str)
-        .transpose()
-        .map_err(|error| ConfigError::Decode(format!("subscription_multiplier: {error}")))?
-        .unwrap_or(serde_json::Value::Null);
-    let value = generation
-        .get("reasoning_billed_as_output")
-        .or_else(|| nested.get("reasoning_billed_as_output"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!([]));
-    let providers: Vec<String> = serde_json::from_value(value)
-        .map_err(|error| ConfigError::Decode(format!("reasoning_billed_as_output: {error}")))?;
-    validate_reasoning_providers(&providers)?;
-    Ok(providers)
-}
-
 /// The `desired_config.harness_ingest` column value: the member's canonical
 /// JSON.
 pub(crate) fn harness_ingest_column(config: &AstrocyteConfig) -> Result<String, ConfigError> {
@@ -361,18 +181,13 @@ pub fn decode(contents: &str) -> Result<DesiredContent, ConfigError> {
     validate_closed_shape(&value)?;
     // Deserialize the original JSON too: serde's struct visitor sees duplicate
     // members that a Value map would already have collapsed.
-    let decoded: DecodedConfig =
+    let decoded =
         serde_json::from_str(&json).map_err(|error| ConfigError::Decode(error.to_string()))?;
-    canonicalize(decoded.into())
+    canonicalize(decoded)
 }
 
 fn validate_closed_shape(value: &serde_json::Value) -> Result<(), ConfigError> {
-    const MEMBERS: [&str; 4] = [
-        "poll_interval_secs",
-        "subscription_multiplier",
-        "harness_ingest",
-        "reasoning_billed_as_output",
-    ];
+    const MEMBERS: [&str; 2] = ["poll_interval_secs", "harness_ingest"];
     let object = value
         .as_object()
         .ok_or_else(|| ConfigError::Decode("desired root must be an object".into()))?;
@@ -410,12 +225,6 @@ pub(crate) fn canonicalize(config: AstrocyteConfig) -> Result<DesiredContent, Co
 pub fn intentional_empty() -> DesiredContent {
     canonicalize(AstrocyteConfig {
         poll_interval_secs: 60,
-        reasoning_billed_as_output: Vec::new(),
-        subscription_multiplier: MultiplierSetting::Recorded(MultiplierConfig {
-            api_twins: Default::default(),
-            plan_price_overrides: Default::default(),
-            quota_providers: Default::default(),
-        }),
         harness_ingest: HarnessIngest::all_on(),
     })
     .expect("the closed intentional-empty value is valid")
@@ -423,26 +232,7 @@ pub fn intentional_empty() -> DesiredContent {
 
 fn validate_config(config: &AstrocyteConfig) -> Result<(), ConfigError> {
     validate_poll_interval(config.poll_interval_secs)?;
-    config.harness_ingest.validate()?;
-    validate_reasoning_providers(&config.reasoning_billed_as_output)?;
-    match &config.subscription_multiplier {
-        MultiplierSetting::Recorded(multiplier) => {
-            multiplier.validate().map_err(ConfigError::Validation)
-        }
-        MultiplierSetting::NotRecorded => Ok(()),
-    }
-}
-
-fn validate_reasoning_providers(providers: &[String]) -> Result<(), ConfigError> {
-    let mut seen = std::collections::BTreeSet::new();
-    for provider in providers {
-        if provider.is_empty() || !seen.insert(provider) {
-            return Err(ConfigError::Validation(format!(
-                "reasoning_billed_as_output entry '{provider}' must be non-empty and listed once"
-            )));
-        }
-    }
-    Ok(())
+    config.harness_ingest.validate()
 }
 
 fn validate_poll_interval(value: u64) -> Result<(), ConfigError> {
@@ -463,11 +253,6 @@ fn validate_poll_interval(value: u64) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
 
-    /// The multiplier member with nothing declared, as every other test
-    /// document carries it so the document stays closed.
-    const NO_MULTIPLIER: &str =
-        r#"{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}}"#;
-
     /// The `harness_ingest` member with every producer on. Every test document
     /// carries it, because the document is closed and the member is required.
     const INGEST_ON: &str = r#"{"enabled":true,"exclude":[]}"#;
@@ -476,29 +261,10 @@ mod tests {
         format!(
             r#"{{
         "poll_interval_secs": 60,
-        "reasoning_billed_as_output": [],
-        "subscription_multiplier": {NO_MULTIPLIER},
         "harness_ingest": {INGEST_ON}
     }}"#
         )
     }
-
-    /// A document with the supplied JSON inserted verbatim as its
-    /// `subscription_multiplier` member.
-    fn with_multiplier(multiplier: &str) -> String {
-        format!(
-            r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{multiplier},"harness_ingest":{INGEST_ON}}}"#
-        )
-    }
-
-    const CODEX: &str = r#"{
-        "api_twins": {"openai-codex": "openai"},
-        "plan_price_overrides": {},
-        "quota_providers": {"codex": {
-            "window": {"pool_key": "primary", "window_minutes": 10080},
-            "scope": [{"producer": "pi", "provider": "openai-codex", "charge_basis": null, "model_prefix": null}]
-        }}
-    }"#;
 
     #[test]
     fn desired_jsonc_comments_and_trailing_commas_are_accepted() {
@@ -506,8 +272,6 @@ mod tests {
             r#"{{
                 // Set the metering cadence in seconds.
                 "poll_interval_secs": 60,
-                "reasoning_billed_as_output": [],
-                "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON},
             }}"#
         ))
@@ -521,8 +285,6 @@ mod tests {
             r#"{{
                 "poll_interval_secs": 60,
                 "catalog_file": null,
-                "reasoning_billed_as_output": [],
-                "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON}
             }}"#
         ))
@@ -539,8 +301,6 @@ mod tests {
             r#"{{
                 "poll_interval_secs": 60,
                 "thalamus_connection_file": null,
-                "reasoning_billed_as_output": [],
-                "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON}
             }}"#
         ))
@@ -562,8 +322,6 @@ mod tests {
             r#"{{
                 "poll_interval_secs": 60,
                 "broca_connection_file": null,
-                "reasoning_billed_as_output": [],
-                "subscription_multiplier": {NO_MULTIPLIER},
                 "harness_ingest": {INGEST_ON}
             }}"#
         ))
@@ -590,11 +348,11 @@ mod tests {
     #[test]
     fn unknown_and_duplicate_members_are_rejected_before_canonicalization() {
         assert!(decode(&format!(
-            r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON},"future":null}}"#
+            r#"{{"poll_interval_secs":60,"harness_ingest":{INGEST_ON},"future":null}}"#
         ))
         .is_err());
         let error = decode(&format!(
-            r#"{{"poll_interval_secs":60,"poll_interval_secs":30,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
+            r#"{{"poll_interval_secs":60,"poll_interval_secs":30,"harness_ingest":{INGEST_ON}}}"#
         ))
         .unwrap_err();
         assert!(error.to_string().contains("duplicate field"));
@@ -604,7 +362,7 @@ mod tests {
     fn required_members_and_value_bounds_are_enforced() {
         assert!(decode(r#"{"poll_interval_secs":60}"#).is_err());
         assert!(decode(&format!(
-            r#"{{"poll_interval_secs":0,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{INGEST_ON}}}"#
+            r#"{{"poll_interval_secs":0,"harness_ingest":{INGEST_ON}}}"#
         ))
         .is_err());
     }
@@ -615,265 +373,14 @@ mod tests {
         assert_eq!(desired.config, intentional_empty().config);
         assert_eq!(
             String::from_utf8(desired.canonical_bytes).unwrap(),
-            r#"{"harness_ingest":{"enabled":true,"exclude":[]},"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}}}"#
+            r#"{"harness_ingest":{"enabled":true,"exclude":[]},"poll_interval_secs":60}"#
         );
-    }
-
-    /// The multiplier member is required like every other member: a document
-    /// written before it existed is refused by name, never given a default.
-    #[test]
-    fn a_document_without_the_multiplier_member_is_refused_by_name() {
-        let error = decode(r#"{"poll_interval_secs":60}"#).unwrap_err();
-        assert_eq!(
-            error,
-            ConfigError::Decode("desired root is missing member 'subscription_multiplier'".into())
-        );
-    }
-
-    #[test]
-    fn the_multiplier_member_is_closed_at_every_level() {
-        assert!(decode(&with_multiplier(CODEX)).is_ok());
-        // An unknown member inside a nested object.
-        let unknown = CODEX.replace(
-            r#""window_minutes": 10080"#,
-            r#""window_minutes": 10080, "largest": true"#,
-        );
-        let error = decode(&with_multiplier(&unknown)).unwrap_err();
-        assert!(error.to_string().contains("largest"), "{error}");
-        // A nullable member left out is missing, not null.
-        let missing = CODEX.replace(r#", "charge_basis": null"#, "");
-        let error = decode(&with_multiplier(&missing)).unwrap_err();
-        assert!(error.to_string().contains("charge_basis"), "{error}");
-        let missing = CODEX.replace(r#", "model_prefix": null"#, "");
-        let error = decode(&with_multiplier(&missing)).unwrap_err();
-        assert!(error.to_string().contains("model_prefix"), "{error}");
-        let prefixed = CODEX.replace(
-            r#""model_prefix": null"#,
-            r#""model_prefix": "antigravity-gemini-""#,
-        );
-        assert!(decode(&with_multiplier(&prefixed)).is_ok());
-    }
-
-    #[test]
-    fn multiplier_values_are_validated() {
-        for (from, to, needle) in [
-            (
-                r#""charge_basis": null"#,
-                r#""charge_basis": "free""#,
-                "charge_basis",
-            ),
-            ("10080", "0", "window_minutes"),
-            (
-                r#""model_prefix": null"#,
-                r#""model_prefix": """#,
-                "model_prefix",
-            ),
-        ] {
-            let error = decode(&with_multiplier(&CODEX.replace(from, to))).unwrap_err();
-            assert!(error.to_string().contains(needle), "{needle}: {error}");
-        }
-    }
-
-    #[test]
-    fn vault_old_config_hydrates_but_live_maps_are_refused_and_nonnull_override_is_not_lost() {
-        assert!(decode(&with_multiplier(CODEX)).is_ok());
-        for field in ["accounts", "credentials"] {
-            let mut old: serde_json::Value = serde_json::from_str(CODEX).unwrap();
-            old["quota_providers"]["codex"][field] =
-                serde_json::json!({"acct":{"plan":"openai/pro_20x","price_override":null}});
-            assert!(decode(&with_multiplier(&old.to_string()))
-                .unwrap_err()
-                .to_string()
-                .contains(field));
-            assert_eq!(
-                decode_multiplier_column(Some(&old.to_string())).unwrap(),
-                decode_multiplier_column(Some(CODEX)).unwrap()
-            );
-            old["quota_providers"]["codex"][field]["acct"]["price_override"] = serde_json::json!({"minor_units":20_000,"exponent":2,"currency":"USD","period":"month"});
-            assert!(decode_multiplier_column(Some(&old.to_string()))
-                .unwrap_err()
-                .to_string()
-                .contains("non-null override"));
-        }
-    }
-
-    #[test]
-    fn vault_startup_seeds_committed_generation_before_closed_hydration_once() {
-        use cortexkit_store::{open_sqlite, Isolation, StorageBackend, StorageDescriptor};
-        let directory = tempfile::tempdir().unwrap();
-        let descriptor = StorageDescriptor {
-            module_id: "astrocyte".into(),
-            storage_namespace: "astrocyte".into(),
-            isolation: Isolation::Module,
-            backend: StorageBackend::Sqlite {
-                path: directory
-                    .path()
-                    .join("store.sqlite")
-                    .to_string_lossy()
-                    .into_owned(),
-            },
-        };
-        let store = open_sqlite(&descriptor).unwrap();
-        store
-            .migrate("astrocyte", astrocyte_core::store::MIGRATIONS)
-            .unwrap();
-        let mut old: serde_json::Value = serde_json::from_str(CODEX).unwrap();
-        old["quota_providers"]["codex"]["accounts"] =
-            serde_json::json!({"acct":{"plan":"openai/pro_20x","price_override":null}});
-        old["quota_providers"]["codex"]["credentials"] = serde_json::json!({});
-        let mut credential = old["quota_providers"]["codex"].clone();
-        credential["accounts"] = serde_json::json!({});
-        credential["credentials"] =
-            serde_json::json!({"vault-key":{"plan":"opencode-go/go","price_override":null}});
-        // Its own provider's calls, as in production: configuration refuses
-        // two quota providers whose scope rules claim the same calls.
-        credential["scope"] = serde_json::json!([{"producer":"opencode","provider":"opencode-go","charge_basis":null,"model_prefix":null}]);
-        old["quota_providers"]["opencodego"] = credential;
-        store.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            tx.execute("UPDATE desired_config SET generation=1,subscription_multiplier=?1,canonical_bytes=?2 WHERE id=1",
-                rusqlite::params![old.to_string(),b"{}".as_slice()])?;
-            tx.execute("UPDATE source_runtime SET desired_generation=1",[])?;
-            tx.commit()
-        }).unwrap();
-        let state = crate::state::SharedState::from_store(store).unwrap();
-        let seeded = state
-            .with_conn(|conn| {
-                astrocyte_core::vault_plan::at(conn, 1).map_err(|error| error.to_string())
-            })
-            .unwrap();
-        assert_eq!(seeded.len(), 2);
-        assert!(seeded
-            .iter()
-            .all(|row| row.source == "config" && row.effective_from_ms == 0));
-        assert!(seeded
-            .iter()
-            .any(|row| row.account_id.as_deref() == Some("acct")
-                && row.plan_key.as_deref() == Some("openai/pro_20x")));
-        assert!(seeded
-            .iter()
-            .any(|row| row.account_id.is_none() && row.credential_id == "vault-key"));
-        drop(state);
-        let state =
-            crate::state::SharedState::from_store(open_sqlite(&descriptor).unwrap()).unwrap();
-        assert_eq!(
-            state
-                .with_conn(|conn| astrocyte_core::vault_plan::at(conn, 1)
-                    .map_err(|error| error.to_string()))
-                .unwrap(),
-            seeded
-        );
-        let MultiplierSetting::Recorded(config) = state.desired_config().subscription_multiplier
-        else {
-            panic!("missing hydrated declaration")
-        };
-        assert_eq!(
-            serde_json::to_value(config).unwrap()["quota_providers"]["codex"]
-                .as_object()
-                .unwrap()
-                .len(),
-            2
-        );
-    }
-
-    /// The production document shipped with the binary must decode under this
-    /// binary's closed format, or the two cannot move together.
-    #[test]
-    fn the_production_config_decodes() {
-        let desired = decode(include_str!("../../../docs/prod-config/astrocyte-v2.jsonc")).unwrap();
-        let MultiplierSetting::Recorded(multiplier) = desired.config.subscription_multiplier else {
-            panic!("a decoded document always records the member");
-        };
-        assert_eq!(
-            multiplier.quota_providers.keys().collect::<Vec<_>>(),
-            ["claude", "codex"]
-        );
-        assert_eq!(desired.config.harness_ingest, HarnessIngest::all_on());
-    }
-
-    #[test]
-    fn the_multiplier_column_round_trips_and_null_is_not_recorded() {
-        let desired = decode(&with_multiplier(CODEX)).unwrap();
-        let column = multiplier_column(&desired.config).unwrap();
-        assert_eq!(
-            decode_multiplier_column(column.as_deref()).unwrap(),
-            desired.config.subscription_multiplier
-        );
-        assert_eq!(
-            decode_multiplier_column(None).unwrap(),
-            MultiplierSetting::NotRecorded
-        );
-    }
-
-    #[test]
-    fn scope_rules_can_differ_only_by_model_prefix() {
-        let mut value: serde_json::Value = serde_json::from_str(CODEX).unwrap();
-        let scope = value["quota_providers"]["codex"]["scope"]
-            .as_array_mut()
-            .unwrap();
-        let mut other = scope[0].clone();
-        other["model_prefix"] = serde_json::json!("antigravity-gemini-");
-        scope.push(other.clone());
-        assert!(decode(&with_multiplier(&value.to_string())).is_ok());
-        value["quota_providers"]["codex"]["scope"]
-            .as_array_mut()
-            .unwrap()
-            .push(other);
-        let error = decode(&with_multiplier(&value.to_string())).unwrap_err();
-        assert!(error.to_string().contains("listed twice"), "{error}");
-    }
-
-    #[test]
-    fn reasoning_billing_is_a_required_top_level_declaration() {
-        let document = empty().replace(
-            "\"reasoning_billed_as_output\": []",
-            "\"reasoning_billed_as_output\": [\"openai\", \"anthropic\"]",
-        );
-        let desired = decode(&document).unwrap();
-        assert_eq!(
-            desired.config.reasoning_billed_as_output,
-            ["openai", "anthropic"]
-        );
-        let mut value: serde_json::Value = serde_json::from_str(&document).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("reasoning_billed_as_output");
-        assert!(decode(&value.to_string())
-            .unwrap_err()
-            .to_string()
-            .contains("missing member 'reasoning_billed_as_output'"));
-        value["reasoning_billed_as_output"] = serde_json::json!([]);
-        value["subscription_multiplier"]["reasoning_billed_as_output"] = serde_json::json!([]);
-        assert!(decode(&value.to_string())
-            .unwrap_err()
-            .to_string()
-            .contains("unknown field `reasoning_billed_as_output`"));
-    }
-
-    #[test]
-    fn reasoning_billing_refuses_empty_and_duplicate_providers() {
-        for providers in [
-            serde_json::json!([""]),
-            serde_json::json!(["openai", "openai"]),
-        ] {
-            let document = empty().replace(
-                "\"reasoning_billed_as_output\": []",
-                &format!("\"reasoning_billed_as_output\": {providers}"),
-            );
-            assert!(decode(&document)
-                .unwrap_err()
-                .to_string()
-                .contains("must be non-empty and listed once"));
-        }
     }
 
     /// A document with the supplied JSON inserted verbatim as its
     /// `harness_ingest` member.
     fn with_ingest(ingest: &str) -> String {
-        format!(
-            r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER},"harness_ingest":{ingest}}}"#
-        )
+        format!(r#"{{"poll_interval_secs":60,"harness_ingest":{ingest}}}"#)
     }
 
     #[test]
@@ -931,10 +438,7 @@ mod tests {
 
     #[test]
     fn a_document_without_the_ingest_member_is_refused_by_name() {
-        let error = decode(&format!(
-            r#"{{"poll_interval_secs":60,"reasoning_billed_as_output":[],"subscription_multiplier":{NO_MULTIPLIER}}}"#
-        ))
-        .unwrap_err();
+        let error = decode(r#"{"poll_interval_secs":60}"#).unwrap_err();
         assert_eq!(
             error,
             ConfigError::Decode("desired root is missing member 'harness_ingest'".into())

@@ -621,7 +621,12 @@ fn source_is_registered_and_old_config_shape_stays_enabled_and_can_exclude_it() 
         serde_json::from_value(json!({"enabled":true,"exclude":[]})).unwrap();
     assert!(old.ingests(SOURCE_KEY));
     let config = f.home.path().join("astrocyte.jsonc");
-    fs::write(&config, json!({"poll_interval_secs":30,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[SOURCE_KEY]}}).to_string()).unwrap();
+    fs::write(
+        &config,
+        json!({"poll_interval_secs":30,"harness_ingest":{"enabled":true,"exclude":[SOURCE_KEY]}})
+            .to_string(),
+    )
+    .unwrap();
     crate::refresher::reload_config(&f.state, Ok(config)).unwrap();
     fs::write(&f.roots, "{").unwrap();
     crate::refresher::run_iteration_with_harness(&f.state, &[], &f.source, &NEVER_STOP);

@@ -66,24 +66,26 @@ pub fn discover(conn: &Connection, limit: i64) -> Result<(), MultiplierError> {
 }
 
 /// A catalog version change queues every known model, including targets no longer used directly.
-pub fn prepare(
-    conn: &Connection,
-    version: i64,
-    twins: &BTreeMap<String, String>,
-) -> Result<(), MultiplierError> {
-    let encoded = serde_json::to_string(twins).map_err(catalog_error)?;
-    let (previous, previous_twins): (i64, String) = conn.query_row(
-        "SELECT catalog_version,twins FROM rate_cache_state WHERE id=1",
+pub fn prepare(conn: &Connection, version: i64) -> Result<(), MultiplierError> {
+    let (previous, legacy_references): (i64, bool) = conn.query_row(
+        "SELECT catalog_version,twins<>'{}' FROM rate_cache_state WHERE id=1",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     // A restored catalog can reuse earlier versions for different timelines.
-    if version < previous || previous_twins != encoded {
+    if version < previous {
         conn.execute("UPDATE rate_model SET catalog_version=NULL", [])?;
     }
+    if legacy_references {
+        // Cached references may come from a removed setting rather than the catalog.
+        conn.execute(
+            "UPDATE rate_model SET catalog_version=NULL WHERE reference_provider IS NOT NULL",
+            [],
+        )?;
+    }
     conn.execute(
-        "UPDATE rate_cache_state SET catalog_version=?1,twins=?2 WHERE id=1",
-        params![version, encoded],
+        "UPDATE rate_cache_state SET catalog_version=?1,twins='{}' WHERE id=1",
+        [version],
     )?;
     Ok(())
 }
@@ -108,19 +110,13 @@ pub fn fetch(
     catalog: &CatalogClient,
     provider: &str,
     model: &str,
-    twins: &BTreeMap<String, String>,
 ) -> Result<FetchedModel, MultiplierError> {
     let current = catalog.get_current(provider, model);
     let mut reference = match &current {
         Ok(CatalogLookup::Resolved(snapshot)) => snapshot.alias_target.clone(),
         _ => None,
     };
-    if let Some(twin) = twins.get(provider).filter(|twin| twin.as_str() != provider) {
-        reference = Some(CatalogModel {
-            provider_id: twin.clone(),
-            model_id: model.into(),
-        });
-    } else if multiplier::lookup_missing(&current) && reference.is_none() {
+    if multiplier::lookup_missing(&current) && reference.is_none() {
         if let Some(base) = model
             .strip_suffix("-low")
             .or_else(|| model.strip_suffix("-high"))
@@ -498,7 +494,9 @@ fn resolved_model(
             return Err(catalog_error("cyclic model reference"));
         }
         let row: Option<(Option<i64>, Option<String>, Option<String>)> = conn.query_row(
-            "SELECT catalog_version,reference_provider,reference_model FROM rate_model WHERE provider=?1 AND model=?2",
+            "SELECT CASE WHEN reference_provider IS NULL OR (SELECT twins='{}' FROM rate_cache_state WHERE id=1)
+                         THEN catalog_version END,reference_provider,reference_model
+             FROM rate_model WHERE provider=?1 AND model=?2",
             params![current.0, current.1], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;
         match row {

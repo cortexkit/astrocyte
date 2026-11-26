@@ -1,6 +1,5 @@
-//! Calendar fees and exact two-stage allocation, independent of report grouping.
-use super::{pools_for_provider, PlanBook, PlanMember, PlanRecordId};
-use crate::multiplier::MultiplierConfig;
+//! Calendar fees and exact per-record allocation, independent of report grouping.
+use super::{PlanBook, PlanMember};
 use crate::report::ReportError;
 use crate::subscription::recurring_cost_nanos;
 use chrono::{Datelike, NaiveDate, Utc};
@@ -83,12 +82,8 @@ impl DayMember {
     }
 }
 
-fn is_pool(member: &PlanMember) -> bool {
-    member.plan_account.is_some() && member.plan != "pool_conflict"
-}
-
 /// Exact list-value numerators in the valuer's common scale. Include zero-weight
-/// entries for pool calls too: they establish which pending days touch a row.
+/// entries for plan calls too: they establish which pending days touch a row.
 #[derive(Clone, Debug, Default)]
 pub struct Weights(pub BTreeMap<DayMember, i128>);
 
@@ -132,7 +127,6 @@ pub struct FeeDays {
     pub days: Vec<FeeDay>,
     /// Distinct overlapping records, including records with no ledger calls.
     pub non_usd: BTreeSet<PlanMember>,
-    pub conflicts: BTreeSet<PlanMember>,
 }
 
 fn period_days(day: i64, period: &str) -> Result<i64, ReportError> {
@@ -166,18 +160,12 @@ impl FeeDays {
     /// two subscription ledgers, never multiplier observations or call cells.
     /// Each day retains its full fee; report-window overlap is applied only to
     /// unspread fees, not to the full-day allocation denominators.
-    pub fn load(
-        conn: &Connection,
-        config: &MultiplierConfig,
-        start_ms: i64,
-        end_ms: i64,
-    ) -> Result<Self, ReportError> {
-        Self::from_book(&PlanBook::load(conn)?, config, start_ms, end_ms)
+    pub fn load(conn: &Connection, start_ms: i64, end_ms: i64) -> Result<Self, ReportError> {
+        Self::from_book(&PlanBook::load(conn)?, start_ms, end_ms)
     }
 
     pub(super) fn from_book(
         book: &PlanBook,
-        config: &MultiplierConfig,
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Self, ReportError> {
@@ -190,7 +178,6 @@ impl FeeDays {
                 end_ms,
                 days: Vec::new(),
                 non_usd: BTreeSet::new(),
-                conflicts: BTreeSet::new(),
             });
         }
         let first_day = start_ms
@@ -209,17 +196,10 @@ impl FeeDays {
             end_ms,
             days: Vec::new(),
             non_usd: BTreeSet::new(),
-            conflicts: BTreeSet::new(),
         };
         for record in &book.records {
-            let PlanRecordId {
-                ledger,
-                provider,
-                identity,
-                effective_from_ms: from,
-            } = &record.id;
             let (from, to, minor, exponent, currency, period) = (
-                *from,
+                record.id.effective_from_ms,
                 record.until_ms,
                 record.minor,
                 record.exponent,
@@ -229,31 +209,9 @@ impl FeeDays {
             if from >= day_end || to.is_some_and(|to| to <= first_day) {
                 continue;
             }
-            let pools = pools_for_provider(provider, config);
-            let conflict = pools.len() != 1;
-            let member = PlanMember {
-                plan: if conflict {
-                    "pool_conflict".into()
-                } else {
-                    pools
-                        .into_iter()
-                        .next()
-                        .ok_or(ReportError::Integrity("missing plan pool"))?
-                },
-                plan_account: Some(identity.clone()),
-                record: Some(PlanRecordId {
-                    ledger: *ledger,
-                    provider: provider.clone(),
-                    identity: identity.clone(),
-                    effective_from_ms: from,
-                }),
-            };
-            let overlaps_window = from < end_ms && to.is_none_or(|to| to > start_ms);
-            if conflict && overlaps_window {
-                result.conflicts.insert(member.clone());
-            }
+            let member = record.member();
             if currency != "USD" {
-                if overlaps_window {
+                if from < end_ms && to.is_none_or(|to| to > start_ms) {
                     result.non_usd.insert(member);
                 }
                 continue;
@@ -302,47 +260,17 @@ impl FeeDays {
             coefficients: BTreeMap::new(),
             unspread: Vec::new(),
             non_usd: self.non_usd.clone(),
-            conflicts: self.conflicts.clone(),
         };
-        let mut onward: BTreeMap<PoolDay, Vec<&FeeDay>> = BTreeMap::new();
         for fee in &self.days {
-            if fee.key.member.plan == "pool_conflict" {
-                result.unspread.push(fee.clone());
-            } else if !result.pending(&fee.key.pool_day())? {
-                let weight = day.weights.0.get(&fee.key).copied().unwrap_or(0);
-                if weight > 0 {
-                    result.add_coefficient(
-                        fee.key.clone(),
-                        fee.fee.checked_mul(&Fraction::new(1, weight)?)?,
-                        false,
-                    )?;
-                } else {
-                    onward.entry(fee.key.pool_day()).or_default().push(fee);
-                }
+            if result.pending(&fee.key.pool_day())? {
+                continue;
             }
-        }
-        for (pool_day, fees) in onward {
-            let key = DayMember {
-                day_start_ms: pool_day.day_start_ms,
-                member: PlanMember {
-                    plan: pool_day.pool,
-                    plan_account: Some("account_unknown".into()),
-                    record: None,
-                },
-            };
-            let weight = day.weights.0.get(&key).copied().unwrap_or(0);
+            let weight = day.weights.0.get(&fee.key).copied().unwrap_or(0);
             if weight > 0 {
-                let mut total = Fraction::default();
-                for fee in fees {
-                    total = total.checked_add(&fee.fee)?;
-                }
-                result.add_coefficient(
-                    key,
-                    total.checked_mul(&Fraction::new(1, weight)?)?,
-                    true,
-                )?;
+                let share = result.coefficients.entry(fee.key.clone()).or_default();
+                *share = share.checked_add(&fee.fee.checked_mul(&Fraction::new(1, weight)?)?)?;
             } else {
-                result.unspread.extend(fees.into_iter().cloned());
+                result.unspread.push(fee.clone());
             }
         }
         Ok(result)
@@ -352,7 +280,6 @@ impl FeeDays {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RowShare {
     pub fee: Fraction,
-    pub by_rule: Fraction,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -365,16 +292,6 @@ pub struct Deduced {
 }
 
 impl RowShare {
-    pub fn by_rule_share(&self) -> Result<Option<f64>, ReportError> {
-        if self.fee.numerator().is_zero() {
-            return Ok(None);
-        }
-        (&self.by_rule.0 / &self.fee.0)
-            .to_f64()
-            .map(Some)
-            .ok_or(ReportError::Arithmetic)
-    }
-
     /// Add recorded USD only after all exact fee fractions for the row have been
     /// summed. Non-USD rows deliberately have no deduced cost.
     pub fn deduced(
@@ -394,11 +311,7 @@ impl RowShare {
             currency: "USD",
             nanos,
             pending_days,
-            by_rule_share: if self.by_rule.numerator().is_zero() {
-                None
-            } else {
-                self.by_rule_share()?
-            },
+            by_rule_share: None,
         }))
     }
 }
@@ -409,10 +322,9 @@ pub struct Allocation {
     end_ms: i64,
     now_ms: i64,
     not_current: BTreeSet<PoolDay>,
-    coefficients: BTreeMap<DayMember, RowShare>,
+    coefficients: BTreeMap<DayMember, Fraction>,
     unspread: Vec<FeeDay>,
     non_usd: BTreeSet<PlanMember>,
-    conflicts: BTreeSet<PlanMember>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,20 +345,6 @@ impl Allocation {
             || self.not_current.contains(day))
     }
 
-    fn add_coefficient(
-        &mut self,
-        key: DayMember,
-        fee: Fraction,
-        by_rule: bool,
-    ) -> Result<(), ReportError> {
-        let target = self.coefficients.entry(key).or_default();
-        target.fee = target.fee.checked_add(&fee)?;
-        if by_rule {
-            target.by_rule = target.by_rule.checked_add(&fee)?;
-        }
-        Ok(())
-    }
-
     /// The row contains only its own matching calls, in the same numerator scale
     /// as the whole-day weights. Keep zero-weight entries to count pending days.
     /// Sum exact shares across all cells before calling `RowShare::deduced`.
@@ -457,25 +355,19 @@ impl Allocation {
             if *weight < 0 {
                 return Err(ReportError::Arithmetic);
             }
-            if is_pool(&key.member) && self.pending(&key.pool_day())? {
+            if key.member.record.is_some() && self.pending(&key.pool_day())? {
                 pending.insert(key.day_start_ms);
             }
             if let Some(coefficient) = self.coefficients.get(key) {
                 let weight = Fraction::new(*weight, 1)?;
-                share.fee = share
-                    .fee
-                    .checked_add(&coefficient.fee.checked_mul(&weight)?)?;
-                share.by_rule = share
-                    .by_rule
-                    .checked_add(&coefficient.by_rule.checked_mul(&weight)?)?;
+                share.fee = share.fee.checked_add(&coefficient.checked_mul(&weight)?)?;
             }
         }
         Ok((share, pending))
     }
 
     /// The report reader supplies record matching for plan/plan_account filters. If any other
-    /// dimension is filtered, pass `include_unspread = false`. Unspread retains
-    /// the originating record, even when its fee passed through the rule stage.
+    /// dimension is filtered, pass `include_unspread = false`.
     pub fn totals(
         &self,
         include_unspread: bool,
@@ -488,11 +380,8 @@ impl Allocation {
                 None
             },
             deduced_non_usd_plans: self.non_usd.iter().filter(|member| matches(member)).count(),
-            deduced_conflict_plans: self
-                .conflicts
-                .iter()
-                .filter(|member| matches(member))
-                .count(),
+            // The store rejects overlapping fee records for a provider and identity.
+            deduced_conflict_plans: 0,
         })
     }
 

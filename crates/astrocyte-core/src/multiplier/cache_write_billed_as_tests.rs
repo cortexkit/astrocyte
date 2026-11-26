@@ -39,15 +39,13 @@ fn cache_write_call(quantity: i64, unit: &str) -> EventTokens {
 fn cache_write_billed_as_multiplier_values_each_tier_and_stores_the_rule() {
     let mut conn = conn();
     publish_cache_write_rates(&conn, cache_write_vector());
-    let config = config(vec![rule("opencode", "xai", None)]);
-    let rules = ValuationRules::from_config(&config, &[]);
     let resolution = crate::rate_era::resolve(&conn, "xai", XAI_MODEL, 10).unwrap();
     for (id, quantity, expected_nanos) in [
         ("base", 200_000, 250_000_000_i64),
         ("tier", 300_000, 750_000_000_i64),
     ] {
         let call = cache_write_call(quantity, "token");
-        let value = crate::valuation::list_value_event(&rules, resolution.as_ref(), &call).unwrap();
+        let value = crate::valuation::list_value_event(resolution.as_ref(), &call).unwrap();
         assert_eq!(
             value.numerator,
             i128::from(expected_nanos) * 1_000_000,
@@ -65,13 +63,8 @@ fn cache_write_billed_as_multiplier_values_each_tier_and_stores_the_rule() {
             &[("cache_write", "fixture", quantity)],
         );
     }
-    reading(&conn, "acct", 0, 0.0, None);
-    reading(&conn, "acct", 20, 10.0, None);
-    let plan = plan_observation(&conn, &config, "codex", 0, 20).unwrap();
-    let rates =
-        crate::rate_era::resolved_rates(&conn, &catalog_models(&config, &plan), 20).unwrap();
-    let observation =
-        super::compute_observation(&conn, &config, &plan, &rates, &priced_plan(), 20, &[]).unwrap();
+    let rates = crate::rate_era::resolved_rates(&conn, &test_models(&conn, 0, 20), 20).unwrap();
+    let observation = storeable_usage(&conn, (0, 20), &rates, 20);
     assert_eq!(observation.api_nanos, 1_000_000_000);
     assert_eq!(observation.tokens.cache_write, 500_000);
     assert!(observation.unpriced_tokens.is_empty());
@@ -134,14 +127,8 @@ fn cache_write_billed_as_valuation_honors_the_named_tier_and_explicit_verdicts()
         let conn = conn();
         publish_cache_write_rates(&conn, reply.clone());
         let resolution = crate::rate_era::resolve(&conn, "xai", XAI_MODEL, 10).unwrap();
-        let config = config(vec![]);
         let call = cache_write_call(300_000, "token");
-        let value = crate::valuation::list_value_event(
-            &ValuationRules::from_config(&config, &[]),
-            resolution.as_ref(),
-            &call,
-        )
-        .unwrap();
+        let value = crate::valuation::list_value_event(resolution.as_ref(), &call).unwrap();
         assert_eq!(value.numerator, i128::from(nanos_per_million) * 300_000);
         assert_eq!(value.unvalued.tokens, unpriced);
     }
@@ -195,13 +182,11 @@ fn cache_write_billed_as_valuation_requires_the_recorded_lifetime() {
     let conn = conn();
     publish_cache_write_rates(&conn, reply);
     let resolution = crate::rate_era::resolve(&conn, "xai", XAI_MODEL, 10).unwrap();
-    let config = config(vec![]);
-    let rules = ValuationRules::from_config(&config, &[]);
     let hour = cache_write_call(100, "token_cache_1h");
-    let value = crate::valuation::value_event(&rules, resolution.as_ref(), &hour).unwrap();
+    let value = crate::valuation::value_event(resolution.as_ref(), &hour).unwrap();
     assert_eq!(value.numerator, 700_000_000_000);
     let five_minutes = cache_write_call(100, "token_cache_5m");
-    let value = crate::valuation::value_event(&rules, resolution.as_ref(), &five_minutes).unwrap();
+    let value = crate::valuation::value_event(resolution.as_ref(), &five_minutes).unwrap();
     assert_eq!(value.numerator, 0);
     assert_eq!(value.unpriced.len(), 1);
     assert_eq!(value.unpriced[0].reason, "no_rate");

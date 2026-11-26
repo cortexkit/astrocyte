@@ -1046,7 +1046,7 @@ mod tests {
         f.declare(vec![f.root(SESSION, false)]);
         f.tick(100);
         let config = f.temp.path().join("astrocyte.jsonc");
-        fs::write(&config, json!({"poll_interval_secs":30,"reasoning_billed_as_output":[],"subscription_multiplier":{"api_twins":{},"plan_price_overrides":{},"quota_providers":{}},"harness_ingest":{"enabled":true,"exclude":[SOURCE_KEY]}}).to_string()).unwrap();
+        fs::write(&config, json!({"poll_interval_secs":30,"harness_ingest":{"enabled":true,"exclude":[SOURCE_KEY]}}).to_string()).unwrap();
         crate::refresher::reload_config(&f.state, Ok(config)).unwrap();
         f.call(SESSION, "two", true);
         fs::write(&f.roots, b"{").unwrap();

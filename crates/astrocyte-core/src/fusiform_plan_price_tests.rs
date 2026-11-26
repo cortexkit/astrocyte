@@ -63,14 +63,9 @@ fn fusiform_071_curated_plan_prices_keep_allegro_fee_without_credit_rate() {
     assert!(fast.get("credit_rate").is_none());
 
     let conn = conn();
-    let mut config = config(vec![rule("pi", "kimi-code-plan-global", None)]);
-    let mut provider = config.quota_providers.remove("codex").unwrap();
-    provider.accounts.get_mut("acct").unwrap().plan = "kimi-code-plan-global/allegro".into();
-    config
-        .quota_providers
-        .insert("kimi-code-plan-global".into(), provider);
-    config.config = config.declarations();
-    let start = 1_795_000_000_000;
+    fixture_vault_plan(&conn, "kimi-code-plan-global/allegro");
+    fixture_pool_schema_at_genesis(&conn);
+    let start = 1_795_000_000_000_i64.div_euclid(HOUR_MS) * HOUR_MS;
     let end = start + DAY;
     // A reading every ten minutes keeps the whole day covered: the multiplier
     // drops quota used across a long gap between readings, even when the plan
@@ -80,37 +75,45 @@ fn fusiform_071_curated_plan_prices_keep_allegro_fee_without_credit_rate() {
         let used = if at_ms == end { 10 } else { 0 };
         conn.execute(
             "INSERT INTO window_sample (provider, account_ref, pool_key, fetched_at_instant,
-                 used_percent, resets_at, window_minutes, source)
+                 used_percent, resets_at, window_minutes, source, model_scope)
              VALUES ('kimi-code-plan-global', 'acct', 'primary', ?1, ?2,
-                 '2026-12-01T00:00:00Z', 10080, 'vault')",
+                 '2026-12-01T00:00:00Z', 10080, 'vault', 'all')",
             params![at_ms * NANOS_PER_MS, used],
         )
         .unwrap();
     }
-    let plan = plan_observation(&conn, &config, "kimi-code-plan-global", start, end).unwrap();
-    let prices = super::resolve_plans(Some(&CapturedPlanPrices), &config, &plan.provider, end)
+    let tx = conn.unchecked_transaction().unwrap();
+    let day = pools::capture_pool_day(&tx, "kimi-code-plan-global", start, end).unwrap();
+    tx.commit().unwrap();
+    let prices = CapturedPlanPrices
+        .plan_prices(PlanPricesRequest {
+            provider_id: None,
+            at_ms: Some(end),
+        })
         .expect("all curated plan prices decode even when a service tier has no credit rate");
-    let used = &prices["acct"];
+    let planned = pools::plan_pools(&day.readings, &prices.quota_pools);
+    let observation = pools::compute_pool_observations(
+        &day,
+        &planned,
+        &ResolvedRates::default(),
+        &Default::default(),
+        &prices,
+        end,
+    )
+    .unwrap()
+    .remove(0);
+    let [used] = observation.plan_prices.as_slice() else {
+        panic!("expected one plan fee")
+    };
     assert_eq!(used.source.as_deref(), Some("fusiform"));
     assert_eq!(used.monthly_nanos, Some(99_000_000_000));
     assert_eq!(used.unpriceable_reason, None);
     assert!(!used.plan_price_overdue);
 
-    let observation = super::compute_observation(
-        &conn,
-        &config,
-        &plan,
-        &ResolvedRates::default(),
-        &prices,
-        end,
-        &[],
-    )
-    .unwrap();
     // The monthly $99 fee still funds the weekly quota and one day's paid
     // share. An unstated purchased-credit rate is neither zero nor a fee.
     assert_eq!(observation.subscription_nanos, 2_310_000_000);
     assert_eq!(observation.fee_paid_nanos, 3_300_000_000);
     assert_eq!(observation.accounts_included.len(), 1);
     assert!(observation.accounts_excluded.is_empty());
-    assert_eq!(observation.plan_prices, vec![used.clone()]);
 }

@@ -1,19 +1,12 @@
+use super::*;
+use crate::test_support::conn;
+
 fn vault_account_membership_with_secondary(
     provider: Option<&str>,
     plan: Option<&str>,
     effective_from_ms: i64,
-) -> ResolvedQuotaProvider {
+) -> Option<String> {
     let mut conn = conn();
-    let declaration = QuotaProviderConfig {
-        window: window(),
-        scope: vec![rule("broca", "meta", None)],
-    };
-    conn.execute(
-        "INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,
-             used_percent,window_minutes) VALUES('muse','acct','primary',0,1,10080)",
-        [],
-    )
-    .unwrap();
     let tx = conn.transaction().unwrap();
     for (credential, provider, plan, source, effective) in [
         (
@@ -48,17 +41,16 @@ fn vault_account_membership_with_secondary(
         .unwrap();
     }
     tx.commit().unwrap();
-    resolve_membership(&conn, &declaration, "muse", 4).unwrap()
+    let tx = conn.transaction().unwrap();
+    VaultPlanTimeline::capture(&tx, (0, 4))
+        .unwrap()
+        .plan_at(PlanLedger::Account, "acct", 4)
+        .map(str::to_owned)
 }
 
 fn assert_vault_account_membership_ignores_empty_record(effective_from_ms: i64) {
     let resolved = vault_account_membership_with_secondary(None, None, effective_from_ms);
-    assert!(resolved.unknown_reasons.is_empty(), "{resolved:?}");
-    assert_eq!(resolved.accounts.len(), 1);
-    assert_eq!(resolved.accounts["acct"].plan, "meta/power_usage");
-    assert!(resolved.credentials.is_empty());
-    assert!(!resolved.credential_keyed);
-    assert!(resolved.membership_reason.is_none());
+    assert_eq!(resolved.as_deref(), Some("meta/power_usage"));
 }
 
 #[test]
@@ -79,16 +71,6 @@ fn vault_account_membership_ignores_newer_providerless_planless_record() {
 #[test]
 fn vault_regression_real_provider_overrides_config_seed_for_the_same_account() {
     let mut conn = conn();
-    let declaration = QuotaProviderConfig {
-        window: window(),
-        scope: vec![rule("broca", "openai", None)],
-    };
-    conn.execute(
-        "INSERT INTO window_sample(provider,account_ref,pool_key,fetched_at_instant,
-             used_percent,window_minutes) VALUES('codex','acct','primary',0,1,10080)",
-        [],
-    )
-    .unwrap();
     let tx = conn.transaction().unwrap();
     for (credential, provider, tier, source, effective) in [
         ("config:acct", "anthropic", "max", "config", 0),
@@ -110,43 +92,33 @@ fn vault_regression_real_provider_overrides_config_seed_for_the_same_account() {
         .unwrap();
     }
     tx.commit().unwrap();
-    let seed = resolve_membership(&conn, &declaration, "codex", 1).unwrap();
-    assert_eq!(seed.accounts["acct"].plan, "anthropic/max");
-    let corrected = resolve_membership(&conn, &declaration, "codex", 2).unwrap();
-    assert!(corrected.unknown_reasons.is_empty(), "{corrected:?}");
-    assert_eq!(corrected.accounts["acct"].plan, "openai/pro");
+    let tx = conn.transaction().unwrap();
+    let timeline = VaultPlanTimeline::capture(&tx, (0, 2)).unwrap();
+    assert_eq!(
+        timeline.plan_at(PlanLedger::Account, "acct", 0),
+        Some("anthropic/max")
+    );
+    assert_eq!(
+        timeline.plan_at(PlanLedger::Account, "acct", 1),
+        Some("openai/pro")
+    );
 }
 
 #[test]
 fn vault_account_membership_two_known_providers_are_ambiguous() {
     let resolved =
         vault_account_membership_with_secondary(Some("anthropic"), Some("anthropic/max"), 2);
-    assert!(resolved.accounts.is_empty());
-    assert!(resolved.credentials.is_empty());
-    assert_eq!(
-        resolved.unknown_reasons,
-        BTreeMap::from([("acct".into(), "vault_account_ambiguous".into())])
-    );
+    assert_eq!(resolved, None);
 }
 
 #[test]
 fn vault_account_membership_known_provider_without_plan_stays_unknown() {
     let resolved = vault_account_membership_with_secondary(Some("meta"), None, 3);
-    assert!(resolved.accounts.is_empty());
-    assert!(resolved.credentials.is_empty());
-    assert_eq!(
-        resolved.unknown_reasons,
-        BTreeMap::from([("acct".into(), "vault_plan_unknown".into())])
-    );
+    assert_eq!(resolved, None);
 }
 
 #[test]
 fn vault_account_membership_equal_time_conflicting_plans_are_ambiguous() {
     let resolved = vault_account_membership_with_secondary(Some("meta"), Some("meta/basic"), 2);
-    assert!(resolved.accounts.is_empty());
-    assert!(resolved.credentials.is_empty());
-    assert_eq!(
-        resolved.unknown_reasons,
-        BTreeMap::from([("acct".into(), "vault_account_ambiguous".into())])
-    );
+    assert_eq!(resolved, None);
 }

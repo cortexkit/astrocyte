@@ -1,8 +1,11 @@
 //! Independent list-value partitions. Recorded spend uses the summary reducer unchanged.
 use super::*;
-use crate::multiplier::{MultiplierConfig, ScopeRule};
 use crate::subscription::plan_lookup_key;
-use crate::valuation::{list_value_event, EventTokens, Unvalued, ValuationRules};
+use crate::valuation::{list_value_event, EventTokens, Unvalued};
+
+// Older cache keys encoded pricing settings. Never decode those keys or serve
+// their cached values, even before the refresher has started the rebuild.
+const VALUATION_FORMAT: &str = "served-rates-v1";
 
 pub mod fees;
 mod plans;
@@ -53,92 +56,30 @@ pub(crate) struct ValuedCell {
 
 type Cells = BTreeMap<(Key, PlanMember), ValuedCell>;
 
-fn rule_matches(rule: &ScopeRule, event: &EventTokens, basis: &str) -> bool {
-    rule.producer == event.producer
-        && rule.provider == event.provider
-        && rule
-            .charge_basis
-            .as_deref()
-            .is_none_or(|value| value == basis)
-        && rule.model_prefix.as_deref().is_none_or(|prefix| {
-            event
-                .model
-                .as_deref()
-                .is_some_and(|model| model.starts_with(prefix))
-        })
-}
-
 /// Membership deliberately matches ledger coverage: a present account selects
 /// account plans, and only a NULL account selects the exact paying credential.
 /// An empty account selects neither ledger; it is not an absent account.
-#[allow(clippy::too_many_arguments)]
 pub fn plan_member(
     book: &PlanBook,
-    config: &MultiplierConfig,
-    event: &EventTokens,
+    provider: &str,
     basis: &str,
     account: Option<&str>,
     paying_credential: Option<&str>,
     at_ms: Option<i64>,
-) -> Result<PlanMember, ReportError> {
+) -> PlanMember {
     if basis == "metered_api" {
-        return Ok(PlanMember::non_pool("api"));
+        return PlanMember::non_pool("api");
     }
-    let mut records = BTreeSet::new();
-    if let (Some((ledger, identity)), Some(at)) =
-        (plan_lookup_key(account, paying_credential), at_ms)
-    {
-        for record in book.active(ledger, &event.provider, identity, at) {
-            for pool in pools_for_provider(&record.id.provider, config) {
-                records.insert(PlanMember {
-                    plan: pool,
-                    plan_account: Some(identity.into()),
-                    record: Some(record.id.clone()),
-                });
-            }
-        }
+    let (Some((ledger, identity)), Some(at)) = (plan_lookup_key(account, paying_credential), at_ms)
+    else {
+        return PlanMember::non_pool("none");
+    };
+    let mut records = book.active(ledger, provider, identity, at);
+    match (records.next(), records.next()) {
+        (Some(_), Some(_)) => PlanMember::non_pool("pool_conflict"),
+        (Some(record), None) => record.member(),
+        (None, _) => PlanMember::non_pool("none"),
     }
-    if records.len() > 1 {
-        return Ok(PlanMember::non_pool("pool_conflict"));
-    }
-    if let Some(member) = records.into_iter().next() {
-        return Ok(member);
-    }
-    let pools: Vec<_> = config
-        .quota_providers
-        .iter()
-        .filter(|(_, pool)| {
-            pool.scope
-                .iter()
-                .any(|rule| rule_matches(rule, event, basis))
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
-    Ok(match pools.as_slice() {
-        [] => PlanMember::non_pool("none"),
-        [pool] => PlanMember {
-            plan: pool.clone(),
-            plan_account: Some("account_unknown".into()),
-            record: None,
-        },
-        _ => PlanMember::non_pool("pool_conflict"),
-    })
-}
-
-fn pools_for_provider(provider: &str, config: &MultiplierConfig) -> BTreeSet<String> {
-    let mut pools: BTreeSet<_> = config
-        .quota_providers
-        .iter()
-        .filter(|(name, pool)| {
-            name.as_str() == provider || pool.scope.iter().any(|rule| rule.provider == provider)
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
-    // A recorded plan outside configured quota pools still owns its own fee.
-    if pools.is_empty() {
-        pools.insert(provider.into());
-    }
-    pools
 }
 
 fn merge_unvalued(target: &mut Unvalued, value: &Unvalued) -> Result<(), ReportError> {
@@ -159,18 +100,9 @@ fn merge_unvalued(target: &mut Unvalued, value: &Unvalued) -> Result<(), ReportE
 pub(crate) fn reduce(
     conn: &Connection,
     filter: &str,
-    config: &MultiplierConfig,
-    reasoning: &[String],
     cells: &mut Cells,
 ) -> Result<(usize, bool), ReportError> {
-    reduce_with_book(
-        conn,
-        filter,
-        config,
-        reasoning,
-        &PlanBook::load(conn)?,
-        cells,
-    )
+    reduce_with_book(conn, filter, &PlanBook::load(conn)?, cells)
 }
 
 fn measurement_sql(filter: &str) -> String {
@@ -189,19 +121,15 @@ fn measurement_sql(filter: &str) -> String {
 fn reduce_with_book(
     conn: &Connection,
     filter: &str,
-    config: &MultiplierConfig,
-    reasoning: &[String],
     book: &PlanBook,
     cells: &mut Cells,
 ) -> Result<(usize, bool), ReportError> {
-    reduce_both(conn, filter, config, reasoning, book, cells, None)
+    reduce_both(conn, filter, book, cells, None)
 }
 
 fn reduce_both(
     conn: &Connection,
     filter: &str,
-    config: &MultiplierConfig,
-    reasoning: &[String],
     book: &PlanBook,
     cells: &mut Cells,
     projection: Option<(
@@ -267,7 +195,6 @@ fn reduce_both(
                 .or_insert_with(|| ModelTimeline::load(conn, &provider, model));
         }
     }
-    let rules = ValuationRules::from_config(config, reasoning);
     let mut members: BTreeMap<(PlanMember, attribution::Attribution), Data> = BTreeMap::new();
     let mut event_members = BTreeMap::new();
     let mut fetched = true;
@@ -303,15 +230,14 @@ fn reduce_both(
         };
         let member = plan_member(
             book,
-            config,
-            &tokens,
+            &tokens.provider,
             key.0[Grouping::ChargeBasis as usize]
                 .as_deref()
                 .unwrap_or_default(),
             key.0[Grouping::Account as usize].as_deref(),
             payer.as_deref(),
             event.occurred_at_ms,
-        )?;
+        );
         let data = members.entry((member.clone(), tuple.clone())).or_default();
         data.observe_event(&ledger, event)?;
         if let Some(projected) = projection.as_deref_mut().filter(|_| disagrees) {
@@ -353,7 +279,7 @@ fn reduce_both(
             continue;
         }
         let mut value =
-            list_value_event(&rules, resolution, &tokens).map_err(|_| ReportError::Arithmetic)?;
+            list_value_event(resolution, &tokens).map_err(|_| ReportError::Arithmetic)?;
         for ((role, unit, _, raw_units, raw_exponent), _, _) in measured {
             let Some((units, exponent)) =
                 raw_units.zip(raw_exponent).filter(|(units, _)| *units > 0)
@@ -579,28 +505,13 @@ pub struct ValuationMaintenance {
 
 impl ValuationMaintenance {
     /// Idle cycles use a reader snapshot and need no writer transaction.
-    pub fn needs_prepare(
-        conn: &Connection,
-        config: &MultiplierConfig,
-        reasoning: &[String],
-    ) -> Result<bool, ReportError> {
-        let encoded = config_key(config, reasoning)?;
-        Ok(conn.query_row("SELECT config<>?1 OR rate_generation<>(SELECT generation FROM rate_cache_state WHERE id=1) FROM valuation_state WHERE id=1",[encoded],|r|r.get(0))?)
+    pub fn needs_prepare(conn: &Connection) -> Result<bool, ReportError> {
+        Ok(conn.query_row("SELECT config<>?1 OR rate_generation<>(SELECT generation FROM rate_cache_state WHERE id=1) FROM valuation_state WHERE id=1",[VALUATION_FORMAT],|r|r.get(0))?)
     }
 
     /// Synchronize generations and consume indexed rate invalidations atomically.
-    pub fn prepare(
-        tx: &Transaction<'_>,
-        config: &MultiplierConfig,
-        reasoning: &[String],
-    ) -> Result<(), ReportError> {
-        let encoded = config_key(config, reasoning)?;
-        let previous: String =
-            tx.query_row("SELECT config FROM valuation_state WHERE id=1", [], |r| {
-                r.get(0)
-            })?;
-        if encoded != previous {
-            tx.execute("UPDATE valuation_state SET config=?1,config_generation=config_generation+1 WHERE id=1",[encoded])?;
+    pub fn prepare(tx: &Transaction<'_>) -> Result<(), ReportError> {
+        if tx.execute("UPDATE valuation_state SET config=?1,config_generation=config_generation+1 WHERE id=1 AND config<>?1",[VALUATION_FORMAT])? != 0 {
             tx.execute(
                 "UPDATE valuation_hour SET state='dirty',revision=revision+1",
                 [],
@@ -629,12 +540,7 @@ impl ValuationMaintenance {
         self.pending.is_some()
     }
 
-    pub fn read_chunk(
-        &mut self,
-        conn: &Connection,
-        config: &MultiplierConfig,
-        reasoning: &[String],
-    ) -> Result<bool, ReportError> {
+    pub fn read_chunk(&mut self, conn: &Connection) -> Result<bool, ReportError> {
         if self.pending.is_none() {
             let read = |after: Option<Hour>| -> rusqlite::Result<Option<Hour>> {
                 let main=conn.query_row(&format!("SELECT v.kind,v.hour_number FROM valuation_hour v JOIN summary_hour s USING(kind,hour_number) WHERE v.state='dirty' AND s.built_revision=s.revision AND s.format_version={FORMAT} AND (?1 IS NULL OR (v.kind,v.hour_number)>(?1,?2)) ORDER BY v.kind,v.hour_number LIMIT 1"),params![after.map(|h|h.kind),after.map(|h|h.number)],|r|Ok(Hour {kind:r.get(0)?,number:r.get(1)?})).optional()?;
@@ -689,8 +595,6 @@ impl ValuationMaintenance {
             let (count, fetched) = reduce_both(
                 conn,
                 &chunk_filter(pending.hour, pending.after, last),
-                config,
-                reasoning,
                 &PlanBook::load(conn)?,
                 &mut pending.cells,
                 Some((&mut pending.attribution, &mut pending.attribution_resolver)),
@@ -778,18 +682,6 @@ impl ValuationMaintenance {
         }
         Ok(true)
     }
-}
-
-fn config_key(config: &MultiplierConfig, reasoning: &[String]) -> Result<String, ReportError> {
-    encode(&(
-        &config.api_twins,
-        &config
-            .quota_providers
-            .iter()
-            .map(|(key, pool)| (key, &pool.scope))
-            .collect::<BTreeMap<_, _>>(),
-        reasoning,
-    ))
 }
 
 fn cache_generation(conn: &Connection) -> Result<i64, ReportError> {

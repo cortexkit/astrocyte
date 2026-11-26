@@ -31,9 +31,6 @@ fn context_tier_rates(entries: &[(&str, i64)]) -> ResolvedRates {
 #[test]
 fn multiplier_regression_fast_only_tier_does_not_mask_standard_tier() {
     let conn = conn();
-    let config = config(vec![rule("opencode", "openai", None)]);
-    reading(&conn, "acct", 0, 0.0, None);
-    reading(&conn, "acct", 100, 10.0, None);
     event(
         &conn,
         "e",
@@ -50,12 +47,10 @@ fn multiplier_regression_fast_only_tier_does_not_mask_standard_tier() {
         ("rate.input.mode.fast", 3 * TEN_PER_M),
         ("rate.input.mode.fast.above_context.200000", 4 * TEN_PER_M),
     ]);
-    let mut plan = plan_observation(&conn, &config, "codex", 0, DAY).unwrap();
+    let mut calls = test_calls(&conn, 0, DAY);
     for (mode, nanos) in [("standard", 5_000_000_000), ("fast", 10_000_000_000)] {
-        plan.events[0].tokens.mode = Some(mode.into());
-        let row =
-            super::compute_observation(&conn, &config, &plan, &rates, &priced_plan(), DAY, &[])
-                .unwrap();
+        calls[0].0.mode = Some(mode.into());
+        let row = measured_usage(&calls, (0, DAY), &rates).unwrap();
         assert_eq!(row.api_nanos, nanos, "mode={mode}");
         assert!(row.unpriced_tokens.is_empty());
     }
@@ -73,9 +68,6 @@ fn context_tier_is_selected_per_role_above_and_between_thresholds() {
     ]);
     for (input, expected_nanos) in [(250_000, 5_600_000_000), (150_000, 3_200_000_000)] {
         let conn = conn();
-        let config = config(vec![rule("opencode", "openai", None)]);
-        reading(&conn, "acct", 0, 0.0, None);
-        reading(&conn, "acct", 100, 10.0, None);
         event(
             &conn,
             "e",
@@ -89,7 +81,7 @@ fn context_tier_is_selected_per_role_above_and_between_thresholds() {
                 ("output", "usage.output", 20_000),
             ],
         );
-        let observation = observe(&conn, &config, 0, DAY, &rates);
+        let observation = storeable_usage(&conn, (0, DAY), &rates, DAY);
         // Input is $20/M in both calls; output is $30/M only above 200k.
         assert_eq!(observation.api_nanos, expected_nanos, "input={input}");
         assert_eq!(observation.tokens.input, input);
@@ -105,9 +97,6 @@ fn context_tier_is_selected_per_role_above_and_between_thresholds() {
 #[test]
 fn context_tier_shared_threshold_preserves_the_stored_day_observation() {
     let mut conn = conn();
-    let config = config(vec![rule("opencode", "openai", None)]);
-    reading(&conn, "acct", 0, 0.0, None);
-    reading(&conn, "acct", 100, 10.0, None);
     event(
         &conn,
         "e",
@@ -127,7 +116,7 @@ fn context_tier_shared_threshold_preserves_the_stored_day_observation() {
         ("rate.input.above_context.100000", 2 * TEN_PER_M),
         ("rate.output.above_context.100000", 2 * TEN_PER_M),
     ]);
-    let observation = observe(&conn, &config, 0, DAY, &rates);
+    let observation = storeable_usage(&conn, (0, DAY), &rates, DAY);
     assert_eq!(observation.api_nanos, 5_400_000_000);
     let tx = conn.transaction().unwrap();
     insert_observation_in_tx(&tx, &observation).unwrap();
@@ -228,9 +217,6 @@ fn context_tier_per_role_keeps_complete_mode_and_ttl_matching() {
         ),
     ] {
         let conn = conn();
-        let config = config(vec![rule("opencode", "openai", None)]);
-        reading(&conn, "acct", 0, 0.0, None);
-        reading(&conn, "acct", 100, 10.0, None);
         event(
             &conn,
             "e",
@@ -257,15 +243,13 @@ fn context_tier_per_role_keeps_complete_mode_and_ttl_matching() {
             .filter(|(key, _)| *key != omitted)
             .collect();
         let rates = context_tier_rates(&entries);
-        let mut plan = plan_observation(&conn, &config, "codex", 0, DAY).unwrap();
+        let mut calls = test_calls(&conn, 0, DAY);
         // Stored usage currently has no mode; exercise stated modes on the
         // captured event without bypassing observation valuation.
-        for event in &mut plan.events {
-            event.tokens.mode = mode.map(str::to_owned);
+        for (event, _) in &mut calls {
+            event.mode = mode.map(str::to_owned);
         }
-        let observation =
-            super::compute_observation(&conn, &config, &plan, &rates, &priced_plan(), DAY, &[])
-                .unwrap();
+        let observation = measured_usage(&calls, (0, DAY), &rates).unwrap();
         assert_eq!(
             observation.api_nanos, expected_nanos,
             "mode={mode:?}, omitted={omitted}"

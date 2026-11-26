@@ -272,11 +272,7 @@ fn resolve_event<'a>(
     // Plan reading committed above; catalog resolution therefore never
     // runs while a SQLite transaction or store mutex is held.
     let resolved = match catalog {
-        Some(catalog) => astrocyte_core::subscription::resolve_reprice(
-            &plan,
-            catalog,
-            &state.desired_config().reasoning_billed_as_output,
-        ),
+        Some(catalog) => astrocyte_core::subscription::resolve_reprice(&plan, catalog),
         None => astrocyte_core::subscription::resolve_reprice_without_catalog(&plan),
     }
     .map_err(|error| {
@@ -809,12 +805,9 @@ pub(super) mod tests {
         for path in ["pass", "reprice", "basis"] {
             for declared in [false, true] {
                 let state = test_state();
-                let mut desired = config::intentional_empty().config;
-                if declared {
-                    desired.reasoning_billed_as_output.push("anthropic".into());
-                }
-                state.publish_desired(desired, 1);
-                let catalog = CatalogClient::connect(Arc::new(LateCatalog::warming(0))).unwrap();
+                let mut peer = LateCatalog::warming(0);
+                peer.reasoning_rule = declared;
+                let catalog = CatalogClient::connect(Arc::new(peer)).unwrap();
                 state.install_catalog(Some(catalog)).unwrap();
                 let event_id = crate::ops::dispatch(&state, crate::ops::OP_EVENT_INGEST, json!({
                     "producer":"producer", "producer_lineage":"lineage", "producer_ref":"thinking",

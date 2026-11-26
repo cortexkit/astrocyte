@@ -170,21 +170,6 @@ pub(crate) fn billed_as_target(fact_key: &str, target_key: &str) -> Option<Billi
     }
 }
 
-pub(crate) fn reasoning_uses_output(
-    served_rule: bool,
-    has_reasoning_variant: bool,
-    provider: Option<&str>,
-    legacy_providers: &[String],
-) -> bool {
-    // A catalog declaration fills gaps in the catalog's own reasoning rates.
-    // In its absence the legacy setting still overrides the reasoning price.
-    if served_rule {
-        !has_reasoning_variant
-    } else {
-        provider.is_some_and(|provider| legacy_providers.iter().any(|item| item == provider))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogModel {
     pub provider_id: String,

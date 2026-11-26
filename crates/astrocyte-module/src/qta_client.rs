@@ -514,10 +514,6 @@ mod tests {
             &state,
             &AstrocyteConfig {
                 poll_interval_secs: 3,
-                reasoning_billed_as_output: Vec::new(),
-                subscription_multiplier: crate::config::intentional_empty()
-                    .config
-                    .subscription_multiplier,
                 harness_ingest: crate::config::HarnessIngest::all_on(),
             },
             Some(PeerAccess::Fixture(peer.connection_file_path.clone())),

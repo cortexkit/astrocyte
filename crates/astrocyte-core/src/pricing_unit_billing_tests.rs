@@ -205,7 +205,7 @@ fn unit_billing_selectors_match_exactly_without_base_fallback() {
             ("quality".into(), quality.into()),
             ("size".into(), "large".into()),
         ]);
-        let resolved = resolve_reprice(&plan, &catalog, &[]).unwrap();
+        let resolved = resolve_reprice(&plan, &catalog).unwrap();
         let tx = conn.transaction().unwrap();
         commit_reprice_in_tx(&tx, &plan, &resolved, 1_000, PricingOrigin::PricingPass).unwrap();
         tx.commit().unwrap();
@@ -249,7 +249,7 @@ fn unit_billing_standard_mode_prices_at_the_base_unit_rate() {
         ])));
         let mut plan = read_reprice(&conn, &id).unwrap();
         plan.mode = Some(mode.into());
-        let resolved = resolve_reprice(&plan, &catalog, &[]).unwrap();
+        let resolved = resolve_reprice(&plan, &catalog).unwrap();
         let tx = conn.transaction().unwrap();
         commit_reprice_in_tx(&tx, &plan, &resolved, 1_000, PricingOrigin::PricingPass).unwrap();
         tx.commit().unwrap();
