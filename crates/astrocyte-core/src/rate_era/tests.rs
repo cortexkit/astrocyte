@@ -405,6 +405,40 @@ fn rate_era_discovery_cursor_follows_new_calls_and_twins_invalidate_references()
 }
 
 #[test]
+fn rate_era_catalog_version_reset_refreshes_cached_timeline() {
+    let conn = conn();
+    let twins = BTreeMap::new();
+    let timeline = |units| {
+        synthetic(
+            "p",
+            "m",
+            serde_json::json!({"rate.input": [{
+                "from_ms": 0, "until_ms": null, "state": "value", "value": {
+                    "state": "priced", "currency": "USD", "units": units,
+                    "exponent": 9, "unit_provenance": {"kind": "stated"}
+                }
+            }]}),
+        )
+    };
+    prepare(&conn, 12, &twins).unwrap();
+    publish(&conn, &timeline(2_000_000_000), 12).unwrap();
+    assert!(pending(&conn, 10).unwrap().is_empty());
+    assert_eq!(
+        numerator(&conn, "p", "m", 0, "input", "token", 1).0,
+        2_000_000_000
+    );
+
+    prepare(&conn, 3, &twins).unwrap();
+    assert_eq!(pending(&conn, 10).unwrap(), vec![("p".into(), "m".into())]);
+    publish(&conn, &timeline(1_000_000_000), 3).unwrap();
+    assert!(pending(&conn, 10).unwrap().is_empty());
+    assert_eq!(
+        numerator(&conn, "p", "m", 0, "input", "token", 1).0,
+        1_000_000_000
+    );
+}
+
+#[test]
 fn rate_era_failed_fetch_yields_to_other_pending_models() {
     let conn = conn();
     for model in ["a", "b"] {

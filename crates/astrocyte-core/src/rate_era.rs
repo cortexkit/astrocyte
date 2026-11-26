@@ -65,7 +65,7 @@ pub fn discover(conn: &Connection, limit: i64) -> Result<(), MultiplierError> {
     Ok(())
 }
 
-/// A catalog advance queues every known model, including targets no longer used directly.
+/// A catalog version change queues every known model, including targets no longer used directly.
 pub fn prepare(
     conn: &Connection,
     version: i64,
@@ -77,12 +77,13 @@ pub fn prepare(
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if previous_twins != encoded {
+    // A restored catalog can reuse earlier versions for different timelines.
+    if version < previous || previous_twins != encoded {
         conn.execute("UPDATE rate_model SET catalog_version=NULL", [])?;
     }
     conn.execute(
         "UPDATE rate_cache_state SET catalog_version=?1,twins=?2 WHERE id=1",
-        params![version.max(previous), encoded],
+        params![version, encoded],
     )?;
     Ok(())
 }

@@ -728,9 +728,11 @@ pub fn mode_rate_key(role: &str, mode: &str) -> String {
 /// at the base rate. Dropping the key made the set smaller -- possibly empty --
 /// and silently bypassed the threshold-crossing refusal for exactly the
 /// models whose tier spelling we did not understand.
-pub fn tier_thresholds(facts: &BTreeMap<String, Value>) -> Result<BTreeSet<u64>, String> {
+pub fn tier_thresholds<'a>(
+    keys: impl IntoIterator<Item = &'a String>,
+) -> Result<BTreeSet<u64>, String> {
     let mut thresholds = BTreeSet::new();
-    for key in facts.keys() {
+    for key in keys {
         match parse_rate_key(key) {
             Ok(parsed) if parsed.has_only_known_token_selectors() => {
                 if let Some(threshold) = parsed.selectors.get("above_context") {
@@ -1138,7 +1140,10 @@ mod tests {
             panic!("tiered lifetime catalog snapshot refused: {result:?}");
         };
         assert_eq!(snapshot.facts, facts);
-        assert_eq!(tier_thresholds(&facts).unwrap(), BTreeSet::from([272_000]));
+        assert_eq!(
+            tier_thresholds(facts.keys()).unwrap(),
+            BTreeSet::from([272_000])
+        );
     }
 
     #[test]
@@ -1261,7 +1266,10 @@ mod tests {
             assert!(parsed.unit.is_none(), "{key} gained a denominator");
             assert!(parsed.has_only_known_token_selectors(), "{key}");
         }
-        assert_eq!(tier_thresholds(&facts).unwrap(), BTreeSet::from([200_000]));
+        assert_eq!(
+            tier_thresholds(facts.keys()).unwrap(),
+            BTreeSet::from([200_000])
+        );
     }
 
     #[test]
@@ -1277,7 +1285,7 @@ mod tests {
             panic!("conditional rate keys were refused");
         };
         assert_eq!(snapshot.facts, facts);
-        assert_eq!(tier_thresholds(&facts).unwrap(), BTreeSet::new());
+        assert_eq!(tier_thresholds(facts.keys()).unwrap(), BTreeSet::new());
     }
 
     #[test]
@@ -1296,7 +1304,10 @@ mod tests {
             ("rate.input.above_context.200000".into(), priced_rate(9)),
         ]);
         validate_rate_fact_keys(&facts).unwrap();
-        assert_eq!(tier_thresholds(&facts).unwrap(), BTreeSet::from([200_000]));
+        assert_eq!(
+            tier_thresholds(facts.keys()).unwrap(),
+            BTreeSet::from([200_000])
+        );
     }
 
     #[test]

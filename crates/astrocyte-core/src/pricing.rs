@@ -1125,7 +1125,9 @@ fn resolve_catalog_snapshot(
     // CatalogClient rejects malformed rate keys before constructing a snapshot.
     // Keep the fallback for an internally constructed snapshot: an unreadable
     // threshold must not silently select the base rate.
-    let Ok(thresholds) = tier_thresholds(&snapshot.facts) else {
+    let Ok(thresholds) =
+        tier_thresholds(snapshot.facts.keys().chain(snapshot.withheld_facts.keys()))
+    else {
         return Ok(unpriced_all(
             plan,
             UnpricedReason::RateTiered,
@@ -4017,7 +4019,7 @@ mod tests {
     fn astrocyte_core_tier_thresholds(
         facts: &BTreeMap<String, serde_json::Value>,
     ) -> Result<std::collections::BTreeSet<u64>, String> {
-        crate::catalog_client::tier_thresholds(facts)
+        crate::catalog_client::tier_thresholds(facts.keys())
     }
 
     #[test]
@@ -4672,6 +4674,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, ("arithmetic_out_of_range".into(), None));
+    }
+
+    #[test]
+    fn withheld_context_tier_does_not_price_crossing_input_at_base() {
+        let mut conn = conn();
+        let fake = FakeCatalog::new(BTreeMap::from([("rate.input".into(), rate(1_000_000_000))]));
+        fake.response.lock().unwrap().withheld = vec![WithheldFactWire {
+            model: "provider/model".into(),
+            fact_key: "rate.input.above_context.200000".into(),
+            corrections: vec![],
+        }];
+        let catalog = client(fake);
+        for (name, tokens, expected) in [
+            (
+                "withheld-tier-over",
+                250_000,
+                (Some("rate_tiered".into()), None),
+            ),
+            ("withheld-tier-under", 100_000, (None, Some(100_000_000))),
+        ] {
+            let event_id = record(
+                &mut conn,
+                name,
+                ChargeBasis::MeteredApi,
+                Some(700),
+                vec![measurement("input", Some(tokens))],
+            );
+            reprice_event(
+                &mut conn,
+                &event_id,
+                &catalog,
+                1_000,
+                PricingOrigin::PricingPass,
+            )
+            .unwrap();
+            let charges: Vec<_> = tier_rows(&conn, &event_id)
+                .into_iter()
+                .map(|(reason, _, _, _, charge)| (reason, charge))
+                .collect();
+            assert_eq!(charges, vec![expected], "{name}");
+        }
     }
 
     #[test]
