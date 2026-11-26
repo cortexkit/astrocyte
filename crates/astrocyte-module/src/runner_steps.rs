@@ -307,6 +307,21 @@ mod tests {
     }
 
     #[test]
+    fn refusal_fallback_without_category_is_admitted() {
+        // Since llm-runner 0.9.9 a provider may give no refusal category; the
+        // record then omits it, and the step must still reach the feed.
+        let (subject, body) = event("refusal_fallback", "broca", |body| {
+            body["fallback"].as_object_mut().unwrap().remove("category");
+        });
+        decode_step_finished(&subject, &body).expect("decode fallback without category");
+        let state = test_state();
+        admit(&state, &subject, &body);
+        let served = rows(&state, json!({}));
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0]["source"], "runner");
+    }
+
+    #[test]
     fn refusal_fallback_row_omits_unknown_counters() {
         let state = test_state();
         admit_event(

@@ -303,7 +303,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "bytes",
- "cortexkit-bus-naming 0.4.4",
+ "cortexkit-bus-naming 0.5.9",
  "cortexkit-bus-trait",
  "futures-util",
  "tokio",
@@ -383,9 +383,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.9.6"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d433207ff9e497db318616adf5b854a068f78b04fea66cd5133db2af5f1e08c0"
+checksum = "7149b47aa1a4933291abc642b98448dddd1f8290df94f059a95b93ff6ae05fba"
 dependencies = [
  "cortexkit-rich-ui-syntax",
  "cortexkit-role-tool-provider",
