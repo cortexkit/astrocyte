@@ -579,6 +579,8 @@ pub struct ObservationPlan {
     /// Accounts with readings in this window that the config does not name.
     /// Their Δused% is reported and never counted.
     pub(crate) unconfigured_accounts: Vec<AccountDelta>,
+    /// Identities excluded because their effective plan changed in this window.
+    changed_accounts: Vec<AccountDelta>,
     /// The interval clipped to the span the quota data covers, or `None` when
     /// no configured account has a reading in the interval.
     pub token_interval_ms: Option<(i64, i64)>,
@@ -659,6 +661,22 @@ pub fn resolve_membership(
     quota_provider: &str,
     end_ms: i64,
 ) -> Result<ResolvedQuotaProvider, MultiplierError> {
+    let (accounts, credentials) = sampled_identities(conn, declaration, quota_provider, end_ms)?;
+    let history = crate::vault_plan::at(conn, end_ms)?;
+    Ok(membership_from_history(
+        declaration,
+        &accounts,
+        &credentials,
+        &history,
+    ))
+}
+
+fn sampled_identities(
+    conn: &Connection,
+    declaration: &QuotaProviderConfig,
+    quota_provider: &str,
+    end_ms: i64,
+) -> rusqlite::Result<(BTreeSet<String>, BTreeSet<String>)> {
     let identities = |table: &str, field: &str| -> rusqlite::Result<BTreeSet<String>> {
         conn.prepare(&sample_identities_sql(
             table,
@@ -676,9 +694,18 @@ pub fn resolve_membership(
         )?
         .collect()
     };
-    let accounts = identities("window_sample", "account_ref")?;
-    let credentials = identities("credential_window_sample", "credential_ref")?;
-    let history = crate::vault_plan::at(conn, end_ms)?;
+    Ok((
+        identities("window_sample", "account_ref")?,
+        identities("credential_window_sample", "credential_ref")?,
+    ))
+}
+
+fn membership_from_history(
+    declaration: &QuotaProviderConfig,
+    accounts: &BTreeSet<String>,
+    credentials: &BTreeSet<String>,
+    history: &[crate::vault_plan::VaultPlan],
+) -> ResolvedQuotaProvider {
     let usable_accounts = accounts.iter().any(|id| {
         history
             .iter()
@@ -692,7 +719,7 @@ pub fn resolve_membership(
     let credential_keyed =
         usable_credentials && !usable_accounts || accounts.is_empty() && !credentials.is_empty();
     let mixed = usable_accounts && usable_credentials;
-    let (winners, differences) = crate::vault_plan::account_winners(&history);
+    let (winners, differences) = crate::vault_plan::account_winners(history);
     let mut resolved = ResolvedQuotaProvider {
         window: declaration.window.clone(),
         scope: declaration.scope.clone(),
@@ -706,55 +733,55 @@ pub fn resolve_membership(
         for id in credentials {
             if let Some(key) = history
                 .iter()
-                .find(|row| row.credential_id == id && row.account_id.is_none())
+                .find(|row| &row.credential_id == id && row.account_id.is_none())
                 .and_then(|row| row.plan_key.as_ref())
             {
                 resolved
                     .credentials
-                    .insert(id, AccountPlan { plan: key.clone() });
+                    .insert(id.clone(), AccountPlan { plan: key.clone() });
             } else {
                 resolved
                     .unknown_reasons
-                    .insert(id, "vault_plan_unknown".into());
+                    .insert(id.clone(), "vault_plan_unknown".into());
             }
         }
     } else {
         for id in accounts {
             let providers: BTreeSet<_> = history
                 .iter()
-                .filter(|row| row.account_id.as_ref() == Some(&id))
+                .filter(|row| row.account_id.as_ref() == Some(id))
                 .filter_map(|row| row.provider.as_ref())
                 .collect();
             let ambiguous = providers.len() > 1
                 || differences
                     .iter()
-                    .any(|difference| difference.account_id == id && difference.ambiguous);
+                    .any(|difference| &difference.account_id == id && difference.ambiguous);
             if ambiguous {
                 resolved
                     .unknown_reasons
-                    .insert(id, "vault_account_ambiguous".into());
+                    .insert(id.clone(), "vault_account_ambiguous".into());
                 continue;
             }
             if let Some(key) = winners
                 .iter()
                 .find(|row| {
                     // A providerless, planless credential carries no membership information.
-                    row.account_id.as_ref() == Some(&id)
+                    row.account_id.as_ref() == Some(id)
                         && (row.provider.is_some() || row.plan_key.is_some())
                 })
                 .and_then(|row| row.plan_key.as_ref())
             {
                 resolved
                     .accounts
-                    .insert(id, AccountPlan { plan: key.clone() });
+                    .insert(id.clone(), AccountPlan { plan: key.clone() });
             } else {
                 resolved
                     .unknown_reasons
-                    .insert(id, "vault_plan_unknown".into());
+                    .insert(id.clone(), "vault_plan_unknown".into());
             }
         }
     }
-    Ok(resolved)
+    resolved
 }
 
 pub fn plan_observation(
@@ -778,7 +805,53 @@ pub fn plan_observation(
             message: "interval start must precede its end".into(),
         });
     }
-    let provider = resolve_membership(conn, &declaration, quota_provider, interval_end_ms)?;
+    let (account_ids, credential_ids) =
+        sampled_identities(conn, &declaration, quota_provider, interval_end_ms)?;
+    let membership_at = |end| -> rusqlite::Result<ResolvedQuotaProvider> {
+        Ok(membership_from_history(
+            &declaration,
+            &account_ids,
+            &credential_ids,
+            &crate::vault_plan::at(conn, end)?,
+        ))
+    };
+    let mut provider = membership_at(interval_end_ms)?;
+    let mut switched = BTreeSet::new();
+    let boundaries =
+        crate::vault_plan::boundaries_between(conn, interval_start_ms, interval_end_ms)?;
+    if let Some((_, earlier_boundaries)) = boundaries.split_last() {
+        let mut known = provider.members().clone();
+        // Check the start and every distinct intermediate membership so a
+        // switch away and back cannot look like a stable end-to-end plan.
+        for at in std::iter::once(interval_start_ms).chain(earlier_boundaries.iter().copied()) {
+            let previous = membership_at(at + 1)?;
+            let earlier = if provider.credential_keyed {
+                &previous.credentials
+            } else {
+                &previous.accounts
+            };
+            // A first known plan covers the login from its first recorded
+            // call; only two different known plans count as a switch.
+            for (id, plan) in earlier {
+                let recorded = known.entry(id.clone()).or_insert_with(|| plan.clone());
+                if recorded != plan {
+                    switched.insert(id.clone());
+                }
+            }
+        }
+    }
+    let mut changed_accounts = Vec::new();
+    for account in &switched {
+        provider.members_mut().remove(account);
+        changed_accounts.push(clean::counter_delta(
+            conn,
+            quota_provider,
+            (account, provider.credential_keyed),
+            &provider.window,
+            interval_start_ms,
+            interval_end_ms,
+        )?);
+    }
     let mut accounts = Vec::new();
     for account in provider.members().keys() {
         accounts.push(clean::counter_delta(
@@ -810,10 +883,9 @@ pub fn plan_observation(
         )?
         .collect::<rusqlite::Result<_>>()?;
     let mut unconfigured_accounts = Vec::new();
-    for account in seen
-        .iter()
-        .filter(|account| !provider.members().contains_key(*account))
-    {
+    for account in seen.iter().filter(|account| {
+        !provider.members().contains_key(*account) && !switched.contains(*account)
+    }) {
         let measured = clean::counter_delta(
             conn,
             quota_provider,
@@ -837,7 +909,14 @@ pub fn plan_observation(
         interval_start_ms,
         interval_end_ms,
         |event| {
-            events.push(event);
+            if provider.credential_keyed
+                || event
+                    .account_ref
+                    .as_ref()
+                    .is_none_or(|id| !switched.contains(id))
+            {
+                events.push(event);
+            }
             Ok(())
         },
     )?;
@@ -852,6 +931,7 @@ pub fn plan_observation(
         interval_end_ms,
         accounts,
         unconfigured_accounts,
+        changed_accounts,
         token_interval_ms,
         models,
         events,
@@ -961,21 +1041,33 @@ pub struct ModelRates {
 }
 
 impl ModelRates {
-    pub(crate) fn context_tier_for_role(&self, role: &str, prompt: PromptSize) -> Option<u64> {
+    pub(crate) fn context_tier_for_role(
+        &self,
+        role: &str,
+        prompt: PromptSize,
+        mode: Option<&str>,
+    ) -> Option<u64> {
         self.tiers
             .iter()
-            .filter_map(|(threshold, rates)| rates.contains_key(role).then_some(*threshold))
+            .filter_map(|(threshold, rates)| rates.contains_key(role).then_some((true, *threshold)))
             .chain(self.conditional.keys().filter_map(|key| {
                 let parsed = parse_rate_key(key).ok()?;
                 if parsed.role != role {
                     return None;
                 }
-                // Mode- or lifetime-only tiers still establish this role's
-                // threshold; the complete condition set is matched afterward.
-                parsed.selectors.get("above_context")?.parse::<u64>().ok()
+                let matching_mode = parsed
+                    .selectors
+                    .get("mode")
+                    .is_none_or(|required| Some(required.as_str()) == mode);
+                let threshold = parsed.selectors.get("above_context")?.parse::<u64>().ok()?;
+                Some((matching_mode, threshold))
             }))
-            .filter(|threshold| prompt.exceeds(*threshold))
+            .filter(|(_, threshold)| prompt.exceeds(*threshold))
+            // Prefer a threshold for the requested mode. When only another
+            // mode has a crossed tier, keep its threshold so a missing exact
+            // mode or lifetime rate cannot fall back to a less specific one.
             .max()
+            .map(|(_, threshold)| threshold)
     }
 }
 
@@ -2079,6 +2171,14 @@ pub fn compute_observation(
             "readings": account.readings,
         }));
     }
+    for account in &plan.changed_accounts {
+        accounts_excluded.push(json!({
+            (plan.provider.identity_field()): account.account_ref,
+            "reason": "vault_plan_changed",
+            "delta_percent": account.delta_percent,
+            "readings": account.readings,
+        }));
+    }
     let subscription_nanos = subscription.round()?;
     let fee_paid_nanos = fee_paid.round()?;
     for (account, amount) in accounts_included.iter_mut().zip(allocate_subscription(
@@ -2723,7 +2823,7 @@ pub fn multiplier_pace(
                 if Some(account.plan.as_str()) != selected_plan {
                     return Ok(());
                 }
-            } else if plans.len() > 1 {
+            } else if plans.len() != 1 || plans.first().copied() != selected_plan {
                 return Ok(());
             }
             let event = scoped.tokens;

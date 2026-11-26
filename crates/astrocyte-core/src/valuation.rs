@@ -417,7 +417,9 @@ pub fn value_event(
     let mode_rates = stated_mode.map(|mode| model_rates.modes.get(mode));
     let select_rate = |rate_role: &str, ttl: Option<&str>| {
         let tier = if per_request {
-            prompt.and_then(|prompt| model_rates.context_tier_for_role(rate_role, prompt))
+            prompt.and_then(|prompt| {
+                model_rates.context_tier_for_role(rate_role, prompt, stated_mode)
+            })
         } else {
             None
         };

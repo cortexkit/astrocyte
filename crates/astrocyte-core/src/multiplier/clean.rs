@@ -248,7 +248,10 @@ pub(super) fn counter_delta(
             continue;
         }
         let gap = current.at - previous.at;
-        let covered = gap <= MAX_GAP_MS || (!reset && quiet_pair(previous, current, tolerance));
+        // A reading past its own reset cannot certify coverage for that period.
+        let covered = current.reset.is_none_or(|at| current.at <= at)
+            && (reset || previous.reset.is_none_or(|at| previous.at <= at))
+            && (gap <= MAX_GAP_MS || (!reset && quiet_pair(previous, current, tolerance)));
         if covered {
             result.coverage_ms = Some(match result.coverage_ms {
                 Some((old_from, old_to)) => (old_from.min(from), old_to.max(to)),
@@ -421,13 +424,14 @@ pub fn compute_plan_observations(
                 !plan.provider.credential_keyed && plan.provider.accounts.contains_key(account)
             })
         };
+        let can_pool = plans.len() == 1 && plan.changed_accounts.is_empty();
         let pooled_hours: BTreeSet<i64> = plan
             .events
             .iter()
             .filter(|event| !attributed(event.account_ref.as_ref()))
             .map(|event| event.occurred_at_ms.div_euclid(HOUR_MS) * HOUR_MS)
             .filter(|hour| {
-                plans.len() > 1
+                !can_pool
                     || !plan
                         .provider
                         .members()
@@ -497,7 +501,7 @@ pub fn compute_plan_observations(
                     .filter(|account| attributed(Some(*account)))
                 {
                     Some(account) => members.contains(account),
-                    None => plans.len() == 1,
+                    None => can_pool,
                 }
         });
         fee_view.token_interval_ms = Some((plan.interval_start_ms, plan.interval_end_ms));
@@ -512,7 +516,7 @@ pub fn compute_plan_observations(
                 Some(account) => members.contains(account) && paired(account, hour),
                 None => {
                     unmatched += 1;
-                    plans.len() == 1
+                    can_pool
                         && plan
                             .provider
                             .members()

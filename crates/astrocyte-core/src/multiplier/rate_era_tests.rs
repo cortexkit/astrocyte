@@ -144,8 +144,8 @@ fn reasoning_billed_as_history_controls_list_value_and_multiplier_at_call_time()
             &[("reasoning", "fixture", 1_000_000)],
         );
     }
-    reading(&conn, "acct", from_ms - 50, 0.0, None);
-    reading(&conn, "acct", from_ms + 150, 10.0, None);
+    reset_reading(&conn, "acct", from_ms - 50, 0.0, from_ms + DAY);
+    reset_reading(&conn, "acct", from_ms + 150, 10.0, from_ms + DAY);
     let end = from_ms + 150;
     let plan = plan_observation(&conn, &config, "codex", from_ms - 50, end).unwrap();
     let rates =

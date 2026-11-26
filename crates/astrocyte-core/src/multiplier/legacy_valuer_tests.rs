@@ -247,7 +247,9 @@ fn legacy_value_event(
             role
         };
         let tier = if per_request {
-            prompt.and_then(|prompt| model_rates.context_tier_for_role(rate_role, prompt))
+            prompt.and_then(|prompt| {
+                model_rates.context_tier_for_role(rate_role, prompt, stated_mode)
+            })
         } else {
             None
         };

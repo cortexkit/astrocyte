@@ -69,6 +69,10 @@ For each credential, a snapshot uses the last recorded history row whose start
 is before the snapshot's exclusive end. Rows replace earlier recorded evidence
 from their own start onward, even when a correction moves the start backwards
 across an older row's start. A future-start row does not change earlier snapshots.
+Calibration uses the end snapshot, except that an identity whose known plan
+changed in the window is listed in `accounts_excluded` as `vault_plan_changed`.
+Its quota and usage do not calibrate either plan. The first known plan still
+applies from the login's first recorded call.
 The lookup seeks backwards in recording order and stops at the first eligible
 row, skipping future-start rows if needed. Date-only edits to an already open,
 vault-owned ledger plan with the same key leave its existing ledger interval

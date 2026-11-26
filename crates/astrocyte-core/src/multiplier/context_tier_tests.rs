@@ -29,6 +29,39 @@ fn context_tier_rates(entries: &[(&str, i64)]) -> ResolvedRates {
 }
 
 #[test]
+fn multiplier_regression_fast_only_tier_does_not_mask_standard_tier() {
+    let conn = conn();
+    let config = config(vec![rule("opencode", "openai", None)]);
+    reading(&conn, "acct", 0, 0.0, None);
+    reading(&conn, "acct", 100, 10.0, None);
+    event(
+        &conn,
+        "e",
+        "opencode",
+        "openai",
+        "m",
+        "unknown",
+        10,
+        &[("input", "usage.input", 250_000)],
+    );
+    let rates = context_tier_rates(&[
+        ("rate.input", TEN_PER_M),
+        ("rate.input.above_context.100000", 2 * TEN_PER_M),
+        ("rate.input.mode.fast", 3 * TEN_PER_M),
+        ("rate.input.mode.fast.above_context.200000", 4 * TEN_PER_M),
+    ]);
+    let mut plan = plan_observation(&conn, &config, "codex", 0, DAY).unwrap();
+    for (mode, nanos) in [("standard", 5_000_000_000), ("fast", 10_000_000_000)] {
+        plan.events[0].tokens.mode = Some(mode.into());
+        let row =
+            super::compute_observation(&conn, &config, &plan, &rates, &priced_plan(), DAY, &[])
+                .unwrap();
+        assert_eq!(row.api_nanos, nanos, "mode={mode}");
+        assert!(row.unpriced_tokens.is_empty());
+    }
+}
+
+#[test]
 fn context_tier_is_selected_per_role_above_and_between_thresholds() {
     let rates = context_tier_rates(&[
         ("rate.input", TEN_PER_M),

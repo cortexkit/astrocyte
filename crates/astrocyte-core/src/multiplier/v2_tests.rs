@@ -408,6 +408,165 @@ fn v2_credential_scopes_and_plan_prices_use_their_own_provider_names() {
 }
 
 #[test]
+fn multiplier_regression_expired_reset_cannot_certify_a_clean_hour() {
+    let conn = conn();
+    let config = config(vec![rule("pi", "openai", None)]);
+    for hour in [1, 2] {
+        reset_reading(&conn, "acct", hour * HOUR_MS, 10.0, HOUR_MS / 2);
+    }
+    v2_event(
+        &conn,
+        "expired-period",
+        Some("acct"),
+        "m",
+        HOUR_MS + 1,
+        Some(1_000_000),
+    );
+    let plan = plan_observation(&conn, &config, "codex", HOUR_MS, 2 * HOUR_MS).unwrap();
+    let row = compute_plan_observations(
+        &conn,
+        &config,
+        &plan,
+        &rates_for(&[("openai", "m")], 100, None),
+        &priced_plan(),
+        2 * HOUR_MS,
+        &[],
+    )
+    .unwrap()
+    .remove(0);
+    assert_eq!(row.api_nanos, 0, "expired quota admitted priced usage");
+    assert!(row.clean_hours_share.abs() < f64::EPSILON);
+}
+
+fn switch_fixture_account(conn: &Connection, account: &str, at: i64, tier: &str) {
+    let tx = conn.unchecked_transaction().unwrap();
+    crate::vault_plan::append_in_tx(
+        &tx,
+        &crate::vault_plan::VaultPlan {
+            credential_id: format!("fixture:{account}"),
+            provider: Some("openai".into()),
+            account_id: Some(account.into()),
+            plan_tier: Some(tier.into()),
+            plan_key: Some(format!("openai/{tier}")),
+            source: "operator".into(),
+            effective_from_ms: at,
+            observed_at_ms: at,
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+#[test]
+fn multiplier_regression_mixed_plan_account_does_not_calibrate_with_its_new_plan() {
+    let conn = conn();
+    let mut config = config(vec![rule("pi", "openai", None)]);
+    config
+        .quota_providers
+        .get_mut("codex")
+        .unwrap()
+        .accounts
+        .insert(
+            "stable".into(),
+            AccountPlan {
+                plan: "openai/pro_20x".into(),
+            },
+        );
+    for minute in (0..=120).step_by(5) {
+        for account in ["acct", "stable"] {
+            reset_reading(&conn, account, minute * 60_000, minute as f64 / 60.0, DAY);
+        }
+    }
+    v2_event(
+        &conn,
+        "before-switch",
+        Some("acct"),
+        "m",
+        1,
+        Some(1_000_000),
+    );
+    v2_event(
+        &conn,
+        "after-switch",
+        Some("acct"),
+        "m",
+        HOUR_MS + 1,
+        Some(1_000_000),
+    );
+    v2_event(&conn, "stable-plan", Some("stable"), "m", 1, Some(500_000));
+    plan_observation(&conn, &config, "codex", 0, 2 * HOUR_MS).unwrap();
+    switch_fixture_account(&conn, "acct", HOUR_MS, "pro_100");
+    let plan = super::plan_observation(&conn, &config, "codex", 0, 2 * HOUR_MS).unwrap();
+    let mut prices = priced_plan();
+    let mut stable_price = prices["acct"].clone();
+    stable_price.account_ref = "stable".into();
+    prices.insert("stable".into(), stable_price);
+    let rows = compute_plan_observations(
+        &conn,
+        &config,
+        &plan,
+        &rates_for(&[("openai", "m")], 100, None),
+        &prices,
+        2 * HOUR_MS,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.plan.as_deref(), row.api_nanos))
+            .collect::<Vec<_>>(),
+        [(Some("openai/pro_20x"), 50)],
+    );
+    assert_eq!(rows[0].accounts_included[0]["account_ref"], "stable");
+    assert_eq!(rows[0].accounts_excluded[0]["account_ref"], "acct");
+    assert_eq!(rows[0].accounts_excluded[0]["reason"], "vault_plan_changed");
+    assert!((rows[0].delta_percent - 2.0).abs() < 1e-9);
+}
+
+#[test]
+fn multiplier_regression_old_plan_pace_omits_accountless_usage() {
+    let mut conn = conn();
+    let config = stable_fixture(&conn);
+    let plan = plan_observation(&conn, &config, "codex", 0, 3 * DAY).unwrap();
+    let row = compute_plan_observations(
+        &conn,
+        &config,
+        &plan,
+        &rates_for(&[("openai", "m")], TEN_PER_M, None),
+        &priced_plan(),
+        3 * DAY,
+        &[],
+    )
+    .unwrap()
+    .remove(0);
+    assert!(row.routing_eligible, "{:?}", row.eligibility_reasons);
+    let tx = conn.transaction().unwrap();
+    insert_observation_in_tx(&tx, &row).unwrap();
+    tx.commit().unwrap();
+    switch_fixture_account(&conn, "acct", 3 * DAY, "pro_100");
+    v2_event(
+        &conn,
+        "post-switch",
+        None,
+        "m",
+        3 * DAY + 1,
+        Some(1_000_000),
+    );
+    let pace = multiplier_pace(
+        &conn,
+        Some(&config),
+        &MultiplierPaceRequest {
+            quota_provider: "codex".into(),
+            plan: row.plan,
+            from_ms: 3 * DAY,
+            to_ms: 3 * DAY + HOUR_MS,
+        },
+    )
+    .unwrap();
+    assert_eq!(pace["hours"][0]["producers"], json!({}));
+}
+
+#[test]
 fn v2_reset_periods_ignore_rounding_flaps_and_jitter_but_count_new_first_reading() {
     let conn = conn();
     let reset = 7 * 24 * HOUR_MS;
@@ -1438,7 +1597,10 @@ fn v2_latest_last_eligible_uses_newest_eligible_plan_head() {
             "fee_multiplier": 0.75,
         })
     );
-    println!("latest with last_eligible: {}", serde_json::to_string(latest).unwrap());
+    println!(
+        "latest with last_eligible: {}",
+        serde_json::to_string(latest).unwrap()
+    );
     assert!(report["series"]
         .as_array()
         .unwrap()
@@ -1673,6 +1835,7 @@ fn vault_seeded_history_recomputes_the_day_identically_to_old_config() {
         interval_end_ms: 72 * HOUR_MS,
         accounts,
         unconfigured_accounts: Vec::new(),
+        changed_accounts: Vec::new(),
         token_interval_ms,
         models: BTreeSet::new(),
         events,

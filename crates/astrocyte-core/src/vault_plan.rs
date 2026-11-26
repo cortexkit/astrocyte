@@ -653,19 +653,31 @@ pub fn latest(conn: &Connection, credential_id: &str) -> rusqlite::Result<Option
     .optional()
 }
 
-const AT_SQL: &str = "WITH RECURSIVE credential(id) AS (
+const CREDENTIALS_CTE: &str = "WITH RECURSIVE credential(id) AS (
          SELECT (SELECT credential_id FROM vault_plan_history ORDER BY credential_id LIMIT 1)
          UNION ALL
          SELECT (SELECT n.credential_id FROM vault_plan_history n WHERE n.credential_id>credential.id
-                 ORDER BY n.credential_id LIMIT 1)
-           FROM credential WHERE credential.id IS NOT NULL)
-     SELECT h.credential_id,h.provider,h.account_id,h.plan_tier,h.plan_key,h.source,
-            h.effective_from_ms,h.observed_at_ms
-       FROM credential CROSS JOIN vault_plan_history h
-      WHERE h.history_id=(SELECT l.history_id FROM vault_plan_history l INDEXED BY vault_plan_credential_latest
-                           WHERE l.credential_id=credential.id AND l.effective_from_ms<?1
-                           ORDER BY l.history_id DESC LIMIT 1)
-      ORDER BY h.effective_from_ms,h.history_id";
+                  ORDER BY n.credential_id LIMIT 1)
+           FROM credential WHERE credential.id IS NOT NULL)";
+
+/// Candidate effective boundaries strictly inside a half-open interval.
+/// A backdated correction can shadow rows at these boundaries; callers check
+/// membership using the same snapshot lookup as at the interval end.
+pub(crate) fn boundaries_between(
+    conn: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+) -> rusqlite::Result<Vec<i64>> {
+    conn.prepare_cached(&format!(
+        "{CREDENTIALS_CTE}
+         SELECT DISTINCT h.effective_from_ms FROM credential
+          CROSS JOIN vault_plan_history h INDEXED BY vault_plan_record_history
+          WHERE h.credential_id=credential.id AND h.effective_from_ms>?1 AND h.effective_from_ms<?2
+          ORDER BY h.effective_from_ms"
+    ))?
+    .query_map(params![start_ms, end_ms], |row| row.get(0))?
+    .collect()
+}
 
 /// Newest row of one credential by history ID, read through
 /// `vault_plan_credential_latest` so an unchanged listing costs one seek.
@@ -682,7 +694,7 @@ const LATEST_PLAN_SQL: &str =
 /// than sorting the credential's history. Future-start rows are skipped until
 /// an eligible row is found. The result keeps the order by effective time and history ID.
 pub fn at(conn: &Connection, end_ms: i64) -> rusqlite::Result<Vec<VaultPlan>> {
-    conn.prepare(AT_SQL)?
+    conn.prepare_cached(&at_sql())?
         .query_map([end_ms], |row| {
             Ok(VaultPlan {
                 credential_id: row.get(0)?,
@@ -696,6 +708,19 @@ pub fn at(conn: &Connection, end_ms: i64) -> rusqlite::Result<Vec<VaultPlan>> {
             })
         })?
         .collect()
+}
+
+fn at_sql() -> String {
+    format!(
+        "{CREDENTIALS_CTE}
+         SELECT h.credential_id,h.provider,h.account_id,h.plan_tier,h.plan_key,h.source,
+                h.effective_from_ms,h.observed_at_ms
+           FROM credential CROSS JOIN vault_plan_history h
+          WHERE h.history_id=(SELECT l.history_id FROM vault_plan_history l INDEXED BY vault_plan_credential_latest
+                               WHERE l.credential_id=credential.id AND l.effective_from_ms<?1
+                               ORDER BY l.history_id DESC LIMIT 1)
+          ORDER BY h.effective_from_ms,h.history_id"
+    )
 }
 
 #[cfg(test)]
@@ -931,7 +956,7 @@ mod tests {
             "{small_steps} -> {large_steps} VM steps"
         );
         let conn = crate::test_support::conn();
-        let plan = query_plan(&conn, AT_SQL);
+        let plan = query_plan(&conn, &at_sql());
         for expected in [
             "SEARCH h USING INTEGER PRIMARY KEY (rowid=?)",
             "SEARCH l USING INDEX vault_plan_credential_latest (credential_id=?)",
