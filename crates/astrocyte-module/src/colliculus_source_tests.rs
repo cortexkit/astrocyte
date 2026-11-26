@@ -844,20 +844,17 @@ fn media_absent_wait_doubles_to_ten_minutes_and_resets_when_present() {
     let mut backoff = AbsentBackoff::default();
     assert!(backoff.may_try(0));
     let mut now = 0;
-    let mut waits = Vec::new();
-    for _ in 0..6 {
+    for wait in [60_000, 120_000, 240_000, 480_000, 600_000, 600_000] {
         backoff.absent(now);
-        let (_, wait) = backoff.waiting.unwrap();
         assert!(!backoff.may_try(now + wait - 1));
         assert!(backoff.may_try(now + wait));
-        waits.push(wait);
         now += wait;
     }
-    assert_eq!(waits, [60_000, 120_000, 240_000, 480_000, 600_000, 600_000]);
     backoff.present();
     assert!(backoff.may_try(now));
     backoff.absent(now);
-    assert_eq!(backoff.waiting, Some((now, 60_000)));
+    assert!(!backoff.may_try(now + 59_999));
+    assert!(backoff.may_try(now + 60_000));
 }
 
 #[test]

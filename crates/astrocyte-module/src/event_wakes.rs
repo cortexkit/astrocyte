@@ -8,7 +8,7 @@ use cortexkit_bus_nats::NatsConnection;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio::sync::oneshot;
 
-use crate::state::SharedState;
+use crate::{absent_backoff::AbsentBackoff, state::SharedState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Source {
@@ -35,6 +35,7 @@ struct Lane {
     /// the producer is still starting (for example after a daemon restart)
     /// waits out the whole backstop, and the source shows stale until then.
     failed: bool,
+    absent: AbsentBackoff,
     waiting: Vec<oneshot::Sender<bool>>,
 }
 
@@ -53,13 +54,47 @@ impl Ticket<'_> {
     }
 
     pub(crate) fn finish(self, committed: bool) {
-        self.control
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(self.source)
-            .or_default()
-            .failed = !committed;
+        self.finish_with_absence(committed, None);
+    }
+
+    pub(crate) fn finish_absent(self, now: i64) {
+        self.finish_with_absence(false, Some(now));
+    }
+
+    fn finish_with_absence(self, committed: bool, absent_at: Option<i64>) {
+        let was_absent = {
+            let mut lanes = self
+                .control
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let lane = lanes.entry(self.source).or_default();
+            lane.failed = !committed;
+            let was_absent = lane.absent.is_waiting();
+            if let Some(now) = absent_at {
+                // A notice bypasses the wait. If the publisher is still absent,
+                // start again at the first interval rather than extending it.
+                if self.has_notice() {
+                    lane.absent.present();
+                }
+                lane.absent.absent(now);
+            } else {
+                lane.absent.present();
+            }
+            was_absent
+        };
+        if let Source::Attribution(publisher) = self.source {
+            match (was_absent, absent_at.is_some()) {
+                (false, true) => tracing::info!(
+                    publisher,
+                    "attribution publisher unavailable; backing off route opens"
+                ),
+                (true, false) => {
+                    tracing::info!(publisher, "attribution publisher absence backoff cleared")
+                }
+                _ => {}
+            }
+        }
         for waiting in self.waiting {
             let _ = waiting.send(committed);
         }
@@ -123,6 +158,7 @@ impl Control {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let lane = lanes.entry(source).or_default();
         let due = full_tick
+            && lane.absent.may_try(now)
             && (!lane.attached
                 || lane.failed
                 || lane

@@ -17,6 +17,7 @@ use subc_client_rs::{CallError, CallOptions, NotSentCause, RouteHandle, SubcCons
 use subc_protocol::SUBC_MODULE_ID_ENV;
 use subc_protocol::{error_codes, RouteTarget};
 
+use crate::absent_backoff::AbsentBackoff;
 use crate::peer_exchange::{open_route, PeerAccess};
 use crate::refresher::{harness_drain, SetAsideRecord, SourceDrainError};
 use crate::state::SharedState;
@@ -206,38 +207,6 @@ impl Route {
             ));
         }
         Ok(())
-    }
-}
-
-/// How long to wait before asking for colliculus again after the daemon said
-/// it isn't installed. Each refusal counts at the daemon, so a machine without
-/// colliculus would otherwise log one every tick forever. The wait doubles up
-/// to `ABSENT_RETRY_MAX_MS`; colliculus keeps records until they are
-/// acknowledged, so a late first read loses nothing.
-const ABSENT_RETRY_FIRST_MS: i64 = 60_000;
-const ABSENT_RETRY_MAX_MS: i64 = 600_000;
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct AbsentBackoff {
-    /// When colliculus was last found absent, and how long to wait from then.
-    waiting: Option<(i64, i64)>,
-}
-
-impl AbsentBackoff {
-    fn may_try(&self, now: i64) -> bool {
-        self.waiting
-            .is_none_or(|(since, wait)| now.saturating_sub(since) >= wait)
-    }
-
-    fn absent(&mut self, now: i64) {
-        let wait = self.waiting.map_or(ABSENT_RETRY_FIRST_MS, |(_, wait)| {
-            wait.saturating_mul(2).min(ABSENT_RETRY_MAX_MS)
-        });
-        self.waiting = Some((now, wait));
-    }
-
-    fn present(&mut self) {
-        self.waiting = None;
     }
 }
 

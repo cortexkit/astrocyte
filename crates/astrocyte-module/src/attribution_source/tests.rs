@@ -57,6 +57,200 @@ fn basal_pages() -> Vec<Value> {
 }
 
 #[test]
+fn attribution_reader_absent_publisher_backs_off_over_an_hour() {
+    let state = test_state();
+    let stop = AtomicBool::new(false);
+    let source = crate::event_wakes::Source::Attribution(Publisher::Entorhinal.key());
+    state.event_wakes().attached(&[source], true);
+    let before = transaction_attempts_for_test();
+    let mut absent_opens = Vec::new();
+    let mut other_failures = 0;
+    for now in (0..3_600_000).step_by(250) {
+        let full_tick = now % 1_000 == 0;
+        drain_selected(
+            &state,
+            &stop,
+            full_tick,
+            || now,
+            |publisher| match publisher {
+                Publisher::Entorhinal => {
+                    absent_opens.push(now / 1_000);
+                    Err(DrainError::Absent)
+                }
+                Publisher::Basal => {
+                    other_failures += 1;
+                    Ok(false)
+                }
+                _ => Ok(true),
+            },
+        );
+    }
+    assert_eq!(
+        absent_opens.len(),
+        9,
+        "absent publisher route opens in one hour"
+    );
+    assert_eq!(absent_opens, [0, 60, 180, 420, 900, 1500, 2100, 2700, 3300]);
+    assert_eq!(
+        other_failures, 3_600,
+        "other failures still retry each full tick"
+    );
+    assert_eq!(transaction_attempts_for_test(), before);
+}
+
+#[test]
+fn attribution_reader_wake_and_open_reset_absence_backoff() {
+    let state = test_state();
+    let stop = AtomicBool::new(false);
+    let source = crate::event_wakes::Source::Attribution(Publisher::Entorhinal.key());
+    state.event_wakes().attached(&[source], true);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let step = |now, full_tick, should_open, served_refusal| {
+        let mut opens = 0;
+        drain_selected(
+            &state,
+            &stop,
+            full_tick,
+            || now,
+            |publisher| {
+                if publisher != Publisher::Entorhinal {
+                    return Ok(true);
+                }
+                opens += 1;
+                if served_refusal {
+                    let mut peer = Peer::new(vec![json!({"error":{"code":"not_permitted"}})]);
+                    runtime
+                        .block_on(drain_pages(&state, publisher, now, &stop, &mut peer))
+                        .map_err(DrainError::Page)
+                } else {
+                    Err(DrainError::Absent)
+                }
+            },
+        );
+        assert_eq!(opens, usize::from(should_open), "route opens at {now} ms");
+    };
+
+    step(0, true, true, false);
+    step(60_000, true, true, false);
+    step(61_000, true, false, false);
+    let mut wake = state.event_wakes().wake(source);
+    step(62_000, false, true, false);
+    assert_eq!(
+        wake.try_recv(),
+        Ok(false),
+        "absence must not acknowledge the wake"
+    );
+    step(121_999, true, false, false);
+    step(122_000, true, true, false);
+    // Opening successfully resets the schedule even if the page is refused.
+    step(242_000, true, true, true);
+    step(243_000, true, true, false);
+    step(302_999, true, false, false);
+    step(303_000, true, true, false);
+}
+
+#[tokio::test]
+async fn attribution_reader_prefrontal_absence_requires_every_module_id() {
+    let refusal = |code| {
+        CallError::Module(
+            serde_json::from_value(json!({"code": code, "message": "fixture refusal"})).unwrap(),
+        )
+    };
+    for (second, expected) in [
+        (Err(error_codes::TARGET_UNAVAILABLE), Err(OpenError::Absent)),
+        (Err(error_codes::MODULE_RELOADING), Err(OpenError::Other)),
+        (Ok("legacy route"), Ok("legacy route")),
+    ] {
+        let mut attempted = Vec::new();
+        let route = open_publisher(Publisher::Prefrontal, |module| {
+            attempted.push(module);
+            std::future::ready(match module {
+                "prefrontal" => Err(refusal(error_codes::UNKNOWN_MODULE)),
+                _ => second.map_err(refusal),
+            })
+        })
+        .await;
+        assert_eq!(attempted, ["prefrontal", "prefrontal-core"]);
+        assert_eq!(route, expected);
+    }
+}
+
+#[tokio::test]
+async fn attribution_reader_sdk_preserves_target_unavailable() {
+    use crate::test_support::{fake_daemon, read_peer_request, HANG_GUARD};
+    use subc_protocol::{Frame, FrameType};
+    use subc_transport::{auth::authenticate_server, write_frame};
+
+    let (listener, path, connection) = fake_daemon("attribution-unavailable", 41, 42);
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let daemon = async {
+        let serve = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            authenticate_server(
+                &mut stream,
+                &connection.key,
+                &connection.daemon_id,
+                &connection.daemon_ver,
+                HANG_GUARD,
+            )
+            .await
+            .unwrap();
+            while let Some(request) = read_peer_request(&mut stream).await {
+                let open: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(open["op"], "route.open");
+                assert_eq!(open["target"]["module_id"], "entorhinal");
+                let body =
+                    json!({"code": error_codes::TARGET_UNAVAILABLE, "message": "fixture refusal"});
+                let response = Frame::build(
+                    FrameType::Error,
+                    request.header.flags,
+                    0,
+                    0,
+                    request.header.corr,
+                    serde_json::to_vec(&body).unwrap(),
+                )
+                .unwrap();
+                if write_frame(&mut stream, &response).await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::select! { () = serve => {}, _ = released => {} }
+    };
+    let client = async {
+        let consumer = crate::peer_exchange::PeerAccess::Fixture(path.clone())
+            .connect(HANG_GUARD)
+            .await
+            .unwrap();
+        let result = open_publisher(Publisher::Entorhinal, |module| {
+            open_route(
+                &consumer,
+                RouteTarget::ManagementSurface {
+                    module_id: module.into(),
+                },
+                "attribution/entorhinal",
+                CallOptions {
+                    route_retry_deadline: Duration::from_millis(200),
+                    ..options()
+                },
+            )
+        })
+        .await;
+        let _ = release.send(());
+        result
+    };
+    let (_, result) = tokio::time::timeout(HANG_GUARD, async { tokio::join!(daemon, client) })
+        .await
+        .expect("attribution fake daemon did not finish");
+    std::fs::remove_file(path).unwrap();
+    assert!(matches!(result, Err(OpenError::Absent)));
+}
+
+#[test]
 fn event_wakes_attribution_idle_opens_no_routes_and_subject_selects_one_publisher() {
     let state = test_state();
     let stop = AtomicBool::new(false);
@@ -73,10 +267,16 @@ fn event_wakes_attribution_idle_opens_no_routes_and_subject_selects_one_publishe
     }
     let mut opens = 0;
     for _ in 0..10 {
-        drain_selected(&state, &stop, true, |_| {
-            opens += 1;
-            Ok(true)
-        });
+        drain_selected(
+            &state,
+            &stop,
+            true,
+            || now,
+            |_| {
+                opens += 1;
+                Ok(true)
+            },
+        );
     }
     assert_eq!(
         opens, 0,
@@ -89,12 +289,20 @@ fn event_wakes_attribution_idle_opens_no_routes_and_subject_selects_one_publishe
         .enable_all()
         .build()
         .unwrap();
-    drain_selected(&state, &stop, false, |publisher| {
-        opens += 1;
-        assert_eq!(publisher, Publisher::Basal);
-        let mut peer = Peer::new(basal_pages());
-        runtime.block_on(drain_pages(&state, publisher, now, &stop, &mut peer))
-    });
+    drain_selected(
+        &state,
+        &stop,
+        false,
+        || now,
+        |publisher| {
+            opens += 1;
+            assert_eq!(publisher, Publisher::Basal);
+            let mut peer = Peer::new(basal_pages());
+            runtime
+                .block_on(drain_pages(&state, publisher, now, &stop, &mut peer))
+                .map_err(DrainError::Page)
+        },
+    );
     assert_eq!(opens, 1);
     assert_eq!(first.try_recv(), Ok(true));
     assert_eq!(second.try_recv(), Ok(true));
@@ -108,10 +316,18 @@ fn event_wakes_attribution_idle_opens_no_routes_and_subject_selects_one_publishe
         .unwrap();
     assert_eq!(facts, 4);
     let mut failed = state.event_wakes().wake(source);
-    drain_selected(&state, &stop, false, |publisher| {
-        let mut peer = Peer::new(vec![json!({"error":{"code":"not_permitted"}})]);
-        runtime.block_on(drain_pages(&state, publisher, now, &stop, &mut peer))
-    });
+    drain_selected(
+        &state,
+        &stop,
+        false,
+        || now,
+        |publisher| {
+            let mut peer = Peer::new(vec![json!({"error":{"code":"not_permitted"}})]);
+            runtime
+                .block_on(drain_pages(&state, publisher, now, &stop, &mut peer))
+                .map_err(DrainError::Page)
+        },
+    );
     assert_eq!(
         failed.try_recv(),
         Ok(false),

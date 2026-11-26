@@ -5,10 +5,11 @@ use astrocyte_core::attribution::{self, Page, Publisher};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use subc_client_rs::{CallOptions, RouteHandle, SubcConsumer};
-use subc_protocol::RouteTarget;
+use subc_client_rs::{CallError, CallOptions, NotSentCause, RouteHandle, SubcConsumer};
+use subc_protocol::{error_codes, RouteTarget};
 
 const LIMIT: usize = 128;
 const BUDGET: Duration = Duration::from_secs(10);
@@ -27,31 +28,73 @@ struct Route {
     handle: RouteHandle,
     publisher: Publisher,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum OpenError {
+    Absent,
+    Other,
+}
+
+impl From<CallError> for OpenError {
+    fn from(error: CallError) -> Self {
+        let cause = error.not_sent_cause();
+        let code = error
+            .route_open_refusal()
+            .map(|body| body.code.as_str())
+            .or_else(|| error.code())
+            .or(match &cause {
+                Some(
+                    NotSentCause::RouteOpenRefused { code }
+                    | NotSentCause::DaemonRefusedBeforeForward { code },
+                ) => Some(code.as_str()),
+                _ => None,
+            });
+        // A route refusal can echo launch credentials. Classify by code without
+        // inspecting or logging the message or details.
+        match code {
+            Some(
+                error_codes::TARGET_UNAVAILABLE
+                | error_codes::UNKNOWN_MODULE
+                | error_codes::MODULE_REMOVED,
+            ) => Self::Absent,
+            _ => Self::Other,
+        }
+    }
+}
+
+async fn open_publisher<T, F: Future<Output = Result<T, CallError>>>(
+    publisher: Publisher,
+    mut open: impl FnMut(&'static str) -> F,
+) -> Result<T, OpenError> {
+    // Prefrontal answers under its new id after its rename and its old id
+    // before it. Try both before concluding that the publisher is absent.
+    let mut failure = OpenError::Absent;
+    for &module in publisher.modules() {
+        match open(module).await.map_err(OpenError::from) {
+            Ok(handle) => return Ok(handle),
+            Err(OpenError::Other) => failure = OpenError::Other,
+            Err(OpenError::Absent) => {}
+        }
+    }
+    Err(failure)
+}
+
 impl Route {
-    async fn open(state: &SharedState, publisher: Publisher) -> Result<Self, ()> {
-        let access = state.peer_access().ok_or(())?;
-        let consumer = access.connect(BUDGET).await.map_err(|_| ())?;
-        // Prefrontal answers under its new id after its rename and its old id
-        // before it. A refused open for an id not installed is cheap, so each
-        // refresh tries the preferred id first rather than remembering one.
-        let mut opened = None;
-        for module in publisher.modules() {
-            let route = RouteTarget::ManagementSurface {
-                module_id: (*module).into(),
-            };
-            if let Ok(handle) = open_route(
+    async fn open(state: &SharedState, publisher: Publisher) -> Result<Self, OpenError> {
+        let access = state.peer_access().ok_or(OpenError::Other)?;
+        let consumer = access.connect(BUDGET).await.map_err(|_| OpenError::Other)?;
+        let session = publisher.source();
+        let handle = open_publisher(publisher, |module| {
+            open_route(
                 &consumer,
-                route,
-                &format!("attribution/{}", publisher.key()),
+                RouteTarget::ManagementSurface {
+                    module_id: module.into(),
+                },
+                &session,
                 options(),
             )
-            .await
-            {
-                opened = Some(handle);
-                break;
-            }
-        }
-        let handle = opened.ok_or(())?;
+        })
+        .await?;
         Ok(Self {
             consumer,
             handle,
@@ -189,6 +232,11 @@ async fn drain_pages<T: ReadTransport>(
     }
 }
 
+enum DrainError {
+    Absent,
+    Page(String),
+}
+
 pub(super) fn drain_all(state: &SharedState, stop: &AtomicBool, full_tick: bool) {
     if !state.quota_bus().hello_acked() {
         return;
@@ -199,14 +247,18 @@ pub(super) fn drain_all(state: &SharedState, stop: &AtomicBool, full_tick: bool)
     else {
         return;
     };
-    drain_selected(state, stop, full_tick, |publisher| {
+    drain_selected(state, stop, full_tick, crate::state::now_ms, |publisher| {
         runtime.block_on(async {
             // Absence and routing refusals are normal while publishers roll out.
             // Do not create source_runtime rows or change an existing health result.
-            let Ok(mut route) = Route::open(state, publisher).await else {
-                return Ok(false);
+            let mut route = match Route::open(state, publisher).await {
+                Ok(route) => route,
+                Err(OpenError::Absent) => return Err(DrainError::Absent),
+                Err(OpenError::Other) => return Ok(false),
             };
-            drain_pages(state, publisher, crate::state::now_ms(), stop, &mut route).await
+            drain_pages(state, publisher, crate::state::now_ms(), stop, &mut route)
+                .await
+                .map_err(DrainError::Page)
         })
     });
 }
@@ -215,28 +267,33 @@ fn drain_selected(
     state: &SharedState,
     stop: &AtomicBool,
     full_tick: bool,
-    mut read: impl FnMut(Publisher) -> Result<bool, String>,
+    mut now_ms: impl FnMut() -> i64,
+    mut read: impl FnMut(Publisher) -> Result<bool, DrainError>,
 ) {
     for publisher in Publisher::ALL {
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        let now = now_ms();
         let Some(ticket) = state.event_wakes().begin(
             crate::event_wakes::Source::Attribution(publisher.key()),
             full_tick,
-            crate::state::now_ms(),
+            now,
         ) else {
             continue;
         };
-        let result = read(publisher);
-        ticket.finish(matches!(result, Ok(true)));
-        if let Err(error) = result {
-            if !stop.load(Ordering::Relaxed) {
-                tracing::warn!(
-                    publisher = publisher.key(),
-                    %error,
-                    "attribution page was not committed"
-                );
+        match read(publisher) {
+            Err(DrainError::Absent) => ticket.finish_absent(now),
+            Ok(committed) => ticket.finish(committed),
+            Err(DrainError::Page(error)) => {
+                ticket.finish(false);
+                if !stop.load(Ordering::Relaxed) {
+                    tracing::warn!(
+                        publisher = publisher.key(),
+                        %error,
+                        "attribution page was not committed"
+                    );
+                }
             }
         }
     }
