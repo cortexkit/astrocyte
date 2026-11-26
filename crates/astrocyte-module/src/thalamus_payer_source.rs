@@ -265,7 +265,10 @@ fn read_page(
     };
     let version = meta("schema_version")?;
     if version != "1" {
-        return Err(format!("unknown payer schema_version {version}"));
+        return Err(format!(
+            "unknown payer schema_version {}",
+            harness_drain::bounded_producer_string(&version)
+        ));
     }
     let incarnation = meta("incarnation")?;
     if incarnation.is_empty() {
@@ -435,7 +438,7 @@ fn record_row(tx: &Transaction<'_>, record: &Record, at: i64) -> Result<Option<S
     ) {
         return Ok(Some(format!(
             "unknown request_kind {}",
-            record.request_kind
+            harness_drain::bounded_producer_string(&record.request_kind)
         )));
     }
     if record.step_ref.is_some() {
@@ -1293,6 +1296,27 @@ mod tests {
             })
             .unwrap();
         assert!(reason.contains("unknown request_kind"), "{reason}");
+        assert!(reason.contains("line\\n\\\""), "{reason}");
+        assert!(reason.contains("truncated"), "{reason}");
+        assert!(!reason.contains(MARKER), "{reason}");
+    }
+
+    #[test]
+    fn safeguard_thalamus_unknown_schema_version_is_bounded() {
+        const MARKER: &str = "SCHEMA_VERSION_VALUE_MUST_NOT_BE_STORED";
+        let (_home, source, store, state) = fixture();
+        let version = format!("line\n\"{}{MARKER}", "x".repeat(80));
+        store
+            .execute(
+                "UPDATE payer_meta SET value=?1 WHERE key='schema_version'",
+                [version],
+            )
+            .unwrap();
+
+        crate::refresher::run_iteration_with_harness(&state, &[], &source, &AtomicBool::new(false));
+
+        let reason = state.producer_degraded_reason(SOURCE_KEY).unwrap();
+        assert!(reason.contains("unknown payer schema_version"), "{reason}");
         assert!(reason.contains("line\\n\\\""), "{reason}");
         assert!(reason.contains("truncated"), "{reason}");
         assert!(!reason.contains(MARKER), "{reason}");

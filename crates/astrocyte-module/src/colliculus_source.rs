@@ -12,6 +12,7 @@ use cortexkit_role_media::usage::{
 use rusqlite::{params, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use subc_client_rs::{CallError, CallOptions, NotSentCause, RouteHandle, SubcConsumer};
 #[cfg(test)]
 use subc_protocol::SUBC_MODULE_ID_ENV;
@@ -114,6 +115,28 @@ impl ReadEntry {
         body.insert("seq".into(), self.seq.into());
         serde_json::from_value(Value::Object(body))
     }
+}
+
+fn raw_entry_reason(raw: &impl Serialize) -> Result<String, String> {
+    let serialized = serde_json::to_vec(raw).map_err(|error| error.to_string())?;
+    let value: Value = serde_json::from_slice(&serialized).map_err(|error| error.to_string())?;
+    let keys = value.as_object().map_or_else(String::new, |object| {
+        object
+            .keys()
+            .take(16)
+            .map(|key| harness_drain::bounded_producer_string(key))
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    // The same reason is persisted and logged. Values stay out of both; the
+    // digest still lets an operator correlate this entry with the producer.
+    Ok(format!(
+        "raw media entry: type={}, keys=[{}], serialized_bytes={}, sha256={:x}",
+        harness_drain::json_type(&value),
+        keys,
+        serialized.len(),
+        Sha256::digest(&serialized)
+    ))
 }
 
 fn check_page_structure(page: &ReadPage) -> Result<(), FeedError> {
@@ -328,7 +351,7 @@ impl ColliculusSource {
                             Err(reason) => evidence.push(SetAsideRecord { locator, reason: format!("record {}: {reason}", record.record_id) }),
                         }
                     } else if let Some(raw) = &entry.raw {
-                        evidence.push(SetAsideRecord { locator, reason: format!("raw media entry: {}", serde_json::to_string(raw).map_err(|error| error.to_string())?) });
+                        evidence.push(SetAsideRecord { locator, reason: raw_entry_reason(raw)? });
                     }
                 }
                 if stop.load(Ordering::Relaxed) {

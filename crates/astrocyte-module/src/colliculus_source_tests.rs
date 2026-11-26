@@ -553,58 +553,77 @@ fn media_raw_feed_vectors_are_set_aside_and_acknowledged() {
                 .map_err(|error| error.to_string())
         })
         .unwrap();
-    assert!(reasons[0].contains("undecodable"));
-    assert!(reasons[0].contains("/w=="));
-    assert!(reasons[1].contains("oversize"));
-    assert!(reasons[1].contains("262145"));
-    assert!(reasons[1].contains("ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"));
+    for reason in &reasons {
+        assert!(reason.contains("raw media entry: type=object"), "{reason}");
+        assert!(reason.contains("bytes_b64"), "{reason}");
+        assert!(reason.contains("reason"), "{reason}");
+        assert!(reason.contains("serialized_bytes="), "{reason}");
+        assert!(reason.contains("sha256="), "{reason}");
+    }
+    assert!(!reasons[0].contains("undecodable"));
+    assert!(!reasons[0].contains("/w=="));
+    assert!(!reasons[1].contains("oversize"));
+    assert!(!reasons[1].contains("262145"));
+    assert!(
+        !reasons[1].contains("ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb")
+    );
     assert_eq!(peer.calls("usage.ack")[0]["params"]["through_seq"], 3);
     assert_eq!(state.producer_degraded_reason(SOURCE_KEY), None);
 }
 
-    #[test]
-    fn safeguard_raw_media_reason_is_structural_and_bounded() {
-        use sha2::{Digest, Sha256};
+#[test]
+fn safeguard_raw_media_reason_is_structural_and_bounded() {
+    use sha2::{Digest, Sha256};
 
-        const MARKER: &str = "RAW_MEDIA_VALUE_MUST_NOT_BE_STORED";
-        let mut raw = serde_json::Map::new();
-        let long_key = format!("a{}", "k".repeat(80));
-        raw.insert(long_key, json!(MARKER));
-        raw.insert("b-visible".into(), json!(MARKER));
-        for index in 0..18 {
-            raw.insert(format!("key-{index:02}"), json!(MARKER));
-        }
-        let raw = Value::Object(raw);
-        let serialized = serde_json::to_vec(&raw).unwrap();
-        let digest = format!("{:x}", Sha256::digest(&serialized));
-        let peer = Peer::start(fixed_page(vec![json!({"seq":1,"raw":raw})]));
-        let state = test_state();
+    const MARKER: &str = "RAW_MEDIA_VALUE_MUST_NOT_BE_STORED";
+    let raw = json!({"bytes_b64":"/w==","reason":MARKER});
+    let serialized = serde_json::to_vec(&raw).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&serialized));
+    let peer = Peer::start(fixed_page(vec![json!({"seq":1,"raw":raw})]));
+    let state = test_state();
 
-        tick(&state, &peer.source());
+    tick(&state, &peer.source());
 
-        let reason: String = state
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT reason FROM set_aside_record WHERE locator='usage.read/seq/1'",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|error| error.to_string())
-            })
-            .unwrap();
-        assert!(reason.contains("type=object"), "{reason}");
-        assert!(
-            reason.contains(&format!("serialized_bytes={}", serialized.len())),
-            "{reason}"
-        );
-        assert!(reason.contains(&digest), "{reason}");
-        assert!(reason.contains("b-visible"), "{reason}");
-        assert!(reason.contains(&"k".repeat(64)), "{reason}");
-        assert!(!reason.contains(&"k".repeat(65)), "{reason}");
-        assert!(!reason.contains("key-16"), "{reason}");
-        assert!(!reason.contains(MARKER), "{reason}");
-        assert!(reason.len() <= 2_000, "{reason}");
+    let reason: String = state
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT reason FROM set_aside_record WHERE locator='usage.read/seq/1'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+    assert!(reason.contains("type=object"), "{reason}");
+    assert!(
+        reason.contains(&format!("serialized_bytes={}", serialized.len())),
+        "{reason}"
+    );
+    assert!(reason.contains(&digest), "{reason}");
+    assert!(reason.contains("bytes_b64"), "{reason}");
+    assert!(!reason.contains(MARKER), "{reason}");
+}
+
+#[test]
+fn safeguard_raw_media_reason_bounds_key_names() {
+    const MARKER: &str = "RAW_MEDIA_VALUE_MUST_NOT_BE_STORED";
+    let mut raw = serde_json::Map::new();
+    let long_key = format!("a{}", "k".repeat(80));
+    raw.insert(long_key, json!(MARKER));
+    raw.insert("b-visible".into(), json!(MARKER));
+    for index in 0..18 {
+        raw.insert(format!("key-{index:02}"), json!(MARKER));
     }
+
+    let reason = raw_entry_reason(&Value::Object(raw)).unwrap();
+
+    assert!(reason.contains("b-visible"), "{reason}");
+    assert!(reason.contains(&"k".repeat(63)), "{reason}");
+    assert!(!reason.contains(&"k".repeat(64)), "{reason}");
+    assert!(!reason.contains("key-16"), "{reason}");
+    assert!(!reason.contains(MARKER), "{reason}");
+    assert!(reason.len() <= 2_000, "{reason}");
+}
 
 #[test]
 fn media_invalid_middle_record_is_set_aside_without_stalling_the_page() {

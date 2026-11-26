@@ -438,7 +438,13 @@ fn decode_store_row(
             let stamp = wire.take_scope_stamp();
             map_attempt(wire).map(|attempt| BrocaFact::Attempt(attempt, stamp))
         }
-        Some(kind) => Err(format!("segment of fact {fact_id} has unknown kind {kind}")),
+        Some(kind) => {
+            let kind = match kind {
+                Value::String(value) => super::harness_drain::bounded_producer_string(value),
+                other => super::harness_drain::json_type(other).into(),
+            };
+            Err(format!("segment of fact {fact_id} has unknown kind {kind}"))
+        }
     }
 }
 
@@ -1760,8 +1766,7 @@ mod tests {
         let mut long_kind: Value = serde_json::from_str(&stored_segment("long-kind")).unwrap();
         long_kind["kind"] = Value::from(long);
         add_segment(&path, 1, "long-kind", &long_kind.to_string());
-        let mut object_kind: Value =
-            serde_json::from_str(&stored_segment("object-kind")).unwrap();
+        let mut object_kind: Value = serde_json::from_str(&stored_segment("object-kind")).unwrap();
         object_kind["kind"] = serde_json::json!({"secret":MARKER});
         add_segment(&path, 2, "object-kind", &object_kind.to_string());
         let state = test_state();

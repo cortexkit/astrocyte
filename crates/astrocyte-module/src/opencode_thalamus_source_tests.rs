@@ -867,7 +867,8 @@ fn opencode_payer_join_wait_holds_ack_cursor_and_watermark_not_health() {
             assert_eq!(f.runtime(), Some((Some(at), true)));
             assert_eq!(f.degraded(), None);
         }
-        let mut folder = Folder::new(f.database(ONE).parent().unwrap());
+        let database = f.database(ONE);
+        let mut folder = Folder::new(database.parent().unwrap(), &database);
         let entry: Entry = serde_json::from_value(f.entry(ONE, true)).unwrap();
         assert!(matches!(
             read_folder(

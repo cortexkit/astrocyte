@@ -156,6 +156,55 @@ pub(crate) fn contain(
     })
 }
 
+/// Resolve a declared file itself, rather than trusting the containment of
+/// its parent. The file must remain below `folder` and be a regular file after
+/// every link has been followed.
+pub(crate) fn contain_file(
+    folder: &Path,
+    declared: &Path,
+    label: &str,
+) -> Result<Contained, String> {
+    contain_typed(folder, declared, label, "regular file", |metadata| {
+        metadata.is_file()
+    })
+}
+
+/// Resolve a declared directory itself, rather than trusting the containment
+/// of its parent. Enumeration below the resolved directory never starts on a
+/// link that escaped the checked folder.
+pub(crate) fn contain_directory(
+    folder: &Path,
+    declared: &Path,
+    label: &str,
+) -> Result<Contained, String> {
+    contain_typed(folder, declared, label, "directory", |metadata| {
+        metadata.is_dir()
+    })
+}
+
+fn contain_typed(
+    folder: &Path,
+    declared: &Path,
+    label: &str,
+    expected: &str,
+    accepts: impl FnOnce(&fs::Metadata) -> bool,
+) -> Result<Contained, String> {
+    let contained = contain(Some(folder), declared, label)?;
+    let path = match contained {
+        Contained::Inside(path) => path,
+        other => return Ok(other),
+    };
+    match fs::metadata(&path) {
+        Ok(metadata) if accepts(&metadata) => Ok(Contained::Inside(path)),
+        Ok(_) => Ok(Contained::Refused(format!(
+            "refuse {label}: expected {expected} at {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Contained::Gone),
+        Err(error) => Err(format!("inspect {label} {}: {error}", path.display())),
+    }
+}
+
 /// OpenCode also reads runner heads in the harness data folder. Their data
 /// folders cannot move because OpenCode and other modules already refer to them.
 pub(crate) fn contain_opencode_session(

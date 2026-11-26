@@ -26,6 +26,32 @@ pub(crate) fn warn_set_aside(source: &str, newly_seen: &[super::SetAsideRecord])
         tracing::warn!(source, locator = %record.locator, reason = %record.reason, "producer record set aside");
     }
 }
+
+/// Quote a producer string for a stored reason without letting its size or
+/// control characters make that reason unbounded or multiline.
+pub(crate) fn bounded_producer_string(value: &str) -> String {
+    const LIMIT: usize = 64;
+    let mut chars = value.chars();
+    let bounded: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{bounded:?} (truncated)")
+    } else {
+        format!("{bounded:?}")
+    }
+}
+
+/// The JSON type is safe to retain when a value's contents are not.
+pub(crate) fn json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn assert_set_aside(state: &crate::state::SharedState, source: &str, expected: i64) {
     state.with_conn(|conn| {

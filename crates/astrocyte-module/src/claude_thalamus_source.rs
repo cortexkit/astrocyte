@@ -251,10 +251,21 @@ impl ClaudeThalamusSource {
                 return Err(SourceDrainError::Stopped);
             }
             accepted.insert(root.session.clone());
-            let projects = canonical.join("projects");
+            let projects = match declared_roots::contain_directory(
+                &canonical,
+                &canonical.join("projects"),
+                "Claude Code session projects",
+            ) {
+                Ok(Contained::Inside(path)) => Some(path),
+                Ok(Contained::Gone) => None,
+                Ok(Contained::Refused(reason)) | Err(reason) => {
+                    problems.push(reason);
+                    continue;
+                }
+            };
             let previous = cache.resumes.get(&canonical).cloned().unwrap_or_default();
-            let read = match astrocyte_readers::read_io::metadata(&projects) {
-                Ok(_) => claude_code_source::read_projects(
+            let read = match projects {
+                Some(projects) => claude_code_source::read_projects(
                     &projects,
                     &previous,
                     at,
@@ -264,23 +275,14 @@ impl ClaudeThalamusSource {
                     harness_drain::DrainMode::Full,
                     root.state == SessionState::Done,
                 )?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    claude_code_source::ClaudeCodeRead {
-                        outcome: ClaudeCodeDrainOutcome::default(),
-                        requests: vec![],
-                        completed_at_ms: HashMap::new(),
-                        set_aside: vec![],
-                        cache: ClaudeCodeCache::default(),
-                        transactions: Vec::new(),
-                    }
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "inspect Claude Code session projects {}: {e}",
-                        projects.display()
-                    )
-                    .into())
-                }
+                None => claude_code_source::ClaudeCodeRead {
+                    outcome: ClaudeCodeDrainOutcome::default(),
+                    requests: vec![],
+                    completed_at_ms: HashMap::new(),
+                    set_aside: vec![],
+                    cache: ClaudeCodeCache::default(),
+                    transactions: Vec::new(),
+                },
             };
             transactions.extend(read.transactions);
             if read.outcome.counts.calls_refused > 0 || !read.set_aside.is_empty() {

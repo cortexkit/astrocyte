@@ -205,14 +205,18 @@ Tests: `operator_cannot_mark_candidate_billed_without_effect`,
 ### 3.4 `spend.statement.import`
 
 Imports a vendor statement CSV from `path` and matches its lines against the
-ledger. The file is read before the write transaction. Reply: `statement_id`,
-`import_id`, `content_outcome` (`created` or `no_op`), `lines_created`,
-`lines_skipped`, `matching`.
+ledger. The import folder is `statements/` beside astrocyte's `store.db`; create
+it before importing. A relative `path` resolves inside that folder. The folder
+and the requested file are each fully resolved, including all symlinks, and the
+resolved file must remain inside the resolved folder. The file is read before
+the write transaction. Reply: `statement_id`, `import_id`, `content_outcome`
+(`created` or `no_op`), `lines_created`, `lines_skipped`, `matching`.
 
 | Code | Condition |
 |---|---|
 | `invalid_request` | `path` is not a regular file, or is over 64 MiB. |
-| `statement_source` | The file cannot be read. |
+| `statement_outside_import_folder` | The resolved file is outside the resolved import folder. |
+| `statement_source` | The import folder or file is missing, or the file cannot be read. |
 | `malformed` | A line or field does not parse. |
 | `invalid_period` | `period_start` is not before `period_end`. |
 | `line_outside_period` | A line falls outside the declared period. |
@@ -223,7 +227,12 @@ ledger. The file is read before the write transaction. Reply: `statement_id`,
 
 Tests: `statement_import_refuses_a_directory_without_importing`,
 `statement_import_refuses_files_over_64_mib_without_importing`,
-`statement_import_refuses_fifo_without_waiting_for_a_writer`.
+`statement_import_refuses_fifo_without_waiting_for_a_writer`,
+`safeguard_statement_import_reads_relative_name_inside_folder`,
+`safeguard_statement_import_refuses_parent_escape`,
+`safeguard_statement_import_refuses_absolute_path_outside`,
+`safeguard_statement_import_refuses_file_symlink_outside`,
+`safeguard_statement_import_refuses_folder_symlink_outside`.
 
 ### 3.5 `spend.subscription.set` and `spend.subscription.close`
 

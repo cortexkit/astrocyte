@@ -91,6 +91,17 @@ macOS, SQLite picks that directory from `SQLITE_TMPDIR`, then `TMPDIR`, then
 store's location. On Linux and macOS, set `SQLITE_TMPDIR` in the module's
 environment to keep that work on another drive.
 
+### Statement import files
+
+Create `<data home>/cortexkit/astrocyte/statements` before importing a vendor
+statement; astrocyte does not create it. Put the CSV in that folder and pass its
+name as `path`, for example `"path":"january.csv"` in
+`spend.statement.import`. An absolute path is accepted only when it resolves to
+a file inside the same folder. Astrocyte resolves the folder, every symlink in
+the requested path, and the final file before opening it. A path that resolves
+outside is refused with `statement_outside_import_folder`; a missing folder or
+file is `statement_source`.
+
 ## 2. Subscriptions
 
 A subscription plan makes events with charge basis `subscription_included`

@@ -112,6 +112,7 @@ enum SessionState {
 
 /// The two readers of one declared folder's `opencode.db`.
 struct Folder {
+    database: PathBuf,
     v1: OpenCodeSource,
     v2: OpenCodeV2Source,
     /// Since the folder or its latest done session was seen done, a full pass
@@ -129,8 +130,7 @@ impl Folder {
         self.v1.payer_waiting() + self.v2.payer_waiting()
     }
 
-    fn new(folder: &Path) -> Self {
-        let database = folder.join("opencode.db");
+    fn new(folder: &Path, database: &Path) -> Self {
         let store = folder.to_string_lossy().into_owned();
         let home = |layout| CursorHome::Declared {
             source_key: SOURCE_KEY,
@@ -138,8 +138,9 @@ impl Folder {
             layout,
         };
         Self {
-            v1: OpenCodeSource::declared(database.clone(), home(LAYOUT_V1)),
-            v2: OpenCodeV2Source::declared(database, home(LAYOUT_V2)),
+            database: database.to_path_buf(),
+            v1: OpenCodeSource::declared(database.to_path_buf(), home(LAYOUT_V1)),
+            v2: OpenCodeV2Source::declared(database.to_path_buf(), home(LAYOUT_V2)),
             settled: false,
             done_sessions: HashSet::new(),
         }
@@ -340,12 +341,39 @@ impl OpenCodeThalamusSource {
                 ));
                 continue;
             }
+            let (database, present) = match declared_roots::contain_file(
+                &canonical,
+                &canonical.join("opencode.db"),
+                "OpenCode session database",
+            ) {
+                Ok(Contained::Inside(path)) => (path, true),
+                Ok(Contained::Gone) => (canonical.join("opencode.db"), false),
+                Ok(Contained::Refused(reason)) | Err(reason) => {
+                    complete = false;
+                    warn_once(&mut cache.warned, reason.clone());
+                    problems.push(reason);
+                    continue;
+                }
+            };
+            // A link retargeted within the approved folder must not leave the
+            // cached readers pointed at the previously resolved file.
+            if present
+                && cache
+                    .folders
+                    .get(&canonical)
+                    .is_some_and(|reader| reader.database != database)
+            {
+                cache.folders.remove(&canonical);
+            }
             let reader = cache
                 .folders
                 .entry(canonical.clone())
-                .or_insert_with(|| Folder::new(&canonical));
+                .or_insert_with(|| Folder::new(&canonical, &database));
             let other_waiting = payer_waiting.saturating_sub(reader.payer_waiting());
-            let database = canonical.join("opencode.db");
+            if !present {
+                payer_waiting = other_waiting + reader.payer_waiting();
+                continue;
+            }
             let read = read_folder(reader, entry, &database, state, at, stop, other_waiting);
             payer_waiting = other_waiting + reader.payer_waiting();
             match read {

@@ -84,7 +84,10 @@ impl QtaClient {
         let body = self
             .runtime
             .block_on(self.request(OP_USAGE_GET, json!({})))?;
-        decode_usage_response(&body).map_err(PullError::Unavailable)
+        // Decode failures can quote an unexpected peer value. Keep that value
+        // out of the durable capacity failure detail.
+        decode_usage_response(&body)
+            .map_err(|_| PullError::Unavailable("usage.get response invalid".into()))
     }
 
     pub(crate) async fn event_body(&self, event_key: &str) -> Result<Vec<u8>, PullError> {
@@ -120,7 +123,7 @@ impl QtaClient {
                 PullError::Unavailable(format!("qta exchange: {reason}"))
             }
             ReadError::Refused(error) => {
-                PullError::Unavailable(format!("{method} error: {}: {}", error.code, error.message))
+                PullError::Unavailable(format!("{method} error: {}", error.code))
             }
         });
         *cached = guard;
@@ -559,9 +562,11 @@ mod tests {
 
         let detail: Option<String> = state
             .with_conn(|conn| {
-                conn.query_row("SELECT detail FROM capacity_runtime WHERE id=1", [], |row| {
-                    row.get(0)
-                })
+                conn.query_row(
+                    "SELECT detail FROM capacity_runtime WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )
                 .map_err(|error| error.to_string())
             })
             .unwrap();
@@ -878,7 +883,10 @@ mod tests {
         ]);
         let client = QtaClient::for_test(&peer.path).unwrap();
         let error = client.poll().unwrap_err();
-        assert!(format!("{error:?}").contains("last refusal"), "{error:?}");
+        assert_eq!(
+            error,
+            PullError::Unavailable("usage.get error: module_reloading".into())
+        );
         assert_eq!(peer.requests.lock().unwrap().len(), 4);
     }
 

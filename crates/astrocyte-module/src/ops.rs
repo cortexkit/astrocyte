@@ -625,7 +625,7 @@ fn op_statement_import(state: &SharedState, params: Value) -> OpResult {
             .map_err(|error| ("malformed".into(), format!("statement params: {error}")))?;
     // Read the file before taking the writer lock. The database transaction is
     // never held across filesystem or network I/O.
-    let bytes = read_statement_file(&request.path)?;
+    let bytes = read_statement_file(state, &request.path)?;
     state.ordered_op_write(|tx| {
         let outcome = astrocyte_core::statement_import::import_statement_in_tx(
             tx,
@@ -641,13 +641,47 @@ fn op_statement_import(state: &SharedState, params: Value) -> OpResult {
 
 const MAX_STATEMENT_BYTES: u64 = 64 * 1024 * 1024;
 
-fn read_statement_file(path: &str) -> Result<Vec<u8>, (String, String)> {
+fn read_statement_file(state: &SharedState, path: &str) -> Result<Vec<u8>, (String, String)> {
     let source_error = |error: std::io::Error| {
         (
             "statement_source".into(),
             format!("read statement: {error}"),
         )
     };
+    let outside = || {
+        (
+            "statement_outside_import_folder".into(),
+            "statement source resolves outside the statements import folder".into(),
+        )
+    };
+    let folder = state.with_read_op(|conn| {
+        let store = conn.path().filter(|path| !path.is_empty()).ok_or_else(|| {
+            (
+                "statement_source".into(),
+                "statement store has no filesystem path".into(),
+            )
+        })?;
+        let data = std::path::Path::new(store).parent().ok_or_else(|| {
+            (
+                "statement_source".into(),
+                "statement store has no data directory".into(),
+            )
+        })?;
+        Ok(data.join("statements"))
+    })?;
+    // Both paths must be fully resolved before they are compared: a link in
+    // either the requested file or a directory component can otherwise escape.
+    let folder = std::fs::canonicalize(folder).map_err(source_error)?;
+    let requested = std::path::Path::new(path);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        folder.join(requested)
+    };
+    let resolved = std::fs::canonicalize(candidate).map_err(source_error)?;
+    if !resolved.starts_with(&folder) {
+        return Err(outside());
+    }
     let validate = |metadata: &std::fs::Metadata| {
         if !metadata.is_file() {
             Err((
@@ -665,18 +699,36 @@ fn read_statement_file(path: &str) -> Result<Vec<u8>, (String, String)> {
     };
     // Refuse special files before opening them: opening a FIFO can itself wait
     // forever. Recheck the opened handle and bound the read in case it grows.
-    validate(&std::fs::metadata(path).map_err(source_error)?)?;
+    validate(&std::fs::metadata(&resolved).map_err(source_error)?)?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // A pathname may be replaced with a FIFO after the metadata check.
-        // Nonblocking open prevents that race from parking a serving task.
-        options.custom_flags(libc::O_NONBLOCK);
+        // Nonblocking open prevents a last-minute FIFO replacement from
+        // parking a serving task. O_NOFOLLOW prevents a last-minute link
+        // replacement from changing which file the containment check approved.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
-    let file = options.open(path).map_err(source_error)?;
-    validate(&file.metadata().map_err(source_error)?)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Opening a reparse point itself, rather than following it, lets the
+        // opened-handle check below catch a final-component replacement.
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(&resolved).map_err(source_error)?;
+    let opened_metadata = file.metadata().map_err(source_error)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if opened_metadata.file_attributes() & 0x0000_0400 != 0 {
+            // FILE_ATTRIBUTE_REPARSE_POINT: the approved file was replaced
+            // before it could be opened, so its target was never checked.
+            return Err(outside());
+        }
+    }
+    validate(&opened_metadata)?;
     read_statement_bytes(file)
 }
 
@@ -2531,9 +2583,9 @@ mod tests {
 mod import_boundary_tests {
     use super::*;
     use crate::state::{leased_test_state, test_state};
+    use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::sync::Arc;
-    use std::path::{Path, PathBuf};
 
     const STATEMENT_CSV: &str = "line_id,occurred_at,description,quantity,unit,amount_minor,currency,correlation_ref\nline-1,50,charge,1,request,2,USD,\n";
 
