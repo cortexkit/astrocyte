@@ -416,6 +416,18 @@ pub fn commit_page(
                 let inserted=sql(tx.execute("INSERT INTO attribution_fact SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22 WHERE NOT EXISTS(SELECT 1 FROM attribution_fact WHERE fact_id=?1)",params![fact.fact_id,publisher.key(),text(body)?,kind,runner,harness,session,run,flow,fact.alfonso,parent.map(|p|p.0),parent.and_then(|p|p.1),parent.and_then(|p|p.2),parent.and_then(|p|p.3),parent.and_then(|p|p.4),parent.and_then(|p|p.5),fact.workload,fact.task,fact.project_id,fact.effective_from_ms,fact.recorded_at_ms,fact.supersedes]))?!=0;
                 if inserted {
                     insert_session_ref(tx, &fact.fact_id, runner, harness, session)?;
+                    if let Some(("session", Some(runner), Some(harness), Some(session), _, _)) =
+                        parent
+                    {
+                        let reference = resolve::subject_ref(runner, harness, session);
+                        sql(
+                            sql(tx.prepare_cached(INSERT_PARENT_SESSION_REF))?.execute(params![
+                                runner,
+                                reference,
+                                fact.fact_id
+                            ]),
+                        )?;
+                    }
                 }
                 changed |= inserted;
                 if fact
@@ -494,6 +506,8 @@ pub fn commit_page(
 
 const INSERT_SESSION_REF: &str =
     "INSERT INTO attribution_session_ref(runner,session_ref,fact_id) VALUES(?1,?2,?3)";
+const INSERT_PARENT_SESSION_REF: &str =
+    "INSERT INTO attribution_parent_session_ref(parent_runner,session_ref,fact_id) VALUES(?1,?2,?3)";
 
 /// Files a session fact under its computed `session_ref`. The resolver finds a
 /// fact by that name through this table, because SQLite can't compute the
@@ -516,10 +530,28 @@ fn insert_session_ref(
 /// table existed. The store runs this once, in the same transaction as the
 /// migration that creates the table.
 pub(crate) fn backfill_session_refs(conn: &Connection) -> Result<usize, String> {
-    let mut statement = sql(conn.prepare(
+    backfill_refs(conn,
         "SELECT fact_id,subject_runner,subject_harness,subject_session FROM attribution_fact WHERE subject_kind='session'",
-    ))?;
-    let mut insert = sql(conn.prepare(INSERT_SESSION_REF))?;
+        INSERT_SESSION_REF,
+    )
+}
+
+/// Stream existing session parents through a single prepared insert. Only one
+/// fact's reference is kept in memory at a time during backfill.
+pub(crate) fn backfill_parent_session_refs(conn: &Connection) -> Result<usize, String> {
+    let filed = backfill_refs(conn,
+        "SELECT fact_id,parent_runner,parent_harness,parent_session FROM attribution_fact WHERE parent_kind='session'",
+        INSERT_PARENT_SESSION_REF,
+    )?;
+    if filed > 0 {
+        dirty_children_of_existing_computed_aliases(conn)?;
+    }
+    Ok(filed)
+}
+
+fn backfill_refs(conn: &Connection, select: &str, insert: &str) -> Result<usize, String> {
+    let mut statement = sql(conn.prepare(select))?;
+    let mut insert = sql(conn.prepare(insert))?;
     let mut rows = sql(statement.query([]))?;
     let mut filed = 0;
     while let Some(row) = sql(rows.next())? {
@@ -542,6 +574,16 @@ fn normalized_runner(runner: &str) -> &str {
     } else {
         runner
     }
+}
+
+fn runner_spellings(runner: &str) -> (&str, &str) {
+    let normalized = normalized_runner(runner);
+    let other = if normalized == "thalamus" {
+        "thalamus-harness"
+    } else {
+        normalized
+    };
+    (normalized, other)
 }
 
 #[derive(Default)]
@@ -687,18 +729,50 @@ fn dirty_context(conn: &Connection, context: &Context, from: Option<i64>) -> Res
     for name in names {
         let mut parameters = vec![rusqlite::types::Value::Text(name)];
         if let Some(runner) = runner {
-            let normalized = normalized_runner(runner);
-            let other = if normalized == "thalamus" {
-                "thalamus-harness"
-            } else {
-                normalized
-            };
+            let (normalized, other) = runner_spellings(runner);
             parameters.extend([normalized.into(), other.into()].map(rusqlite::types::Value::Text));
         }
         if let Some(from) = from {
             parameters.push(rusqlite::types::Value::Integer(from));
         }
         sql(conn.execute(&query, rusqlite::params_from_iter(parameters)))?;
+    }
+    Ok(())
+}
+
+const COMPUTED_PARENT_CHILDREN: &str = "SELECT f.body FROM attribution_parent_session_ref p
+    CROSS JOIN attribution_fact f ON f.fact_id=p.fact_id
+    WHERE p.parent_runner IN (?1,?2) AND p.session_ref=?3";
+
+fn find_session_children(
+    statement: &mut rusqlite::Statement<'_>,
+    runner: &str,
+    name: &str,
+    children: &mut BTreeSet<Subject>,
+) -> Result<(), String> {
+    let (normalized, other) = runner_spellings(runner);
+    let rows =
+        sql(statement.query_map(params![normalized, other, name], |r| r.get::<_, String>(0)))?;
+    for row in rows {
+        let fact: Fact = serde_json::from_str(&sql(row)?).map_err(|e| e.to_string())?;
+        children.insert(fact.subject);
+    }
+    Ok(())
+}
+
+fn dirty_children_of_existing_computed_aliases(conn: &Connection) -> Result<(), String> {
+    let aliases = Aliases::load(conn)?;
+    let mut statement = sql(conn.prepare(COMPUTED_PARENT_CHILDREN))?;
+    let mut children = BTreeSet::new();
+    // Visit each stored alias spelling once per runner. Unlike new alias
+    // commits, only the newly indexed computed references need to be checked.
+    for (runner, names) in &aliases.by_runner {
+        for name in names.keys() {
+            find_session_children(&mut statement, runner, name, &mut children)?;
+        }
+    }
+    for child in children {
+        dirty_subject(conn, &aliases, &child, None)?;
     }
     Ok(())
 }
@@ -727,12 +801,17 @@ fn dirty_context_with_children(
     dirty_context(conn, context, from)?;
     let mut children = BTreeSet::new();
     let (query,parameters)=match context {
-        Context::Session{runner,names}=>{
-            let normalized=normalized_runner(runner);let other=if normalized=="thalamus" {"thalamus-harness"} else {normalized};
-            let query="SELECT body FROM attribution_fact INDEXED BY attribution_parent_session WHERE parent_kind='session' AND parent_runner IN (?1,?2) AND parent_session=?3";
-            let mut statement=sql(conn.prepare(query))?;
-            for name in names {let rows=sql(statement.query_map(params![normalized,other,name],|r|r.get::<_,String>(0)))?;for row in rows {let fact:Fact=serde_json::from_str(&sql(row)?).map_err(|e|e.to_string())?;children.insert(fact.subject);}}
-            for child in children {dirty_subject(conn,aliases,&child,from)?;}
+        Context::Session { runner, names } => {
+            let query = format!("SELECT body FROM attribution_fact INDEXED BY attribution_parent_session
+                WHERE parent_kind='session' AND parent_runner IN (?1,?2) AND parent_session=?3
+                UNION ALL {COMPUTED_PARENT_CHILDREN}");
+            let mut statement = sql(conn.prepare_cached(&query))?;
+            for name in names {
+                find_session_children(&mut statement, runner, name, &mut children)?;
+            }
+            for child in children {
+                dirty_subject(conn, aliases, &child, from)?;
+            }
             return Ok(());
         },
         Context::Run(run_id)=>("SELECT body FROM attribution_fact INDEXED BY attribution_parent_run WHERE parent_kind='run' AND parent_run_id=?1",run_id),

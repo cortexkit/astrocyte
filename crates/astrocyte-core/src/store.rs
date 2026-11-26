@@ -128,34 +128,42 @@ pub fn migrate_store(store: &SqliteStore) -> Result<MigrationOutcome, StoreError
         restore.restore()?;
         applied += rebuilt?.applied;
     }
-    let before = MIGRATIONS.partition_point(|migration| migration.version < SESSION_REF_VERSION);
-    let earlier = store.migrate("astrocyte", &MIGRATIONS[..before])?;
-    applied += earlier.applied;
-    if earlier.recorded < SESSION_REF_VERSION {
-        store
-            .with_conn(|conn| Ok(migrate_session_refs(conn, &MIGRATIONS[before])))?
-            .map_err(|error| {
-                StoreError::Migration(format!(
-                    "namespace 'astrocyte' migration {SESSION_REF_VERSION}: {error}"
-                ))
-            })?;
-        applied += 1;
+    for (version, backfill) in SESSION_REF_MIGRATIONS {
+        let before = MIGRATIONS.partition_point(|migration| migration.version < *version);
+        let earlier = store.migrate("astrocyte", &MIGRATIONS[..before])?;
+        applied += earlier.applied;
+        if earlier.recorded < *version {
+            store
+                .with_conn(|conn| Ok(migrate_session_refs(conn, &MIGRATIONS[before], *backfill)))?
+                .map_err(|error| {
+                    StoreError::Migration(format!(
+                        "namespace 'astrocyte' migration {version}: {error}"
+                    ))
+                })?;
+            applied += 1;
+        }
     }
     let mut outcome = store.migrate("astrocyte", MIGRATIONS)?;
     outcome.applied += applied;
     Ok(outcome)
 }
 
-/// The migration that adds `attribution_session_ref`. Its rows are SHA-256
-/// references SQLite can't compute, so the store runs the migration itself:
-/// the table, the backfill from every stored session fact and the version
-/// record commit together, exactly as a SQL-only migration would.
-const SESSION_REF_VERSION: u32 = 59;
-fn migrate_session_refs(conn: &Connection, migration: &Migration) -> Result<(), String> {
+type SessionRefBackfill = fn(&Connection) -> Result<usize, String>;
+// SQLite cannot compute the references. Create each table, backfill it in
+// Rust, and record the migration version in one transaction.
+const SESSION_REF_MIGRATIONS: &[(u32, SessionRefBackfill)] = &[
+    (59, crate::attribution::backfill_session_refs),
+    (66, crate::attribution::backfill_parent_session_refs),
+];
+fn migrate_session_refs(
+    conn: &Connection,
+    migration: &Migration,
+    backfill: SessionRefBackfill,
+) -> Result<(), String> {
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     tx.execute_batch(migration.statements)
         .map_err(|e| e.to_string())?;
-    crate::attribution::backfill_session_refs(&tx)?;
+    backfill(&tx)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
@@ -491,6 +499,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 65,
         statements: migrations::v60_v79::V65,
     },
+    // Run by `migrate_session_refs`, which also fills the table in Rust.
+    Migration {
+        version: 66,
+        statements: migrations::v60_v79::V66,
+    },
 ];
 
 #[cfg(test)]
@@ -556,6 +569,7 @@ impl Drop for VmCounter {
 mod tests {
     include!("store_v58_tests.rs");
     include!("store_v59_tests.rs");
+    include!("store_v66_tests.rs");
     include!("store_v33_tests.rs");
     include!("store_v64_tests.rs");
 

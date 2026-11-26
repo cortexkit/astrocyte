@@ -434,8 +434,8 @@ pub(crate) fn report(
     now_ms: i64,
 ) -> Result<SpendReport, ReportError> {
     let parsed = ParsedReport::new(request)?;
-    let plan_request =
-        parsed.grouping.iter().any(is_plan) || parsed.filters.iter().any(|(d, _)| is_plan(d));
+    let plan_filter = parsed.filters.iter().any(|(d, _)| is_plan(d));
+    let plan_request = parsed.grouping.iter().any(is_plan) || plan_filter;
     let mut recorded_request = request.clone();
     recorded_request
         .grouping
@@ -601,6 +601,20 @@ pub(crate) fn report(
             .map(|(key, acc)| render_row(key.clone(), acc))
             .collect::<Result<_, _>>()?;
         report.totals = recorded_totals(&report.rows)?;
+    }
+    if plan_filter {
+        let mut population = Cell::default();
+        for total in totals.values() {
+            population.merge(&total.spend.population)?;
+        }
+        // Plan membership needs an event time. Undated events can be disclosed
+        // when grouping alone, but cannot satisfy an explicit plan filter.
+        report.undated = UndatedCoverage {
+            events_undated: 0,
+            events_report_total: population.events,
+            reasons: BTreeMap::new(),
+        };
+        report.rate_staleness = population.staleness(now_ms);
     }
     for row in &mut report.rows {
         if let Some(acc) = buckets.get(&row_key(row, &parsed.grouping)) {

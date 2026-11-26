@@ -124,6 +124,78 @@ fn report_surface_plan_grouping_filters_and_unfiltered_fee_weights() {
 }
 
 #[test]
+fn audit17_report_plan_filters_also_filter_dated_coverage() {
+    let mut conn = conn();
+    rate(&conn, "A", 1_000_000_000);
+    let key = event(&mut conn, "api", 1, "A", None, None, "metered_api", 100);
+    recorded_price(&conn, key, 123);
+    ready(&mut conn);
+
+    let mut req = request(&["plan"], 0, DAY_MS);
+    let all = report(&conn, &req);
+    assert_eq!(all["undated"]["events_report_total"], 1);
+    assert_eq!(all["rate_staleness"]["measurements_total"], 2);
+    req.filters.insert("plan".into(), vec![Some("pool".into())]);
+    let excluded = report(&conn, &req);
+    assert_eq!(excluded["rows"], serde_json::json!([]));
+    assert_eq!(excluded["totals"], serde_json::json!([]));
+    assert_eq!(excluded["undated"]["events_report_total"], 0);
+    assert_eq!(excluded["rate_staleness"]["measurements_total"], 0);
+    assert_eq!(excluded["rate_staleness"]["priced_measurements"], 0);
+    assert!(excluded["rate_staleness"]["oldest_resolved_at_ms"].is_null());
+}
+
+#[test]
+fn report_surface_undated_coverage_is_excluded_only_by_explicit_plan_filters() {
+    let mut conn = conn();
+    let request = serde_json::from_value(serde_json::json!({
+        "producer":"fixture","producer_ref":"undated","charge_basis":"metered_api",
+        "measurements":[{"role":"input","unit":"token","kind":"billed","source":"fixture",
+            "quantity_units":100,"quantity_exponent":0}]
+    }))
+    .unwrap();
+    crate::ingest::record_event(&mut conn, &request, 1).unwrap();
+    ready(&mut conn);
+    let mut req = ReportRequest {
+        grouping: vec!["plan".into()],
+        grain: "day".into(),
+        timezone: "UTC".into(),
+        ..ReportRequest::default()
+    };
+    let grouped = report(&conn, &req);
+    assert_eq!(grouped["undated"]["events_undated"], 1);
+    assert_eq!(grouped["rate_staleness"]["measurements_total"], 1);
+    req.filters.insert("plan_account".into(), vec![None]);
+    let filtered = report(&conn, &req);
+    assert_eq!(filtered["undated"]["events_undated"], 0);
+    assert_eq!(filtered["undated"]["events_report_total"], 0);
+    assert_eq!(filtered["undated"]["reasons"], serde_json::json!({}));
+    assert_eq!(filtered["rate_staleness"]["measurements_total"], 0);
+}
+
+#[test]
+fn audit17_report_unspread_fee_uses_only_the_active_part_of_the_day() {
+    let conn = conn();
+    plan(
+        &conn,
+        PlanLedger::Account,
+        "provider",
+        "account",
+        DAY_MS / 2,
+        None,
+    );
+    let unspread = |from, to| {
+        let mut req = request(&[], from, to);
+        req.grain = "hour".into();
+        report(&conn, &req)["totals"][0]["deduced_unspread_nanos"].clone()
+    };
+    assert_eq!(unspread(0, DAY_MS / 2), 0);
+    let full_day = unspread(0, DAY_MS);
+    assert!(full_day.as_i64().unwrap() > 0);
+    assert_eq!(unspread(DAY_MS / 2, DAY_MS), full_day);
+}
+
+#[test]
 fn report_surface_pending_hours_preserve_recorded_spend_and_distinct_counts() {
     let mut conn = conn();
     rate(&conn, "A", 1_000_000_000);

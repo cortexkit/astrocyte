@@ -761,6 +761,114 @@ fn attribution_report_combination_refusal_names_the_incompatible_pair() {
 }
 
 #[test]
+fn audit17_computed_parent_alias_invalidates_the_child_summary() {
+    let mut conn = conn();
+    let raw_parent = "ses_parent";
+    let mut owner = fact(
+        "owner",
+        session("thalamus-harness", "opencode", "ses_owner"),
+    );
+    owner["alfonso"] = json!("parent-owner");
+    let mut child = fact(
+        "child",
+        session("thalamus-harness", "opencode", "ses_child"),
+    );
+    child["parent"] = session("thalamus-harness", "opencode2", raw_parent);
+    ingest(&mut conn, Publisher::Prefrontal, vec![owner, child]);
+    event(
+        &conn,
+        "child-call",
+        "thalamus",
+        "opencode",
+        Some("ses_child"),
+        None,
+        None,
+        100,
+    );
+    summaries(&mut conn);
+    assert_eq!(tuple(&conn).parent_alfonso, None);
+
+    let reference = resolve::subject_ref("thalamus-harness", "opencode2", raw_parent);
+    let tx = conn.transaction().unwrap();
+    append_aliases(
+        &tx,
+        "thalamus-harness",
+        "opencode",
+        "ses_owner",
+        &[&reference],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let fresh = Resolver::default()
+        .resolve(
+            &conn,
+            Some("thalamus"),
+            Some("ses_child"),
+            None,
+            None,
+            Some(100),
+        )
+        .unwrap();
+    assert_eq!(fresh.parent_alfonso.as_deref(), Some("parent-owner"));
+    summaries(&mut conn);
+    assert_eq!(tuple(&conn), fresh);
+}
+
+#[test]
+fn attribution_computed_parent_alias_commit_cost_does_not_grow_with_unrelated_parent_facts() {
+    let mut steps = Vec::new();
+    for unrelated in [1_000, 50_000] {
+        let mut conn = conn();
+        let runner = "thalamus-harness";
+        let mut child = fact("child", session(runner, "opencode", "ses_child"));
+        child["parent"] = session(runner, "opencode2", "ses_parent");
+        ingest(&mut conn, Publisher::Prefrontal, vec![child]);
+        event(
+            &conn,
+            "child-call",
+            "thalamus",
+            "opencode",
+            Some("ses_child"),
+            None,
+            None,
+            100,
+        );
+        conn.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?1)
+             INSERT INTO attribution_fact(fact_id,publisher,body,subject_kind,subject_run_id,
+                 parent_kind,parent_runner,parent_harness,parent_session,workload,effective_from_ms,recorded_at_ms)
+             SELECT 'fact-'||i,'prefrontal','{}','run','run-'||i,
+                 'session','thalamus-harness','opencode2','unrelated-'||i,'mason',0,1 FROM n",
+            [unrelated],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO attribution_parent_session_ref
+             SELECT parent_runner, parent_session, fact_id FROM attribution_fact WHERE fact_id!='child'",
+            [],
+        ).unwrap();
+        let revision = |conn: &Connection| {
+            conn.query_row(
+                "SELECT revision FROM attribution_hour WHERE kind=0 AND hour_number=0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        let before = revision(&conn);
+        let reference = resolve::subject_ref(runner, "opencode2", "ses_parent");
+        let counter = crate::store::VmCounter::start(&conn);
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(append_aliases(&tx, runner, "opencode", "ses_owner", &[&reference]).unwrap());
+        tx.commit().unwrap();
+        steps.push(counter.steps());
+        assert!(revision(&conn) > before);
+    }
+    eprintln!("computed-parent alias commit at 1,000 / 50,000 unrelated facts: {steps:?} VM steps");
+    assert!(steps[1] <= steps[0] + 10, "{steps:?}");
+}
+
+#[test]
 fn attribution_alias_dirtying_does_not_invent_a_reference_from_the_host_harness_label() {
     let mut conn = conn();
     let not_an_alias =

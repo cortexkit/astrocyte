@@ -305,8 +305,8 @@ pub(crate) fn reconcile_statement_in_tx(
     statement_id: &str,
     attempted_at_ms: i64,
 ) -> Result<MatchSummary, StatementError> {
-    let (provider, account_ref, statement_currency, amount_exponent) = tx.query_row(
-        "SELECT provider,account_ref,currency,amount_exponent
+    let (provider, account_ref, statement_currency, amount_exponent, period) = tx.query_row(
+        "SELECT provider,account_ref,currency,amount_exponent,period_start_ms,period_end_ms
          FROM statement WHERE statement_id=?1",
         [statement_id],
         |row| {
@@ -315,6 +315,7 @@ pub(crate) fn reconcile_statement_in_tx(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, u32>(3)?,
+                row.get::<_, i64>(4)?..row.get::<_, i64>(5)?,
             ))
         },
     )?;
@@ -356,8 +357,13 @@ pub(crate) fn reconcile_statement_in_tx(
     for line in lines {
         let vendor_amount =
             vendor_amount_nanos(line.amount_minor, amount_exponent, line.line_id.as_str())?;
-        let correlated =
-            correlated_events(tx, &provider, &account_ref, line.correlation_ref.as_deref())?;
+        let correlated = correlated_events(
+            tx,
+            &provider,
+            &account_ref,
+            line.correlation_ref.as_deref(),
+            &period,
+        )?;
         let decision = matching.decide(tx, &line, &correlated, vendor_amount, &attribution)?;
 
         persist_attempt(
@@ -509,6 +515,7 @@ fn correlated_events(
     provider: &str,
     account_ref: &str,
     correlation_ref: Option<&str>,
+    period: &std::ops::Range<i64>,
 ) -> Result<Vec<CorrelatedEvent>, StatementError> {
     let Some(correlation_ref) = correlation_ref else {
         return Ok(Vec::new());
@@ -521,16 +528,27 @@ fn correlated_events(
                 ) AS unresolved
          FROM usage_event event
          WHERE event.provider=?1 AND event.account_ref=?2 AND event.producer_ref=?3
+           AND (event.occurred_at_ms IS NULL OR
+                (event.occurred_at_ms>=?4 AND event.occurred_at_ms<?5))
          ORDER BY event.event_id",
     )?;
     let events = stmt
-        .query_map(params![provider, account_ref, correlation_ref], |row| {
-            Ok(CorrelatedEvent {
-                event_id: row.get(0)?,
-                currency: row.get(1)?,
-                unresolved: row.get(2)?,
-            })
-        })?
+        .query_map(
+            params![
+                provider,
+                account_ref,
+                correlation_ref,
+                period.start,
+                period.end
+            ],
+            |row| {
+                Ok(CorrelatedEvent {
+                    event_id: row.get(0)?,
+                    currency: row.get(1)?,
+                    unresolved: row.get(2)?,
+                })
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(events)
 }

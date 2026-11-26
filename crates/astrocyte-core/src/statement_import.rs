@@ -1240,6 +1240,22 @@ mod tests {
     }
 
     #[test]
+    fn audit17_statement_does_not_settle_a_different_period() {
+        let mut conn = conn();
+        let event = serde_json::from_value::<crate::ingest::EventRecordRequest>(json!({
+            "producer":"producer-a", "producer_ref":"corr", "provider":"vendor", "account_ref":"acct",
+            "charge_basis":"metered_api", "occurred_at_ms":99, "measurements":[]
+        })).unwrap();
+        let event_id = crate::ingest::record_event(&mut conn, &event, 250)
+            .unwrap()
+            .event_id;
+        price_existing_event(&conn, &event_id, "JPY", 1_000_000_000);
+        import_statement(&mut conn, &request(), &standard_line("corr"), None, 300).unwrap();
+        assert_eq!(statement_state(&conn), (1, 1, 1, 1, 0, 0));
+        assert_eq!(line_outcome(&conn), ("unmatched".into(), None));
+    }
+
+    #[test]
     fn absent_correlation_imports_unmatched_without_inferred_settlement() {
         let mut conn = conn();
         seed_event(

@@ -393,3 +393,21 @@ pub(in crate::store) const V65: &str = r#"
 ALTER TABLE source_runtime ADD COLUMN file_identity TEXT;
 ALTER TABLE declared_store_cursor ADD COLUMN file_identity TEXT;
 "#;
+
+// Rust computes the parent references in the same transaction as this SQL.
+pub(in crate::store) const V66: &str = r#"
+CREATE TABLE attribution_parent_session_ref (
+    parent_runner TEXT NOT NULL,
+    session_ref TEXT NOT NULL,
+    fact_id TEXT NOT NULL,
+    PRIMARY KEY(parent_runner,session_ref,fact_id)
+) WITHOUT ROWID;
+CREATE TRIGGER attribution_parent_session_ref_no_update BEFORE UPDATE ON attribution_parent_session_ref
+BEGIN SELECT RAISE(ABORT, 'attribution_parent_session_ref_no_update'); END;
+CREATE TRIGGER attribution_parent_session_ref_no_delete BEFORE DELETE ON attribution_parent_session_ref
+BEGIN SELECT RAISE(ABORT, 'attribution_parent_session_ref_no_delete'); END;
+CREATE TRIGGER attribution_parent_session_ref_insert_once BEFORE INSERT ON attribution_parent_session_ref
+WHEN EXISTS (SELECT 1 FROM attribution_parent_session_ref WHERE parent_runner=NEW.parent_runner
+    AND session_ref=NEW.session_ref AND fact_id=NEW.fact_id)
+BEGIN SELECT RAISE(ABORT, 'attribution_parent_session_ref_insert_once'); END;
+"#;

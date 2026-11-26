@@ -1996,9 +1996,10 @@ fn load_subscription_events(
     // Ordered by the event's rowid, which is the order the outer table scan
     // already produces, so every event's measurement rows arrive together.
     let filter = filter.map_or_else(String::new, |filter| format!(" AND ({filter})"));
+    let quantity = reported_quantity_sql();
     let mut statement = conn.prepare(&format!(
         "SELECT e.rowid,e.occurred_at_ms,e.provider,e.account_ref,
-                m.role,m.unit,m.quantity_units,m.quantity_exponent,head.outcome,m.kind,
+                m.role,m.unit,{quantity},m.quantity_exponent,head.outcome,m.kind,
                 COALESCE(e.resolved_credential,e.auth_selection)
          FROM usage_event e
          LEFT JOIN measurement m ON m.event_key=e.event_key

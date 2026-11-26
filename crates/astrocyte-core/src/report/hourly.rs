@@ -2802,6 +2802,54 @@ mod tests {
         assert_eq!(actual.rows[0].covered_measurements, 4);
     }
 
+    #[test]
+    fn audit17_covered_legacy_output_matches_the_rebuilt_summary() {
+        let mut conn = conn();
+        let tx = conn.transaction().unwrap();
+        subscription::set_subscription_in_tx(
+            &tx,
+            &subscription::SetSubscriptionRequest {
+                provider: "provider".into(),
+                account_ref: "account".into(),
+                plan_name: "fixture".into(),
+                recurring_cost_minor: 100,
+                currency: "USD".into(),
+                amount_exponent: 2,
+                period: subscription::SubscriptionPeriod::Month,
+                effective_from: 0,
+            },
+            None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "producer":"broca","producer_ref":"legacy-output","occurred_at_ms":1,
+            "provider":"provider","model":"model","account_ref":"account",
+            "charge_basis":"subscription_included","measurements":[
+                {"role":"output","unit":"token","kind":"billed","source":"usage.output_tokens","quantity_units":100,"quantity_exponent":0},
+                {"role":"reasoning","unit":"token","kind":"billed","source":"usage.reasoning_tokens","quantity_units":30,"quantity_exponent":0}
+            ]
+        })).unwrap();
+        let id = ingest::record_event(&mut conn, &request, 1)
+            .unwrap()
+            .event_id;
+        reprice(&mut conn, &id);
+        let fallback = subscription_report(&conn, &SubscriptionReportRequest {}).unwrap();
+        catch_up(&mut conn);
+        let built = subscription_report(&conn, &SubscriptionReportRequest {}).unwrap();
+        let output = |report: &SubscriptionReport| {
+            report.rows[0]
+                .quantities
+                .iter()
+                .find(|q| q.role == "output")
+                .unwrap()
+                .quantity_units
+        };
+        assert_eq!(output(&built), 70);
+        assert_eq!(output(&fallback), output(&built));
+        assert_eq!(fallback.rows, built.rows);
+    }
+
     fn credential_fixture() -> Connection {
         let mut conn = conn();
         let tx = conn.transaction().unwrap();

@@ -87,6 +87,7 @@ mod session_refs {
                         !matches!(
                             table.as_str(),
                             "attribution_session_ref"
+                                | "attribution_parent_session_ref"
                                 | "cortexkit_schema_version"
                                 | "broca_attempt_detail"
                                 | "broca_segment_evidence"

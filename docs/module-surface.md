@@ -477,9 +477,9 @@ Reads never write. A refusal on a read is one of the codes below.
 
   Only the USD currency total carries `deduced` and the fee diagnostics:
   `deduced_unspread_nanos`, `deduced_non_usd_plans`, `deduced_conflict_plans`.
-  Unspread fees are prorated to the report window's overlap with each UTC day
-  and rounded once. A filter on `plan` or `plan_account` restricts them to
-  matching records; a filter on any other dimension omits
+  Unspread fees are prorated to the report window's overlap with the plan's
+  active part of each UTC day and rounded once. A filter on `plan` or
+  `plan_account` restricts them to matching records; a filter on any other dimension omits
   `deduced_unspread_nanos`. Non-USD plans contribute no fee and count in
   `deduced_non_usd_plans`; records mapping to multiple pools count in
   `deduced_conflict_plans` and their USD fees go directly to unspread. Totals

@@ -121,6 +121,8 @@ pub struct DayWeights {
 pub struct FeeDay {
     pub key: DayMember,
     pub fee: Fraction,
+    active_from_ms: i64,
+    active_to_ms: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -261,7 +263,9 @@ impl FeeDays {
             let mut day = first_day.max(from.div_euclid(DAY_MS) * DAY_MS);
             while day < day_end && to.is_none_or(|to| day < to) {
                 let next = day.checked_add(DAY_MS).ok_or(ReportError::Arithmetic)?;
-                let span = next.min(to.unwrap_or(next)) - day.max(from);
+                let active_from_ms = day.max(from);
+                let active_to_ms = next.min(to.unwrap_or(next));
+                let span = active_to_ms - active_from_ms;
                 let fee = Fraction::new(i128::from(nanos), i128::from(period_days(day, period)?))?
                     .checked_mul(&Fraction::new(i128::from(span), i128::from(DAY_MS))?)?;
                 result.days.push(FeeDay {
@@ -270,6 +274,8 @@ impl FeeDays {
                         member: member.clone(),
                     },
                     fee,
+                    active_from_ms,
+                    active_to_ms,
                 });
                 day = next;
             }
@@ -497,16 +503,14 @@ impl Allocation {
             if !matches(&fee.key.member) {
                 continue;
             }
-            let from = self.start_ms.max(fee.key.day_start_ms);
-            let to = self.end_ms.min(
-                fee.key
-                    .day_start_ms
-                    .checked_add(DAY_MS)
-                    .ok_or(ReportError::Arithmetic)?,
-            );
+            let from = self.start_ms.max(fee.active_from_ms);
+            let to = self.end_ms.min(fee.active_to_ms);
+            if to <= from {
+                continue;
+            }
             total = total.checked_add(&fee.fee.checked_mul(&Fraction::new(
-                i128::from((to - from).max(0)),
-                i128::from(DAY_MS),
+                i128::from(to - from),
+                i128::from(fee.active_to_ms - fee.active_from_ms),
             )?)?)?;
         }
         Ok(total)

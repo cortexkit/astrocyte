@@ -70,6 +70,7 @@ copies that timeout without running the table-creating probes.
 | `placement_fact` | Each row preserves entorhinal's dated project-to-workspace placement and verbatim fact. | insert only; corrections append with `supersedes` |
 | `attribution_cursor` | Each row checkpoints one publisher's read name, opaque cursor, through position and last committed read time. | upsert with a changed committed page |
 | `attribution_session_ref` | Each row files one session fact under the `session_ref` computed from its runner, harness and session, so resolution can find the fact by that name through an index. Migration 59 fills it in Rust for facts stored earlier, in the migration's own transaction. | insert only, beside its fact |
+| `attribution_parent_session_ref` | Each row indexes the computed `session_ref` of a fact's session parent, so linking a parent alias invalidates cached child attribution. Migration 66 backfills the references in Rust and marks child attribution hours affected by existing computed aliases for rebuild, in the same transaction that creates the table. | insert only, beside its fact |
 | `session_alias` | Each row preserves a runner/harness-qualified pair of a ledger's recorded session and another published name for it. | insert only |
 | `summary_value` | Each row assigns an exact stored string an integer identifier, with identifier zero reserved for null. | Builders insert new values. |
 | `summary_hour` | Each row records an hour's persistent revision, published revision, format, event count and time extrema. | Triggers advance revisions, and publication records a completed build. |
@@ -179,6 +180,7 @@ in the table above means both of these exist:
 - `placement_fact_no_update`, `placement_fact_no_delete`
 - `session_alias_no_update`, `session_alias_no_delete`
 - `attribution_session_ref_no_update`, `attribution_session_ref_no_delete`
+- `attribution_parent_session_ref_no_update`, `attribution_parent_session_ref_no_delete`
 
 Each of these tables also has a `BEFORE INSERT` trigger named
 `<table>_insert_once`. The same protection applies to `step_feed`, whose rows
