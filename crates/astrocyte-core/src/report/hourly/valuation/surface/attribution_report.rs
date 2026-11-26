@@ -273,6 +273,7 @@ pub(crate) fn report(
     conn: &Connection,
     raw: &ReportRequest,
     now: i64,
+    fold_range: bool,
 ) -> Result<SpendReport, ReportError> {
     let request = Request::new(raw)?;
     let (from, to) = request.range(conn, now)?;
@@ -394,9 +395,10 @@ pub(crate) fn report(
     }
     let allocation = book.allocate(&day, now)?;
     let mut rows = Vec::with_capacity(output.buckets.len());
+    let mut range = fold_range.then(|| RangeFold::new(request.parsed.range, output.buckets.len()));
     for (key, acc) in &output.buckets {
         let mut row = render_row(key.clone(), acc)?;
-        row.valuation = acc.value(&allocation, row.currency.as_deref(), row.total_nanos)?;
+        value_row(&mut row, acc, &allocation, &mut range)?;
         rows.push(row);
     }
     let mut totals = recorded_totals(&rows)?;
@@ -444,6 +446,9 @@ pub(crate) fn report(
                 .reasons
                 .insert("missing_occurred_at".into(), undated.events_undated);
         }
+    }
+    if let Some(range) = range {
+        rows = range.finish(rows)?;
     }
     Ok(SpendReport {
         totals,

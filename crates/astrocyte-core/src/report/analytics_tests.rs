@@ -164,6 +164,60 @@ fn analytics_decimal_quantities_sum_exactly_across_lifetimes() {
 }
 
 #[test]
+fn analytics_range_sums_displayed_tokens_and_exact_decimal_units() {
+    let conn = conn();
+    let measurements = [
+        (
+            "early",
+            1,
+            [
+                ("output", "token", 5, -1),
+                ("reasoning", "token", 3, 0),
+                ("duration", "second", 15, -1),
+            ],
+        ),
+        (
+            "late",
+            86_400_001,
+            [
+                ("output", "token", 5, 0),
+                ("reasoning", "token", 7, 0),
+                ("duration", "second", 2, 0),
+            ],
+        ),
+    ];
+    for (id, instant, rows) in measurements {
+        event(&conn, id, None, Some(instant), "metered_api");
+        for (role, unit, units, exponent) in rows {
+            conn.execute(
+                "INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent) VALUES((SELECT event_key FROM usage_event WHERE event_id=?1),?2,?3,'billed','fixture',?4,?5)",
+                params![id, role, unit, units, exponent],
+            ).unwrap();
+        }
+    }
+    let day = read(&conn, json!({}));
+    assert_eq!(day["rows"][0]["tokens"], json!({"reasoning":3}));
+    assert_eq!(day["rows"][1]["tokens"], json!({"output":12,"reasoning":7}));
+    let range = read(&conn, json!({"grain":"range"}));
+    assert_eq!(
+        range["rows"][0]["tokens"],
+        json!({"output":12,"reasoning":10})
+    );
+    assert_eq!(
+        range["rows"][0]["units"],
+        json!([
+            {"role":"duration","unit":"second","quantity":{"units":35,"exponent":-1}}
+        ])
+    );
+    assert_eq!(range["totals"], day["totals"]);
+    let empty = read(
+        &conn,
+        json!({"grain":"range", "where":{"model":["not present"]}}),
+    );
+    assert_eq!(empty["rows"], json!([]));
+}
+
+#[test]
 fn analytics_refusals_are_specific_and_read_only() {
     let conn = conn();
     event(&conn, "a", None, Some(1), "metered_api");
@@ -176,6 +230,16 @@ fn analytics_refusals_are_specific_and_read_only() {
             "range_too_large",
         ),
         (json!({"grain":"hour"}), "range_too_large"),
+        (json!({"grain":"other"}), "invalid_grain"),
+        (json!({"grain":"range","to_ms":2}), "invalid_range"),
+        (
+            json!({"grain":"range","from_ms":1,"to_ms":400_i64*86_400_000+1}),
+            "range_too_large",
+        ),
+        (
+            json!({"grain":"range","grouping":["alfonso","model"],"where":{"provider":["provider"]}}),
+            "combination_unavailable",
+        ),
         (
             json!({"grain":"hour","from_ms":0,"to_ms":32_i64*86_400_000}),
             "range_too_large",

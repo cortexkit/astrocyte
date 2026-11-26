@@ -453,9 +453,18 @@ fn op_runs_detail(state: &SharedState, params: Value) -> OpResult {
 }
 
 pub fn dispatch(state: &SharedState, method: &str, params: Value) -> OpResult {
+    dispatch_with_report_clock(state, method, params, now_ms)
+}
+
+fn dispatch_with_report_clock(
+    state: &SharedState,
+    method: &str,
+    params: Value,
+    report_now: impl FnOnce() -> i64,
+) -> OpResult {
     match method {
         OP_VERDICT => op_verdict(state, params),
-        OP_REPORT => op_report(state, params),
+        OP_REPORT => op_report(state, params, report_now),
         OP_EVENT_INGEST => op_event_ingest(state, params),
         OP_CORRECTION_INGEST => op_correction_ingest(state, params),
         OP_CHARGEABILITY_SETTLE => op_chargeability_settle(state, params),
@@ -730,10 +739,10 @@ fn op_verdict(state: &SharedState, params: Value) -> OpResult {
     })
 }
 
-fn op_report(state: &SharedState, params: Value) -> OpResult {
+fn op_report(state: &SharedState, params: Value, clock: impl FnOnce() -> i64) -> OpResult {
     let request: ReportRequest = serde_json::from_value(params)
         .map_err(|error| ("malformed".into(), format!("report params: {error}")))?;
-    state.public_projection().report(&request, now_ms())
+    state.public_projection().report(&request, clock())
 }
 
 fn op_subscription_report(state: &SharedState, params: Value) -> OpResult {

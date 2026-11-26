@@ -25,6 +25,8 @@ mod recent_steps;
 mod refresher;
 #[cfg(test)]
 mod rewrite_causes_vectors;
+#[doc(hidden)]
+pub mod route_reply;
 mod runner_steps;
 pub mod runs_feed;
 #[cfg(test)]

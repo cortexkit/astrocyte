@@ -1271,10 +1271,23 @@ pub fn spend_report(
     request: &ReportRequest,
     now_ms: i64,
 ) -> Result<SpendReport, ReportError> {
+    // Range changes only how finished day rows are presented, not which
+    // calendar buckets are selected or how each bucket is valued.
+    let fold_range = request.grain == "range";
+    let daily;
+    let request = if fold_range {
+        daily = ReportRequest {
+            grain: "day".into(),
+            ..request.clone()
+        };
+        &daily
+    } else {
+        request
+    };
     if analytics::attribution_request(request)? {
-        return valuation::surface::attribution_report::report(conn, request, now_ms);
+        return valuation::surface::attribution_report::report(conn, request, now_ms, fold_range);
     }
-    valuation::surface::report(conn, request, now_ms)
+    valuation::surface::report(conn, request, now_ms, fold_range)
 }
 
 fn recorded_spend_report(

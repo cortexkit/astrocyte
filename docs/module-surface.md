@@ -21,8 +21,16 @@ see [operations](operations.md).
   people and is not a stable interface.
 - A body that does not decode as `{method, params}` is refused
   `invalid_request`.
+- A request/reply read under `spend.*` or `usage.*`, or a call to
+  `budget.verdict` or `watermark.get`, refuses `reply_too_large` if its reply
+  would exceed the daemon's frame limit. The Error's `detail` carries
+  `reply_bytes` and `limit_bytes` for the encoded body (including the `result`
+  wrapper on success, excluding the frame header), plus `rows` when the result
+  has a `rows` array. The body limit is 4,194,283 bytes. The caller must narrow
+  the request; the watch subscriptions are not subject to this read check.
+  Test: `read_reply_uses_exact_body_size_and_keeps_refusal_code`.
 - A reply larger than the daemon delivers (4 MiB, counting the 21-byte
-  frame header) is replaced by a refusal `frame_too_large` whose `detail` is
+  frame header) that reaches the transport is replaced by `frame_too_large` whose `detail` is
   `{"size": <reply bytes>, "limit": <limit>}`, on the request's own route and
   correlation id. Test:
   `oversized_route_reply_is_refused_frame_too_large_on_its_own_correlation`.
@@ -308,7 +316,7 @@ Reads never write. A refusal on a read is one of the codes below.
   `auth_selection`, `charge_basis`, `work_class`, `project`, `producer`, `runner`,
   `harness`, `plan`, `plan_account`, `alfonso`, `parent_alfonso`, `workload`,
   `project_id` and `workspace`; `grain` is
-  `hour`, `day`, `week` or `month`; `timezone` is an IANA name. Refusals:
+  `hour`, `day`, `week`, `month` or `range`; `timezone` is an IANA name. Refusals:
   `invalid_grouping` (unknown or repeated), `invalid_grain`,
   `invalid_timezone`. Test: `spend_report_refusal_keeps_its_code`.
   Event exclusion reasons in spend, work-class and ledger coverage include
@@ -317,7 +325,7 @@ Reads never write. A refusal on a read is one of the codes below.
 
   Optional `from_ms` and `to_ms` must be supplied together, with `from_ms < to_ms`,
   or the read refuses `invalid_range`. They select a half-open interval widened
-  outward to whole buckets. Without them, day/week/month cover all history as
+  outward to whole buckets. Without them, day/week/month/range cover all history as
   before. Day buckets begin at the first existing instant of the local date;
   weeks begin Monday, and months begin on the first local date of the month.
   Day ranges are limited to 400 days after widening. Week/month requests are
@@ -331,6 +339,18 @@ Reads never write. A refusal on a read is one of the codes below.
   Hour refuses `hour_timezone_unsupported` if the timezone has any offset that
   is not an integral number of UTC hours anywhere in the widened range, including
   historical second offsets and fractional-hour daylight saving offsets.
+
+  `range` selects the same local days as `day`, with the same 400-day limit and
+  grouping and filter rules. It returns one row per group and currency instead
+  of one per day. With explicit bounds, all rows share the widened request
+  edges. Without bounds they span the first through last local day with
+  selected usage, including future-dated days if the day report shows them.
+  The range has no rows if the equivalent day report has none. Counts and
+  money sum the day rows, retaining their daily rounding and fee allocation.
+  `deduced.by_rule_share` is the ratio of the summed exact rule-allocated fee
+  to the summed exact allocated fee, omitted if the denominator is zero.
+  `totals` and `attribution_coverage` match the equivalent day report.
+  Test: `spend_report_range_matches_daily_values_across_dst`.
 
   `runner` groups calls by the recorded runner (`broca`, `thalamus` or
   `colliculus`); null identifies unmanaged calls. The label is recorded once,
@@ -413,9 +433,10 @@ Reads never write. A refusal on a read is one of the codes below.
   Tests: `analytics_unknown_quantities_are_not_measured_zero_on_either_path`,
   `analytics_tokens_and_exact_media_units_are_additive`,
   `analytics_widened_range_caps_and_calendar_edges`,
-  `analytics_refusals_are_specific_and_read_only`. Tagged handler samples are
-  in `crates/astrocyte-module/test-vectors/analytics-reads-v3`, pinned by
-  `analytics_vectors_match_real_dispatch_and_sha256sums`.
+  `analytics_refusals_are_specific_and_read_only`. Handler samples for range
+  grain and `reply_too_large` are in `crates/astrocyte-module/test-vectors/analytics-reads-v5`,
+  pinned by `analytics_vectors_range_match_real_dispatch_and_sha256sums`.
+  The published `analytics-reads-v3` and `analytics-reads-v4` sets are unchanged.
 
   Every row and currency total also carries `list_value`, with
   `{currency: "USD", nanos, unvalued: {measurements, tokens, by_reason},

@@ -2,9 +2,12 @@
 use super::*;
 use crate::money::round_nano_num;
 use crate::multiplier::{QuotaProviderConfig, WindowSelector};
-use fees::{Allocation, DayMember, DayWeights, FeeDays, PoolDay, Weights, DAY_MS};
+use fees::{Allocation, DayMember, DayWeights, FeeDays, PoolDay, RowShare, Weights, DAY_MS};
 
 pub(crate) mod attribution_report;
+mod range;
+
+use range::RangeFold;
 
 fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, ReportError> {
     serde_json::from_str(value).map_err(|_| ReportError::Integrity("invalid valuation payload"))
@@ -55,8 +58,17 @@ impl Accumulator {
         currency: Option<&str>,
         recorded: i64,
     ) -> Result<RowValuation, ReportError> {
+        self.value_with_share(allocation, currency, recorded)
+            .map(|(value, _)| value)
+    }
+    fn value_with_share(
+        &self,
+        allocation: &Allocation,
+        currency: Option<&str>,
+        recorded: i64,
+    ) -> Result<(RowValuation, RowShare), ReportError> {
         let (share, pending) = allocation.row(&self.weights)?;
-        Ok(RowValuation {
+        let value = RowValuation {
             list_value: ListValue {
                 currency: "USD",
                 nanos: round_nano_num(self.numerator).map_err(|_| ReportError::Arithmetic)?,
@@ -65,7 +77,8 @@ impl Accumulator {
                 base_rate_tier_untested_tokens: self.base_tokens,
             },
             deduced: share.deduced(currency.unwrap_or_default(), recorded, pending.len())?,
-        })
+        };
+        Ok((value, share))
     }
     fn observe(
         &mut self,
@@ -113,6 +126,21 @@ impl Accumulator {
             if pending { 0 } else { cell.numerator },
         )
     }
+}
+
+fn value_row(
+    row: &mut SpendRow,
+    acc: &Accumulator,
+    allocation: &Allocation,
+    range: &mut Option<RangeFold>,
+) -> Result<(), ReportError> {
+    let (value, share) =
+        acc.value_with_share(allocation, row.currency.as_deref(), row.total_nanos)?;
+    row.valuation = value;
+    if let Some(range) = range {
+        range.shares.push(share);
+    }
+    Ok(())
 }
 fn day_start(at: i64) -> i64 {
     at.div_euclid(DAY_MS) * DAY_MS
@@ -432,6 +460,7 @@ pub(crate) fn report(
     conn: &Connection,
     request: &ReportRequest,
     now_ms: i64,
+    fold_range: bool,
 ) -> Result<SpendReport, ReportError> {
     let parsed = ParsedReport::new(request)?;
     let plan_filter = parsed.filters.iter().any(|(d, _)| is_plan(d));
@@ -616,16 +645,13 @@ pub(crate) fn report(
         };
         report.rate_staleness = population.staleness(now_ms);
     }
+    let mut range = fold_range.then(|| RangeFold::new(parsed.range, report.rows.len()));
+    let empty = Accumulator::default();
     for row in &mut report.rows {
-        if let Some(acc) = buckets.get(&row_key(row, &parsed.grouping)) {
-            row.valuation = acc.value(&allocation, row.currency.as_deref(), row.total_nanos)?;
-        } else {
-            row.valuation = Accumulator::default().value(
-                &allocation,
-                row.currency.as_deref(),
-                row.total_nanos,
-            )?;
-        }
+        let acc = buckets
+            .get(&row_key(row, &parsed.grouping))
+            .unwrap_or(&empty);
+        value_row(row, acc, &allocation, &mut range)?;
     }
     if !report
         .totals
@@ -655,6 +681,9 @@ pub(crate) fn report(
             total.valuation.deduced_non_usd_plans = Some(fee_totals.deduced_non_usd_plans);
             total.valuation.deduced_conflict_plans = Some(fee_totals.deduced_conflict_plans);
         }
+    }
+    if let Some(range) = range {
+        report.rows = range.finish(report.rows)?;
     }
     Ok(report)
 }

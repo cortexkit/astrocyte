@@ -8,7 +8,7 @@
 
 #[cfg(test)]
 use astrocyte_module::test_support;
-use astrocyte_module::{config, ops, state, step_feed};
+use astrocyte_module::{config, ops, route_reply, state, step_feed};
 
 use std::{
     collections::HashMap,
@@ -814,22 +814,22 @@ impl ModuleHandler for AstrocyteHandler {
                 )
                 .await;
             }
-            if request.method == ops::OP_STEPS_READ {
-                return tokio::task::block_in_place(|| {
-                    step_feed::read_outcome(&self.state, request.params)
-                });
-            }
         }
-        if request.method == ops::OP_WATERMARK_GET {
+        let method = request.method.as_str();
+        let outcome = if method == ops::OP_STEPS_READ {
+            tokio::task::block_in_place(|| step_feed::read_outcome(&self.state, request.params))
+        } else if method == ops::OP_WATERMARK_GET {
             // A read on the reader connection, answered for the principal
             // the daemon attested when this route was bound, never for one
             // the request names.
             let outcome = tokio::task::block_in_place(|| {
                 ops::watermark_get(&self.state, route.principal.as_ref(), request.params)
             });
-            return route_reply(&request.method, outcome);
-        }
-        dispatch_route_request(&self.state, request, route.flow)
+            route_reply::from_dispatch(method, outcome)
+        } else {
+            dispatch_route_request(&self.state, method, request.params, route.flow)
+        };
+        route_reply::finish(method, outcome)
     }
 
     /// Open subscriptions can be held for hours, so they get a pool of
@@ -1102,29 +1102,32 @@ fn handle_route_request(
     flow: Option<String>,
 ) -> HandlerOutcome {
     match decode_route_request(body) {
-        Ok(request) => dispatch_route_request(state, request, flow),
+        Ok(request) => {
+            let method = request.method.as_str();
+            let outcome = dispatch_route_request(state, method, request.params, flow);
+            route_reply::finish(method, outcome)
+        }
         Err(refusal) => refusal,
     }
 }
 
 /// One routed unary request, checked against the route's flow and
-/// dispatched. The helper sends what this returns on the request's own
-/// route and correlation id; a reply larger than the daemon delivers is
-/// replaced there by a small `frame_too_large` refusal.
+/// dispatched. The unary handler checks the encoded read result before the
+/// serve helper sends it on the request's own route and correlation id.
 fn dispatch_route_request(
     state: &Arc<SharedState>,
-    request: RouteRequest,
+    method: &str,
+    params: Value,
     flow: Option<String>,
 ) -> HandlerOutcome {
-    if let Some(refused) = refuse_unsupported_flow_operation(&request.method, flow.as_deref()) {
+    if let Some(refused) = refuse_unsupported_flow_operation(method, flow.as_deref()) {
         return refused;
     }
     // Dispatch performs synchronous SQLite work and may bridge the fusiform
     // socket through its current-thread runtime. Leave the daemon executor
     // before entering that blocking boundary.
-    let outcome =
-        tokio::task::block_in_place(|| ops::dispatch(state, &request.method, request.params));
-    route_reply(&request.method, outcome)
+    let outcome = tokio::task::block_in_place(|| ops::dispatch(state, method, params));
+    route_reply::from_dispatch(method, outcome)
 }
 
 /// Flow admission precedes dispatch and the principal-specific read handlers,
@@ -1137,22 +1140,6 @@ fn refuse_unsupported_flow_operation(method: &str, flow: Option<&str>) -> Option
             format!("{method} is not served to a flow (flow {flow_id})"),
         )
     })
-}
-
-/// One unary operation's answer as the route reply: `{"result": ...}`, or
-/// the operation's own refusal.
-fn route_reply(method: &str, outcome: ops::OpResult) -> HandlerOutcome {
-    match outcome {
-        Ok(result) => match serde_json::to_vec(&json!({ "result": result })) {
-            Ok(body) => HandlerOutcome::Response(body),
-            Err(error) => {
-                tracing::error!(target: "astrocyte", method, %error,
-                    "route reply could not be encoded");
-                refusal("internal", "request could not be completed".to_string())
-            }
-        },
-        Err((code, message)) => refusal(&code, message),
-    }
 }
 
 /// The manifest is the public operation authority. Its operation entries and

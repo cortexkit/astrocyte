@@ -14,6 +14,10 @@ const DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/test-vectors/analytics-reads-v4"
 );
+const RANGE_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/test-vectors/analytics-reads-v5"
+);
 
 fn fixture() -> SharedState {
     let state = test_state();
@@ -332,6 +336,104 @@ fn analytics_vectors_match_real_dispatch_and_sha256sums() {
 }
 
 #[test]
+fn analytics_vectors_range_match_real_dispatch_and_sha256sums() {
+    use crate::route_reply;
+    use subc_client_rs::HandlerOutcome;
+    use subc_protocol::ErrorBody;
+
+    let ordinary = fixture();
+    let attribution = attribution_fixture();
+    let today = 86_400_000;
+    let cases = [
+        (
+            "range-attribution-where.json",
+            &attribution,
+            false,
+            json!({
+                "grain":"range", "timezone":"UTC", "grouping":["workload","parent_alfonso"],
+                "where":{"model":["beta"]}, "from_ms":1, "to_ms":2*today
+            }),
+        ),
+        (
+            "range-ends-today.json",
+            &ordinary,
+            false,
+            json!({
+                "grain":"range", "timezone":"UTC", "grouping":[], "from_ms":1, "to_ms":today+1
+            }),
+        ),
+        (
+            "reply-too-large.json",
+            &ordinary,
+            true,
+            json!({
+                "grain":"day", "timezone":"UTC", "grouping":["model"], "from_ms":0, "to_ms":2*today
+            }),
+        ),
+    ];
+    let export = std::env::var_os("ASTROCYTE_EXPORT_ANALYTICS_VECTORS").is_some();
+    let mut hashes = String::new();
+    for (name, state, force_limit, params) in cases {
+        let method = ops::OP_REPORT;
+        let dispatched = super::dispatch_with_report_clock(state, method, params, || today + 3600);
+        let reply = route_reply::from_dispatch(method, dispatched);
+        let value = if force_limit {
+            let HandlerOutcome::Response(body) = &reply else {
+                panic!("expected a report")
+            };
+            let limit = body.len() - 1;
+            let HandlerOutcome::ErrorWithDetail {
+                code,
+                message,
+                detail,
+            } = route_reply::finish_with_limit(method, reply, limit)
+            else {
+                panic!("expected a refused read")
+            };
+            assert_eq!(code, "reply_too_large");
+            json!({"error": ErrorBody::new(code, message).with_detail(detail)})
+        } else {
+            let HandlerOutcome::Response(body) = route_reply::finish(method, reply) else {
+                panic!("expected a range report")
+            };
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                value["result"]["rows"][0]["bucket_end_ms"],
+                json!(2 * today)
+            );
+            if name == "range-ends-today.json" {
+                assert_eq!(value["result"]["rows"][0]["events_total"], 4);
+            }
+            value
+        };
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        hashes.push_str(&format!("{:x}  {name}\n", Sha256::digest(&bytes)));
+        check_range_vector(export, name, bytes);
+    }
+    hashes.push_str(&format!(
+        "{:x}  README.md\n",
+        Sha256::digest(std::fs::read(format!("{RANGE_DIR}/README.md")).unwrap())
+    ));
+    check_range_vector(export, "SHA256SUMS", hashes.into_bytes());
+}
+
+fn check_range_vector(export: bool, name: &str, bytes: Vec<u8>) {
+    if export {
+        println!(
+            "VECTOR {}",
+            json!({"name": name, "content": String::from_utf8(bytes).unwrap()})
+        );
+    } else {
+        assert_eq!(
+            std::fs::read(format!("{RANGE_DIR}/{name}")).unwrap(),
+            bytes,
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn analytics_vectors_pin_inclusive_tokens_and_unknown_quantities() {
     let vectors: std::collections::BTreeMap<_, _> = vectors().into_iter().collect();
     let report = &vectors["two-groupings.json"]["result"];
@@ -391,4 +493,126 @@ fn analytics_vectors_pin_list_value_deduced_and_pending() {
     assert_eq!(no_fees["totals"].as_array().unwrap().len(), 1);
     assert!(no_fees["totals"][0]["currency"].is_null());
     assert!(no_fees["totals"][0].get("deduced").is_none());
+}
+
+#[test]
+#[ignore = "timing comparison over 90 days of synthetic attributed usage"]
+fn spend_report_range_90_day_timing() {
+    use crate::route_reply;
+    use astrocyte_core::attribution::{commit_page, Page, Publisher};
+    use std::time::Instant;
+    use subc_client_rs::HandlerOutcome;
+
+    const DAYS: i64 = 90;
+    const DAY_MS: i64 = 86_400_000;
+    const AGENTS: i64 = 24;
+    const MODELS: i64 = 6;
+    const DAILY_CALLS_PER_GROUP: i64 = 3;
+    let state = test_state();
+    state.with_conn(|conn| {
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute("INSERT INTO account_subscription(account_ref,provider,plan_name,recurring_cost_minor,currency,amount_exponent,period,effective_from_ms) VALUES('account','provider','plan',2000,'USD',2,'month',0)", []).unwrap();
+        tx.execute(
+            "WITH RECURSIVE day(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM day WHERE n+1<?1),
+             agent(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM agent WHERE n+1<?2),
+             model(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM model WHERE n+1<?3),
+             call(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM call WHERE n+1<?4),
+             seed AS (SELECT printf('call-%d-%d-%d-%d',day.n,agent.n,model.n,call.n) AS id,
+                 printf('agent-%d',agent.n) AS agent,printf('model-%d',model.n) AS model,
+                 day.n*86400000+(9+model.n)*3600000+call.n AS at
+                 FROM day CROSS JOIN agent CROSS JOIN model CROSS JOIN call)
+             INSERT INTO usage_event(event_id,producer,producer_ref,provider,model,account_ref,
+                 occurred_at_ms,recorded_at_ms,charge_basis,runner,harness,session)
+             SELECT id,'opencode',id,'provider',model,'account',at,at,'subscription_included',
+                 'thalamus','opencode',agent FROM seed",
+            rusqlite::params![DAYS, AGENTS, MODELS, DAILY_CALLS_PER_GROUP],
+        ).unwrap();
+        tx.execute("UPDATE usage_event SET pricing_generation=1,currency='USD'", []).unwrap();
+        for (role, units) in [("input", 1300), ("output", 123)] {
+            tx.execute("INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent)
+                SELECT event_key,?1,'token','billed','synthetic',?2,0 FROM usage_event", rusqlite::params![role, units]).unwrap();
+            tx.execute("INSERT INTO priced_charge(event_key,role,unit,pricing_generation,outcome,charge_basis,basis_covered,currency,charge_nanos,origin,recorded_at_ms)
+                SELECT event_key,?1,'token',1,'covered','subscription_included',1,'USD',0,'pricing_pass',1 FROM usage_event", [role]).unwrap();
+        }
+        let facts = (0..AGENTS).map(|n| {
+            let agent = format!("agent-{n}");
+            json!({"fact_id":agent,"supersedes":null,"subject":{"kind":"session","runner":"thalamus-harness","harness":"opencode2","session":agent},"alfonso":agent,"parent":null,"workload":"mason","task":null,"project_id":null,"effective_from_ms":0,"recorded_at_ms":1})
+        }).collect::<Vec<_>>();
+        let page: Page = serde_json::from_value(json!({"facts": facts,"next":null,"through":AGENTS})).unwrap();
+        commit_page(&tx, Publisher::Prefrontal, None, &page, 1).unwrap();
+        for n in 0..MODELS {
+            let model = format!("model-{n}");
+            let history = serde_json::from_value(json!({
+                "source":"synthetic", "provider_id":"provider", "model_id":model,
+                "fact_prefix":"rate.", "eras":[], "served_by_key":{
+                    "rate.input":[{"from_ms":0,"until_ms":null,"state":"value","value":{"state":"priced","units":947_000_001,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}}}],
+                    "rate.output":[{"from_ms":0,"until_ms":null,"state":"value","value":{"state":"priced","units":1_203_000_001,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"}}}]
+                }
+            })).unwrap();
+            publish(&tx, &fetched(history, "provider", &model, None).unwrap(), 1).unwrap();
+        }
+        tx.commit().unwrap();
+        build_hours(conn);
+        Ok(())
+    }).unwrap();
+
+    let run = |grain| {
+        let query = json!({"grain":grain,"grouping":["alfonso","model"],"timezone":"UTC","from_ms":0,"to_ms":DAYS*DAY_MS});
+        let method = ops::OP_REPORT;
+        let start = Instant::now();
+        let outcome =
+            super::dispatch_with_report_clock(&state, method, query, || (DAYS + 1) * DAY_MS);
+        let reply = route_reply::from_dispatch(method, outcome);
+        // The pre-limit day path handed these exact bytes to the serve helper.
+        // Include the production read check in the range timing.
+        let reply = if grain == "range" {
+            route_reply::finish(method, reply)
+        } else {
+            reply
+        };
+        let elapsed = start.elapsed();
+        let HandlerOutcome::Response(body) = reply else {
+            panic!("expected a report")
+        };
+        (elapsed, body)
+    };
+
+    let (_, day_body) = run("day");
+    let (_, range_body) = run("range");
+    let day_bytes = day_body.len();
+    let range_bytes = range_body.len();
+    let day: Value = serde_json::from_slice(&day_body).unwrap();
+    let range: Value = serde_json::from_slice(&range_body).unwrap();
+    assert_eq!(
+        day["result"]["rows"].as_array().unwrap().len(),
+        usize::try_from(DAYS * AGENTS * MODELS).unwrap()
+    );
+    assert_eq!(
+        range["result"]["rows"].as_array().unwrap().len(),
+        usize::try_from(AGENTS * MODELS).unwrap()
+    );
+    assert_eq!(day["result"]["totals"], range["result"]["totals"]);
+    let HandlerOutcome::ErrorWithDetail { code, detail, .. } =
+        route_reply::finish(ops::OP_REPORT, HandlerOutcome::Response(day_body))
+    else {
+        panic!("the day report must overflow the real frame limit")
+    };
+    assert_eq!(code, "reply_too_large");
+    assert_eq!(detail["rows"], DAYS * AGENTS * MODELS);
+    assert_eq!(detail["reply_bytes"], day_bytes);
+
+    let mut day = Vec::new();
+    let mut range = Vec::new();
+    for trial in 0..7 {
+        if trial % 2 == 0 {
+            day.push(run("day").0);
+            range.push(run("range").0);
+        } else {
+            range.push(run("range").0);
+            day.push(run("day").0);
+        }
+    }
+    day.sort();
+    range.sort();
+    println!("90 days × {AGENTS} agents × {MODELS} models, {} calls: day {:?} median, {day_bytes} bytes; range {:?} median, {range_bytes} bytes (7 pairs)", DAYS*AGENTS*MODELS*DAILY_CALLS_PER_GROUP, day[3], range[3]);
 }

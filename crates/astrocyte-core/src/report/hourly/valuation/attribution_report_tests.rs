@@ -918,3 +918,135 @@ fn attribution_report_hour_and_fractional_offset_day_seams_match_ordinary_totals
         }
     }
 }
+
+#[test]
+fn spend_report_range_matches_daily_values_across_dst() {
+    let mut conn = conn();
+    let at = |day, hour| {
+        Utc.with_ymd_and_hms(2025, 3, day, hour, 0, 0)
+            .unwrap()
+            .timestamp_millis()
+    };
+    plan(&conn, PlanLedger::Account, "provider", "account", 0, None);
+    for (n, day, hour, session, model, quantity) in [
+        (0, 7, 12, "session-a", "a", 1),
+        (1, 8, 12, "session-a", "a", 1),
+        (2, 9, 6, "session-a", "a", 1),
+        (3, 9, 8, "session-b", "a", 7),
+        (4, 10, 1, "session-a", "a", 1),
+        (5, 10, 6, "session-b", "a", 3),
+        (6, 10, 7, "session-a", "excluded", 9),
+        (7, 13, 7, "session-b", "a", 2),
+    ] {
+        call(
+            &mut conn,
+            &format!("range-{n}"),
+            at(day, hour),
+            session,
+            model,
+            "subscription_included",
+            quantity,
+        );
+    }
+    facts(&mut conn);
+    // One input token is worth 0.4 list nanos, so rounding after summing
+    // the period would give a different result from summing the day rows.
+    rate(&conn, "a", 400_000);
+    rate(&conn, "excluded", 400_000);
+    summaries(&mut conn);
+    drain(&mut conn, &config());
+    let now = at(12, 12);
+    for grouping in [vec!["alfonso", "workload"], vec!["model", "plan"]] {
+        for explicit in [true, false] {
+            let mut query = request(json!({
+                "grouping": grouping, "timezone": "America/New_York",
+                "from_ms": explicit.then(|| at(7, 1)), "to_ms": explicit.then(|| at(11, 1)),
+                "where": {"model": ["a"]}
+            }));
+            let day = spend_report(&conn, &query, now).unwrap();
+            assert!(day
+                .rows
+                .iter()
+                .any(|row| row.bucket_end_ms - row.bucket_start_ms == 23 * HOUR_MS));
+            assert!(day
+                .rows
+                .iter()
+                .filter_map(|r| r.valuation.deduced.as_ref())
+                .any(|v| v.nanos > 0));
+            query.grain = "range".into();
+            let range = spend_report(&conn, &query, now).unwrap();
+            assert_eq!(range.totals, day.totals);
+            assert_eq!(range.attribution_coverage, day.attribution_coverage);
+            let (start, end) = if explicit {
+                (at(6, 5), at(11, 4))
+            } else {
+                (at(7, 5), at(14, 4))
+            };
+            let groups: BTreeSet<_> = day
+                .rows
+                .iter()
+                .map(|r| (&r.grouping, &r.currency))
+                .collect();
+            assert_eq!(range.rows.len(), groups.len());
+            for row in &range.rows {
+                assert_eq!((row.bucket_start_ms, row.bucket_end_ms), (start, end));
+                let matching: Vec<_> = day
+                    .rows
+                    .iter()
+                    .filter(|r| r.grouping == row.grouping && r.currency == row.currency)
+                    .collect();
+                assert!(!matching.is_empty());
+                let money = |r: &SpendRow| {
+                    [
+                        r.total_nanos,
+                        r.metered_nanos,
+                        r.valuation.list_value.nanos,
+                        r.valuation.list_value.unvalued.tokens,
+                        r.valuation.list_value.base_rate_tier_untested_tokens,
+                        r.valuation.deduced.as_ref().unwrap().nanos,
+                    ]
+                };
+                let counts = |r: &SpendRow| {
+                    [
+                        r.events_total,
+                        r.events_priced,
+                        r.events_unpriced,
+                        r.cost_sample_n,
+                        r.zero_measurement_events,
+                        r.measurements_total,
+                        r.valuation.list_value.unvalued.measurements,
+                        r.usage.tokens.counts.input.unwrap(),
+                    ]
+                };
+                for (i, v) in money(row).into_iter().enumerate() {
+                    assert_eq!(
+                        v,
+                        matching.iter().map(|r| money(r)[i]).sum::<i64>(),
+                        "money slot {i}"
+                    );
+                }
+                for (i, v) in counts(row).into_iter().enumerate() {
+                    assert_eq!(
+                        v,
+                        matching.iter().map(|r| counts(r)[i]).sum::<u64>(),
+                        "count slot {i}"
+                    );
+                }
+                assert_eq!(
+                    row.valuation.list_value.not_yet_valued_hours,
+                    matching
+                        .iter()
+                        .map(|r| r.valuation.list_value.not_yet_valued_hours)
+                        .sum::<usize>()
+                );
+                assert_eq!(
+                    row.valuation.deduced.as_ref().unwrap().pending_days,
+                    matching
+                        .iter()
+                        .map(|r| r.valuation.deduced.as_ref().unwrap().pending_days)
+                        .sum::<usize>()
+                );
+            }
+        }
+    }
+}

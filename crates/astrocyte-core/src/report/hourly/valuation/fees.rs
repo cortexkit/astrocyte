@@ -365,6 +365,16 @@ pub struct Deduced {
 }
 
 impl RowShare {
+    pub fn by_rule_share(&self) -> Result<Option<f64>, ReportError> {
+        if self.fee.numerator().is_zero() {
+            return Ok(None);
+        }
+        (&self.by_rule.0 / &self.fee.0)
+            .to_f64()
+            .map(Some)
+            .ok_or(ReportError::Arithmetic)
+    }
+
     /// Add recorded USD only after all exact fee fractions for the row have been
     /// summed. Non-USD rows deliberately have no deduced cost.
     pub fn deduced(
@@ -380,21 +390,15 @@ impl RowShare {
             .fee
             .checked_add(&Fraction::new(i128::from(recorded_nanos), 1)?)?
             .round()?;
-        let by_rule_share = if self.fee.numerator().is_zero() || self.by_rule.numerator().is_zero()
-        {
-            None
-        } else {
-            Some(
-                (&self.by_rule.0 / &self.fee.0)
-                    .to_f64()
-                    .ok_or(ReportError::Arithmetic)?,
-            )
-        };
         Ok(Some(Deduced {
             currency: "USD",
             nanos,
             pending_days,
-            by_rule_share,
+            by_rule_share: if self.by_rule.numerator().is_zero() {
+                None
+            } else {
+                self.by_rule_share()?
+            },
         }))
     }
 }

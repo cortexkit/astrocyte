@@ -1,0 +1,1 @@
+{"error":{"code":"reply_too_large","detail":{"limit_bytes":3425,"reply_bytes":3426,"rows":4},"message":"Read reply exceeds the frame limit; narrow the request"}}
