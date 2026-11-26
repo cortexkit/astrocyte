@@ -253,11 +253,11 @@ const RUNNER_POSITIVE_SQL: &str = "SELECT e.latest_feed_cursor,f.row_json FROM s
     WHERE e.harness=?1 AND e.session=?2 AND e.step_ref<>?3 AND e.feed_source='runner'
       AND e.latest_feed_cursor IS NOT NULL AND e.positive_read=1
     ORDER BY e.latest_feed_cursor DESC LIMIT 1";
-const RUNNER_UNKNOWN_BEFORE_SQL: &str = "SELECT f.row_json FROM step_evidence e
+const RUNNER_UNKNOWN_SQL: &str = "SELECT f.row_json FROM step_evidence e
     INDEXED BY step_evidence_runner_cache
     JOIN step_feed f ON f.feed_cursor=e.latest_feed_cursor
     WHERE e.harness=?1 AND e.session=?2 AND e.feed_source='runner'
-      AND e.latest_feed_cursor IS NOT NULL AND e.reports_cache=1 AND e.occurred_at_ms<?3
+      AND e.latest_feed_cursor IS NOT NULL AND e.reports_cache=1 AND e.occurred_at_ms BETWEEN ?4 AND ?3
       AND f.committed_at_ms>=?4 AND json_extract(f.row_json,'$.verdict')='unknown'
     ORDER BY e.occurred_at_ms,e.latest_feed_cursor";
 
@@ -391,15 +391,8 @@ pub fn append_runner_step(
     let body = serde_json::to_string(&Value::Object(row)).map_err(to_sql)?;
     let mut appended = append_body(conn, now_ms, &body, facts_changed, old_position)?;
     if first_positive {
-        let earlier = conn
-            .prepare_cached(RUNNER_UNKNOWN_BEFORE_SQL)?
-            .query_map(
-                params![harness, session, step.step.occurred_at_ms, window_start],
-                |row| row.get::<_, String>(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for body in earlier {
-            appended |= refresh_runner_diagnostics(conn, now_ms, &body)?;
+        if let Some(before) = step.step.occurred_at_ms.checked_sub(1) {
+            appended |= refresh_unknown_runner_steps(conn, now_ms, harness, session, before)? > 0;
         }
     }
     prune(conn, window_start)?;
@@ -479,6 +472,27 @@ pub fn rejudge_runner_steps(conn: &Connection, now_ms: i64) -> rusqlite::Result<
         if refresh_runner_diagnostics(conn, now_ms, &body)? {
             appended += 1;
         }
+    }
+    Ok(appended)
+}
+
+fn refresh_unknown_runner_steps(
+    conn: &Connection,
+    now_ms: i64,
+    harness: &str,
+    session: &str,
+    through_ms: i64,
+) -> rusqlite::Result<usize> {
+    let window_start = now_ms.saturating_sub(FEED_WINDOW_MS);
+    let old = conn
+        .prepare_cached(RUNNER_UNKNOWN_SQL)?
+        .query_map(params![harness, session, through_ms, window_start], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut appended = 0;
+    for body in old {
+        appended += usize::from(refresh_runner_diagnostics(conn, now_ms, &body)?);
     }
     Ok(appended)
 }
@@ -604,6 +618,11 @@ pub fn append_changes(
             if append_body(conn, now_ms, &body, false, None)? {
                 appended += 1;
             }
+        }
+        if flipped && cache::CacheModel::of(producer) == cache::CacheModel::Explicit {
+            // File rows above already replaced any matching runner rows. Rejudge
+            // the retained runner-only steps that just gained session cache evidence.
+            appended += refresh_unknown_runner_steps(conn, now_ms, producer, session, i64::MAX)?;
         }
     }
     conn.execute(

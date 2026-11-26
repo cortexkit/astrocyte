@@ -87,6 +87,86 @@ fn observed_record(c: &mut Connection, time: i64) {
 }
 
 #[test]
+fn audit18_run_list_omits_only_the_overflowing_token_total() {
+    let mut conn = overflowing_run();
+    let request = ListRequest {
+        from_ms: 0,
+        to_ms: 2 * HOUR_MS,
+        harness: None,
+        limit: None,
+        after: None,
+    };
+    for built in [false, true] {
+        if built {
+            fill(&mut conn);
+        }
+        let result = list(&conn, &request).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        let row = &result.rows[0];
+        assert_eq!(row.steps, 4);
+        for tokens in [&row.tokens, &row.models[0].tokens, &result.totals.tokens] {
+            let json = serde_json::to_value(tokens).unwrap();
+            assert!(json.get("input").is_none());
+            assert_eq!(json["output"], 12);
+        }
+        assert_eq!(row.cost.pending_measurements, 8);
+    }
+}
+
+#[test]
+fn audit18_run_detail_omits_only_the_overflowing_token_total() {
+    let mut conn = overflowing_run();
+    let request = DetailRequest {
+        key: RunKey::Session {
+            harness: "opencode".into(),
+            session: "overflow-session".into(),
+        },
+        limit: None,
+        after: None,
+    };
+    for built in [false, true] {
+        if built {
+            fill(&mut conn);
+        }
+        let result = detail(&conn, &request).unwrap();
+        let json = serde_json::to_value(&result.totals.tokens).unwrap();
+        assert!(json.get("input").is_none());
+        assert_eq!(json["output"], 12);
+        assert_eq!(result.items.len(), 4);
+        assert_eq!(
+            result.items[0].measurements[0]
+                .quantity
+                .as_ref()
+                .unwrap()
+                .units,
+            i64::MAX
+        );
+        assert_eq!(result.totals.cost.pending_measurements, 8);
+    }
+}
+
+fn overflowing_run() -> Connection {
+    let mut conn = conn();
+    for (at, input) in [
+        (1, i64::MAX),
+        (2, i64::MAX),
+        (3, i64::MAX),
+        (HOUR_MS + 1, 7),
+    ] {
+        let request = serde_json::from_value(json!({
+            "producer":"opencode","producer_ref":format!("overflow-{at}"),
+            "session":"overflow-session","occurred_at_ms":at,
+            "provider":"provider","model":"model","charge_basis":"metered_api","measurements":[
+                {"role":"input","unit":"token","kind":"billed","source":"fixture","quantity_units":input,"quantity_exponent":0},
+                {"role":"output","unit":"token","kind":"billed","source":"fixture","quantity_units":3,"quantity_exponent":0}
+            ]
+        })).unwrap();
+        ingest::record_event(&mut conn, &request, 1).unwrap();
+    }
+    conn
+}
+
+#[test]
 fn runs_observed_only_readings_are_unpriced_not_pending_or_free() {
     let mut c = conn();
     observed_record(&mut c, 1);

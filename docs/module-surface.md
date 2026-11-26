@@ -1138,7 +1138,8 @@ whole; clients must not divide them over feed calls.
 
 **Tokens** have optional `input`, `output`, `reasoning`, `cache_read`, and
 `cache_write` integer members. Missing is not zero: a role is absent when no
-included event reports an exact whole-token quantity. Exact decimal encodings
+included event reports an exact whole-token quantity. A role total too large to
+represent is also left out, just like an unknown total. Exact decimal encodings
 are normalized (100 × 10^-1 contributes 10). Genuinely fractional quantities
 are omitted from integer totals without rounding and preserved exactly in detail. `output` includes reasoning, as on the feed;
 `reasoning` is its breakdown. Stored detail roles remain disjoint.

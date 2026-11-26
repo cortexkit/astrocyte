@@ -129,21 +129,48 @@ fn add<T: Copy + std::ops::Add<Output = T>>(
 fn count(left: &mut u64, right: u64) -> Result<(), ReportError> {
     add(left, right, u64::checked_add)
 }
-fn optional(left: &mut Option<u64>, right: Option<u64>) -> Result<(), ReportError> {
+fn optional(left: &mut Option<u128>, right: Option<u128>) {
     if let Some(right) = right {
-        let mut value = left.unwrap_or(0);
-        count(&mut value, right)?;
-        *left = Some(value);
+        *left = Some(left.unwrap_or(0).saturating_add(right));
     }
-    Ok(())
 }
-impl Tokens {
-    fn merge(&mut self, other: &Self) -> Result<(), ReportError> {
-        optional(&mut self.input, other.input)?;
-        optional(&mut self.output, other.output)?;
-        optional(&mut self.reasoning, other.reasoning)?;
-        optional(&mut self.cache_read, other.cache_read)?;
-        optional(&mut self.cache_write, other.cache_write)
+
+// Keep overflows distinct from unknown counts until the reply is built. A
+// partial sum that already overflowed must not disappear when merging cells.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TokenSums {
+    input: Option<u128>,
+    output: Option<u128>,
+    reasoning: Option<u128>,
+    cache_read: Option<u128>,
+    cache_write: Option<u128>,
+}
+impl TokenSums {
+    fn merge(&mut self, other: &Self) {
+        optional(&mut self.input, other.input);
+        optional(&mut self.output, other.output);
+        optional(&mut self.reasoning, other.reasoning);
+        optional(&mut self.cache_read, other.cache_read);
+        optional(&mut self.cache_write, other.cache_write);
+    }
+    fn finish(&self) -> Tokens {
+        let fit = |n: Option<u128>| n.and_then(|n| u64::try_from(n).ok());
+        Tokens {
+            input: fit(self.input),
+            output: fit(self.output),
+            reasoning: fit(self.reasoning),
+            cache_read: fit(self.cache_read),
+            cache_write: fit(self.cache_write),
+        }
+    }
+    fn read(row: &rusqlite::Row<'_>, first: usize) -> Result<Self, ReportError> {
+        Ok(Self {
+            input: stored_count(row, first)?,
+            output: stored_count(row, first + 1)?,
+            reasoning: stored_count(row, first + 2)?,
+            cache_read: stored_count(row, first + 3)?,
+            cache_write: stored_count(row, first + 4)?,
+        })
     }
 }
 
@@ -181,9 +208,14 @@ pub struct Totals {
     pub tokens: Tokens,
     pub cost: Cost,
 }
-impl Totals {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Aggregate {
+    tokens: TokenSums,
+    cost: Cost,
+}
+impl Aggregate {
     fn merge(&mut self, other: &Self) -> Result<(), ReportError> {
-        self.tokens.merge(&other.tokens)?;
+        self.tokens.merge(&other.tokens);
         self.cost.merge(&other.cost)
     }
 }
@@ -264,12 +296,12 @@ pub struct DetailReply {
 }
 
 type CellKey = (RunKey, Option<String>, Option<String>);
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Cell {
     first: i64,
     last: i64,
     steps: u64,
-    totals: Totals,
+    totals: Aggregate,
     session: Option<String>,
     work_class: Option<String>,
 }
@@ -289,8 +321,8 @@ struct Event {
     reported_output: Option<Quantity>,
 }
 impl Event {
-    fn totals(&self) -> Result<Totals, ReportError> {
-        let mut totals = Totals::default();
+    fn totals(&self) -> Result<Aggregate, ReportError> {
+        let mut totals = Aggregate::default();
         for m in &self.measurements {
             let reported = if m.role == "output" && m.unit == "token" {
                 &self.reported_output
@@ -310,7 +342,7 @@ impl Event {
                         _ => None,
                     };
                     if let Some(target) = target {
-                        optional(target, Some(value))?;
+                        optional(target, Some(value));
                     }
                 }
             }
@@ -351,7 +383,7 @@ impl Event {
         }
         // The feed adds reasoning only when output was reported by that step.
         if totals.tokens.output.is_some() {
-            optional(&mut totals.tokens.output, totals.tokens.reasoning)?;
+            optional(&mut totals.tokens.output, totals.tokens.reasoning);
         }
         Ok(totals)
     }
@@ -540,14 +572,8 @@ fn cell_row(row: &rusqlite::Row<'_>) -> Result<(CellKey, Cell), ReportError> {
             first: row.get(3)?,
             last: row.get(4)?,
             steps: row.get(5)?,
-            totals: Totals {
-                tokens: Tokens {
-                    input: stored_count(row, 6)?,
-                    output: stored_count(row, 7)?,
-                    reasoning: stored_count(row, 8)?,
-                    cache_read: stored_count(row, 9)?,
-                    cache_write: stored_count(row, 10)?,
-                },
+            totals: Aggregate {
+                tokens: TokenSums::read(row, 6)?,
                 cost: Cost {
                     priced: parsed(row, 11)?,
                     covered_measurements: row.get(12)?,
@@ -730,21 +756,15 @@ fn range_frame(conn: &Connection, request: &ListRequest) -> Result<Frame, Report
     Ok(Frame { clean, fallback })
 }
 
-fn summed(conn: &Connection, filter: &str) -> Result<(u64, Totals), ReportError> {
+fn summed(conn: &Connection, filter: &str) -> Result<(u64, Aggregate), ReportError> {
     let mut stmt=conn.prepare(&format!("SELECT steps,input,output,reasoning,cache_read,cache_write,priced,covered,unpriced,pending,reasons FROM summary_run_cell c WHERE {filter}"))?;
     let mut rows = stmt.query([])?;
     let mut steps = 0;
-    let mut totals = Totals::default();
+    let mut totals = Aggregate::default();
     while let Some(row) = rows.next()? {
         count(&mut steps, row.get(0)?)?;
-        totals.merge(&Totals {
-            tokens: Tokens {
-                input: stored_count(row, 1)?,
-                output: stored_count(row, 2)?,
-                reasoning: stored_count(row, 3)?,
-                cache_read: stored_count(row, 4)?,
-                cache_write: stored_count(row, 5)?,
-            },
+        totals.merge(&Aggregate {
+            tokens: TokenSums::read(row, 1)?,
             cost: Cost {
                 priced: parsed(row, 6)?,
                 covered_measurements: row.get(7)?,
@@ -765,24 +785,29 @@ fn quoted(value: &str) -> String {
 
 fn page_rows(conn: &Connection, cells: Cells) -> Result<Vec<RunRow>, Error> {
     use rusqlite::OptionalExtension;
-    let mut rows: BTreeMap<RunKey, RunRow> = BTreeMap::new();
+    let mut rows: BTreeMap<RunKey, (RunRow, TokenSums)> = BTreeMap::new();
     for ((key, provider, model), cell) in cells {
-        let row = rows.entry(key.clone()).or_insert_with(|| RunRow {
-            pricing_unit: key.pricing_unit(false).into(),
-            key,
-            first_at_ms: cell.first,
-            last_at_ms: cell.last,
-            steps: 0,
-            tokens: Tokens::default(),
-            cost: Cost::default(),
-            models: Vec::new(),
-            session: None,
-            work_class: None,
+        let (row, tokens) = rows.entry(key.clone()).or_insert_with(|| {
+            (
+                RunRow {
+                    pricing_unit: key.pricing_unit(false).into(),
+                    key,
+                    first_at_ms: cell.first,
+                    last_at_ms: cell.last,
+                    steps: 0,
+                    tokens: Tokens::default(),
+                    cost: Cost::default(),
+                    models: Vec::new(),
+                    session: None,
+                    work_class: None,
+                },
+                TokenSums::default(),
+            )
         });
         row.first_at_ms = row.first_at_ms.min(cell.first);
         row.last_at_ms = row.last_at_ms.max(cell.last);
         count(&mut row.steps, cell.steps)?;
-        row.tokens.merge(&cell.totals.tokens)?;
+        tokens.merge(&cell.totals.tokens);
         row.cost.merge(&cell.totals.cost)?;
         if matches!(row.key, RunKey::Run { .. }) {
             row.session = row.session.clone().max(cell.session);
@@ -794,11 +819,17 @@ fn page_rows(conn: &Connection, cells: Cells) -> Result<Vec<RunRow>, Error> {
             provider,
             model,
             steps: cell.steps,
-            tokens: cell.totals.tokens,
+            tokens: cell.totals.tokens.finish(),
             cost: cell.totals.cost,
         });
     }
-    let mut rows: Vec<_> = rows.into_values().collect();
+    let mut rows: Vec<_> = rows
+        .into_values()
+        .map(|(mut row, tokens)| {
+            row.tokens = tokens.finish();
+            row
+        })
+        .collect();
     rows.sort_by_cached_key(|r| {
         (
             std::cmp::Reverse(r.last_at_ms),
@@ -959,7 +990,7 @@ pub fn list(conn: &Connection, request: &ListRequest) -> Result<ListReply, Error
         totals: RangeTotals {
             rows: row_count,
             steps,
-            tokens: total.tokens,
+            tokens: total.tokens.finish(),
             cost: total.cost,
         },
         next,
@@ -1090,7 +1121,10 @@ pub fn detail(conn: &Connection, request: &DetailRequest) -> Result<DetailReply,
         key: request.key.clone(),
         pricing_unit: request.key.pricing_unit(has_attempts).into(),
         items: items.into_values().collect(),
-        totals,
+        totals: Totals {
+            tokens: totals.tokens.finish(),
+            cost: totals.cost,
+        },
         next,
     })
 }
@@ -1248,22 +1282,22 @@ impl Drop for Probe<'_> {
     }
 }
 
-fn whole_tokens(quantity: &Quantity) -> Option<u64> {
-    let units = u64::try_from(quantity.units).ok()?;
+fn whole_tokens(quantity: &Quantity) -> Option<u128> {
+    let units = u128::try_from(quantity.units).ok()?;
     if quantity.exponent <= 0 {
-        let divisor = 10_u64.checked_pow(quantity.exponent.unsigned_abs())?;
+        let divisor = 10_u128.checked_pow(quantity.exponent.unsigned_abs())?;
         if units % divisor == 0 {
             Some(units / divisor)
         } else {
             None
         }
     } else {
-        units.checked_mul(10_u64.checked_pow(quantity.exponent.unsigned_abs())?)
+        Some(units.saturating_mul(10_u128.saturating_pow(quantity.exponent.unsigned_abs())))
     }
 }
-// SQLite INTEGER is signed. A nonnumeric prefix preserves rare wider u64
+// SQLite INTEGER is signed. A nonnumeric prefix preserves rare wider
 // aggregates as exact text instead of coercing decimal text to a lossy REAL.
-fn count_value(value: Option<u64>) -> rusqlite::types::Value {
+fn count_value(value: Option<u128>) -> rusqlite::types::Value {
     use rusqlite::types::Value;
     match value {
         None => Value::Null,
@@ -1273,11 +1307,13 @@ fn count_value(value: Option<u64>) -> rusqlite::types::Value {
         },
     }
 }
-fn stored_count(row: &rusqlite::Row<'_>, column: usize) -> Result<Option<u64>, ReportError> {
+fn stored_count(row: &rusqlite::Row<'_>, column: usize) -> Result<Option<u128>, ReportError> {
     use rusqlite::types::ValueRef;
     match row.get_ref(column)? {
         ValueRef::Null => Ok(None),
-        ValueRef::Integer(n) => Ok(Some(u64::try_from(n).map_err(|_| ReportError::Arithmetic)?)),
+        ValueRef::Integer(n) => Ok(Some(
+            u128::try_from(n).map_err(|_| ReportError::Arithmetic)?,
+        )),
         ValueRef::Text(text) => Ok(Some(
             std::str::from_utf8(text)
                 .ok()

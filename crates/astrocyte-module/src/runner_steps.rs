@@ -620,6 +620,48 @@ mod tests {
     }
 
     #[test]
+    fn audit18_file_first_positive_revises_an_earlier_runner_row() {
+        let state = test_state();
+        admit_event(
+            &state,
+            &event("minimal", "thalamus-harness", |body| {
+                body["harness"] = json!("opencode");
+                body["session"] = json!("s1");
+                body["harness_step_ref"] = json!("msg_runner");
+                body["input_tokens"] = json!(10);
+                body["cached_input_tokens"] = json!(0);
+            }),
+        );
+        let read = || rows(&state, json!({"harness": "opencode", "session": "s1"}));
+        let initial = read();
+        assert_eq!(initial[0]["verdict"], "unknown");
+        let at = initial[0]["occurred_at_ms"].as_i64().unwrap();
+        record_steps_for_test(
+            &state,
+            "opencode",
+            &[TestStep {
+                occurred_at_ms: at + 1,
+                ..TestStep::now("s1", "msg_file")
+            }],
+            false,
+        )
+        .unwrap();
+        let served = read();
+        assert_eq!(served.len(), 2);
+        assert!(served
+            .iter()
+            .any(|row| row["source"] == "file" && row["cache_read"] == 100));
+        let runner = served
+            .iter()
+            .find(|row| row["step_ref"] == "msg_runner")
+            .unwrap();
+        assert_eq!(runner["source"], "runner");
+        assert_eq!(runner["cache_read"], 0);
+        assert_ne!(runner["cursor"], initial[0]["cursor"]);
+        assert_eq!(runner["verdict"], "cold_start");
+    }
+
+    #[test]
     fn opencode2_runner_identity_joins_the_recorded_opencode_row() {
         let state = test_state();
         let announced = event("full", "thalamus", |body| {
