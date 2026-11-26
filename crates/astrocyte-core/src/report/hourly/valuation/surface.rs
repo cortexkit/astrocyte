@@ -134,8 +134,10 @@ fn value_row(
     allocation: &Allocation,
     range: &mut Option<RangeFold>,
 ) -> Result<(), ReportError> {
-    let (value, share) =
-        acc.value_with_share(allocation, row.currency.as_deref(), row.total_nanos)?;
+    // Covered usage can have no recorded currency but still earns a USD fee
+    // share. Keep the recorded currency and the separate currency totals intact.
+    let currency = row.currency.as_deref().unwrap_or("USD");
+    let (value, share) = acc.value_with_share(allocation, Some(currency), row.total_nanos)?;
     row.valuation = value;
     if let Some(range) = range {
         range.shares.push(share);

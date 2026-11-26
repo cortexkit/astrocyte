@@ -492,7 +492,7 @@ Reads never write. A refusal on a read is one of the codes below.
   same bounded per-call path. These figures never change recorded spend,
   `total_nanos` or `metered_nanos`.
 
-  USD recorded-currency rows additionally carry `deduced`:
+  Rows with USD or no recorded currency additionally carry `deduced`:
   `{currency: "USD", nanos, pending_days}`. It is recorded spend plus the row's
   exact share of USD subscription fees, rounded once half-even. Fees come only
   from account/credential plan records, prorated over UTC calendar days of the
@@ -501,18 +501,21 @@ Reads never write. A refusal on a read is one of the codes below.
   then spread over the pool's `account_unknown` calls. Day denominators always
   cover the whole UTC day, unfiltered; row numerators cover only matching calls.
   Optional `by_rule_share` is the fraction of the row's fee share assigned by
-  that second stage, omitted when zero or when no fee was assigned. A day is
-  pending if it has not ended or any hour holding pool calls is not current;
-  pending fees are neither spread nor unspread. `pending_days` counts distinct
-  pending UTC days touching the row. A dirty summary is never a built valuation
-  hour even when its live row can be valued. While an hour awaits valuation,
+  that second stage. Outside `range`, it is omitted when zero or when no fee
+  was assigned. A day is pending if it has not ended or if any hour holding
+  pool calls has an unbuilt or stale valuation. Pending fees are neither spread
+  nor unspread. `pending_days` counts distinct pending UTC days touching the
+  row. A dirty summary is never a built valuation hour even when its live row
+  can be valued. While an hour awaits valuation,
   non-metered NULL-account summary cells without a retained resolved payer
   conservatively defer their provider's unique pool if a credential plan could
   match. This can delay a spread until the builder reaches the hour, but cannot
   assign a fee to the wrong calls.
 
-  Totals aggregate exact values; each row is rounded independently, so summed
-  rows may differ from the total by under one nanodollar per row.
+  Summed row `deduced` nanos match the USD total within one nanodollar per
+  independently rounded row (the day rows before folding for `range`). The
+  exception is a USD fee share assigned to a call whose recorded currency is
+  neither USD nor null: only the USD total counts that share.
 
   Only the USD currency total carries `deduced` and the fee diagnostics:
   `deduced_unspread_nanos`, `deduced_non_usd_plans`, `deduced_conflict_plans`.
@@ -523,12 +526,9 @@ Reads never write. A refusal on a read is one of the codes below.
   `deduced_non_usd_plans`; records mapping to multiple pools count in
   `deduced_conflict_plans` and their USD fees go directly to unspread. Totals
   aggregate exact values and distinct pending hours/days across rows before
-  rounding. Non-USD and null-currency totals carry `list_value` only. Assigned
-  shares of a USD plan fee count toward the USD total even when the matching
-  call has a different or unknown recorded currency; the call's recorded spend
-  and any row-level `deduced` field are unchanged. When USD fees exist but no
-  USD calls match, an additional USD total has zero recorded spend and exposes
-  those fees; no such entry is added without USD fees.
+  rounding. Non-USD and null-currency totals carry `list_value` only. When USD
+  fees exist but no USD calls match, an additional USD total has zero recorded
+  spend and exposes those fees; no such entry is added without USD fees.
   With explicit dates, the fee window is the widened report window. Without
   dates, it starts at the first calendar bucket holding any dated summary hour
   and ends at the end of the bucket holding `now_ms`; with no dated hours it

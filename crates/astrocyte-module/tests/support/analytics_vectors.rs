@@ -12,11 +12,7 @@ use sha2::{Digest, Sha256};
 
 const DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/test-vectors/analytics-reads-v4"
-);
-const RANGE_DIR: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-vectors/analytics-reads-v5"
+    "/test-vectors/analytics-reads-v6"
 );
 
 fn fixture() -> SharedState {
@@ -35,7 +31,7 @@ fn fixture() -> SharedState {
     state
 }
 
-fn plan_fixture(pending: bool) -> SharedState {
+fn plan_fixture(pending: bool, recorded_currency: Option<&str>) -> SharedState {
     let state = test_state();
     state.with_conn(|conn| {
         conn.execute("INSERT INTO account_subscription(account_ref,provider,plan_name,recurring_cost_minor,currency,amount_exponent,period,effective_from_ms,effective_to_ms) VALUES('account','provider','plan',2000,'USD',2,'month',0,86400000)", []).unwrap();
@@ -47,9 +43,11 @@ fn plan_fixture(pending: bool) -> SharedState {
             for (role, quantity) in [("input", 100), ("output", 50)] {
                 conn.execute("INSERT INTO measurement(event_key,role,unit,kind,source,quantity_units,quantity_exponent) VALUES((SELECT event_key FROM usage_event WHERE event_id=?1),?2,'token','billed','synthetic',?3,0)",rusqlite::params![id,role,quantity]).unwrap();
             }
-            conn.execute("UPDATE usage_event SET pricing_generation=1,currency='USD' WHERE event_id=?1",[id]).unwrap();
-            for role in ["input", "output"] {
-                conn.execute("INSERT INTO priced_charge(event_key,role,unit,pricing_generation,outcome,charge_basis,basis_covered,currency,charge_nanos,origin,recorded_at_ms) VALUES((SELECT event_key FROM usage_event WHERE event_id=?1),?2,'token',1,'covered','subscription_included',1,'USD',0,'pricing_pass',1)",rusqlite::params![id,role]).unwrap();
+            if let Some(currency) = recorded_currency {
+                conn.execute("UPDATE usage_event SET pricing_generation=1,currency=?2 WHERE event_id=?1",rusqlite::params![id,currency]).unwrap();
+                for role in ["input", "output"] {
+                    conn.execute("INSERT INTO priced_charge(event_key,role,unit,pricing_generation,outcome,charge_basis,basis_covered,currency,charge_nanos,origin,recorded_at_ms) VALUES((SELECT event_key FROM usage_event WHERE event_id=?1),?2,'token',1,'covered','subscription_included',1,?3,0,'pricing_pass',1)",rusqlite::params![id,role,currency]).unwrap();
+                }
             }
             // An unfetched beta timeline leaves exactly its hour pending even
             // after both maintenance queues have drained.
@@ -128,7 +126,7 @@ fn build_hours(conn: &rusqlite::Connection) {
 
 fn attribution_fixture() -> SharedState {
     use astrocyte_core::attribution::{commit_page, Page, Publisher};
-    let state = plan_fixture(false);
+    let state = plan_fixture(false, Some("USD"));
     state.with_conn(|conn| {
         let facts:Page=serde_json::from_value(json!({"facts":[
             {"fact_id":"fixture-a","supersedes":null,"subject":{"kind":"session","runner":"thalamus-harness","harness":"opencode2","session":"included-alpha"},"alfonso":"agent_fixture","parent":null,"workload":"mason","task":null,"project_id":"project_fixture","effective_from_ms":0,"recorded_at_ms":1},
@@ -197,7 +195,7 @@ fn vectors() -> Vec<(String, Value)> {
         .into_iter()
         .map(|(name, q)| (format!("{name}.json"), served(&state, q)))
         .collect();
-    let valued = plan_fixture(false);
+    let valued = plan_fixture(false, Some("USD"));
     for (name, query) in [
         (
             "plan",
@@ -217,7 +215,7 @@ fn vectors() -> Vec<(String, Value)> {
     vectors.push((
         "pending.json".into(),
         served(
-            &plan_fixture(true),
+            &plan_fixture(true, Some("USD")),
             json!({"grouping":["plan","plan_account"],"from_ms":0,"to_ms":86_400_000}),
         ),
     ));
@@ -270,43 +268,9 @@ fn vectors() -> Vec<(String, Value)> {
 fn analytics_vectors_match_real_dispatch_and_sha256sums() {
     let export = std::env::var_os("ASTROCYTE_EXPORT_ANALYTICS_VECTORS").is_some();
     let mut hashes = String::new();
-    for (name, value) in vectors() {
+    for (name, value) in vectors().into_iter().chain(fixed_clock_vectors()) {
         let mut bytes = serde_json::to_vec(&value).unwrap();
         bytes.push(b'\n');
-        if [
-            "one-grouping.json",
-            "two-groupings.json",
-            "runner-harness.json",
-            "hour.json",
-            "where-null.json",
-            "range.json",
-            "invalid-grouping-where.json",
-            "invalid-filter.json",
-            "invalid-range.json",
-            "invalid-range-missing-end.json",
-            "range-too-large.json",
-            "hour-no-range.json",
-            "hour-range-too-large.json",
-            "hour-timezone-unsupported.json",
-            "malformed.json",
-            "plan.json",
-            "plan-account.json",
-            "where-plan.json",
-            "pending.json",
-            "no-usd-fees.json",
-        ]
-        .contains(&name.as_str())
-        {
-            assert_eq!(
-                std::fs::read(format!(
-                    "{}/test-vectors/analytics-reads-v3/{name}",
-                    env!("CARGO_MANIFEST_DIR")
-                ))
-                .unwrap(),
-                bytes,
-                "ordinary v3 frame changed: {name}"
-            );
-        }
         hashes.push_str(&format!("{:x}  {name}\n", Sha256::digest(&bytes)));
         if export {
             println!(
@@ -335,14 +299,14 @@ fn analytics_vectors_match_real_dispatch_and_sha256sums() {
     }
 }
 
-#[test]
-fn analytics_vectors_range_match_real_dispatch_and_sha256sums() {
+fn fixed_clock_vectors() -> Vec<(String, Value)> {
     use crate::route_reply;
     use subc_client_rs::HandlerOutcome;
     use subc_protocol::ErrorBody;
 
     let ordinary = fixture();
     let attribution = attribution_fixture();
+    let unpriced_subscription = plan_fixture(false, None);
     let today = 86_400_000;
     let cases = [
         (
@@ -370,9 +334,16 @@ fn analytics_vectors_range_match_real_dispatch_and_sha256sums() {
                 "grain":"day", "timezone":"UTC", "grouping":["model"], "from_ms":0, "to_ms":2*today
             }),
         ),
+        (
+            "null-currency-deduced.json",
+            &unpriced_subscription,
+            false,
+            json!({
+                "grain":"day", "timezone":"UTC", "grouping":[], "from_ms":0, "to_ms":today
+            }),
+        ),
     ];
-    let export = std::env::var_os("ASTROCYTE_EXPORT_ANALYTICS_VECTORS").is_some();
-    let mut hashes = String::new();
+    let mut vectors = Vec::with_capacity(cases.len());
     for (name, state, force_limit, params) in cases {
         let method = ops::OP_REPORT;
         let dispatched = super::dispatch_with_report_clock(state, method, params, || today + 3600);
@@ -394,43 +365,29 @@ fn analytics_vectors_range_match_real_dispatch_and_sha256sums() {
             json!({"error": ErrorBody::new(code, message).with_detail(detail)})
         } else {
             let HandlerOutcome::Response(body) = route_reply::finish(method, reply) else {
-                panic!("expected a range report")
+                panic!("expected a spend report")
             };
             let value: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(
-                value["result"]["rows"][0]["bucket_end_ms"],
-                json!(2 * today)
-            );
-            if name == "range-ends-today.json" {
-                assert_eq!(value["result"]["rows"][0]["events_total"], 4);
+            let row = &value["result"]["rows"][0];
+            if name == "null-currency-deduced.json" {
+                assert_eq!(row["bucket_end_ms"], today);
+                assert!(row["currency"].is_null());
+                assert_eq!(row["total_nanos"], 0);
+                assert_eq!(
+                    row["deduced"],
+                    json!({"currency":"USD", "nanos":645_161_290, "pending_days":0})
+                );
+            } else {
+                assert_eq!(row["bucket_end_ms"], 2 * today);
+                if name == "range-ends-today.json" {
+                    assert_eq!(row["events_total"], 4);
+                }
             }
             value
         };
-        let mut bytes = serde_json::to_vec(&value).unwrap();
-        bytes.push(b'\n');
-        hashes.push_str(&format!("{:x}  {name}\n", Sha256::digest(&bytes)));
-        check_range_vector(export, name, bytes);
+        vectors.push((name.into(), value));
     }
-    hashes.push_str(&format!(
-        "{:x}  README.md\n",
-        Sha256::digest(std::fs::read(format!("{RANGE_DIR}/README.md")).unwrap())
-    ));
-    check_range_vector(export, "SHA256SUMS", hashes.into_bytes());
-}
-
-fn check_range_vector(export: bool, name: &str, bytes: Vec<u8>) {
-    if export {
-        println!(
-            "VECTOR {}",
-            json!({"name": name, "content": String::from_utf8(bytes).unwrap()})
-        );
-    } else {
-        assert_eq!(
-            std::fs::read(format!("{RANGE_DIR}/{name}")).unwrap(),
-            bytes,
-            "{name}"
-        );
-    }
+    vectors
 }
 
 #[test]

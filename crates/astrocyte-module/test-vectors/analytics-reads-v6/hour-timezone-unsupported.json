@@ -1,0 +1,1 @@
+{"error":{"code":"hour_timezone_unsupported","message":"hour grain requires whole-hour UTC offsets throughout the range"}}

@@ -56,7 +56,10 @@ fn ledger_regression_usd_fee_survives_null_recorded_currency_in_both_readers() {
         let value = report(&conn, &request(grouping, 0, DAY_MS));
         assert_eq!(value["rows"][0]["list_value"]["nanos"], 200_000);
         assert!(value["rows"][0]["currency"].is_null());
-        assert!(value["rows"][0].get("deduced").is_none());
+        assert_eq!(
+            value["rows"][0]["deduced"],
+            json!({"currency": "USD", "nanos": 645_161_290, "pending_days": 0})
+        );
         let usd = value["totals"]
             .as_array()
             .unwrap()
@@ -65,6 +68,47 @@ fn ledger_regression_usd_fee_survives_null_recorded_currency_in_both_readers() {
             .unwrap();
         assert_eq!(usd["total_nanos"], 0);
         assert_eq!(usd["list_value"]["nanos"], 0);
+        assert_eq!(usd["deduced"]["nanos"], 645_161_290);
+        assert_eq!(usd["deduced_unspread_nanos"], 0);
+    }
+}
+
+#[test]
+fn report_surface_non_usd_row_fee_share_is_only_in_usd_total() {
+    let mut conn = conn();
+    rate(&conn, "A", 1_000_000_000);
+    plan(&conn, PlanLedger::Account, "provider", "account", 0, None);
+    let key = event(
+        &mut conn,
+        "covered-eur",
+        1,
+        "A",
+        Some("account"),
+        None,
+        "subscription_included",
+        100,
+    );
+    // Recorded currency does not decide whether the call matches a USD plan.
+    conn.execute(
+        "UPDATE usage_event SET currency='EUR' WHERE event_key=?1",
+        [key],
+    )
+    .unwrap();
+    ready(&mut conn);
+
+    for grouping in [&[][..], &["alfonso"][..]] {
+        let value = report(&conn, &request(grouping, 0, DAY_MS));
+        let rows = value["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["currency"], "EUR");
+        assert!(rows[0].get("deduced").is_none());
+        let usd = value["totals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|total| total["currency"] == "USD")
+            .unwrap();
+        assert_eq!(usd["total_nanos"], 0);
         assert_eq!(usd["deduced"]["nanos"], 645_161_290);
         assert_eq!(usd["deduced_unspread_nanos"], 0);
     }

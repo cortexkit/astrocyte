@@ -3,7 +3,7 @@ use super::*;
 use crate::attribution::Publisher;
 use crate::broca::{record_scope_in_tx, CallKind, ScopeStamp};
 
-fn call(
+fn record_call(
     conn: &mut Connection,
     id: &str,
     at: i64,
@@ -19,13 +19,24 @@ fn call(
     })).unwrap();
     request.runner = Some("thalamus".into());
     let result = ingest::record_event(conn, &request, 1).unwrap();
-    let key: i64 = conn
-        .query_row(
-            "SELECT event_key FROM usage_event WHERE event_id=?1",
-            [result.event_id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    conn.query_row(
+        "SELECT event_key FROM usage_event WHERE event_id=?1",
+        [result.event_id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn call(
+    conn: &mut Connection,
+    id: &str,
+    at: i64,
+    session: &str,
+    model: &str,
+    basis: &str,
+    quantity: i64,
+) -> i64 {
+    let key = record_call(conn, id, at, session, model, basis, quantity);
     conn.execute(
         "UPDATE usage_event SET pricing_generation=1,currency='USD' WHERE event_key=?1",
         [key],
@@ -655,6 +666,100 @@ fn attribution_report_unbounded_keeps_future_calls_like_the_ordinary_report() {
     );
 }
 
+fn deduced_row_sum(report: &SpendReport) -> i128 {
+    report
+        .rows
+        .iter()
+        .filter(|row| matches!(row.currency.as_deref(), None | Some("USD")))
+        .filter_map(|row| row.valuation.deduced.as_ref())
+        .map(|value| i128::from(value.nanos))
+        .sum()
+}
+
+fn assert_deduced_row_sum(report: &SpendReport, rounding_rows: usize, context: &serde_json::Value) {
+    let row_sum = deduced_row_sum(report);
+    let total = report
+        .totals
+        .iter()
+        .find(|total| total.currency.as_deref() == Some("USD"))
+        .unwrap();
+    let total = i128::from(total.valuation.row.deduced.as_ref().unwrap().nanos);
+    assert!(
+        (row_sum - total).abs() <= i128::try_from(rounding_rows).unwrap(),
+        "{context}: rows={row_sum}, total={total}, independently rounded rows={rounding_rows}"
+    );
+}
+
+#[test]
+fn spend_report_deduced_rows_include_null_currency_covered_calls() {
+    let mut conn = conn();
+    plan(&conn, PlanLedger::Account, "provider", "account", 0, None);
+    call(&mut conn, "api", 1, "session-a", "a", "metered_api", 100);
+    record_call(
+        &mut conn,
+        "covered",
+        2,
+        "session-b",
+        "a",
+        "subscription_included",
+        100,
+    );
+    facts(&mut conn);
+    rate(&conn, "a", 1_000_000_000);
+    summaries(&mut conn);
+    drain(&mut conn, &config());
+
+    for grouping in [json!([]), json!(["alfonso"])] {
+        for grain in ["day", "range"] {
+            let query = json!({"grouping": grouping, "grain": grain});
+            let report = spend_report(&conn, &request(query.clone()), DAY_MS).unwrap();
+            assert_eq!(report.rows.len(), 2, "{query}");
+            let covered = report
+                .rows
+                .iter()
+                .find(|row| row.currency.is_none())
+                .unwrap();
+            if grouping == json!(["alfonso"]) {
+                assert_eq!(covered.grouping["alfonso"].as_deref(), Some("agent-b"));
+            }
+            assert_eq!(covered.total_nanos, 0);
+            let deduced = covered
+                .valuation
+                .deduced
+                .as_ref()
+                .expect("covered row needs its fee share");
+            assert_eq!(deduced.currency, "USD");
+            assert_eq!(
+                deduced.nanos, 645_161_290,
+                "one day of the $20 January plan"
+            );
+            assert_eq!(deduced.pending_days, 0);
+            assert_eq!(
+                deduced.by_rule_share,
+                (grain == "range").then_some(0.0),
+                "{query}"
+            );
+            let api = report
+                .rows
+                .iter()
+                .find(|row| row.currency.as_deref() == Some("USD"))
+                .unwrap();
+            assert_eq!(api.total_nanos, 300);
+            assert_eq!(api.valuation.deduced.as_ref().unwrap().nanos, 300);
+            assert!(report
+                .totals
+                .iter()
+                .find(|t| t.currency.is_none())
+                .unwrap()
+                .valuation
+                .row
+                .deduced
+                .is_none());
+            assert_deduced_row_sum(&report, report.rows.len(), &query);
+        }
+    }
+}
+
 #[test]
 fn attribution_report_randomized_groups_sum_to_ordinary_totals_with_identical_model_filters() {
     let mut conn = conn();
@@ -678,7 +783,12 @@ fn attribution_report_randomized_groups_sum_to_ordinary_totals_with_identical_mo
         };
         let at = i64::try_from(seed % u64::try_from(7 * DAY_MS).unwrap()).unwrap();
         let quantity = i64::try_from(seed % 120).unwrap() + 1;
-        call(
+        let add_call = if basis == "metered_api" {
+            call
+        } else {
+            record_call
+        };
+        add_call(
             &mut conn,
             &format!("call-{n}"),
             at,
@@ -702,7 +812,7 @@ fn attribution_report_randomized_groups_sum_to_ordinary_totals_with_identical_mo
         for models in [json!({}), json!({"model":["a"]}), json!({"model":["b"]})] {
             let base = json!({"grouping":[],"to_ms":7*DAY_MS,"where":models});
             let ordinary = spend_report(&conn, &request(base.clone()), 7 * DAY_MS).unwrap();
-            let mut split_request = base;
+            let mut split_request = base.clone();
             split_request["grouping"] = json!(grouping);
             let split = spend_report(&conn, &request(split_request.clone()), 7 * DAY_MS).unwrap();
             assert_eq!(
@@ -710,52 +820,46 @@ fn attribution_report_randomized_groups_sum_to_ordinary_totals_with_identical_mo
                 serde_json::to_value(&ordinary.totals).unwrap(),
                 "{split_request}"
             );
-            let total = &ordinary.totals[0];
-            assert_eq!(
-                split.rows.iter().map(|r| r.events_total).sum::<u64>(),
-                total.events_total
-            );
-            assert_eq!(
-                split.rows.iter().map(|r| r.total_nanos).sum::<i64>(),
-                total.total_nanos
-            );
-            assert_eq!(
-                split.rows.iter().map(|r| r.metered_nanos).sum::<i64>(),
-                total.metered_nanos
-            );
-            assert_eq!(
-                split
-                    .rows
-                    .iter()
-                    .map(|r| r.valuation.list_value.nanos)
-                    .sum::<i64>(),
-                total.valuation.row.list_value.nanos
-            );
-            for report in [&ordinary, &split] {
-                let row_sum = report
-                    .rows
-                    .iter()
-                    .filter_map(|row| row.valuation.deduced.as_ref())
-                    .map(|value| i128::from(value.nanos))
-                    .sum::<i128>();
-                let total = i128::from(
-                    report.totals[0]
-                        .valuation
-                        .row
-                        .deduced
-                        .as_ref()
-                        .unwrap()
-                        .nanos,
+            for total in &ordinary.totals {
+                let rows = || {
+                    split
+                        .rows
+                        .iter()
+                        .filter(|row| row.currency == total.currency)
+                };
+                assert_eq!(
+                    rows().map(|r| r.events_total).sum::<u64>(),
+                    total.events_total
                 );
-                assert!(
-                    (row_sum - total).abs() * 2 <= i128::try_from(report.rows.len()).unwrap(),
-                    "{split_request}: rows={row_sum}, total={total}"
+                assert_eq!(
+                    rows().map(|r| r.total_nanos).sum::<i64>(),
+                    total.total_nanos
                 );
+                assert_eq!(
+                    rows().map(|r| r.metered_nanos).sum::<i64>(),
+                    total.metered_nanos
+                );
+                assert_eq!(
+                    rows().map(|r| r.valuation.list_value.nanos).sum::<i64>(),
+                    total.valuation.row.list_value.nanos
+                );
+            }
+            for (mut query, day) in [(base, &ordinary), (split_request, &split)] {
+                assert_deduced_row_sum(day, day.rows.len(), &query);
+                query["grain"] = json!("range");
+                let range = spend_report(&conn, &request(query.clone()), 7 * DAY_MS).unwrap();
+                assert_eq!(range.totals, day.totals, "{query}");
+                assert_eq!(deduced_row_sum(&range), deduced_row_sum(day), "{query}");
+                assert_deduced_row_sum(&range, day.rows.len(), &query);
             }
             let coverage = split.attribution_coverage.unwrap();
             assert_eq!(
                 coverage.attributed_calls + coverage.unattributed_calls,
-                total.events_total
+                ordinary
+                    .totals
+                    .iter()
+                    .map(|total| total.events_total)
+                    .sum::<u64>()
             );
         }
     }
