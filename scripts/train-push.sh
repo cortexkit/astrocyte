@@ -1307,14 +1307,13 @@ fi
 # Editors run cargo without --locked on save (rust-analyzer's check-on-save
 # is the measured case), and in a repository that path-depends on sibling
 # checkouts that rewrites Cargo.lock to whatever those checkouts happen to be
-# at: the `version =` line of each source-less package moves and nothing
-# else. That diff cannot be an intentional edit here, because pins advance
-# through refresh-siblings-lock.sh, which moves siblings.lock in the same
-# change. So a lone Cargo.lock drift of exactly that shape is restored and
-# named rather than refused. Anything wider (a `source =` or `checksum =`
-# line, a dependency list, any other dirty file) is still the operator's
-# uncommitted work and stays a refusal. The gate's guarantee holds either
-# way: CI tests the pushed commit, and the restored lock IS that commit's.
+# at: only the sibling packages' `version =` lines move. Intentional pin
+# updates also move siblings.lock through refresh-siblings-lock.sh. Restore
+# a lone lockfile diff only if every changed package is source-less and
+# outside the workspace. A member's version edit or anything wider (a
+# `source =` or `checksum =` line, a dependency list, any other dirty file)
+# is left for the operator. CI tests the pushed commit, and the restored
+# lock is that commit's.
 #
 # Prints the drifted package names, one per line, when the working tree is
 # dirty in exactly that way; prints nothing and returns 1 otherwise.
@@ -1341,7 +1340,7 @@ sibling_lock_drift_packages() {
   # with that name and that version and require it to have no `source =`.
   # A name can appear twice (a path copy beside a registry or git copy of
   # the same crate), which is why the block is matched on both fields.
-  local head_lock names name old
+  local head_lock names name old metadata workspace_packages
   head_lock="$(git -C "$REPO" show HEAD:Cargo.lock)"
   names=""
   while IFS= read -r line; do
@@ -1358,7 +1357,7 @@ sibling_lock_drift_packages() {
           inblk && /^$/ { if (hit && ver) { found=1; if (src) bad=1 } inblk=0; hit=0; ver=0; src=0 }
           END { if (hit && ver) { found=1; if (src) bad=1 } exit !(found && !bad) }
         ' || return 1
-        names="${names}${name}\n"
+        names="${names}${name}"$'\n'
         name=""
         ;;
     esac
@@ -1366,7 +1365,23 @@ sibling_lock_drift_packages() {
 $(printf '%s\n' "$diff" | grep -E '^( name = "|-version = ")' | sed 's/^ //')
 EOF_DIFF
   [ -n "$names" ] || return 1
-  printf '%b' "$names"
+  names="${names%$'\n'}"
+
+  # Workspace members are also source-less. Ask Cargo for just the workspace
+  # packages without resolving dependencies or allowing a lockfile update.
+  if ! metadata="$(cd "$REPO" && cargo metadata --no-deps --locked --offline --format-version 1)" ||
+    ! workspace_packages="$(python3 -c 'import json, sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"]))' <<< "$metadata")" ||
+    [ -z "$workspace_packages" ]; then
+    say "left Cargo.lock unchanged: could not determine workspace membership for ${names//$'\n'/,}" >&2
+    return 1
+  fi
+  while IFS= read -r name; do
+    if grep -Fxq -- "$name" <<< "$workspace_packages"; then
+      say "left Cargo.lock unchanged: workspace member $name has a version edit" >&2
+      return 1
+    fi
+  done <<< "$names"
+  printf '%s\n' "$names"
 }
 
 # CI tests the pushed commit, not the working tree. Uncommitted work would be
