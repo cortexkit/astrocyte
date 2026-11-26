@@ -1265,6 +1265,40 @@ mod tests {
     }
 
     #[test]
+    fn safeguard_thalamus_unknown_request_kind_is_bounded() {
+        const MARKER: &str = "REQUEST_KIND_VALUE_MUST_NOT_BE_STORED";
+        let (_home, source, store, state) = fixture();
+        let kind = format!("line\n\"{}{MARKER}", "x".repeat(80));
+        store
+            .execute(
+                "INSERT INTO payer_record(
+                    attempt_id,harness,session,request_kind,recorded_at_ms,provider,model,auth_selection
+                 ) VALUES ('bad','pi','session-a',?1,1000,'anthropic','model-a','login-a')",
+                [kind],
+            )
+            .unwrap();
+
+        source
+            .drain_for_health(&state, 100_000, &AtomicBool::new(false))
+            .unwrap();
+
+        let reason: String = state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT reason FROM set_aside_record WHERE source_key=?1",
+                    [SOURCE_KEY],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert!(reason.contains("unknown request_kind"), "{reason}");
+        assert!(reason.contains("line\\n\\\""), "{reason}");
+        assert!(reason.contains("truncated"), "{reason}");
+        assert!(!reason.contains(MARKER), "{reason}");
+    }
+
+    #[test]
     fn thalamus_payer_unreadable_attempt_identity_keeps_later_rows_and_progress() {
         let (_home, source, store, state) = fixture();
         insert(&store, "");

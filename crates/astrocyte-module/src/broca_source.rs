@@ -1750,6 +1750,34 @@ mod tests {
         assert_eq!(count(&state, "measurement"), 5 + 1);
     }
 
+    #[test]
+    fn safeguard_broca_unknown_kind_is_bounded_and_structural() {
+        const MARKER: &str = "UNKNOWN_KIND_VALUE_MUST_NOT_BE_STORED";
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("run-index.db");
+        create_store(&path, "instance-a", 1);
+        let long = format!("line\n\"{}{MARKER}", "x".repeat(80));
+        let mut long_kind: Value = serde_json::from_str(&stored_segment("long-kind")).unwrap();
+        long_kind["kind"] = Value::from(long);
+        add_segment(&path, 1, "long-kind", &long_kind.to_string());
+        let mut object_kind: Value =
+            serde_json::from_str(&stored_segment("object-kind")).unwrap();
+        object_kind["kind"] = serde_json::json!({"secret":MARKER});
+        add_segment(&path, 2, "object-kind", &object_kind.to_string());
+        let state = test_state();
+
+        drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
+
+        let rows = set_aside_rows(&state);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let long_reason = &rows[0].1;
+        assert!(long_reason.contains("line\\n\\\""), "{long_reason}");
+        assert!(long_reason.contains("truncated"), "{long_reason}");
+        assert!(!long_reason.contains(MARKER), "{long_reason}");
+        assert!(rows[1].1.contains("unknown kind object"), "{rows:?}");
+        assert!(!rows[1].1.contains(MARKER), "{rows:?}");
+    }
+
     /// Batch facts re-read from a rebuilt store are exact redeliveries, and a
     /// re-read batch fact whose flow changed is a contradiction: quarantined,
     /// with the stored event left as first written.

@@ -832,6 +832,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn safeguard_claude_projects_symlink_outside_is_refused() {
+        let f = Fixture::new();
+        f.call(SESSION, "outside-call", true);
+        f.call(OTHER, "good", true);
+        let projects = f.config(SESSION).join("projects");
+        let outside = f.temp.path().join("outside-projects");
+        fs::rename(&projects, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &projects).unwrap();
+        f.declare(vec![f.root(SESSION, true), f.root(OTHER, true)]);
+
+        f.tick(100);
+
+        assert_eq!(
+            f.events().iter().map(|event| &event.0).collect::<Vec<_>>(),
+            vec!["good"]
+        );
+        assert!(f
+            .state
+            .producer_degraded_reason(SOURCE_KEY)
+            .is_some_and(|reason| reason.contains("Claude Code session projects")
+                && reason.contains("outside declared folder")));
+        assert_eq!(
+            f.acks()["read_through"],
+            json!([{"session":OTHER,"at_ms":100}])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn refuses_aliased_session_entries() {
         let f = Fixture::new();
         f.call(SESSION, "ambiguous", true);

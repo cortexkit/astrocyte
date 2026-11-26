@@ -1976,6 +1976,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn safeguard_opencode_database_symlink_outside_is_refused() {
+        let f = Fixture::new();
+        f.call(ONE, Layout::V2, "good", true, CREATED);
+        f.call(TWO, Layout::V2, "outside-call", true, CREATED);
+        let outside = f.temp.path().join("outside.db");
+        fs::rename(f.database(TWO), &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, f.database(TWO)).unwrap();
+        f.declare(vec![f.entry(TWO, true), f.entry(ONE, false)]);
+
+        f.tick(T0);
+
+        assert_eq!(f.refs(), vec!["good".to_string()]);
+        assert!(
+            f.degraded()
+                .is_some_and(|reason| reason.contains("OpenCode session database")
+                    && reason.contains("outside declared folder")),
+            "{:?}",
+            f.degraded()
+        );
+        assert_eq!(f.runtime(), Some((Some(T0), true)));
+        assert_eq!(f.watermark(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn escaping_head_symlink_is_refused_without_blocking_other_entries() {
         refuses_path(Fixture::new(), |f| {
             let outside = f.temp.path().join("outside/launch-head-runner");

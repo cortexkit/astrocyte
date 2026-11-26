@@ -541,6 +541,38 @@ mod tests {
     }
 
     #[test]
+    fn safeguard_capacity_error_detail_omits_peer_message() {
+        use crate::fusiform_client::tests::{DeadlinePeer, PeerReply};
+
+        const MARKER: &str = "PEER_MESSAGE_MUST_NOT_REACH_THE_STORE";
+        let peer = DeadlinePeer::start(vec![
+            PeerReply::opened(Duration::ZERO),
+            PeerReply::error("module_reloading", "first refusal"),
+            PeerReply::opened(Duration::ZERO),
+            PeerReply::error("quota_denied", MARKER),
+        ]);
+        let client = QtaClient::for_test(&peer.path).unwrap();
+        let state = test_state();
+        state.configure_capacity_runtime(true, 3_000, 100).unwrap();
+
+        run_iteration_with_capacity(&state, &[], Some(&client), &AtomicBool::new(false));
+
+        let detail: Option<String> = state
+            .with_conn(|conn| {
+                conn.query_row("SELECT detail FROM capacity_runtime WHERE id=1", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(
+            detail.as_deref(),
+            Some("Unavailable(\"usage.get error: quota_denied\")")
+        );
+        assert!(!detail.unwrap_or_default().contains(MARKER));
+    }
+
+    #[test]
     fn response_without_complete_providers_preserves_seeded_accounts() {
         let peer = ResponsePeer::start(json!({
             "result": [{

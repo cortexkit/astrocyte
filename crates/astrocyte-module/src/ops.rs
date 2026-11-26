@@ -2530,9 +2530,30 @@ mod tests {
 #[cfg(test)]
 mod import_boundary_tests {
     use super::*;
-    use crate::state::test_state;
+    use crate::state::{leased_test_state, test_state};
     #[cfg(unix)]
     use std::sync::Arc;
+    use std::path::{Path, PathBuf};
+
+    const STATEMENT_CSV: &str = "line_id,occurred_at,description,quantity,unit,amount_minor,currency,correlation_ref\nline-1,50,charge,1,request,2,USD,\n";
+
+    fn import_fixture() -> (tempfile::TempDir, SharedState, PathBuf) {
+        let directory = tempfile::TempDir::new().unwrap();
+        let state = leased_test_state(&directory);
+        let folder = directory.path().join("statements");
+        std::fs::create_dir(&folder).unwrap();
+        (directory, state, folder)
+    }
+
+    fn write_statement(path: &Path) {
+        std::fs::write(path, STATEMENT_CSV).unwrap();
+    }
+
+    fn assert_outside_import_folder(state: &SharedState, path: &Path) {
+        let error = dispatch(state, OP_STATEMENT_IMPORT, import_params(path)).unwrap_err();
+        assert_eq!(error.0, "statement_outside_import_folder", "{error:?}");
+        assert_eq!(statement_rows(state), 0);
+    }
 
     fn import_params(path: &std::path::Path) -> Value {
         json!({"path": path, "provider": "openai", "account_ref": "a",
@@ -2551,22 +2572,79 @@ mod import_boundary_tests {
     }
 
     #[test]
-    fn statement_import_reads_a_regular_csv_and_commits_its_line() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let path = directory.path().join("statement.csv");
-        std::fs::write(&path, "line_id,occurred_at,description,quantity,unit,amount_minor,currency,correlation_ref\nline-1,50,charge,1,request,2,USD,\n").unwrap();
-        let state = test_state();
-        let result = dispatch(&state, OP_STATEMENT_IMPORT, import_params(&path)).unwrap();
+    fn safeguard_statement_import_reads_relative_name_inside_folder() {
+        let (_directory, state, folder) = import_fixture();
+        write_statement(&folder.join("statement.csv"));
+        let result = dispatch(
+            &state,
+            OP_STATEMENT_IMPORT,
+            import_params(Path::new("statement.csv")),
+        )
+        .unwrap();
         assert_eq!(result["lines_created"], 1);
         assert_eq!(statement_rows(&state), 1);
     }
 
     #[test]
-    fn statement_import_refuses_a_directory_without_importing() {
+    fn safeguard_statement_import_refuses_parent_escape() {
+        let (directory, state, folder) = import_fixture();
+        write_statement(&directory.path().join("outside.csv"));
+        assert_outside_import_folder(&state, Path::new("../outside.csv"));
+        assert!(folder.join("../outside.csv").exists());
+    }
+
+    #[test]
+    fn safeguard_statement_import_refuses_absolute_path_outside() {
+        let (directory, state, _folder) = import_fixture();
+        let outside = directory.path().join("outside.csv");
+        write_statement(&outside);
+        assert_outside_import_folder(&state, &outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safeguard_statement_import_refuses_file_symlink_outside() {
+        let (directory, state, folder) = import_fixture();
+        let outside = directory.path().join("outside.csv");
+        write_statement(&outside);
+        let link = folder.join("statement.csv");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert_outside_import_folder(&state, &link);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safeguard_statement_import_refuses_folder_symlink_outside() {
+        let (directory, state, folder) = import_fixture();
+        write_statement(&directory.path().join("outside.csv"));
+        let link = folder.join("nested");
+        std::os::unix::fs::symlink(directory.path(), &link).unwrap();
+        assert_outside_import_folder(&state, &link.join("outside.csv"));
+    }
+
+    #[test]
+    fn statement_import_does_not_create_a_missing_import_folder() {
         let directory = tempfile::TempDir::new().unwrap();
-        let state = test_state();
+        let state = leased_test_state(&directory);
+        let folder = directory.path().join("statements");
+        let error = dispatch(
+            &state,
+            OP_STATEMENT_IMPORT,
+            import_params(&folder.join("missing.csv")),
+        )
+        .unwrap_err();
+        assert_eq!(error.0, "statement_source");
+        assert!(!folder.exists());
+        assert_eq!(statement_rows(&state), 0);
+    }
+
+    #[test]
+    fn statement_import_refuses_a_directory_without_importing() {
+        let (_directory, state, folder) = import_fixture();
+        let source = folder.join("source");
+        std::fs::create_dir(&source).unwrap();
         assert_eq!(
-            dispatch(&state, OP_STATEMENT_IMPORT, import_params(directory.path()))
+            dispatch(&state, OP_STATEMENT_IMPORT, import_params(&source))
                 .unwrap_err()
                 .0,
             "invalid_request"
@@ -2576,19 +2654,9 @@ mod import_boundary_tests {
 
     #[cfg(unix)]
     #[test]
-    fn statement_import_refuses_a_device_without_importing() {
-        let state = test_state();
-        assert_eq!(
-            dispatch(
-                &state,
-                OP_STATEMENT_IMPORT,
-                import_params(std::path::Path::new("/dev/null"))
-            )
-            .unwrap_err()
-            .0,
-            "invalid_request"
-        );
-        assert_eq!(statement_rows(&state), 0);
+    fn statement_import_refuses_a_device_outside_the_import_folder() {
+        let (_directory, state, _folder) = import_fixture();
+        assert_outside_import_folder(&state, Path::new("/dev/null"));
     }
 
     #[test]
@@ -2610,14 +2678,14 @@ mod import_boundary_tests {
     #[cfg(unix)]
     #[test]
     fn statement_import_refuses_fifo_without_waiting_for_a_writer() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let fifo = directory.path().join("statement.fifo");
+        let (_directory, state, folder) = import_fixture();
+        let fifo = folder.join("statement.fifo");
         assert!(std::process::Command::new("mkfifo")
             .arg(&fifo)
             .status()
             .unwrap()
             .success());
-        let state = Arc::new(test_state());
+        let state = Arc::new(state);
         let importing = Arc::clone(&state);
         let params = import_params(&fifo);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2644,13 +2712,12 @@ mod import_boundary_tests {
 
     #[test]
     fn statement_import_refuses_files_over_64_mib_without_importing() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let path = directory.path().join("large.csv");
+        let (_directory, state, folder) = import_fixture();
+        let path = folder.join("large.csv");
         std::fs::File::create(&path)
             .unwrap()
             .set_len(64 * 1024 * 1024 + 1)
             .unwrap();
-        let state = test_state();
         let error = dispatch(&state, OP_STATEMENT_IMPORT, import_params(&path)).unwrap_err();
         assert_eq!(statement_rows(&state), 0);
         assert_eq!(error.0, "invalid_request");
