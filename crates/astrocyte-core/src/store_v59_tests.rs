@@ -100,6 +100,7 @@ mod session_refs {
                                 | "broca_scope_backfill"
                                 | "quota_reset_period"
                                 | "multiplier_provider_day"
+                                | "media_caller"
                         )
                     })
                     .collect();

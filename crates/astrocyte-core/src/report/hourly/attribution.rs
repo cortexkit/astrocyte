@@ -20,7 +20,11 @@ impl Attribution {
     }
 }
 
-type ScopeStamps = HashMap<i64, (ScopeStamp, String)>;
+#[derive(Default)]
+pub(super) struct ScopeStamps {
+    broca: HashMap<i64, (ScopeStamp, String)>,
+    media: HashMap<i64, String>,
+}
 
 pub(super) fn stamps_sql(filter: &str) -> String {
     format!(
@@ -45,7 +49,16 @@ pub(super) fn stamps(conn: &Connection, filter: &str) -> Result<ScopeStamps, Rep
             ),
         ))
     })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let broca = rows.collect::<rusqlite::Result<_>>()?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT c.event_key,c.agent_id FROM (SELECT event_key FROM usage_event WHERE {filter}) e
+         CROSS JOIN media_caller c ON c.event_key=e.event_key WHERE c.agent_id IS NOT NULL"
+    ))?;
+    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(ScopeStamps {
+        broca,
+        media: rows.collect::<rusqlite::Result<_>>()?,
+    })
 }
 
 pub(super) fn resolve(
@@ -65,11 +78,14 @@ pub(super) fn resolve(
             event.occurred_at_ms,
         )
         .map_err(|_| ReportError::Integrity("invalid attribution evidence"))?;
-    match stamps.get(&event.key) {
+    match stamps.broca.get(&event.key) {
         Some((stamp, kind)) => resolver
             .apply_stamp(conn, tuple, stamp, kind, event.occurred_at_ms)
             .map_err(|_| ReportError::Integrity("invalid attribution evidence")),
-        None => Ok((tuple, false)),
+        None => Ok(match stamps.media.get(&event.key) {
+            Some(agent) => tuple.with_media_caller(agent),
+            None => (tuple, false),
+        }),
     }
 }
 

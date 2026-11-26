@@ -15,11 +15,16 @@ pub(crate) fn conn() -> Connection {
 /// A migration fixture can still use today's summary builder without
 /// applying unrelated data changes that came after the migration under test.
 pub(crate) fn add_scope_schema_for_historical_summary(conn: &Connection) {
-    let scope = MIGRATIONS
-        .iter()
-        .find(|step| step.statements.contains("CREATE TABLE broca_scope_stamp ("))
-        .expect("scope stamp schema belongs to a migration");
-    conn.execute_batch(scope.statements).unwrap();
+    for table in [
+        "CREATE TABLE broca_scope_stamp (",
+        "CREATE TABLE media_caller (",
+    ] {
+        let scope = MIGRATIONS
+            .iter()
+            .find(|step| step.statements.contains(table))
+            .expect("attribution evidence schema belongs to a migration");
+        conn.execute_batch(scope.statements).unwrap();
+    }
 }
 
 pub(crate) fn measurement(role: &str, units: Option<i64>) -> MeasurementInput {

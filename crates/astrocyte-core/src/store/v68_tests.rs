@@ -57,7 +57,9 @@ fn schema_v68_preserves_populated_rows_and_splits_observation_originals() {
         })
         .unwrap();
 
-    let result = migrate_store(&store).unwrap();
+    let result = store
+        .migrate("astrocyte", &MIGRATIONS[..=previous.len()])
+        .unwrap();
     assert_eq!((result.applied, result.recorded), (1, 68));
     store
         .with_conn(|conn| {

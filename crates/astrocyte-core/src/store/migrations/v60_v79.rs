@@ -516,3 +516,26 @@ WHEN EXISTS (SELECT 1 FROM multiplier_observation parent WHERE parent.observatio
         OR (NEW.pool_scope IS NOT NULL AND parent.window_pool_key IS NOT NEW.window_pool_key)))
 BEGIN SELECT RAISE(ABORT, 'multiplier_observation_same_lineage'); END;
 "#;
+
+pub(in crate::store) const V69: &str = r#"
+CREATE TABLE media_caller (
+    event_key INTEGER PRIMARY KEY REFERENCES usage_event(event_key),
+    agent_id TEXT,
+    device TEXT CHECK(device IS NULL OR (json_valid(device) AND json_type(device) = 'object')),
+    CHECK(agent_id IS NOT NULL OR device IS NOT NULL)
+);
+CREATE TRIGGER media_caller_no_update BEFORE UPDATE ON media_caller
+    BEGIN SELECT RAISE(ABORT,'media_caller is append-only'); END;
+CREATE TRIGGER media_caller_no_delete BEFORE DELETE ON media_caller
+    BEGIN SELECT RAISE(ABORT,'media_caller is append-only'); END;
+CREATE TRIGGER media_caller_insert_once BEFORE INSERT ON media_caller
+    WHEN EXISTS (SELECT 1 FROM media_caller WHERE event_key=NEW.event_key)
+    BEGIN SELECT RAISE(ABORT,'media_caller is append-only'); END;
+CREATE TRIGGER media_caller_dirty_hour AFTER INSERT ON media_caller BEGIN
+    UPDATE attribution_hour SET revision=revision+1 WHERE (kind,hour_number) IN (
+        SELECT CASE WHEN occurred_at_ms IS NULL THEN 1 ELSE 0 END,
+               coalesce(occurred_at_ms/3600000-(occurred_at_ms<0 AND occurred_at_ms%3600000<>0),0)
+        FROM usage_event WHERE event_key=NEW.event_key
+    );
+END;
+"#;

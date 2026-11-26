@@ -573,7 +573,7 @@ durable, full-tick polling and absence backoff remain unchanged. A wake bypasses
 absence backoff. The backstop also finds records too large for Colliculus's bus
 publication limit. Bus bodies are ignored: only `usage.read` supplies evidence.
 
-The reader decodes the published `cortexkit-role-media` 0.1.6 types. Each vendor
+The reader decodes the published `cortexkit-role-media` 0.1.12 types. Each vendor
 record uses its `record_id` as the colliculus producer reference, without an instance
 or epoch qualifier. Its one job, stream or call id is the run reference and its
 principal is the work class. API-key vendor work is metered, OAuth vendor work is subscription-included,

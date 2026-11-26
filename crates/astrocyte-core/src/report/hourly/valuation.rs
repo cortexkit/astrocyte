@@ -147,7 +147,7 @@ fn reduce_both(
     let stamps = if projection.is_some() {
         attribution::stamps(conn, filter)?
     } else {
-        HashMap::new()
+        attribution::ScopeStamps::default()
     };
     // Bulk reads stay scoped by the chunk's time/key bounds. In particular, do
     // not pass per-member event-key lists through the runs reducer: its forced

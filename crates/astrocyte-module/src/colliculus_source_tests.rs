@@ -753,6 +753,135 @@ fn media_usage_vectors_drain_with_invalid_and_unrepresentable_evidence() {
 }
 
 #[test]
+fn media_caller_is_read_and_stored_with_the_call() {
+    let mut entry = vendor_entry(1);
+    entry["record"]["principal"] = json!("reserved:callosum");
+    let caller = json!({"agent_id":"stated-owner","device":{
+        "class":"phone","fingerprint":"device-fingerprint-1","pairing_id":"pairing-1","name":"Relayed phone"
+    }});
+    entry["record"]["caller"] = caller.clone();
+    let decoded = serde_json::from_value::<ReadEntry>(entry.clone())
+        .unwrap()
+        .decode()
+        .unwrap();
+    assert_eq!(
+        json!(decoded.record.unwrap())["caller"],
+        caller,
+        "the wire decoder must retain caller evidence"
+    );
+    let peer = Peer::start(fixed_page(vec![entry]));
+    let state = test_state();
+    tick(&state, &peer.source());
+
+    assert_eq!(
+        count(&state, "usage_event"),
+        1,
+        "caller arrived as a ledger call"
+    );
+    assert_eq!(count(&state, "set_aside_record"), 0);
+    state.with_conn(|conn| {
+        let call = conn.query_row(
+            "SELECT work_class,agent_id,device FROM usage_event JOIN media_caller USING(event_key)",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        ).unwrap();
+        assert_eq!(call.0, "reserved:callosum");
+        assert_eq!(call.1, "stated-owner");
+        assert_eq!(serde_json::from_str::<Value>(&call.2).unwrap(), caller["device"]);
+        Ok(())
+    }).unwrap();
+}
+
+#[test]
+fn media_caller_role_vectors_preserve_legacy_and_local_behavior() {
+    let vectors: Value =
+        serde_json::from_str(cortexkit_role_media::vectors::file("attribution.json").unwrap())
+            .unwrap();
+    let entries = vectors["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(1_u64..)
+        .map(|(record, seq)| json!({"seq":seq,"record":record}))
+        .collect();
+    let peer = Peer::start(fixed_page(entries));
+    let state = test_state();
+    tick(&state, &peer.source());
+
+    assert_eq!(cursor(&state).as_deref(), Some("3"));
+    assert_eq!(count(&state, "set_aside_record"), 0);
+    assert_eq!(count(&state, "rejected_delivery"), 0);
+    assert_eq!(count(&state, "measurement"), 1);
+    assert_eq!(count(&state, "media_caller"), 1);
+    state
+        .with_conn(|conn| {
+            let skipped: i64 = conn
+                .query_row("SELECT skipped_local FROM media_feed_cursor", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(skipped, 1);
+            let calls = conn
+                .prepare(
+                    "SELECT producer_ref,work_class,charge_basis,agent_id,device
+             FROM usage_event LEFT JOIN media_caller USING(event_key) ORDER BY producer_ref",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    let device: Option<String> = row.get(4)?;
+                    Ok(json!([
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        device.map(|text| serde_json::from_str::<Value>(&text).unwrap()),
+                    ]))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                calls,
+                [
+                    json!(["r-caller-absent", "person-a", "unknown", null, null]),
+                    json!([
+                        "r-relayed-call",
+                        "person-a",
+                        "unknown",
+                        "agent-relayed",
+                        vectors["records"][0]["caller"]["device"]
+                    ]),
+                ]
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn media_caller_over_contract_bound_is_set_aside() {
+    let mut entry = vendor_entry(1);
+    entry["record"]["caller"] = json!({"agent_id":"é".repeat(257),"device":null});
+    let peer = Peer::start(fixed_page(vec![entry]));
+    let state = test_state();
+    tick(&state, &peer.source());
+
+    assert_eq!(cursor(&state).as_deref(), Some("1"));
+    assert_eq!(count(&state, "usage_event"), 0);
+    assert_eq!(count(&state, "media_caller"), 0);
+    assert_eq!(count(&state, "set_aside_record"), 1);
+    state
+        .with_conn(|conn| {
+            let reason: String = conn
+                .query_row("SELECT reason FROM set_aside_record", [], |row| row.get(0))
+                .unwrap();
+            assert!(reason.contains("caller.agent_id"), "{reason}");
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn media_voice_call_v1_pinned_reply_prices_each_record_at_its_model_rates() {
     let bytes = voice_call_v1_reply();
     let peer = Peer::start_bytes(Arc::new(move |value| {

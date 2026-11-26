@@ -512,6 +512,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 68,
         statements: migrations::v60_v79::V68,
     },
+    Migration {
+        version: 69,
+        statements: migrations::v60_v79::V69,
+    },
 ];
 
 #[cfg(test)]
@@ -581,6 +585,7 @@ mod tests {
     include!("store_v33_tests.rs");
     include!("store_v64_tests.rs");
     include!("store/v68_tests.rs");
+    include!("store/v69_tests.rs");
 
     #[test]
     fn lookup_index_migration_adds_two_indexes_and_changes_no_rows() {

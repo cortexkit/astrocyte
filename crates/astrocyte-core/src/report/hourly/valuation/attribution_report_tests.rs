@@ -282,6 +282,104 @@ fn attribution_report_broca_scope_publisher_wins_and_counts_disagreement() {
 }
 
 #[test]
+fn attribution_report_media_caller_falls_back_to_stated_agent_only() {
+    let mut conn = conn();
+    record_media_call(&mut conn, "agent-only", json!({"agent_id":"stated-agent"}));
+    record_media_call(
+        &mut conn,
+        "device-only",
+        json!({"device":{
+            "class":"phone","fingerprint":"fingerprint","pairing_id":"pairing","name":"Phone"
+        }}),
+    );
+    summaries(&mut conn);
+    drain(&mut conn);
+
+    let result = spend_report(
+        &conn,
+        &request(json!({"grouping":["alfonso","workload"]})),
+        DAY_MS,
+    )
+    .unwrap();
+    assert_eq!(result.rows.len(), 2);
+    for owner in [Some("stated-agent"), None] {
+        assert!(
+            result.rows.iter().any(|row| {
+                row.grouping["alfonso"].as_deref() == owner
+                    && row.grouping["workload"].is_none()
+                    && row.events_total == 1
+            }),
+            "missing group {owner:?}"
+        );
+    }
+    let coverage = result.attribution_coverage.unwrap();
+    assert_eq!(
+        (coverage.attributed_calls, coverage.unattributed_calls),
+        (1, 1)
+    );
+    assert_eq!(coverage.stamp_disagreement_calls, 0);
+}
+
+#[test]
+fn attribution_report_media_caller_yields_to_publisher_and_counts_disagreement() {
+    let mut conn = conn();
+    for (id, owner) in [("different", "stated-agent"), ("same", "published-agent")] {
+        record_media_call(&mut conn, id, json!({"agent_id":owner}));
+    }
+    // Run ownership joins by the published run ID, not by the call's runner.
+    publish_facts(
+        &mut conn,
+        Publisher::Prefrontal,
+        json!([{
+        "fact_id":"owner","subject":{"kind":"run","harness":"broca","run_id":"media-run"},
+            "alfonso":"published-agent","workload":"published-workload",
+            "effective_from_ms":0,"recorded_at_ms":0
+        }]),
+    );
+    summaries(&mut conn);
+    drain(&mut conn);
+
+    let result = spend_report(
+        &conn,
+        &request(json!({"grouping":["alfonso","workload"]})),
+        DAY_MS,
+    )
+    .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(
+        result.rows[0].grouping["alfonso"].as_deref(),
+        Some("published-agent")
+    );
+    assert_eq!(
+        result.rows[0].grouping["workload"].as_deref(),
+        Some("published-workload")
+    );
+    assert_eq!(result.rows[0].events_total, 2);
+    assert_eq!(
+        result
+            .attribution_coverage
+            .unwrap()
+            .stamp_disagreement_calls,
+        1
+    );
+}
+
+fn record_media_call(conn: &mut Connection, id: &str, caller: serde_json::Value) {
+    let wire = serde_json::from_value(json!({
+        "record_id":id,"principal":"reserved:callosum","call_id":"media-run",
+        "provider":"provider","model":"a","charge_basis":"vendor","auth_method":"api_key",
+        "started_at_ms":1,"finished_at_ms":2,"status":"ended","caller":caller,
+        "selectors":{},"measurements":[{"role":"input","unit":"token","quantity":"1",
+        "measure":"billed","source":"vendor_reply"}]
+    }))
+    .unwrap();
+    let (event, evidence) = crate::media::map_record(&wire).unwrap().unwrap();
+    let tx = conn.transaction().unwrap();
+    ingest::record_media_event_in_tx(&tx, &event, &evidence, 3).unwrap();
+    tx.commit().unwrap();
+}
+
+#[test]
 fn attribution_report_broca_scope_join_seeks_stamps_by_call_key() {
     use crate::report::hourly::attribution::stamps_sql;
     let conn = conn();

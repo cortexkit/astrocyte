@@ -334,7 +334,7 @@ pub struct BasisCorrectRequest {
 
 #[derive(Debug)]
 struct EventPayload {
-    media: Option<crate::media::MediaFacts>,
+    media: Option<crate::media::MediaEvidence>,
     prior_event_ref: Option<String>,
     harness: Option<String>,
     project_root: Option<String>,
@@ -385,7 +385,7 @@ impl EventPayload {
     fn restated_by(
         &self,
         incoming: &EventRecordRequest,
-        media: Option<&crate::media::MediaFacts>,
+        media: Option<&crate::media::MediaEvidence>,
     ) -> bool {
         if self.media.as_ref() != media
             || self.prior_event_ref != incoming.prior_event_ref
@@ -540,12 +540,12 @@ pub fn record_event_in_tx(
     record_event_with_facts_in_tx(tx, request, recorded_at_ms, delivery, None)
 }
 
-/// Records media price facts with the event. Passing them separately keeps the
+/// Records media pricing and caller evidence with the event. Passing it separately keeps the
 /// `spend.event.ingest` request schema unchanged.
 pub fn record_media_event_in_tx(
     tx: &Transaction<'_>,
     request: &EventRecordRequest,
-    media: &crate::media::MediaFacts,
+    media: &crate::media::MediaEvidence,
     recorded_at_ms: i64,
 ) -> Result<EventRecordOutcome, IngestError> {
     record_event_with_facts_in_tx(tx, request, recorded_at_ms, DeliveryPath::Read, Some(media))
@@ -556,11 +556,13 @@ fn record_event_with_facts_in_tx(
     request: &EventRecordRequest,
     recorded_at_ms: i64,
     delivery: DeliveryPath,
-    media: Option<&crate::media::MediaFacts>,
+    media: Option<&crate::media::MediaEvidence>,
 ) -> Result<EventRecordOutcome, IngestError> {
     validate_event_request(request, recorded_at_ms)?;
 
-    if let Some((stored_event_id, stored_payload)) = load_event_payload(tx, request)? {
+    if let Some((stored_event_id, stored_payload)) =
+        load_event_payload(tx, request, media.is_some())?
+    {
         if stored_payload.restated_by(request, media) {
             // An exact re-read may give an event recorded before its reader
             // kept this detail the row it lacks. It never changes a row.
@@ -612,7 +614,11 @@ fn record_event_with_facts_in_tx(
         });
     }
 
-    let local_event_id = insert_event(tx, request, recorded_at_ms, media)?;
+    let local_event_id =
+        insert_event(tx, request, recorded_at_ms, media.map(|media| &media.facts))?;
+    if let Some(caller) = media.and_then(|media| media.caller.as_ref()) {
+        crate::media::insert_caller(tx, &local_event_id, caller)?;
+    }
 
     let mut effects = PairEffects::default();
     let mut waiting_for_target = false;
@@ -926,14 +932,14 @@ fn validate_event_request(
 
 fn canonical_incoming_payload(
     request: &EventRecordRequest,
-    media: Option<&crate::media::MediaFacts>,
+    media: Option<&crate::media::MediaEvidence>,
 ) -> Result<String, CanonError> {
     jcs_serialize(&incoming_payload_value(request, media))
 }
 
 pub(crate) fn incoming_payload_value(
     request: &EventRecordRequest,
-    media: Option<&crate::media::MediaFacts>,
+    media: Option<&crate::media::MediaEvidence>,
 ) -> serde_json::Value {
     let mut measurements = request.measurements.iter().collect::<Vec<_>>();
     measurements.sort_by(|left, right| (&left.role, &left.unit).cmp(&(&right.role, &right.unit)));
@@ -973,7 +979,10 @@ pub(crate) fn incoming_payload_value(
         object.insert("resolved_credential".into(), json!(credential));
     }
     if let (Some(media), Some(object)) = (media, payload.as_object_mut()) {
-        object.insert("media_facts".into(), json!(media));
+        object.insert("media_facts".into(), json!(media.facts));
+        if let Some(caller) = &media.caller {
+            object.insert("caller".into(), json!(caller));
+        }
     }
     payload
 }
@@ -985,7 +994,7 @@ pub(crate) fn strictly_restates_event(
     tx: &Transaction<'_>,
     request: &EventRecordRequest,
 ) -> Result<bool, IngestError> {
-    let Some((_, stored)) = load_event_payload(tx, request)? else {
+    let Some((_, stored)) = load_event_payload(tx, request, false)? else {
         return Ok(false);
     };
     let mut incoming = request.measurements.iter().collect::<Vec<_>>();
@@ -1001,6 +1010,7 @@ pub(crate) fn strictly_restates_event(
 fn load_event_payload(
     tx: &Transaction<'_>,
     request: &EventRecordRequest,
+    include_media_caller: bool,
 ) -> Result<Option<(String, EventPayload)>, IngestError> {
     // `IS` is null-safe equality: a lineage-absent request must find the
     // lineage-absent stored row, which `= NULL` could never match.
@@ -1010,7 +1020,7 @@ fn load_event_payload(
                 occurred_at_ms,emitted_at_ms,terminal_status,attempt_ordinal,
                 vendor_request_id,provider,model,account_ref,auth_selection,charge_basis,
                 charge_basis_mapping_version,charge_basis_overrides,event_id,flow_ref,media_facts,
-                resolved_credential
+                resolved_credential,event_key
          FROM usage_event
          WHERE producer=?1 AND producer_lineage IS ?2 AND producer_ref=?3",
         )?
@@ -1025,8 +1035,14 @@ fn load_event_payload(
                 let charge_basis = row.get::<_, String>(15)?;
                 Ok((
                     row.get::<_, String>(18)?,
+                    row.get::<_, i64>(22)?,
                     EventPayload {
-                        media: crate::media::read_facts(row, 20)?,
+                        media: crate::media::read_facts(row, 20)?.map(|facts| {
+                            crate::media::MediaEvidence {
+                                facts,
+                                caller: None,
+                            }
+                        }),
                         prior_event_ref: row.get(0)?,
                         harness: row.get(1)?,
                         project_root: row.get(2)?,
@@ -1060,9 +1076,12 @@ fn load_event_payload(
             },
         )
         .optional()?;
-    let Some((event_id, mut payload)) = stored else {
+    let Some((event_id, event_key, mut payload)) = stored else {
         return Ok(None);
     };
+    if let Some(media) = payload.media.as_mut().filter(|_| include_media_caller) {
+        media.caller = crate::media::read_caller(tx, event_key)?;
+    }
     payload.measurements = load_measurements(tx, &event_id)?;
     Ok(Some((event_id, payload)))
 }

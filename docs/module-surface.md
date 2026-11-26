@@ -408,8 +408,11 @@ Reads never write. A refusal on a read is one of the codes below.
   `project_id` from the stamped run's publisher fact when known. The workload
   is `broca_session` for session segments and model attempts, and `system_one`
   for System One calls, whose export does not name an operation. No task is
-  inferred. Without matching publisher or stamp evidence, all five values are
-  null (Not attributed). A known fact may itself name a null Alfonso, so a null
+  inferred. If no publisher fact matches a Colliculus call, its `caller.agent_id`
+  supplies `alfonso` only. This is the app's stated value, not a verified
+  identity or a permission. Device evidence is not an attribution dimension.
+  Without matching publisher or fallback evidence, all five values are null
+  (Not attributed). A known fact may itself name a null Alfonso, so a null
   Alfonso group alone does not prove that every call lacks attribution.
 
   A request grouping or filtering by attribution additionally carries
@@ -417,8 +420,9 @@ Reads never write. A refusal on a read is one of the codes below.
   dated calls in the selected range with its non-attribution filters, ignoring
   attribution filters. Their sum equals the ordinary report's dated call total
   for that population. When nonzero, `stamp_disagreement_calls` counts calls
-  in the same population for which the winning publisher fact and the stamp
-  name different agents. The publisher still wins. Even without a range,
+  in the same population for which the winning publisher fact and either the
+  BROCA stamp or the Colliculus caller name different agents. The publisher
+  still wins. Even without a range,
   undated calls remain solely in the separate `undated` disclosure. Ordinary
   requests omit attribution coverage.
   Tests: `attribution_report_real_split_rows_keep_unattributed_and_all_metric_totals`,

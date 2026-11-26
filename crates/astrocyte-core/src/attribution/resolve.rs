@@ -143,6 +143,27 @@ pub(crate) struct Resolver {
     placements: HashMap<String, Arc<[Placement]>>,
 }
 
+impl Attribution {
+    fn publisher_disagreement(&self, stated_agent: Option<&str>) -> Option<bool> {
+        // A publisher fact always supplies a workload, even when it does not
+        // name an agent. Stated evidence cannot fill in that missing agent.
+        self.workload.as_ref().map(|_| {
+            self.alfonso
+                .as_deref()
+                .zip(stated_agent)
+                .is_some_and(|(publisher, stated)| publisher != stated)
+        })
+    }
+
+    pub(crate) fn with_media_caller(mut self, agent: &str) -> (Self, bool) {
+        if let Some(disagrees) = self.publisher_disagreement(Some(agent)) {
+            return (self, disagrees);
+        }
+        self.alfonso = Some(agent.to_owned());
+        (self, false)
+    }
+}
+
 impl Resolver {
     pub(crate) fn resolve(
         &mut self,
@@ -181,12 +202,7 @@ impl Resolver {
         call_kind: &str,
         at: Option<i64>,
     ) -> Result<(Attribution, bool), String> {
-        if tuple.workload.is_some() {
-            let disagrees = tuple
-                .alfonso
-                .as_ref()
-                .zip(stamp.agent_id.as_ref())
-                .is_some_and(|(publisher, stamped)| publisher != stamped);
+        if let Some(disagrees) = tuple.publisher_disagreement(stamp.agent_id.as_deref()) {
             return Ok((tuple, disagrees));
         }
         if let Some(flow) = &stamp.flow_id {

@@ -2,23 +2,39 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cortexkit_role_media::usage::{self, AuthMethod, ChargeBasis, Measure, UsageRecord};
+use cortexkit_role_media::usage::{
+    self, AuthMethod, ChargeBasis, Measure, UsageCaller, UsageDevice, UsageRecord,
+};
+use rusqlite::{params, OptionalExtension, Row, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::ingest::{EventRecordRequest, MeasurementInput};
+use crate::canon::jcs_serialize;
+use crate::ingest::{EventRecordRequest, IngestError, MeasurementInput};
 
-/// Producer-stated facts stored on the event and compared on every redelivery.
+/// Producer-stated pricing facts stored on the event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaFacts {
     pub selectors: BTreeMap<String, String>,
     pub failure: Option<Value>,
 }
 
-pub(crate) fn read_facts(
-    row: &rusqlite::Row<'_>,
+/// Media facts compared on every redelivery. Caller evidence lives outside the
+/// event because it affects attribution, not pricing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaEvidence {
+    pub facts: MediaFacts,
+    pub caller: Option<UsageCaller>,
+}
+
+pub(crate) fn read_facts(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<MediaFacts>> {
+    read_json(row, column)
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(
+    row: &Row<'_>,
     column: usize,
-) -> rusqlite::Result<Option<MediaFacts>> {
+) -> rusqlite::Result<Option<T>> {
     row.get::<_, Option<String>>(column)?
         .map(|text| {
             serde_json::from_str(&text).map_err(|error| {
@@ -32,10 +48,42 @@ pub(crate) fn read_facts(
         .transpose()
 }
 
+pub(crate) fn read_caller(
+    tx: &Transaction<'_>,
+    event_key: i64,
+) -> rusqlite::Result<Option<UsageCaller>> {
+    tx.prepare_cached("SELECT agent_id,device FROM media_caller WHERE event_key=?1")?
+        .query_row([event_key], |row| {
+            Ok(UsageCaller::new(
+                row.get(0)?,
+                read_json::<UsageDevice>(row, 1)?,
+            ))
+        })
+        .optional()
+}
+
+pub(crate) fn insert_caller(
+    tx: &Transaction<'_>,
+    event_id: &str,
+    caller: &UsageCaller,
+) -> Result<(), IngestError> {
+    let device = caller
+        .device
+        .as_ref()
+        .map(|device| jcs_serialize(&json!(device)))
+        .transpose()?;
+    tx.execute(
+        "INSERT INTO media_caller(event_key,agent_id,device)
+         SELECT event_key,?2,?3 FROM usage_event WHERE event_id=?1",
+        params![event_id, caller.agent_id, device],
+    )?;
+    Ok(())
+}
+
 /// `None` is local work: it contributes coverage, but is not a spend event.
 pub fn map_record(
     record: &UsageRecord,
-) -> Result<Option<(EventRecordRequest, MediaFacts)>, String> {
+) -> Result<Option<(EventRecordRequest, MediaEvidence)>, String> {
     usage::check_usage_record(record).map_err(|error| format!("invalid media record: {error}"))?;
     if record.charge_basis == ChargeBasis::Local {
         return Ok(None);
@@ -102,9 +150,18 @@ pub fn map_record(
     request.runner = Some("colliculus".into());
     Ok(Some((
         request,
-        MediaFacts {
-            selectors: record.selectors.clone(),
-            failure: record.failure.as_ref().map(|failure| json!(failure)),
+        MediaEvidence {
+            facts: MediaFacts {
+                selectors: record.selectors.clone(),
+                failure: record.failure.as_ref().map(|failure| json!(failure)),
+            },
+            // The wire check already bounds each string. Keep the exact IDs so
+            // attribution and replay checks cannot confuse two truncated IDs.
+            caller: record
+                .caller
+                .as_ref()
+                .filter(|caller| caller.agent_id.is_some() || caller.device.is_some())
+                .cloned(),
         },
     )))
 }
@@ -181,7 +238,7 @@ mod tests {
                     if record.record_id == "r-failed" {
                         assert_eq!(event.run_ref.as_deref(), Some("stream-1"));
                         assert_eq!(event.terminal_status.as_deref(), Some("failed"));
-                        assert_eq!(facts.failure.unwrap()["code"], "routing_refused");
+                        assert_eq!(facts.facts.failure.unwrap()["code"], "routing_refused");
                         assert!(event.measurements.is_empty());
                     } else {
                         assert_eq!(event.run_ref.as_deref(), Some("job-1"));
@@ -286,7 +343,10 @@ mod tests {
             RecordDisposition::ExactRedelivery
         );
         let mut changed = facts.clone();
-        changed.selectors.insert("quality".into(), "low".into());
+        changed
+            .facts
+            .selectors
+            .insert("quality".into(), "low".into());
         assert_eq!(
             record_media_event_in_tx(&tx, &event, &changed, 5)
                 .unwrap()
@@ -294,7 +354,7 @@ mod tests {
             RecordDisposition::QuarantinedRedelivery
         );
         changed = facts.clone();
-        changed.failure = None;
+        changed.facts.failure = None;
         assert_eq!(
             record_media_event_in_tx(&tx, &event, &changed, 6)
                 .unwrap()
@@ -318,5 +378,75 @@ mod tests {
             .unwrap(),
             "v"
         );
+    }
+
+    #[test]
+    fn media_caller_exact_replay_writes_nothing_and_changes_are_quarantined() {
+        let mut conn = crate::test_support::conn();
+        let agent = "a".repeat(128);
+        let device = json!({"class":"phone","name":"Phone","pairing_id":"p","fingerprint":"f"});
+        let mut payload = json!({
+            "record_id":"r","principal":"reserved:callosum","call_id":"c",
+            "provider":"example","model":"speech","charge_basis":"vendor",
+            "started_at_ms":1,"finished_at_ms":2,"status":"ended",
+            "caller":{"agent_id":agent,"device":device},"selectors":{},"measurements":[]
+        });
+        let (event, evidence) = map_record(&record(payload.clone())).unwrap().unwrap();
+        let tx = conn.transaction().unwrap();
+        let first = record_media_event_in_tx(&tx, &event, &evidence, 3).unwrap();
+        assert_eq!(first.disposition, RecordDisposition::Recorded);
+        let before = tx.total_changes();
+        let replay = record_media_event_in_tx(&tx, &event, &evidence, 4).unwrap();
+        assert_eq!(replay.disposition, RecordDisposition::ExactRedelivery);
+        assert_eq!(
+            tx.total_changes(),
+            before,
+            "exact replay wrote a row or dirtied an hour"
+        );
+
+        let different_agent = format!("{}b", "a".repeat(127));
+        let other_device =
+            json!({"class":"phone","name":"Other","pairing_id":"p","fingerprint":"f"});
+        for changed_caller in [
+            json!({"agent_id":different_agent,"device":device}),
+            json!({"agent_id":agent,"device":other_device}),
+            Value::Null,
+        ] {
+            payload["caller"] = changed_caller.clone();
+            let (event, evidence) = map_record(&record(payload.clone())).unwrap().unwrap();
+            let outcome = record_media_event_in_tx(&tx, &event, &evidence, 5).unwrap();
+            assert_eq!(
+                outcome.disposition,
+                RecordDisposition::QuarantinedRedelivery
+            );
+            assert_eq!(outcome.event_id, first.event_id);
+            let rejected: String = tx
+                .query_row(
+                    "SELECT incoming_payload FROM rejected_delivery ORDER BY rowid DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&rejected).unwrap()["caller"],
+                changed_caller
+            );
+        }
+        assert_eq!(
+            tx.total_changes(),
+            before + 3,
+            "only rejection rows should be written"
+        );
+        let stored: (String, String) = tx
+            .query_row("SELECT agent_id,device FROM media_caller", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(stored.0, agent);
+        assert_eq!(
+            stored.1,
+            r#"{"class":"phone","fingerprint":"f","name":"Phone","pairing_id":"p"}"#
+        );
+        tx.commit().unwrap();
     }
 }

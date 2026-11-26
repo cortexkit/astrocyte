@@ -343,8 +343,8 @@ impl ColliculusSource {
                     }
                     if let Some(record) = &entry.record {
                         match astrocyte_core::media::map_record(record) {
-                            Ok(Some((event, facts))) => {
-                                let outcome = record_media_event_in_tx(tx, &event, &facts, now).map_err(|error| format!("record media event: {error:?}"))?;
+                            Ok(Some((event, media))) => {
+                                let outcome = record_media_event_in_tx(tx, &event, &media, now).map_err(|error| format!("record media event: {error:?}"))?;
                                 quarantined |= outcome.disposition == RecordDisposition::QuarantinedRedelivery;
                             }
                             Ok(None) => { if entry.seq > cursor { local += 1; } }

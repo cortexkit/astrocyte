@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 68. A schema change appends a migration; an applied
+currently version 69. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -21,6 +21,7 @@ copies that timeout without running the table-creating probes.
 | `broca_attempt_detail` | Each row keeps a BROCA call's attempt identifiers, original share index, outcome and HTTP status, response counts, tier, speed, pricing mode and segment link. Usage lives in the call's ledger measurements. | insert only, once per call |
 | `broca_scope_stamp` | Each row preserves the daemon-stamped agent, agent run or flow and the BROCA export fact kind for an existing ledger call. Unstamped calls have no row. The stamp is attribution evidence, not a ledger or pricing field. | insert only, once per call; dirties the attribution hour |
 | `broca_scope_backfill` | The singleton tracks how far a one-time read of retained BROCA exports has filled stamps for existing calls, and whether it caught up to the reader's committed cursor. | advances with each backfill page; stops on completion |
+| `media_caller` | Each row holds caller evidence for a Colliculus ledger call: the app's stated `agent_id` and the daemon-relayed `device` as JSON. Either may be absent, but not both. Without a matching publisher fact, the stated agent supplies only `alfonso`. Device is not a grouping dimension, and neither value changes pricing or permissions. | insert only, once per call; dirties the attribution hour |
 | `broca_segment_check_state` | The singleton stores the insertion cursor of the last segment checked against its attempt shares. | advances with each checked batch |
 | `broca_segment_mismatch` | Each row preserves a differing segment and attempt quantity (including whether each side reported it), the role and unit, and the check time. When the attempt sum exceeds the integer range, `over_range` is set and the sum is NULL. | insert only, once per segment, role and unit |
 | `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
