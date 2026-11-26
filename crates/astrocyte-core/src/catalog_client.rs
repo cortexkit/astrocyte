@@ -95,19 +95,79 @@ pub struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
-    pub(crate) fn reasoning_billed_as_output(&self) -> bool {
-        let fact_key = "rate.reasoning";
+    pub(crate) fn has_base_billing_rule(&self, role: &str) -> bool {
+        let fact_key = match role {
+            "reasoning" => "rate.reasoning",
+            "cache_write" => "rate.cache_write",
+            _ => return false,
+        };
         !self.withheld_facts.contains_key(fact_key)
             && !self.uncertain_facts.contains_key(fact_key)
             && self.facts.get(fact_key).is_some_and(|entry| {
                 matches!(serde_json::from_value::<RateValue>(entry.clone()),
-                    Ok(RateValue::BilledAs { key }) if bills_reasoning_as_output(fact_key, &key))
+                    Ok(RateValue::BilledAs { key }) if billed_as_target(fact_key, &key).is_some())
             })
     }
 }
 
-pub(crate) fn bills_reasoning_as_output(fact_key: &str, target_key: &str) -> bool {
-    fact_key == "rate.reasoning" && target_key == "rate.output"
+const INPUT_TIER_PREFIX: &str = "rate.input.above_context.";
+
+/// Known billing targets, serialized as the catalog's rate keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum BillingRateKey {
+    Output,
+    Input,
+    InputAboveContext(u64),
+}
+
+impl BillingRateKey {
+    fn parse(key: &str) -> Option<Self> {
+        match key {
+            "rate.output" => Some(Self::Output),
+            "rate.input" => Some(Self::Input),
+            _ => {
+                let suffix = key.strip_prefix(INPUT_TIER_PREFIX)?;
+                let threshold = suffix.parse::<u64>().ok()?;
+                // Accept the spelling Fusiform serves so the stored key is identical.
+                (threshold.to_string() == suffix).then_some(Self::InputAboveContext(threshold))
+            }
+        }
+    }
+}
+
+impl TryFrom<String> for BillingRateKey {
+    type Error = String;
+
+    fn try_from(key: String) -> Result<Self, Self::Error> {
+        Self::parse(&key).ok_or_else(|| format!("unsupported billing target {key:?}"))
+    }
+}
+
+impl From<BillingRateKey> for String {
+    fn from(key: BillingRateKey) -> Self {
+        match key {
+            BillingRateKey::Output => "rate.output".into(),
+            BillingRateKey::Input => "rate.input".into(),
+            BillingRateKey::InputAboveContext(threshold) => {
+                format!("{INPUT_TIER_PREFIX}{threshold}")
+            }
+        }
+    }
+}
+
+pub(crate) fn billed_as_target(fact_key: &str, target_key: &str) -> Option<BillingRateKey> {
+    match (fact_key, BillingRateKey::parse(target_key)?) {
+        ("rate.reasoning", BillingRateKey::Output) => Some(BillingRateKey::Output),
+        ("rate.cache_write", BillingRateKey::Input) => Some(BillingRateKey::Input),
+        (fact, target @ BillingRateKey::InputAboveContext(_))
+            if fact.strip_prefix("rate.cache_write.above_context.")
+                == target_key.strip_prefix(INPUT_TIER_PREFIX) =>
+        {
+            Some(target)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn reasoning_uses_output(

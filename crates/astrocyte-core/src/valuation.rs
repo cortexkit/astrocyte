@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog_client::{
-    cache_write_ttl, reasoning_uses_output, stated_mode_condition, token_rate_key, RATE_ROLES,
+    cache_write_ttl, reasoning_uses_output, stated_mode_condition, token_rate_key, BillingRateKey,
+    RATE_ROLES,
 };
 use crate::money::MoneyError;
 use crate::multiplier::{
@@ -454,20 +455,28 @@ pub fn value_event(
             }
         }
     };
-    let served_rule = matches!(
+    let reasoning_rule = matches!(
         model_rates.base.get("reasoning"),
-        Some(RateState::BilledAs { .. })
+        Some(RateState::BilledAs {
+            key: BillingRateKey::Output
+        })
+    );
+    let cache_write_rule = matches!(
+        model_rates.base.get("cache_write"),
+        Some(RateState::BilledAs {
+            key: BillingRateKey::Input
+        })
     );
     for ((role, ttl), quantity) in quantities {
         if quantity == 0 {
             continue;
         }
         let state = if role == "reasoning" {
-            let reasoning = served_rule.then(|| select_rate(role, ttl));
+            let reasoning = reasoning_rule.then(|| select_rate(role, ttl));
             // Only a complete selector match is a more specific verdict.
             let has_variant = matches!(reasoning, Some(Ok(Some(state))) if !matches!(state, RateState::BilledAs { .. }));
             if reasoning_uses_output(
-                served_rule,
+                reasoning_rule,
                 has_variant,
                 Some(api_provider),
                 rules.reasoning_billed_as_output,
@@ -475,6 +484,22 @@ pub fn value_event(
                 select_rate("output", ttl)
             } else {
                 reasoning.unwrap_or_else(|| select_rate(role, ttl))
+            }
+        } else if role == "cache_write" && ttl.is_none() {
+            match select_rate(role, ttl) {
+                // A tier rule names its precise input key. A different input
+                // tier might otherwise be selected for the same prompt.
+                Ok(Some(RateState::BilledAs {
+                    key: BillingRateKey::InputAboveContext(threshold),
+                })) => Ok(model_rates
+                    .tiers
+                    .get(threshold)
+                    .and_then(|rates| rates.get("input"))),
+                Ok(Some(RateState::BilledAs {
+                    key: BillingRateKey::Input,
+                })) => select_rate("input", ttl),
+                Ok(None) | Err(_) if cache_write_rule => select_rate("input", ttl),
+                selected => selected,
             }
         } else {
             select_rate(role, ttl)

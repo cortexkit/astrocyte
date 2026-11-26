@@ -34,8 +34,9 @@ use rusqlite::{
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
+pub use crate::catalog_client::BillingRateKey;
 use crate::catalog_client::{
-    bills_reasoning_as_output, parse_rate_key, token_rate_key, CatalogCallError, CatalogClient,
+    billed_as_target, parse_rate_key, token_rate_key, CatalogCallError, CatalogClient,
     CatalogClientError, CatalogLookup, CatalogModel, CatalogSnapshot, RATE_FACT_PREFIX,
 };
 #[cfg(test)]
@@ -932,17 +933,10 @@ pub enum RateState {
     Unpriced {
         reason: String,
     },
-    /// Only the base reasoning fact can refer to another rate.
+    /// A supported cross-role billing rule, not a price.
     BilledAs {
         key: BillingRateKey,
     },
-}
-
-/// The only rate target supported for cross-role token billing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BillingRateKey {
-    #[serde(rename = "rate.output")]
-    Output,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1210,7 +1204,7 @@ pub(crate) fn lookup_without_prices(lookup: &Result<CatalogLookup, CatalogClient
             match serde_json::from_value::<RateValue>(value.clone()) {
                 // A billing rule is not a price and does not preclude finding
                 // the dated public API card for this quota proxy.
-                Ok(RateValue::BilledAs { key }) => bills_reasoning_as_output(fact_key, &key),
+                Ok(RateValue::BilledAs { key }) => billed_as_target(fact_key, &key).is_some(),
                 Ok(RateValue::StatedZero { .. })
                 | Ok(RateValue::Unpriced {
                     reason:
@@ -1279,7 +1273,8 @@ pub(crate) fn rates_from_snapshot(snapshot: &CatalogSnapshot) -> ModelResolution
             reason: "no_catalog_coverage".into(),
         };
     }
-    let served_rule = snapshot.reasoning_billed_as_output();
+    let reasoning_rule = snapshot.has_base_billing_rule("reasoning");
+    let cache_write_rule = snapshot.has_base_billing_rule("cache_write");
     let mut rates = ModelRates::default();
     for key in keys {
         let Ok(parsed) = parse_rate_key(key) else {
@@ -1303,10 +1298,10 @@ pub(crate) fn rates_from_snapshot(snapshot: &CatalogSnapshot) -> ModelResolution
         }
         let role = parsed.role.to_string();
         let selectors = &parsed.selectors;
-        // An explicit missing rate does not establish a reasoning variant.
-        // Keep other verdicts, including ambiguous condition sets below.
-        if served_rule
-            && role == "reasoning"
+        // An explicit missing rate does not override a base billing rule.
+        // Lifetime-tagged writes never use the base rule.
+        if ((reasoning_rule && role == "reasoning")
+            || (cache_write_rule && role == "cache_write" && !selectors.contains_key("ttl")))
             && !selectors.is_empty()
             && matches!(&state, RateState::Unpriced { reason } if reason == "no_rate")
         {
@@ -1386,12 +1381,10 @@ fn rate_state(snapshot: &CatalogSnapshot, key: &str) -> RateState {
     match serde_json::from_value::<RateValue>(entry.clone()) {
         Err(_) => unpriced(RATE_UNDECODABLE),
         Ok(RateValue::Priced { per: Some(_), .. }) => unpriced(RATE_UNDECODABLE),
-        Ok(RateValue::BilledAs { key: target }) if bills_reasoning_as_output(key, &target) => {
-            RateState::BilledAs {
-                key: BillingRateKey::Output,
-            }
-        }
-        Ok(RateValue::BilledAs { .. }) => unpriced(RATE_UNDECODABLE),
+        Ok(RateValue::BilledAs { key: target }) => billed_as_target(key, &target).map_or_else(
+            || unpriced(RATE_UNDECODABLE),
+            |key| RateState::BilledAs { key },
+        ),
         Ok(RateValue::Priced {
             inherited_from: Some(_),
             ..
@@ -2984,6 +2977,7 @@ mod tests {
     include!("multiplier/legacy_valuer_tests.rs");
     include!("multiplier/shared_valuer_tests.rs");
     include!("multiplier/rate_era_tests.rs");
+    include!("multiplier/cache_write_billed_as_tests.rs");
     include!("fusiform_plan_price_tests.rs");
     include!("multiplier/v2_tests.rs");
     include!("multiplier/context_tier_tests.rs");

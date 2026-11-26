@@ -608,8 +608,9 @@ Reads never write. A refusal on a read is one of the codes below.
   complete token condition sets, including lifetime-only rows and combined
   lifetime, mode and context-tier rows. Its keys are rate keys with selectors
   sorted by name. It is omitted when empty; older rows decode with an empty map.
-  A served reasoning billing rule appears at `rates.base.reasoning` as
-  `{"state":"billed_as","key":"rate.output"}`.
+  A supported billing rule is stored at its role and condition as
+  `{"state":"billed_as","key":"rate.output"}` for reasoning, or with `rate.input`
+  (including its named context-tier key) for cache writes.
   `stability_diagnostics` adds the recorded day-block bootstrap interval/width,
   active-day count, held-out-day six-hour RMSE/R² and resampling parameters;
   older rows without calibration inputs return null there. Adequacy uses clean

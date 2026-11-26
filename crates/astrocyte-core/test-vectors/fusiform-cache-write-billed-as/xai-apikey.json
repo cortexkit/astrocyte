@@ -1,0 +1,149 @@
+{
+  "billing_rules": [
+    {
+      "as_class": "input",
+      "established_at_ms": 1791331200000,
+      "established_by": "fusiform",
+      "fact_key": "rate.cache_write",
+      "model": "xai/grok-4.20-0309-non-reasoning",
+      "review_by_ms": 1796515200000,
+      "source_ref": "https://docs.x.ai/developers/advanced-api-usage/prompt-caching/usage-and-pricing",
+      "state": "billed_as"
+    },
+    {
+      "as_class": "input",
+      "established_at_ms": 1791331200000,
+      "established_by": "fusiform",
+      "fact_key": "rate.cache_write.above_context.200000",
+      "model": "xai/grok-4.20-0309-non-reasoning",
+      "review_by_ms": 1796515200000,
+      "source_ref": "https://docs.x.ai/developers/advanced-api-usage/prompt-caching/usage-and-pricing",
+      "state": "billed_as"
+    }
+  ],
+  "catalog_version": 0,
+  "models": {
+    "xai/grok-4.20-0309-non-reasoning": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.output_modalities": [
+        "text"
+      ],
+      "capability.reasoning": false,
+      "capability.reasoning_options": null,
+      "capability.structured_output": true,
+      "capability.temperature": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.image_bytes": 20971520,
+      "limit.output": 30000,
+      "limit.temperature_max": 2,
+      "limit.temperature_min": 0,
+      "model.canonical_id": null,
+      "model.family": "grok",
+      "model.lineage": "grok",
+      "model.name": "Grok 4.20 (Non-Reasoning)",
+      "model.open_weights": false,
+      "model.status": null,
+      "model.type": "chat",
+      "provider.name": "xAI",
+      "quality.elo": 660,
+      "quality.eq": 1347,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 200000000
+      },
+      "rate.cache_read.above_context.200000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 400000000
+      },
+      "rate.cache_write": {
+        "key": "rate.input",
+        "state": "billed_as"
+      },
+      "rate.cache_write.above_context.200000": {
+        "key": "rate.input.above_context.200000",
+        "state": "billed_as"
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 1250000000
+      },
+      "rate.input.above_context.200000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 2500000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 2500000000
+      },
+      "rate.output.above_context.200000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 5000000000
+      },
+      "wire.api": {
+        "from": "model",
+        "value": "https://api.x.ai/v1"
+      },
+      "wire.family": "openai.responses",
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/xai"
+      }
+    }
+  },
+  "plane": {
+    "auth_method": "apikey",
+    "kind": "upstream",
+    "provider_id": "xai",
+    "review_by_ms": 1796515200000,
+    "source_ref": "https://docs.x.ai/developers/advanced-api-usage/prompt-caching/usage-and-pricing"
+  },
+  "quality_scores": {
+    "graded_at_ms": 1794404263242,
+    "graded_by": "operator"
+  },
+  "resolved_at_ms": -1,
+  "source": "models.dev"
+}

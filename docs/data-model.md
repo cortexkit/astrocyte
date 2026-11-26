@@ -559,6 +559,10 @@ uses the selected output rate, including mode and context tiers where supported,
 unless an applicable reasoning variant states its own verdict. Without that rule,
 reasoning needs its own rate unless the provider is in `reasoning_billed_as_output`. Ledger
 coverage and whole-event `rate_tiered` refusals precede selection.
+A served `rate.cache_write` billed as `rate.input` uses the selected input rate
+for plain writes unless an applicable cache-write variant states its own verdict.
+A tier rule must name the same-tier input key, and lifetime-tagged writes still
+require a matching lifetime price.
 
 Unit rates use `rate.<role>.per_<unit>` followed by zero or more selector/value
 pairs. The closed unit list is `second`, `character`, `image`, `request`, and `result`

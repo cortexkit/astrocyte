@@ -1163,17 +1163,33 @@ fn resolve_catalog_snapshot(
     }
 
     // Keep the measurement's role while recording the rate key actually used.
-    let served_rule = snapshot.reasoning_billed_as_output();
+    let reasoning_rule = snapshot.has_base_billing_rule("reasoning");
+    let cache_write_rule = snapshot.has_base_billing_rule("cache_write");
     let mut measurements = Vec::with_capacity(plan.targets.len());
     for measurement in &plan.targets {
-        let token_rule = served_rule && measurement.unit == "token";
-        let reasoning_as_output = measurement.role == "reasoning"
-            && reasoning_uses_output(
-                token_rule,
-                token_rule && has_reasoning_variant(snapshot, measurement, plan.mode.as_deref()),
-                plan.provider.as_deref(),
-                reasoning_billed_as_output,
-            );
+        let mode = plan.mode.as_deref();
+        let token_rule = reasoning_rule && measurement.unit == "token";
+        let rate_role = match measurement.role.as_str() {
+            "reasoning"
+                if reasoning_uses_output(
+                    token_rule,
+                    token_rule && has_selected_variant(snapshot, measurement, mode),
+                    plan.provider.as_deref(),
+                    reasoning_billed_as_output,
+                ) =>
+            {
+                "output"
+            }
+            // A lifetime-tagged write needs a price for that exact lifetime.
+            "cache_write"
+                if cache_write_rule
+                    && measurement.unit == "token"
+                    && !has_selected_variant(snapshot, measurement, mode) =>
+            {
+                "input"
+            }
+            role => role,
+        };
         let decision = match priced_quantity(plan, measurement) {
             None => ChargeDecision::Unpriced {
                 reason: UnpricedReason::MissingQuantity,
@@ -1184,12 +1200,8 @@ fn resolve_catalog_snapshot(
             Some((quantity_units, quantity_exponent)) => resolve_measurement(
                 snapshot,
                 measurement,
-                if reasoning_as_output {
-                    "output"
-                } else {
-                    &measurement.role
-                },
-                plan.mode.as_deref(),
+                rate_role,
+                mode,
                 quantity_units,
                 quantity_exponent,
             )?,
@@ -1205,16 +1217,16 @@ fn resolve_catalog_snapshot(
     Ok(ResolvedReprice::for_plan(plan, measurements))
 }
 
-fn has_reasoning_variant(
+fn has_selected_variant(
     snapshot: &CatalogSnapshot,
     measurement: &MeasurementPlan,
     mode: Option<&str>,
 ) -> bool {
-    let Some(key) = measurement_rate_key(snapshot, measurement, "reasoning", mode) else {
+    let Some(key) = measurement_rate_key(snapshot, measurement, &measurement.role, mode) else {
         // An ambiguous selection is a refusal, not an absent price.
         return true;
     };
-    key != "rate.reasoning"
+    rate_fact_key(&measurement.role, "token") != Some(key.as_str())
         && (snapshot.withheld_facts.contains_key(&key)
             || snapshot.uncertain_facts.contains_key(&key)
             || snapshot.facts.get(&key).is_some_and(|entry| {
@@ -1380,7 +1392,7 @@ fn resolve_measurement(
         }
     }
     match rate {
-        // The supported reasoning rule is resolved before selecting the rate.
+        // Supported billing rules are resolved before selecting the rate.
         // No other billed-as entry can be interpreted as a charge.
         RateValue::BilledAs { .. } => Err(CatalogClientError::InvalidRate {
             reason: "billing-plane rate is unsupported on an ordinary catalog read".into(),
@@ -1932,6 +1944,7 @@ mod tests {
     include!("pricing_unit_billing_tests.rs");
     include!("media_pricing_tests.rs");
     include!("pricing_reasoning_billed_as_tests.rs");
+    include!("pricing_cache_write_billed_as_tests.rs");
 
     #[test]
     fn corrupt_head_outcome_names_the_stored_value() {

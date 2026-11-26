@@ -63,3 +63,21 @@ pub(crate) fn reasoning_vector<T: serde::de::DeserializeOwned>(name: &str) -> T 
     let (_, bytes) = FILES.iter().find(|(file, _)| *file == name).unwrap();
     serde_json::from_slice(bytes).unwrap()
 }
+
+#[cfg(test)]
+pub(crate) const XAI_MODEL: &str = "grok-4.20-0309-non-reasoning";
+
+#[cfg(test)]
+pub(crate) const XAI_MODEL_KEY: &str = "xai/grok-4.20-0309-non-reasoning";
+
+#[cfg(test)]
+pub(crate) fn cache_write_vector() -> fusiform_protocol::CatalogGetResponse {
+    use sha2::{Digest, Sha256};
+
+    let reply = include_bytes!("../test-vectors/fusiform-cache-write-billed-as/xai-apikey.json");
+    assert_eq!(
+        include_str!("../test-vectors/fusiform-cache-write-billed-as/SHA256SUMS"),
+        format!("{}  xai-apikey.json\n", hex::encode(Sha256::digest(reply)))
+    );
+    serde_json::from_slice(reply).unwrap()
+}
