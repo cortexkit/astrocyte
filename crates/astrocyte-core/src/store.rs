@@ -2721,7 +2721,14 @@ mod tests {
                 include_str!("statement.rs"),
                 "SELECT event.event_id,event.currency,",
             ),
-            vec![Text("openai".into()), Text("a".into()), Text("3000".into())],
+            // The statement period spans every fixture call, so only the index choice is tested.
+            vec![
+                Text("openai".into()),
+                Text("a".into()),
+                Text("3000".into()),
+                Integer(i64::MIN),
+                Integer(i64::MAX),
+            ],
             "usage_event_statement_match",
         ));
         cases.push((
