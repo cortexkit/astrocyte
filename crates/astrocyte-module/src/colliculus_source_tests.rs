@@ -1355,3 +1355,49 @@ fn media_malformed_feed_page_keeps_cursor_and_acks_nothing() {
         assert!(peer.calls("usage.ack").is_empty());
     }
 }
+
+/// Colliculus's own `usage.read` replies from its caller build (tag
+/// `astrocyte-voice-call-v2`): a voice call, a phone voice message and a phone
+/// dictation, each carrying `caller`. Every record must be read as a call
+/// with its stated agent and device stored, and nothing set aside.
+#[test]
+fn colliculus_caller_samples_record_every_call_with_its_caller() {
+    let files = [
+        include_str!("../test-vectors/colliculus-caller-v1/voice-call.json"),
+        include_str!("../test-vectors/colliculus-caller-v1/voice-message.json"),
+        include_str!("../test-vectors/colliculus-caller-v1/dictation.json"),
+    ];
+    let mut entries = Vec::new();
+    for file in files {
+        let reply: Value = serde_json::from_str(file).unwrap();
+        let result = reply.get("answer").unwrap_or(&reply)["result"].clone();
+        for entry in result["entries"].as_array().unwrap() {
+            let mut entry = entry.clone();
+            // The three replies number their entries independently; give them
+            // one sequence so they read as a single feed.
+            entry["seq"] = json!(u64::try_from(entries.len()).unwrap() + 1);
+            entries.push(entry);
+        }
+    }
+    let calls = i64::try_from(entries.len()).unwrap();
+    let peer = Peer::start(fixed_page(entries));
+    let state = test_state();
+    tick(&state, &peer.source());
+
+    assert_eq!(count(&state, "set_aside_record"), 0);
+    assert_eq!(count(&state, "usage_event"), calls);
+    assert_eq!(count(&state, "media_caller"), calls);
+    state
+        .with_conn(|conn| {
+            let missing: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM media_caller WHERE agent_id IS NULL OR device IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            assert_eq!(missing, 0, "every sample states both agent and device");
+            Ok(())
+        })
+        .unwrap();
+}

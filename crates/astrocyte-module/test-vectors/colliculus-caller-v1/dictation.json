@@ -1,0 +1,45 @@
+{
+  "tag": "usage_read_with_caller",
+  "request": {
+    "method": "usage.read",
+    "params": {
+      "limit": 10
+    }
+  },
+  "frame": "response",
+  "answer": {
+    "result": {
+      "entries": [
+        {
+          "record": {
+            "auth_method": "api_key",
+            "call_id": "example-phone-call",
+            "caller": {
+              "agent_id": "example-agent",
+              "device": {
+                "class": "phone",
+                "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "name": "Example Phone",
+                "pairing_id": "example-pairing"
+              }
+            },
+            "charge_basis": "vendor",
+            "credential_ref": "fixture-credential",
+            "decision_id": "example-routing-decision",
+            "finished_at_ms": 1800000000000,
+            "measurements": [],
+            "model": "gpt-live-transcribe",
+            "principal": "reserved:callosum",
+            "provider": "openai",
+            "record_id": "call:ffc9697b766df140a41fdb343bc47fdece4c34a4a6a2a7fdafce84fa40065c83",
+            "selectors": {},
+            "started_at_ms": 1800000000000,
+            "status": "ended"
+          },
+          "seq": 1
+        }
+      ],
+      "last_seq": 1
+    }
+  }
+}
