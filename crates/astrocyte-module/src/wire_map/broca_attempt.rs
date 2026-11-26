@@ -9,6 +9,9 @@ pub(crate) const MODEL_ATTEMPT_KIND: &str = "model_attempt";
 pub(crate) struct WireModelAttempt {
     pub fact_id: String,
     run_id: String,
+    agent_id: Option<String>,
+    agent_run_id: Option<String>,
+    flow_id: Option<String>,
     session: WireBindIdentity,
     step_id: u64,
     attempt: u64,
@@ -32,6 +35,16 @@ pub(crate) struct WireModelAttempt {
     charge_basis_overrides: Option<String>,
     sent_at_ms: Option<u64>,
     recorded_at_ms: u64,
+}
+
+impl WireModelAttempt {
+    pub(crate) fn take_scope_stamp(&mut self) -> ScopeStamp {
+        ScopeStamp {
+            agent_id: self.agent_id.take(),
+            agent_run_id: self.agent_run_id.take(),
+            flow_id: self.flow_id.take(),
+        }
+    }
 }
 
 #[derive(Deserialize)]

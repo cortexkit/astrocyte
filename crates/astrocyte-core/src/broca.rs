@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::ingest::{self, DeliveryPath, EventRecordRequest, IngestError, RecordDisposition};
 
+mod scope;
+pub use scope::{record_scope_in_tx, CallKind, ScopeStamp};
+
 /// BROCA's raw usage counts, before any pricing interpretation. A provider
 /// that does not report a quantity is different from one that reports zero.
 #[derive(Debug, Clone, Default, Deserialize)]

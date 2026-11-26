@@ -12,6 +12,7 @@
 use super::{
     normalized_runner, sql, Attribution, Subject, VALID_CORRECTION, VALID_PLACEMENT_CORRECTION,
 };
+use crate::broca::ScopeStamp;
 use cortexkit_role_llm_runner::{session_ref, SessionIdentity};
 use rusqlite::{params, Connection, Row};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -169,11 +170,87 @@ impl Resolver {
         let Some(id) = id else {
             return Ok(Attribution::default());
         };
+        self.publisher_attribution(conn, id, at)
+    }
+
+    pub(crate) fn apply_stamp(
+        &mut self,
+        conn: &Connection,
+        tuple: Attribution,
+        stamp: &ScopeStamp,
+        call_kind: &str,
+        at: Option<i64>,
+    ) -> Result<(Attribution, bool), String> {
+        if tuple.workload.is_some() {
+            let disagrees = tuple
+                .alfonso
+                .as_ref()
+                .zip(stamp.agent_id.as_ref())
+                .is_some_and(|(publisher, stamped)| publisher != stamped);
+            return Ok((tuple, disagrees));
+        }
+        if let Some(flow) = &stamp.flow_id {
+            return match self.flow(conn, flow)? {
+                Some(id) => Ok((self.publisher_attribution(conn, id, at)?, false)),
+                None => Ok((tuple, false)),
+            };
+        }
+        let Some(agent) = &stamp.agent_id else {
+            return Ok((tuple, false));
+        };
+        // The stamp names the caller. The stamped run describes its launch
+        // context, not the caller's workload or agent identity.
+        let parent = match &stamp.agent_run_id {
+            Some(run) => self.run(conn, run)?,
+            None => None,
+        };
+        let parent_alfonso = parent.and_then(|id| self.winners[id].alfonso.clone());
+        let project_id = parent.and_then(|id| self.winners[id].project_id.clone());
+        let workspace = self.workspace(conn, project_id.as_deref(), at)?;
+        let workload = if call_kind == "system_one" {
+            "system_one"
+        } else {
+            "broca_session"
+        };
+        Ok((
+            Attribution {
+                alfonso: Some(agent.clone()),
+                parent_alfonso,
+                workload: Some(workload.into()),
+                project_id,
+                workspace,
+            },
+            false,
+        ))
+    }
+
+    fn publisher_attribution(
+        &mut self,
+        conn: &Connection,
+        id: usize,
+        at: Option<i64>,
+    ) -> Result<Attribution, String> {
         let parent_alfonso = self.parent_alfonso(conn, id)?;
         let fact = &self.winners[id];
         let project_id = fact.project_id.clone();
         let (alfonso, workload) = (fact.alfonso.clone(), fact.workload.clone());
-        let workspace = match (&project_id, at) {
+        let workspace = self.workspace(conn, project_id.as_deref(), at)?;
+        Ok(Attribution {
+            alfonso,
+            parent_alfonso,
+            workload: Some(workload),
+            project_id,
+            workspace,
+        })
+    }
+
+    fn workspace(
+        &mut self,
+        conn: &Connection,
+        project_id: Option<&str>,
+        at: Option<i64>,
+    ) -> Result<Option<String>, String> {
+        Ok(match (project_id, at) {
             (Some(project), Some(at)) => {
                 let placements = self.placements(conn, project)?;
                 let through =
@@ -183,13 +260,6 @@ impl Resolver {
                     .and_then(|index| placements[index].workspace_id.clone())
             }
             _ => None,
-        };
-        Ok(Attribution {
-            alfonso,
-            parent_alfonso,
-            workload: Some(workload),
-            project_id,
-            workspace,
         })
     }
 

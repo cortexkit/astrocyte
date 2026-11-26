@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use astrocyte_core::broca::{Attempt, MarkedSegment};
+use astrocyte_core::broca::{Attempt, CallKind, MarkedSegment, ScopeStamp};
 use astrocyte_core::ingest::EventRecordRequest;
 use astrocyte_readers::{
     file_identity::{file_identity, same_identity},
@@ -41,6 +41,9 @@ use crate::wire_map::{
     map_attempt, map_fact, map_marked_segment, map_system_one_fact, WireModelAttempt,
     WireSpendSegmentFact, WireSystemOneFact, MODEL_ATTEMPT_KIND, SYSTEM_ONE_KIND,
 };
+
+#[path = "broca_scope_backfill.rs"]
+mod scope_backfill;
 
 pub(crate) const BROCA_SOURCE_KEY: &str = "broca";
 
@@ -199,6 +202,10 @@ impl SourceClient for BrocaSource {
 
     fn pull_fast(&self, since: Option<SourceCursor>, limit: u32) -> Result<ExportPage, PullError> {
         self.pull_in_lane(since, limit, false)
+    }
+
+    fn backfill_scope_stamps(&self, state: &super::SharedState) -> Result<(), PullError> {
+        self.backfill_scope_page(state, PAGE_LIMIT).map(|_| ())
     }
 
     fn resolved_path(&self) -> Option<PathBuf> {
@@ -385,9 +392,19 @@ fn read_snapshot(
     reason = "avoid allocations for the common legacy event"
 )]
 pub(crate) enum BrocaFact {
-    Event(EventRecordRequest),
-    MarkedSegment(MarkedSegment),
-    Attempt(Attempt),
+    Event(EventRecordRequest, CallKind, ScopeStamp),
+    MarkedSegment(MarkedSegment, ScopeStamp),
+    Attempt(Attempt, ScopeStamp),
+}
+
+impl BrocaFact {
+    pub(super) fn scope(&self) -> (&str, CallKind, &ScopeStamp) {
+        match self {
+            Self::Event(event, kind, stamp) => (&event.producer_ref, *kind, stamp),
+            Self::MarkedSegment(segment, stamp) => (&segment.fact_id, CallKind::Segment, stamp),
+            Self::Attempt(attempt, stamp) => (&attempt.fact_id, CallKind::ModelAttempt, stamp),
+        }
+    }
 }
 
 /// Decode one row by the `kind` its fact carries.
@@ -412,13 +429,14 @@ fn decode_store_row(
     match segment.get("kind") {
         None => decode_session_segment(export_seq, fact_id, segment),
         Some(Value::String(kind)) if kind == SYSTEM_ONE_KIND => {
-            decode_system_one_segment(export_seq, fact_id, segment).map(BrocaFact::Event)
+            decode_system_one_segment(export_seq, fact_id, segment)
         }
         Some(Value::String(kind)) if kind == MODEL_ATTEMPT_KIND => {
-            let wire: WireModelAttempt = serde_json::from_str(segment_json)
+            let mut wire: WireModelAttempt = serde_json::from_str(segment_json)
                 .map_err(|error| format!("decode attempt of fact {fact_id}: {error}"))?;
             refuse_fact_id_mismatch(export_seq, fact_id, &wire.fact_id)?;
-            map_attempt(wire).map(BrocaFact::Attempt)
+            let stamp = wire.take_scope_stamp();
+            map_attempt(wire).map(|attempt| BrocaFact::Attempt(attempt, stamp))
         }
         Some(kind) => Err(format!("segment of fact {fact_id} has unknown kind {kind}")),
     }
@@ -438,24 +456,30 @@ fn decode_session_segment(
         .as_object_mut()
         .ok_or_else(|| format!("segment_json of fact {fact_id} is not an object"))?
         .insert("export_seq".to_string(), Value::from(export_seq));
-    let wire: WireSpendSegmentFact = serde_json::from_value(segment)
+    let mut wire: WireSpendSegmentFact = serde_json::from_value(segment)
         .map_err(|error| format!("decode segment of fact {fact_id}: {error}"))?;
     refuse_fact_id_mismatch(export_seq, fact_id, &wire.fact_id)?;
+    let stamp = wire.take_scope_stamp();
     if wire.usage_in_attempts {
-        return map_marked_segment(wire).map(BrocaFact::MarkedSegment);
+        return map_marked_segment(wire).map(|segment| BrocaFact::MarkedSegment(segment, stamp));
     }
-    map_fact(wire).map(BrocaFact::Event)
+    map_fact(wire).map(|event| BrocaFact::Event(event, CallKind::Segment, stamp))
 }
 
 fn decode_system_one_segment(
     export_seq: u64,
     fact_id: &str,
     segment: Value,
-) -> Result<EventRecordRequest, String> {
-    let wire: WireSystemOneFact = serde_json::from_value(segment)
+) -> Result<BrocaFact, String> {
+    let mut wire: WireSystemOneFact = serde_json::from_value(segment)
         .map_err(|error| format!("decode {SYSTEM_ONE_KIND} segment of fact {fact_id}: {error}"))?;
     refuse_fact_id_mismatch(export_seq, fact_id, &wire.fact_id)?;
-    map_system_one_fact(wire)
+    let stamp = ScopeStamp {
+        agent_id: wire.agent_id.take(),
+        agent_run_id: wire.run_id.clone(),
+        flow_id: wire.flow_id.clone(),
+    };
+    map_system_one_fact(wire).map(|event| BrocaFact::Event(event, CallKind::SystemOne, stamp))
 }
 
 /// The column and the segment name the fact the same way whenever BROCA
@@ -601,6 +625,7 @@ mod tests {
     }
 
     mod broca_attempt_tests;
+    mod broca_scope_tests;
 
     #[test]
     fn set_aside_broca_blob_keeps_good_rows_and_progress() {
@@ -734,7 +759,7 @@ mod tests {
 
         let pulled = map_fact(serde_json::from_value(wire_fixture()).unwrap()).unwrap();
         assert!(
-            matches!(&page.broca_facts[..], [(_, BrocaFact::Event(event))] if event == &pulled)
+            matches!(&page.broca_facts[..], [(_, BrocaFact::Event(event, _, stamp))] if event == &pulled && stamp == &ScopeStamp::default())
         );
         assert_eq!(
             page.cursor,
@@ -1821,7 +1846,7 @@ mod tests {
                 page.broca_facts
                     .into_iter()
                     .filter_map(|(_, fact)| match fact {
-                        BrocaFact::Event(event) => Some(event),
+                        BrocaFact::Event(event, _, _) => Some(event),
                         _ => None,
                     }),
             );

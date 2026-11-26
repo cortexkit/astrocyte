@@ -504,6 +504,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 66,
         statements: migrations::v60_v79::V66,
     },
+    Migration {
+        version: 67,
+        statements: migrations::v60_v79::V67,
+    },
 ];
 
 #[cfg(test)]

@@ -1,5 +1,7 @@
 use super::super::fees::DAY_MS;
 use super::*;
+use crate::attribution::Publisher;
+use crate::broca::{record_scope_in_tx, CallKind, ScopeStamp};
 
 fn call(
     conn: &mut Connection,
@@ -66,6 +68,236 @@ fn request(extra: serde_json::Value) -> ReportRequest {
         .unwrap()
         .extend(extra.as_object().unwrap().clone());
     serde_json::from_value(value).unwrap()
+}
+
+fn broca_call(conn: &mut Connection, id: &str, at: i64, run: &str) {
+    let mut call: ingest::EventRecordRequest = serde_json::from_value(json!({
+        "producer":"broca", "producer_ref":id, "run_ref":run,
+        "provider":"provider", "model":"a", "occurred_at_ms":at, "charge_basis":"metered_api",
+        "measurements":[{"role":"input","unit":"token","kind":"billed","source":"fixture",
+                         "quantity_units":17,"quantity_exponent":0}]
+    }))
+    .unwrap();
+    call.runner = Some("broca".into());
+    ingest::record_event(conn, &call, 1).unwrap();
+}
+
+fn broca_stamp(conn: &mut Connection, id: &str, kind: CallKind, stamp: ScopeStamp) {
+    let tx = conn.transaction().unwrap();
+    assert_eq!(record_scope_in_tx(&tx, id, kind, &stamp).unwrap(), 1);
+    tx.commit().unwrap();
+}
+
+fn publish_facts(conn: &mut Connection, publisher: Publisher, facts: serde_json::Value) {
+    let page = serde_json::from_value(json!({"facts":facts,"next":null,"through":1})).unwrap();
+    let tx = conn.transaction().unwrap();
+    crate::attribution::commit_page(&tx, publisher, None, &page, 1).unwrap();
+    tx.commit().unwrap();
+}
+
+#[test]
+fn attribution_report_broca_scope_agent_uses_stamped_run_parent() {
+    let mut conn = conn();
+    broca_call(&mut conn, "session-call", 10, "broca-run");
+    broca_stamp(
+        &mut conn,
+        "session-call",
+        CallKind::Segment,
+        ScopeStamp {
+            agent_id: Some("stamped-agent".into()),
+            agent_run_id: Some("launch-run".into()),
+            flow_id: None,
+        },
+    );
+    broca_call(&mut conn, "batch-call", 20, "batch-run");
+    broca_stamp(
+        &mut conn,
+        "batch-call",
+        CallKind::SystemOne,
+        ScopeStamp {
+            agent_id: Some("batch-agent".into()),
+            agent_run_id: Some("batch-run".into()),
+            flow_id: None,
+        },
+    );
+    rate(&conn, "a", 1_000_000_000);
+    summaries(&mut conn);
+    drain(&mut conn, &config());
+    let workload = request(json!({"grouping":["alfonso","workload"]}));
+    let result = spend_report(&conn, &workload, DAY_MS).unwrap();
+    assert!(result
+        .rows
+        .iter()
+        .any(
+            |row| row.grouping["alfonso"].as_deref() == Some("stamped-agent")
+                && row.grouping["workload"].as_deref() == Some("broca_session")
+                && row.events_total == 1
+        ));
+    assert!(result
+        .rows
+        .iter()
+        .any(
+            |row| row.grouping["alfonso"].as_deref() == Some("batch-agent")
+                && row.grouping["workload"].as_deref() == Some("system_one")
+                && row.events_total == 1
+        ));
+
+    publish_facts(
+        &mut conn,
+        Publisher::Prefrontal,
+        json!([{
+            "fact_id":"launch","subject":{"kind":"run","harness":"broca","run_id":"launch-run"},
+            "alfonso":"launcher","workload":"launcher-kind","project_id":"launch-project",
+            "effective_from_ms":0,"recorded_at_ms":0
+        }]),
+    );
+    publish_facts(
+        &mut conn,
+        Publisher::Entorhinal,
+        json!([{
+            "fact_id":"place","project_id":"launch-project","workspace_id":"launch-space",
+            "effective_from_ms":5,"recorded_at_ms":5
+        }]),
+    );
+    for (dimension, expected) in [
+        ("parent_alfonso", "launcher"),
+        ("project_id", "launch-project"),
+        ("workspace", "launch-space"),
+    ] {
+        let query = request(json!({"grouping":[dimension], "where":{"alfonso":["stamped-agent"]}}));
+        let report = spend_report(&conn, &query, DAY_MS).unwrap();
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(
+            report.rows[0].grouping[dimension].as_deref(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn attribution_report_broca_scope_flow_joins_publisher_flow() {
+    let mut conn = conn();
+    broca_call(&mut conn, "flow-call", 1, "broca-run");
+    broca_stamp(
+        &mut conn,
+        "flow-call",
+        CallKind::Segment,
+        ScopeStamp {
+            flow_id: Some("stamped-flow".into()),
+            ..ScopeStamp::default()
+        },
+    );
+    rate(&conn, "a", 1_000_000_000);
+    summaries(&mut conn);
+    drain(&mut conn, &config());
+    let query = request(json!({"grouping":["alfonso","workload"]}));
+    let before = spend_report(&conn, &query, DAY_MS).unwrap();
+    assert_eq!(before.attribution_coverage.unwrap().unattributed_calls, 1);
+    publish_facts(
+        &mut conn,
+        Publisher::Basal,
+        json!([{
+            "fact_id":"flow","subject":{"kind":"flow","flow_id":"stamped-flow"},
+            "alfonso":"flow-owner","workload":"flow-workload","project_id":"flow-project",
+            "effective_from_ms":0,"recorded_at_ms":0
+        }]),
+    );
+    let report = spend_report(&conn, &query, DAY_MS).unwrap();
+    assert_eq!(report.rows.len(), 1);
+    assert_eq!(
+        report.rows[0].grouping["alfonso"].as_deref(),
+        Some("flow-owner")
+    );
+    assert_eq!(
+        report.rows[0].grouping["workload"].as_deref(),
+        Some("flow-workload")
+    );
+    assert_eq!(report.attribution_coverage.unwrap().attributed_calls, 1);
+}
+
+#[test]
+fn attribution_report_broca_scope_publisher_wins_and_counts_disagreement() {
+    let mut conn = conn();
+    for (fact, stamp_agent) in [("different", "stamped-agent"), ("same", "publisher-agent")] {
+        broca_call(&mut conn, fact, 1, "native-run");
+        broca_stamp(
+            &mut conn,
+            fact,
+            CallKind::SystemOne,
+            ScopeStamp {
+                agent_id: Some(stamp_agent.into()),
+                agent_run_id: Some("native-run".into()),
+                flow_id: None,
+            },
+        );
+    }
+    publish_facts(
+        &mut conn,
+        Publisher::Prefrontal,
+        json!([{
+            "fact_id":"owner","subject":{"kind":"run","harness":"broca","run_id":"native-run"},
+            "alfonso":"publisher-agent","workload":"publisher-workload",
+            "effective_from_ms":0,"recorded_at_ms":0
+        }]),
+    );
+    rate(&conn, "a", 1_000_000_000);
+    summaries(&mut conn);
+    drain(&mut conn, &config());
+    let result = spend_report(
+        &conn,
+        &request(json!({"grouping":["alfonso","workload"]})),
+        DAY_MS,
+    )
+    .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(
+        result.rows[0].grouping["alfonso"].as_deref(),
+        Some("publisher-agent")
+    );
+    assert_eq!(
+        result.rows[0].grouping["workload"].as_deref(),
+        Some("publisher-workload")
+    );
+    assert_eq!(result.rows[0].events_total, 2);
+    let query = request(json!({"where":{"alfonso":["stamped-agent"],"model":["a"]}}));
+    let filtered = spend_report(&conn, &query, DAY_MS).unwrap();
+    assert!(filtered.rows.is_empty());
+    assert_eq!(
+        serde_json::to_value(filtered.attribution_coverage.unwrap()).unwrap(),
+        json!({
+            "attributed_calls":2,"unattributed_calls":0,"stamp_disagreement_calls":1
+        })
+    );
+}
+
+#[test]
+fn attribution_report_broca_scope_join_seeks_stamps_by_call_key() {
+    use crate::report::hourly::attribution::stamps_sql;
+    let conn = conn();
+    let plan = conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            stamps_sql("occurred_at_ms>=0 AND occurred_at_ms<3600000")
+        ))
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.starts_with("SEARCH usage_event")),
+        "{plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|step| step == "SEARCH s USING INTEGER PRIMARY KEY (rowid=?)"),
+        "{plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|step| step.starts_with("SCAN")),
+        "{plan:?}"
+    );
 }
 
 fn basis_parity_store(stored: bool) -> (Connection, String, String) {
@@ -756,6 +988,40 @@ fn attribution_report_stale_summary_valuation_and_fact_windows_match_ordinary_me
         25,
     );
     assert_parity(&conn, "late call");
+
+    broca_call(&mut conn, "historical-broca", 2, "broca-run");
+    summaries(&mut conn);
+    drain(&mut conn, &config());
+    let revision = |conn: &Connection| {
+        conn.query_row(
+        "SELECT a.revision,s.revision FROM attribution_hour a JOIN summary_hour s USING(kind,hour_number)
+         WHERE a.kind=0 AND a.hour_number=0", [], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,i64>(1)?))
+    ).unwrap()
+    };
+    let (attribution_revision, summary_revision) = revision(&conn);
+    broca_stamp(
+        &mut conn,
+        "historical-broca",
+        CallKind::Segment,
+        ScopeStamp {
+            agent_id: Some("backfilled-owner".into()),
+            ..ScopeStamp::default()
+        },
+    );
+    assert_eq!(
+        revision(&conn),
+        (attribution_revision + 1, summary_revision)
+    );
+    let query = request(json!({}));
+    let live = spend_report(&conn, &query, DAY_MS).unwrap();
+    assert!(live
+        .rows
+        .iter()
+        .any(|row| row.grouping["alfonso"].as_deref() == Some("backfilled-owner")));
+    assert_parity(&conn, "stamped attribution stale");
+    summaries(&mut conn);
+    drain(&mut conn, &config());
+    same_bytes(live, spend_report(&conn, &query, DAY_MS).unwrap());
 }
 
 #[test]
@@ -792,7 +1058,8 @@ fn attribution_report_no_range_filters_undated_separately_from_dated_coverage() 
         split.attribution_coverage.unwrap(),
         AttributionCoverage {
             attributed_calls: 1,
-            unattributed_calls: 0
+            unattributed_calls: 0,
+            stamp_disagreement_calls: 0,
         }
     );
 }

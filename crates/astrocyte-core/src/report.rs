@@ -368,6 +368,12 @@ pub struct SpendReport {
 pub struct AttributionCoverage {
     pub attributed_calls: u64,
     pub unattributed_calls: u64,
+    #[serde(skip_serializing_if = "is_zero_calls")]
+    pub stamp_disagreement_calls: u64,
+}
+
+fn is_zero_calls(calls: &u64) -> bool {
+    *calls == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

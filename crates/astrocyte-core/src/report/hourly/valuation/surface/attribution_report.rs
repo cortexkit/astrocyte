@@ -157,6 +157,7 @@ impl Dictionary<'_> {
                         unvalued,
                     },
                     metered: payload.metered,
+                    stamp_disagreement_calls: payload.stamp_disagreement_calls,
                     ..Default::default()
                 },
             ));
@@ -242,6 +243,10 @@ impl Output {
                 &mut self.coverage.attributed_calls
             };
             add_count(count, population)?;
+            add_count(
+                &mut self.coverage.stamp_disagreement_calls,
+                cell.stamp_disagreement_calls,
+            )?;
             if !request.attribution(key) {
                 continue;
             }

@@ -88,8 +88,8 @@ pub(super) fn drain_once_in_lane(
             let mut set_aside = page.set_aside;
             for (seq, fact) in &page.broca_facts {
                 let locator = || format!("{discovery_path:?}:{}:export_seq:{seq}", cursor.lineage);
-                match fact {
-                    broca_source::BrocaFact::Attempt(attempt) => {
+                let keep_stamp = match fact {
+                    broca_source::BrocaFact::Attempt(attempt, _) => {
                         let outcome = broca::record_attempt_in_tx(tx, attempt, now_ms)
                             .map_err(|error| format!("record BROCA attempt: {error:?}"))?;
                         events_recorded += attempt.calls.len() - outcome.skipped_shares.len();
@@ -102,11 +102,12 @@ pub(super) fn drain_once_in_lane(
                                 reason: format!("segment_already_billed: {segment}"),
                             });
                         }
+                        outcome.disposition != RecordDisposition::QuarantinedRedelivery
                     }
-                    broca_source::BrocaFact::MarkedSegment(segment) => {
-                        if !broca::record_segment_in_tx(tx, segment, now_ms)
-                            .map_err(|error| format!("record BROCA segment evidence: {error}"))?
-                        {
+                    broca_source::BrocaFact::MarkedSegment(segment, _) => {
+                        let accepted = broca::record_segment_in_tx(tx, segment, now_ms)
+                            .map_err(|error| format!("record BROCA segment evidence: {error}"))?;
+                        if !accepted {
                             set_aside.push(SetAsideRecord {
                                 locator: locator(),
                                 reason: format!(
@@ -115,8 +116,9 @@ pub(super) fn drain_once_in_lane(
                                 ),
                             });
                         }
+                        accepted
                     }
-                    broca_source::BrocaFact::Event(event) => {
+                    broca_source::BrocaFact::Event(event, _, _) => {
                         if broca::segment_has_attempts(tx, &event.producer_ref)
                             .map_err(|error| format!("look up BROCA segment's shares: {error}"))?
                         {
@@ -124,12 +126,19 @@ pub(super) fn drain_once_in_lane(
                                 locator: locator(),
                                 reason: format!("segment_already_billed: {}", event.producer_ref),
                             });
+                            false
                         } else {
-                            quarantined_redeliveries +=
-                                usize::from(record_read_call(tx, event, now_ms)?);
+                            let quarantined = record_read_call(tx, event, now_ms)?;
+                            quarantined_redeliveries += usize::from(quarantined);
                             events_recorded += 1;
+                            !quarantined
                         }
                     }
+                };
+                if keep_stamp {
+                    let (id, kind, stamp) = fact.scope();
+                    broca::record_scope_in_tx(tx, id, kind, stamp)
+                        .map_err(|error| format!("record BROCA scope stamp: {error:?}"))?;
                 }
             }
             let newly_seen =

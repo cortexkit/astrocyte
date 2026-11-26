@@ -1001,6 +1001,7 @@ fn ledger_regression_legacy_broca_inclusive_output_is_counted_once() {
     for step in previous {
         conn.execute_batch(step.statements).unwrap();
     }
+    crate::test_support::add_scope_schema_for_historical_summary(&conn);
     let event = serde_json::from_value(json!({"producer":"broca","producer_ref":"legacy-output","run_ref":"old-run","provider":"anthropic","model":"model","occurred_at_ms":1,"charge_basis":"unknown","measurements":[
         {"role":"output","unit":"token","kind":"billed","source":"usage.output_tokens","quantity_units":100,"quantity_exponent":0},
         {"role":"reasoning","unit":"token","kind":"billed","source":"usage.reasoning_tokens","quantity_units":30,"quantity_exponent":0}

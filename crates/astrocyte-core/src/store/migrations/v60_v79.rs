@@ -411,3 +411,37 @@ WHEN EXISTS (SELECT 1 FROM attribution_parent_session_ref WHERE parent_runner=NE
     AND session_ref=NEW.session_ref AND fact_id=NEW.fact_id)
 BEGIN SELECT RAISE(ABORT, 'attribution_parent_session_ref_insert_once'); END;
 "#;
+
+pub(in crate::store) const V67: &str = r#"
+CREATE TABLE broca_scope_stamp (
+    event_key INTEGER PRIMARY KEY REFERENCES usage_event(event_key),
+    agent_id TEXT,
+    agent_run_id TEXT,
+    flow_id TEXT,
+    call_kind TEXT NOT NULL CHECK(call_kind IN ('segment','model_attempt','system_one')),
+    CHECK(agent_id IS NOT NULL OR agent_run_id IS NOT NULL OR flow_id IS NOT NULL)
+);
+CREATE INDEX broca_scope_stamp_run ON broca_scope_stamp(agent_run_id) WHERE agent_run_id IS NOT NULL;
+CREATE INDEX broca_scope_stamp_flow ON broca_scope_stamp(flow_id) WHERE flow_id IS NOT NULL;
+CREATE TRIGGER broca_scope_stamp_no_update BEFORE UPDATE ON broca_scope_stamp
+    BEGIN SELECT RAISE(ABORT,'broca_scope_stamp is append-only'); END;
+CREATE TRIGGER broca_scope_stamp_no_delete BEFORE DELETE ON broca_scope_stamp
+    BEGIN SELECT RAISE(ABORT,'broca_scope_stamp is append-only'); END;
+CREATE TRIGGER broca_scope_stamp_insert_once BEFORE INSERT ON broca_scope_stamp
+    WHEN EXISTS (SELECT 1 FROM broca_scope_stamp WHERE event_key=NEW.event_key)
+    BEGIN SELECT RAISE(ABORT,'broca_scope_stamp is append-only'); END;
+CREATE TRIGGER broca_scope_stamp_dirty_hour AFTER INSERT ON broca_scope_stamp BEGIN
+    UPDATE attribution_hour SET revision=revision+1 WHERE (kind,hour_number) IN (
+        SELECT CASE WHEN occurred_at_ms IS NULL THEN 1 ELSE 0 END,
+               coalesce(occurred_at_ms/3600000-(occurred_at_ms<0 AND occurred_at_ms%3600000<>0),0)
+        FROM usage_event WHERE event_key=NEW.event_key
+    );
+END;
+
+CREATE TABLE broca_scope_backfill (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    lineage TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+    done INTEGER NOT NULL CHECK(done IN (0,1))
+);
+"#;

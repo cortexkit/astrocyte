@@ -132,6 +132,7 @@ fn valuation_migration_requeues_existing_media_and_unavailable_rate_hours_only()
     for step in previous {
         conn.execute_batch(step.statements).unwrap();
     }
+    crate::test_support::add_scope_schema_for_historical_summary(&conn);
     let history = serde_json::from_value(json!({"source":"test","provider_id":"provider","model_id":"media","fact_prefix":"rate.","eras":[],"served_by_key":{
         "rate.input_audio.per_second":[{"from_ms":0,"until_ms":null,"state":"value","value":{"state":"priced","units":7,"exponent":9,"currency":"USD","unit_provenance":{"kind":"stated"},"per":1}}]
     }})).unwrap();

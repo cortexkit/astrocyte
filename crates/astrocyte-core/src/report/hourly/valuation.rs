@@ -216,6 +216,11 @@ fn reduce_both(
     use crate::rate_era::ModelTimeline;
     use crate::valuation::MeasuredRole;
     let ledger = load_scoped_ledger(conn, &DIMENSIONS, Some(filter))?;
+    let stamps = if projection.is_some() {
+        attribution::stamps(conn, filter)?
+    } else {
+        HashMap::new()
+    };
     // Bulk reads stay scoped by the chunk's time/key bounds. In particular, do
     // not pass per-member event-key lists through the runs reducer: its forced
     // time index would scan unrelated history and valuation needs no runs data.
@@ -271,10 +276,10 @@ fn reduce_both(
     };
     for event in &ledger.events {
         let key = key(&ledger, event);
-        let tuple = if let Some(resolver) = maps.as_deref_mut() {
-            attribution::resolve(resolver, conn, &ledger, event)?
+        let (tuple, disagrees) = if let Some(resolver) = maps.as_deref_mut() {
+            attribution::resolve(resolver, conn, &ledger, event, &stamps)?
         } else {
-            attribution::Attribution::default()
+            (attribution::Attribution::default(), false)
         };
         let measured = measurements.remove(&event.key).unwrap_or_default();
         let (payer, broca_attempt, mode, media) = payers.remove(&event.key).unwrap_or_default();
@@ -309,6 +314,15 @@ fn reduce_both(
         )?;
         let data = members.entry((member.clone(), tuple.clone())).or_default();
         data.observe_event(&ledger, event)?;
+        if let Some(projected) = projection.as_deref_mut().filter(|_| disagrees) {
+            let cell = projected
+                .entry((
+                    attribution::AttributionKey::new(&key, &tuple),
+                    member.clone(),
+                ))
+                .or_default();
+            add_count(&mut cell.stamp_disagreement_calls, 1)?;
+        }
         for ((role, unit, _, _, exponent), covered, units) in &measured {
             data.observe_quantity(
                 &key,

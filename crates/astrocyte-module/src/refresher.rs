@@ -143,6 +143,10 @@ pub trait SourceClient: Send + Sync {
         self.pull(since, limit)
     }
 
+    fn backfill_scope_stamps(&self, _state: &SharedState) -> Result<(), PullError> {
+        Ok(())
+    }
+
     /// The resolved store path, if known, used when logging whether the store is
     /// present or absent.
     fn resolved_path(&self) -> Option<PathBuf> {
@@ -1313,6 +1317,10 @@ fn run_iteration_all(
         ) {
             Ok(outcome) if outcome.quarantined_redeliveries == 0 => {
                 state.clear_producer_degraded(&producer.source_key);
+                match producer.client.backfill_scope_stamps(state) {
+                    Ok(()) | Err(PullError::Stopped | PullError::SourceAbsent) => {}
+                    Err(error) => tracing::warn!(?error, "BROCA scope stamp backfill failed"),
+                }
             }
             // The page committed, but a stored event came back with a
             // different payload; that is surfaced like any reader's quarantine.

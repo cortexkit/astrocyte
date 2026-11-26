@@ -2,6 +2,7 @@
 use super::valuation::{PlanMember, Recorded, ValuedCell};
 use super::*;
 pub(crate) use crate::attribution::Attribution;
+use crate::broca::ScopeStamp;
 use serde::{Deserialize, Serialize};
 
 pub(super) const DELETE_CELLS_SQL: &str =
@@ -19,13 +20,42 @@ impl Attribution {
     }
 }
 
+type ScopeStamps = HashMap<i64, (ScopeStamp, String)>;
+
+pub(super) fn stamps_sql(filter: &str) -> String {
+    format!(
+        "SELECT s.event_key,s.agent_id,s.agent_run_id,s.flow_id,s.call_kind
+             FROM (SELECT event_key FROM usage_event WHERE {filter}) e
+             CROSS JOIN broca_scope_stamp s ON s.event_key=e.event_key"
+    )
+}
+
+pub(super) fn stamps(conn: &Connection, filter: &str) -> Result<ScopeStamps, ReportError> {
+    let mut statement = conn.prepare(&stamps_sql(filter))?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            (
+                ScopeStamp {
+                    agent_id: row.get(1)?,
+                    agent_run_id: row.get(2)?,
+                    flow_id: row.get(3)?,
+                },
+                row.get(4)?,
+            ),
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub(super) fn resolve(
     resolver: &mut crate::attribution::Resolver,
     conn: &Connection,
     ledger: &Ledger,
     event: &LedgerEvent,
-) -> Result<Attribution, ReportError> {
-    resolver
+    stamps: &ScopeStamps,
+) -> Result<(Attribution, bool), ReportError> {
+    let tuple = resolver
         .resolve(
             conn,
             event.attribution_runner.map(|id| ledger.values.name(id)),
@@ -34,7 +64,13 @@ pub(super) fn resolve(
             event.flow_ref.map(|id| ledger.values.name(id)),
             event.occurred_at_ms,
         )
-        .map_err(|_| ReportError::Integrity("invalid attribution evidence"))
+        .map_err(|_| ReportError::Integrity("invalid attribution evidence"))?;
+    match stamps.get(&event.key) {
+        Some((stamp, kind)) => resolver
+            .apply_stamp(conn, tuple, stamp, kind, event.occurred_at_ms)
+            .map_err(|_| ReportError::Integrity("invalid attribution evidence")),
+        None => Ok((tuple, false)),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -84,6 +120,8 @@ pub(super) struct Payload {
     // exact metered portion before combining different charge bases.
     #[serde(with = "exact")]
     pub(super) metered: i128,
+    #[serde(skip_serializing_if = "crate::report::is_zero_calls")]
+    pub(super) stamp_disagreement_calls: u64,
 }
 
 // Decode known fields directly rather than buffering the entire nested JSON
@@ -97,6 +135,8 @@ struct ReadPayload {
     money: Vec<((i64, String), Money)>,
     #[serde(with = "exact")]
     metered: i128,
+    #[serde(default)]
+    stamp_disagreement_calls: u64,
 }
 impl From<ReadPayload> for Payload {
     fn from(value: ReadPayload) -> Self {
@@ -108,6 +148,7 @@ impl From<ReadPayload> for Payload {
                 money: value.money,
             },
             metered: value.metered,
+            stamp_disagreement_calls: value.stamp_disagreement_calls,
         }
     }
 }
@@ -116,10 +157,16 @@ impl From<ReadPayload> for Payload {
 pub(super) struct ProjectedValue {
     pub(super) value: ValuedCell,
     pub(super) metered: i128,
+    pub(super) stamp_disagreement_calls: u64,
     pub(super) original_keys: BTreeSet<Key>,
 }
 impl Projection {
-    fn merge(&mut self, tuple: &Attribution, data: &Data) -> Result<(), ReportError> {
+    fn merge(
+        &mut self,
+        tuple: &Attribution,
+        disagrees: bool,
+        data: &Data,
+    ) -> Result<(), ReportError> {
         for (key, cell) in &data.cells {
             let projected = self
                 .cells
@@ -129,6 +176,9 @@ impl Projection {
                 sum(&mut projected.metered, cell.total)?;
             }
             projected.recorded.cell.merge(cell)?;
+            if disagrees {
+                add_count(&mut projected.stamp_disagreement_calls, cell.events)?;
+            }
         }
         for ((key, qkey), q) in &data.quantities {
             valuation::merge_quantity(
@@ -208,6 +258,7 @@ pub(super) fn replace_valuation(
             let recorded = Payload {
                 recorded: cell.value.recorded,
                 metered: cell.metered,
+                stamp_disagreement_calls: cell.stamp_disagreement_calls,
             };
             tx.execute("INSERT INTO attribution_valuation_cell VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![hour.kind,hour.number,currency,tuple,provider,model,encode(&member)?,member.plan,member.plan_account,member.record.as_ref().map(encode).transpose()?,encode(&recorded)?,cell.value.numerator.to_string(),encode(&cell.value.unvalued)?])?;
         }
@@ -247,10 +298,11 @@ pub(super) fn observe(
     resolver: &mut crate::attribution::Resolver,
 ) -> Result<usize, ReportError> {
     let ledger = load_scoped_ledger(conn, &DIMENSIONS, Some(filter))?;
-    let mut groups: BTreeMap<Attribution, Data> = BTreeMap::new();
+    let stamps = stamps(conn, filter)?;
+    let mut groups: BTreeMap<(Attribution, bool), Data> = BTreeMap::new();
     let mut events = HashMap::new();
     for event in &ledger.events {
-        let tuple = resolve(resolver, conn, &ledger, event)?;
+        let tuple = resolve(resolver, conn, &ledger, event, &stamps)?;
         let key = groups
             .entry(tuple.clone())
             .or_default()
@@ -311,8 +363,8 @@ pub(super) fn observe(
         sum(&mut money.nanos, i128::from(row.get::<_, i64>(2)?))?;
         add_count(&mut money.contributions, 1)?;
     }
-    for (tuple, group) in groups {
-        projection.merge(&tuple, &group)?;
+    for ((tuple, disagrees), group) in groups {
+        projection.merge(&tuple, disagrees, &group)?;
         add_count(&mut data.events, group.events)?;
         min(&mut data.first, group.first);
         max(&mut data.last, group.last);

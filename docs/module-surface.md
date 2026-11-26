@@ -384,7 +384,7 @@ Reads never write. A refusal on a read is one of the codes below.
 
   `project` is the folder the call ran in, as recorded in `project_root`; its
   existing `hierarchy_resolution: "unavailable"` is unchanged. `project_id` is
-  the project the publisher named for the session or run. It has no
+  the project the publisher named for the session, run or flow. It has no
   `hierarchy_resolution` member. Combining legacy `project` with an attribution
   dimension is unavailable, not a request to translate folders into projects.
 
@@ -394,16 +394,25 @@ Reads never write. A refusal on a read is one of the codes below.
   computation. The newest unsuperseded fact supplies its owning `alfonso` and
   workload. `parent_alfonso` comes from the launching subject's own winning
   fact. Workspace is the placement of that fact's project at the call's
-  occurrence time. No fact means Not attributed: all five values are null,
-  never guessed. A known fact may itself name a null Alfonso, so a null Alfonso
-  group alone does not prove that every call lacks a fact.
+  occurrence time. If none of those publisher facts matches, a BROCA call can
+  use the daemon scope stamp on its export. A stamped flow joins the flow's
+  publisher fact. A stamped agent supplies `alfonso`, with `parent_alfonso` and
+  `project_id` from the stamped run's publisher fact when known. The workload
+  is `broca_session` for session segments and model attempts, and `system_one`
+  for System One calls, whose export does not name an operation. No task is
+  inferred. Without matching publisher or stamp evidence, all five values are
+  null (Not attributed). A known fact may itself name a null Alfonso, so a null
+  Alfonso group alone does not prove that every call lacks attribution.
 
   A request grouping or filtering by attribution additionally carries
   `attribution_coverage: {attributed_calls, unattributed_calls}`. These count
   dated calls in the selected range with its non-attribution filters, ignoring
   attribution filters. Their sum equals the ordinary report's dated call total
-  for that population. Even without a range, undated calls remain solely in
-  the separate `undated` disclosure. Ordinary requests omit attribution coverage.
+  for that population. When nonzero, `stamp_disagreement_calls` counts calls
+  in the same population for which the winning publisher fact and the stamp
+  name different agents. The publisher still wins. Even without a range,
+  undated calls remain solely in the separate `undated` disclosure. Ordinary
+  requests omit attribution coverage.
   Tests: `attribution_report_real_split_rows_keep_unattributed_and_all_metric_totals`,
   `attribution_report_randomized_groups_sum_to_ordinary_totals_with_identical_model_filters`,
   `attribution_report_filter_coverage_ignores_attribution_but_keeps_model_filter`.

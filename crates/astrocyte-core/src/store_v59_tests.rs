@@ -72,6 +72,8 @@ mod session_refs {
                 assert!(table_rows(conn, "broca_segment_evidence").is_empty());
                 assert!(table_rows(conn, "broca_segment_measurement").is_empty());
                 assert!(table_rows(conn, "broca_segment_mismatch").is_empty());
+                assert!(table_rows(conn, "broca_scope_stamp").is_empty());
+                assert!(table_rows(conn, "broca_scope_backfill").is_empty());
                 assert!(table_rows(conn, "quota_reset_period").is_empty());
                 assert_eq!(
                     conn.query_row(
@@ -94,6 +96,8 @@ mod session_refs {
                                 | "broca_segment_measurement"
                                 | "broca_segment_mismatch"
                                 | "broca_segment_check_state"
+                                | "broca_scope_stamp"
+                                | "broca_scope_backfill"
                                 | "quota_reset_period"
                         )
                     })

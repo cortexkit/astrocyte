@@ -2,6 +2,7 @@
 //! measurements. The facts are read from BROCA's store (see `broca_source`)
 //! in the shape BROCA's retired `usage.export` operation served them.
 
+use astrocyte_core::broca::ScopeStamp;
 use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::{EventRecordRequest, MeasurementInput};
 use serde::Deserialize;
@@ -22,6 +23,9 @@ pub struct WireSpendSegmentFact {
     #[serde(default)]
     pub usage_in_attempts: bool,
     pub run_id: String,
+    pub agent_id: Option<String>,
+    pub agent_run_id: Option<String>,
+    pub flow_id: Option<String>,
     pub session: WireBindIdentity,
     pub provider: String,
     pub model: String,
@@ -79,6 +83,16 @@ pub struct WireSpendSegmentFact {
     /// [`map_fact`] and is not stored: see [`reasoning_is_inside_output`].
     #[serde(default)]
     pub usage_policy_version: Option<u32>,
+}
+
+impl WireSpendSegmentFact {
+    pub(crate) fn take_scope_stamp(&mut self) -> ScopeStamp {
+        ScopeStamp {
+            agent_id: self.agent_id.take(),
+            agent_run_id: self.agent_run_id.take(),
+            flow_id: self.flow_id.take(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -376,6 +390,7 @@ pub struct WireSystemOneFact {
     pub run_id: Option<String>,
     #[serde(default)]
     pub flow_id: Option<String>,
+    pub agent_id: Option<String>,
     pub provider: String,
     pub model: String,
     #[serde(default)]

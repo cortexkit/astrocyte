@@ -43,7 +43,10 @@ mod parent_session_refs {
             revisions(conn)
         }).unwrap();
 
-        assert_eq!(migrate_store(&store).unwrap().recorded, 66);
+        assert_eq!(
+            migrate_store(&store).unwrap().recorded,
+            MIGRATIONS.last().unwrap().version
+        );
         let after = store.with_conn(revisions).unwrap();
         assert_eq!(after, [before[0] + 1, before[1]]);
         // Reopening the migrated store does not mark the children again.
@@ -69,7 +72,11 @@ mod parent_session_refs {
             .unwrap();
 
         let outcome = migrate_store(&store).unwrap();
-        assert_eq!((outcome.applied, outcome.recorded), (1, 66));
+        assert_eq!(outcome.recorded, MIGRATIONS.last().unwrap().version);
+        assert_eq!(
+            outcome.applied,
+            u32::try_from(MIGRATIONS.len() - before.len()).unwrap()
+        );
         assert_eq!(migrate_store(&store).unwrap().applied, 0);
         store
             .with_conn(|conn| {

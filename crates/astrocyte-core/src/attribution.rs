@@ -705,6 +705,29 @@ fn dirty_subject(
     Ok(())
 }
 fn dirty_context(conn: &Connection, context: &Context, from: Option<i64>) -> Result<(), String> {
+    dirty_ledger_context(conn, context, from)?;
+    // A stamped run or flow can affect attribution even when the ledger's
+    // run_ref or flow_ref points somewhere else. Skip the calls already found
+    // through those ledger refs.
+    let stamped = match context {
+        Context::Run(id) => Some((id, "agent_run_id", "broca_scope_stamp_run", "run_ref")),
+        Context::Flow(id) => Some((id, "flow_id", "broca_scope_stamp_flow", "flow_ref")),
+        Context::Session { .. } => None,
+    };
+    if let Some((id, field, index, ledger_field)) = stamped {
+        sql(conn.execute(
+            &dirty_stamp_sql(field, index, ledger_field),
+            params![id, from],
+        ))?;
+    }
+    Ok(())
+}
+
+fn dirty_ledger_context(
+    conn: &Connection,
+    context: &Context,
+    from: Option<i64>,
+) -> Result<(), String> {
     let (column, index, runner, names) = match context {
         Context::Session { runner, names } => (
             "session",
@@ -740,6 +763,15 @@ fn dirty_context(conn: &Connection, context: &Context, from: Option<i64>) -> Res
     Ok(())
 }
 
+fn dirty_stamp_sql(field: &str, index: &str, ledger_field: &str) -> String {
+    format!("UPDATE attribution_hour SET revision=revision+1 WHERE (kind,hour_number) IN (
+        SELECT CASE WHEN e.occurred_at_ms IS NULL THEN 1 ELSE 0 END,
+               coalesce(e.occurred_at_ms/3600000-(e.occurred_at_ms<0 AND e.occurred_at_ms%3600000<>0),0)
+        FROM broca_scope_stamp s INDEXED BY {index} CROSS JOIN usage_event e ON e.event_key=s.event_key
+        WHERE s.{field}=?1 AND e.{ledger_field} IS NOT ?1 AND (?2 IS NULL OR e.occurred_at_ms>=?2)
+    )")
+}
+
 const COMPUTED_PARENT_CHILDREN: &str = "SELECT f.body FROM attribution_parent_session_ref p
     CROSS JOIN attribution_fact f ON f.fact_id=p.fact_id
     WHERE p.parent_runner IN (?1,?2) AND p.session_ref=?3";
@@ -772,7 +804,11 @@ fn dirty_children_of_existing_computed_aliases(conn: &Connection) -> Result<(), 
         }
     }
     for child in children {
-        dirty_subject(conn, &aliases, &child, None)?;
+        // The migration that fills computed parent references predates the
+        // stamp table, so it can invalidate only ledger contexts.
+        if let Some(context) = Context::subject(&aliases, &child) {
+            dirty_ledger_context(conn, &context, None)?;
+        }
     }
     Ok(())
 }
