@@ -312,13 +312,15 @@ Legacy observations without those inputs report null stability diagnostics.
 
 For pools that can be measured, every tracked source must have
 `last_success_ms` at/after the interval end **and** no `pending_known` or
-`pending_unknown` backlog. The daily stage retries an unrecorded day while a
-source is stale or still draining, just as it retries while a needed model's
-rate timeline is not yet cached. It does not append a partial original after
-the two-hour mark. An operator recompute checks the same source readiness but
-may append a routing-ineligible `source_backlog` diagnostic after two hours.
-Sources absent from `source_runtime` are not independently certified; this
-gate does not prove that traffic outside ingestion is visible.
+`pending_unknown` backlog. While a source is stale or still draining, the
+daily stage retries until two hours after the later of the interval end and
+process start. After that deadline it may append a routing-ineligible row
+with `source_backlog` so a failing source does not leave a permanent gap.
+Operator recompute uses the same readiness check but counts two hours from
+the interval end alone. The daily stage also retries while a needed model's
+rate timeline is not yet cached. Sources absent from `source_runtime` are not
+independently certified; this gate does not prove that traffic outside
+ingestion is visible.
 
 Rows expose `zero_measurement_events` and `missing_quantity_events`. The
 historical `unattributed_event_share` field is zero on new rows because calls

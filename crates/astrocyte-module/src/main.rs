@@ -47,6 +47,7 @@ use subc_protocol::{
 use config::DEFAULT_MODULE_ID;
 
 fn main() -> Result<std::process::ExitCode, Box<dyn Error>> {
+    let process_started_at_ms = now_ms();
     // `--version` answers before logging, the launch nonce or any config is
     // touched. SubC's placement script runs it to warm a freshly placed binary,
     // unsupervised and with no `--subc`; reaching startup there would log a
@@ -121,7 +122,7 @@ fn main() -> Result<std::process::ExitCode, Box<dyn Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let outcome = runtime.block_on(run_main());
+    let outcome = runtime.block_on(run_main(process_started_at_ms));
     // Dropping the runtime drops every task still holding the shared state,
     // so the store is closed before `finish_process` can end the process.
     drop(runtime);
@@ -227,10 +228,10 @@ fn init_logging() -> Result<cortexkit_log::Handle, cortexkit_log::InitError> {
     }
 }
 
-async fn run_main() -> Result<LoopEnd, ModuleError> {
+async fn run_main(process_started_at_ms: i64) -> Result<LoopEnd, ModuleError> {
     let module_config = ModuleConfig::from_env()?;
     let state = open_state()?;
-    run(module_config, state).await
+    run(module_config, state, process_started_at_ms).await
 }
 
 fn check_config(config_path: &Path, output: &mut dyn Write) -> Result<(), ModuleError> {
@@ -326,7 +327,11 @@ impl ModuleConfig {
     }
 }
 
-async fn run(config: ModuleConfig, state: Arc<SharedState>) -> Result<LoopEnd, ModuleError> {
+async fn run(
+    config: ModuleConfig,
+    state: Arc<SharedState>,
+    process_started_at_ms: i64,
+) -> Result<LoopEnd, ModuleError> {
     let startup_state = Arc::clone(&state);
     connect_after_startup(
         move || astrocyte_module::hydrate_startup(&startup_state),
@@ -340,7 +345,9 @@ async fn run(config: ModuleConfig, state: Arc<SharedState>) -> Result<LoopEnd, M
             serve_module(
                 &config,
                 state,
-                astrocyte_module::start_refresher_with_media,
+                move |state, stop| {
+                    astrocyte_module::start_refresher_with_media(state, stop, process_started_at_ms)
+                },
                 sigterm,
             )
             .await
@@ -4206,6 +4213,7 @@ mod tests {
         const EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
         if let Some(connection_file_path) = std::env::var_os(CHILD_ENV) {
+            let process_started_at_ms = now_ms();
             let handle = super::init_logging().unwrap();
             println!("{LOG_PATH_PREFIX}{}", handle.path().display());
             let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -4215,7 +4223,7 @@ mod tests {
                     connection_file_path: PathBuf::from(connection_file_path),
                     module_id: DEFAULT_MODULE_ID.to_string(),
                 };
-                run(config, state).await
+                run(config, state, process_started_at_ms).await
             });
             // As in `main`: the runtime goes before `finish_process`.
             drop(runtime);

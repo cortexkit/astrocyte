@@ -642,10 +642,8 @@ pub fn start_refresher(
     spawn_refresher(
         state,
         stop,
+        current_time_ms(),
         refresher_opencode_source(),
-        refresher_pi_source(),
-        refresher_claude_code_source(),
-        refresher_codex_source(),
         refresher_harness_sources(),
     )
 }
@@ -654,16 +652,15 @@ pub fn start_refresher(
 pub fn start_refresher_with_media(
     state: Arc<SharedState>,
     stop: Arc<AtomicBool>,
+    process_started_at_ms: i64,
 ) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
     let mut sources = refresher_harness_sources();
     sources.push(Arc::new(colliculus_source::ColliculusSource::new()));
     spawn_refresher(
         state,
         stop,
+        process_started_at_ms,
         refresher_opencode_source(),
-        refresher_pi_source(),
-        refresher_claude_code_source(),
-        refresher_codex_source(),
         sources,
     )
 }
@@ -679,10 +676,8 @@ pub fn start_refresher_with_opencode(
     spawn_refresher(
         state,
         stop,
+        current_time_ms(),
         opencode_source::OpenCodeSource::at(opencode_database),
-        refresher_pi_source(),
-        refresher_claude_code_source(),
-        refresher_codex_source(),
         refresher_harness_sources(),
     )
 }
@@ -690,12 +685,13 @@ pub fn start_refresher_with_opencode(
 fn spawn_refresher(
     state: Arc<SharedState>,
     stop: Arc<AtomicBool>,
+    process_started_at_ms: i64,
     opencode_source: opencode_source::OpenCodeSource,
-    pi_source: pi_source::PiSource,
-    claude_code_source: claude_code_source::ClaudeCodeSource,
-    codex_source: codex_source::CodexSource,
     harness_sources: Vec<Arc<dyn harness_drain::HarnessSource>>,
 ) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
+    let pi_source = refresher_pi_source();
+    let claude_code_source = refresher_claude_code_source();
+    let codex_source = refresher_codex_source();
     let (ready, initialized) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::Builder::new()
         .name("astrocyte-refresher".into())
@@ -766,7 +762,7 @@ fn spawn_refresher(
                     },
                     capacity,
                     pending_catalog,
-                    MultiplierStage::new(plan_prices),
+                    MultiplierStage::starting_at(plan_prices, process_started_at_ms),
                     poll_interval_secs,
                     Arc::clone(&stop),
                 );
