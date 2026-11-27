@@ -118,6 +118,7 @@ struct Folder {
     /// Since the folder or its latest done session was seen done, a full pass
     /// of each layout has reached its high water and recorded its final calls.
     settled: bool,
+    folder_done: bool,
     /// Sessions already seen done. A newly done session requires a full pass
     /// even while the shared server continues writing other sessions.
     done_sessions: HashSet<String>,
@@ -142,6 +143,7 @@ impl Folder {
             v1: OpenCodeSource::declared(database.to_path_buf(), home(LAYOUT_V1)),
             v2: OpenCodeV2Source::declared(database.to_path_buf(), home(LAYOUT_V2)),
             settled: false,
+            folder_done: false,
             done_sessions: HashSet::new(),
         }
     }
@@ -257,20 +259,6 @@ impl OpenCodeThalamusSource {
                 }
                 RootsFile::Declared(entries) => match check_paths_unique(&entries) {
                     Ok(()) => {
-                        let mut aliases = Vec::new();
-                        for entry in &entries {
-                            if let Store::Shared { sessions } = &entry.store {
-                                for session in sessions {
-                                    aliases.push(astrocyte_core::attribution::SessionAliases {
-                                        runner: "thalamus-harness".into(),
-                                        harness: "opencode".into(),
-                                        recorded: session.session.clone(),
-                                        names: vec![session.metadata.session_ref.clone()],
-                                    });
-                                }
-                            }
-                        }
-                        super::attribution_source::append_roots(state, &aliases, stop)?;
                         cache.entries = entries;
                         true
                     }
@@ -289,6 +277,7 @@ impl OpenCodeThalamusSource {
         let mut complete = declarations_known;
         let mut quarantined = 0;
         let mut seen = HashSet::new();
+        let mut aliases = Vec::new();
         let entries = cache.entries.clone();
         // Borrow the cache's fields apart, through the guard, so a folder's
         // reader and the warned set can both be held in the loop.
@@ -384,6 +373,18 @@ impl OpenCodeThalamusSource {
                 }) => {
                     complete &= recorded_all;
                     quarantined += count;
+                    if declarations_known {
+                        if let Store::Shared { sessions } = &entry.store {
+                            aliases.extend(sessions.iter().map(|session| {
+                                astrocyte_core::attribution::SessionAliases {
+                                    runner: "thalamus-harness".into(),
+                                    harness: "opencode".into(),
+                                    recorded: session.session.clone(),
+                                    names: vec![session.metadata.session_ref.clone()],
+                                }
+                            }));
+                        }
+                    }
                 }
                 Err(error @ (SourceDrainError::Stopped | SourceDrainError::Deferred)) => {
                     return Err(error)
@@ -417,11 +418,27 @@ impl OpenCodeThalamusSource {
         });
 
         let watermark = complete.then(|| at.saturating_sub(WATERMARK_MARGIN_MS));
-        state.ordered_write(|tx| {
-            record_pass_in_tx(tx, at, complete, stores.as_ref())?;
-            store_watermark_in_tx(tx, watermark, at)?;
-            Ok(((), true))
-        })?;
+        let mut stopped = false;
+        state
+            .ordered_write(|tx| {
+                record_pass_in_tx(tx, at, complete, stores.as_ref())?;
+                store_watermark_in_tx(tx, watermark, at)?;
+                // A declaration alone cannot publish aliases. Commit them with
+                // the pass bookkeeping only after that store was read successfully.
+                astrocyte_core::attribution::append_alias_batch(tx, &aliases)?;
+                if stop.load(Ordering::Relaxed) {
+                    stopped = true;
+                    return Err("OpenCode session pass stopped".into());
+                }
+                Ok(((), true))
+            })
+            .map_err(|reason| {
+                if stopped {
+                    SourceDrainError::Stopped
+                } else {
+                    reason.into()
+                }
+            })?;
         if quarantined > 0 {
             problems.push(format!(
                 "{quarantined} OpenCode session deliveries were quarantined"
@@ -498,18 +515,23 @@ fn read_folder(
         .collect::<HashSet<_>>();
     let done =
         matches!(&entry.store, Store::Folder(session) if session.state == SessionState::Done);
-    if matches!(&entry.store, Store::Folder(_)) && !done
-        || !done_sessions.is_subset(&folder.done_sessions)
-    {
+    let newly_done =
+        (done && !folder.folder_done) || !done_sessions.is_subset(&folder.done_sessions);
+    if matches!(&entry.store, Store::Folder(_)) && !done || newly_done {
         folder.settled = false;
     }
+    folder.folder_done = done;
     folder.done_sessions = done_sessions;
     // A final full pass finds calls the tail could have missed, including
     // incomplete rows below the cursor in a newly done shared session.
     let settling = (done || !folder.done_sessions.is_empty()) && !folder.settled;
     if settling {
         folder.v1.require_full_pass();
-        folder.v2.require_full_pass();
+        if newly_done {
+            folder.v2.restart_full_pass();
+        } else {
+            folder.v2.require_full_pass();
+        }
     }
     let options = ReadOptions {
         work_class: match &entry.store {
@@ -1275,6 +1297,27 @@ mod tests {
     }
 
     #[test]
+    fn refused_shared_store_cannot_add_session_aliases() {
+        let f = Fixture::new();
+        let mut refused = f.shared_entry(vec![Fixture::shared_session("refused", false)]);
+        refused["path"] = json!(f.folder.join("misplaced"));
+        fs::create_dir_all(f.folder.join("misplaced")).unwrap();
+        f.shared_call("accepted", "shared", true, CREATED);
+        f.declare(vec![
+            refused,
+            f.shared_entry(vec![Fixture::shared_session("accepted", false)]),
+        ]);
+        f.tick(T0);
+        assert_eq!(f.refs(), vec!["shared"]);
+        let aliases = f.state.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT host_session FROM session_alias WHERE harness='opencode' ORDER BY host_session").map_err(|error| error.to_string())?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|error| error.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| error.to_string())
+        }).unwrap();
+        assert_eq!(aliases, ["accepted"]);
+    }
+
+    #[test]
     fn shared_paths_require_the_shared_kind_and_exact_resolved_location() {
         for relative in [
             "opencode2-server/data/opencode",
@@ -1437,6 +1480,25 @@ mod tests {
         f.tick(T0 + 3 * TICK);
         assert_eq!(f.watermark(), Some(T0 + 3 * TICK - WATERMARK_MARGIN_MS));
         assert_eq!(f.degraded(), None);
+    }
+
+    #[test]
+    fn a_session_settled_mid_sweep_revisits_open_rows_from_earlier_pages() {
+        let f = Fixture::new();
+        f.shared_call("done", "early-open", false, T0);
+        let database = f.shared_path().join("opencode.db");
+        fill(&database, Layout::V2, page_limit(Layout::V2) + 2, T0 + 1);
+        f.declare(vec![
+            f.shared_entry(vec![Fixture::shared_session("done", false)])
+        ]);
+        f.tick(T0);
+        assert!(f.refs().is_empty());
+        f.declare(vec![
+            f.shared_entry(vec![Fixture::shared_session("done", true)])
+        ]);
+        f.tick(T0 + TICK);
+        assert_eq!(f.refs(), ["early-open"]);
+        assert_eq!(f.watermark(), Some(T0 + TICK - WATERMARK_MARGIN_MS));
     }
 
     #[test]

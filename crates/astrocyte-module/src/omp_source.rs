@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::EventRecordRequest;
 use astrocyte_readers::sessions::omp::{
-    parse_omp_file_resumable, OmpCall, OmpOutput, OmpParseCounts, OmpResumePoint,
+    try_parse_omp_file_resumable, OmpCall, OmpOutput, OmpParseCounts, OmpResumePoint,
 };
 
 use crate::refresher::harness_drain::{
@@ -131,14 +131,14 @@ impl OmpSource {
                     .is_some_and(|extension| extension == "jsonl")
             },
             |path, previous, check| {
-                let parse = parse_omp_file_resumable(path, previous, check);
-                JsonlRead {
+                let parse = try_parse_omp_file_resumable(path, previous, check, stop)?;
+                Ok(JsonlRead {
                     resumed: parse.resumed,
                     hashed_bytes: parse.hashed_bytes,
                     counts: parse.counts,
                     calls: parse.calls,
                     resume: parse.resume,
-                }
+                })
             },
             |call| call.entry_id.as_str(),
             map_call,
@@ -174,11 +174,13 @@ impl HarnessSource for OmpSource {
         stop: &AtomicBool,
     ) -> Result<Option<String>, SourceDrainError> {
         let outcome = self.drain(state, recorded_at_ms, stop)?;
-        Ok(health_reason(
-            "Oh My Pi",
-            outcome.quarantined_redeliveries,
-            outcome.counts.usage_not_ingested() + outcome.calls_set_aside,
-        ))
+        Ok(outcome.read_errors.into_iter().next().or_else(|| {
+            health_reason(
+                "Oh My Pi",
+                outcome.quarantined_redeliveries,
+                outcome.counts.usage_not_ingested() + outcome.calls_set_aside,
+            )
+        }))
     }
 }
 
@@ -589,7 +591,11 @@ mod tests {
         let mut reader = RawTotals::default();
         let mut counts = OmpParseCounts::default();
         for path in &files {
-            let parse = parse_omp_file_resumable(path, None, PrefixCheck::Full);
+            let parse = astrocyte_readers::sessions::omp::parse_omp_file_resumable(
+                path,
+                None,
+                PrefixCheck::Full,
+            );
             counts.add(&parse.counts);
             for call in parse.calls {
                 let usage = call.usage;

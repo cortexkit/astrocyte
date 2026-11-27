@@ -41,7 +41,7 @@
 //! non-zero `tool` leaves `input` underivable. A record whose `total`
 //! contradicts the identity has both `input` and `output` underivable.
 
-use super::jsonl_resume::{read_appended_lines, JsonlResumePoint, PrefixCheck};
+use super::jsonl_resume::{read_appended_lines, JsonlResumePoint, PrefixCheck, ReadOptions};
 use super::roles::DerivedRole;
 use super::utils::parse_json_line;
 use serde::Deserialize;
@@ -396,6 +396,8 @@ impl GeminiResumePoint {
 /// Result of one [`parse_gemini_jsonl_resumable`] call.
 #[derive(Debug, Default)]
 pub struct GeminiResumableParse {
+    /// A read failure does not mean the transcript was empty.
+    pub io_error: Option<String>,
     /// Calls read by this call, in file order.
     pub calls: Vec<GeminiCall>,
     /// True when the previous point's prefix verified and parsing started at
@@ -417,30 +419,51 @@ pub fn parse_gemini_jsonl_resumable(
     previous: Option<GeminiResumePoint>,
     check: PrefixCheck,
 ) -> GeminiResumableParse {
+    match try_parse_gemini_jsonl_resumable(
+        path,
+        previous,
+        check,
+        &std::sync::atomic::AtomicBool::new(false),
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => GeminiResumableParse {
+            io_error: Some(error.to_string()),
+            ..GeminiResumableParse::default()
+        },
+    }
+}
+
+pub fn try_parse_gemini_jsonl_resumable(
+    path: &Path,
+    previous: Option<GeminiResumePoint>,
+    check: PrefixCheck,
+    stop: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<GeminiResumableParse> {
     let mut counts = GeminiParseCounts::default();
     let mut calls = Vec::new();
     let mut buffer = Vec::with_capacity(4096);
-    let Some(read) = read_appended_lines(
+    let read = read_appended_lines(
         path,
         previous.map(|point| point.0),
-        check,
+        ReadOptions::live(check, stop),
         GeminiParseState::default,
-        |state, payload| {
+        |state, payload, _| {
             counts.lines += 1;
-            parse_jsonl_line(payload, &mut buffer, state, &mut counts, &mut calls);
+            if let Some(payload) = payload {
+                parse_jsonl_line(payload, &mut buffer, state, &mut counts, &mut calls);
+            } else {
+                counts.skipped_lines += 1;
+            }
         },
-    ) else {
-        return GeminiResumableParse::default();
-    };
-    GeminiResumableParse {
+    )?;
+    Ok(GeminiResumableParse {
+        io_error: None,
         calls,
         resumed: read.resumed,
-        resume: read
-            .cursor
-            .map(|cursor| GeminiResumePoint(cursor.with_state(read.state))),
+        resume: Some(GeminiResumePoint(read.cursor.with_state(read.state))),
         hashed_bytes: read.hashed_bytes,
         counts,
-    }
+    })
 }
 
 #[cfg(test)]

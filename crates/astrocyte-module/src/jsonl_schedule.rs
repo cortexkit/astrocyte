@@ -484,6 +484,48 @@ mod tests {
     }
 
     #[test]
+    fn failed_legacy_transcript_retries_without_blocking_a_healthy_file() {
+        use crate::refresher::harness_drain::HarnessSource;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (reader, path, contents) = fixtures(root, false)
+            .into_iter()
+            .find(|(reader, _, _)| reader.key() == "omp")
+            .unwrap();
+        let Reader::Omp(source) = &reader else {
+            unreachable!()
+        };
+        let healthy = path.with_file_name("z-healthy.jsonl");
+        std::fs::write(
+            &healthy,
+            contents
+                .replace("resp-one", "resp-two")
+                .replace("\"id\":\"one\"", "\"id\":\"two\""),
+        )
+        .unwrap();
+        let disappearing = path.clone();
+        AFTER_STAT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(disappearing).unwrap()
+            }));
+        });
+        let state = test_state();
+        let stop = AtomicBool::new(false);
+        let reason = source
+            .drain_for_health(&state, 100, &stop)
+            .unwrap()
+            .unwrap();
+        assert!(reason.contains("read Oh My Pi session"), "{reason}");
+        assert_eq!(count(&state, "usage_event"), 1);
+        std::fs::write(&path, contents).unwrap();
+        let retried = source.drain(&state, 101, &stop).unwrap();
+        assert!(retried.read_errors.is_empty());
+        assert_eq!(retried.rows_recorded, 1);
+        assert_eq!(count(&state, "usage_event"), 2);
+    }
+
+    #[test]
     fn quiet_unexpired_tick_reads_no_content_but_commits_health() {
         for large in [false, true] {
             let temp = tempfile::tempdir().unwrap();

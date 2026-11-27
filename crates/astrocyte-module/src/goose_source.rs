@@ -193,6 +193,7 @@ impl GooseSource {
                 cache.through = None;
                 cache.last_full_ms = None;
                 cache.recheck.clear();
+                cache.sent.clear();
                 return Ok(GooseDrainOutcome {
                     root_absent: true,
                     ..GooseDrainOutcome::default()
@@ -274,6 +275,9 @@ impl GooseSource {
         outcome.quarantined_redeliveries = tally.quarantined_redeliveries;
 
         cache.sent.extend(sent_now);
+        if full {
+            cache.sent.retain(|id, _| read.seen.contains(id));
+        }
         cache.recheck = recheck;
         cache.through = if full {
             through
@@ -435,6 +439,36 @@ mod tests {
 
     fn drain(source: &GooseSource, state: &SharedState, at: i64) -> GooseDrainOutcome {
         source.drain(state, at, &NEVER_STOP).unwrap()
+    }
+
+    #[test]
+    fn full_inventory_prunes_only_deleted_goose_sessions() {
+        let temp = TempDir::new().unwrap();
+        let path = store(temp.path());
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("INSERT INTO sessions (id,working_dir,created_at,updated_at,provider_name,model_config_json,accumulated_input_tokens,accumulated_output_tokens) SELECT 'keep',working_dir,created_at,updated_at,provider_name,model_config_json,accumulated_input_tokens,accumulated_output_tokens FROM sessions").unwrap();
+        let source = GooseSource::at(&path);
+        let state = test_state();
+        let at = 1_800_000_000_000;
+        assert_eq!(drain(&source, &state, at).rows_recorded, 2);
+        db.execute("DELETE FROM sessions WHERE id != 'keep'", [])
+            .unwrap();
+        drain(&source, &state, at + 1);
+        assert_eq!(source.cache.lock().unwrap().sent.len(), 2);
+        drain(&source, &state, at + FULL_PASS_INTERVAL_MS);
+        let cache = source.cache.lock().unwrap();
+        assert_eq!(cache.sent.len(), 1);
+        assert!(cache
+            .sent
+            .values()
+            .any(|request| request.session.as_deref() == Some("keep")));
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM usage_event WHERE producer='goose'"
+            ),
+            2
+        );
     }
 
     fn count(state: &SharedState, sql: &str) -> i64 {

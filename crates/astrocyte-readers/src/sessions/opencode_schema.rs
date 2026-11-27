@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use rusqlite::{params, Connection, ErrorCode, Statement, StatementStatus};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Statement, StatementStatus};
 use serde::Deserialize;
 
 use super::opencode::{OpenCodeMessage, OpenCodeTotals};
@@ -711,8 +711,20 @@ fn read_tail_snapshot(
     let start_rowid = request
         .after_rowid
         .unwrap_or_else(|| max_rowid.saturating_sub(request.seed_rows).max(0));
-    let limit = i64::try_from(request.limit)
+    let offset = i64::try_from(request.limit.saturating_sub(1))
         .map_err(|_| "OpenCode tail limit exceeds SQLite integer range".to_string())?;
+    // Choose the raw rowid window before testing role or decoding JSON. A
+    // long run of user messages must use the same budget as assistant rows.
+    let through = counted_query_row(
+        connection,
+        &mut cost,
+        "SELECT rowid FROM message WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT 1 OFFSET ?3",
+        params![start_rowid, max_rowid, offset],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| sqlite_error(stop, "select OpenCode tail boundary", error))?
+    .unwrap_or_else(|| start_rowid.max(max_rowid));
     let columns = format!(
         "SELECT rowid,id,session_id,time_updated,data,(CASE WHEN typeof(data)='text' AND json_valid(data) THEN ({HAS_TOKENS} AND {TOKENS_FINAL}) ELSE 0 END)
          FROM message"
@@ -721,7 +733,7 @@ fn read_tail_snapshot(
         set_aside: Vec::new(),
         max_rowid,
         start_rowid,
-        scanned_through_rowid: start_rowid.max(max_rowid),
+        scanned_through_rowid: through,
         messages: Vec::new(),
         open_rows: Vec::new(),
         front_row_id: read_front_row_id(connection, &mut cost, stop)?,
@@ -733,25 +745,19 @@ fn read_tail_snapshot(
         &format!(
             "{columns}
              WHERE rowid>?1 AND rowid<=?2 AND (typeof(time_updated)!='integer' OR {})
-             ORDER BY rowid
-             LIMIT ?3",
+             ORDER BY rowid",
             eligible_row(false)
         ),
     )
     .map_err(|error| sqlite_error(stop, "prepare OpenCode tail scan", error))?;
     let mut rows = new_rows
-        .query(params![start_rowid, max_rowid, limit])
+        .query(params![start_rowid, through])
         .map_err(|error| sqlite_error(stop, "query OpenCode tail scan", error))?;
-    let mut returned = 0usize;
     while let Some(row) = rows
         .next()
         .map_err(|error| sqlite_error(stop, "step OpenCode tail scan", error))?
     {
-        let rowid = take_tail_row(row, &mut page, stop)?;
-        returned += 1;
-        if returned == request.limit {
-            page.scanned_through_rowid = rowid;
-        }
+        take_tail_row(row, &mut page, stop)?;
     }
     drop(rows);
     cost.add_statement(&new_rows);
@@ -930,6 +936,32 @@ pub(super) fn readonly_uri(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tail_limits_raw_rows_before_filtering_non_assistants() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_updated INTEGER,data TEXT);
+            WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000)
+            INSERT INTO message SELECT 'user-'||x,'s',x,'{\"role\":\"user\"}' FROM n;").unwrap();
+        conn.execute("INSERT INTO message VALUES ('assistant','s',1001,?1)", [r#"{"role":"assistant","providerID":"provider","modelID":"model","tokens":{"input":1,"output":1},"finish":"stop","time":{"created":1}}"#]).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut request = OpenCodeTailRequest {
+            after_rowid: Some(0),
+            seed_rows: 0,
+            open_rowids: &[],
+            limit: 8,
+        };
+        let page = read_tail(&path, &request, &stop).unwrap();
+        assert_eq!(page.scanned_through_rowid, 8);
+        assert!(page.messages.is_empty());
+        assert!(page.cost.vm_steps < 500);
+        request.after_rowid = Some(998);
+        let page = read_tail(&path, &request, &stop).unwrap();
+        assert_eq!(page.scanned_through_rowid, 1001);
+        assert_eq!(page.messages[0].id, "assistant");
+    }
+
     #[test]
     fn page_selects_final_token_rows_and_retains_malformed_evidence() {
         let temp = tempfile::tempdir().unwrap();

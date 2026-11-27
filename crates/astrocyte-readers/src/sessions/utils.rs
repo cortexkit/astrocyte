@@ -145,26 +145,40 @@ pub(crate) fn hash_file_range(
     len: u64,
     hashed: &mut u64,
 ) -> Option<[u8; 32]> {
-    use std::io::{Read, Seek, SeekFrom};
+    try_hash_file_range(file, start, len, hashed, || Ok(())).ok()
+}
 
-    file.seek(SeekFrom::Start(start)).ok()?;
+pub(crate) fn try_hash_file_range(
+    file: &mut std::fs::File,
+    start: u64,
+    len: u64,
+    hashed: &mut u64,
+    mut check_stop: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<[u8; 32]> {
+    use std::io::{self, Read, Seek, SeekFrom};
+
+    check_stop()?;
+    file.seek(SeekFrom::Start(start))?;
     let mut hasher = Sha256::new();
     let mut remaining = len;
     let mut chunk = vec![0_u8; 64 * 1024].into_boxed_slice();
-    let chunk_len = u64::try_from(chunk.len()).ok()?;
+    let chunk_len = chunk.len() as u64;
     while remaining > 0 {
+        check_stop()?;
         let want = usize::try_from(remaining.min(chunk_len)).unwrap_or(chunk.len());
-        match file.read(&mut chunk[..want]) {
-            Ok(0) | Err(_) => return None,
-            Ok(read) => {
-                hasher.update(&chunk[..read]);
-                let read = u64::try_from(read).ok()?;
-                *hashed += read;
-                remaining -= read;
-            }
+        let read = file.read(&mut chunk[..want])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file ended inside its JSONL prefix",
+            ));
         }
+        hasher.update(&chunk[..read]);
+        let read = read as u64;
+        *hashed += read;
+        remaining -= read;
     }
-    Some(hasher.finalize().into())
+    Ok(hasher.finalize().into())
 }
 
 #[cfg(test)]

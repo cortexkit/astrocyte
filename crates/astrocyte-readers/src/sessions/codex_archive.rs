@@ -107,10 +107,15 @@ fn read_archive(
     if !record.is_empty() || oversized {
         return Err(invalid("unterminated archive record"));
     }
-    if state.activity
+    if let Some(pending) = state.pending {
+        result.set_aside.push((
+            pending.call.source_line,
+            "Codex archive ends with unconfirmed request usage; final quantities are unknown"
+                .into(),
+        ));
+    } else if state.activity
         && result.counts.usage_records == 0
         && result.counts.supplementary_requests == 0
-        && state.pending.is_none()
     {
         result.set_aside.push((
             0,
@@ -170,6 +175,25 @@ mod tests {
         assert_eq!(parsed.calls.len(), 1);
         assert_eq!(parsed.calls[0].producer_ref, "thread:ordinal:2");
         assert_eq!(parsed.calls[0].usage.cache_read, None);
+    }
+
+    #[test]
+    fn archive_eof_sets_aside_unconfirmed_request_usage() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("a.jsonl.zst");
+        let data = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\"}}\n",
+            "{\"type\":\"token_usage_record\",\"ordinal\":2,\"payload\":{\"usage\":{\"input_tokens\":3}}}\n",
+            "{\"type\":\"compacted\",\"payload\":{}}\n",
+        );
+        std::fs::write(&path, frame(data.as_bytes())).unwrap();
+        let parsed = parse_archive(&path);
+        assert!(parsed.io_error.is_none());
+        assert!(parsed.calls.is_empty());
+        assert_eq!(parsed.counts.supplementary_requests, 0);
+        assert_eq!(parsed.set_aside.len(), 1);
+        assert_eq!(parsed.set_aside[0].0, 2);
+        assert!(parsed.set_aside[0].1.contains("unconfirmed"));
     }
 
     #[test]

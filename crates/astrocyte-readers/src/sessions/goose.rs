@@ -129,6 +129,9 @@ pub struct GooseRead {
     pub through: Option<f64>,
     /// Unreadable rows must be reconsidered even if their update time is old.
     pub recheck: HashSet<String>,
+    /// IDs seen by the main query, including sessions without usable usage.
+    /// Only a read without an `after` cursor inventories the whole store.
+    pub seen: HashSet<String>,
 }
 
 /// A counter column: `Ok(None)` for NULL, `Err` for anything that is not a
@@ -209,6 +212,7 @@ pub fn read_goose_sessions_since(
     }
     read.sessions
         .sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    read.seen = seen;
     Ok(read)
 }
 

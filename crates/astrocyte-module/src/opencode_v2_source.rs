@@ -37,6 +37,7 @@ struct Cache {
     marker_present: bool,
     last_full: Option<i64>,
     backlog: bool,
+    full_progress: Option<opencode_v2::FullProgress>,
     front: Option<String>,
     tail: Option<i64>,
     open: BTreeMap<i64, i64>,
@@ -103,8 +104,7 @@ impl OpenCodeV2Source {
         }
     }
 
-    /// Make the next full drain a full pass from the durable cursor, whatever
-    /// the cadence says.
+    /// Make the next scheduled drain continue or start a full sweep.
     pub(crate) fn require_full_pass(&self) {
         self.cache
             .lock()
@@ -112,11 +112,19 @@ impl OpenCodeV2Source {
             .last_full = None;
     }
 
+    /// A newly settled session can now emit open rows already visited by an
+    /// in-progress sweep. Start again from the durable cursor and open floor.
+    pub(crate) fn restart_full_pass(&self) {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.full_progress = None;
+        cache.last_full = None;
+    }
+
     /// Whether, since the last `require_full_pass`, a full pass has reached
     /// the store's high water or a read found no OpenCode 2 layout at all.
     pub(crate) fn full_pass_reached_high_water(&self) -> bool {
         let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        !cache.marker_present || cache.last_full.is_some()
+        !cache.marker_present || (!cache.backlog && cache.last_full.is_some())
     }
 
     pub(crate) fn payer_waiting(&self) -> usize {
@@ -259,6 +267,7 @@ impl OpenCodeV2Source {
             cache.reader = None;
             cache.tail = None;
             cache.open.clear();
+            cache.full_progress = None;
         }
         let mut full = mode.is_full()
             && (replaced
@@ -279,18 +288,21 @@ impl OpenCodeV2Source {
         } else {
             None
         };
-        let full_page = |reset_floor: bool| {
+        let full_page = |reset_floor: bool, progress| {
             let (cursor, floor) = if identity_changed {
                 (None, None)
             } else {
                 self.home
                     .read_cursor_with_open_row_floor(state, identity.as_deref())?
             };
-            opencode_v2::read_page_with_sessions(
+            opencode_v2::read_page_continuing(
                 path,
-                cursor.as_ref(),
-                floor.filter(|_| !reset_floor),
-                PAGE_LIMIT,
+                &opencode_v2::FullPageRequest {
+                    cursor: cursor.as_ref(),
+                    open_row_floor: floor.filter(|_| !reset_floor),
+                    progress,
+                    limit: PAGE_LIMIT,
+                },
                 now,
                 stop,
                 &sessions,
@@ -298,7 +310,7 @@ impl OpenCodeV2Source {
             .map_err(read_error)
         };
         let page = if full {
-            full_page(replaced)?
+            full_page(replaced, cache.full_progress.as_ref())?
         } else {
             if cache.reader.is_none() {
                 let Some(reader) = TailReader::open(path, stop).map_err(read_error)? else {
@@ -350,7 +362,7 @@ impl OpenCodeV2Source {
                         });
                     }
                     full = true;
-                    full_page(true)?
+                    full_page(true, None)?
                 }
                 page => page,
             }
@@ -387,7 +399,8 @@ impl OpenCodeV2Source {
                 cache.reader = None;
             }
             cache.front.clone_from(&page.front_id);
-            cache.backlog = page.consumed < page.high_water;
+            cache.full_progress = page.continuation;
+            cache.backlog = cache.full_progress.is_some();
             if !cache.backlog {
                 cache.last_full = Some(now);
             }
@@ -939,16 +952,22 @@ mod tests {
         let source = OpenCodeV2Source::at(&path);
         assert_eq!(source.drain(&state, 100, &STOP).unwrap().recorded, 1);
         assert_eq!(stored_floor(&state), Some(2));
+        // The open rows outnumber one page. The durable floor must survive
+        // the sweep even after the bounded tail cache evicts its first row.
+        assert_eq!(source.drain(&state, 110, &STOP).unwrap().recorded, 0);
+        assert_eq!(stored_floor(&state), Some(2));
+        assert_eq!(source.drain(&state, 120, &STOP).unwrap().recorded, 1);
         assert_eq!(source.cache.lock().unwrap().open.len(), OPEN_CAP);
         assert!(!source.cache.lock().unwrap().open.contains_key(&2));
-        assert_eq!(source.drain(&state, 110, &STOP).unwrap().recorded, 1);
         conn.execute(
             "UPDATE session_message SET time_updated=30,data=?1 WHERE id='open-1'",
             [payload(20, true).to_string()],
         )
         .unwrap();
         let restarted = OpenCodeV2Source::at(path);
-        assert_eq!(restarted.drain(&state, 120, &STOP).unwrap().recorded, 1);
+        assert_eq!(restarted.drain(&state, 130, &STOP).unwrap().recorded, 0);
+        assert_eq!(restarted.drain(&state, 140, &STOP).unwrap().recorded, 0);
+        assert_eq!(restarted.drain(&state, 150, &STOP).unwrap().recorded, 1);
         assert_eq!(stored_floor(&state), Some(3));
         assert_eq!(count(&state, "usage_event"), 3);
         assert_eq!(quantity(&state, "output"), 39);
@@ -1143,6 +1162,63 @@ mod tests {
     /// OpenCode can write more rows than a page in one millisecond, as when it
     /// imports a long session. The cursor must still pass that tie, or every
     /// later call stays unrecorded.
+    #[test]
+    fn v2_bounds_tied_full_pages_and_replays_the_tie_after_restart() {
+        let (_temp, path, conn) = database();
+        for index in 0..PAGE_LIMIT + 5 {
+            insert(&conn, &format!("tied-{index:05}"), 10, &payload(10, true));
+        }
+        insert(&conn, "later", 20, &payload(20, true));
+        let state = test_state();
+        let first = OpenCodeV2Source::at(&path)
+            .drain(&state, 100, &STOP)
+            .unwrap();
+        assert!(first.full);
+        assert_eq!(first.recorded, PAGE_LIMIT);
+        assert_eq!(runtime(&state).1, 10);
+        let restarted = OpenCodeV2Source::at(&path);
+        let replay = restarted.drain(&state, 101, &STOP).unwrap();
+        assert!(replay.full);
+        assert_eq!(replay.recorded, 0);
+        let rest = restarted.drain(&state, 102, &STOP).unwrap();
+        assert!(rest.full);
+        assert_eq!(rest.recorded, 6);
+        assert_eq!(
+            count(&state, "usage_event"),
+            i64::try_from(PAGE_LIMIT + 6).unwrap()
+        );
+        assert_eq!(runtime(&state).1, 20);
+        assert_eq!(count(&state, "quarantine_evidence"), 0);
+    }
+
+    #[test]
+    fn v2_bounds_old_incomplete_full_pages_and_revisits_all_rows() {
+        let (_temp, path, conn) = database();
+        let state = test_state();
+        let source = OpenCodeV2Source::at(&path);
+        for index in 0..PAGE_LIMIT + 5 {
+            insert(&conn, &format!("old-{index:05}"), 10, &payload(10, false));
+        }
+        insert(&conn, "later", 20, &payload(20, true));
+        for now in [100, 101] {
+            source.drain(&state, now, &STOP).unwrap();
+        }
+        assert_eq!(runtime(&state).1, 20);
+        assert_eq!(count(&state, "usage_event"), 1);
+        source.require_full_pass();
+        let later = opencode_v2::QUIET_WINDOW + 100;
+        let first = source.drain(&state, later, &STOP).unwrap();
+        assert!(first.full);
+        assert_eq!(first.recorded, PAGE_LIMIT);
+        let rest = source.drain(&state, later + 1, &STOP).unwrap();
+        assert!(rest.full);
+        assert_eq!(rest.recorded, 5);
+        assert_eq!(
+            count(&state, "usage_event"),
+            i64::try_from(PAGE_LIMIT + 6).unwrap()
+        );
+    }
+
     #[test]
     fn a_tie_larger_than_a_page_does_not_stall_the_cursor() {
         let (_temp, path, conn) = database();

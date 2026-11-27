@@ -948,6 +948,26 @@ pub fn parse_claude_file_with_final_tail(
     quiet_window_ms: i64,
     final_tail: bool,
 ) -> (ClaudeResumableParse, ReadTransaction) {
+    parse_claude_file_with_stop(
+        path,
+        previous,
+        check,
+        now_ms,
+        quiet_window_ms,
+        final_tail,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+pub fn parse_claude_file_with_stop(
+    path: &Path,
+    previous: Option<ClaudeResumePoint>,
+    check: ClaudePrefixCheck,
+    now_ms: i64,
+    quiet_window_ms: i64,
+    final_tail: bool,
+    stop: &std::sync::atomic::AtomicBool,
+) -> (ClaudeResumableParse, ReadTransaction) {
     let mut transaction = ReadTransaction::default();
     if let Some(point) = &previous {
         begin_history(&point.0.state, &mut transaction);
@@ -961,15 +981,27 @@ pub fn parse_claude_file_with_final_tail(
     let mut set_aside = Vec::new();
     let mut buffer = Vec::with_capacity(4096);
     let mut rejected_tail = None;
-    let read = super::jsonl_resume::try_read_appended_lines_with_tail(
+    let read = super::jsonl_resume::read_appended_lines(
         path,
         previous.map(|point| point.0),
-        check,
+        super::jsonl_resume::ReadOptions {
+            check,
+            final_tail,
+            stop,
+        },
         // A first read, or a full re-read, counts as growth.
         || fresh,
-        final_tail,
         |state, payload, tail| {
             counts.lines += 1;
+            let Some(payload) = payload else {
+                counts.skipped_lines += 1;
+                state.parse.lines += 1;
+                set_aside.push((
+                    state.parse.lines,
+                    "Claude Code JSONL record exceeds 16 MiB".into(),
+                ));
+                return;
+            };
             let skipped = counts.skipped_lines;
             let unidentified = counts.records_with_unidentified_usage;
             parse_line(payload, &mut buffer, &mut state.parse, &mut counts);
@@ -1016,9 +1048,7 @@ pub fn parse_claude_file_with_final_tail(
             set_aside,
             calls,
             resumed: read.resumed,
-            resume: read
-                .cursor
-                .map(|cursor| ClaudeResumePoint(cursor.with_state(state))),
+            resume: Some(ClaudeResumePoint(read.cursor.with_state(state))),
             hashed_bytes: read.hashed_bytes,
             counts,
             pending_calls,

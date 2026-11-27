@@ -257,6 +257,9 @@ struct PiCache {
     /// `resume`, and trusted only for a file whose resume verified.
     header_scans: HashMap<PathBuf, HeaderScan>,
     identities: HashMap<String, CachedIdentity>,
+    /// Every observed copy keeps its canonical request live, even after the
+    /// file where that request was first seen has been removed.
+    identities_by_file: HashMap<PathBuf, HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -375,6 +378,12 @@ impl PiSource {
                         false,
                     );
                     mode.remove_runtime(state, PI_SOURCE_KEY)?;
+                    let mut cache = self
+                        .cache
+                        .lock()
+                        .map_err(|_| "Pi cache lock poisoned".to_string())?;
+                    cache.identities.clear();
+                    cache.identities_by_file.clear();
                     return Ok(PiDrainOutcome {
                         root_absent: true,
                         ..PiDrainOutcome::default()
@@ -430,6 +439,7 @@ impl PiSource {
             windows.clone_from(&cached_windows);
         }
         let mut observations = Vec::new();
+        let mut observed_identities: HashMap<PathBuf, HashSet<String>> = HashMap::new();
         let mut set_aside = Vec::new();
         for path in files.iter().cloned() {
             // Nothing has been written yet and the caches below are replaced
@@ -541,7 +551,13 @@ impl PiSource {
                 };
                 let locator = format!("{path:?}:byte:{}", record.source_offset);
                 match map_message(record) {
-                    Ok(request) => observations.push(Observation { request, rank }),
+                    Ok(request) => {
+                        observed_identities
+                            .entry(path.clone())
+                            .or_default()
+                            .insert(request.producer_ref.clone());
+                        observations.push(Observation { request, rank });
+                    }
                     Err(reason) => {
                         set_aside.push(crate::refresher::SetAsideRecord { locator, reason })
                     }
@@ -591,9 +607,9 @@ impl PiSource {
                 cache.header_scans = header_scans;
                 cache.windows = windows;
             } else {
-                for path in files {
-                    cache.resume.remove(&path);
-                    cache.header_scans.remove(&path);
+                for path in &files {
+                    cache.resume.remove(path);
+                    cache.header_scans.remove(path);
                 }
                 cache.resume.extend(resume_points);
                 cache.prefix_verified_ms.extend(verified_ms);
@@ -602,6 +618,25 @@ impl PiSource {
             }
         }
         cache.identities.extend(additions);
+        for (path, ids) in observed_identities {
+            cache
+                .identities_by_file
+                .entry(path)
+                .or_default()
+                .extend(ids);
+        }
+        if mode.is_full() {
+            let files: HashSet<_> = files.iter().collect();
+            let cache = &mut *cache;
+            let before = cache.identities_by_file.len();
+            cache
+                .identities_by_file
+                .retain(|path, _| files.contains(path));
+            if cache.identities_by_file.len() != before {
+                let live_ids: HashSet<_> = cache.identities_by_file.values().flatten().collect();
+                cache.identities.retain(|id, _| live_ids.contains(id));
+            }
+        }
         cache.payer_wait = next_payer_wait;
         state.set_payer_waiting(PI_SOURCE_KEY, cache.payer_wait.len());
         if !cache.payer_wait.is_empty() {
@@ -750,7 +785,12 @@ fn session_header_timestamp(
         scanned_bytes += read;
         let complete = line.last() == Some(&b'\n');
         let line_end = line_start + read;
-        let header = serde_json::from_slice::<HeaderProbe>(&line)
+        let payload = if line_start == 0 {
+            line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&line)
+        } else {
+            &line
+        };
+        let header = serde_json::from_slice::<HeaderProbe>(payload)
             .ok()
             .filter(|probe| probe.entry_type == "session");
         let Some(probe) = header else {
@@ -1623,6 +1663,54 @@ mod tests {
         let path = directory.join("session.jsonl");
         fs::write(&path, contents).unwrap();
         path
+    }
+
+    #[test]
+    fn pi_inventory_prunes_deleted_files_but_retains_live_copy_identity() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let parent = write_fixture(root, "a", &fixture("parent", "/source", Some("shared")));
+        let child = write_fixture(root, "b", &fixture("fork", "/fork", Some("shared")));
+        let removed = write_fixture(root, "c", &fixture("removed", "/other", Some("removed")));
+        let source = PiSource::at(root);
+        let state = test_state();
+        source.drain(&state, 100, &NEVER_STOP).unwrap();
+        assert_eq!(source.cache.lock().unwrap().identities.len(), 2);
+        fs::remove_file(parent).unwrap();
+        fs::remove_file(removed).unwrap();
+        source.drain(&state, 101, &NEVER_STOP).unwrap();
+        assert_eq!(source.cache.lock().unwrap().identities.len(), 1);
+        fs::remove_file(child).unwrap();
+        source.drain(&state, 102, &NEVER_STOP).unwrap();
+        assert!(source.cache.lock().unwrap().identities.is_empty());
+    }
+
+    #[test]
+    fn pi_bom_parent_wins_over_later_unmarked_fork() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let parent = format!("\u{feff}{}", fixture("parent", "/source", Some("shared")));
+        let child = fixture("fork", "/fork", Some("shared")).replacen(
+            "2026-09-01T00:00:00.000Z",
+            "2026-09-02T00:00:00.000Z",
+            1,
+        );
+        write_fixture(root, "a", &parent);
+        write_fixture(root, "b", &child);
+        let state = test_state();
+        let result = PiSource::at(root).drain(&state, 100, &NEVER_STOP).unwrap();
+        assert_eq!(result.observations_deduplicated, 1);
+        let owner: (String, String) = state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT session, project_root FROM usage_event WHERE producer='pi'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(owner, ("parent".into(), "/source".into()));
     }
 
     #[test]
@@ -3289,10 +3377,6 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
         )
     }
 
-    /// A session header the reader accepts but the rank search does not
-    /// recognise: the reader strips a leading byte-order mark and the search
-    /// does not, so records in a file that starts with this line are accepted
-    /// and ranked as headerless (`i64::MAX`).
     fn bom_header_line() -> String {
         format!("\u{feff}{}", header_line("bom", "2026-07-01T00:00:00.000Z"))
     }
@@ -3336,13 +3420,8 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
     /// through the same appends into their own stores, and the stores must be
     /// identical after every drain.
     ///
-    /// The fixture covers each case the cache could get wrong: fork copies
-    /// whose owner is decided by header rank, a headerless file (rank
-    /// `i64::MAX`) whose copies lose to a headed file, a header that appears
-    /// only after a headerless file was already searched and then outranks
-    /// the other copy, an unterminated header line that is not yet
-    /// remembered, and a rewritten file whose earlier search must not be
-    /// reused.
+    /// Fork copies use the same header rank with or without the cache, even
+    /// when the older file has a BOM or a rewrite changes which file is older.
     #[test]
     fn cached_pi_header_rank_records_exactly_what_a_full_header_search_does() {
         let temp = TempDir::new().unwrap();
@@ -3355,9 +3434,9 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
                 message_line("entry-1", "response-1", 11)
             ),
         );
-        let headerless = write_fixture(
+        let bom = write_fixture(
             temp.path(),
-            "headerless",
+            "bom",
             &format!(
                 "{}\n{}\n{}\n",
                 bom_header_line(),
@@ -3381,22 +3460,20 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
         };
         drain_both("first read");
 
-        // Both files gain a copy of the same call; the headed file owns it.
+        // Both files gain a copy; the older, BOM-marked file owns it.
         append(
             &headed,
             &format!("{}\n", message_line("entry-3", "response-3", 31)),
         );
         append(
-            &headerless,
+            &bom,
             &format!("{}\n", message_line("entry-3", "response-3", 31)),
         );
-        drain_both("copies split across a headed and a headerless file");
+        drain_both("copies split across two ranked files");
 
-        // An unterminated header line ranked earlier than the headed file:
-        // the full search reads it, so the new copy in the headerless file
-        // outranks the headed one. It is not complete, so it is not cached.
+        // A later header does not replace the BOM-marked first header.
         append(
-            &headerless,
+            &bom,
             &format!(
                 "{}\n{}",
                 message_line("entry-4", "response-4", 41),
@@ -3409,20 +3486,19 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
         );
         drain_both("an unterminated header line");
 
-        // The header line completes, so later copies in the formerly
-        // headerless file outrank copies in the headed file.
+        // Completing that later header still leaves the first header in use.
         append(
-            &headerless,
+            &bom,
             &format!("\n{}\n", message_line("entry-5", "response-5", 51)),
         );
         append(
             &headed,
             &format!("{}\n", message_line("entry-5", "response-5", 51)),
         );
-        drain_both("a header that arrived after the file was searched");
+        drain_both("a second header that arrived after the first");
 
         append(
-            &headerless,
+            &bom,
             &format!("{}\n", message_line("entry-6", "response-6", 61)),
         );
         append(
@@ -3444,18 +3520,14 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
         )
         .unwrap();
         append(
-            &headerless,
+            &bom,
             &format!("{}\n", message_line("entry-7", "response-7", 71)),
         );
         drain_both("a rewritten file");
         drain_both("nothing changed");
 
-        // The fixture did reach both outcomes of the rank: the headed file
-        // owns the copies made while the other file had no recognised header
-        // (responses 1 and 3), the other file owns every copy made once its
-        // later, earlier-dated header was readable (responses 4 to 6), plus
-        // response 2, which only it holds, and the rewritten headed file owns
-        // response 7 under its new, still earlier header.
+        // The BOM file owns the first six calls; the rewritten file owns the
+        // seventh because its new header predates the BOM file's header.
         let owners: Vec<(Option<String>, i64)> = cached_state
             .with_conn(|conn| {
                 let mut statement = conn
@@ -3471,15 +3543,14 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
         assert_eq!(
             owners,
             vec![
-                (Some("bom".to_string()), 4),
-                (Some("headed".to_string()), 3)
+                (Some("bom".to_string()), 6),
+                (Some("headed".to_string()), 1)
             ]
         );
     }
 
     /// A file's session header is searched for once. A file whose header was
-    /// found costs no header read on later drains, an unchanged file costs
-    /// none, and a file with no header yet costs only its appended bytes.
+    /// found costs no header read on later drains, even if it had a BOM.
     #[test]
     fn pi_header_rank_is_not_searched_again_for_unchanged_or_grown_files() {
         let temp = TempDir::new().unwrap();
@@ -3493,12 +3564,12 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
                 message_line("entry-2", "response-2", 21)
             ),
         );
-        let headerless_contents = format!(
+        let bom_contents = format!(
             "{}\n{}\n",
             bom_header_line(),
             message_line("entry-9", "response-9", 91)
         );
-        let headerless = write_fixture(temp.path(), "headerless", &headerless_contents);
+        let bom = write_fixture(temp.path(), "bom", &bom_contents);
         let state = test_state();
         let source = PiSource::at(temp.path());
 
@@ -3506,8 +3577,8 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
         assert_eq!(first.rows_recorded, 3);
         assert_eq!(
             first.header_scan_bytes,
-            (header.len() + 1 + headerless_contents.len()) as u64,
-            "the first drain reads the headed file's header line and all of the headerless file"
+            (header.len() + bom_header_line().len() + 2) as u64,
+            "the first drain reads only the two header lines"
         );
 
         let unchanged = source.drain(&state, 200, &NEVER_STOP).unwrap();
@@ -3519,14 +3590,33 @@ INSERT INTO payer_meta VALUES('schema_version','1'),('incarnation','pi-fixture')
             &headed,
             &format!("{}\n", message_line("entry-3", "response-3", 31)),
         );
-        append(&headerless, &appended);
+        append(&bom, &appended);
         let grown = source.drain(&state, 300, &NEVER_STOP).unwrap();
         assert_eq!(grown.files_resumed, 2);
         assert_eq!(grown.rows_recorded, 2);
+        assert_eq!(grown.header_scan_bytes, 0, "both headers are already known");
+    }
+
+    #[test]
+    fn pi_header_search_remembers_only_the_verified_complete_prefix() {
+        let temp = TempDir::new().unwrap();
+        let path = write_fixture(temp.path(), "headerless", "{}\n");
+        let first = session_header_timestamp(&path, None, Some(3)).unwrap();
+        assert_eq!(first.header_timestamp_ms, i64::MAX);
+        assert_eq!(first.scanned_bytes, 3);
+        let header = header_line("late", "2026-09-01T00:00:00.000Z");
+        append(&path, &header);
+        let partial = session_header_timestamp(&path, first.scan, Some(3)).unwrap();
+        assert_ne!(partial.header_timestamp_ms, i64::MAX);
+        assert_eq!(partial.scanned_bytes, header.len() as u64);
+        assert!(partial.scan.unwrap().header_timestamp_ms.is_none());
+        append(&path, "\n");
+        let complete =
+            session_header_timestamp(&path, partial.scan, Some((header.len() + 4) as u64)).unwrap();
+        assert_eq!(complete.scanned_bytes, (header.len() + 1) as u64);
         assert_eq!(
-            grown.header_scan_bytes,
-            appended.len() as u64,
-            "only the headerless file's appended bytes are searched"
+            complete.scan.unwrap().header_timestamp_ms,
+            Some(partial.header_timestamp_ms)
         );
     }
 }

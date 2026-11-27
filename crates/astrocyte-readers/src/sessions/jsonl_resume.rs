@@ -21,11 +21,12 @@
 //! because it also parses an unterminated tail against a scratch state and
 //! discards a whole transcript whose header it rejects.
 
-use super::utils::hash_file_range;
+use super::utils::try_hash_file_range;
 use crate::file_identity::{inode_of, same_identity};
 use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Bytes of the already-consumed prefix that a [`PrefixCheck::Window`]
 /// resume re-hashes: the window ending at the stored offset. 64 KiB is one
@@ -33,6 +34,7 @@ use std::path::Path;
 /// shapes append-only logs suffer (truncate-and-rewrite, tail edits) on the
 /// very next read.
 pub const PREFIX_WINDOW_BYTES: u64 = 64 * 1024;
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// How much of a file's already-consumed prefix to re-hash before trusting a
 /// resume point. `Window` on ordinary ticks, `Full` on the periodic cadence.
@@ -93,10 +95,8 @@ pub(crate) struct JsonlRead<S> {
     /// The parser state after every consumed line: the previous point's
     /// state when resumed, else the fresh one.
     pub state: S,
-    /// Where the next read may resume, or `None` when the bytes that anchor
-    /// the next window check could not be read back, so the next read starts
-    /// over.
-    pub cursor: Option<ResumeCursor>,
+    /// Verified anchor for the next read.
+    pub cursor: ResumeCursor,
     /// Bytes fed to SHA-256 by this call. A steady-state resume is
     /// O(window + appended), never O(file): the deterministic cost counter.
     pub hashed_bytes: u64,
@@ -106,105 +106,59 @@ pub(crate) struct JsonlRead<S> {
     pub previous_observed_len: Option<u64>,
 }
 
-/// Reads the complete lines of `path` that `previous` has not consumed yet,
-/// handing each to `on_line` with the parser state.
-///
-/// `previous` is trusted only when the file is at least as long as its
-/// offset, has the same inode, and the bytes `check` re-hashes are
-/// unchanged; otherwise reading starts from byte 0 with `fresh()`. Each line
-/// reaches `on_line` without its `\n`, a trailing `\r`, or (on the file's
-/// first line) a UTF-8 BOM, and may be empty or whitespace.
-///
-/// Returns `None` when the file cannot be opened or positioned, in which
-/// case nothing was parsed.
+pub(crate) struct ReadOptions<'a> {
+    pub check: PrefixCheck,
+    /// A closed writer can leave a complete final record without a newline.
+    pub final_tail: bool,
+    pub stop: &'a AtomicBool,
+}
+
+impl<'a> ReadOptions<'a> {
+    pub(crate) fn live(check: PrefixCheck, stop: &'a AtomicBool) -> Self {
+        Self {
+            check,
+            final_tail: false,
+            stop,
+        }
+    }
+}
+
+/// Reads complete records after the verified resume offset. The callback gets
+/// `None` instead of bytes for an oversized record, and a range only for an
+/// explicitly final unterminated tail. No result is accepted after an I/O error.
 pub(crate) fn read_appended_lines<S>(
     path: &Path,
     previous: Option<JsonlResumePoint<S>>,
-    check: PrefixCheck,
+    options: ReadOptions<'_>,
     fresh: impl FnOnce() -> S,
-    on_line: impl FnMut(&mut S, &[u8]),
-) -> Option<JsonlRead<S>> {
-    let mut on_line = on_line;
-    read_appended_lines_inner(
-        path,
-        previous,
-        check,
-        fresh,
-        |s, bytes, _| on_line(s, bytes),
-        false,
-        false,
-    )
-    .ok()
-}
-
-/// Fallible read for callers that must distinguish an unreadable file from an
-/// empty one. No parser output or resume point is accepted after an I/O failure.
-pub(crate) fn try_read_appended_lines<S>(
-    path: &Path,
-    previous: Option<JsonlResumePoint<S>>,
-    check: PrefixCheck,
-    fresh: impl FnOnce() -> S,
-    on_line: impl FnMut(&mut S, &[u8]),
-) -> std::io::Result<JsonlRead<S>> {
-    let mut on_line = on_line;
-    try_read_appended_lines_with_tail(path, previous, check, fresh, false, |s, bytes, _| {
-        on_line(s, bytes)
-    })
-}
-
-/// A closed writer can leave a complete final record without a newline.
-pub(crate) fn try_read_appended_lines_with_tail<S>(
-    path: &Path,
-    previous: Option<JsonlResumePoint<S>>,
-    check: PrefixCheck,
-    fresh: impl FnOnce() -> S,
-    final_tail: bool,
-    on_line: impl FnMut(&mut S, &[u8], Option<std::ops::Range<u64>>),
-) -> std::io::Result<JsonlRead<S>> {
-    read_appended_lines_inner(path, previous, check, fresh, on_line, true, final_tail)
-}
-
-fn read_appended_lines_inner<S>(
-    path: &Path,
-    previous: Option<JsonlResumePoint<S>>,
-    check: PrefixCheck,
-    fresh: impl FnOnce() -> S,
-    mut on_line: impl FnMut(&mut S, &[u8], Option<std::ops::Range<u64>>),
-    fail_on_io_error: bool,
-    final_tail: bool,
-) -> std::io::Result<JsonlRead<S>> {
+    mut on_line: impl FnMut(&mut S, Option<&[u8]>, Option<std::ops::Range<u64>>),
+) -> io::Result<JsonlRead<S>> {
+    check_stop(options.stop)?;
     let mut file = crate::read_io::open(path)?;
 
     let mut hashed_bytes = 0_u64;
     let mut resumed = None;
+    let stop_check = || check_stop(options.stop);
     if let Some(previous) = previous {
         let cursor = &previous.cursor;
-        let metadata = crate::read_io::file_metadata(&file).ok();
-        let long_enough = metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.len() >= cursor.offset);
-        let same_inode = same_identity(
-            metadata
-                .as_ref()
-                .and_then(|metadata| inode_of(&file, metadata)),
-            cursor.inode,
-        );
+        let metadata = crate::read_io::file_metadata(&file)?;
+        let long_enough = metadata.len() >= cursor.offset;
+        let same_inode = same_identity(inode_of(&file, &metadata), cursor.inode);
         let prefix_matches = long_enough
             && same_inode
-            && match check {
-                PrefixCheck::Window => hash_file_range(
-                    &mut file,
-                    cursor.window_start,
-                    cursor.offset - cursor.window_start,
-                    &mut hashed_bytes,
-                )
-                .is_some_and(|digest| digest == cursor.window_sha256),
+            && match options.check {
+                PrefixCheck::Window => {
+                    try_hash_file_range(
+                        &mut file,
+                        cursor.window_start,
+                        cursor.offset - cursor.window_start,
+                        &mut hashed_bytes,
+                        stop_check,
+                    )? == cursor.window_sha256
+                }
                 PrefixCheck::Full => {
-                    hash_file_range(&mut file, 0, cursor.offset, &mut hashed_bytes).is_some_and(
-                        |digest| {
-                            digest == <[u8; 32]>::from(cursor.prefix_hasher.clone().finalize())
-                        },
-                    )
+                    try_hash_file_range(&mut file, 0, cursor.offset, &mut hashed_bytes, stop_check)?
+                        == <[u8; 32]>::from(cursor.prefix_hasher.clone().finalize())
                 }
             };
         if prefix_matches {
@@ -231,70 +185,95 @@ fn read_appended_lines_inner<S>(
     let mut consumed = start;
     let mut observed_len = start;
     let bom = "\u{feff}".as_bytes();
-    loop {
+    'lines: loop {
         raw.clear();
-        match reader.read_until(b'\n', &mut raw) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(error) if fail_on_io_error => return Err(error),
-            Err(_) => break,
-        }
-        observed_len += raw.len() as u64;
-        let terminated = raw.last() == Some(&b'\n');
-        if !terminated && !final_tail {
-            // An unterminated tail: a writer mid-append. Not consumed.
-            break;
-        }
-        let mut payload: &[u8] = &raw[..raw.len() - usize::from(terminated)];
-        if payload.last() == Some(&b'\r') {
-            payload = &payload[..payload.len() - 1];
-        }
-        if consumed == 0 && payload.starts_with(bom) {
-            payload = &payload[bom.len()..];
-        }
+        let mut oversized_hasher: Option<Sha256> = None;
+        let terminated = loop {
+            check_stop(options.stop)?;
+            let bytes = reader.fill_buf()?;
+            if bytes.is_empty() {
+                if observed_len == consumed || !options.final_tail {
+                    // A writer may still be appending this tail. Leave the
+                    // resume offset and prefix hash at its starting byte.
+                    if oversized_hasher.is_some() {
+                        hashed_bytes += observed_len - consumed;
+                    }
+                    break 'lines;
+                }
+                break false;
+            }
+            let newline = bytes.iter().position(|&byte| byte == b'\n');
+            let len = newline.map_or(bytes.len(), |index| index + 1);
+            let chunk = &bytes[..len];
+            if let Some(hasher) = oversized_hasher.as_mut() {
+                hasher.update(chunk);
+            } else if raw.len() + len > MAX_LINE_BYTES {
+                // Preserve the resume digest for a skipped line without ever
+                // buffering the whole record or consuming an unfinished tail.
+                let mut partial = hasher.clone();
+                partial.update(&raw);
+                partial.update(chunk);
+                oversized_hasher = Some(partial);
+                raw.clear();
+            } else {
+                raw.extend_from_slice(chunk);
+            }
+            reader.consume(len);
+            observed_len += len as u64;
+            if newline.is_some() {
+                break true;
+            }
+        };
+        let payload = oversized_hasher.is_none().then(|| {
+            let bytes = &raw[..raw.len() - usize::from(terminated)];
+            let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+            if consumed == 0 {
+                bytes.strip_prefix(bom).unwrap_or(bytes)
+            } else {
+                bytes
+            }
+        });
         on_line(
             &mut state,
             payload,
             (!terminated).then_some(consumed..observed_len),
         );
-        hasher.update(&raw);
-        hashed_bytes += raw.len() as u64;
-        consumed += raw.len() as u64;
+        if let Some(partial) = oversized_hasher {
+            hasher = partial;
+        } else {
+            hasher.update(&raw);
+        }
+        hashed_bytes += observed_len - consumed;
+        consumed = observed_len;
     }
 
     let mut file = reader.into_inner();
     // With no complete line consumed, the window just verified (or covered by
     // the full-prefix check) is unchanged. Keep its digest rather than hashing
     // the same bytes twice on every read of a quiet file or partial tail.
-    let unchanged_window = previous_window.filter(|_| consumed == start);
-    let window_start = consumed.saturating_sub(PREFIX_WINDOW_BYTES);
-    let cursor = unchanged_window
-        .or_else(|| {
-            hash_file_range(
+    let (window_start, window_sha256) =
+        if let Some(window) = previous_window.filter(|_| consumed == start) {
+            window
+        } else {
+            let window_start = consumed.saturating_sub(PREFIX_WINDOW_BYTES);
+            let digest = try_hash_file_range(
                 &mut file,
                 window_start,
                 consumed - window_start,
                 &mut hashed_bytes,
-            )
-            .map(|digest| (window_start, digest))
-        })
-        .map(|(window_start, window_sha256)| ResumeCursor {
-            offset: consumed,
-            prefix_hasher: hasher,
-            window_start,
-            window_sha256,
-            inode: crate::read_io::file_metadata(&file)
-                .ok()
-                .as_ref()
-                .and_then(|metadata| inode_of(&file, metadata)),
-            observed_len,
-        });
-
-    if cursor.is_none() && fail_on_io_error {
-        return Err(std::io::Error::other(
-            "could not verify the consumed JSONL bytes",
-        ));
-    }
+                stop_check,
+            )?;
+            (window_start, digest)
+        };
+    let metadata = crate::read_io::file_metadata(&file)?;
+    let cursor = ResumeCursor {
+        offset: consumed,
+        prefix_hasher: hasher,
+        window_start,
+        window_sha256,
+        inode: inode_of(&file, &metadata),
+        observed_len,
+    };
     Ok(JsonlRead {
         resumed: was_resumed,
         state,
@@ -305,56 +284,103 @@ fn read_appended_lines_inner<S>(
     })
 }
 
+fn check_stop(stop: &AtomicBool) -> io::Result<()> {
+    if stop.load(Ordering::Relaxed) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "JSONL read stopped",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 // The fixed 64 KiB resume window fits usize on supported 32-bit targets.
 #[allow(clippy::cast_possible_truncation)]
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn checked_read_exposes_io_errors_without_changing_legacy_callers() {
+    fn legacy_jsonl_read_does_not_report_directory_as_empty_transcript() {
         let directory = tempfile::tempdir().unwrap();
         let read = read_appended_lines(
             directory.path(),
             None,
-            PrefixCheck::Window,
+            ReadOptions::live(PrefixCheck::Window, &AtomicBool::new(false)),
             Vec::<Vec<u8>>::new,
-            |lines, payload| lines.push(payload.to_vec()),
+            |lines, payload, _| lines.push(payload.unwrap().to_vec()),
         );
-        assert!(
-            read.is_some(),
-            "legacy readers keep their existing partial-read result on a read error"
-        );
-        assert!(read.unwrap().state.is_empty());
-        let checked = try_read_appended_lines(
-            directory.path(),
-            None,
-            PrefixCheck::Window,
-            Vec::<Vec<u8>>::new,
-            |lines, payload| lines.push(payload.to_vec()),
-        );
-        assert!(
-            checked.is_err(),
-            "a directory cannot be read as a transcript"
-        );
+        assert!(read.is_err(), "a read error is not an empty transcript");
     }
     use std::io::Write;
+
+    #[test]
+    fn shared_jsonl_line_limit_ignores_oversized_line_and_keeps_later_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.jsonl");
+        let mut data = vec![b'x'; MAX_LINE_BYTES + 1];
+        std::fs::write(&path, &data).unwrap();
+        let first = lines(&path, None, PrefixCheck::Window);
+        assert!(first.state.is_empty());
+        assert_eq!(first.cursor.offset, 0);
+        data.extend_from_slice(b"\nvalid\n");
+        std::fs::write(&path, &data).unwrap();
+        let second = lines(&path, resume(first), PrefixCheck::Window);
+        assert!(second.state.iter().all(|line| line.len() <= MAX_LINE_BYTES));
+        assert_eq!(second.state.last().unwrap(), "valid");
+        assert_eq!(second.cursor.offset, data.len() as u64);
+    }
+
+    #[test]
+    fn shared_jsonl_read_checks_stop_inside_the_file() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.jsonl");
+        std::fs::write(&path, b"first\nsecond\n").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut lines_seen = 0;
+        let result = read_appended_lines(
+            &path,
+            None,
+            ReadOptions::live(PrefixCheck::Window, &stop),
+            || (),
+            |_, _, _| {
+                lines_seen += 1;
+                stop.store(true, Ordering::Relaxed);
+            },
+        );
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(lines_seen, 1);
+    }
 
     fn lines(
         path: &Path,
         previous: Option<JsonlResumePoint<Vec<String>>>,
         check: PrefixCheck,
     ) -> JsonlRead<Vec<String>> {
-        read_appended_lines(path, previous, check, Vec::new, |seen, line| {
-            seen.push(String::from_utf8_lossy(line).into_owned())
-        })
+        read_appended_lines(
+            path,
+            previous,
+            ReadOptions::live(check, &AtomicBool::new(false)),
+            Vec::new,
+            |seen, line, _| {
+                seen.push(line.map_or_else(
+                    || "<oversized>".into(),
+                    |line| String::from_utf8_lossy(line).into_owned(),
+                ))
+            },
+        )
         .unwrap()
     }
 
     fn resume(read: JsonlRead<Vec<String>>) -> Option<JsonlResumePoint<Vec<String>>> {
         let state = read.state;
-        read.cursor.map(|cursor| cursor.with_state(state))
+        Some(read.cursor.with_state(state))
     }
 
     #[test]

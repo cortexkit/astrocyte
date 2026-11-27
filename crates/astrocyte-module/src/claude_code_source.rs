@@ -16,7 +16,7 @@ use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::EventRecordRequest;
 use astrocyte_readers::provider_identity::inferred_provider_from_model;
 use astrocyte_readers::sessions::claudecode::{
-    parse_claude_file_with_final_tail, ClaudeCodeCall, ClaudeParseCounts, ClaudePrefixCheck,
+    parse_claude_file_with_stop, ClaudeCodeCall, ClaudeParseCounts, ClaudePrefixCheck,
     ClaudeResumePoint, ReadTransaction, CLAUDE_CODE_QUIET_WINDOW_MS,
 };
 use rusqlite::params;
@@ -424,16 +424,20 @@ fn read_projects_staged(
             }
         }
         let previous_offset = point.as_ref().map(|point| point.offset());
-        let (parse, transaction) = parse_claude_file_with_final_tail(
+        let (parse, transaction) = parse_claude_file_with_stop(
             &path,
             point.map(|point| (*point).clone()),
             check,
             recorded_at_ms,
             quiet_window_ms,
             final_tail,
+            stop,
         );
         transactions.push(transaction);
         if let Some(reason) = parse.io_error {
+            if stop.load(Ordering::Relaxed) {
+                return Err(SourceDrainError::Stopped);
+            }
             return Err(
                 format!("read Claude Code session file {}: {reason}", path.display()).into(),
             );

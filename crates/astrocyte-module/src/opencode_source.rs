@@ -877,6 +877,12 @@ impl OpenCodeSource {
             Ok(page) => page,
             Err(error) => {
                 cache.reader = None;
+                if mode.is_full() && self.skip_v2_only_store(state, &mut cache, root, stop)? {
+                    return Ok(OpenCodeDrainOutcome {
+                        root_absent: true,
+                        ..OpenCodeDrainOutcome::default()
+                    });
+                }
                 return Err(read_error(error));
             }
         };
@@ -972,8 +978,18 @@ impl OpenCodeSource {
         // written: no event, no cursor advance, no runtime failure. Every
         // OpenCode event has a content-derived identity, so the next start
         // reads the same page again and loses nothing.
-        let page =
-            read_opencode_page(root, stored.as_ref(), page_limit, stop).map_err(read_error)?;
+        let page = match read_opencode_page(root, stored.as_ref(), page_limit, stop) {
+            Ok(page) => page,
+            Err(error) => {
+                if self.skip_v2_only_store(state, cache, root, stop)? {
+                    return Ok(OpenCodeDrainOutcome {
+                        root_absent: true,
+                        ..OpenCodeDrainOutcome::default()
+                    });
+                }
+                return Err(read_error(error));
+            }
+        };
         let front_row_id = page.front_row_id.clone();
         let mut set_aside: Vec<_> = page
             .set_aside
@@ -1022,6 +1038,27 @@ impl OpenCodeSource {
         };
         outcome.count(committed);
         Ok(outcome)
+    }
+
+    fn skip_v2_only_store(
+        &self,
+        state: &SharedState,
+        cache: &mut OpenCodeCache,
+        root: &Path,
+        stop: &AtomicBool,
+    ) -> Result<bool, SourceDrainError> {
+        let Some(key) = self.home.runtime_key() else {
+            return Ok(false);
+        };
+        if !matches!(
+            astrocyte_readers::sessions::opencode_v2::has_only_v2_layout(root, stop),
+            Ok(true)
+        ) {
+            return Ok(false);
+        }
+        DrainMode::Full.remove_runtime(state, key)?;
+        *cache = OpenCodeCache::default();
+        Ok(true)
     }
 }
 
@@ -1634,6 +1671,35 @@ mod tests {
             )
             .unwrap();
         connection
+    }
+
+    #[test]
+    fn personal_v1_skips_v2_only_store_and_detects_later_v1_layout() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("opencode.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE session_v2(id TEXT PRIMARY KEY,directory TEXT,path TEXT);
+            CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,seq INTEGER,time_created INTEGER,time_updated INTEGER,data TEXT);").unwrap();
+        drop(db);
+        let state = test_state();
+        let source = OpenCodeSource::at(&path);
+        let stop = AtomicBool::new(false);
+        let skipped = source.drain(&state, 100, &stop).unwrap();
+        assert!(skipped.root_absent);
+        assert_eq!(skipped.pass, None);
+        assert!(!state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM source_runtime WHERE source_key='opencode')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .unwrap());
+        let db = create_database(&path);
+        insert_message(&db, "v1", "session", 1, 1);
+        assert_eq!(source.drain(&state, 200, &stop).unwrap().rows_recorded, 1);
     }
 
     fn insert_message(

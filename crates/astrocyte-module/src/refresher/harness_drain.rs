@@ -795,6 +795,7 @@ pub(crate) fn health_reason(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct JsonlDrainOutcome<C> {
     pub root_absent: bool,
+    pub read_errors: Vec<String>,
     pub files_read: usize,
     pub files_resumed: usize,
     pub counts: C,
@@ -827,7 +828,7 @@ pub(crate) fn drain_jsonl<P, C: Default, Call>(
     recorded_at_ms: i64,
     stop: &AtomicBool,
     keep: &dyn Fn(&Path) -> bool,
-    parse: impl Fn(&Path, Option<P>, PrefixCheck) -> JsonlRead<P, C, Call>,
+    parse: impl Fn(&Path, Option<P>, PrefixCheck) -> std::io::Result<JsonlRead<P, C, Call>>,
     reference: impl Fn(&Call) -> &str,
     map: impl Fn(Call) -> Result<EventRecordRequest, String>,
     add_counts: impl Fn(&mut C, &C) -> u64,
@@ -870,8 +871,15 @@ pub(crate) fn drain_jsonl<P, C: Default, Call>(
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(SourceDrainError::Stopped);
         }
-        let stat = FileStat::read_in_lane(&path, mode)
-            .map_err(|error| format!("stat {label} session {}: {error}", path.display()))?;
+        let stat = match FileStat::read_in_lane(&path, mode) {
+            Ok(stat) => stat,
+            Err(error) => {
+                outcome
+                    .read_errors
+                    .push(format!("stat {label} session {}: {error}", path.display()));
+                continue;
+            }
+        };
         if !mode.is_full() && !stat.fast_changed(previous_windows.get(&path), recorded_at_ms) {
             if let Some(point) = previous_points.remove(&path) {
                 next.resume.insert(path.clone(), point);
@@ -900,7 +908,24 @@ pub(crate) fn drain_jsonl<P, C: Default, Call>(
             continue;
         }
         let previous_offset = point.as_ref().map(&offset);
-        let parsed = parse(&path, point, check);
+        let parsed = match parse(&path, point, check) {
+            Ok(parsed) => parsed,
+            Err(_) if stop.load(std::sync::atomic::Ordering::Relaxed) => {
+                return Err(SourceDrainError::Stopped)
+            }
+            Err(error) => {
+                outcome
+                    .read_errors
+                    .push(format!("read {label} session {}: {error}", path.display()));
+                // The parser consumed the old resume state. Retry from the
+                // start rather than accepting partial output or an offset.
+                next.windows.insert(
+                    path,
+                    WindowSchedule::after_read(window, stat, recorded_at_ms, false, false),
+                );
+                continue;
+            }
+        };
         let next_offset = parsed.resume.as_ref().map(&offset);
         next.windows.insert(
             path.clone(),

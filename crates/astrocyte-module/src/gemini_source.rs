@@ -24,8 +24,8 @@ use astrocyte_readers::provider_identity::inferred_provider_from_model;
 #[cfg(test)]
 use astrocyte_readers::sessions::gemini::parse_gemini_json_document;
 use astrocyte_readers::sessions::gemini::{
-    is_gemini_chat_recording, parse_gemini_jsonl_resumable, read_gemini_json_document, GeminiCall,
-    GeminiParseCounts, GeminiResumePoint,
+    is_gemini_chat_recording, read_gemini_json_document, try_parse_gemini_jsonl_resumable,
+    GeminiCall, GeminiParseCounts, GeminiResumePoint,
 };
 
 use crate::refresher::harness_drain::{
@@ -42,6 +42,7 @@ pub(crate) const GEMINI_SOURCE_KEY: &str = "gemini";
 pub(crate) struct GeminiDrainOutcome {
     /// The `tmp` directory does not exist: no Gemini CLI lane.
     pub root_absent: bool,
+    pub read_errors: Vec<String>,
     /// Chat recordings found.
     pub files_found: usize,
     /// JSON documents parsed this drain (new or changed).
@@ -219,8 +220,15 @@ impl GeminiSource {
             {
                 let previous = previous_points.remove(&path);
                 let verified = previous_verified.get(&path).copied();
-                let stat = FileStat::read_in_lane(&path, mode)
-                    .map_err(|error| format!("stat Gemini JSONL {}: {error}", path.display()))?;
+                let stat = match FileStat::read_in_lane(&path, mode) {
+                    Ok(stat) => stat,
+                    Err(error) => {
+                        outcome
+                            .read_errors
+                            .push(format!("stat Gemini JSONL {}: {error}", path.display()));
+                        continue;
+                    }
+                };
                 if !mode.is_full()
                     && !stat.fast_changed(previous_windows.get(&path), recorded_at_ms)
                 {
@@ -255,7 +263,22 @@ impl GeminiSource {
                 let previous_offset = previous
                     .as_ref()
                     .map(astrocyte_readers::sessions::gemini::GeminiResumePoint::offset);
-                let parse = parse_gemini_jsonl_resumable(&path, previous, check);
+                let parse = match try_parse_gemini_jsonl_resumable(&path, previous, check, stop) {
+                    Ok(parse) => parse,
+                    Err(_) if stop.load(Ordering::Relaxed) => {
+                        return Err(SourceDrainError::Stopped)
+                    }
+                    Err(error) => {
+                        outcome
+                            .read_errors
+                            .push(format!("read Gemini JSONL {}: {error}", path.display()));
+                        next.jsonl.windows.insert(
+                            path,
+                            WindowSchedule::after_read(window, stat, recorded_at_ms, false, false),
+                        );
+                        continue;
+                    }
+                };
                 let offset = parse
                     .resume
                     .as_ref()
@@ -425,11 +448,13 @@ impl HarnessSource for GeminiSource {
         stop: &AtomicBool,
     ) -> Result<Option<String>, SourceDrainError> {
         let outcome = self.drain(state, recorded_at_ms, stop)?;
-        Ok(health_reason(
-            "Gemini CLI",
-            outcome.quarantined_redeliveries,
-            outcome.counts.usage_not_ingested() + outcome.calls_set_aside,
-        ))
+        Ok(outcome.read_errors.into_iter().next().or_else(|| {
+            health_reason(
+                "Gemini CLI",
+                outcome.quarantined_redeliveries,
+                outcome.counts.usage_not_ingested() + outcome.calls_set_aside,
+            )
+        }))
     }
 }
 
@@ -1028,7 +1053,11 @@ mod tests {
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
             {
-                let parse = parse_gemini_jsonl_resumable(path, None, PrefixCheck::Full);
+                let parse = astrocyte_readers::sessions::gemini::parse_gemini_jsonl_resumable(
+                    path,
+                    None,
+                    PrefixCheck::Full,
+                );
                 (parse.calls, parse.counts)
             } else {
                 let parse = parse_gemini_json_document(path).unwrap();

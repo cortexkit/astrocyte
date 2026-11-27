@@ -1003,6 +1003,20 @@ pub fn parse_codex_file_transactional(
     previous: Option<CodexResumePoint>,
     check: CodexPrefixCheck,
 ) -> (CodexResumableParse, super::claudecode::ReadTransaction) {
+    parse_codex_file_with_stop(
+        path,
+        previous,
+        check,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+pub fn parse_codex_file_with_stop(
+    path: &Path,
+    previous: Option<CodexResumePoint>,
+    check: CodexPrefixCheck,
+    stop: &std::sync::atomic::AtomicBool,
+) -> (CodexResumableParse, super::claudecode::ReadTransaction) {
     let mut transaction = super::claudecode::ReadTransaction::default();
     if is_codex_archive(path) {
         return (archive::parse_archive(path), transaction);
@@ -1016,15 +1030,20 @@ pub fn parse_codex_file_transactional(
     let mut set_aside = Vec::new();
     let mut calls = Vec::new();
     let mut buffer = Vec::with_capacity(4096);
-    let read = super::jsonl_resume::try_read_appended_lines(
+    let read = super::jsonl_resume::read_appended_lines(
         path,
         previous.map(|point| point.0),
-        check,
+        super::jsonl_resume::ReadOptions::live(check, stop),
         || fresh,
-        |state, payload| {
+        |state, payload, _| {
             state.lines += 1;
             counts.lines += 1;
             let skipped = counts.skipped_lines;
+            let Some(payload) = payload else {
+                counts.skipped_lines += 1;
+                set_aside.push((state.lines, "Codex JSONL record exceeds 16 MiB".into()));
+                return;
+            };
             parse_line(payload, &mut buffer, state, &mut counts, &mut calls);
             if counts.skipped_lines > skipped {
                 set_aside.push((state.lines, "Codex record could not be decoded".into()));
@@ -1050,9 +1069,7 @@ pub fn parse_codex_file_transactional(
             set_aside,
             calls,
             resumed: read.resumed,
-            resume: read
-                .cursor
-                .map(|cursor| CodexResumePoint(cursor.with_state(read.state))),
+            resume: Some(CodexResumePoint(read.cursor.with_state(read.state))),
             hashed_bytes: read.hashed_bytes,
             decompressed_bytes: 0,
             counts,

@@ -22,7 +22,7 @@ use std::sync::Mutex;
 use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::EventRecordRequest;
 use astrocyte_readers::sessions::kimi::{
-    parse_kimi_wire_resumable, KimiCall, KimiParseCounts, KimiResumePoint,
+    try_parse_kimi_wire_resumable, KimiCall, KimiParseCounts, KimiResumePoint,
 };
 
 use crate::refresher::harness_drain::{
@@ -122,14 +122,14 @@ impl KimiSource {
             stop,
             &|path| path.file_name().is_some_and(|name| name == "wire.jsonl"),
             |path, previous, check| {
-                let parse = parse_kimi_wire_resumable(path, previous, check);
-                JsonlRead {
+                let parse = try_parse_kimi_wire_resumable(path, previous, check, stop)?;
+                Ok(JsonlRead {
                     resumed: parse.resumed,
                     hashed_bytes: parse.hashed_bytes,
                     counts: parse.counts,
                     calls: parse.calls,
                     resume: parse.resume,
-                }
+                })
             },
             |call| call.message_id.as_str(),
             map_call,
@@ -165,11 +165,13 @@ impl HarnessSource for KimiSource {
         stop: &AtomicBool,
     ) -> Result<Option<String>, SourceDrainError> {
         let outcome = self.drain(state, recorded_at_ms, stop)?;
-        Ok(health_reason(
-            "Kimi CLI",
-            outcome.quarantined_redeliveries,
-            outcome.counts.usage_not_ingested() + outcome.calls_set_aside,
-        ))
+        Ok(outcome.read_errors.into_iter().next().or_else(|| {
+            health_reason(
+                "Kimi CLI",
+                outcome.quarantined_redeliveries,
+                outcome.counts.usage_not_ingested() + outcome.calls_set_aside,
+            )
+        }))
     }
 }
 
@@ -625,7 +627,11 @@ mod tests {
         let mut reader = RawTotals::default();
         let mut counts = KimiParseCounts::default();
         for path in &files {
-            let parse = parse_kimi_wire_resumable(path, None, PrefixCheck::Full);
+            let parse = astrocyte_readers::sessions::kimi::parse_kimi_wire_resumable(
+                path,
+                None,
+                PrefixCheck::Full,
+            );
             counts.add(&parse.counts);
             for call in parse.calls {
                 reader.calls += 1;

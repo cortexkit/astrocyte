@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use astrocyte_core::fact::ChargeBasis;
 use astrocyte_core::ingest::{EventRecordRequest, MeasurementInput, StepDetail};
 use astrocyte_readers::sessions::codex::{
-    is_codex_archive, parse_codex_file_transactional, CodexCall, CodexDerived, CodexParseCounts,
+    is_codex_archive, parse_codex_file_with_stop, CodexCall, CodexDerived, CodexParseCounts,
     CodexPrefixCheck, CodexResumePoint,
 };
 
@@ -348,13 +348,17 @@ impl CodexSource {
                 }
             }
             let previous_offset = previous.as_ref().map(|point| point.offset());
-            let (parse, transaction) = parse_codex_file_transactional(
+            let (parse, transaction) = parse_codex_file_with_stop(
                 &path,
                 previous.map(|point| (*point).clone()),
                 check,
+                stop,
             );
             if let Some(reason) = parse.io_error {
                 transaction.rollback();
+                if stop.load(Ordering::Relaxed) {
+                    return Err(SourceDrainError::Stopped);
+                }
                 if archive {
                     // A truncated frame may still be growing. Retry after the
                     // first failure; if the same file still fails at the same

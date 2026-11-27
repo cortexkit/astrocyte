@@ -43,6 +43,32 @@ pub struct Page {
     /// Work spent discovering incomplete rows below the timestamp cursor.
     pub incomplete_cost: OpenCodeScanCost,
     pub open_row_floor: i64,
+    pub continuation: Option<FullProgress>,
+}
+
+/// In-memory position within a full sweep. The ledger still stores only the
+/// inclusive timestamp, so a restart replays its entire last timestamp.
+#[derive(Debug, Clone)]
+pub struct FullProgress {
+    lineage: String,
+    lower: i64,
+    floor: i64,
+    oldest_open: Option<i64>,
+    position: FullPosition,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FullPosition {
+    Malformed(Option<i64>),
+    OldIncomplete(Option<i64>),
+    Current(Option<(i64, i64)>),
+}
+
+pub struct FullPageRequest<'a> {
+    pub cursor: Option<&'a OpenCodeCursor>,
+    pub open_row_floor: Option<i64>,
+    pub progress: Option<&'a FullProgress>,
+    pub limit: usize,
 }
 
 #[derive(Deserialize)]
@@ -177,6 +203,32 @@ pub fn read_page_with_sessions(
     stop: &AtomicBool,
     sessions: &dyn Fn(&str) -> SessionPolicy,
 ) -> Result<Option<Page>, OpenCodeReadError> {
+    read_page_continuing(
+        path,
+        &FullPageRequest {
+            cursor,
+            open_row_floor,
+            progress: None,
+            limit,
+        },
+        now_ms,
+        stop,
+        sessions,
+    )
+}
+
+pub fn read_page_continuing(
+    path: &Path,
+    request: &FullPageRequest<'_>,
+    now_ms: i64,
+    stop: &AtomicBool,
+    sessions: &dyn Fn(&str) -> SessionPolicy,
+) -> Result<Option<Page>, OpenCodeReadError> {
+    let limit = i64::try_from(request.limit)
+        .map_err(|_| "OpenCode 2 page limit exceeds SQLite integer range".to_string())?;
+    if limit == 0 {
+        return Err("OpenCode 2 page limit is zero".to_string().into());
+    }
     with_read_snapshot(path, stop, |connection| {
         let Some(mut page) = begin_page(connection, stop, true)? else {
             return Ok(None);
@@ -190,116 +242,192 @@ pub fn read_page_with_sessions(
             |row| row.get(0),
         )
         .map_err(|e| sqlite_error(stop, "read OpenCode 2 high water", e))?;
-        let represented = cursor.filter(|cursor| cursor.lineage == page.lineage);
-        // A new row can reuse a deleted rowid below this floor. The timestamp
-        // branch remains unbounded by rowid and discovers it before the cursor
-        // passes it: new writes must be stamped at or after the cursor, the
-        // same clock assumption the existing timestamp cursor requires.
-        // A replaced store or an upgrade without a floor needs one discovery.
-        let floor = represented.and(open_row_floor).unwrap_or(i64::MIN);
-        let lower = represented.map_or(0, |cursor| cursor.ordinal);
-        if lower > page.high_water {
-            // OpenCode deletes sessions. When the deleted sessions held every
-            // row at or above the cursor, the maximum falls below the cursor
-            // while the front row (and so the lineage) is unchanged. The store
-            // then holds no row newer than the cursor. Keep the high water at
-            // the cursor, as its durable row requires, but still check older
-            // incomplete calls: they may now be quiet or their session done.
-            // Completed rows below the cursor are not re-read. A later write
-            // at or above the cursor is read normally.
-            page.high_water = lower;
-        }
-        let offset = i64::try_from(
-            limit
-                .checked_sub(1)
-                .ok_or_else(|| "OpenCode 2 page limit is zero".to_string())?,
-        )
-        .map_err(|_| "OpenCode 2 page limit exceeds SQLite integer range".to_string())?;
-        // Include every row tied at the cutoff. Both range bounds are inclusive,
-        // so a completion sharing a cursor timestamp cannot be lost.
-        page.consumed = counted_query_row(
-            connection,
-            &mut page.cost,
-            "SELECT time_updated FROM session_message
-             WHERE typeof(time_updated)='integer' AND time_updated>=?1
-             ORDER BY time_updated,seq LIMIT 1 OFFSET ?2",
-            params![lower, offset],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| sqlite_error(stop, "select OpenCode 2 boundary", e))?
-        .unwrap_or(page.high_water);
-        if page.consumed == lower && lower < page.high_water {
-            // A whole page of rows shares the cursor's own update time, so the
-            // boundary above lands on the cursor again and would never move.
-            // That happens when OpenCode writes many rows in one millisecond,
-            // as when it imports a long session. Move the boundary to the next
-            // update time instead: the page then reads every tied row plus the
-            // rows at that next time, and the cursor passes the tie.
-            page.consumed = counted_query_row(
-                connection,
-                &mut page.cost,
-                "SELECT MIN(time_updated) FROM session_message
-                 WHERE typeof(time_updated)='integer' AND time_updated>?1",
-                params![lower],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .map_err(|e| sqlite_error(stop, "select OpenCode 2 boundary past a tie", e))?
-            .unwrap_or(page.high_water);
-        }
+        let represented = request
+            .cursor
+            .filter(|cursor| cursor.lineage == page.lineage);
+        let progress = request
+            .progress
+            .filter(|p| p.lineage == page.lineage)
+            .cloned()
+            .unwrap_or_else(|| FullProgress {
+                lineage: page.lineage.clone(),
+                lower: represented.map_or(0, |cursor| cursor.ordinal),
+                floor: represented.and(request.open_row_floor).unwrap_or(i64::MIN),
+                oldest_open: None,
+                position: FullPosition::Malformed(None),
+            });
+        let position_time = match progress.position {
+            FullPosition::Current(Some((updated, _))) => updated,
+            _ => progress.lower,
+        };
+        page.consumed = position_time.max(represented.map_or(0, |cursor| cursor.ordinal));
+        // Session deletion can shrink the store below the durable cursor.
+        // Keep the cursor monotonic but still visit the older incomplete rows.
+        page.high_water = page.high_water.max(page.consumed);
         let legacy = table_exists(connection, &mut page.cost, "message")
             .map_err(|e| sqlite_error(stop, "detect OpenCode 1 table", e))?;
-        // Discover old incomplete rows separately so their JSON work can be
-        // measured independently of the unindexed scalar timestamp scans.
-        let mut incomplete = connection
-            .prepare(
-                "SELECT rowid FROM session_message
-                 WHERE rowid>=?3 AND type='assistant' AND typeof(time_updated)='integer'
-                   AND time_updated<?1 AND time_updated<=?2
-                   AND CASE WHEN typeof(data)='text' AND json_valid(data)
-                     THEN json_extract(data,'$.time.completed') IS NULL ELSE 0 END",
-            )
-            .map_err(|e| sqlite_error(stop, "prepare OpenCode 2 incomplete rows", e))?;
-        let old_open = incomplete
-            .query_map(params![lower, page.consumed, floor], |row| {
-                row.get::<_, i64>(0)
-            })
-            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
-            .map_err(|e| sqlite_error(stop, "read OpenCode 2 incomplete rows", e))?;
-        page.incomplete_cost.add_statement(&incomplete);
-        page.cost.add_assign_saturating(&page.incomplete_cost);
-        let old_open = serde_json::to_string(&old_open)
-            .map_err(|e| format!("encode OpenCode 2 incomplete rowids: {e}"))?;
-        // Malformed timestamps cannot enter the paging bounds, but must
-        // still reach the row decoder so the ledger records their evidence.
-        let mut statement = connection
-            .prepare(
-                "SELECT rowid,id,session_id,time_updated,data,seq FROM session_message
-             WHERE typeof(time_updated)!='integer' OR
-               (type='assistant' AND time_updated<=?2 AND
-                (time_updated>=?1 OR rowid IN (SELECT value FROM json_each(?3))))
-             ORDER BY seq",
-            )
-            .map_err(|e| sqlite_error(stop, "prepare OpenCode 2 page", e))?;
-        let mut rows = statement
-            .query(params![lower, page.consumed, old_open])
-            .map_err(|e| sqlite_error(stop, "query OpenCode 2 page", e))?;
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| sqlite_error(stop, "step OpenCode 2 page", e))?
-        {
-            take_row(connection, row, legacy, now_ms, stop, &mut page, sessions)?;
+        FullSweep {
+            connection,
+            legacy,
+            now_ms,
+            stop,
+            sessions,
         }
-        drop(rows);
-        page.cost.add_statement(&statement);
-        page.open_row_floor = page
-            .open_rows
-            .iter()
-            .map(|row| row.rowid)
-            .min()
-            .unwrap_or(page.max_rowid);
+        .read(&mut page, progress, limit)?;
         Ok(Some(page))
     })
+}
+
+struct FullSweep<'a> {
+    connection: &'a Connection,
+    legacy: bool,
+    now_ms: i64,
+    stop: &'a AtomicBool,
+    sessions: &'a dyn Fn(&str) -> SessionPolicy,
+}
+
+impl FullSweep<'_> {
+    fn read(
+        &self,
+        page: &mut Page,
+        mut progress: FullProgress,
+        mut remaining: i64,
+    ) -> Result<(), OpenCodeReadError> {
+        let rowid_start =
+            |after: Option<i64>, floor| after.map_or(floor, |id| id.saturating_add(1).max(floor));
+        while remaining > 0 {
+            let (statement, bindings) = match progress.position {
+                FullPosition::Malformed(after) => (self.connection.prepare(
+                    "SELECT rowid,id,session_id,time_updated,data,seq FROM session_message
+                     WHERE rowid>=?1 AND (?2 IS NULL OR rowid>?2) AND typeof(time_updated)!='integer'
+                     ORDER BY rowid LIMIT ?3"),
+                    [Some(rowid_start(after, i64::MIN)), after, Some(remaining), None]),
+                FullPosition::OldIncomplete(after) => (self.connection.prepare(
+                    "SELECT rowid,id,session_id,time_updated,data,seq FROM session_message
+                     WHERE rowid>=?1 AND (?2 IS NULL OR rowid>?2) AND type='assistant'
+                       AND typeof(time_updated)='integer' AND time_updated<?4
+                       AND CASE WHEN typeof(data)='text' AND json_valid(data)
+                         THEN json_extract(data,'$.time.completed') IS NULL ELSE 0 END
+                     ORDER BY rowid LIMIT ?3"),
+                    [Some(rowid_start(after, progress.floor)), after, Some(remaining), Some(progress.lower)]),
+                // Sort scalar keys and choose the bounded window first. There
+                // is no producer timestamp index; sorting row payloads would
+                // materialize JSON even for rows outside the requested page.
+                FullPosition::Current(after) => (self.connection.prepare(
+                    "WITH selected AS MATERIALIZED (
+                       SELECT rowid,time_updated FROM session_message
+                       WHERE typeof(time_updated)='integer'
+                         AND time_updated>=?1 AND (?2 IS NULL OR (time_updated,rowid)>(?2,?4))
+                       ORDER BY time_updated,rowid LIMIT ?3
+                     )
+                     SELECT m.rowid,m.id,m.session_id,m.time_updated,m.data,m.seq,
+                            CASE WHEN m.type='assistant' THEN 1 ELSE 0 END
+                     FROM selected JOIN session_message m ON m.rowid=selected.rowid
+                     ORDER BY selected.time_updated,selected.rowid"),
+                     [Some(progress.lower), after.map(|(time, _)| time), Some(remaining), after.map(|(_, rowid)| rowid)]),
+            };
+            let mut statement = statement
+                .map_err(|e| sqlite_error(self.stop, "prepare OpenCode 2 full batch", e))?;
+            let count = statement.parameter_count();
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(bindings.into_iter().take(count)))
+                .map_err(|e| sqlite_error(self.stop, "query OpenCode 2 full batch", e))?;
+            let mut last = None;
+            while let Some(row) = rows
+                .next()
+                .map_err(|e| sqlite_error(self.stop, "step OpenCode 2 full batch", e))?
+            {
+                let eligible = !matches!(progress.position, FullPosition::Current(_))
+                    || row
+                        .get::<_, bool>(6)
+                        .map_err(|e| sqlite_error(self.stop, "read OpenCode 2 role", e))?;
+                if eligible {
+                    take_row(
+                        self.connection,
+                        row,
+                        self.legacy,
+                        self.now_ms,
+                        self.stop,
+                        page,
+                        self.sessions,
+                    )?;
+                }
+                last = Some((
+                    row.get::<_, i64>(0)
+                        .map_err(|e| format!("read OpenCode 2 rowid: {e}"))?,
+                    row.get::<_, i64>(3).ok(),
+                ));
+                remaining -= 1;
+            }
+            drop(rows);
+            if matches!(progress.position, FullPosition::OldIncomplete(_)) {
+                let mut cost = OpenCodeScanCost::default();
+                cost.add_statement(&statement);
+                page.incomplete_cost.add_assign_saturating(&cost);
+                page.cost.add_assign_saturating(&cost);
+            } else {
+                page.cost.add_statement(&statement);
+            }
+            progress.oldest_open = progress
+                .oldest_open
+                .into_iter()
+                .chain(page.open_rows.iter().map(|row| row.rowid))
+                .min();
+            progress.position = match (progress.position, last, remaining) {
+                (FullPosition::Malformed(_), Some((rowid, _)), 0) => {
+                    FullPosition::Malformed(Some(rowid))
+                }
+                (FullPosition::Malformed(_), _, _) => FullPosition::OldIncomplete(None),
+                (FullPosition::OldIncomplete(_), Some((rowid, _)), 0) => {
+                    FullPosition::OldIncomplete(Some(rowid))
+                }
+                (FullPosition::OldIncomplete(_), _, _) => FullPosition::Current(None),
+                (FullPosition::Current(_), Some((rowid, Some(updated))), 0) => {
+                    // An exactly full final page need not schedule an empty
+                    // sweep merely to find out that the last tie ended.
+                    if updated == page.high_water {
+                        let tied_rows_remain = counted_query_row(
+                            self.connection,
+                            &mut page.cost,
+                            "SELECT EXISTS(SELECT 1 FROM session_message WHERE rowid>?1
+                              AND typeof(time_updated)='integer' AND time_updated=?2)",
+                            params![rowid, updated],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .map_err(|e| {
+                            sqlite_error(self.stop, "check remaining OpenCode 2 tie", e)
+                        })?;
+                        if !tied_rows_remain {
+                            page.consumed = page.high_water;
+                            page.open_row_floor = progress.oldest_open.unwrap_or(page.max_rowid);
+                            return Ok(());
+                        }
+                    }
+                    // Keep the tied timestamp inclusive in the persisted cursor;
+                    // only this process knows which rows at that time it read.
+                    page.consumed = page.consumed.max(updated);
+                    FullPosition::Current(Some((updated, rowid)))
+                }
+                (FullPosition::Current(_), _, _) => {
+                    page.consumed = page.high_water;
+                    page.open_row_floor = progress.oldest_open.unwrap_or(page.max_rowid);
+                    return Ok(());
+                }
+            };
+        }
+        // Until the older rows have been checked, a restart must keep the
+        // original floor. Once the sweep reaches timestamp paging, unread
+        // rows remain at or above its inclusive cursor regardless of rowid.
+        page.open_row_floor = if matches!(progress.position, FullPosition::Current(_)) {
+            progress.oldest_open.unwrap_or(page.max_rowid)
+        } else {
+            progress
+                .oldest_open
+                .map_or(progress.floor, |open| open.min(progress.floor))
+        };
+        page.continuation = Some(progress);
+        Ok(())
+    }
 }
 
 /// Whether the store at `path` has OpenCode 1's `message` table. An OpenCode 2
@@ -309,6 +437,19 @@ pub fn has_v1_message_table(path: &Path, stop: &AtomicBool) -> Result<bool, Open
     with_read_snapshot(path, stop, |connection| {
         table_exists(connection, &mut OpenCodeScanCost::default(), "message")
             .map_err(|e| sqlite_error(stop, "detect OpenCode 1 table", e))
+    })
+}
+
+/// Distinguish a V2-only store from an unrelated or unreadable database.
+pub fn has_only_v2_layout(path: &Path, stop: &AtomicBool) -> Result<bool, OpenCodeReadError> {
+    with_read_snapshot(path, stop, |connection| {
+        let mut cost = OpenCodeScanCost::default();
+        (|| {
+            Ok(table_exists(connection, &mut cost, "session_v2")?
+                && table_exists(connection, &mut cost, "session_message")?
+                && !table_exists(connection, &mut cost, "message")?)
+        })()
+        .map_err(|e| sqlite_error(stop, "detect OpenCode layouts", e))
     })
 }
 

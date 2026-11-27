@@ -40,7 +40,7 @@
 //! `input` underivable. No record reports reasoning separately; `output` is
 //! stored as reported and no reasoning role is emitted.
 
-use super::jsonl_resume::{read_appended_lines, JsonlResumePoint, PrefixCheck};
+use super::jsonl_resume::{read_appended_lines, JsonlResumePoint, PrefixCheck, ReadOptions};
 use super::roles::DerivedRole;
 use super::utils::parse_json_line;
 use serde::Deserialize;
@@ -286,6 +286,8 @@ impl KimiResumePoint {
 /// Result of one [`parse_kimi_wire_resumable`] call.
 #[derive(Debug, Default)]
 pub struct KimiResumableParse {
+    /// A read failure does not mean the transcript was empty.
+    pub io_error: Option<String>,
     /// Calls read by this call, in file order.
     pub calls: Vec<KimiCall>,
     /// True when the previous point's prefix verified and parsing started at
@@ -320,38 +322,59 @@ pub fn parse_kimi_wire_resumable(
     previous: Option<KimiResumePoint>,
     check: PrefixCheck,
 ) -> KimiResumableParse {
+    match try_parse_kimi_wire_resumable(
+        path,
+        previous,
+        check,
+        &std::sync::atomic::AtomicBool::new(false),
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => KimiResumableParse {
+            io_error: Some(error.to_string()),
+            ..KimiResumableParse::default()
+        },
+    }
+}
+
+pub fn try_parse_kimi_wire_resumable(
+    path: &Path,
+    previous: Option<KimiResumePoint>,
+    check: PrefixCheck,
+    stop: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<KimiResumableParse> {
     let session_id = session_id_of(path);
     let mut counts = KimiParseCounts::default();
     let mut calls = Vec::new();
     let mut buffer = Vec::with_capacity(4096);
-    let Some(read) = read_appended_lines(
+    let read = read_appended_lines(
         path,
         previous.map(|point| point.0),
-        check,
+        ReadOptions::live(check, stop),
         KimiParseState::default,
-        |state, payload| {
+        |state, payload, _| {
             counts.lines += 1;
-            parse_line(
-                payload,
-                &session_id,
-                &mut buffer,
-                state,
-                &mut counts,
-                &mut calls,
-            );
+            if let Some(payload) = payload {
+                parse_line(
+                    payload,
+                    &session_id,
+                    &mut buffer,
+                    state,
+                    &mut counts,
+                    &mut calls,
+                );
+            } else {
+                counts.skipped_lines += 1;
+            }
         },
-    ) else {
-        return KimiResumableParse::default();
-    };
-    KimiResumableParse {
+    )?;
+    Ok(KimiResumableParse {
+        io_error: None,
         calls,
         resumed: read.resumed,
-        resume: read
-            .cursor
-            .map(|cursor| KimiResumePoint(cursor.with_state(read.state))),
+        resume: Some(KimiResumePoint(read.cursor.with_state(read.state))),
         hashed_bytes: read.hashed_bytes,
         counts,
-    }
+    })
 }
 
 #[cfg(test)]

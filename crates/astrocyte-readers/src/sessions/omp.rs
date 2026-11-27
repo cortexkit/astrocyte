@@ -38,7 +38,7 @@
 //! own `totalTokens` shows it was added on top. `reasoningTokens` is absent
 //! from 9 records; there `output` is stored gross (see [`OmpOutput`]).
 
-use super::jsonl_resume::{read_appended_lines, JsonlResumePoint, PrefixCheck};
+use super::jsonl_resume::{read_appended_lines, JsonlResumePoint, PrefixCheck, ReadOptions};
 use super::normalize_workspace_key;
 use super::roles::DerivedRole;
 use super::utils::parse_json_line_with_probe;
@@ -113,21 +113,30 @@ pub struct OmpCallUsage {
 
 impl OmpCallUsage {
     fn from_usage(usage: &OmpUsage) -> Self {
-        let cache_write_outside_input = || {
-            let parts = [
-                usage.input,
-                usage.output,
-                usage.cache_read,
-                usage.cache_write,
-            ];
-            let sum = parts
-                .into_iter()
-                .try_fold(0_u64, |sum, part| sum.checked_add(part?));
-            sum.is_some() && sum == usage.total_tokens
-        };
+        let gross_total = [
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |sum, part| sum.checked_add(part?));
+        let cache_write_outside_input = gross_total.is_some() && gross_total == usage.total_tokens;
         let cache_write_unmeasured =
-            usage.cache_write.is_some_and(|write| write > 0) && !cache_write_outside_input();
+            usage.cache_write.is_some_and(|write| write > 0) && !cache_write_outside_input;
         let output = match usage.reasoning_tokens {
+            Some(reasoning)
+                if reasoning > 0
+                    && gross_total.is_some_and(|total| {
+                        total
+                            .checked_add(reasoning)
+                            .is_some_and(|additive| usage.total_tokens == Some(additive))
+                    }) =>
+            {
+                // This record's total adds reasoning to the other token counts.
+                // Don't price a guessed split when reasoning is normally nested.
+                OmpOutput::Visible(DerivedRole::Conflicted)
+            }
             Some(reasoning) => {
                 OmpOutput::Visible(DerivedRole::difference(usage.output, Some(reasoning)))
             }
@@ -332,6 +341,8 @@ impl OmpResumePoint {
 /// Result of one [`parse_omp_file_resumable`] call.
 #[derive(Debug, Default)]
 pub struct OmpResumableParse {
+    /// A read failure does not mean the transcript was empty.
+    pub io_error: Option<String>,
     /// Calls read by this call, in file order.
     pub calls: Vec<OmpCall>,
     /// True when the previous point's prefix verified and parsing started at
@@ -356,30 +367,51 @@ pub fn parse_omp_file_resumable(
     previous: Option<OmpResumePoint>,
     check: PrefixCheck,
 ) -> OmpResumableParse {
+    match try_parse_omp_file_resumable(
+        path,
+        previous,
+        check,
+        &std::sync::atomic::AtomicBool::new(false),
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => OmpResumableParse {
+            io_error: Some(error.to_string()),
+            ..OmpResumableParse::default()
+        },
+    }
+}
+
+pub fn try_parse_omp_file_resumable(
+    path: &Path,
+    previous: Option<OmpResumePoint>,
+    check: PrefixCheck,
+    stop: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<OmpResumableParse> {
     let mut counts = OmpParseCounts::default();
     let mut calls = Vec::new();
     let mut buffer = Vec::with_capacity(4096);
-    let Some(read) = read_appended_lines(
+    let read = read_appended_lines(
         path,
         previous.map(|point| point.0),
-        check,
+        ReadOptions::live(check, stop),
         OmpParseState::default,
-        |state, payload| {
+        |state, payload, _| {
             counts.lines += 1;
-            parse_line(payload, &mut buffer, state, &mut counts, &mut calls);
+            if let Some(payload) = payload {
+                parse_line(payload, &mut buffer, state, &mut counts, &mut calls);
+            } else {
+                counts.skipped_lines += 1;
+            }
         },
-    ) else {
-        return OmpResumableParse::default();
-    };
-    OmpResumableParse {
+    )?;
+    Ok(OmpResumableParse {
+        io_error: None,
         calls,
         resumed: read.resumed,
-        resume: read
-            .cursor
-            .map(|cursor| OmpResumePoint(cursor.with_state(read.state))),
+        resume: Some(OmpResumePoint(read.cursor.with_state(read.state))),
         hashed_bytes: read.hashed_bytes,
         counts,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -476,6 +508,18 @@ mod tests {
 
     fn parse(path: &Path, previous: Option<OmpResumePoint>) -> OmpResumableParse {
         parse_omp_file_resumable(path, previous, PrefixCheck::Window)
+    }
+
+    #[test]
+    fn total_that_adds_reasoning_on_top_conflicts_with_gross_output_convention() {
+        let usage = r#"{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":18,"reasoningTokens":3}"#;
+        let (_dir, path) = file_with(&(header() + &assistant("m", usage)));
+        let parse = parse(&path, None);
+        assert_eq!(parse.calls.len(), 1);
+        assert_eq!(parse.counts.output_conflicts, 1);
+        let usage = parse.calls[0].usage;
+        assert_eq!(usage.output, OmpOutput::Visible(DerivedRole::Conflicted));
+        assert_eq!(usage.reasoning, Some(3));
     }
 
     /// Cached input is outside `input` and stored beside it; reasoning is
