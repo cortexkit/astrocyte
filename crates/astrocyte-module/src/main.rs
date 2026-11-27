@@ -2034,6 +2034,12 @@ mod tests {
     /// helper must still connect, authenticate and send HELLO to it.
     #[tokio::test(flavor = "multi_thread")]
     async fn unbracketed_ipv6_endpoint_connects_and_authenticates() {
+        // A host without an IPv6 loopback can't run this test. Report it
+        // instead of failing on the host's network setup.
+        if let Err(error) = std::net::TcpListener::bind("[::1]:0") {
+            eprintln!("skipped: this host has no IPv6 loopback ({error})");
+            return;
+        }
         let daemon = FakeDaemon::start_on("::1").await;
         let refresher = IdleRefresher::new();
         let serving = serve_idle(&daemon, Arc::new(test_state()), &refresher);
