@@ -593,7 +593,8 @@ between -9 and 0. A billed quantity prices against the same rate whatever its
 source: the vendor's reply, the provider's measurement, or `request_derived`, a
 count the provider computed from the request as sent, under the vendor's documented
 billing rule. Observed measurements are retained but never priced. Entries
-that fail the contract's entry or record checks, records whose quantities cannot
+that fail the media contract's (`cortexkit-role-media`) checks on an entry or a
+usage record, records whose quantities cannot
 fit the store, and raw undecodable or oversize entries are set aside with a
 locator and reason. On identified feeds the locator uses a digest of the
 `record_id`, or of the entry payload without its sequence if no id can be read.
