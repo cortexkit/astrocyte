@@ -11,6 +11,7 @@ use super::PoolScope;
 mod calls;
 mod capture;
 mod history;
+mod inheritance;
 mod rows;
 #[cfg(test)]
 pub(super) use rows::empty_row;
@@ -36,7 +37,7 @@ pub struct PoolReading {
     pub used_percent: f64,
     pub resets_at: Option<String>,
     pub window_minutes: Option<i64>,
-    /// Catalog provider stated by the quota reading, not the quota provider.
+    /// Effective catalog provider for this computation, not the quota provider.
     pub api_provider: Option<String>,
     /// Effective for this computation, including any pre-cut inheritance.
     pub model_scope: Option<WindowModelScope>,
@@ -54,6 +55,7 @@ struct Stream {
     pool_id: String,
     window_pool_key: String,
     readings: Vec<PoolReading>,
+    scope_conflicts: BTreeSet<i64>,
 }
 
 /// Owned inputs from the provider day's read transaction. No catalog facts
@@ -157,6 +159,7 @@ impl<'a> PlannedPool<'a> {
 struct PoolShape<'a> {
     runs: Vec<PoolReadingRun<'a>>,
     scopes: [bool; 3],
+    scope_conflict: bool,
     minutes: BTreeSet<Option<i64>>,
     api_providers: BTreeSet<Option<&'a str>>,
     newest_duration: Option<(i64, i64)>,
@@ -164,8 +167,9 @@ struct PoolShape<'a> {
 }
 
 impl<'a> PoolShape<'a> {
-    fn observe(&mut self, reading: &'a PoolReading, key: &'a str) {
+    fn observe(&mut self, reading: &'a PoolReading, stream: &'a Stream) {
         let instant = reading.fetched_at_instant_ns;
+        self.scope_conflict |= stream.scope_conflicts.contains(&instant);
         self.scopes[match reading.model_scope {
             None => 0,
             Some(WindowModelScope::All) => 1,
@@ -177,7 +181,9 @@ impl<'a> PoolShape<'a> {
         if let Some(minutes) = reading.window_minutes {
             self.newest_duration = self.newest_duration.max(Some((instant, minutes)));
         }
-        self.newest_key = self.newest_key.max(Some((instant, key)));
+        self.newest_key = self
+            .newest_key
+            .max(Some((instant, &stream.window_pool_key)));
     }
 
     fn classify(
@@ -192,6 +198,7 @@ impl<'a> PoolShape<'a> {
         let (_, window_minutes) = self.newest_duration?;
         let (_, window_pool_key) = self.newest_key?;
         let (pool_scope, mut diagnostic) = match self.scopes {
+            _ if self.scope_conflict => (PoolScope::Unknown, Some(ScopeChanged)),
             [true, _, _] => (PoolScope::Unknown, Some(ScopeUnstated)),
             [false, true, true] => (PoolScope::Unknown, Some(ScopeChanged)),
             [false, false, true] => (PoolScope::Subset, None),
@@ -288,7 +295,7 @@ pub fn plan_pools<'a>(
             }
             let shape = shapes.entry((plan, &stream.pool_id)).or_default();
             for reading in &readings[pair_start..pair_end] {
-                shape.observe(reading, &stream.window_pool_key);
+                shape.observe(reading, stream);
             }
             shape.runs.push(PoolReadingRun {
                 login: &stream.login,

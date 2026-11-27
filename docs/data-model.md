@@ -513,10 +513,10 @@ and starts again from the beginning after a restart.
 `window_sample` and `credential_window_sample` store nullable `model_scope`
 (`all` or `subset`) with each new reading. After migration 68, a null value
 means the reading stated no recognized scope. Readings fetched before the
-migration keep null in storage. For measurement only, they inherit the scope
-of the earliest reading stored since the migration for the same quota
-provider, login and pool identity, if that reading exists and states a scope.
-No readings are backfilled.
+migration keep null in storage. At measurement time, missing scope on pre-cut
+readings and missing catalog provider can be filled from later readings. See
+the [inheritance rules](subscription-multiplier.md#served-pool-coverage) for when the
+same login or other logins can supply those facts. No readings are backfilled.
 
 `multiplier_observation` retains `window_pool_key` and `window_minutes`. The
 stored key is a named slot or a length-prefixed extra-window key; the report's

@@ -359,9 +359,15 @@ fn provider_day_recompute_keeps_the_pre_cut_chain_unchanged() {
         interval_start_ms: DAY_START - MULTIPLIER_INTERVAL_MS,
         interval_end_ms: DAY_START,
     };
-    let mut legacy = compute_multiplier_day(&state, Some(fusiform.as_ref()), day, NOW, false)
-        .unwrap_or_else(|error| panic!("{}: {}", error.code, error.message))
-        .remove(0);
+    let mut legacy = compute_multiplier_day(
+        &state,
+        Some(fusiform.as_ref()),
+        day,
+        NOW,
+        DayMode::Recompute,
+    )
+    .unwrap_or_else(|error| panic!("{}: {}", error.code, error.message))
+    .remove(0);
     legacy.pool_scope = None;
     legacy.catalog_provider = None;
     state

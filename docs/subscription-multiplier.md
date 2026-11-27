@@ -84,7 +84,7 @@ changed snapshot or daily; their query is not part of an idle tick or an hourly 
 Insula's `usage.get` supplies each window's `modelScope`. `all` covers every
 call counted toward that login's plan. `subset` covers the models in the
 Fusiform `plan.prices` reply's `quota_pools` list. The lookup uses the catalog
-provider stated by all of that pool's readings and the pool ID. The ID is the
+provider agreed on by the pool's readings and the pool ID. The ID is the
 insula slot name or the raw extra-window ID. For example, an extra window
 stored as `extra:5:Fable` has pool ID `Fable`. An extra window with no ID is
 known only by its position in an array, so it cannot produce a row or compete
@@ -114,8 +114,20 @@ scopes, inconsistent durations, and missing or empty subset lists produce
 diagnostic rows instead of measurements. A subset list is also treated as
 missing when any reading lacks the catalog provider or the readings disagree
 about it. A `plan.prices` reply without `quota_pools` leaves subset lists
-missing but does not prevent measurement of `all` pools. Historical readings
-can inherit scope at read time under the rules in the [data model](data-model.md#quota-readings-and-multiplier-observations).
+missing but does not prevent measurement of `all` pools.
+
+For a pre-migration-68 reading with no scope, use the same login's first
+post-migration reading for that quota provider and pool, even if it too has no
+scope. If the login has no post-migration reading for the pool, use each peer
+login's first stated post-migration scope for the same quota provider, plan,
+and pool. Only peers that state a value count, and they must agree. For a
+missing catalog provider, use the same login's first later stated provider for
+the same plan and pool. If there is none, look for unanimous providers among
+the peers' first stated readings that are both later and post-migration.
+Stated values are never overwritten. Donor readings can be outside the
+interval; they supply metadata only, not counter readings or additional logins
+to measure. The [data model](data-model.md#quota-readings-and-multiplier-observations)
+describes how readings are stored.
 See the [module surface](module-surface.md) for the row members and reason codes.
 
 ## Counter periods and boundaries
@@ -300,11 +312,13 @@ Legacy observations without those inputs report null stability diagnostics.
 
 For pools that can be measured, every tracked source must have
 `last_success_ms` at/after the interval end **and** no `pending_known` or
-`pending_unknown` backlog. Before two hours after the boundary the operation
-waits; afterwards it may append a diagnostic row, never an eligible one.
-Recompute checks the same readiness. Sources absent from `source_runtime`
-are not independently certified; this gate does not prove that traffic
-outside ingestion is visible.
+`pending_unknown` backlog. The daily stage retries an unrecorded day while a
+source is stale or still draining, just as it retries while a needed model's
+rate timeline is not yet cached. It does not append a partial original after
+the two-hour mark. An operator recompute checks the same source readiness but
+may append a routing-ineligible `source_backlog` diagnostic after two hours.
+Sources absent from `source_runtime` are not independently certified; this
+gate does not prove that traffic outside ingestion is visible.
 
 Rows expose `zero_measurement_events` and `missing_quantity_events`. The
 historical `unattributed_event_share` field is zero on new rows because calls

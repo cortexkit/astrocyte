@@ -57,6 +57,24 @@ impl VaultPlanTimeline {
             .range((Excluded(from), Included(to)))
             .all(|(_, state)| state.get(ledger, login) == Some(plan))
     }
+
+    /// Look up donor metadata only in periods when the donor held this plan.
+    pub(super) fn plan_periods<'a>(
+        &'a self,
+        ledger: PlanLedger,
+        login: &'a str,
+        plan: &'a str,
+    ) -> impl Iterator<Item = (i64, Option<i64>)> + 'a {
+        let mut states = self.states.iter().peekable();
+        std::iter::from_fn(move || {
+            while let Some((&start, state)) = states.next() {
+                if state.get(ledger, login) == Some(plan) {
+                    return Some((start, states.peek().map(|(&end, _)| end)));
+                }
+            }
+            None
+        })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

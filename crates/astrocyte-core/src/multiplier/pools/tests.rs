@@ -200,7 +200,7 @@ fn nested_pools_use_raw_fable_id_and_cover_only_their_own_models() {
 }
 
 #[test]
-fn absent_empty_or_changed_catalog_provider_does_not_choose_a_subset_list() {
+fn never_stated_or_conflicting_catalog_provider_does_not_choose_a_subset_list() {
     let lists = [
         list(PROVIDER, "Fable", &["claude/not-a-fallback"]),
         list(CATALOG_PROVIDER, "Fable", &["anthropic/fable"]),
@@ -209,7 +209,6 @@ fn absent_empty_or_changed_catalog_provider_does_not_choose_a_subset_list() {
     for (opener, closer) in [
         (None, None),
         (Some(""), Some("")),
-        (None, Some(CATALOG_PROVIDER)),
         (Some(CATALOG_PROVIDER), Some("other-catalog")),
     ] {
         let conn = fixture();
@@ -238,6 +237,47 @@ fn absent_empty_or_changed_catalog_provider_does_not_choose_a_subset_list() {
             (None, Some(END))
         );
     }
+}
+
+#[test]
+fn missing_catalog_provider_uses_the_first_later_stated_provider() {
+    let conn = fixture();
+    let (start, end) = (CUT - DAY, CUT + 1);
+    for (at, used, scope, provider) in [
+        (start, 10, None, None),
+        (CUT, 20, SUBSET, None),
+        (end, 30, SUBSET, Some("")),
+        (end + 2 * DAY, 40, SUBSET, Some(CATALOG_PROVIDER)),
+        (end + 3 * DAY, 50, SUBSET, Some("changed-catalog")),
+    ] {
+        sample_with_api_provider(
+            &conn,
+            ACCOUNT,
+            (PROVIDER, FABLE),
+            (at, used),
+            (WEEK, scope),
+            provider,
+        );
+    }
+    vault_plan(&conn, CREDENTIAL, Some(PLAN), 0);
+    sample_with_api_provider(
+        &conn,
+        CREDENTIAL,
+        (PROVIDER, FABLE),
+        (end + DAY, 40),
+        (WEEK, SUBSET),
+        Some("peer-catalog"),
+    );
+    let lists = [list(CATALOG_PROVIDER, "Fable", &["anthropic/fable"])];
+    let readings = capture(&conn, start, end);
+    let pools = plan_pools(&readings, &lists);
+    let pool = by_id(&pools, "Fable");
+    assert_eq!(pool.catalog_provider, Some(CATALOG_PROVIDER));
+    assert_eq!(
+        pool.coverage(),
+        Some(PoolCoverage::Subset(&lists[0].models))
+    );
+    assert_eq!(pool.reading_runs[0].readings.len(), 3);
 }
 
 #[test]
@@ -602,6 +642,87 @@ fn inheritance_uses_the_earliest_post_cut_reading_even_outside_the_interval() {
                 .is_none()
                 .then_some(PoolDiagnostic::ScopeUnstated)
         );
+    }
+}
+
+#[test]
+fn pre_cut_pool_inherits_only_unanimous_peer_metadata_without_adding_counters() {
+    let lists = [list(CATALOG_PROVIDER, "Fable", &["anthropic/fable"])];
+    let (start, end) = (CUT - DAY, CUT - 1);
+    for (second_scope, second_provider, expected) in [
+        (SUBSET, CATALOG_PROVIDER, None),
+        (ALL, CATALOG_PROVIDER, Some(PoolDiagnostic::ScopeChanged)),
+        (
+            SUBSET,
+            "other-catalog",
+            Some(PoolDiagnostic::PoolListMissing),
+        ),
+    ] {
+        let conn = fixture();
+        for (at, used) in [(start, 10), (end, 20)] {
+            sample_with_api_provider(
+                &conn,
+                ACCOUNT,
+                (PROVIDER, FABLE),
+                (at, used),
+                (WEEK, None),
+                None,
+            );
+        }
+        let other_account = (PlanLedger::Account, "peer");
+        let other_plan = (PlanLedger::Account, "other-plan");
+        vault_plan(&conn, other_account, Some("anthropic/other"), 0);
+        vault_plan(&conn, other_account, Some(PLAN), CUT + DAY);
+        vault_plan(&conn, CREDENTIAL, Some(PLAN), 0);
+        vault_plan(&conn, other_plan, Some("anthropic/other"), 0);
+        sample_with_api_provider(
+            &conn,
+            other_account,
+            (PROVIDER, FABLE),
+            (CUT, 15),
+            (WEEK, ALL),
+            Some("other-catalog"),
+        );
+        sample_with_api_provider(
+            &conn,
+            CREDENTIAL,
+            (PROVIDER, FABLE),
+            (CUT, 15),
+            (WEEK, None),
+            None,
+        );
+        for (login, scope, provider) in [
+            (other_account, SUBSET, CATALOG_PROVIDER),
+            (CREDENTIAL, second_scope, second_provider),
+            (other_plan, ALL, "other-catalog"),
+        ] {
+            sample_with_api_provider(
+                &conn,
+                login,
+                (PROVIDER, FABLE),
+                (CUT + 2 * DAY, 30),
+                (WEEK, scope),
+                Some(provider),
+            );
+        }
+        let readings = capture(&conn, start, end);
+        let pools = plan_pools(&readings, &lists);
+        let pool = by_id(&pools, "Fable");
+        assert_eq!(pool.diagnostic, expected);
+        assert_eq!(pool.reading_runs.len(), 1);
+        assert_eq!(pool.reading_runs[0].login.ledger, PlanLedger::Account);
+        assert_eq!(pool.reading_runs[0].login.id, ACCOUNT.1);
+        assert_eq!(pool.reading_runs[0].readings.len(), 2);
+        assert_eq!(
+            pool.catalog_provider,
+            (second_provider == CATALOG_PROVIDER).then_some(CATALOG_PROVIDER)
+        );
+        if expected.is_none() {
+            assert_eq!(
+                pool.coverage(),
+                Some(PoolCoverage::Subset(&lists[0].models))
+            );
+        }
     }
 }
 

@@ -1,13 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet};
-
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, Row};
 
 use crate::capacity::{pool_identity, WindowModelScope};
 use crate::subscription::PlanLedger;
 
 use super::super::{clamp_nanos, clean, millis_to_nanos, MultiplierError};
 use super::history::VaultPlanTimeline;
+use super::inheritance::inherit_metadata;
 use super::{PoolLogin, PoolReading, PoolReadingCapture, Stream};
+
+pub(super) fn sample_table(ledger: PlanLedger) -> (&'static str, &'static str) {
+    match ledger {
+        PlanLedger::Account => ("window_sample", "account_ref"),
+        PlanLedger::Credential => ("credential_window_sample", "credential_ref"),
+    }
+}
 
 /// Capture both login namespaces and their effective vault plans from the
 /// caller's read transaction. Usage for the same observation must be read in
@@ -31,22 +37,22 @@ pub fn capture_pool_readings(
     )?;
     let cut_ns = clamp_nanos(i128::from(applied_at_unix) * 1_000_000_000);
     let mut streams = Vec::new();
-    for (ledger, table, field) in [
-        (PlanLedger::Account, "window_sample", "account_ref"),
-        (
-            PlanLedger::Credential,
-            "credential_window_sample",
-            "credential_ref",
-        ),
-    ] {
+    let mut keys = Vec::new();
+    for ledger in [PlanLedger::Account, PlanLedger::Credential] {
+        let namespace_keys = stream_keys(tx, quota_provider, ledger)?;
         capture_namespace(
             tx,
             quota_provider,
             (interval_start_ms, interval_end_ms),
-            cut_ns,
-            (ledger, table, field),
+            ledger,
+            &namespace_keys,
             &mut streams,
         )?;
+        keys.extend(
+            namespace_keys
+                .into_iter()
+                .map(|(id, key)| (PoolLogin { ledger, id }, key)),
+        );
     }
     let mut bounds = (interval_start_ms, interval_end_ms);
     for stream in &streams {
@@ -57,7 +63,24 @@ pub fn capture_pool_readings(
             bounds.1 = bounds.1.max(last.fetched_at_ms());
         }
     }
+    let needs_metadata = streams
+        .iter()
+        .flat_map(|stream| &stream.readings)
+        .any(|reading| {
+            reading.api_provider.is_none()
+                || (reading.fetched_at_instant_ns < cut_ns && reading.model_scope.is_none())
+        });
+    if needs_metadata {
+        // A donor may report after the measured interval. Match its plan at
+        // the donor's own timestamp, not at the end of the observation.
+        bounds.1 = bounds
+            .1
+            .max(i64::MAX.div_euclid(super::super::NANOS_PER_MS));
+    }
     let history = VaultPlanTimeline::capture(tx, bounds)?;
+    if needs_metadata {
+        inherit_metadata(tx, quota_provider, cut_ns, &history, &keys, &mut streams)?;
+    }
     Ok(PoolReadingCapture {
         quota_provider: quota_provider.into(),
         interval_start_ms,
@@ -71,14 +94,11 @@ fn capture_namespace(
     tx: &Connection,
     provider: &str,
     (start_ms, end_ms): (i64, i64),
-    cut_ns: i64,
-    (ledger, table, field): (PlanLedger, &str, &str),
+    ledger: PlanLedger,
+    keys: &[(String, String)],
     streams: &mut Vec<Stream>,
 ) -> rusqlite::Result<()> {
-    let keys: Vec<(String, String)> = tx
-        .prepare_cached(&stream_keys_sql(table, field))?
-        .query_map([provider], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
+    let (table, field) = sample_table(ledger);
     let start_ns = clamp_nanos(millis_to_nanos(start_ms));
     let end_ns = clamp_nanos(millis_to_nanos(end_ms));
     let tail_ns = clamp_nanos(millis_to_nanos(end_ms.saturating_add(clean::MAX_GAP_MS)));
@@ -101,9 +121,7 @@ fn capture_namespace(
     let mut lookback = tx.prepare_cached(&format!(
         "{base} AND fetched_at_instant>=?4 AND fetched_at_instant<?5 ORDER BY fetched_at_instant"
     ))?;
-    let mut needs_inheritance = BTreeSet::new();
-    let mut found = Vec::new();
-    for (id, key) in &keys {
+    for (id, key) in keys {
         let Some(pool_id) = pool_identity(key) else {
             continue;
         };
@@ -137,10 +155,7 @@ fn capture_namespace(
         if readings.len() < 2 {
             continue;
         }
-        if readings[0].fetched_at_instant_ns < cut_ns {
-            needs_inheritance.insert((id.as_str(), pool_id));
-        }
-        found.push(Stream {
+        streams.push(Stream {
             login: PoolLogin {
                 ledger,
                 id: id.clone(),
@@ -148,48 +163,10 @@ fn capture_namespace(
             pool_id: pool_id.into(),
             window_pool_key: key.clone(),
             readings,
+            scope_conflicts: Default::default(),
         });
     }
 
-    let mut first_post_cut = tx.prepare_cached(&format!(
-        "SELECT fetched_at_instant, model_scope FROM {table} WHERE {predicate}
-         AND fetched_at_instant>=?4 ORDER BY fetched_at_instant LIMIT 1"
-    ))?;
-    let mut inherited = BTreeMap::new();
-    for (id, key) in &keys {
-        let Some(pool_id) = pool_identity(key) else {
-            continue;
-        };
-        let identity = (id.as_str(), pool_id);
-        if !needs_inheritance.contains(&identity) {
-            continue;
-        }
-        // No interval-end bound: a later reading can state the scope of a
-        // pre-cut pool on recompute. An unstated earliest reading is not skipped.
-        let first = first_post_cut
-            .query_row(params![provider, id, key, cut_ns], |row| {
-                Ok((row.get::<_, i64>(0)?, read_scope(row, 1)?))
-            })
-            .optional()?;
-        if let Some((at, scope)) = first {
-            let earliest = inherited.entry(identity).or_insert((at, scope));
-            if at < earliest.0 {
-                *earliest = (at, scope);
-            } else if at == earliest.0 && scope != earliest.1 {
-                earliest.1 = None;
-            }
-        }
-    }
-    for stream in &mut found {
-        let identity = (stream.login.id.as_str(), stream.pool_id.as_str());
-        let scope = inherited.get(&identity).and_then(|&(_, scope)| scope);
-        for reading in &mut stream.readings {
-            if reading.fetched_at_instant_ns < cut_ns {
-                reading.model_scope = scope;
-            }
-        }
-    }
-    streams.extend(found);
     Ok(())
 }
 
@@ -208,7 +185,7 @@ fn read_samples(
                 resets_at: row.get(2)?,
                 window_minutes: row.get(3)?,
                 model_scope: read_scope(row, 4)?,
-                api_provider: row.get(6)?,
+                api_provider: row.get::<_, Option<String>>(6)?.filter(|id| !id.is_empty()),
             },
             row.get::<_, Option<String>>(5)?,
         ))
@@ -227,7 +204,10 @@ fn read_samples(
     Ok(readings)
 }
 
-fn read_scope(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<WindowModelScope>> {
+pub(super) fn read_scope(
+    row: &Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<WindowModelScope>> {
     Ok(match row.get_ref(index)?.as_str_or_null()? {
         Some("all") => Some(WindowModelScope::All),
         Some("subset") => Some(WindowModelScope::Subset),
@@ -236,8 +216,13 @@ fn read_scope(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<WindowMode
 }
 
 // Jump over reading history using the primary key's login and pool prefixes.
-fn stream_keys_sql(table: &str, field: &str) -> String {
-    format!(
+fn stream_keys(
+    tx: &Connection,
+    provider: &str,
+    ledger: PlanLedger,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let (table, field) = sample_table(ledger);
+    let sql = format!(
         "WITH RECURSIVE identities(id) AS (
              SELECT (SELECT {field} FROM {table} WHERE provider=?1 ORDER BY {field} LIMIT 1)
              UNION ALL
@@ -251,5 +236,8 @@ fn stream_keys_sql(table: &str, field: &str) -> String {
                           AND pool_key>pools.key ORDER BY pool_key LIMIT 1)
              FROM pools WHERE key IS NOT NULL
          ) SELECT id,key FROM pools WHERE id<>'' AND key IS NOT NULL"
-    )
+    );
+    let mut stmt = tx.prepare_cached(&sql)?;
+    let keys = stmt.query_map([provider], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    keys.collect()
 }

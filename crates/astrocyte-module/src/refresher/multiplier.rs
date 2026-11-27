@@ -11,8 +11,8 @@ use std::collections::BTreeSet;
 pub(super) const DAY_MS: i64 = 86_400_000;
 /// Each observation covers the seven UTC days that end at the day boundary.
 pub(super) const MULTIPLIER_INTERVAL_MS: i64 = 7 * DAY_MS;
-// Preserve a bounded two-hour drain wait after midnight; later diagnostic rows
-// may be recorded but stay ineligible until their source backlog is resolved.
+// A recompute can disclose stale sources after the two-hour drain window.
+// The daily stage never publishes an original from a known incomplete drain.
 const MULTIPLIER_SOURCE_WAIT_MS: i64 = 2 * 3_600_000;
 
 /// Records a complete set of pool observations per quota provider per UTC day,
@@ -337,12 +337,13 @@ impl From<DayError> for DayFailure {
     }
 }
 
-/// Tokens can arrive through any ingest source. Wait for active sources to
-/// drain, but bound the wait so a broken source cannot leave a permanent gap.
+/// Tokens can arrive through any ingest source. An original must wait for
+/// all active sources to drain; recompute can explicitly disclose stale data.
 fn multiplier_stale_sources(
     conn: &rusqlite::Connection,
     interval_end_ms: i64,
     snapshot_at_ms: i64,
+    mode: DayMode,
 ) -> Result<Vec<String>, (String, String)> {
     let internal = |error: rusqlite::Error| ("internal".into(), error.to_string());
     let mut statement = conn
@@ -357,11 +358,14 @@ fn multiplier_stale_sources(
         .query_map([interval_end_ms], |row| row.get::<_, String>(0))
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
         .map_err(internal)?;
-    if !sources.is_empty() && snapshot_at_ms < interval_end_ms + MULTIPLIER_SOURCE_WAIT_MS {
+    if !sources.is_empty()
+        && (mode == DayMode::Original
+            || snapshot_at_ms < interval_end_ms + MULTIPLIER_SOURCE_WAIT_MS)
+    {
         return Err((
             "source_reads_pending".into(),
             format!(
-                "waiting for a successful read after midnight: {}",
+                "waiting for sources to drain through the interval end: {}",
                 sources.join(", ")
             ),
         ));
@@ -504,13 +508,14 @@ fn record_multiplier_day(
     catalog_pending: bool,
     stop: &AtomicBool,
 ) -> Result<DailyOutcome, DayFailure> {
-    let observations = match compute_multiplier_day(state, plan_prices, day, snapshot_at_ms, true) {
-        Ok(observations) => observations,
-        Err(error) if catalog_pending && error.code == "catalog_unavailable" => {
-            return Ok(DailyOutcome::CatalogPending);
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let observations =
+        match compute_multiplier_day(state, plan_prices, day, snapshot_at_ms, DayMode::Original) {
+            Ok(observations) => observations,
+            Err(error) if catalog_pending && error.code == "catalog_unavailable" => {
+                return Ok(DailyOutcome::CatalogPending);
+            }
+            Err(error) => return Err(error.into()),
+        };
     // A plan-price or catalog read may finish after shutdown starts. Leave the
     // complete day for the next refresher instead of committing part of it.
     if stop.load(Ordering::Relaxed) {
@@ -539,6 +544,12 @@ fn record_multiplier_day(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DayMode {
+    Original,
+    Recompute,
+}
+
 /// Capture the whole provider day before reading any served facts. Every pool
 /// uses the same readings, vault plans and traffic, including the measurements.
 fn compute_multiplier_day(
@@ -546,7 +557,7 @@ fn compute_multiplier_day(
     plan_prices: Option<&dyn PlanPriceSource>,
     day: ProviderDay<'_>,
     snapshot_at_ms: i64,
-    cached: bool,
+    mode: DayMode,
 ) -> Result<Vec<multiplier::Observation>, DayError> {
     let (capture, stale_sources) = state
         .with_read_op(|conn| {
@@ -573,7 +584,7 @@ fn compute_multiplier_day(
                 )
             });
             let stale_sources = if might_measure {
-                multiplier_stale_sources(conn, day.interval_end_ms, snapshot_at_ms)?
+                multiplier_stale_sources(conn, day.interval_end_ms, snapshot_at_ms, mode)?
             } else {
                 Vec::new()
             };
@@ -620,7 +631,7 @@ fn compute_multiplier_day(
                 .map_err(multiplier_refusal)
                 .map_err(DayError::from)
         };
-        if cached {
+        if mode == DayMode::Original {
             let rates = state
                 .with_read_op(|conn| {
                     astrocyte_core::rate_era::resolved_rates(conn, &models, snapshot_at_ms)
@@ -702,7 +713,7 @@ pub(crate) fn recompute_multiplier_day(
             interval_start_ms,
             interval_end_ms,
         };
-        let rows = compute_multiplier_day(state, plan_prices, day, now_ms, false)
+        let rows = compute_multiplier_day(state, plan_prices, day, now_ms, DayMode::Recompute)
             .map_err(|error| (error.code, error.message))?;
         calculations.push((day, rows));
     }
@@ -1423,7 +1434,7 @@ mod multiplier_stage_tests {
     }
 
     #[test]
-    fn at_two_hours_the_day_records_and_names_all_stale_sources() {
+    fn backfill_waits_for_the_first_source_drain_even_after_two_hours() {
         let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(state::leased_test_state(&directory));
         publish_desired(&state, &directory);
@@ -1431,27 +1442,35 @@ mod multiplier_stage_tests {
         install_catalog(&state, &fusiform);
         seed_usage(&state);
         source_success(&state, "opencode", None);
-        source_success(&state, "opencode-v2", Some(DAY_START - 1));
-        source_success(&state, "codex", Some(DAY_START + 1));
-        let mut stage = MultiplierStage::new(Some(fusiform.clone()));
-        stage.tick(&state, false, DAY_START + 7_200_000 - 1);
-        assert!(!observation_days(&state).contains(&DAY.to_string()));
-        stage.tick(&state, false, DAY_START + 7_200_000);
-        let text: String = state
-            .with_read_op(|conn| {
-                conn.query_row(
-                    "SELECT error_deflating FROM multiplier_observation WHERE observation_day=?1",
-                    [DAY],
-                    |row| row.get(0),
+        let mut stage = MultiplierStage::new(Some(fusiform));
+        let backfill_at = DAY_START + 7_200_000;
+        stage.tick(&state, false, backfill_at);
+        assert!(current_day_observations(&state).is_empty());
+        assert!(!recorded_provider_days(&state)
+            .iter()
+            .any(|(_, day, _)| day == DAY));
+
+        state
+            .ordered_write(|tx| {
+                tx.execute(
+                    "UPDATE source_runtime SET last_success_ms=?1, lineage='lineage',
+                     consumed_ordinal=0, high_water_ordinal=1, pending_known=1, pending_unknown=0
+                 WHERE source_key='opencode'",
+                    [backfill_at],
                 )
-                .map_err(|error| ("internal".into(), error.to_string()))
+                .map_err(|error| error.to_string())?;
+                Ok(((), true))
             })
             .unwrap();
-        assert!(
-            text.contains("stale_sources: opencode, opencode-v2"),
-            "{text}"
+        stage.tick(&state, false, backfill_at + 1);
+        assert!(current_day_observations(&state).is_empty());
+
+        source_success(&state, "opencode", Some(backfill_at + 2));
+        stage.tick(&state, false, backfill_at + 2);
+        assert_eq!(
+            current_day_observations(&state),
+            [("codex".into(), DAY.into(), 10_000_000)]
         );
-        assert!(!text.contains("codex"), "{text}");
         let report = crate::ops::dispatch(
             &state,
             crate::ops::OP_MULTIPLIER_REPORT,
@@ -1459,13 +1478,8 @@ mod multiplier_stage_tests {
         )
         .unwrap();
         let row = &report["series"][0];
-        assert_eq!(row["routing_eligible"], false);
-        assert_eq!(row["source_backlog"], json!(["opencode", "opencode-v2"]));
-        assert!(row["eligibility_reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|reason| reason == "source_backlog"));
+        assert_eq!(row["source_backlog"], json!([]));
+        assert!(row["subscription_nanos"].as_i64().unwrap() > 0);
     }
 
     #[test]
