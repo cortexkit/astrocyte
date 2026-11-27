@@ -158,11 +158,12 @@ page rows themselves. Only local apps and the person's phones and desktops via C
 ## Serving and write ordering
 
 The `subc-client-rs` serve helper owns the daemon connection and runs requests
-concurrently. `SharedState` holds a fenced writer and one read-only connection.
-`ordered_write` (refresher) and `ordered_op_write` (served writes) run one
-transaction under the fence, then refresh the in-memory projection; network and
-file I/O come first. Served reads use `with_read_op`, so a report never blocks
-ingest.
+concurrently. `SharedState` holds one writer and two pooled read-only
+connections. `ordered_write` (refresher) and `ordered_op_write` (served writes)
+serialize each write transaction and its in-memory projection refresh under
+one lock. Network and file I/O come first. `with_read_op` gives each served
+read its own snapshot. One long report leaves a connection available for a
+short read and does not block ingest.
 
 Direct ledger writes have a daemon confirmation gate, off until release; enabling
 it refuses writes wherever the deployed daemon cannot confirm the person.
