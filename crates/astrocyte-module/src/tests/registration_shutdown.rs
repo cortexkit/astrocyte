@@ -16,6 +16,8 @@ const LOG_PATH_PREFIX: &str = "ASTROCYTE_LOG_PATH=";
 enum End {
     Goodbye,
     Eof,
+    // Constructed only by the Linux-only reset test.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Reset,
     Sigterm,
 }
@@ -252,6 +254,10 @@ fn control_frame(ty: FrameType) -> Frame {
     .unwrap()
 }
 
+// Only Linux turns a Unix socket closed with unread data into ECONNRESET for
+// the peer. macOS delivers a plain EOF in that case, which the EOF test below
+// already covers with the same nonzero exit.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn registration_reset_exits_nonzero_after_joining_refresher() {
     registration_end(
