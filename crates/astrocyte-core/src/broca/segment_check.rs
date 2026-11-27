@@ -201,7 +201,7 @@ mod tests {
         tx.commit().unwrap();
 
         let vm = VmCounter::start(&conn);
-        let tx = conn.transaction().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
         assert_eq!(
             check_segments_in_tx(&tx, GRACE_MS + 2).unwrap(),
             usize::try_from(CHECK_BATCH).unwrap()

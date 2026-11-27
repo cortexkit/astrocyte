@@ -406,11 +406,11 @@ fn event(
     conn.execute("INSERT INTO usage_event(event_id,producer,producer_ref,runner,harness,session,run_ref,flow_ref,occurred_at_ms,charge_basis,recorded_at_ms) VALUES(?1,'thalamus-harness',?1,?2,'opencode',?3,?4,?5,100,'metered_api',100)",params![id,runner,session,run,flow]).unwrap();
 }
 
-fn summaries(conn: &mut Connection) {
+fn summaries(conn: &Connection) {
     let mut builder = crate::report::SummaryMaintenance::default();
     for _ in 0..100 {
         if builder.read_chunk(conn, 10_000).unwrap() {
-            let tx = conn.transaction().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
             builder.publish(&tx, 10_000).unwrap();
             tx.commit().unwrap();
         } else if !builder.has_pending() {
@@ -491,7 +491,7 @@ fn hour_steps(history: usize) -> u64 {
         event(&conn, id, "thalamus", session, run, flow);
     }
     let counter = crate::store::VmCounter::start(&conn);
-    summaries(&mut conn);
+    summaries(&conn);
     let steps = counter.steps();
     let mut owners: Vec<(String, Option<String>, Option<String>)> = conn
         .prepare("SELECT v.value FROM attribution_cell c JOIN summary_value v ON v.value_id=c.attribution")

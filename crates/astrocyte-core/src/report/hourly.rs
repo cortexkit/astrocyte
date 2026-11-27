@@ -2189,13 +2189,21 @@ mod tests {
         tx.commit().unwrap();
     }
     fn step(conn: &mut Connection, maintenance: &mut SummaryMaintenance) -> SummaryOutcome {
+        step_with_shared_connection(conn, maintenance)
+    }
+    fn step_with_shared_connection(
+        conn: &Connection,
+        maintenance: &mut SummaryMaintenance,
+    ) -> SummaryOutcome {
+        // VmCounter borrows the connection while counting SQLite instructions.
+        // End the read transaction before opening the publish transaction.
         let tx = conn.unchecked_transaction().unwrap();
         let ready = maintenance.read_chunk(&tx, 10_000).unwrap();
         tx.commit().unwrap();
         if !ready {
             return SummaryOutcome::default();
         }
-        let tx = conn.transaction().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
         let result = maintenance.publish(&tx, 10_000).unwrap();
         tx.commit().unwrap();
         result
@@ -2207,6 +2215,9 @@ mod tests {
         .unwrap()
     }
     fn catch_up(conn: &mut Connection) {
+        catch_up_with_shared_connection(conn);
+    }
+    fn catch_up_with_shared_connection(conn: &Connection) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut maintenance = SummaryMaintenance::default();
         while dirty(conn) > 0 {
@@ -2214,7 +2225,7 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "summary fill failed to progress"
             );
-            step(conn, &mut maintenance);
+            step_with_shared_connection(conn, &mut maintenance);
         }
     }
     fn request(timezone: &str, grain: &str, grouping: &[&str]) -> ReportRequest {
@@ -3656,7 +3667,7 @@ mod tests {
             }
             let mut maintenance = SummaryMaintenance::default();
             let counter = crate::store::VmCounter::start(&conn);
-            let outcome = step(&mut conn, &mut maintenance);
+            let outcome = step_with_shared_connection(&conn, &mut maintenance);
             let steps = counter.steps();
             assert!(
                 steps < 200,
@@ -3688,7 +3699,7 @@ mod tests {
             assert_eq!(outcome.hour, Some(stale));
             assert!(!outcome.mismatch);
             let counter = crate::store::VmCounter::start(&conn);
-            assert!(!step(&mut conn, &mut maintenance).published);
+            assert!(!step_with_shared_connection(&conn, &mut maintenance).published);
             let steps = counter.steps();
             assert!(
                 steps < 200,
@@ -3909,7 +3920,7 @@ mod tests {
             priced(&mut conn, &id, "USD", 100);
             unused_dictionary_values(&conn, unused);
             let counter = crate::store::VmCounter::start(&conn);
-            catch_up(&mut conn);
+            catch_up_with_shared_connection(&conn);
             publish.push(counter.steps());
             let hour = Hour { kind: 0, number: 0 };
             let counter = crate::store::VmCounter::start(&conn);

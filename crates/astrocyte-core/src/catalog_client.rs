@@ -5,7 +5,7 @@
 //! pricing sees them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -193,7 +193,7 @@ pub enum CatalogLookup {
 #[derive(Clone)]
 pub struct CatalogClient {
     connection: Arc<dyn CatalogConnection>,
-    history_start_ms: i64,
+    history_start_ms: Arc<AtomicI64>,
     deadline: Option<Instant>,
 }
 
@@ -230,13 +230,13 @@ impl CatalogClient {
     pub(crate) fn new(connection: Arc<dyn CatalogConnection>, history_start_ms: i64) -> Self {
         Self {
             connection,
-            history_start_ms,
+            history_start_ms: Arc::new(AtomicI64::new(history_start_ms)),
             deadline: None,
         }
     }
 
     pub fn history_start_ms(&self) -> i64 {
-        self.history_start_ms
+        self.history_start_ms.load(Ordering::Relaxed)
     }
 
     /// All calls through this clone share one deadline, including retries.
@@ -271,6 +271,11 @@ impl CatalogClient {
         self.connection
             .catalog_status_with_timeout(StatusRequest::default(), self.remaining()?)
             .map(|status| {
+                // A catalog may backfill history while this client stays connected.
+                // Share the refreshed cutoff with pricing and deadline-scoped clones.
+                if let Some(boundary) = status.history_begins_at_ms {
+                    self.history_start_ms.store(boundary, Ordering::Relaxed);
+                }
                 i64::try_from(status.rates_version)
                     .ok()
                     .filter(|version| *version > 0)
@@ -403,10 +408,9 @@ impl CatalogClient {
         model_id: &str,
         at_ms: i64,
     ) -> Result<CatalogLookup, CatalogClientError> {
-        if at_ms < self.history_start_ms {
-            return Ok(CatalogLookup::PreHistory {
-                history_start_ms: self.history_start_ms,
-            });
+        let history_start_ms = self.history_start_ms();
+        if at_ms < history_start_ms {
+            return Ok(CatalogLookup::PreHistory { history_start_ms });
         }
         self.get_at(provider_id, model_id, Some(at_ms), None)
     }

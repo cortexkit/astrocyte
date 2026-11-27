@@ -12,7 +12,9 @@ fn schema_v69_adds_append_only_media_caller_without_rewriting_calls() {
         Ok(all_rows(conn))
     }).unwrap();
 
-    let outcome = migrate_store(&store).unwrap();
+    let outcome = store
+        .migrate("astrocyte", &MIGRATIONS[..=previous.len()])
+        .unwrap();
     assert_eq!((outcome.applied, outcome.recorded), (1, 69));
     store
         .with_conn(|conn| {

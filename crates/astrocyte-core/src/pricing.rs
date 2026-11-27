@@ -28,6 +28,7 @@ use crate::money::{round_nano_num, MoneyError, NUMERATOR_SCALE};
 /// exponent is distinct from NUMERATOR_SCALE, the millionths-of-a-nanodollar
 /// scale `money` uses to round stored amounts.
 const RATE_UNIT_EXPONENT: i32 = 6;
+const TOKEN_RATE_PER: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1328,7 +1329,20 @@ fn resolve_measurement(
             catalog_entry: Some(json!({"fact_key": fact_key, "withheld": withheld})),
         });
     }
-    let Some(entry) = snapshot.facts.get(fact_key) else {
+    let value = snapshot.facts.get(fact_key);
+    if let Some(uncertain) = snapshot.uncertain_facts.get(fact_key) {
+        let mut entry = json!({"fact_key": fact_key, "uncertain": uncertain});
+        if let Some(value) = value {
+            entry["value"] = value.clone();
+        }
+        return Ok(ChargeDecision::Unpriced {
+            reason: UnpricedReason::RateUncertain,
+            catalog_source: Some(snapshot.source.clone()),
+            resolved_at_ms: Some(snapshot.resolved_at_ms),
+            catalog_entry: Some(entry),
+        });
+    }
+    let Some(entry) = value else {
         return Ok(ChargeDecision::Unpriced {
             reason: UnpricedReason::NoRate,
             catalog_source: Some(snapshot.source.clone()),
@@ -1336,18 +1350,6 @@ fn resolve_measurement(
             catalog_entry: Some(json!({"fact_key": fact_key, "state": "absent"})),
         });
     };
-    if let Some(uncertain) = snapshot.uncertain_facts.get(fact_key) {
-        return Ok(ChargeDecision::Unpriced {
-            reason: UnpricedReason::RateUncertain,
-            catalog_source: Some(snapshot.source.clone()),
-            resolved_at_ms: Some(snapshot.resolved_at_ms),
-            catalog_entry: Some(json!({
-                "fact_key": fact_key,
-                "value": entry,
-                "uncertain": uncertain,
-            })),
-        });
-    }
     let mut provenance = json!({
         "fact_key": fact_key,
         "value": entry,
@@ -1434,13 +1436,17 @@ fn resolve_measurement(
                     catalog_entry: Some(provenance),
                 });
             };
-            let price = if let Some(per) = per {
-                provenance["per"] = json!(per);
+            let has_quantity_rule = matches!(increment, Increment::Quantum { .. })
+                || matches!(minimum_quantity, MinimumQuantity::Minimum { .. });
+            let price = if per.is_some() || has_quantity_rule {
+                if let Some(per) = per {
+                    provenance["per"] = json!(per);
+                }
                 provenance["increment"] = json!(increment);
                 provenance["minimum_quantity"] = json!(minimum_quantity);
                 provenance["raw_quantity"] =
                     json!({"units":quantity_units,"exponent":quantity_exponent});
-                adjusted_unit_quantity(
+                adjust_quantity(
                     quantity_units,
                     quantity_exponent,
                     &increment,
@@ -1448,7 +1454,7 @@ fn resolve_measurement(
                 )
                 .and_then(|(units, exponent)| {
                     provenance["priced_quantity"] = json!({"units":units,"exponent":exponent});
-                    price_unit_exact(&amount, units, exponent, per)
+                    price_unit_exact(&amount, units, exponent, per.unwrap_or(TOKEN_RATE_PER))
                 })
             } else {
                 price_exact(&amount, quantity_units, quantity_exponent)
@@ -1632,7 +1638,11 @@ fn measurement_rate_key(
         .flatten();
     let token = measurement.unit == "token" || ttl.is_some();
     let base = if token {
-        if !measurement.price_selectors.is_empty() {
+        // The prompt size and cache-write unit, not the producer's media
+        // labels, determine the context and lifetime conditions.
+        if measurement.price_selectors.contains_key("above_context")
+            || measurement.price_selectors.contains_key("ttl")
+        {
             return None;
         }
         rate_fact_key(role, "token")?.to_string()
@@ -1659,11 +1669,12 @@ fn measurement_rate_key(
         return Some(base);
     }
     // Selector ordering is not a pricing dimension. Match the complete set,
-    // including withheld facts, and never fall back to a less specific price.
+    // including catalog refusals, and never fall back to a less specific price.
     let keys: std::collections::BTreeSet<_> = snapshot
         .facts
         .keys()
         .chain(snapshot.withheld_facts.keys())
+        .chain(snapshot.uncertain_facts.keys())
         .collect();
     let mut matches = keys.into_iter().filter(|key| {
         parse_rate_key(key).is_ok_and(|parsed| {
@@ -1691,10 +1702,7 @@ fn measurement_rate_key(
 }
 
 /// Keeps decimal quantities exact until money reaches its single rounding site.
-fn quantity_ratio(units: i64, exponent: i32) -> Result<(i128, i128), MoneyError> {
-    if units < 0 {
-        return Err(MoneyError::OutOfRange);
-    }
+fn quantity_ratio(units: u64, exponent: i32) -> Result<(i128, i128), MoneyError> {
     let scale = 10_i128
         .checked_pow(exponent.unsigned_abs())
         .ok_or(MoneyError::OutOfRange)?;
@@ -1710,12 +1718,13 @@ fn quantity_ratio(units: i64, exponent: i32) -> Result<(i128, i128), MoneyError>
     }
 }
 
-fn adjusted_unit_quantity(
+fn adjust_quantity(
     units: i64,
     exponent: i32,
     increment: &Increment,
     minimum: &MinimumQuantity,
-) -> Result<(i64, i32), MoneyError> {
+) -> Result<(u64, i32), MoneyError> {
+    let units = u64::try_from(units).map_err(|_| MoneyError::OutOfRange)?;
     let (mut numerator, mut denominator) = quantity_ratio(units, exponent)?;
     let mut priced = (units, exponent);
     // A stated minimum is a floor on charged usage, so apply it after quantum
@@ -1732,7 +1741,7 @@ fn adjusted_unit_quantity(
         numerator = quanta.checked_mul(quantum).ok_or(MoneyError::OutOfRange)?;
         denominator = 1;
         priced = (
-            i64::try_from(numerator).map_err(|_| MoneyError::OutOfRange)?,
+            u64::try_from(numerator).map_err(|_| MoneyError::OutOfRange)?,
             0,
         );
     }
@@ -1741,10 +1750,7 @@ fn adjusted_unit_quantity(
             .checked_mul(denominator)
             .ok_or(MoneyError::OutOfRange)?;
         if numerator < floor {
-            priced = (
-                i64::try_from(*quantity).map_err(|_| MoneyError::OutOfRange)?,
-                0,
-            );
+            priced = (*quantity, 0);
         }
     }
     Ok(priced)
@@ -1752,7 +1758,7 @@ fn adjusted_unit_quantity(
 
 fn price_unit_exact(
     amount: &Amount,
-    units: i64,
+    units: u64,
     exponent: i32,
     per: u64,
 ) -> Result<i64, MoneyError> {
@@ -1935,6 +1941,7 @@ fn stored_integrity_error(column: usize, kind: Type, detail: String) -> rusqlite
 #[cfg(test)]
 mod tests {
     include!("pricing_unit_billing_tests.rs");
+    include!("pricing/catalog_regression_tests.rs");
     include!("media_pricing_tests.rs");
     include!("pricing_reasoning_billed_as_tests.rs");
     include!("pricing_cache_write_billed_as_tests.rs");
@@ -2349,7 +2356,7 @@ mod tests {
     }
 
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use fusiform_protocol::{
@@ -2496,6 +2503,7 @@ mod tests {
     struct FakeCatalog {
         response: Mutex<CatalogGetResponse>,
         calls: AtomicUsize,
+        history_begins_at_ms: AtomicI64,
         requests: Mutex<Vec<CatalogGetRequest>>,
     }
 
@@ -2524,6 +2532,7 @@ mod tests {
                     speed_twins: vec![],
                 }),
                 calls: AtomicUsize::new(0),
+                history_begins_at_ms: AtomicI64::new(500),
                 requests: Mutex::new(Vec::new()),
             })
         }
@@ -2545,7 +2554,8 @@ mod tests {
         ) -> Result<fusiform_protocol::StatusResponse, CatalogCallError> {
             Ok(
                 serde_json::from_value(json!({"source": "fake", "catalog_version": 0,
-                "model_count": 0, "era_count": 0, "recent_polls": []}))
+                "model_count": 0, "era_count": 0, "recent_polls": [],
+                "history_begins_at_ms": self.history_begins_at_ms.load(Ordering::SeqCst)}))
                 .unwrap(),
             )
         }

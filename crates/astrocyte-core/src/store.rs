@@ -516,6 +516,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 69,
         statements: migrations::v60_v79::V69,
     },
+    Migration {
+        version: 70,
+        statements: migrations::v60_v79::V70,
+    },
 ];
 
 #[cfg(test)]
@@ -531,8 +535,8 @@ pub(crate) fn migration_parts(version: u32) -> (&'static [Migration], &'static M
 /// history sizes: unlike elapsed time it is deterministic, so work that grows
 /// with unrelated history shows up as a difference.
 #[cfg(test)]
-pub(crate) struct VmCounter {
-    handle: *mut rusqlite::ffi::sqlite3,
+pub(crate) struct VmCounter<'conn> {
+    conn: &'conn Connection,
     steps: Box<u64>,
 }
 #[cfg(test)]
@@ -543,18 +547,15 @@ unsafe extern "C" fn count_vm_step(pointer: *mut std::ffi::c_void) -> std::ffi::
     0
 }
 #[cfg(test)]
-impl VmCounter {
-    /// The counter holds the raw handle rather than a borrow, so the caller
-    /// can keep using the connection mutably (for example to open a
-    /// transaction) while it counts. Drop or `steps` removes the handler.
-    pub(crate) fn start(conn: &Connection) -> Self {
+impl<'conn> VmCounter<'conn> {
+    pub(crate) fn start(conn: &'conn Connection) -> Self {
         let mut counter = Self {
-            handle: unsafe { conn.handle() },
+            conn,
             steps: Box::new(0),
         };
         unsafe {
             rusqlite::ffi::sqlite3_progress_handler(
-                counter.handle,
+                counter.conn.handle(),
                 1,
                 Some(count_vm_step),
                 std::ptr::from_mut(counter.steps.as_mut()).cast(),
@@ -567,10 +568,15 @@ impl VmCounter {
     }
 }
 #[cfg(test)]
-impl Drop for VmCounter {
+impl Drop for VmCounter<'_> {
     fn drop(&mut self) {
         unsafe {
-            rusqlite::ffi::sqlite3_progress_handler(self.handle, 0, None, std::ptr::null_mut());
+            rusqlite::ffi::sqlite3_progress_handler(
+                self.conn.handle(),
+                0,
+                None,
+                std::ptr::null_mut(),
+            );
         }
     }
 }
@@ -586,6 +592,24 @@ mod tests {
     include!("store_v64_tests.rs");
     include!("store/v68_tests.rs");
     include!("store/v69_tests.rs");
+    include!("store/v70_tests.rs");
+
+    #[test]
+    fn vm_counter_measures_transaction_before_connection_closes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE example (value INTEGER)")
+            .unwrap();
+        let counter = VmCounter::start(&conn);
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute("INSERT INTO example VALUES (7)", []).unwrap();
+        tx.commit().unwrap();
+        let value: i64 = conn
+            .query_row("SELECT value FROM example", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, 7);
+        assert!(counter.steps() > 0);
+        conn.close().unwrap();
+    }
 
     #[test]
     fn lookup_index_migration_adds_two_indexes_and_changes_no_rows() {

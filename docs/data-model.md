@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 69. A schema change appends a migration; an applied
+currently version 70. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -586,8 +586,9 @@ Each `cache_write` measurement with unit `token_cache_<lifetime>` selects its ow
 `ttl.<lifetime>` row, combined with any applicable mode or context tier. Selection
 matches the complete condition set regardless of pair order. A missing lifetime
 row is `no_rate`, never a fallback to another lifetime or plain `rate.cache_write`.
-A plain `token` write still uses the plain rate (or its stated mode). Unknown
-token selectors parse but never apply.
+A plain `token` write still uses the plain rate (or its stated mode). Other
+token-rate selectors must match the selectors recorded by the media producer;
+an unmatched selector never falls back to the base rate.
 Without a stored mode, multiplier rows count `mode_unrecorded_tokens` and
 `base_rate_tier_untested_tokens`. A served `rate.reasoning` billed as `rate.output`
 uses the selected output rate, including mode and context tiers where supported,
@@ -605,19 +606,24 @@ pairs. The closed unit list is `second`, `character`, `image`, `request`, and `r
 Request billing uses only `rate.request.per_request`. Selector names cannot repeat.
 A unit measurement matches both role and unit, and every stated selector must
 match the served selector set regardless of pair order. An unserved selector
-leaves the measurement unpriced; it never selects the base rate. Record-level
-media selectors are not yet part of any served input or stored column.
+leaves the measurement unpriced; it never selects the base rate. Producer-stated
+media selectors are stored in `usage_event.media_facts.selectors` and copied
+into each measurement's pricing plan. Pricing treats `speed_mode` as a mode
+selector: `fast` selects `mode.fast`, while `standard` and `default` select the
+base mode.
 
-Every priced unit rate needs a positive `per` denominator. Its `increment` and
-`minimum_quantity` states distinguish `unknown`, established `none`, and a
-`quantum` or `minimum` quantity. A quantum rounds usage up to its next multiple;
-a minimum then raises the resulting quantity if needed. Unknown and none leave
-that quantity unchanged. Quantity rules use exact decimal arithmetic, including
-fractional seconds, before the amount is calculated as quantity times rate divided
-by `per` through the single money rounding site.
+Every priced unit rate needs a positive `per` denominator. The `increment` and
+`minimum_quantity` states on unit and token rates distinguish `unknown`,
+established `none`, and a `quantum` or `minimum` quantity. A quantum rounds usage
+up to its next multiple; a minimum then raises the resulting quantity if needed.
+Unknown and none leave that quantity unchanged. Quantity rules use exact decimal
+arithmetic, including fractional seconds, before the amount is calculated as
+quantity times rate divided by the denominator through the single money rounding
+site.
 
 The charge's `catalog_entry` retains `fact_key` and the original rate `value`.
-For unit charges it also records `per`, `increment`, `minimum_quantity`,
+For unit charges it also records `per`. For unit charges and token charges with
+a stated quantum or minimum it records `increment`, `minimum_quantity`,
 `raw_quantity`, and `priced_quantity`. Both quantities have `units` and `exponent`
 members, representing units times ten to the exponent. This preserves the gap
 between measured and billed usage, including uncertainty about rounding rules.

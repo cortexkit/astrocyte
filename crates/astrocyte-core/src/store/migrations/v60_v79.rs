@@ -539,3 +539,42 @@ CREATE TRIGGER media_caller_dirty_hour AFTER INSERT ON media_caller BEGIN
     );
 END;
 "#;
+
+pub(in crate::store) const V70: &str = r#"
+-- The token-only insert trigger did not remove projections of older non-token reads.
+DELETE FROM cache_read_step AS r
+WHERE NOT EXISTS (
+    SELECT 1 FROM measurement m
+    WHERE m.event_key = r.event_key AND m.role = 'cache_read'
+      AND m.unit IN (SELECT unit FROM cache_token_unit) AND m.quantity_exponent = 0
+);
+DELETE FROM cache_read_session AS c
+WHERE NOT EXISTS (SELECT 1 FROM cache_read_step r WHERE r.session_id = c.session_id);
+
+-- A step can remain in the projection because it reported zero tokens, even
+-- though a non-token measurement was the reason it counted as positive.
+UPDATE cache_read_session AS c
+SET first_positive_cursor = (
+    SELECT MIN(r.cursor) FROM cache_read_step r
+    WHERE r.session_id = c.session_id AND EXISTS (
+        SELECT 1 FROM measurement m
+        WHERE m.event_key = r.event_key AND m.role = 'cache_read'
+          AND m.unit IN (SELECT unit FROM cache_token_unit) AND m.quantity_exponent = 0
+          AND m.quantity_units > 0
+    )
+)
+WHERE c.first_positive_cursor IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM cache_step_sequence s
+    CROSS JOIN measurement m ON m.event_key = s.event_key
+    WHERE s.cursor = c.first_positive_cursor AND m.role = 'cache_read'
+      AND m.unit IN (SELECT unit FROM cache_token_unit) AND m.quantity_exponent = 0
+      AND m.quantity_units > 0
+);
+
+-- A SQLite CHECK accepts NULL as well as true. Guard the required fields
+-- on insert without rebuilding or rewriting the immutable charge history.
+CREATE TRIGGER priced_charge_required_outcome_fields BEFORE INSERT ON priced_charge
+WHEN (NEW.outcome = 'priced' AND NEW.rate_exponent IS NULL)
+  OR (NEW.outcome = 'covered' AND NEW.charge_nanos IS NULL)
+BEGIN SELECT RAISE(ABORT, 'priced_charge_required_outcome_fields'); END;
+"#;
