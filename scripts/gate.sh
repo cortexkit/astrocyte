@@ -83,13 +83,15 @@ windows_dump="$PWD/gate-windows-crash.dmp"
 rm -f "$windows_dump"
 
 step "Linux and Windows suites (remote, in parallel)"
-ck motor run --vcpus 8 --net --env "NATS_SERVER_VERSION=$nats_version" \
-  --env "NATS_SERVER_SHA256=$nats_linux_sha" --env NATS_TARGET=linux-amd64 -- "set -euo pipefail
+# `ck motor run` forwards no environment, so each lane sets the pins inside
+# its own command.
+ck motor run --vcpus 8 --net -- "set -euo pipefail
+export NATS_SERVER_VERSION=$nats_version NATS_SERVER_SHA256=$nats_linux_sha NATS_TARGET=linux-amd64
 $linux_cmd" >"$logs/linux.log" 2>&1 &
 linux_pid=$!
-ck motor run --platform windows --net --env "NATS_SERVER_VERSION=$nats_version" \
-  --env "NATS_SERVER_SHA256=$nats_windows_sha" --env NATS_TARGET=windows-amd64 \
+ck motor run --platform windows --net \
   --return-path "$windows_dump" --return-max-bytes 134217728 -- "set -euo pipefail
+export NATS_SERVER_VERSION=$nats_version NATS_SERVER_SHA256=$nats_windows_sha NATS_TARGET=windows-amd64
 $windows_cmd" >"$logs/windows.log" 2>&1 &
 windows_pid=$!
 
