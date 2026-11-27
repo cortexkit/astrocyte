@@ -632,3 +632,7 @@ CREATE TABLE step_detail_late (
 
 ALTER TABLE step_feed_state ADD COLUMN late_detail_high_water INTEGER NOT NULL DEFAULT 0;
 "#;
+
+pub(in crate::store) const V73: &str = r#"
+ALTER TABLE media_feed_cursor ADD COLUMN feed_id TEXT;
+"#;

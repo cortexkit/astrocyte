@@ -2137,7 +2137,7 @@ mod tests {
             .expect("hourly summaries are used");
         assert!(hourly.skipped_local_by_source.is_empty());
         conn.execute(
-            "INSERT INTO media_feed_cursor VALUES('colliculus','18446744073709551615',3)",
+            "INSERT INTO media_feed_cursor(source_key,through_seq,skipped_local) VALUES('colliculus','18446744073709551615',3)",
             [],
         )
         .unwrap();

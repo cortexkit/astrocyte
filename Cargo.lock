@@ -397,9 +397,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-media"
-version = "0.1.12"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "230302be370878a132d5484ce874febe6dacc0ab6d1f1237dcf4b94a1e883535"
+checksum = "4fdb4497ad0c8519edfbef405540ac00416bba944266aa9893f5fe4e35213869"
 dependencies = [
  "base64",
  "serde",

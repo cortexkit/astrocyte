@@ -546,9 +546,9 @@ The `colliculus` source is enabled by default and can be excluded through
 `harness_ingest.exclude`. A bus wake or scheduled backstop opens a management route
 and pages `usage.read` with a limit of 1,000. Each page commits events, evidence
 set aside because it could not be accepted as valid usage, and the durable cursor
-in one ingest transaction before `usage.ack` is
-called. A failed acknowledgement leaves committed facts intact; subsequent drains
-retry acknowledgement and accept identical redelivery without recording spend twice.
+and last seen feed id in one ingest transaction before `usage.ack` is called.
+A failed acknowledgement leaves committed facts intact. The reader retries it only
+after reading again and confirming that the sequence belongs to the current feed.
 The media feed and event-bus readers share a staged launch identity released only after
 the daemon accepts HELLO. The media route uses the SDK's separate consumer
 connection and implicit identity from the process's cached launch nonce, so the
@@ -573,8 +573,16 @@ durable, full-tick polling and absence backoff remain unchanged. A wake bypasses
 absence backoff. The backstop also finds records too large for Colliculus's bus
 publication limit. Bus bodies are ignored: only `usage.read` supplies evidence.
 
-The reader decodes the published `cortexkit-role-media` 0.1.12 types. Each vendor
-record uses its `record_id` as the colliculus producer reference, without an instance
+The reader decodes the published `cortexkit-role-media` 0.1.13 types. The first
+`usage.read` reply carrying `feed` adopts its `id` without resetting progress from
+the older protocol. After that, a different `id` or a `head_seq` below the saved
+cursor means the sequence numbers have reset, even if the reply is empty. The
+reader discards that page, saves the id with cursor zero, and reads again from
+zero. It does not acknowledge a sequence observed only under another id or in an
+untagged reply. A reply without `feed` uses the legacy sequence rules and leaves
+the last seen id intact.
+
+Each vendor record uses its `record_id` as the colliculus producer reference, without an instance
 or epoch qualifier. Its one job, stream or call id is the run reference and its
 principal is the work class. API-key vendor work is metered, OAuth vendor work is subscription-included,
 and an absent authentication method leaves the charge basis unknown. Local work
@@ -586,11 +594,13 @@ source: the vendor's reply, the provider's measurement, or `request_derived`, a
 count the provider computed from the request as sent, under the vendor's documented
 billing rule. Observed measurements are retained but never priced. Entries
 that fail the contract's entry or record checks, records whose quantities cannot
-fit the store, and raw undecodable or oversize entries are set aside with their
-feed location and reason. Valid records on the same page are still recorded; the
-evidence and cursor commit together before the page is acknowledged. A structured
-entry that fails to decode is set aside under its feed sequence number without
-blocking its siblings.
+fit the store, and raw undecodable or oversize entries are set aside with a
+locator and reason. On identified feeds the locator uses a digest of the
+`record_id`, or of the entry payload without its sequence if no id can be read.
+Re-reading a renumbered record then does not add a second evidence row. Legacy
+pages still use sequence locators, which cannot be matched reliably to
+renumbered records. Valid records on the same page are still recorded; the
+evidence and cursor commit together before the page is acknowledged.
 Invalid page structure instead fails the page without advancing or acknowledging it.
 
 The contract admits a quantity only when it has at most nine fractional digits and

@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 72. A schema change appends a migration; an applied
+currently version 73. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -57,7 +57,7 @@ copies that timeout without running the table-creating probes.
 | `statement_import` | Each row records CSV import provenance and its content digest for idempotency. | insert only |
 | `desired_config` | The row records the committed desired-configuration generation. | one row |
 | `source_runtime` | Each row records a producer's cursor, lineage, last successful drain and pending disclosure. OpenCode stores its file identity in `file_identity`. | upsert |
-| `media_feed_cursor` | The row records colliculus's committed unsigned feed sequence and skipped-local count. | upsert with each page |
+| `media_feed_cursor` | The row records colliculus's committed unsigned feed sequence, last seen feed id, and skipped-local count. | upsert with each page or feed reset |
 | `thalamus_payer_cursor` | The row records the payer store incarnation and committed sequence. | upsert with each mirror page |
 | `thalamus_payer_session` | Each row preserves the declared owner of a THALAMUS session. | insert once per harness and session |
 | `thalamus_payer_record` | Each row preserves one payer attempt, including its original usage JSON, after THALAMUS deletes its copy. | insert only |
@@ -902,7 +902,7 @@ each measurement plan, removing `speed_mode` into the established mode path so
 `skipped_local` count. Sequence numbers are decimal text to preserve the feed's
 unsigned 64-bit range. The cursor, local-work count, events and set-aside evidence
 commit together before acknowledgement. Local counters increase only for entries
-beyond the previous watermark. The cursor survives source exclusion or absence;
+beyond the current feed cursor. The cursor survives source exclusion or absence;
 removing a source's runtime row never discards committed feed progress.
 
 `spend.ledger.coverage.skipped_local_by_source` is always a map, empty when no local
@@ -910,3 +910,10 @@ work was skipped. Both the direct and hourly coverage paths load these counters
 live; they are not spend events or priced-charge rows. The migration rehearsal
 runs the SQL on an empty store and on a store through schema 36 with an existing
 event, verifies that no rows were rewritten, and checks both immutability guards.
+
+## Schema 73: media feed identity
+
+Migration 73 adds nullable `media_feed_cursor.feed_id`. The reader adopts the
+first reported identity without moving existing progress. Later resets update
+the id and zero the cursor in the same transaction, before reading the feed
+from zero. Legacy replies leave the last known id intact.

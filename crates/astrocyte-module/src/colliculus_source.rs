@@ -2,12 +2,13 @@
 
 #[cfg(test)]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use astrocyte_core::ingest::{record_media_event_in_tx, RecordDisposition};
 use cortexkit_role_media::usage::{
-    self, UsageAckAnswer, UsageAckRequest, UsageEntry, UsageReadRequest,
+    self, UsageAckAnswer, UsageAckRequest, UsageEntry, UsageFeed, UsageReadRequest,
 };
 use rusqlite::{params, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -101,6 +102,8 @@ struct ReadPage {
     entries: Vec<ReadEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feed: Option<UsageFeed>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -111,6 +114,27 @@ struct ReadEntry {
 }
 
 impl ReadEntry {
+    fn evidence_locator(&self, identified_feed: bool) -> Result<String, String> {
+        if !identified_feed {
+            return Ok(format!("usage.read/seq/{}", self.seq));
+        }
+        // Feed sequence numbers can be reused for different records. Hash the id
+        // so an unreadable entry cannot put arbitrary text in the locator.
+        if let Some(id) = self
+            .payload
+            .get("record")
+            .and_then(|record| record.get("record_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            return Ok(format!("usage.read/record/{:x}", Sha256::digest(id)));
+        }
+        // An unreadable record may not have an id. Hash its payload without the
+        // sequence so the same evidence survives renumbering.
+        let payload = serde_json::to_vec(&self.payload).map_err(|error| error.to_string())?;
+        Ok(format!("usage.read/payload/{:x}", Sha256::digest(payload)))
+    }
+
     fn decode(self) -> Result<UsageEntry, serde_json::Error> {
         let mut body = self.payload;
         body.insert("seq".into(), self.seq.into());
@@ -147,6 +171,13 @@ fn check_page_structure(page: &ReadPage) -> Result<(), FeedError> {
         return Err(FeedError::Failed(
             "media page exceeds requested limit".into(),
         ));
+    }
+    if page.feed.as_ref().is_some_and(|feed| {
+        !(1..=64).contains(&feed.id.len())
+            || !feed.id.bytes().all(|byte| (0x21..=0x7E).contains(&byte))
+            || page.last_seq.is_some_and(|last| last > feed.head_seq)
+    }) {
+        return Err(FeedError::Failed("invalid media feed identity".into()));
     }
     let mut previous = 0;
     for entry in &page.entries {
@@ -234,12 +265,54 @@ impl Route {
     }
 }
 
+fn load_cursor(state: &SharedState) -> Result<(u64, Option<String>), String> {
+    state.with_conn(|conn| {
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT through_seq,feed_id FROM media_feed_cursor WHERE source_key=?1",
+                [SOURCE_KEY],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        row.map_or(Ok((0, None)), |(text, feed_id)| {
+            let seq = text
+                .parse::<u64>()
+                .map_err(|error| format!("invalid media cursor: {error}"))?;
+            Ok((seq, feed_id))
+        })
+    })
+}
+
+fn write_cursor(
+    tx: &rusqlite::Transaction<'_>,
+    seq: u64,
+    feed_id: Option<&str>,
+    skipped_local: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO media_feed_cursor(source_key,through_seq,feed_id,skipped_local)
+         VALUES(?1,?2,?3,?4) ON CONFLICT(source_key) DO UPDATE SET
+         through_seq=excluded.through_seq,
+         feed_id=COALESCE(excluded.feed_id,media_feed_cursor.feed_id),
+         skipped_local=media_feed_cursor.skipped_local+excluded.skipped_local",
+        params![SOURCE_KEY, seq.to_string(), feed_id, skipped_local],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+struct PendingAck {
+    through_seq: u64,
+    feed_id: Option<String>,
+}
+
 pub(crate) struct ColliculusSource {
     #[cfg(test)]
     fixture_connection: Option<PathBuf>,
     transient_logged: AtomicBool,
-    pending_ack: AtomicU64,
-    absent: std::sync::Mutex<AbsentBackoff>,
+    pending_ack: Mutex<Option<PendingAck>>,
+    absent: Mutex<AbsentBackoff>,
 }
 
 impl ColliculusSource {
@@ -248,8 +321,8 @@ impl ColliculusSource {
             #[cfg(test)]
             fixture_connection: None,
             transient_logged: AtomicBool::new(false),
-            pending_ack: AtomicU64::new(0),
-            absent: std::sync::Mutex::new(AbsentBackoff::default()),
+            pending_ack: Mutex::new(None),
+            absent: Mutex::new(AbsentBackoff::default()),
         }
     }
 
@@ -264,6 +337,28 @@ impl ColliculusSource {
         Route::open(&access, stop).await
     }
 
+    fn pending_ack(&self) -> MutexGuard<'_, Option<PendingAck>> {
+        self.pending_ack
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    async fn acknowledge(
+        &self,
+        route: &mut Route,
+        ack: PendingAck,
+        stop: &AtomicBool,
+    ) -> Result<(), FeedError> {
+        let through_seq = ack.through_seq;
+        *self.pending_ack() = Some(ack);
+        if stop.load(Ordering::Relaxed) {
+            return Err(FeedError::Stopped);
+        }
+        route.ack(through_seq).await?;
+        *self.pending_ack() = None;
+        Ok(())
+    }
+
     async fn drain(
         &self,
         state: &SharedState,
@@ -271,32 +366,13 @@ impl ColliculusSource {
         stop: &AtomicBool,
     ) -> Result<Option<String>, FeedError> {
         let started = Instant::now();
-        let mut cursor = state.with_conn(|conn| {
-            let text: Option<String> = conn
-                .query_row(
-                    "SELECT through_seq FROM media_feed_cursor WHERE source_key=?1",
-                    [SOURCE_KEY],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?;
-            text.map_or(Ok(0), |text| {
-                text.parse::<u64>()
-                    .map_err(|error| format!("invalid media cursor: {error}"))
-            })
-        })?;
+        let (mut cursor, mut feed_id) = load_cursor(state)?;
         if stop.load(Ordering::Relaxed) {
             return Err(FeedError::Stopped);
         }
         let mut route = self.open(state, stop).await?;
         if stop.load(Ordering::Relaxed) {
             return Err(FeedError::Stopped);
-        }
-        // Retry a failed acknowledgement for a page this reader committed. A
-        // saved cursor alone doesn't prove a fresh route recognizes that sequence.
-        if cursor > 0 && self.pending_ack.load(Ordering::Relaxed) == cursor {
-            route.ack(cursor).await?;
-            self.pending_ack.store(0, Ordering::Relaxed);
         }
         let mut unhealthy = false;
         let mut replayed = false;
@@ -314,6 +390,32 @@ impl ColliculusSource {
                 return Err(FeedError::Stopped);
             }
             check_page_structure(&page)?;
+            if let Some(feed) = page.feed.as_ref().filter(|feed| {
+                feed_id
+                    .as_ref()
+                    .is_some_and(|last| *last != feed.id || feed.head_seq < cursor)
+            }) {
+                // The probe used the old cursor, so its entries may start after
+                // unseen records in the replacement feed. Discard it and go to zero.
+                *self.pending_ack() = None;
+                state.ordered_write(|tx| {
+                    write_cursor(tx, 0, Some(&feed.id), 0)?;
+                    Ok(((), true))
+                })?;
+                feed_id = Some(feed.id.clone());
+                cursor = 0;
+                replayed = false;
+                continue;
+            }
+            let page_feed_id = page.feed.map(|feed| feed.id);
+            // A saved cursor does not prove that a fresh route serves the same
+            // feed. Retry a committed ack only after a read confirms its identity.
+            let pending = self.pending_ack().take();
+            if let Some(ack) =
+                pending.filter(|ack| ack.through_seq == cursor && ack.feed_id == page_feed_id)
+            {
+                self.acknowledge(&mut route, ack, stop).await?;
+            }
             let observed_cursor = page.last_seq.is_some_and(|last| last >= cursor);
             let next = page.last_seq.unwrap_or(cursor).max(cursor);
             if !page.entries.is_empty() && next == cursor {
@@ -335,29 +437,47 @@ impl ColliculusSource {
                         stopped = true;
                         return Err("media ingest stopped".into());
                     }
-                    let locator = format!("usage.read/seq/{}", entry.seq);
+                    let locator = entry.evidence_locator(page_feed_id.is_some())?;
                     let entry = match entry.decode() {
                         Ok(entry) => entry,
                         Err(error) => {
-                            evidence.push(SetAsideRecord { locator, reason: format!("undecodable media entry: {error}") });
+                            evidence.push(SetAsideRecord {
+                                locator,
+                                reason: format!("undecodable media entry: {error}"),
+                            });
                             continue;
                         }
                     };
                     if let Err(error) = usage::check_usage_entry(&entry) {
-                        evidence.push(SetAsideRecord { locator, reason: format!("invalid media entry: {error}") });
+                        evidence.push(SetAsideRecord {
+                            locator,
+                            reason: format!("invalid media entry: {error}"),
+                        });
                         continue;
                     }
                     if let Some(record) = &entry.record {
                         match astrocyte_core::media::map_record(record) {
                             Ok(Some((event, media))) => {
-                                let outcome = record_media_event_in_tx(tx, &event, &media, now).map_err(|error| format!("record media event: {error:?}"))?;
-                                quarantined |= outcome.disposition == RecordDisposition::QuarantinedRedelivery;
+                                let outcome = record_media_event_in_tx(tx, &event, &media, now)
+                                    .map_err(|error| format!("record media event: {error:?}"))?;
+                                quarantined |=
+                                    outcome.disposition == RecordDisposition::QuarantinedRedelivery;
                             }
-                            Ok(None) => { if entry.seq > cursor { local += 1; } }
-                            Err(reason) => evidence.push(SetAsideRecord { locator, reason: format!("record {}: {reason}", record.record_id) }),
+                            Ok(None) => {
+                                if entry.seq > cursor {
+                                    local += 1;
+                                }
+                            }
+                            Err(reason) => evidence.push(SetAsideRecord {
+                                locator,
+                                reason: format!("record {}: {reason}", record.record_id),
+                            }),
                         }
                     } else if let Some(raw) = &entry.raw {
-                        evidence.push(SetAsideRecord { locator, reason: raw_entry_reason(raw)? });
+                        evidence.push(SetAsideRecord {
+                            locator,
+                            reason: raw_entry_reason(raw)?,
+                        });
                     }
                 }
                 if stop.load(Ordering::Relaxed) {
@@ -365,10 +485,15 @@ impl ColliculusSource {
                     return Err("media ingest stopped".into());
                 }
                 let new = harness_drain::record_set_aside_in_tx(tx, SOURCE_KEY, &evidence, now)?;
-                tx.execute("INSERT INTO media_feed_cursor(source_key,through_seq,skipped_local) VALUES(?1,?2,?3) ON CONFLICT(source_key) DO UPDATE SET through_seq=excluded.through_seq,skipped_local=media_feed_cursor.skipped_local+excluded.skipped_local", params![SOURCE_KEY,next.to_string(),local]).map_err(|error| error.to_string())?;
-                harness_drain::ensure_runtime_row_in_tx(tx, SOURCE_KEY).map_err(|error| error.to_string())?;
+                write_cursor(tx, next, page_feed_id.as_deref(), local)?;
+                harness_drain::ensure_runtime_row_in_tx(tx, SOURCE_KEY)
+                    .map_err(|error| error.to_string())?;
                 harness_drain::mark_current_in_tx(tx, SOURCE_KEY, SOURCE_KEY, now)?;
-                tx.execute("UPDATE source_runtime SET pending_unknown=?2 WHERE source_key=?1", params![SOURCE_KEY,has_entries]).map_err(|error| error.to_string())?;
+                tx.execute(
+                    "UPDATE source_runtime SET pending_unknown=?2 WHERE source_key=?1",
+                    params![SOURCE_KEY, has_entries],
+                )
+                .map_err(|error| error.to_string())?;
                 Ok(((new, quarantined), true))
             });
             let (new, anomalous) = match committed {
@@ -378,18 +503,24 @@ impl ColliculusSource {
             harness_drain::warn_set_aside(SOURCE_KEY, &new);
             unhealthy |= anomalous;
             cursor = next;
+            if let Some(id) = page_feed_id.as_ref() {
+                feed_id = Some(id.clone());
+            }
             if !has_entries {
                 break;
             }
             // ordered_write returns only after SQLite commits events, evidence,
             // coverage and the cursor. No acknowledgement can precede that act.
             if observed_cursor {
-                self.pending_ack.store(cursor, Ordering::Relaxed);
-                if stop.load(Ordering::Relaxed) {
-                    return Err(FeedError::Stopped);
-                }
-                route.ack(cursor).await?;
-                self.pending_ack.store(0, Ordering::Relaxed);
+                self.acknowledge(
+                    &mut route,
+                    PendingAck {
+                        through_seq: cursor,
+                        feed_id: page_feed_id,
+                    },
+                    stop,
+                )
+                .await?;
             }
             // Yield between pages, leaving the committed cursor and pending
             // coverage for the next wake even when the feed never becomes quiet.

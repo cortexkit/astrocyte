@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 use subc_protocol::FrameType;
 use subc_protocol::{Flags, Frame, Priority};
 
+#[path = "colliculus_source/feed_identity_tests.rs"]
+mod feed_identity;
+
 type Reply = Arc<dyn Fn(&Value) -> (FrameType, Value) + Send + Sync>;
 type ByteReply = Arc<dyn Fn(&Value) -> (FrameType, Vec<u8>) + Send + Sync>;
 
@@ -1144,7 +1147,7 @@ fn media_transient_preserves_cursor_and_existing_health_until_recovery() {
     state
         .with_conn(|conn| {
             conn.execute(
-                "INSERT INTO media_feed_cursor VALUES('colliculus','9',0)",
+                "INSERT INTO media_feed_cursor(source_key,through_seq,skipped_local) VALUES('colliculus','9',0)",
                 [],
             )
             .map(|_| ())
@@ -1193,7 +1196,7 @@ fn media_other_refusals_keep_cursor_and_mark_the_drain_failed() {
     state
         .with_conn(|conn| {
             conn.execute(
-                "INSERT INTO media_feed_cursor VALUES('colliculus','7',0)",
+                "INSERT INTO media_feed_cursor(source_key,through_seq,skipped_local) VALUES('colliculus','7',0)",
                 [],
             )
             .map(|_| ())
