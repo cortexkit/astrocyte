@@ -934,7 +934,7 @@ impl SharedState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let advanced = self.with_conn(|conn| {
-            let late = astrocyte_core::cache_diagnostics::take_late_step_details(conn)
+            let late = astrocyte_core::cache_diagnostics::pending_late_step_details(conn)
                 .map_err(|error| describe_sqlite_error(&error))?;
             let advanced = memory
                 .advance(conn, &late, now_ms)

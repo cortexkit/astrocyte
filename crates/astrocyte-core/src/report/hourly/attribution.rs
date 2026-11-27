@@ -301,7 +301,22 @@ pub(super) fn next_summary(
     after: Option<Hour>,
 ) -> Result<Option<Hour>, ReportError> {
     let read = |after: Option<Hour>| {
-        conn.query_row("SELECT kind,hour_number FROM attribution_hour INDEXED BY attribution_summary_stale WHERE (summary_revision IS NULL OR summary_attribution_revision IS NOT revision) AND (?1 IS NULL OR (kind,hour_number)>(?1,?2)) ORDER BY kind,hour_number LIMIT 1",params![after.map(|h|h.kind),after.map(|h|h.number)],|r|Ok(Hour{kind:r.get(0)?,number:r.get(1)?})).optional()
+        conn.query_row(
+            "SELECT kind,hour_number FROM attribution_hour INDEXED BY attribution_summary_stale
+            WHERE (summary_revision IS NULL OR summary_attribution_revision IS NOT revision)
+              AND (?1 IS NULL OR (kind,hour_number)>(?1,?2))
+              AND NOT EXISTS (SELECT 1 FROM summary_dirty_hour d
+                  WHERE d.kind=attribution_hour.kind AND d.hour_number=attribution_hour.hour_number)
+            ORDER BY kind,hour_number LIMIT 1",
+            params![after.map(|h| h.kind), after.map(|h| h.number)],
+            |r| {
+                Ok(Hour {
+                    kind: r.get(0)?,
+                    number: r.get(1)?,
+                })
+            },
+        )
+        .optional()
     };
     Ok(read(after)?.or(read(None)?))
 }

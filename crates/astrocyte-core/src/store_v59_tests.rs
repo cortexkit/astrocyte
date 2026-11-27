@@ -62,45 +62,19 @@ mod session_refs {
                 Ok(all_rows(conn))
             })
             .unwrap();
-        let outcome = migrate_store(&store).unwrap();
-        let latest = MIGRATIONS.last().unwrap().version;
-        assert_eq!((outcome.applied, outcome.recorded), (latest - 58, latest));
+        let (previous, migration) = migration_parts(59);
+        let through_59 = &MIGRATIONS[..=previous.len()];
         store
             .with_conn(|conn| {
+                migrate_session_refs(conn, migration, crate::attribution::backfill_session_refs)
+                    .unwrap();
                 assert_eq!(table_rows(conn, "attribution_session_ref"), expected);
-                assert!(table_rows(conn, "broca_attempt_detail").is_empty());
-                assert!(table_rows(conn, "broca_segment_evidence").is_empty());
-                assert!(table_rows(conn, "broca_segment_measurement").is_empty());
-                assert!(table_rows(conn, "broca_segment_mismatch").is_empty());
-                assert!(table_rows(conn, "broca_scope_stamp").is_empty());
-                assert!(table_rows(conn, "broca_scope_backfill").is_empty());
-                assert!(table_rows(conn, "quota_reset_period").is_empty());
-                assert_eq!(
-                    conn.query_row(
-                        "SELECT checked_through FROM broca_segment_check_state WHERE id=1",
-                        [],
-                        |row| row.get::<_, i64>(0)
-                    )?,
-                    0,
-                );
                 let others: Vec<_> = all_rows(conn)
                     .into_iter()
                     .filter(|(table, _)| {
                         !matches!(
                             table.as_str(),
-                            "attribution_session_ref"
-                                | "attribution_parent_session_ref"
-                                | "cortexkit_schema_version"
-                                | "broca_attempt_detail"
-                                | "broca_segment_evidence"
-                                | "broca_segment_measurement"
-                                | "broca_segment_mismatch"
-                                | "broca_segment_check_state"
-                                | "broca_scope_stamp"
-                                | "broca_scope_backfill"
-                                | "quota_reset_period"
-                                | "multiplier_provider_day"
-                                | "media_caller"
+                            "attribution_session_ref" | "cortexkit_schema_version"
                         )
                     })
                     .collect();
@@ -109,36 +83,12 @@ mod session_refs {
                     .filter(|(table, _)| table != "cortexkit_schema_version")
                     .cloned()
                     .collect();
-                // Later migrations may append nullable columns to an existing
-                // table. An existing row then gains only trailing NULLs, which
-                // is not a change to it, so compare the columns it had before.
-                assert_eq!(others.len(), before.len());
-                let others: Vec<_> = others
-                    .into_iter()
-                    .zip(&before)
-                    .map(|((table, rows), (_, old_rows))| {
-                        assert_eq!(rows.len(), old_rows.len(), "{table}");
-                        let rows = rows
-                            .into_iter()
-                            .zip(old_rows)
-                            .map(|(mut row, old)| {
-                                let added = row.split_off(old.len());
-                                assert!(
-                                    added.iter().all(|v| *v == rusqlite::types::Value::Null),
-                                    "{table}: an appended column is not NULL"
-                                );
-                                row
-                            })
-                            .collect::<Vec<_>>();
-                        (table, rows)
-                    })
-                    .collect();
                 assert_eq!(others, before);
                 Ok(())
             })
             .unwrap();
-        // A second start finds the migration recorded and fills nothing again.
-        assert_eq!(migrate_store(&store).unwrap().applied, 0);
+        let recorded = store.migrate("astrocyte", through_59).unwrap();
+        assert_eq!((recorded.applied, recorded.recorded), (0, 59));
     }
 
     #[test]

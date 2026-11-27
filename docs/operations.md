@@ -27,7 +27,7 @@ target/debug/spend_drive <connection-file> <operation> '<json params>'
 | Exit | Meaning | Output |
 |---|---|---|
 | 0 | The operation succeeded. | The reply as one JSON line on stdout. |
-| 1 | The module refused, the transport failed, or the call timed out after 15 seconds. | `<code>: <message>` on stderr; a transport failure has code `transport`. |
+| 1 | The module refused, the transport failed, or the call timed out. Ledger write calls have a 300-second deadline; other calls have 15 seconds. | `<code>: <message>` on stderr; a transport failure has code `transport`. |
 | 2 | Wrong argument count, or the params are not valid JSON. | A usage line on stderr. |
 
 `spend_drive` never retries. A timeout means the outcome of a write is
@@ -185,8 +185,10 @@ append an adjustment with `spend.correction.ingest` (see
 
 ## 4. Correct an event's charge basis
 
-Every harness event is recorded with basis `unknown`, so it stays unpriced
-until its basis is known. When the operator knows how a call was paid:
+A matching Thalamus payer row can supply a harness call's charge basis when
+the call is recorded. A harness event without a known basis is recorded as
+`unknown` and stays unpriced until its basis is known. When the operator knows
+how such a call was paid:
 
 ```sh
 spend_drive <connection-file> spend.basis.correct '{"event_id":"<event_id>","corrected_basis":"metered_api","reason":"<why>"}'

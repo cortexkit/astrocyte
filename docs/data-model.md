@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 71. A schema change appends a migration; an applied
+currently version 72. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -29,6 +29,7 @@ copies that timeout without running the table-creating probes.
 | `broca_segment_recheck` | Queues already-checked segments whose attempt shares have changed. | derived queue |
 | `broca_segment_current_mismatch` | Lists the segments still differing at their most recent comparison. The original differences remain in `broca_segment_mismatch`. | derived |
 | `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
+| `step_detail_late` | Each row queues detail for a previously recorded event. Entries remain pending until the feed advances `step_feed_state.late_detail_high_water` in the same transaction as its append. | insert only, once per event |
 | `step_message` | Each row records the host's own message id for a newly recorded event, for joining live feed rows within their harness and session. Old events are not backfilled. | insert only, once per event |
 | `cache_step_sequence` | Each row maps a ledger event to a durable cache cursor. | insert |
 | `cache_read_session` | Each row names a producer's session with a dated cache-read step and records the cursor of its first positive read. | derived; a measurement trigger inserts it and lowers the cursor |

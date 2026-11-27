@@ -575,8 +575,8 @@ fn newest_body(
 /// the commit that recorded the steps, on the writer's connection, inside
 /// one transaction or savepoint of its own: it reads the cache cursor the
 /// feed has caught up to, appends rows for every changed step, and records
-/// the new cursor. `late_keys` are the events that gained a `step_detail`
-/// row after they were recorded. Returns how many rows were appended.
+/// the new cursors. `late_keys` may also request a refresh for particular events.
+/// Returns how many rows were appended.
 pub fn append_changes(
     conn: &Connection,
     now_ms: i64,
@@ -588,9 +588,13 @@ pub fn append_changes(
         |row| row.get(0),
     )?;
     let newest = cache::last_event_key(conn)?;
+    let (detail_through, mut pending_details) = cache::late_detail_batch(conn)?;
+    pending_details.extend_from_slice(late_keys);
+    pending_details.sort_unstable();
+    pending_details.dedup();
     let window_start = now_ms.saturating_sub(FEED_WINDOW_MS);
     let mut appended = 0;
-    for changed in cache::changed_sessions(conn, caught_up, newest, late_keys)? {
+    for changed in cache::changed_sessions(conn, caught_up, newest, &pending_details)? {
         let (producer, session) = (changed.producer.as_str(), changed.session.as_str());
         // A session whose steps had never read the cache before, and now do,
         // can change the verdict of every earlier step: recompute the whole
@@ -603,7 +607,7 @@ pub fn append_changes(
         } else {
             changed.earliest_ms.max(window_start)
         };
-        for step in cache::session_steps_since(conn, producer, session, since)? {
+        cache::visit_session_steps_since(conn, producer, session, since, |step| {
             let message_id: Option<String> = conn
                 .prepare_cached(MESSAGE_ID_SQL)?
                 .query_row([step.cursor], |row| row.get(0))?;
@@ -618,7 +622,8 @@ pub fn append_changes(
             if append_body(conn, now_ms, &body, false, None)? {
                 appended += 1;
             }
-        }
+            Ok(())
+        })?;
         if flipped && cache::CacheModel::of(producer) == cache::CacheModel::Explicit {
             // File rows above already replaced any matching runner rows. Rejudge
             // the retained runner-only steps that just gained session cache evidence.
@@ -626,8 +631,10 @@ pub fn append_changes(
         }
     }
     conn.execute(
-        "UPDATE step_feed_state SET cache_high_water=?1 WHERE id=1",
-        [newest],
+        "UPDATE step_feed_state SET cache_high_water=?1,
+                                    late_detail_high_water=COALESCE(?2,late_detail_high_water)
+         WHERE id=1",
+        params![newest, detail_through],
     )?;
     prune(conn, window_start)?;
     evidence::prune(conn, now_ms)?;

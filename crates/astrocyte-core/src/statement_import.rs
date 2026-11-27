@@ -321,6 +321,7 @@ struct CsvRecord {
 fn parse_csv(file_bytes: &[u8]) -> Result<Vec<CsvRecord>, StatementError> {
     let text = std::str::from_utf8(file_bytes)
         .map_err(|_| malformed_error(None, "file", "CSV is not valid UTF-8"))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut records = Vec::new();
     let mut fields = Vec::new();
     let mut field = String::new();
@@ -625,6 +626,26 @@ mod tests {
         csv(&format!(
             "line-1,150,vendor charge,1,request,2,JPY,{correlation_ref}"
         ))
+    }
+
+    #[test]
+    fn statement_import_accepts_a_utf8_bom_and_hashes_the_original_bytes() {
+        let mut conn = conn();
+        let mut bytes = b"\xef\xbb\xbf".to_vec();
+        bytes.extend(standard_line(""));
+        import_statement(&mut conn, &request(), &bytes, None, 300).unwrap();
+
+        let (line_id, amount, digest): (String, i64, String) = conn
+            .query_row(
+                "SELECT line.line_id,line.amount_minor,import.file_sha256
+                 FROM statement_line line JOIN statement_import import USING(statement_id)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(line_id, "line-1");
+        assert_eq!(amount, 2);
+        assert_eq!(digest, hex::encode(Sha256::digest(&bytes)));
     }
 
     fn statement_state(conn: &Connection) -> (i64, i64, i64, i64, i64, i64) {
@@ -1300,6 +1321,43 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(outcomes, ["unpriced_target", "settled"]);
+    }
+
+    #[test]
+    fn reconciliation_reports_the_last_committed_attempt_at_equal_times() {
+        let mut conn = conn();
+        seed_event(&conn, "event-1", "producer-a", "corr", None, 0);
+        // At this time the hash with attempt ordinal 0 sorts after ordinal 1.
+        let attempted_at_ms = 302;
+        let first = import_statement(
+            &mut conn,
+            &request(),
+            &standard_line("corr"),
+            None,
+            attempted_at_ms,
+        )
+        .unwrap();
+        assert_eq!(first.matching.unpriced_target_lines, 1);
+        price_existing_event(&conn, "event-1", "JPY", 1_000_000_000);
+        let second = import_statement(
+            &mut conn,
+            &request(),
+            &standard_line("corr"),
+            None,
+            attempted_at_ms,
+        )
+        .unwrap();
+        assert_eq!(second.matching.settled_lines, 1);
+        let report = crate::reconcile::run_reconciliation(
+            &conn,
+            &crate::reconcile::ReconcileRequest {
+                statement_id: second.statement_id,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.lines[0].match_outcome, Some(MatchOutcome::Settled));
+        assert_eq!(report.lines[0].difference_nanos, Some(1_000_000_000));
+        assert_eq!(report.summary.settled.lines, 1);
     }
 
     #[test]

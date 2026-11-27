@@ -62,20 +62,17 @@ pub const REPORT_CACHE_KIB: i64 = -65_536;
 
 /// Tune only a read-only report connection, never the ingest writer.
 pub fn configure_report_reader(conn: &Connection) -> rusqlite::Result<()> {
-    for (name, wanted) in [
-        ("mmap_size", REPORT_MMAP_BYTES),
-        ("cache_size", REPORT_CACHE_KIB),
-    ] {
-        conn.pragma_update(None, name, wanted)?;
-        let actual: i64 = conn.pragma_query_value(None, name, |row| row.get(0))?;
-        if actual != wanted {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                Some(format!(
-                    "report reader {name}: requested {wanted}, got {actual}"
-                )),
-            ));
-        }
+    // SQLite can cap the mapping or use conventional page reads instead.
+    conn.pragma_update(None, "mmap_size", REPORT_MMAP_BYTES)?;
+    conn.pragma_update(None, "cache_size", REPORT_CACHE_KIB)?;
+    let actual: i64 = conn.pragma_query_value(None, "cache_size", |row| row.get(0))?;
+    if actual != REPORT_CACHE_KIB {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!(
+                "report reader cache_size: requested {REPORT_CACHE_KIB}, got {actual}"
+            )),
+        ));
     }
     Ok(())
 }
@@ -2864,6 +2861,24 @@ mod tests {
     mod analytics {
         use super::*;
         include!("report/analytics_tests.rs");
+    }
+
+    #[test]
+    fn report_reader_works_when_sqlite_cannot_map_the_database() {
+        let conn = conn();
+        assert_ne!(
+            conn.pragma_query_value(None, "mmap_size", |row| row.get::<_, i64>(0))
+                .optional()
+                .unwrap(),
+            Some(REPORT_MMAP_BYTES)
+        );
+        configure_report_reader(&conn).unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "cache_size", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            REPORT_CACHE_KIB
+        );
+        assert!(ledger_coverage(&conn, &LedgerCoverageRequest {}, 100).is_ok());
     }
 
     #[test]

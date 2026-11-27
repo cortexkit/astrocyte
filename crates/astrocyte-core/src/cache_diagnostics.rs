@@ -53,11 +53,6 @@ pub const RECENT_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 /// now. The reply reads every step in the window, so the window is bounded.
 pub const SESSIONS_MAX_WINDOW_MS: i64 = 7 * RECENT_WINDOW_MS;
 
-/// The connection-private list of events that gained a `step_detail` row
-/// after they were recorded. See `ingest::note_late_step_detail`.
-pub(crate) const CREATE_LATE_STEP_DETAIL: &str =
-    "CREATE TEMP TABLE IF NOT EXISTS step_detail_late (event_key INTEGER PRIMARY KEY)";
-
 /// How a producer's cache reports are read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheModel {
@@ -421,6 +416,19 @@ const SINCE_SQL: &str = concat!(
     " WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms>=?3",
     " ORDER BY e.occurred_at_ms, e.event_key"
 );
+// The session summary needs only cache counts and the newest context limit.
+const SESSION_SUMMARY_STEPS_SQL: &str = concat!(
+    "SELECT s.cursor,e.occurred_at_ms,d.context_limit,",
+    token_count!("input"),
+    ",",
+    token_count!("cache_read"),
+    ",",
+    token_count!("cache_write"),
+    " FROM usage_event e LEFT JOIN step_detail d ON d.event_key=e.event_key",
+    " JOIN cache_step_sequence s ON s.event_key=e.event_key",
+    " WHERE e.session=?1 AND e.producer=?2 AND e.occurred_at_ms>=?3",
+    " ORDER BY e.occurred_at_ms, e.event_key"
+);
 const PROJECT_ROOT_SQL: &str = "SELECT project_root FROM usage_event
      WHERE session=?1 AND producer=?2 AND occurred_at_ms>=?3 AND project_root IS NOT NULL
       ORDER BY occurred_at_ms DESC, event_key DESC LIMIT 1";
@@ -513,7 +521,7 @@ pub fn load_session(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.reverse();
     let lead = match rows.first() {
-        Some(first) => lead_before(conn, producer, session, first)?,
+        Some(first) => lead_before(conn, producer, session, first.occurred_at_ms, first.cursor)?,
         None => Lead::default(),
     };
     Ok(SessionSteps {
@@ -529,21 +537,20 @@ fn lead_before(
     conn: &Connection,
     producer: &str,
     session: &str,
-    step: &StepRow,
+    occurred_at_ms: i64,
+    cursor: i64,
 ) -> rusqlite::Result<Lead> {
-    let earlier_steps = conn.prepare_cached(EARLIER_SQL)?.query_row(
-        params![session, producer, step.occurred_at_ms, step.cursor],
-        |row| row.get::<_, bool>(0),
-    )?;
+    let earlier_steps = conn
+        .prepare_cached(EARLIER_SQL)?
+        .query_row(params![session, producer, occurred_at_ms, cursor], |row| {
+            row.get::<_, bool>(0)
+        })?;
     if !earlier_steps {
         return Ok(Lead::default());
     }
     let baseline = conn
         .prepare_cached(projection_sql!(BASELINE_SQL, WALK_BASELINE_SQL))?
-        .query_row(
-            params![session, producer, step.occurred_at_ms, step.cursor],
-            step_row,
-        )
+        .query_row(params![session, producer, occurred_at_ms, cursor], step_row)
         .optional()?;
     Ok(Lead {
         earlier_steps,
@@ -721,25 +728,25 @@ pub fn last_event_key(conn: &Connection) -> rusqlite::Result<i64> {
     )
 }
 
-/// Take the events that gained a `step_detail` row after they were
-/// recorded, on this connection, since the last call. See
-/// `ingest::note_late_step_detail`. Runs outside any transaction, after the
-/// commit that wrote them.
-pub fn take_late_step_details(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM temp.sqlite_master WHERE name='step_detail_late')",
-        [],
-        |row| row.get(0),
+/// Read the event keys whose late detail has not yet been handled by the feed.
+pub fn pending_late_step_details(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
+    Ok(late_detail_batch(conn)?.1)
+}
+
+pub(crate) fn late_detail_batch(conn: &Connection) -> rusqlite::Result<(Option<i64>, Vec<i64>)> {
+    let mut statement = conn.prepare_cached(
+        "SELECT pending_id,event_key FROM step_detail_late
+         WHERE pending_id>(SELECT late_detail_high_water FROM step_feed_state WHERE id=1)
+         ORDER BY pending_id",
     )?;
-    if !exists {
-        return Ok(Vec::new());
+    let mut rows = statement.query([])?;
+    let mut through = None;
+    let mut keys = Vec::new();
+    while let Some(row) = rows.next()? {
+        through = Some(row.get(0)?);
+        keys.push(row.get(1)?);
     }
-    let keys = conn
-        .prepare("SELECT event_key FROM temp.step_detail_late ORDER BY event_key")?
-        .query_map([], |row| row.get(0))?
-        .collect::<rusqlite::Result<Vec<i64>>>()?;
-    conn.execute("DELETE FROM temp.step_detail_late", [])?;
-    Ok(keys)
+    Ok((through, keys))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -926,50 +933,11 @@ pub fn steps_reply(
     reads_cache: bool,
     undated_steps: u64,
 ) -> StepsReply {
-    let counts = window.iter().map(StepRow::counts).collect::<Vec<_>>();
-    let derived = derive(CacheModel::of(&query.producer), reads_cache, lead, &counts);
-    let mut previous_body_len = lead.request_body_len;
+    let mut next_lead = lead;
+    let model = CacheModel::of(&query.producer);
     let steps = window
         .into_iter()
-        .zip(derived)
-        .map(|(row, derived)| {
-            let request_size = if derived.prompt_dropped {
-                row.request_body_len
-                    .zip(previous_body_len)
-                    .map(|(current, previous)| {
-                        if current < previous {
-                            "smaller"
-                        } else {
-                            "not_smaller"
-                        }
-                    })
-            } else {
-                None
-            };
-            previous_body_len = row.request_body_len;
-            CacheStep {
-                cause: None,
-                evidence: crate::rewrite_evidence::Evidence::default(),
-                cursor: row.cursor,
-                step_ref: row.step_ref,
-                occurred_at_ms: row.occurred_at_ms,
-                input: row.input,
-                cache_read: row.cache_read,
-                cache_write: row.cache_write,
-                output: served_output(row.output, row.reasoning),
-                reasoning: row.reasoning,
-                provider: row.provider,
-                model: row.model,
-                finish: row.finish,
-                context_limit: row.context_limit,
-                request_body_len: row.request_body_len,
-                request_size,
-                prompt: derived.prompt,
-                retention: derived.retention,
-                verdict: derived.verdict,
-                prompt_dropped: derived.prompt_dropped,
-            }
-        })
+        .map(|row| served_step(row, model, reads_cache, &mut next_lead))
         .filter(|row| query.after_cursor.is_none_or(|after| row.cursor > after))
         .collect();
     StepsReply {
@@ -978,6 +946,48 @@ pub fn steps_reply(
         steps,
         earlier_steps: lead.earlier_steps,
         undated_steps,
+    }
+}
+
+fn served_step(row: StepRow, model: CacheModel, reads_cache: bool, lead: &mut Lead) -> CacheStep {
+    let counts = row.counts();
+    let derived = derive_step(model, reads_cache, lead, &counts);
+    let request_size = if derived.prompt_dropped {
+        row.request_body_len
+            .zip(lead.request_body_len)
+            .map(|(current, previous)| {
+                if current < previous {
+                    "smaller"
+                } else {
+                    "not_smaller"
+                }
+            })
+    } else {
+        None
+    };
+    lead.advance(&counts);
+    lead.request_body_len = row.request_body_len;
+    CacheStep {
+        cause: None,
+        evidence: crate::rewrite_evidence::Evidence::default(),
+        cursor: row.cursor,
+        step_ref: row.step_ref,
+        occurred_at_ms: row.occurred_at_ms,
+        input: row.input,
+        cache_read: row.cache_read,
+        cache_write: row.cache_write,
+        output: served_output(row.output, row.reasoning),
+        reasoning: row.reasoning,
+        provider: row.provider,
+        model: row.model,
+        finish: row.finish,
+        context_limit: row.context_limit,
+        request_body_len: row.request_body_len,
+        request_size,
+        prompt: derived.prompt,
+        retention: derived.retention,
+        verdict: derived.verdict,
+        prompt_dropped: derived.prompt_dropped,
     }
 }
 
@@ -1079,31 +1089,30 @@ pub fn session_read_cache_through(
     .query_row(params![session, producer, through], |row| row.get(0))
 }
 
-/// Every dated step of one session at or after `since_ms`, oldest first,
-/// built exactly as `usage.cache.steps` serves them: the verdicts are
-/// computed over the whole session in time order.
-pub fn session_steps_since(
+/// Visit the dated steps at or after `since_ms` in order without buffering a
+/// session's history. Carrying the previous cache report and whether an earlier
+/// step exists preserves the verdicts served by `usage.cache.steps`.
+pub(crate) fn visit_session_steps_since(
     conn: &Connection,
     producer: &str,
     session: &str,
     since_ms: i64,
-) -> rusqlite::Result<Vec<CacheStep>> {
-    let rows = conn
-        .prepare_cached(SINCE_SQL)?
-        .query_map(params![session, producer, since_ms], step_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let Some(first) = rows.first() else {
-        return Ok(Vec::new());
+    mut visit: impl FnMut(CacheStep) -> rusqlite::Result<()>,
+) -> rusqlite::Result<()> {
+    let mut statement = conn.prepare_cached(SINCE_SQL)?;
+    let mut rows = statement.query_map(params![session, producer, since_ms], step_row)?;
+    let Some(first) = rows.next().transpose()? else {
+        return Ok(());
     };
-    let lead = lead_before(conn, producer, session, first)?;
-    let query = StepsQuery {
-        producer: producer.to_string(),
-        session: session.to_string(),
-        limit: rows.len(),
-        after_cursor: None,
-    };
+    let mut lead = lead_before(conn, producer, session, first.occurred_at_ms, first.cursor)?;
     let reads_cache = session_reads_cache(conn, producer, session)?;
-    Ok(steps_reply(&query, rows, lead, reads_cache, 0).steps)
+    let model = CacheModel::of(producer);
+    for row in std::iter::once(Ok(first)).chain(rows) {
+        #[cfg(test)]
+        tests::note_step_batch(1);
+        visit(served_step(row?, model, reads_cache, &mut lead))?;
+    }
+    Ok(())
 }
 
 /// The `output` a served row reports. The fleet reports reasoning as a
@@ -1207,34 +1216,38 @@ fn session_summary(
     since_ms: i64,
     last_activity_ms: i64,
 ) -> rusqlite::Result<CacheSession> {
-    let rows = conn
-        .prepare_cached(SINCE_SQL)?
-        .query_map(params![session, producer, since_ms], step_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let lead = match rows.first() {
-        Some(first) => lead_before(conn, &producer, &session, first)?,
-        None => Lead::default(),
-    };
-    let counts = rows.iter().map(StepRow::counts).collect::<Vec<_>>();
-    let derived = derive(
-        CacheModel::of(&producer),
-        session_reads_cache(conn, &producer, &session)?,
-        lead,
-        &counts,
-    );
-    let busts = derived
-        .iter()
-        .filter(|derived| matches!(derived.verdict, Verdict::Bust | Verdict::FullBust))
-        .count();
-    let (read, prompt) = counts.iter().filter(|counts| counts.reports_cache()).fold(
-        (0_u64, 0_u64),
-        |(read, prompt), counts| {
-            (
-                read.saturating_add(counts.cache_read.unwrap_or(0)),
-                prompt.saturating_add(counts.prompt()),
-            )
-        },
-    );
+    let model = CacheModel::of(&producer);
+    let reads_cache = session_reads_cache(conn, &producer, &session)?;
+    let mut statement = conn.prepare_cached(SESSION_SUMMARY_STEPS_SQL)?;
+    let mut rows = statement.query(params![session, producer, since_ms])?;
+    let mut lead = Lead::default();
+    let (mut steps, mut busts, mut read, mut prompt) = (0_u64, 0_u64, 0_u64, 0_u64);
+    let mut context_limit = None;
+    while let Some(row) = rows.next()? {
+        #[cfg(test)]
+        tests::note_step_batch(1);
+        if steps == 0 {
+            lead = lead_before(conn, &producer, &session, row.get(1)?, row.get(0)?)?;
+        }
+        steps = steps.saturating_add(1);
+        if let Some(limit) = row.get::<_, Option<i64>>(2)?.filter(|&limit| limit > 0) {
+            context_limit = Some(limit);
+        }
+        let counts = StepCounts {
+            input: count(row, 3)?,
+            cache_read: count(row, 4)?,
+            cache_write: count(row, 5)?,
+        };
+        let verdict = derive_step(model, reads_cache, &lead, &counts).verdict;
+        if matches!(verdict, Verdict::Bust | Verdict::FullBust) {
+            busts = busts.saturating_add(1);
+        }
+        if let Some(cache_read) = counts.cache_read {
+            read = read.saturating_add(cache_read);
+            prompt = prompt.saturating_add(counts.prompt());
+        }
+        lead.advance(&counts);
+    }
     #[allow(clippy::cast_precision_loss)] // A ratio of token counts; rounding is harmless.
     let hit_ratio = (prompt > 0).then(|| read as f64 / prompt as f64);
     let project_root = conn
@@ -1243,14 +1256,11 @@ fn session_summary(
         .optional()?;
     Ok(CacheSession {
         project_root,
-        steps: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+        steps,
         hit_ratio,
-        busts: u64::try_from(busts).unwrap_or(u64::MAX),
+        busts,
         last_activity_ms,
-        context_limit: rows
-            .iter()
-            .rev()
-            .find_map(|row| row.context_limit.filter(|limit| *limit > 0)),
+        context_limit,
         harness: producer,
         session,
     })
@@ -2496,9 +2506,13 @@ mod tests {
                 FIXTURE_BASE_MS + 5 * RECENT_WINDOW_MS / 2,
                 FIXTURE_NOW_MS,
             ] {
-                out.push(json(
-                    &session_steps_since(conn, producer, session, since).unwrap(),
-                ));
+                let mut steps = Vec::new();
+                visit_session_steps_since(conn, producer, session, since, |step| {
+                    steps.push(step);
+                    Ok(())
+                })
+                .unwrap();
+                out.push(json(&steps));
             }
             for at in [FIXTURE_BASE_MS + RECENT_WINDOW_MS + 300_000, FIXTURE_NOW_MS] {
                 for cache_read in [Some(0), Some(50_000)] {
@@ -2686,6 +2700,64 @@ mod tests {
         record(&mut conn, &steps);
         crate::step_feed::append_changes(&conn, FIXTURE_BASE_MS + RECENT_WINDOW_MS, &[]).unwrap();
         conn
+    }
+
+    thread_local! {
+        static BIGGEST_STEP_BATCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn note_step_batch(size: usize) {
+        BIGGEST_STEP_BATCH.set(BIGGEST_STEP_BATCH.get().max(size));
+    }
+
+    #[test]
+    fn a_busy_cache_session_streams_its_summary_and_first_positive_feed_replay() {
+        let history = 2_000;
+        let mut conn = cache_free_history(history);
+        let now = FIXTURE_BASE_MS + 5_000_000;
+        record(
+            &mut conn,
+            &[step(
+                "claude-code",
+                "s",
+                history + 1,
+                Some(now),
+                counts(Some(10), Some(20), None),
+            )],
+        );
+        BIGGEST_STEP_BATCH.set(0);
+        let (appended, feed_steps) = vm_steps(&conn, || {
+            let tx = conn.unchecked_transaction().unwrap();
+            let count = crate::step_feed::append_changes(&tx, now, &[]).unwrap();
+            tx.commit().unwrap();
+            count
+        });
+        let feed_batch = BIGGEST_STEP_BATCH.replace(0);
+        let (reply, report_steps) = vm_steps(&conn, || {
+            cache_sessions(
+                &conn,
+                CacheSessionsRequest {
+                    limit: Some(1),
+                    since_ms: Some(FIXTURE_BASE_MS),
+                    harness: Some("claude-code".into()),
+                },
+                now,
+            )
+            .unwrap()
+        });
+        let report_batch = BIGGEST_STEP_BATCH.replace(0);
+        eprintln!(
+            "cache session: feed {feed_steps} VM steps, {feed_batch} rows at peak; \
+             summary {report_steps} VM steps, {report_batch} rows at peak"
+        );
+        assert_eq!(appended, 2, "one correction and the new positive step");
+        assert_eq!(reply.sessions.len(), 1);
+        let summary = &reply.sessions[0];
+        assert_eq!(summary.steps, history + 2);
+        assert_eq!(summary.busts, 0);
+        assert_eq!(summary.hit_ratio, Some(0.5));
+        assert_eq!(summary.last_activity_ms, now);
+        assert_eq!((feed_batch, report_batch), (1, 1));
     }
 
     /// VM steps of the cache reads for one new step of a session like

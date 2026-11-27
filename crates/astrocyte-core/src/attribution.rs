@@ -320,13 +320,25 @@ fn aside(
     Ok(sql(conn.execute("INSERT OR IGNORE INTO set_aside_record(source_key,locator,reason,first_seen_ms,last_seen_ms) VALUES(?1,?2,?3,?4,?4)",params![publisher.source(),locator(publisher,body)?,reason,now]))?!=0)
 }
 
-// The reader checks this before locking the store writer. Replaying a known
-// suffix must not open an empty transaction or refresh its cursor timestamps.
+// The reader checks this before locking the store writer. A known suffix with
+// no new resume token must not open an empty transaction.
 pub fn page_needs_commit(
     conn: &Connection,
     publisher: Publisher,
     page: &Page,
 ) -> Result<bool, String> {
+    if let Some(next) = &page.next {
+        let known = sql(conn
+            .query_row(
+                "SELECT 1 FROM attribution_cursor WHERE publisher=?1 AND cursor=?2",
+                params![publisher.key(), text(next)?],
+                |_| Ok(()),
+            )
+            .optional())?;
+        if known.is_none() {
+            return Ok(true);
+        }
+    }
     for body in &page.facts {
         let id = body.get("fact_id").and_then(Value::as_str);
         let table = if publisher == Publisher::Entorhinal {
@@ -367,7 +379,7 @@ pub fn page_needs_commit(
     Ok(false)
 }
 
-/// Called only after preflight finds new evidence; the caller owns the page transaction.
+/// Called after preflight finds new evidence or a new cursor; the caller owns the transaction.
 pub fn commit_page(
     tx: &Transaction<'_>,
     publisher: Publisher,
@@ -493,13 +505,21 @@ pub fn commit_page(
                 dirty_subject(tx, &aliases, &fact.subject, Some(from))?;
             }
         }
+    }
+    if changed || page.next.is_some() {
         let cursor = page
             .next
             .as_ref()
             .or(request_cursor)
             .map(text)
             .transpose()?;
-        sql(tx.execute("INSERT INTO attribution_cursor VALUES(?1,?2,?3,?4,?5) ON CONFLICT(publisher) DO UPDATE SET read_name=excluded.read_name,cursor=excluded.cursor,through=excluded.through,last_read_at_ms=excluded.last_read_at_ms",params![publisher.key(),publisher.read_name(),cursor,text(&page.through)?,now]))?;
+        changed |= sql(tx.execute(
+            "INSERT INTO attribution_cursor VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(publisher) DO UPDATE SET read_name=excluded.read_name,
+                 cursor=excluded.cursor,through=excluded.through,last_read_at_ms=excluded.last_read_at_ms
+             WHERE ?6 OR attribution_cursor.cursor IS NOT excluded.cursor",
+            params![publisher.key(), publisher.read_name(), cursor, text(&page.through)?, now, changed],
+        ))? != 0;
     }
     Ok(changed)
 }

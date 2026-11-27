@@ -157,9 +157,9 @@ pub fn run_reconciliation(
              SELECT latest.attempt_id
              FROM match_attempt AS latest
              WHERE latest.statement_line_id=line.statement_line_id
-             -- Two imports can share one millisecond. The immutable unique id
-             -- selects the same representative on every read when they tie.
-             ORDER BY latest.attempted_at_ms DESC, latest.attempt_id DESC
+             -- Two imports can share one millisecond. The append-only table's
+             -- rowid breaks that tie in the order the attempts were recorded.
+             ORDER BY latest.attempted_at_ms DESC, latest.rowid DESC
              LIMIT 1
          )
          LEFT JOIN usage_event AS event ON event.event_key=attempt.event_key

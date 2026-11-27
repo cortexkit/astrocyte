@@ -431,7 +431,6 @@ fn parse_exact(value: String) -> Result<i128, ReportError> {
 
 struct RawCell {
     id: i64,
-    hour: Hour,
     dictionary: [i64; GROUPING_DIMENSIONS + 2],
     payload: String,
 }
@@ -443,15 +442,18 @@ impl RawCell {
         }
         dictionary[GROUPING_DIMENSIONS] = row.get(13)?;
         dictionary[GROUPING_DIMENSIONS + 1] = row.get(15)?;
-        Ok(Self {
+        let raw = Self {
             id: row.get(0)?,
-            hour: Hour {
-                kind: row.get(1)?,
-                number: row.get(2)?,
-            },
             dictionary,
             payload: row.get(14)?,
-        })
+        };
+        #[cfg(test)]
+        tests::RAW_CELLS.with(|counter| {
+            if let Some((active, peak)) = counter.get() {
+                counter.set(Some((active + 1, peak.max(active + 1))));
+            }
+        });
+        Ok(raw)
     }
 
     fn key(&self, values: &mut Values<'_>) -> Result<Key, ReportError> {
@@ -464,6 +466,17 @@ impl RawCell {
             value(values, self.dictionary[GROUPING_DIMENSIONS])?,
             value(values, self.dictionary[GROUPING_DIMENSIONS + 1])?,
         ))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RawCell {
+    fn drop(&mut self) {
+        tests::RAW_CELLS.with(|counter| {
+            if let Some((active, peak)) = counter.get() {
+                counter.set(Some((active - 1, peak)));
+            }
+        });
     }
 }
 
@@ -738,6 +751,8 @@ fn stale_hour_sql(after: Option<Hour>) -> String {
     format!(
         "SELECT kind,hour_number FROM summary_hour INDEXED BY summary_hour_stale
          WHERE (built_revision IS NOT revision OR format_version IS NOT {FORMAT}){after}
+           AND NOT EXISTS (SELECT 1 FROM summary_dirty_hour d
+               WHERE d.kind=summary_hour.kind AND d.hour_number=summary_hour.hour_number)
          ORDER BY kind,hour_number LIMIT 1"
     )
 }
@@ -830,21 +845,23 @@ impl SummaryMaintenance {
                 |row| row.get::<_, bool>(0),
             )?;
             let mut dirty=conn.query_row("SELECT kind,hour_number FROM summary_dirty_hour WHERE ?1 IS NULL OR kind>?1 OR (kind=?1 AND hour_number>?2) ORDER BY kind,hour_number LIMIT 1",params![self.dirty_after.map(|hour|hour.kind),self.dirty_after.map(|hour|hour.number)],|row|Ok(Hour{kind:row.get(0)?,number:row.get(1)?})).optional()?;
-            if dirty.is_none() {
-                dirty=conn.query_row("SELECT kind,hour_number FROM summary_dirty_hour ORDER BY kind,hour_number LIMIT 1",[],|row|Ok(Hour{kind:row.get(0)?,number:row.get(1)?})).optional()?;
-            }
-            let next = match dirty {
-                Some(hour) => Some(hour),
-                // Prefer candidates beyond the shared cursor before wrapping
-                // either queue, so a deferred ordinary hour cannot starve attribution.
-                None => [
+            let other = if dirty.is_none() {
+                // Give the other queues a turn before retrying any dirty hours
+                // we passed, including hours that exceed the publication budget.
+                [
                     next_stale(conn, self.stale_after)?,
                     attribution::next_summary(conn, self.stale_after)?,
                 ]
                 .into_iter()
                 .flatten()
-                .min_by_key(|hour| (self.stale_after.is_some_and(|after| *hour <= after), *hour)),
+                .min_by_key(|hour| (self.stale_after.is_some_and(|after| *hour <= after), *hour))
+            } else {
+                None
             };
+            if dirty.is_none() && other.is_none() && self.dirty_after.is_some() {
+                dirty=conn.query_row("SELECT kind,hour_number FROM summary_dirty_hour ORDER BY kind,hour_number LIMIT 1",[],|row|Ok(Hour{kind:row.get(0)?,number:row.get(1)?})).optional()?;
+            }
+            let next = dirty.or(other);
             // Counted whether or not this step goes to the audit instead,
             // which alternates with rebuilds while the audit is due.
             self.rebuild_backlog = next.is_some();
@@ -861,6 +878,7 @@ impl SummaryMaintenance {
                     // A deferred hour stays stale; rotate past it so later
                     // hours can rebuild within the publication row budget.
                     self.stale_after = Some(hour);
+                    self.dirty_after = None;
                 }
             }
             self.pending = Some(Build {
@@ -1194,28 +1212,35 @@ fn scoped_frame<'c>(
     let mut statement=conn.prepare(&format!("SELECT c.cell_id,c.kind,c.hour_number,c.provider,c.model,c.account,c.auth_selection,c.charge_basis,c.work_class,c.project,c.producer,c.runner,c.harness,c.currency,c.payload,c.paying_credential
         FROM summary_cell c{scope}"))?;
     let mut rows = statement.query(rusqlite::params_from_iter(&parameters))?;
-    let mut raw = Vec::new();
-    while let Some(row) = rows.next()? {
-        let hour = Hour {
-            kind: row.get(1)?,
-            number: row.get(2)?,
-        };
-        if !clean.contains(&hour) {
-            continue;
+    // Validate every clean cell in bounded batches so dictionary ids can be
+    // resolved together without buffering excluded payloads from the whole range.
+    const CELL_BATCH: usize = 64;
+    let mut batch = Vec::with_capacity(CELL_BATCH);
+    loop {
+        while batch.len() < CELL_BATCH {
+            let Some(row) = rows.next()? else { break };
+            let hour = Hour {
+                kind: row.get(1)?,
+                number: row.get(2)?,
+            };
+            if clean.contains(&hour) {
+                batch.push((hour, RawCell::read(row)?));
+            }
         }
-        raw.push(RawCell::read(row)?);
-    }
-    values.preload_ids(raw.iter().flat_map(|cell| cell.dictionary))?;
-    for row in raw {
-        let hour = row.hour;
-        let key = row.key(&mut values)?;
-        let cell = decode(&row.payload)?;
-        add_count(observed.entry(hour).or_default(), cell.events)?;
-        if seam(hour, &key, &cell)? {
-            split.insert(hour);
+        if batch.is_empty() {
+            break;
         }
-        if select(&key) {
-            cells.push((row.id, hour, key, cell));
+        values.preload_ids(batch.iter().flat_map(|(_, cell)| cell.dictionary))?;
+        for (hour, row) in batch.drain(..) {
+            let key = row.key(&mut values)?;
+            let cell = decode(&row.payload)?;
+            add_count(observed.entry(hour).or_default(), cell.events)?;
+            if seam(hour, &key, &cell)? {
+                split.insert(hour);
+            }
+            if select(&key) {
+                cells.push((row.id, hour, key, cell));
+            }
         }
     }
     for hour in &clean {
@@ -2236,6 +2261,41 @@ mod tests {
             ..ReportRequest::default()
         }
     }
+
+    thread_local! {
+        pub(super) static RAW_CELLS: std::cell::Cell<Option<(usize, usize)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    #[test]
+    fn a_selective_spend_report_does_not_buffer_clean_payloads() {
+        let mut conn = conn();
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<1023)
+             INSERT INTO usage_event(event_id,producer,producer_ref,session,model,
+                                     occurred_at_ms,recorded_at_ms,charge_basis)
+             SELECT 'event-'||i,'pi','ref-'||i,'busy','model-'||(i % 32),
+                    (i / 32)*{HOUR_MS},1,'metered_api' FROM n;"
+        ))
+        .unwrap();
+        catch_up(&mut conn);
+        let mut request = request("UTC", "day", &["model"]);
+        request
+            .filters
+            .insert("model".into(), vec![Some("model-0".into())]);
+        let expected = spend_report_base(&conn, &request, 10_000, None).unwrap();
+        assert!(!expected.rows.is_empty());
+        RAW_CELLS.set(Some((0, 0)));
+        let counter = crate::store::VmCounter::start(&conn);
+        let served = spend(&conn, &request, 10_000).unwrap().unwrap();
+        let steps = counter.steps();
+        let (active, peak) = RAW_CELLS.replace(None).unwrap();
+        eprintln!("spend model filter: {steps} SQLite VM steps; {peak} buffered payloads at peak");
+        equal(&served, &expected);
+        assert_eq!(active, 0);
+        assert!(peak <= 64, "too many buffered clean payloads: {peak}");
+    }
+
     #[test]
     fn runner_and_harness_summary_matches_ledger_for_grouping_and_where() {
         let mut conn = crate::test_support::conn();
@@ -3735,6 +3795,50 @@ mod tests {
         let later = step(&mut conn, &mut maintenance);
         assert_eq!(later.hour, Some((0, 1)));
         assert!(later.published && later.attribution_only);
+    }
+
+    #[test]
+    fn a_deferred_dirty_hour_leaves_turns_for_stale_and_attribution_hours() {
+        let mut conn = conn();
+        for (id, at, work) in [
+            ("large-a", 0, "coding"),
+            ("large-b", 0, "analysis"),
+            ("stale", HOUR_MS, "coding"),
+            ("attribution", 2 * HOUR_MS, "coding"),
+        ] {
+            record(&mut conn, id, Some(at), ChargeBasis::MeteredApi, Some(work));
+        }
+        catch_up(&mut conn);
+        conn.execute("UPDATE summary_audit_state SET next_due_ms=?1", [i64::MAX])
+            .unwrap();
+        conn.execute(
+            "UPDATE summary_hour SET format_version=?1 WHERE hour_number=1",
+            [FORMAT - 1],
+        )
+        .unwrap();
+        attribution::bump(&conn, Hour { kind: 0, number: 2 });
+        record(
+            &mut conn,
+            "large-c",
+            Some(0),
+            ChargeBasis::MeteredApi,
+            Some("coding"),
+        );
+        assert_eq!(dirty(&conn), 1);
+        let mut maintenance = SummaryMaintenance {
+            max_publication_rows: Some(3),
+            ..Default::default()
+        };
+        let first = step(&mut conn, &mut maintenance);
+        assert_eq!(first.hour, Some((0, 0)));
+        assert!(first.deferred);
+        let published = (0..4)
+            .map(|_| step(&mut conn, &mut maintenance))
+            .filter(|outcome| outcome.published)
+            .map(|outcome| (outcome.hour, outcome.attribution_only))
+            .collect::<Vec<_>>();
+        assert_eq!(published, [(Some((0, 1)), false), (Some((0, 2)), true)]);
+        assert_eq!(dirty(&conn), 1);
     }
 
     #[test]

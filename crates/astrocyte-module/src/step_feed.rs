@@ -11,7 +11,6 @@
 //! subscriber whose queue fills, because its sends are held up by the serve
 //! helper's bounded outbound queue, ends with the error `lagged`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,7 +22,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use subc_client_rs::{async_trait, HandlerOutcome, RequestCtx};
 use subc_protocol::Principal;
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch, Notify, Semaphore};
 
 use crate::state::SharedState;
 
@@ -84,7 +83,7 @@ pub struct FeedSubscribeRequest {
 
 struct Subscriber {
     queue: mpsc::Sender<i64>,
-    lagged: AtomicBool,
+    lagged: Notify,
     filter: Option<FeedFilter>,
 }
 
@@ -345,7 +344,7 @@ impl FeedHub {
             match subscriber.queue.try_send(through) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    subscriber.lagged.store(true, Ordering::Release);
+                    subscriber.lagged.notify_one();
                     false
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -373,25 +372,29 @@ impl FeedHub {
         let mut last_told = opened_at;
         let mut last_sent: Option<tokio::time::Instant> = None;
         loop {
-            let Some(mut through) = queue.recv().await else {
-                // The hub drops its end only when this subscriber lagged.
-                return StreamEnd::Lagged { through: last_told };
+            // A full queue must interrupt even a blocked outbound send, or the
+            // subscriber keeps its shared slot until the client reads again.
+            let sent = tokio::select! {
+                biased;
+                () = subscriber.lagged.notified() => return StreamEnd::Lagged { through: last_told },
+                sent = async {
+                    let mut through = queue.recv().await?;
+                    if let Some(sent) = last_sent {
+                        tokio::time::sleep_until(sent + NOTICE_INTERVAL).await;
+                    }
+                    while let Ok(newer) = queue.try_recv() {
+                        through = newer;
+                    }
+                    let notice = json!({ "through": feed::encode_cursor(through) });
+                    sink.emit(notice.to_string().into_bytes()).await.ok()?;
+                    Some(through)
+                } => sent,
             };
-            if let Some(sent) = last_sent {
-                tokio::time::sleep_until(sent + NOTICE_INTERVAL).await;
-            }
-            while let Ok(newer) = queue.try_recv() {
-                through = newer;
-            }
-            let notice = json!({ "through": feed::encode_cursor(through) });
-            if sink.emit(notice.to_string().into_bytes()).await.is_err() {
+            let Some(through) = sent else {
                 return StreamEnd::Gone;
-            }
+            };
             last_told = through;
             last_sent = Some(tokio::time::Instant::now());
-            if subscriber.lagged.load(Ordering::Acquire) {
-                return StreamEnd::Lagged { through: last_told };
-            }
         }
     }
 }
@@ -442,7 +445,7 @@ pub async fn subscribe(
     let (queue_sender, queue) = mpsc::channel(SUBSCRIBER_QUEUE);
     let subscriber = Arc::new(Subscriber {
         queue: queue_sender,
-        lagged: AtomicBool::new(false),
+        lagged: Notify::new(),
         filter,
     });
     let opened_at = {
@@ -1412,18 +1415,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn late_step_detail_is_published_after_an_append_failure_and_restart() {
+        use astrocyte_core::{ingest, store};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ledger.db");
+        let mut conn = Connection::open(&path).unwrap();
+        store::initialize_connection(&conn).unwrap();
+        for migration in store::MIGRATIONS {
+            conn.execute_batch(migration.statements).unwrap();
+        }
+
+        let hub = FeedHub::default();
+        let now = now_ms();
+        let mut event: ingest::EventRecordRequest = serde_json::from_value(json!({
+            "producer":"pi","producer_ref":"one","session":"s",
+            "charge_basis":"unknown","occurred_at_ms":now,"measurements":[]
+        }))
+        .unwrap();
+        let record = |conn: &mut Connection, event: &ingest::EventRecordRequest| {
+            let tx = conn.transaction().unwrap();
+            let outcome =
+                ingest::record_event_in_tx(&tx, event, now, ingest::DeliveryPath::Read).unwrap();
+            tx.commit().unwrap();
+            outcome.disposition
+        };
+        record(&mut conn, &event);
+        hub.publish(&conn, now, &[]).unwrap();
+        let first = feed::through(&conn).unwrap();
+        assert!(first > 0);
+
+        event.step_detail.finish = Some("tool-calls".into());
+        event.step_detail.context_limit = Some(32_000);
+        assert_eq!(
+            record(&mut conn, &event),
+            ingest::RecordDisposition::ExactRedelivery
+        );
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_feed BEFORE INSERT ON main.step_feed
+             BEGIN SELECT RAISE(ABORT, 'injected feed failure'); END;",
+        )
+        .unwrap();
+        let read_late = astrocyte_core::cache_diagnostics::pending_late_step_details;
+        assert!(hub.publish(&conn, now, &read_late(&conn).unwrap()).is_err());
+        assert_eq!(feed::through(&conn).unwrap(), first);
+        drop(conn);
+
+        let conn = Connection::open(path).unwrap();
+        store::initialize_connection(&conn).unwrap();
+        let hub = FeedHub::default();
+        hub.publish(&conn, now, &read_late(&conn).unwrap()).unwrap();
+        let row: String = conn
+            .query_row(
+                "SELECT row_json FROM step_feed WHERE feed_cursor>?1",
+                [first],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let row: Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(row["finish"], "tool-calls");
+        assert_eq!(row["context_limit"], 32_000);
+        let published = feed::through(&conn).unwrap();
+        hub.publish(&conn, now, &read_late(&conn).unwrap()).unwrap();
+        assert_eq!(feed::through(&conn).unwrap(), published);
+    }
+
     /// A subscriber whose sends are held up while more commits arrive than
     /// its queue holds ends `lagged`, naming the last cursor it was told.
     #[tokio::test]
-    async fn a_subscriber_that_falls_behind_its_queue_ends_lagged() {
+    async fn a_lagged_subscriber_releases_its_slot_while_the_sink_is_blocked() {
         let state = test_state();
         let (sent_tx, mut sent) = mpsc::unbounded_channel();
         let (entered_tx, mut entered) = mpsc::unbounded_channel();
-        let permits = Arc::new(Semaphore::new(0));
         let sink = TestSink {
             sent: sent_tx,
             entered: entered_tx,
-            permits: Arc::clone(&permits),
+            permits: Arc::new(Semaphore::new(1)),
         };
         let (_stop, stopping) = watch::channel(false);
         let subscribing = state.clone();
@@ -1437,23 +1505,26 @@ mod tests {
         .await
         .expect("the subscription never opened");
         record_steps_for_test(&state, "pi", &[TestStep::now("s", "s:0")], false).unwrap();
-        // The subscriber is now sending its first notice and is held there
-        // while more commits arrive than its queue holds.
         tokio::time::timeout(HANG_GUARD, entered.recv())
             .await
             .expect("the subscriber never tried to send")
             .unwrap();
         let first = state.step_feed().through().unwrap();
-        for index in 1..=SUBSCRIBER_QUEUE + 1 {
+        let told = tokio::time::timeout(HANG_GUARD, sent.recv())
+            .await
+            .expect("the first notice was never sent")
+            .unwrap();
+        assert_eq!(told, json!({"through": feed::encode_cursor(first)}));
+        record_steps_for_test(&state, "pi", &[TestStep::now("s", "s:1")], false).unwrap();
+        // The second send has no permit; only the first was delivered.
+        tokio::time::timeout(HANG_GUARD, entered.recv())
+            .await
+            .expect("the subscriber never tried to send again")
+            .unwrap();
+        for index in 2..=SUBSCRIBER_QUEUE + 2 {
             let step_ref = format!("s:{index}");
             record_steps_for_test(&state, "pi", &[TestStep::now("s", &step_ref)], false).unwrap();
         }
-        permits.add_permits(1_000);
-        let told = tokio::time::timeout(HANG_GUARD, sent.recv())
-            .await
-            .expect("the held notice was never sent")
-            .unwrap();
-        assert_eq!(told, json!({"through": feed::encode_cursor(first)}));
         let ended = tokio::time::timeout(HANG_GUARD, serving)
             .await
             .expect("the subscription did not end")
@@ -1464,6 +1535,7 @@ mod tests {
         assert_eq!(code, "lagged");
         assert_eq!(detail, json!({"through": feed::encode_cursor(first)}));
         assert_eq!(state.step_feed().open_subscriptions(), 0);
+        assert!(sent.try_recv().is_err());
     }
 
     #[test]

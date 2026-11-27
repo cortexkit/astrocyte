@@ -369,6 +369,95 @@ fn attribution_reader_pages_from_durable_cursor_and_known_suffix_opens_no_transa
     assert_eq!(replay.calls[0]["after"], 2);
     assert_eq!(transaction_attempts_for_test(), before);
 }
+
+#[test]
+fn attribution_reader_saves_progress_through_replay_only_and_empty_pages() {
+    let state = test_state();
+    let pages = basal_pages();
+    let mut initial = Peer::new(pages.clone());
+    run(&state, Publisher::Basal, &mut initial);
+
+    let mut known = pages[1].clone();
+    known["result"]["next"] = json!({"sequence": 5});
+    let empty = json!({"result":{"facts":[],"next":{"sequence":6},"through":9}});
+    let terminal = json!({"result":{"facts":[],"next":null,"through":9}});
+    let mut replay = Peer::new(vec![known, empty, terminal.clone()]);
+    run(&state, Publisher::Basal, &mut replay);
+
+    state
+        .with_conn(|conn| {
+            let (cursor, through, facts): (String, String, i64) = conn
+                .query_row(
+                    "SELECT cursor,through,(SELECT count(*) FROM attribution_fact)
+                     FROM attribution_cursor WHERE publisher='basal'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&cursor).unwrap(),
+                json!({"sequence":6})
+            );
+            assert_eq!(through, "9");
+            assert_eq!(facts, 4);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(replay.calls.len(), 3);
+    assert_eq!(replay.calls[1]["after"], json!({"sequence":5}));
+
+    let mut restarted = Peer::new(vec![terminal]);
+    run(&state, Publisher::Basal, &mut restarted);
+    assert_eq!(restarted.calls[0]["after"], json!({"sequence":6}));
+}
+
+#[test]
+fn attribution_reader_yields_backlog_and_resumes_at_its_saved_cursor() {
+    let state = test_state();
+    let mut replies = basal_pages();
+    let known = replies[1]["result"]["facts"].clone();
+    replies[1]["result"]["next"] = json!(4);
+    replies.extend((5..=12).map(|next| json!({"result":{"facts":known,"next":next,"through":12}})));
+    replies.push(json!({"result":{"facts":[],"next":null,"through":12}}));
+    let mut peer = Peer::new(replies);
+    let stop = AtomicBool::new(false);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let source = crate::event_wakes::Source::Attribution(Publisher::Basal.key());
+    state.event_wakes().attached(&[source], true);
+    let mut seen = Vec::new();
+    drain_selected(
+        &state,
+        &stop,
+        true,
+        || 100,
+        |publisher| {
+            seen.push(publisher);
+            if publisher == Publisher::Basal {
+                runtime
+                    .block_on(drain_pages(&state, publisher, 100, &stop, &mut peer))
+                    .map_err(DrainError::Page)
+            } else {
+                Ok(true)
+            }
+        },
+    );
+    assert_eq!(seen, Publisher::ALL);
+    assert_eq!(peer.calls.len(), 8, "a publisher must yield after one turn");
+
+    // An attached source with an unfinished turn remains due before its backstop.
+    let next = state.event_wakes().begin(source, true, 101).unwrap();
+    let complete = runtime
+        .block_on(drain_pages(&state, Publisher::Basal, 101, &stop, &mut peer))
+        .unwrap();
+    next.finish(complete);
+    assert!(complete);
+    assert_eq!(peer.calls[8]["after"], 10);
+    assert_eq!(peer.calls.len(), 11);
+}
+
 #[test]
 fn attribution_reader_refusals_route_errors_and_empty_pages_preserve_cursor_and_health() {
     for code in [

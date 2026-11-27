@@ -1,4 +1,4 @@
-//! Read attribution on scheduled refreshes, not the shorter pricing-only cycles.
+//! Read attribution on publisher wakes and scheduled refreshes.
 use crate::peer_exchange::open_route;
 use crate::state::SharedState;
 use astrocyte_core::attribution::{self, Page, Publisher};
@@ -12,6 +12,7 @@ use subc_client_rs::{CallError, CallOptions, NotSentCause, RouteHandle, SubcCons
 use subc_protocol::{error_codes, RouteTarget};
 
 const LIMIT: usize = 128;
+const PAGES_PER_TURN: usize = 8;
 const BUDGET: Duration = Duration::from_secs(10);
 fn options() -> CallOptions {
     CallOptions {
@@ -170,7 +171,7 @@ async fn drain_pages<T: ReadTransport>(
     if let Some(cursor) = &cursor {
         seen.push(cursor.clone());
     }
-    loop {
+    for _ in 0..PAGES_PER_TURN {
         if stop.load(Ordering::Relaxed) {
             return Ok(false);
         }
@@ -203,9 +204,6 @@ async fn drain_pages<T: ReadTransport>(
             malformed_page(state, publisher, &bytes, "malformed_page", now)?;
             return Ok(false);
         };
-        if page.facts.is_empty() {
-            return Ok(true);
-        }
         if page.next.as_ref().is_some_and(|next| seen.contains(next)) {
             malformed_page(state, publisher, &bytes, "cursor_not_advanced", now)?;
             return Ok(false);
@@ -230,6 +228,9 @@ async fn drain_pages<T: ReadTransport>(
         seen.push(next.clone());
         cursor = Some(next);
     }
+    // Other publishers get a turn before we resume. Leave the notice pending
+    // and keep the publisher due on the next full tick until its suffix is read.
+    Ok(false)
 }
 
 enum DrainError {

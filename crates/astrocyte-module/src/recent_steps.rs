@@ -157,10 +157,10 @@ impl RecentSteps {
 
     /// Fold in what was committed since the last call. Runs after a commit,
     /// on the writer's connection, under the writer fence, so nothing is
-    /// committed meanwhile. `late` are the events that gained a
-    /// `step_detail` row since the last call (the caller takes them with
-    /// `cache::take_late_step_details`, because the live step feed needs
-    /// them too). On failure memory stops answering; the store still does.
+    /// committed meanwhile. `late` are the event keys with new `step_detail`
+    /// still pending in the live step feed. The caller reads them with
+    /// `cache::pending_late_step_details`. On failure memory stops answering;
+    /// the store still does.
     pub(crate) fn advance(
         &mut self,
         conn: &Connection,

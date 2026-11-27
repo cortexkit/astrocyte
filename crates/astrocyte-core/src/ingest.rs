@@ -1226,17 +1226,12 @@ fn record_step_detail(
     Ok(written == 1)
 }
 
-/// Remember, for this connection only, that an event recorded earlier gained
-/// its `step_detail` row in this transaction. New events are found by their
-/// increasing `event_key`; an older event gaining a row is not, so the
-/// serving side's recent-steps cache reads this list after the commit (see
-/// `cache_diagnostics::take_late_step_details`). A TEMP table is private to
-/// the connection, is never written to the store file, and rolls back with
-/// the transaction, so a rolled-back re-read leaves nothing behind.
+/// Queue the late detail in the transaction that records it. An older event
+/// falls before the feed's cache cursor, so the feed needs a separate cursor
+/// for late detail. It can then retry a failed append or resume after a restart.
 fn note_late_step_detail(tx: &Transaction<'_>, event_id: &str) -> Result<(), IngestError> {
-    tx.execute_batch(crate::cache_diagnostics::CREATE_LATE_STEP_DETAIL)?;
     tx.execute(
-        "INSERT OR IGNORE INTO temp.step_detail_late (event_key)
+        "INSERT INTO step_detail_late (event_key)
          SELECT event_key FROM usage_event WHERE event_id=?1",
         [event_id],
     )?;
@@ -2257,7 +2252,7 @@ mod tests {
             Some((Some("tool-calls".into()), None))
         );
         assert_eq!(
-            crate::cache_diagnostics::take_late_step_details(&conn).unwrap(),
+            crate::cache_diagnostics::pending_late_step_details(&conn).unwrap(),
             vec![conn
                 .query_row(
                     "SELECT event_key FROM usage_event WHERE event_id=?1",
@@ -2267,6 +2262,9 @@ mod tests {
                 .unwrap()],
             "the late row is announced to the recent-steps memory"
         );
+        let tx = conn.transaction().unwrap();
+        crate::step_feed::append_changes(&tx, 3_000, &[]).unwrap();
+        tx.commit().unwrap();
 
         let different = with_detail(first.clone(), Some("stop"), Some(9));
         let outcome = record_via(&mut conn, &different, 4_000, DeliveryPath::Read);
@@ -2275,7 +2273,7 @@ mod tests {
             stored_detail(&conn, &id),
             Some((Some("tool-calls".into()), None))
         );
-        assert!(crate::cache_diagnostics::take_late_step_details(&conn)
+        assert!(crate::cache_diagnostics::pending_late_step_details(&conn)
             .unwrap()
             .is_empty());
 

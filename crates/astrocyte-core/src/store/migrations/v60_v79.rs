@@ -623,3 +623,12 @@ CROSS JOIN broca_segment_evidence e ON e.fact_id=m.fact_id;
 INSERT INTO broca_segment_current_mismatch(segment_key)
 SELECT segment_key FROM broca_segment_recheck;
 "#;
+
+pub(in crate::store) const V72: &str = r#"
+CREATE TABLE step_detail_late (
+    pending_id INTEGER PRIMARY KEY,
+    event_key INTEGER NOT NULL UNIQUE REFERENCES step_detail(event_key) ON DELETE RESTRICT
+) STRICT;
+
+ALTER TABLE step_feed_state ADD COLUMN late_detail_high_water INTEGER NOT NULL DEFAULT 0;
+"#;

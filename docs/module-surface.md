@@ -1388,17 +1388,20 @@ the durable watermark before reading.
 
 The manifest always declares the four attribution publishers as service clients.
 Its `self_signals` also describe each periodic read as a poller with an observe
-effect: the peer call reads facts rather than mutating the publisher. They run only
-on scheduled full refreshes, never the shorter pricing-only cycles. Each page
-commits its facts and cursor in one transaction. An empty page is one call.
+effect: the peer call reads facts rather than mutating the publisher. With the
+bus consumer attached, an attribution-fact event wakes only its publisher;
+scheduled full refreshes provide an hourly polling backstop. Without the bus
+consumer, full refreshes poll each publisher. Each page commits its facts and
+cursor in one transaction. A publisher with more than eight pages to read yields
+to the others and resumes from its saved cursor on the next full refresh or wake.
 Only a returned `next` is a resume token; a terminal null keeps the request
-cursor and replays that suffix next refresh. A page containing only unchanged,
-known facts opens no write transaction, including no cursor update. Changed
+cursor and replays that suffix next refresh. An unchanged page with no new
+resume token opens no write transaction. A new resume token is saved even when
+the page has only known facts or is empty. Changed
 bodies for known identifiers are set aside as `fact_body_changed`, never
 replaced. Malformed facts, invalid open workload/task names, and subjects already
 claimed by another publisher are also set aside and counted by source in
-`spend.ledger.coverage`. Attribution-fact events do not yet trigger refreshes;
-only the scheduled refresh polls each publisher.
+`spend.ledger.coverage`.
 Known correction targets must have the same publisher and exact subject
 (`project_id` for placements);
 `supersedes_other_subject` distinguishes a bad correction from a malformed body.
