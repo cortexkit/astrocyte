@@ -1925,8 +1925,9 @@ mod tests {
             let heads = f.folder.parent().unwrap().to_path_buf();
             let first = heads.join("launch-head-first/data/opencode");
             let moved = heads.join("launch-head-moved/data/opencode");
+            let original_db = first.join("opencode.db");
             insert(
-                &first.join("opencode.db"),
+                &original_db,
                 layout,
                 "history",
                 "assistant",
@@ -1940,16 +1941,34 @@ mod tests {
 
             // The session moves to another head under another owner, and its
             // new store carries the old call as well as a new one.
+            // The fixture writer has closed and the declared reader keeps no
+            // connection. Copy the bytes directly to avoid the filesystem
+            // clone that fs::copy can use on macOS.
+            let moved_db = moved.join("opencode.db");
             fs::create_dir_all(&moved).unwrap();
-            fs::copy(first.join("opencode.db"), moved.join("opencode.db")).unwrap();
+            fs::write(&moved_db, fs::read(&original_db).unwrap()).unwrap();
             insert(
-                &moved.join("opencode.db"),
+                &moved_db,
                 layout,
                 "after-move",
                 "assistant",
                 CREATED + TICK,
                 &payload(layout, true),
             );
+            let history_present: bool = Connection::open(&moved_db)
+                .unwrap()
+                .query_row(
+                    match layout {
+                        Layout::V1 => "SELECT EXISTS(SELECT 1 FROM message WHERE id = 'history')",
+                        Layout::V2 => {
+                            "SELECT EXISTS(SELECT 1 FROM session_message WHERE id = 'history')"
+                        }
+                    },
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(history_present, "{layout:?}: moved store lost its history");
             let mut moved_entry = f.entry(TWO, false);
             moved_entry["path"] = json!(moved);
             moved_entry["owner_principal"] = json!("other-owner");
