@@ -68,8 +68,9 @@ when the request type has no default for it; an optional field also accepts
 ## 2. Operations
 
 `PUBLIC_OPERATION_NAMES` is the closed list. An unknown method is refused
-`unknown_method`. Writes are serialized through one writer; reads run on a
-read-only connection in one snapshot and neither wait for nor block ingest.
+`unknown_method`. Writes are serialized through one writer. Each read uses one
+snapshot on one of two read-only connections and neither waits for nor blocks
+ingest.
 Test: `every_operation_name_reaches_its_own_handler`.
 
 | Operation | Kind | Request fields (required unless marked `?`) |
@@ -1378,8 +1379,9 @@ re-lists after every notice and on daily full-tick backstops. Only full ticks
 record its queued observations, outside all peer calls.
 
 Colliculus uses the module's daemon connection file while its source is ingested.
-The manifest declares its consumer and `astrocyte-colliculus-usage-read` self-signal
-by default, omitting both when `harness_ingest` is disabled or excludes `colliculus`.
+HELLO always declares Colliculus as a peer and `astrocyte-colliculus-usage-read`
+as a conditional self-signal. A reload changes whether astrocyte ingests
+Colliculus usage, not what the connection declares.
 The signal describes `usage.read` as an observe poller on the refresher tick cadence;
 its note records that `usage.ack` follows each committed page and retries acknowledge
 the durable watermark before reading.

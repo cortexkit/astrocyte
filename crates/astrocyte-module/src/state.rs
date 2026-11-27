@@ -15,18 +15,20 @@ use serde_json::{json, Value};
 
 use crate::config::{self, AstrocyteConfig};
 
+mod read_pool;
+use read_pool::ReadPool;
+
 #[cfg(any(test, feature = "test-support"))]
 use astrocyte_core::store::MIGRATIONS;
 
 enum StateStore {
-    /// The production store: the leased writer connection, and a second,
-    /// read-only connection to the same file that served reports run on, so a
-    /// long report never holds the connection the writer commits through.
+    /// The production store: one leased writer and two read-only connections
+    /// to the same file, so a long report doesn't block writes or a short read.
     /// The store is boxed because it is much larger than the test-only
     /// variant; the state is built once per process, so the indirection is free.
     Leased {
         store: Box<SqliteStore>,
-        reader: Mutex<Connection>,
+        readers: ReadPool,
     },
     /// A single in-memory connection. An in-memory database cannot be opened
     /// by a second connection, so reads and writes share this one; tests that
@@ -61,6 +63,7 @@ struct Inner {
     producer_degraded: RwLock<BTreeMap<String, String>>,
     projection: RwLock<ProjectionSnapshot>,
     projection_degraded: RwLock<Option<String>>,
+    spend_last_attempt_ms: Mutex<Option<i64>>,
     crash: tokio::sync::watch::Sender<Option<String>>,
     /// Last observed store presence per source, kept after an absent store deletes
     /// its runtime row so the change is logged only once.
@@ -304,11 +307,11 @@ impl SharedState {
         let (config, generation) = hydrated
             .unwrap_or_else(|| Err("the store did not run the hydration".to_string()))
             .map_err(|error| format!("hydrate state: {error}"))?;
-        let reader = open_reader(&store)?;
+        let readers = ReadPool::new([open_reader(&store)?, open_reader(&store)?]);
         let state = Self::from_parts(
             StateStore::Leased {
                 store: Box::new(store),
-                reader: Mutex::new(reader),
+                readers,
             },
             config,
             generation,
@@ -330,6 +333,7 @@ impl SharedState {
             catalog: RwLock::new(None),
             producer_degraded: RwLock::new(BTreeMap::new()),
             projection_degraded: RwLock::new(None),
+            spend_last_attempt_ms: Mutex::new(None),
             projection: RwLock::new(ProjectionSnapshot {
                 source_runtime: Vec::new(),
                 capacity_runtime: None,
@@ -357,13 +361,13 @@ impl SharedState {
         }))
     }
 
-    /// A served read, run inside ONE read transaction on the reader connection.
+    /// A served read, run inside one read transaction on a pooled reader.
     ///
-    /// The reader is a separate read-only connection to the same WAL-mode
-    /// file, guarded by its own mutex. It takes neither the writer fence nor
-    /// the writer's connection mutex, so a slow report does not hold up an
-    /// ingest commit, and a commit does not wait for the report. The
-    /// transaction holds one snapshot from the first SELECT until `COMMIT`, so
+    /// Each reader is a separate read-only connection to the same WAL-mode
+    /// file. Reads don't acquire the lock that serializes writes and their
+    /// post-commit work or the writer's connection mutex. Reports and ingest
+    /// commits therefore don't wait on each other. The transaction holds one
+    /// snapshot from the first SELECT until `COMMIT`, so
     /// every SELECT in the operation sees the same committed state, and a
     /// commit made meanwhile is seen by the next call. SQLite refuses a write
     /// on this connection.
@@ -388,14 +392,8 @@ impl SharedState {
         operation: impl FnOnce(&Connection) -> Result<T, E>,
     ) -> Result<T, StoreFailure<E>> {
         match &self.0.store {
-            // A poisoned reader mutex is read through: the reader holds no
-            // state between calls, and a transaction a panicking call left
-            // open was rolled back when it unwound.
-            StateStore::Leased { reader, .. } => {
-                let guard = reader
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                self.run_read_transaction(&guard, operation)
+            StateStore::Leased { readers, .. } => {
+                readers.with(|conn| self.run_read_transaction(conn, operation))
             }
             #[cfg(any(test, feature = "test-support"))]
             StateStore::Direct(connection) => {
@@ -577,16 +575,7 @@ impl SharedState {
             }
         };
         if changed {
-            if let Err(error) = self.refresh_projection() {
-                tracing::error!(target: "astrocyte", %error,
-                    "write committed but projection refresh failed");
-                *self
-                    .0
-                    .projection_degraded
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    Some(format!("projection stale: {error}"));
-            }
+            self.refresh_projection_or_mark_stale();
         }
         Ok(value)
     }
@@ -824,7 +813,7 @@ impl SharedState {
             generation,
             degraded: None,
         };
-        let _ = self.refresh_projection();
+        self.refresh_projection_or_mark_stale();
         crate::bus_publications::publish_watermark(self);
     }
     pub(crate) fn mark_config_degraded(&self, message: String) {
@@ -833,7 +822,17 @@ impl SharedState {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .degraded = Some(message);
-        let _ = self.refresh_projection();
+        self.refresh_projection_or_mark_stale();
+    }
+
+    /// Health drains can fail before writing anything. Record the attempt
+    /// separately from the committed successes that still govern freshness.
+    pub(crate) fn note_spend_drain_attempt(&self, at_ms: i64) {
+        *self
+            .0
+            .spend_last_attempt_ms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(at_ms);
     }
 
     pub(crate) fn mark_producer_degraded(&self, source_key: &str, reason: String) {
@@ -870,6 +869,18 @@ impl SharedState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(source_key)
             .cloned()
+    }
+
+    fn refresh_projection_or_mark_stale(&self) {
+        if let Err(error) = self.refresh_projection() {
+            tracing::error!(target: "astrocyte", %error, "health projection refresh failed");
+            *self
+                .0
+                .projection_degraded
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(format!("projection stale: {error}"));
+        }
     }
 
     fn refresh_projection(&self) -> Result<(), String> {
@@ -1209,11 +1220,19 @@ impl PublicProjection {
                     })
                 })
                 .unwrap_or_else(|| json!({})),
-            spend_last_attempt_ms: projection
-                .source_runtime
-                .iter()
-                .filter_map(|source| source.last_success_ms)
-                .max(),
+            spend_last_attempt_ms: self
+                .0
+                 .0
+                .spend_last_attempt_ms
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .or_else(|| {
+                    projection
+                        .source_runtime
+                        .iter()
+                        .filter_map(|source| source.last_success_ms)
+                        .max()
+                }),
         }
     }
 }
@@ -1337,26 +1356,31 @@ mod report_reader_tests {
     fn leased_report_reader_has_effective_mapping_and_cache_without_tuning_writer() {
         let directory = tempfile::tempdir().unwrap();
         let state = leased_test_state(&directory);
-        let StateStore::Leased { store, reader } = &state.0.store else {
+        let StateStore::Leased { store, readers } = &state.0.store else {
             panic!("leased fixture must use the production reader");
         };
-        let reader = reader.lock().unwrap();
-        let mmap: i64 = reader
-            .pragma_query_value(None, "mmap_size", |row| row.get(0))
-            .unwrap();
-        let cache: i64 = reader
-            .pragma_query_value(None, "cache_size", |row| row.get(0))
-            .unwrap();
-        assert_eq!(mmap, astrocyte_core::report::REPORT_MMAP_BYTES);
-        assert_eq!(cache, astrocyte_core::report::REPORT_CACHE_KIB);
-        assert!(reader
-            .execute("CREATE TABLE must_be_read_only (id INTEGER)", [])
-            .is_err());
+        let assert_reader_settings = |reader: &Connection| {
+            let mmap: i64 = reader
+                .pragma_query_value(None, "mmap_size", |row| row.get(0))
+                .unwrap();
+            let cache: i64 = reader
+                .pragma_query_value(None, "cache_size", |row| row.get(0))
+                .unwrap();
+            assert_eq!(mmap, astrocyte_core::report::REPORT_MMAP_BYTES);
+            assert_eq!(cache, astrocyte_core::report::REPORT_CACHE_KIB);
+            assert!(reader
+                .execute("CREATE TABLE must_be_read_only (id INTEGER)", [])
+                .is_err());
+        };
+        readers.with(|first| {
+            assert_reader_settings(first);
+            readers.with(assert_reader_settings);
+        });
         store
             .with_conn(|writer| {
                 let writer_cache: i64 =
                     writer.pragma_query_value(None, "cache_size", |row| row.get(0))?;
-                assert_ne!(writer_cache, cache);
+                assert_ne!(writer_cache, astrocyte_core::report::REPORT_CACHE_KIB);
                 let writer_mmap: i64 =
                     writer.pragma_query_value(None, "mmap_size", |row| row.get(0))?;
                 assert_eq!(writer_mmap, 0);
@@ -1494,6 +1518,35 @@ mod health_tests {
         let health = state.public_projection().health(10_000);
         assert_eq!(health.status, "ok", "{:?}", health.degraded_reason);
         assert_eq!(health.degraded_reason, None);
+    }
+
+    #[test]
+    fn config_publication_marks_a_retained_projection_stale() {
+        let state = test_state();
+        drain_broca(&state, 9_000, 5, 5);
+        assert_eq!(state.public_projection().health(10_000).status, "ok");
+        // Hide the runtime table only for the publication that must retain
+        // the previous snapshot. Restore it to verify that refresh recovers.
+        let rename = |sql| {
+            state
+                .with_conn(|conn| conn.execute_batch(sql).map_err(|error| error.to_string()))
+                .unwrap();
+        };
+        rename("ALTER TABLE source_runtime RENAME TO hidden_runtime");
+        let config = state.desired_config();
+        state.publish_desired(config.clone(), 7);
+        assert_eq!(state.desired_generation(), 7);
+        let health = state.public_projection().health(10_000);
+        assert_eq!(health.spend_last_attempt_ms, Some(9_000));
+        assert_eq!(health.status, "degraded");
+        assert!(health
+            .degraded_reason
+            .unwrap()
+            .starts_with("projection stale:"));
+
+        rename("ALTER TABLE hidden_runtime RENAME TO source_runtime");
+        state.publish_desired(config, 8);
+        assert_eq!(state.public_projection().health(10_000).status, "ok");
     }
 
     #[test]
@@ -1815,6 +1868,50 @@ mod read_connection_tests {
     }
 
     #[test]
+    fn short_served_read_finishes_while_a_report_holds_its_snapshot() {
+        use std::{sync::mpsc, time::Duration};
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let state = leased_test_state(&directory);
+        ingest_event(&state, "before-report");
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        state.pause_next_read_for_test(move |conn| {
+            assert_eq!(event_count(conn), 1);
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        });
+        let report_state = state.clone();
+        let report = std::thread::spawn(move || {
+            crate::ops::dispatch(
+                &report_state,
+                crate::ops::OP_REPORT,
+                json!({"grouping": [], "grain": "day", "timezone": "UTC"}),
+            )
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("spend.report never opened its snapshot");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let short = std::thread::spawn(move || {
+            let _ = done_tx.send(crate::ops::dispatch(
+                &state,
+                crate::ops::OP_VERDICT,
+                json!({}),
+            ));
+        });
+        let verdict = done_rx.recv_timeout(Duration::from_secs(5));
+        let _ = release_tx.send(());
+        crate::test_support::join_within(report, "the spend.report thread").unwrap();
+        crate::test_support::join_within(short, "the budget.verdict thread");
+        let verdict = verdict
+            .expect("budget.verdict waited behind spend.report")
+            .unwrap();
+        assert_eq!(verdict["uncertainty"]["events_total"], 1);
+    }
+
+    #[test]
     fn regression_long_verdict_allows_ingest_and_keeps_one_snapshot() {
         use std::sync::mpsc;
         use std::time::Duration;
@@ -1892,10 +1989,10 @@ mod read_connection_tests {
     fn served_read_store_failure_is_internal_with_the_sqlite_error() {
         let directory = tempfile::TempDir::new().unwrap();
         let state = leased_test_state(&directory);
-        let StateStore::Leased { reader, .. } = &state.0.store else {
+        let StateStore::Leased { readers, .. } = &state.0.store else {
             unreachable!("leased_test_state builds a leased store")
         };
-        reader.lock().unwrap().execute_batch("BEGIN").unwrap();
+        readers.with(|conn| conn.execute_batch("BEGIN").unwrap());
 
         let (code, message) =
             crate::ops::dispatch(&state, crate::ops::OP_LEDGER_COVERAGE, json!({})).unwrap_err();

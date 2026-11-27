@@ -20,7 +20,7 @@ impl ConfirmationRig {
             confirmation_required: required,
         };
         let path = daemon.config.connection_file_path.clone();
-        let declaration = manifest(DEFAULT_MODULE_ID, &state.desired_config());
+        let declaration = manifest(DEFAULT_MODULE_ID);
         let serving = tokio::spawn(async move {
             ServeOptions::default()
                 .serve_with(&path, declaration, handler)
@@ -351,7 +351,7 @@ async fn ledger_confirmation_direct_read_never_prompts() {
 
 #[test]
 fn ledger_confirmation_manifest_declares_exactly_the_nine_writes() {
-    let declaration = manifest(DEFAULT_MODULE_ID, &config::intentional_empty().config);
+    let declaration = manifest(DEFAULT_MODULE_ID);
     let names = declaration
         .confirm_operations
         .expect("confirm_operations must be declared");

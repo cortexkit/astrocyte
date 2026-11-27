@@ -10,6 +10,7 @@ pub fn drain_once(
     limit: u32,
     now_ms: i64,
 ) -> Result<DrainOutcome, PullError> {
+    state.note_spend_drain_attempt(now_ms);
     drain_once_in_lane(
         state,
         source,
@@ -307,10 +308,12 @@ pub(super) fn drain_harness(
     harness: &dyn harness_drain::HarnessSource,
     stop: &AtomicBool,
 ) {
+    let now_ms = current_time_ms();
+    state.note_spend_drain_attempt(now_ms);
     finish_harness_drain(
         state,
         harness.source_key(),
-        harness.drain_for_health(state, current_time_ms(), stop),
+        harness.drain_for_health(state, now_ms, stop),
     );
 }
 
@@ -327,10 +330,12 @@ pub(super) fn drain_media_if_due(
     ) else {
         return;
     };
+    let now_ms = current_time_ms();
+    state.note_spend_drain_attempt(now_ms);
     let result = if ticket.has_notice() {
-        harness.drain_after_notice(state, current_time_ms(), stop)
+        harness.drain_after_notice(state, now_ms, stop)
     } else {
-        harness.drain_for_health(state, current_time_ms(), stop)
+        harness.drain_for_health(state, now_ms, stop)
     };
     ticket.finish(result.is_ok());
     finish_harness_drain(state, harness.source_key(), result);
@@ -483,6 +488,36 @@ mod tests {
                 pending_unknown: false,
             })
         }
+    }
+
+    #[test]
+    fn a_failed_drain_advances_health_attempt_but_not_success() {
+        let state = test_state();
+        let key = "broca";
+        assert_eq!(
+            state.public_projection().health(100).spend_last_attempt_ms,
+            None
+        );
+        drain_once(&state, &OnePage, key, 1, 100).unwrap();
+        assert_eq!(
+            state.public_projection().health(100).spend_last_attempt_ms,
+            Some(100)
+        );
+
+        // Reject the next drain's runtime write after its pull succeeds. The
+        // attempted drain must still be visible even though it commits nothing.
+        state.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER fail_drain BEFORE UPDATE ON source_runtime BEGIN SELECT RAISE(ABORT, 'drain refused'); END;")
+                .map_err(|error| error.to_string())
+        }).unwrap();
+        assert!(
+            matches!(drain_once(&state, &OnePage, key, 1, 200), Err(PullError::Store(reason)) if reason.contains("drain refused"))
+        );
+        assert_eq!(sequence_less_runtime(&state, key), (Some(100), 0));
+        assert_eq!(
+            state.public_projection().health(200).spend_last_attempt_ms,
+            Some(200)
+        );
     }
 
     #[test]

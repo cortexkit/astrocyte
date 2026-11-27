@@ -61,14 +61,13 @@ fn main() -> Result<std::process::ExitCode, Box<dyn Error>> {
     }
     // `--manifest` prints the manifest astrocyte would send at HELLO, so SubC's
     // placement check can read which commit the binary was built from
-    // (`provenance.build_git_sha`) without starting it. It touches no config,
-    // store, log or network, so the `consumes` list it shows is the one for an
-    // empty configuration, not the live one.
+    // (`provenance.build_git_sha`) without starting it. The declaration does
+    // not depend on live config, so printing it touches no store, log or network.
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--manifest")
     {
-        let manifest = manifest(DEFAULT_MODULE_ID, &config::intentional_empty().config);
+        let manifest = manifest(DEFAULT_MODULE_ID);
         println!("{}", serde_json::to_string(&manifest)?);
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -578,19 +577,15 @@ where
         #[cfg(test)]
         confirmation_required: false,
     };
-    // HELLO is sent once per connection, so the manifest declares the desired
-    // configuration in force at this moment. Startup hydrates that
-    // configuration before the connection exists, so it is always the real
-    // one here. A later reload that adds or removes a peer is NOT
-    // re-announced: the daemon keeps the self-signals and consumers declared
-    // here until the module reconnects.
+    // HELLO is sent once per connection. It declares even the peers a later
+    // reload may enable, so the daemon's manifest does not miss those calls.
     let stop_handle = ModuleStopHandle::new();
     let serving = ServeOptions::default()
         .with_writer_drain_timeout(SERVE_DRAIN_BUDGET)
         .with_stop_handle(stop_handle.clone())
         .serve_with(
             &config.connection_file_path,
-            manifest(&config.module_id, &state.desired_config()),
+            manifest(&config.module_id),
             handler,
         );
     tokio::pin!(serving);
@@ -761,6 +756,10 @@ impl ModuleHandler for AstrocyteHandler {
         {
             return refused;
         }
+        let request = match request.decode_params() {
+            Ok(request) => request,
+            Err(refusal) => return refusal,
+        };
         #[cfg(not(test))]
         let confirmation_required = ledger_write_confirmation_required();
         #[cfg(test)]
@@ -1057,10 +1056,80 @@ fn health_metrics(health: &astrocyte_module::state::Health) -> Value {
     Value::Object(metrics)
 }
 
+mod request_params {
+    use std::{collections::HashSet, fmt};
+
+    use serde::{de, Deserialize, Deserializer};
+    use serde_json::{value::RawValue, Value};
+
+    pub(super) fn decode(params: &RawValue) -> serde_json::Result<Value> {
+        // A Value would collapse repeated fields before a typed decoder could
+        // refuse them. Check names first without changing how scalars are decoded.
+        serde_json::from_str::<UniqueFields>(params.get())?;
+        serde_json::from_str(params.get())
+    }
+
+    struct UniqueFields;
+
+    impl<'de> Deserialize<'de> for UniqueFields {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(Self)
+        }
+    }
+
+    impl<'de> de::Visitor<'de> for UniqueFields {
+        type Value = Self;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a JSON value with no repeated object fields")
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
+            let mut names = HashSet::new();
+            while let Some(name) = map.next_key::<String>()? {
+                if !names.insert(name) {
+                    return Err(de::Error::custom("duplicate operation parameter field"));
+                }
+                map.next_value::<Self>()?;
+            }
+            Ok(self)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self, A::Error> {
+            while seq.next_element::<Self>()?.is_some() {}
+            Ok(self)
+        }
+
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self, E> {
+            Ok(self)
+        }
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self, E> {
+            Ok(self)
+        }
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self, E> {
+            Ok(self)
+        }
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self, E> {
+            Ok(self)
+        }
+        fn visit_str<E: de::Error>(self, _: &str) -> Result<Self, E> {
+            Ok(self)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self, E> {
+            Ok(self)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
+struct RequestEnvelope<'a> {
+    method: String,
+    #[serde(borrow)]
+    params: Option<&'a serde_json::value::RawValue>,
+}
+
 struct RouteRequest {
     method: String,
-    #[serde(default)]
     params: Value,
 }
 
@@ -1071,33 +1140,41 @@ fn refusal(code: &str, message: String) -> HandlerOutcome {
     }
 }
 
-/// The serve helper's pool for a request, from a peek at its body: a
-/// step or Runs subscription request is long-held. Only the first bytes are
-/// read, because this runs on the task that reads every frame; a request
-/// that puts its method name further in uses the default pool, which only
-/// costs it the separate pool.
+/// Use the same envelope as dispatch, so whitespace, member order and escapes
+/// cannot put a watch in the ordinary pool. The frame reader scans but doesn't
+/// materialize params; that work belongs to the scheduled handler.
 fn classify_request(body: &[u8]) -> RequestClass {
-    const PEEK: usize = 512;
-    let head = &body[..body.len().min(PEEK)];
-    for operation in [ops::OP_STEPS_SUBSCRIBE, ops::OP_RUNS_SUBSCRIBE] {
-        let needle = format!("\"{operation}\"");
-        if head
-            .windows(needle.len())
-            .any(|window| window == needle.as_bytes())
-        {
-            return RequestClass::long_held().with_op(operation);
-        }
+    match serde_json::from_slice::<RequestEnvelope<'_>>(body)
+        .ok()
+        .as_ref()
+        .map(|request| request.method.as_str())
+    {
+        Some(ops::OP_STEPS_SUBSCRIBE) => RequestClass::long_held().with_op(ops::OP_STEPS_SUBSCRIBE),
+        Some(ops::OP_RUNS_SUBSCRIBE) => RequestClass::long_held().with_op(ops::OP_RUNS_SUBSCRIBE),
+        _ => RequestClass::default_pool(),
     }
-    RequestClass::default_pool()
 }
 
-fn decode_route_request(body: &[u8]) -> Result<RouteRequest, HandlerOutcome> {
+fn decode_route_request(body: &[u8]) -> Result<RequestEnvelope<'_>, HandlerOutcome> {
     serde_json::from_slice(body).map_err(|error| {
         refusal(
             "invalid_request",
             format!("request body not decodable: {error}"),
         )
     })
+}
+
+impl RequestEnvelope<'_> {
+    fn decode_params(self) -> Result<RouteRequest, HandlerOutcome> {
+        let params = self
+            .params
+            .map_or(Ok(Value::Null), request_params::decode)
+            .map_err(|error| refusal("malformed", error.to_string()))?;
+        Ok(RouteRequest {
+            method: self.method,
+            params,
+        })
+    }
 }
 
 /// Decode and dispatch one unary request body, as `AstrocyteHandler::handle`
@@ -1110,6 +1187,15 @@ fn handle_route_request(
 ) -> HandlerOutcome {
     match decode_route_request(body) {
         Ok(request) => {
+            if let Some(refused) =
+                refuse_unsupported_flow_operation(&request.method, flow.as_deref())
+            {
+                return refused;
+            }
+            let request = match request.decode_params() {
+                Ok(request) => request,
+                Err(refusal) => return refusal,
+            };
             let method = request.method.as_str();
             let outcome = dispatch_route_request(state, method, request.params, flow);
             route_reply::finish(method, outcome)
@@ -1158,10 +1244,9 @@ fn refuse_unsupported_flow_operation(method: &str, flow: Option<&str>) -> Option
 /// to satisfy a required field, not to describe the module. Absent is the
 /// honest form until the daemon reads it and the enum can say what is true.
 ///
-/// `consumes` and `self_signals` describe what astrocyte will do under
-/// `desired`, the configuration in force when HELLO is sent: see
+/// `consumes` and `self_signals` describe the possible peer calls: see
 /// [`declared_consumers`] and [`self_signal_declarations`].
-fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifest {
+fn manifest(module_id: &str) -> ModuleManifest {
     for operation in ops::FLOW_OPERATION_NAMES {
         assert!(
             ops::PUBLIC_OPERATION_NAMES.contains(&operation) && !is_mutating_operation(operation),
@@ -1255,7 +1340,7 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
             ),
             (ops::OP_RUNS_SUBSCRIBE.to_string(), OperationDelivery::WATCH),
         ]))
-        .consumes(declared_consumers(desired))
+        .consumes(declared_consumers())
         // `watermark.get` is the one operation of `log-read-watermark/v1`.
         // `bind-no-project/v1` says no route's project is read at bind (only
         // the principal, the harness and the scope's flow id), so the daemon
@@ -1271,42 +1356,41 @@ fn manifest(module_id: &str, desired: &config::AstrocyteConfig) -> ModuleManifes
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))
-        .self_signals(Some(self_signal_declarations(desired)))
+        .self_signals(Some(self_signal_declarations()))
         .provenance(Some(provenance))
         .build()
 }
 
-/// The modules astrocyte calls under `desired`, and no others. Fusiform, insula
+/// The modules astrocyte can call during this connection. Fusiform, insula
 /// and ckbus use attested routes in every configuration. The bus reader
 /// authenticates with ckbus to follow runners' step events and quota notices.
 /// BROCA never is: its usage is read from its store, not over subc.
 /// Claustrum is always called for subscription tiers with a list-only grant.
-/// Colliculus is called when its media source is ingested.
+/// Reload can enable calls to Colliculus without sending a new HELLO.
 /// Attribution publishers are polled on scheduled refreshes (not the shorter
 /// pricing-only cycles) in every configuration;
 /// an absent or refusing publisher does not degrade ledger health.
-fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
+fn declared_consumers() -> Vec<ConsumerRole> {
     let of: Vec<String> = [
-        ("fusiform", true),
-        ("insula", true),
-        ("ckbus", true),
-        ("claustrum", true),
-        ("colliculus", desired.harness_ingest.ingests("colliculus")),
-        ("prefrontal", true),
-        ("prefrontal-core", true),
-        ("basal", true),
-        ("magic-context", true),
-        ("entorhinal", true),
+        "fusiform",
+        "insula",
+        "ckbus",
+        "claustrum",
+        "colliculus",
+        "prefrontal",
+        "prefrontal-core",
+        "basal",
+        "magic-context",
+        "entorhinal",
     ]
     .into_iter()
-    .filter(|(_, configured)| *configured)
-    .map(|(module, _)| module.to_string())
+    .map(str::to_string)
     .collect();
     vec![ConsumerRole::ServiceClient { of }]
 }
 
-/// Every call astrocyte makes against another module's surface under
-/// `desired`. The list is always present, even when empty, because a present
+/// Every call astrocyte can make against another module's surface during the
+/// connection. The list is always present, even when empty, because a present
 /// list is a survey answer: it claims to be complete, and an empty one claims
 /// astrocyte touches no other surface.
 ///
@@ -1315,7 +1399,7 @@ fn declared_consumers(desired: &config::AstrocyteConfig) -> Vec<ConsumerRole> {
 /// module's surface.
 ///
 /// Names are stable identifiers that analysts key on; do not rename them.
-fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignalDeclaration> {
+fn self_signal_declarations() -> Vec<SelfSignalDeclaration> {
     // The tick interval bounds fallback polling and discovery retries.
     let tick_cadence = || SignalCadence::Derived {
         source: "desired_config.poll_interval_secs".to_string(),
@@ -1452,22 +1536,21 @@ fn self_signal_declarations(desired: &config::AstrocyteConfig) -> Vec<SelfSignal
             ),
         });
     }
-    if desired.harness_ingest.ingests("colliculus") {
-        declarations.push(SelfSignalDeclaration {
-            name: "astrocyte-colliculus-usage-read".to_string(),
-            kind: SelfSignalKind::Poller,
-            effect: SelfSignalEffect::Observe,
-            anchored_to: SignalAnchor::FixedInterval,
-            cadence: Some(tick_cadence()),
-            domain: Some("colliculus".to_string()),
-            note: Some(
-                "usage.read on each full refresher tick, paging until empty; usage.ack \
+    declarations.push(SelfSignalDeclaration {
+        name: "astrocyte-colliculus-usage-read".to_string(),
+        kind: SelfSignalKind::Poller,
+        effect: SelfSignalEffect::Observe,
+        anchored_to: SignalAnchor::FixedInterval,
+        cadence: Some(tick_cadence()),
+        domain: Some("colliculus".to_string()),
+        note: Some(
+            "Only while Colliculus ingestion is enabled: usage.read on each full \
+                 refresher tick, paging until empty; usage.ack \
                  follows each committed page. A retry acknowledges the durable watermark \
                  before reading."
-                    .to_string(),
-            ),
-        });
-    }
+                .to_string(),
+        ),
+    });
     for publisher in astrocyte_core::attribution::Publisher::ALL {
         declarations.push(SelfSignalDeclaration{
             name:format!("astrocyte-{}-{}",publisher.modules()[0],publisher.read_name().replace('.',"-")),
@@ -2305,7 +2388,7 @@ mod tests {
     /// Moving any one name across the write/read boundary fails this test.
     #[test]
     fn manifest_publishes_the_writes_and_reads_by_name() {
-        let manifest = manifest("astrocyte", &config::intentional_empty().config);
+        let manifest = manifest("astrocyte");
         let operations = manifest
             .provides
             .iter()
@@ -2362,7 +2445,7 @@ mod tests {
 
     #[test]
     fn manifest_display_name_is_spend_ledger() {
-        let manifest = manifest("astrocyte", &config::intentional_empty().config);
+        let manifest = manifest("astrocyte");
         assert_eq!(manifest.display_name.as_deref(), Some("Spend Ledger"));
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(wire["display_name"], "Spend Ledger");
@@ -2370,7 +2453,7 @@ mod tests {
 
     #[test]
     fn manifest_declares_first_party_and_no_bindings() {
-        let manifest = manifest("astrocyte", &config::intentional_empty().config);
+        let manifest = manifest("astrocyte");
         assert_eq!(manifest.trust_tier, Some(TrustTier::FirstParty));
         assert!(
             manifest.bindings.is_none(),
@@ -2384,13 +2467,6 @@ mod tests {
             wire.get("bindings").is_none(),
             "bindings serialized: {wire}"
         );
-    }
-
-    fn desired() -> config::AstrocyteConfig {
-        config::AstrocyteConfig {
-            poll_interval_secs: 45,
-            harness_ingest: config::HarnessIngest::all_on(),
-        }
     }
 
     fn self_signal_names(manifest: &ModuleManifest) -> Vec<String> {
@@ -2446,7 +2522,7 @@ mod tests {
 
     #[test]
     fn attribution_manifest_declares_four_unconditional_read_pollers() {
-        let manifest = manifest("astrocyte", &desired());
+        let manifest = manifest("astrocyte");
         let wire = serde_json::to_value(&manifest).unwrap();
         for (module, name) in [
             ("prefrontal", "astrocyte-prefrontal-attribution-read"),
@@ -2479,7 +2555,7 @@ mod tests {
     /// by name, and the consumers must be exactly the modules it calls.
     #[test]
     fn manifest_declares_every_peer_call_with_default_ingestion() {
-        let manifest = manifest("astrocyte", &desired());
+        let manifest = manifest("astrocyte");
         assert_eq!(manifest.registration_channel, Some(true));
         assert_eq!(
             self_signal_names(&manifest),
@@ -2526,7 +2602,7 @@ mod tests {
 
     #[test]
     fn manifest_declares_daily_multiplier_calls_without_a_settings_declaration() {
-        let manifest = manifest("astrocyte", &desired());
+        let manifest = manifest("astrocyte");
         let wire = serde_json::to_value(&manifest).unwrap();
         let plan_prices = wire["self_signals"]
             .as_array()
@@ -2544,93 +2620,46 @@ mod tests {
         assert_eq!(plan_prices["domain"], "fusiform");
     }
 
-    /// Excluding Colliculus does not suppress any of the unconditional peers.
-    #[test]
-    fn manifest_keeps_unconditional_peers_when_colliculus_is_excluded() {
-        let mut desired = desired();
-        desired.harness_ingest.exclude.push("colliculus".into());
-        let manifest = manifest("astrocyte", &desired);
-        assert_eq!(
-            self_signal_names(&manifest),
-            expected_signals(&[
-                "astrocyte-insula-usage-poll",
-                "astrocyte-insula-quota-body",
-                "astrocyte-ckbus-credentials",
-                "astrocyte-fusiform-catalog-lookup",
-                "astrocyte-fusiform-history-status",
-                "astrocyte-fusiform-history-probe",
-                "astrocyte-fusiform-plan-prices",
-                "astrocyte-fusiform-multiplier-rates",
-            ])
-        );
-        assert_eq!(
-            consumed_modules(&manifest),
-            expected_modules(&["fusiform", "insula", "ckbus", "claustrum"])
-        );
-        let wire = serde_json::to_value(&manifest).unwrap();
-        assert_eq!(
-            wire["consumes"],
-            json!([{"role": "service_client", "of": expected_modules(&["fusiform", "insula", "ckbus", "claustrum"])}])
-        );
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hello_manifest_is_the_same_with_ingestion_on_and_off() {
+        let hello = |enabled| async move {
+            let state = Arc::new(test_state());
+            let mut desired = state.desired_config();
+            desired.harness_ingest.enabled = enabled;
+            state.publish_desired(desired, 7);
+            let daemon = FakeDaemon::start().await;
+            let refresher = IdleRefresher::new();
+            let serving = serve_idle(&daemon, state, &refresher);
+            let (mut stream, hello) = daemon.accept().await;
+            send(&mut stream, hello_ack()).await;
+            drop(stream);
+            let _ = served(serving, "serving did not end at EOF").await;
+            serde_json::to_value(hello.manifest).unwrap()
+        };
+        let enabled = hello(true).await;
+        let disabled = hello(false).await;
+        assert!(disabled["consumes"][0]["of"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("colliculus")));
+        assert_eq!(disabled, enabled);
     }
 
-    /// BROCA is read from its store, never called over subc, so no ingest
-    /// setting makes it a consumer or gives it a self-signal. Only colliculus's
-    /// peer calls change when ingestion is disabled for every source.
     #[test]
     fn manifest_never_declares_a_broca_call() {
-        for (ingest, colliculus_enabled) in [
-            (config::HarnessIngest::all_on(), true),
-            (
-                config::HarnessIngest {
-                    enabled: true,
-                    exclude: vec!["broca".into()],
-                },
-                true,
-            ),
-            (
-                config::HarnessIngest {
-                    enabled: false,
-                    exclude: Vec::new(),
-                },
-                false,
-            ),
-        ] {
-            let mut desired = desired();
-            desired.harness_ingest = ingest.clone();
-            let manifest = manifest("astrocyte", &desired);
-            let mut signals = vec![
-                "astrocyte-insula-usage-poll",
-                "astrocyte-insula-quota-body",
-                "astrocyte-ckbus-credentials",
-                "astrocyte-fusiform-catalog-lookup",
-                "astrocyte-fusiform-history-status",
-                "astrocyte-fusiform-history-probe",
-                "astrocyte-fusiform-plan-prices",
-                "astrocyte-fusiform-multiplier-rates",
-            ];
-            let mut modules = vec!["fusiform", "insula", "ckbus", "claustrum"];
-            if colliculus_enabled {
-                signals.push("astrocyte-colliculus-usage-read");
-                modules.push("colliculus");
-            }
-            assert_eq!(
-                self_signal_names(&manifest),
-                expected_signals(&signals),
-                "{ingest:?}"
-            );
-            assert_eq!(
-                consumed_modules(&manifest),
-                expected_modules(&modules),
-                "{ingest:?}"
-            );
-        }
+        // BROCA is read from its store, never called over subc.
+        let manifest = manifest("astrocyte");
+        assert!(!consumed_modules(&manifest)
+            .iter()
+            .any(|module| module == "broca"));
+        assert!(!self_signal_names(&manifest)
+            .iter()
+            .any(|name| name.contains("broca")));
     }
-
     /// The quota fallback poll is a periodic observation, not a mutation.
     #[test]
     fn manifest_declares_the_quota_poll_cadence() {
-        let manifest = manifest("astrocyte", &desired());
+        let manifest = manifest("astrocyte");
         let wire = serde_json::to_value(&manifest).unwrap();
         let poll = &wire["self_signals"][0];
         assert_eq!(poll["name"], "astrocyte-insula-usage-poll");
@@ -2645,83 +2674,32 @@ mod tests {
     }
 
     #[test]
-    fn manifest_colliculus_calls_follow_ingest_configuration() {
-        for (ingest, enabled) in [
-            (config::HarnessIngest::all_on(), true),
-            (
-                config::HarnessIngest {
-                    enabled: true,
-                    exclude: vec!["broca".into()],
-                },
-                true,
-            ),
-            (
-                config::HarnessIngest {
-                    enabled: true,
-                    exclude: vec!["colliculus".into()],
-                },
-                false,
-            ),
-            (
-                config::HarnessIngest {
-                    enabled: false,
-                    exclude: Vec::new(),
-                },
-                false,
-            ),
+    fn manifest_describes_when_colliculus_is_called() {
+        let wire = serde_json::to_value(manifest("astrocyte")).unwrap();
+        let signal = wire["self_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|signal| signal["name"] == "astrocyte-colliculus-usage-read")
+            .unwrap();
+        assert_eq!(signal["domain"], "colliculus");
+        assert_eq!(signal["kind"], "poller");
+        assert_eq!(signal["effect"], "observe");
+        assert_eq!(signal["anchored_to"], "fixed_interval");
+        assert_eq!(
+            signal["cadence"],
+            json!({"derived":{"source":"desired_config.poll_interval_secs"}})
+        );
+        let note = signal["note"].as_str().unwrap();
+        for expected in [
+            "Only while Colliculus ingestion is enabled",
+            "usage.read",
+            "usage.ack",
+            "committed page",
         ] {
-            let mut desired = desired();
-            desired.harness_ingest = ingest.clone();
-            let manifest = manifest("astrocyte", &desired);
-            let mut modules = vec!["fusiform", "insula", "ckbus", "claustrum"];
-            let mut signals = vec![
-                "astrocyte-insula-usage-poll",
-                "astrocyte-insula-quota-body",
-                "astrocyte-ckbus-credentials",
-                "astrocyte-fusiform-catalog-lookup",
-                "astrocyte-fusiform-history-status",
-                "astrocyte-fusiform-history-probe",
-                "astrocyte-fusiform-plan-prices",
-                "astrocyte-fusiform-multiplier-rates",
-            ];
-            if enabled {
-                modules.push("colliculus");
-                signals.push("astrocyte-colliculus-usage-read");
-            }
-            assert_eq!(
-                consumed_modules(&manifest),
-                expected_modules(&modules),
-                "{ingest:?}"
-            );
-            assert_eq!(
-                self_signal_names(&manifest),
-                expected_signals(&signals),
-                "{ingest:?}"
-            );
-            if enabled {
-                let wire = serde_json::to_value(&manifest).unwrap();
-                let signal = wire["self_signals"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|signal| signal["name"] == "astrocyte-colliculus-usage-read")
-                    .unwrap();
-                assert_eq!(signal["domain"], "colliculus");
-                assert_eq!(signal["kind"], "poller");
-                assert_eq!(signal["effect"], "observe");
-                assert_eq!(signal["anchored_to"], "fixed_interval");
-                assert_eq!(
-                    signal["cadence"],
-                    json!({"derived":{"source":"desired_config.poll_interval_secs"}})
-                );
-                let note = signal["note"].as_str().unwrap();
-                assert!(note.contains("usage.read"));
-                assert!(note.contains("usage.ack"));
-                assert!(note.contains("committed page"));
-            }
+            assert!(note.contains(expected), "{note}");
         }
     }
-
     #[test]
     fn check_config_preflight_rejects_retired_catalog_file() {
         let path = std::env::temp_dir().join(format!(
@@ -2796,6 +2774,31 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_subscription_fields_are_refused_without_writing() {
+        let state = Arc::new(test_state());
+        let request = br#"{"method":"spend.subscription.set","params":{
+            "account_ref":"duplicate-date","provider":"anthropic","plan_name":"test plan",
+            "recurring_cost_minor":100,"amount_exponent":2,"currency":"USD","period":"month",
+            "effective_from":100,"effective_from":200}}"#;
+        let outcome = handle_route_request(&state, request, None);
+        let written: i64 = state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT count(*) FROM account_subscription WHERE account_ref='duplicate-date'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(
+            written, 0,
+            "the duplicate field reached the ledger: {outcome:?}"
+        );
+        assert!(matches!(outcome, HandlerOutcome::Error { code, .. } if code == "malformed"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3256,6 +3259,22 @@ mod tests {
         .expect("the subscriptions never opened");
     }
 
+    #[test]
+    fn watch_pool_follows_the_decoded_method() {
+        let late = format!(
+            r#"{{"params":{{}},{}"method":"usage.steps.subscribe"}}"#,
+            " ".repeat(520)
+        );
+        for (body, method, class) in [
+            (late.as_bytes(), ops::OP_STEPS_SUBSCRIBE, RequestClass::long_held().with_op(ops::OP_STEPS_SUBSCRIBE)),
+            (br#"{"meth\u006fd":"usage.runs.subscr\u0069be","params":{}}"#, ops::OP_RUNS_SUBSCRIBE, RequestClass::long_held().with_op(ops::OP_RUNS_SUBSCRIBE)),
+            (br#"{"method":"usage.cache.sessions","params":{"harness":"usage.steps.subscribe"}}"#, ops::OP_CACHE_SESSIONS, RequestClass::default_pool()),
+        ] {
+            assert_eq!(decode_route_request(body).unwrap().method, method);
+            assert_eq!(classify_request(body), class, "{method}");
+        }
+    }
+
     /// The manifest declares both held subscriptions as watches, which lets
     /// the daemon route subscriptions to them.
     /// The surface is module-managed rather than serial: a held watch on a
@@ -3263,7 +3282,7 @@ mod tests {
     /// relay a watch from a serial module.
     #[test]
     fn manifest_declares_the_step_and_runs_subscriptions_as_watches() {
-        let manifest = manifest("astrocyte", &config::intentional_empty().config);
+        let manifest = manifest("astrocyte");
         assert!(manifest.is_watch_operation(ops::OP_STEPS_SUBSCRIBE));
         assert!(manifest.is_watch_operation(ops::OP_RUNS_SUBSCRIBE));
         let wire = serde_json::to_value(&manifest).unwrap();
@@ -3289,7 +3308,7 @@ mod tests {
     /// Capability claims share the block the daemon validates at HELLO.
     #[test]
     fn manifest_provides_the_log_read_watermark_capability() {
-        let manifest = manifest("astrocyte", &config::intentional_empty().config);
+        let manifest = manifest("astrocyte");
         manifest.validate_capability_grammar().unwrap();
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
@@ -3306,7 +3325,7 @@ mod tests {
 
     #[test]
     fn manifest_provides_flow_scopes_and_exact_read_operations() {
-        let manifest = manifest("astrocyte", &config::intentional_empty().config);
+        let manifest = manifest("astrocyte");
         let provides = &manifest.capabilities.as_ref().unwrap().provides;
         assert!(provides
             .iter()
@@ -4968,8 +4987,7 @@ mod logging_tests {
                     connection_file_path: PathBuf::new(),
                     module_id: std::env::var(SUBC_MODULE_ID_ENV).unwrap(),
                 };
-                let wire_id =
-                    manifest(&config.module_id, &config::intentional_empty().config).module_id;
+                let wire_id = manifest(&config.module_id).module_id;
                 log_terminal_error(&"root probe");
                 let contents = std::fs::read_to_string(handle.path()).unwrap();
                 let lines: Vec<_> = contents
