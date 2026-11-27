@@ -43,14 +43,7 @@ fi
 # Which workflow gates a landing. A sha can carry runs from several workflows,
 # so resolving a run BY SHA has to name the gating one or it can latch a run
 # that says nothing about the tests.
-WORKFLOW="${WATCH_CI_WORKFLOW:-tests.yml}"
-if [ -z "${WATCH_CI_WORKFLOW:-}" ]; then
-  workflow_root="$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD")"
-  if [ ! -f "$workflow_root/.github/workflows/tests.yml" ]; then
-    echo "watch-ci: default workflow .github/workflows/tests.yml does not exist; set WATCH_CI_WORKFLOW to the workflow that gates a landing" >&2
-    exit 2
-  fi
-fi
+WORKFLOW="${WATCH_CI_WORKFLOW:-ci.yml}"
 # Which trigger produced the run. A sha is not unique across triggers either: a
 # commit that a schedule (or workflow_dispatch) later re-ran carries several
 # runs of the same workflow with possibly different conclusions, and the
@@ -140,8 +133,6 @@ watch_run_view() {
 
 watch_run_view_checked() {
   if RUN_VIEW=$(watch_run_view "$@" 2>"$GH_ERROR_FILE"); then
-    GH_ERROR_ATTEMPTS=0
-    GH_LAST_ERROR=""
     return 0
   else
     GH_RC=$?
@@ -168,8 +159,12 @@ POLL_DELAY="$(poll_delay_cap "$POLL_SLEEP")"
 # API errors do not mean a run is green or even complete. Retry on the normal
 # polling cadence, doubling the delay after each consecutive error; a valid
 # response resets it so a transient outage does not slow later observations.
-poll_error_wait() {
-  watch_sleep "$POLL_DELAY"
+poll_invalid_run_view() {
+  GH_ERROR_ATTEMPTS=$((GH_ERROR_ATTEMPTS + 1))
+  if [ "$GH_ERROR_ATTEMPTS" -ge "$GH_ERROR_MAX_ATTEMPTS" ]; then
+    undetermined "$1 after $GH_ERROR_ATTEMPTS attempts"
+  fi
+  watch_sleep "$POLL_DELAY" || undetermined "sleep before run status retry failed"
   POLL_DELAY="$(poll_delay_double "$POLL_DELAY")"
 }
 
@@ -193,6 +188,21 @@ poll_gh_error_wait() {
 undetermined() {
   echo "CI_UNDETERMINED run=$RID reason='$1'${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}" >&2
   exit 3
+}
+
+read_run_status() {
+  STATUS=$(jq -er '.status' <<< "$RUN_VIEW" 2>/dev/null) || return 1
+  case "$STATUS" in
+    requested|waiting|pending|queued|in_progress|completed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+reset_poll_errors() {
+  # Only usable data breaks a streak of failed queries or malformed replies.
+  GH_ERROR_ATTEMPTS=0
+  GH_LAST_ERROR=""
+  POLL_DELAY="$(poll_delay_cap "$POLL_SLEEP")"
 }
 
 ARG="${1:-}"
@@ -225,6 +235,13 @@ fi
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/operator-gh.sh" || exit 1
 
 if [ -z "$RID" ]; then
+  if [ -z "${WATCH_CI_WORKFLOW:-}" ]; then
+    workflow_root="$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD")"
+    if [ ! -f "$workflow_root/.github/workflows/$WORKFLOW" ]; then
+      echo "watch-ci: default workflow .github/workflows/$WORKFLOW does not exist; set WATCH_CI_WORKFLOW to the workflow that gates a landing" >&2
+      exit 2
+    fi
+  fi
   # Grabbing the newest run right after a push races run creation and latches
   # a stale (often already-failed) run. Resolve the run FOR A SPECIFIC SHA,
   # polling until it appears.
@@ -266,19 +283,17 @@ while true; do
     poll_gh_error_wait
     continue
   fi
-  if ! STATUS=$(jq -er '.status | select(type == "string" and length > 0)' \
-    <<< "$RUN_VIEW" 2>/dev/null); then
-    poll_error_wait
+  if ! read_run_status; then
+    poll_invalid_run_view "could not read the run status"
     continue
   fi
   if ! jq -e '(.jobs | type) == "array"' <<< "$RUN_VIEW" >/dev/null 2>&1; then
     if [ "$STATUS" = "completed" ]; then
       undetermined "could not list the run's jobs"
     fi
-    poll_error_wait
+    poll_invalid_run_view "could not list the run's jobs"
     continue
   fi
-  POLL_DELAY="$(poll_delay_cap "$POLL_SLEEP")"
   if [ "$RUN_URL_PRINTED" -eq 0 ]; then
     RUN_URL=$(jq -r 'if (.url | type) == "string" then .url else "" end' \
       <<< "$RUN_VIEW" 2>/dev/null || echo "")
@@ -297,7 +312,7 @@ while true; do
     if [ "$STATUS" = "completed" ]; then
       undetermined "could not read job conclusions"
     fi
-    poll_error_wait
+    poll_invalid_run_view "could not read job conclusions"
     continue
   fi
   case "$FAILED_JOB_RESULT" in
@@ -307,10 +322,11 @@ while true; do
       if [ "$STATUS" = "completed" ]; then
         undetermined "could not read job conclusions"
       fi
-      poll_error_wait
+      poll_invalid_run_view "could not read job conclusions"
       continue
       ;;
   esac
+  reset_poll_errors
 
   if [ -n "$FAILED_JOB" ] && [ "$FAILED_JOB" != "null" ]; then
     NAME="${FAILED_JOB%%|*}"; JID="${FAILED_JOB##*|}"
@@ -326,13 +342,12 @@ while true; do
           poll_gh_error_wait
           continue
         fi
-        if ! STATUS=$(jq -er '.status | select(type == "string" and length > 0)' \
-          <<< "$RUN_VIEW" 2>/dev/null) ||
+        if ! read_run_status ||
           ! jq -e '(.jobs | type) == "array"' <<< "$RUN_VIEW" >/dev/null 2>&1; then
-          poll_error_wait
+          poll_invalid_run_view "could not read the settling run status or jobs"
           continue
         fi
-        POLL_DELAY="$(poll_delay_cap "$POLL_SLEEP")"
+        reset_poll_errors
         [ "$STATUS" = "completed" ] && break
         watch_sleep "$POLL_SLEEP"
       done

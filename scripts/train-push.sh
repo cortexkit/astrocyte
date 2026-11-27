@@ -21,7 +21,8 @@
 # caught the failure. It also runs in the one working tree, so trains serialize
 # behind each other and compete with worker sessions for this box's CPU (hence
 # the box gate, the nice steering, and peers asking for quiet windows). CI runs
-# the three platforms in parallel on other hardware in ~11-16 minutes.
+# Linux, Windows and macOS jobs in parallel. The train watches the workflow
+# run, not a single job, and waits for it to finish before landing.
 #
 # The contract we keep is "main is never red". That is a property of what lands
 # on main, not of where the tests ran: nothing lands here except a sha whose CI
@@ -151,7 +152,7 @@ default_branch=""
 # the one override for both scripts (a lift with `ci.yml` sets it once); the
 # step-0 scan below reads the same variable, so the file it checks and the run
 # it waits for cannot name two different workflows.
-tests_workflow_name="${WATCH_CI_WORKFLOW:-tests.yml}"
+tests_workflow_name="${WATCH_CI_WORKFLOW:-ci.yml}"
 # The repository the runs live in: from origin unless REPO is given, the same
 # derivation watch-ci.sh uses, so the probe and the watch query one repository.
 # A fixed default here was kept by the first lift and watched this repository's
@@ -1157,7 +1158,7 @@ fi
 # line-oriented search misses them on exactly the workflows whose behaviour
 # depends on the ref. The path derives from the same variable the probe and
 # the watch use: two spellings of the workflow name in one script disagreed on
-# every lift whose gate is not called tests.yml.
+# checkouts using a different workflow name.
 tests_workflow="$REPO/.github/workflows/$tests_workflow_name"
 gate_scanner="$REPO/scripts/lib/workflow-gates.py"
 
@@ -1187,7 +1188,7 @@ fi
 # present. The report is small enough today that the writer usually finishes
 # first, which is the kind of reasoning that hides the defect until it does not.
 if ! grep -qx 'trigger|ok' <<<"$gate_report"; then
-  refuse "tests.yml does not run on $train_ref — add \`train/**\` to on.push.branches in .github/workflows/tests.yml"
+  refuse "$tests_workflow_name does not run on $train_ref — add \`train/**\` to on.push.branches in .github/workflows/$tests_workflow_name"
 fi
 
 # Conditions that decide on something the landing path never satisfies. A gate

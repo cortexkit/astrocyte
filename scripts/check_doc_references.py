@@ -16,14 +16,15 @@ operation, would pass an existence check:
 - the "Tables" inventory in docs/data-model.md must list exactly the
   tables that exist after applying every migration in store.rs to an empty
   in-memory SQLite database; a "Table" list in any checked file must agree too;
-- the Markdown table whose first header cell is "Operation" must list exactly
-  PUBLIC_OPERATION_NAMES from ops.rs.
+- the "Operation" table in docs/module-surface.md must list exactly
+  PUBLIC_OPERATION_NAMES from ops.rs; an "Operation" list in any checked file
+  must agree too.
 
 The highest migration version must also appear as "version N".
 
 Usage: scripts/check_doc_references.py [FILE.md ...]
-Defaults to ARCHITECTURE.md and STRUCTURE.md, and always checks the data-model
-table inventory. Exits 1 on any miss.
+Defaults to ARCHITECTURE.md and STRUCTURE.md, and always checks the canonical
+table and operation inventories. Exits 1 on any miss.
 """
 
 import pathlib
@@ -141,6 +142,7 @@ def resolve(token, files, dirs, source):
 MAX_OVERVIEW_BYTES = 20_000
 OVERVIEW_FILES = ("ARCHITECTURE.md", "STRUCTURE.md")
 TABLE_INVENTORY_FILE = "docs/data-model.md"
+OPERATION_INVENTORY_FILE = "docs/module-surface.md"
 
 
 def controls(files, dirs, source, tables, operations):
@@ -189,6 +191,13 @@ def main(argv):
             f"missing {sorted(tables - inventory)}, extra {sorted(inventory - tables)}"
         )
 
+    inventory = markdown_column((ROOT / OPERATION_INVENTORY_FILE).read_text(), "Operation")
+    if inventory != operations:
+        misses.append(
+            f"{OPERATION_INVENTORY_FILE}: operation list differs from PUBLIC_OPERATION_NAMES; "
+            f"missing {sorted(operations - inventory)}, extra {sorted(inventory - operations)}"
+        )
+
     for name in names:
         text = (ROOT / name).read_text()
         for token in sorted(set(re.findall(r"`([^`\n]+)`", text))):
@@ -202,7 +211,7 @@ def main(argv):
                 f"missing {sorted(tables - listed)}, extra {sorted(listed - tables)}"
             )
         listed = markdown_column(text, "Operation")
-        if listed and listed != operations:
+        if name != OPERATION_INVENTORY_FILE and listed and listed != operations:
             misses.append(
                 f"{name}: operation list differs from PUBLIC_OPERATION_NAMES; "
                 f"missing {sorted(operations - listed)}, extra {sorted(listed - operations)}"
@@ -223,7 +232,7 @@ def main(argv):
         print(miss)
     print(
         f"checked {checked} tokens, {len(tables)} tables, {len(operations)} operations "
-        f"in {len(names)} files and the {TABLE_INVENTORY_FILE} inventory: "
+        f"in {len(names)} files and the canonical inventories: "
         f"{len(misses)} misses (controls caught)"
     )
     return 1 if misses or checked == 0 else 0

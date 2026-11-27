@@ -34,12 +34,16 @@ from __future__ import annotations
 import pathlib
 import sys
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:
+    yaml = None
 
 WORKFLOW = pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
 TRAIN_GLOB = "train/**"
 DEFAULT_BRANCH = "master"
 PATH_TOKENS = ("github.ref", "github.event_name")
+PYYAML_VERSION = "6.0.2"
 
 
 def check(doc: dict) -> tuple[list[str], list, int, str]:
@@ -112,6 +116,15 @@ def controls() -> list[str]:
 
 
 def main() -> int:
+    if yaml is None or yaml.__version__ != PYYAML_VERSION:
+        print(
+            f"train preconditions require PyYAML=={PYYAML_VERSION} (the CI pin). "
+            "To provision the fast gate once, run:\n"
+            "  python3 -m venv target/astrocyte-gate-python\n"
+            f"  target/astrocyte-gate-python/bin/python -m pip install 'PyYAML=={PYYAML_VERSION}'",
+            file=sys.stderr,
+        )
+        return 1
     broken = controls()
     for reason in broken:
         print(f"CONTROL {reason}")

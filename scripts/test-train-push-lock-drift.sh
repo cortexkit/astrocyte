@@ -9,6 +9,7 @@ trap 'cd "$root" && rm -rf "$scratch"' EXIT
 
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
 unset TRAIN_PUSH_EXEC_COPY
+unset WATCH_CI_WORKFLOW
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL=file
 export TMPDIR="$scratch" PATH="$scratch/bin:$PATH"
 mkdir -p "$scratch/bin" "$scratch/repo/.github/workflows" "$scratch/repo/scripts/lib" \
@@ -75,7 +76,7 @@ git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
 cp Cargo.lock "$scratch/committed.lock"
 
 run_preflight() {
-  REPO=test/preflight WATCH_CI_WORKFLOW=ci.yml bash scripts/train-push.sh lock-drift
+  REPO=test/preflight bash scripts/train-push.sh lock-drift
 }
 
 workspace_member_lock_edit_is_preserved() {

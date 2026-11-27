@@ -28,6 +28,7 @@ env:
   NATS_SERVER_VERSION: "2.15.0"
   NATS_SERVER_SHA256_LINUX_AMD64: 5d2c51caca950333aba84911df7d377f826f3a59ec36061c6539105084f65c92
   NATS_SERVER_SHA256_WINDOWS_AMD64: 2d0861dc2ca3567d17f7d19611d7b346cc2ccbd7086a0a77cc957a2c71663200
+  NATS_SERVER_SHA256_DARWIN_ARM64: e1c4e22d70bd44abfa0bcb3c16f7cf0c66f648c2e728c58924e8a1ce88913cc8
 
 jobs:
   # Runners are GitHub-hosted. Blacksmith runners stopped picking up the
@@ -74,19 +75,12 @@ jobs:
 
       - name: Install pinned NATS server
         shell: bash
+        env:
+          NATS_SERVER_SHA256: ${{ env.NATS_SERVER_SHA256_LINUX_AMD64 }}
         run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/nats-server.tar.gz"
           directory="$RUNNER_TEMP/astrocyte-nats"
-          curl --fail --location --retry 3 \
-            "https://github.com/nats-io/nats-server/releases/download/v${NATS_SERVER_VERSION}/nats-server-v${NATS_SERVER_VERSION}-linux-amd64.tar.gz" \
-            --output "$archive"
-          printf '%s  %s\n' "$NATS_SERVER_SHA256_LINUX_AMD64" "$archive" | sha256sum --check -
-          mkdir -p "$directory"
-          tar -xzf "$archive" --strip-components=1 -C "$directory" \
-            "nats-server-v${NATS_SERVER_VERSION}-linux-amd64/nats-server"
+          bash scripts/lib/install-pinned-nats.sh linux-amd64 "$directory"
           echo "$directory" >> "$GITHUB_PATH"
-          "$directory/nats-server" --version
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -128,7 +122,7 @@ jobs:
 
   # Astrocyte runs on macOS, Linux and Windows. Its readers resolve file
   # identity, paths and SQLite URIs per OS, and a cross-compile proves none of
-  # that, so the suite also runs natively on Windows.
+  # that, so the suite also runs natively on Windows and macOS.
   test-windows:
     name: Test (windows)
     runs-on: windows-2025
@@ -182,3 +176,40 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --all-targets --locked --no-fail-fast
+
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      ASTROCYTE_REQUIRE_NATS_SERVER: "1"
+    steps:
+      - name: Checkout astrocyte
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install pinned NATS server
+        shell: bash
+        env:
+          NATS_SERVER_SHA256: ${{ env.NATS_SERVER_SHA256_DARWIN_ARM64 }}
+        run: |
+          directory="$RUNNER_TEMP/astrocyte-nats"
+          bash scripts/lib/install-pinned-nats.sh darwin-arm64 "$directory"
+          echo "$directory" >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Record Rust compiler for cache
+        id: rust-version
+        run: echo "version=$(rustc --version | cut -d ' ' -f 2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ steps.rust-version.outputs.version }}-
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-targets --locked

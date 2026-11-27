@@ -21,7 +21,11 @@ step() { printf '\n== %s\n' "$1"; }
 
 # The same checks as CI's Linux job, in the same order, before any build.
 step "train preconditions"
-python3 scripts/check_train_preconditions.py
+gate_python=python3
+if [ -x target/astrocyte-gate-python/bin/python ]; then
+  gate_python=target/astrocyte-gate-python/bin/python
+fi
+"$gate_python" scripts/check_train_preconditions.py
 step "overview doc references"
 python3 scripts/check_doc_references.py
 step "nothing internal tracked under .cortexkit"
@@ -40,11 +44,19 @@ if [ "$fast_only" = 1 ]; then
 fi
 
 logs=$(mktemp -d "${TMPDIR:-/tmp}/astrocyte-gate.XXXXXX")
-# CI installs a pinned nats-server and requires the real-bus tests to run.
-# The gate installs nothing: it relies on nats-server being on the build
-# servers' images, and requires the tests so a missing server fails instead
-# of printing SKIP and passing.
-linux_cmd='export ASTROCYTE_REQUIRE_NATS_SERVER=1
+# Use the workflow's exact release and archive hashes on the remote lanes.
+# Neither a download nor a NATS installation belongs in the fast gate.
+nats_pins=$("$gate_python" -c '
+import pathlib, yaml
+env = yaml.safe_load(pathlib.Path(".github/workflows/ci.yml").read_text())["env"]
+print(env["NATS_SERVER_VERSION"], env["NATS_SERVER_SHA256_LINUX_AMD64"], env["NATS_SERVER_SHA256_WINDOWS_AMD64"])
+')
+read -r nats_version nats_linux_sha nats_windows_sha <<< "$nats_pins"
+nats_setup='nats_dir=$(mktemp -d)
+trap '\''rm -rf "$nats_dir"'\'' EXIT
+bash scripts/lib/install-pinned-nats.sh "$NATS_TARGET" "$nats_dir"
+export PATH="$nats_dir:$PATH" ASTROCYTE_REQUIRE_NATS_SERVER=1'
+linux_cmd="$nats_setup"'
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked'
 # A native crash in a test's child process (an access violation) leaves no
@@ -53,7 +65,7 @@ cargo test --workspace --all-targets --locked'
 # 60 s for a dump written during this job and copies it to the checkout root to
 # be returned, so the faulting module can be read afterwards. In a Windows job
 # `target/` links out of the checkout, and a returned file must sit inside it.
-windows_cmd='export ASTROCYTE_REQUIRE_NATS_SERVER=1
+windows_cmd="$nats_setup"'
 touch gate-job-start
 cargo clippy --workspace --all-targets --locked -- -D warnings
 code=0; cargo test --workspace --all-targets --locked --no-fail-fast || code=$?
@@ -71,10 +83,13 @@ windows_dump="$PWD/gate-windows-crash.dmp"
 rm -f "$windows_dump"
 
 step "Linux and Windows suites (remote, in parallel)"
-ck motor run --vcpus 8 -- "set -euo pipefail
+ck motor run --vcpus 8 --net --env "NATS_SERVER_VERSION=$nats_version" \
+  --env "NATS_SERVER_SHA256=$nats_linux_sha" --env NATS_TARGET=linux-amd64 -- "set -euo pipefail
 $linux_cmd" >"$logs/linux.log" 2>&1 &
 linux_pid=$!
-ck motor run --platform windows --return-path "$windows_dump" --return-max-bytes 134217728 -- "set -euo pipefail
+ck motor run --platform windows --net --env "NATS_SERVER_VERSION=$nats_version" \
+  --env "NATS_SERVER_SHA256=$nats_windows_sha" --env NATS_TARGET=windows-amd64 \
+  --return-path "$windows_dump" --return-max-bytes 134217728 -- "set -euo pipefail
 $windows_cmd" >"$logs/windows.log" 2>&1 &
 windows_pid=$!
 
