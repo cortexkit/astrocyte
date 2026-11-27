@@ -31,14 +31,14 @@ pub fn map_usage_array(
 
     // The checks below prove each accepted value fits SQLite's signed integer.
     #[allow(clippy::cast_possible_truncation)]
-    fn count(value: Option<f64>) -> Result<Option<i64>, String> {
+    fn count(value: Option<f64>) -> Result<Option<i64>, &'static str> {
         value
             .map(|value| {
                 if !value.is_finite() || value.fract() != 0.0 {
-                    return Err("capacity count is not an integer".to_string());
+                    return Err("capacity count is not an integer");
                 }
                 if value < i64::MIN as f64 || value >= 2_f64.powi(63) {
-                    return Err("capacity count exceeds SQLite range".to_string());
+                    return Err("capacity count exceeds SQLite range");
                 }
                 Ok(value as i64)
             })
@@ -55,7 +55,7 @@ pub fn map_usage_array(
     let mut observations = Vec::new();
     let mut provider_readings = Vec::new();
     let mut account_pool_counts = BTreeMap::<(String, String, String), usize>::new();
-    let mut invalid_account_pools = BTreeSet::<(String, String, String)>::new();
+    let mut invalid_account_pools = BTreeMap::<(String, String, String), &str>::new();
     // This is the number of degraded labeled accounts, not failed credentials. Degraded entries
     // without an account identity are intentionally excluded because the health signal can name
     // only accounts; treating this as a credential count would understate identity-less handles.
@@ -134,18 +134,25 @@ pub fn map_usage_array(
                     ))
                     .or_default() += 1;
             }
-            if !valid_window(window) {
-                if let Some(account_ref) = account_ref {
-                    invalid_account_pools.insert((
-                        entry.provider.clone(),
-                        account_ref.to_string(),
-                        pool_key,
-                    ));
+            let counts = if valid_window(window) {
+                count(window.used_count).and_then(|used| Ok((used, count(window.total_count)?)))
+            } else {
+                Err("capacity percentage is invalid")
+            };
+            let (used_count, total_count) = match counts {
+                Ok(counts) => counts,
+                Err(reason) => {
+                    if let Some(account_ref) = account_ref {
+                        invalid_account_pools.insert(
+                            (entry.provider.clone(), account_ref.to_string(), pool_key),
+                            reason,
+                        );
+                    } else {
+                        tracing::warn!(provider = %entry.provider, %pool_key, reason, "dropping invalid capacity window");
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            let used_count = count(window.used_count)?;
-            let total_count = count(window.total_count)?;
+            };
             let breakdown = window
                 .breakdown
                 .as_ref()
@@ -314,7 +321,7 @@ pub fn map_usage_array(
     }
 
     let mut invalid_accounts = BTreeSet::new();
-    for (provider, account_ref, pool_key) in invalid_account_pools {
+    for ((provider, account_ref, pool_key), reason) in invalid_account_pools {
         let has_usable_reading = observations.iter().any(|observation| {
             observation.provider == provider
                 && observation.account_ref == account_ref
@@ -324,12 +331,13 @@ pub fn map_usage_array(
             provider = %provider,
             account_ref = %account_ref,
             pool_key = %pool_key,
+            reason,
             previous_windows = if has_usable_reading {
                 "replaced by the remaining usable windows"
             } else {
                 "preserved because no usable window remains"
             },
-            "dropping capacity window with invalid percentage"
+            "dropping invalid capacity window"
         );
         if !has_usable_reading {
             invalid_accounts.insert((provider, account_ref));
@@ -981,24 +989,61 @@ mod tests {
     }
 
     #[test]
-    fn rejects_capacity_count_at_the_i64_upper_exclusive_bound() {
+    fn invalid_capacity_counts_discard_only_their_windows() {
         let mut count_window = window(25.0);
         count_window.used_count = Some(2_f64.powi(63));
-        let entry = ProviderUsage::healthy(
+        let mut fractional = window(50.0);
+        fractional.total_count = Some(1.5);
+        let partial = ProviderUsage::healthy(
             "codex",
             Some("account-a".into()),
             "oauth",
             Usage {
                 primary: Some(count_window),
+                secondary: Some(window(40.0)),
+                tertiary: None,
+                extra_rate_windows: None,
+            },
+        );
+        let invalid = ProviderUsage::healthy(
+            "codex",
+            Some("account-b".into()),
+            "oauth",
+            Usage {
+                primary: Some(fractional),
                 secondary: None,
                 tertiary: None,
                 extra_rate_windows: None,
             },
         );
-
+        let healthy = ProviderUsage::healthy(
+            "codex",
+            Some("account-c".into()),
+            "oauth",
+            Usage {
+                primary: Some(window(10.0)),
+                secondary: None,
+                tertiary: None,
+                extra_rate_windows: None,
+            },
+        );
+        let snapshot = map_usage_array(&[partial, invalid, healthy], None).unwrap();
+        let windows = snapshot
+            .windows
+            .iter()
+            .map(|w| (w.account_ref.as_str(), w.pool_key.as_str()))
+            .collect::<Vec<_>>();
         assert_eq!(
-            map_usage_array(&[entry], None).unwrap_err(),
-            "capacity count exceeds SQLite range"
+            windows,
+            [("account-a", "secondary"), ("account-c", "primary")]
+        );
+        assert_eq!(snapshot.degraded_entries, 1);
+        assert!(
+            snapshot
+                .observations
+                .iter()
+                .any(|entry| entry.account_ref == "account-b"
+                    && entry.observation_state == "degraded")
         );
     }
 

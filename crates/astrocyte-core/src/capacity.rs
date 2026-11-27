@@ -373,6 +373,7 @@ fn apply_readings_in_tx(
         }
     }
 
+    let mut has_usable = !snapshot.windows.is_empty();
     {
         let mut insert = tx.prepare(
             "INSERT INTO capacity_provider_reading
@@ -411,6 +412,7 @@ fn apply_readings_in_tx(
                             reading.window_minutes, reading.source,
                             reading.model_scope.map(WindowModelScope::as_str)],
                     )?;
+                    has_usable = true;
                 }
                 continue;
             }
@@ -432,10 +434,10 @@ fn apply_readings_in_tx(
                 reading.fetched_at,
                 now_ms,
             ])?;
+            has_usable = true;
         }
     }
 
-    let has_usable = !snapshot.windows.is_empty() || !snapshot.provider_readings.is_empty();
     let detail = if degraded_entries > 0 {
         Some(format!("{degraded_entries} degraded capacity entries"))
     } else if has_usable {
@@ -1092,6 +1094,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(class, "unknown_future_class");
+    }
+
+    #[test]
+    fn credential_readings_without_usable_timestamps_do_not_advance_success() {
+        let mut conn = conn();
+        let mut snapshot = snapshot(Vec::new(), None);
+        snapshot.provider_readings.push(CapacityProviderReading {
+            credential_ref: Some("cred".into()),
+            provider: "codex".into(),
+            api_provider: Some("openai".into()),
+            pool_key: "primary".into(),
+            slot_kind: "primary".into(),
+            external_id: None,
+            title: None,
+            extra_ordinal: None,
+            used_percent: 25.0,
+            raw_used_percent: None,
+            resets_at: None,
+            window_minutes: Some(300),
+            model_scope: None,
+            used_count: None,
+            total_count: None,
+            source: None,
+            fetched_at: None,
+        });
+        for (at, fetched_at, last_success, samples) in [
+            (1_000, None, None, 0),
+            (2_000, Some("2026-09-15T10:00:00Z"), Some(2_000), 1),
+            (3_000, Some("2300-01-01T00:00:00Z"), Some(2_000), 1),
+        ] {
+            snapshot.provider_readings[0].fetched_at = fetched_at.map(str::to_string);
+            apply_snapshot(&mut conn, &snapshot, at).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM credential_window_sample", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, samples);
+            let runtime = freshness(&conn).unwrap();
+            assert_eq!(runtime.last_success_ms, last_success);
+            assert_eq!(runtime.last_attempt_ms, Some(at));
+            assert_eq!(
+                runtime.runtime_variant,
+                if samples == 0 {
+                    "configured_unavailable"
+                } else {
+                    "active"
+                }
+            );
+        }
     }
 
     #[test]

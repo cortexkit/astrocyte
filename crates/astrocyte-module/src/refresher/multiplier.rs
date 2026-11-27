@@ -27,7 +27,7 @@ const MULTIPLIER_SOURCE_WAIT_MS: i64 = 2 * 3_600_000;
 pub(crate) struct MultiplierStage {
     pub(super) plan_prices: Option<Arc<dyn PlanPriceSource>>,
     process_started_at_ms: i64,
-    /// Provider/day pairs known to be recorded within the current look-back.
+    /// Provider/day pairs in the look-back with no outstanding automatic work.
     recorded: BTreeSet<(String, String)>,
     /// Provider, day (`None` for configuration-only failures), and reason.
     /// Keep every reason so interleaved retries of missed days do not repeat logs.
@@ -241,14 +241,25 @@ impl MultiplierStage {
                     interval_start_ms: start_ms,
                     interval_end_ms: end_ms,
                 };
-                match state
-                    .with_read_op(|conn| provider_day.recorded(conn).map_err(multiplier_refusal))
-                {
-                    Ok(true) => {
+                let mode = match state.with_read_op(|conn| {
+                    if !provider_day.recorded(conn).map_err(multiplier_refusal)? {
+                        Ok(Some(DayMode::Original {
+                            process_started_at_ms: self.process_started_at_ms,
+                        }))
+                    } else if provider_day
+                        .needs_source_repair(conn)
+                        .map_err(multiplier_refusal)?
+                    {
+                        Ok(Some(DayMode::SourceRepair))
+                    } else {
+                        Ok(None)
+                    }
+                }) {
+                    Ok(Some(mode)) => mode,
+                    Ok(None) => {
                         self.recorded.insert(recorded_key);
                         continue;
                     }
-                    Ok(false) => {}
                     Err((code, message)) => {
                         self.log_failure(
                             &quota_provider,
@@ -257,20 +268,22 @@ impl MultiplierStage {
                         );
                         continue;
                     }
-                }
+                };
                 match record_multiplier_day(
                     state,
                     self.plan_prices.as_deref(),
                     provider_day,
                     now_ms,
-                    self.process_started_at_ms,
+                    mode,
                     catalog_pending,
                     stop,
                 ) {
                     Ok(DailyOutcome::Stopped) => return,
-                    Ok(DailyOutcome::CatalogPending) => continue,
+                    Ok(DailyOutcome::Deferred) => continue,
                     Ok(DailyOutcome::Recorded(observations)) => {
-                        self.recorded.insert(recorded_key);
+                        if observations.iter().all(|row| row.source_backlog.is_empty()) {
+                            self.recorded.insert(recorded_key);
+                        }
                         for observation in observations {
                             tracing::info!(
                                 target: "multiplier",
@@ -354,7 +367,7 @@ impl From<DayError> for DayFailure {
 /// old intervals incomplete until sources have had a chance to drain.
 fn multiplier_stale_sources(
     conn: &rusqlite::Connection,
-    interval_end_ms: i64,
+    day: ProviderDay<'_>,
     snapshot_at_ms: i64,
     mode: DayMode,
 ) -> Result<Vec<String>, (String, String)> {
@@ -367,18 +380,26 @@ fn multiplier_stale_sources(
          ORDER BY source_key",
         )
         .map_err(internal)?;
-    let sources = statement
-        .query_map([interval_end_ms], |row| row.get::<_, String>(0))
+    let mut sources = statement
+        .query_map([day.interval_end_ms], |row| row.get::<_, String>(0))
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
         .map_err(internal)?;
+    if matches!(mode, DayMode::SourceRepair) {
+        sources.extend(
+            day.missing_backlog_sources(conn)
+                .map_err(multiplier_refusal)?,
+        );
+        sources.sort_unstable();
+    }
     let wait_from_ms = match mode {
         DayMode::Original {
             process_started_at_ms,
-        } => interval_end_ms.max(process_started_at_ms),
-        DayMode::Recompute => interval_end_ms,
+        } => day.interval_end_ms.max(process_started_at_ms),
+        DayMode::Recompute | DayMode::SourceRepair => day.interval_end_ms,
     };
     if !sources.is_empty()
-        && snapshot_at_ms < wait_from_ms.saturating_add(MULTIPLIER_SOURCE_WAIT_MS)
+        && (matches!(mode, DayMode::SourceRepair)
+            || snapshot_at_ms < wait_from_ms.saturating_add(MULTIPLIER_SOURCE_WAIT_MS))
     {
         return Err((
             "source_reads_pending".into(),
@@ -514,7 +535,7 @@ fn rate_era_fill(
 
 enum DailyOutcome {
     Stopped,
-    CatalogPending,
+    Deferred,
     Recorded(Vec<multiplier::Observation>),
 }
 
@@ -523,17 +544,19 @@ fn record_multiplier_day(
     plan_prices: Option<&dyn PlanPriceSource>,
     day: ProviderDay<'_>,
     snapshot_at_ms: i64,
-    process_started_at_ms: i64,
+    mode: DayMode,
     catalog_pending: bool,
     stop: &AtomicBool,
 ) -> Result<DailyOutcome, DayFailure> {
-    let mode = DayMode::Original {
-        process_started_at_ms,
-    };
     let observations = match compute_multiplier_day(state, plan_prices, day, snapshot_at_ms, mode) {
         Ok(observations) => observations,
         Err(error) if catalog_pending && error.code == "catalog_unavailable" => {
-            return Ok(DailyOutcome::CatalogPending);
+            return Ok(DailyOutcome::Deferred);
+        }
+        Err(error)
+            if matches!(mode, DayMode::SourceRepair) && error.code == "source_reads_pending" =>
+        {
+            return Ok(DailyOutcome::Deferred);
         }
         Err(error) => return Err(error.into()),
     };
@@ -543,9 +566,26 @@ fn record_multiplier_day(
         return Ok(DailyOutcome::Stopped);
     }
     let written = state.ordered_write(|tx| {
-        let written = day
-            .record(tx, snapshot_at_ms, &observations)
-            .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
+        let format_error =
+            |error: multiplier::MultiplierError| format!("{}: {}", error.code(), error.message());
+        let written = if matches!(mode, DayMode::SourceRepair) {
+            // An operator recompute or a new backlog may have arrived during
+            // the served-price reads. Neither is a reason to publish this repair.
+            if !day.needs_source_repair(tx).map_err(format_error)? {
+                return Ok((false, false));
+            }
+            match multiplier_stale_sources(tx, day, snapshot_at_ms, mode) {
+                Ok(_) => {}
+                Err((code, _)) if code == "source_reads_pending" => return Ok((false, false)),
+                Err((code, message)) => return Err(format!("{code}: {message}")),
+            }
+            !day.reconcile(tx, snapshot_at_ms, &observations)
+                .map_err(format_error)?
+                .is_empty()
+        } else {
+            day.record(tx, snapshot_at_ms, &observations)
+                .map_err(format_error)?
+        };
         if stop.load(Ordering::Relaxed) {
             return Err("multiplier stopped".into());
         }
@@ -561,13 +601,14 @@ fn record_multiplier_day(
         crate::bus_publications::publish_multiplier(state);
         Ok(DailyOutcome::Recorded(observations))
     } else {
-        Ok(DailyOutcome::Recorded(Vec::new()))
+        Ok(DailyOutcome::Deferred)
     }
 }
 
 #[derive(Clone, Copy)]
 enum DayMode {
     Original { process_started_at_ms: i64 },
+    SourceRepair,
     Recompute,
 }
 
@@ -582,6 +623,9 @@ fn compute_multiplier_day(
 ) -> Result<Vec<multiplier::Observation>, DayError> {
     let (capture, stale_sources) = state
         .with_read_op(|conn| {
+            if matches!(mode, DayMode::SourceRepair) {
+                multiplier_stale_sources(conn, day, snapshot_at_ms, mode)?;
+            }
             if !day.has_readings(conn).map_err(multiplier_refusal)? {
                 return Ok((None, Vec::new()));
             }
@@ -604,8 +648,8 @@ fn compute_multiplier_day(
                     )
                 )
             });
-            let stale_sources = if might_measure {
-                multiplier_stale_sources(conn, day.interval_end_ms, snapshot_at_ms, mode)?
+            let stale_sources = if might_measure && !matches!(mode, DayMode::SourceRepair) {
+                multiplier_stale_sources(conn, day, snapshot_at_ms, mode)?
             } else {
                 Vec::new()
             };
@@ -652,7 +696,7 @@ fn compute_multiplier_day(
                 .map_err(multiplier_refusal)
                 .map_err(DayError::from)
         };
-        if matches!(mode, DayMode::Original { .. }) {
+        if !matches!(mode, DayMode::Recompute) {
             let rates = state
                 .with_read_op(|conn| {
                     astrocyte_core::rate_era::resolved_rates(conn, &models, snapshot_at_ms)
@@ -1421,6 +1465,70 @@ mod multiplier_stage_tests {
     }
 
     #[test]
+    fn stale_multiplier_day_is_superseded_once_when_late_usage_drains() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(state::leased_test_state(&directory));
+        publish_desired(&state, &directory);
+        let fusiform = FakeFusiform::new(false);
+        install_catalog(&state, &fusiform);
+        seed_usage(&state);
+        source_success(&state, "opencode", None);
+        let timed_out = DAY_START + MULTIPLIER_SOURCE_WAIT_MS;
+        let mut stage = MultiplierStage::new(Some(fusiform.clone()));
+        stage.tick(&state, false, timed_out);
+        let original = all_rows(&state);
+        let report = || {
+            crate::ops::dispatch(
+                &state,
+                crate::ops::OP_MULTIPLIER_REPORT,
+                json!({"from_ms": DAY_START - 1, "to_ms": DAY_START + 1}),
+            )
+            .unwrap()
+        };
+        let stale = &report()["series"][0];
+        assert_eq!(stale["source_backlog"], json!(["opencode"]));
+        assert_eq!(stale["api_nanos"], 10_000_000);
+        stage.tick(&state, false, timed_out + 1);
+        assert_eq!(
+            all_rows(&state),
+            original,
+            "do not recompute while a source is still behind"
+        );
+        state
+            .ordered_write(|tx| {
+                tx.execute("DELETE FROM source_runtime WHERE source_key='opencode'", [])
+                    .map_err(|error| error.to_string())?;
+                Ok(((), true))
+            })
+            .unwrap();
+        stage.tick(&state, false, timed_out + 2);
+        assert_eq!(
+            all_rows(&state),
+            original,
+            "a source disappearing does not prove it drained"
+        );
+
+        record_late_usage(&state, timed_out + 3);
+        source_success(&state, "opencode", Some(timed_out + 3));
+        let mut restarted = MultiplierStage::new(Some(fusiform.clone()));
+        restarted.tick(&state, false, timed_out + 3);
+        let repaired = &report()["series"][0];
+        assert_eq!(repaired["api_nanos"], 20_000_000);
+        assert_eq!(repaired["source_backlog"], json!([]));
+        assert_eq!(repaired["supersedes"], stale["observation_id"]);
+        let history = all_rows(&state);
+        assert_eq!(&history[..original.len()], original);
+        assert!(history.len() > original.len());
+        restarted.tick(&state, false, timed_out + 4);
+        MultiplierStage::new(Some(fusiform)).tick(&state, false, timed_out + 5);
+        assert_eq!(
+            all_rows(&state),
+            history,
+            "the repair is not repeated, even after restart"
+        );
+    }
+
+    #[test]
     fn the_day_waits_for_active_sources_and_includes_their_late_usage() {
         let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(state::leased_test_state(&directory));
@@ -1433,18 +1541,7 @@ mod multiplier_stage_tests {
         let mut stage = MultiplierStage::new(Some(fusiform.clone()));
         stage.tick(&state, false, NOW);
         assert!(!observation_days(&state).contains(&DAY.to_string()));
-        state.ordered_write(|tx| {
-            tx.execute(
-                "INSERT INTO usage_event (event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis,account_ref)
-                 VALUES ('late','opencode','lineage','late',?1,?2,'openai','m','subscription_included','acct')",
-                params![DAY_START - DAY_MS, NOW],
-            ).map_err(|error| error.to_string())?;
-            tx.execute(
-                "INSERT INTO measurement (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
-                 VALUES ((SELECT event_key FROM usage_event WHERE event_id='late'),'input','token','billed','usage.input',1000,0)", [],
-            ).map_err(|error| error.to_string())?;
-            Ok(((), true))
-        }).unwrap();
+        record_late_usage(&state, NOW);
         source_success(&state, "opencode-v2", Some(NOW + 60_000));
         stage.tick(&state, false, NOW + 60_000);
         let day_rows: Vec<_> = current_day_observations(&state)
@@ -1460,6 +1557,21 @@ mod multiplier_stage_tests {
                 .count(),
             1
         );
+    }
+
+    fn record_late_usage(state: &SharedState, recorded_at_ms: i64) {
+        state.ordered_write(|tx| {
+            tx.execute(
+                "INSERT INTO usage_event (event_id,producer,producer_lineage,producer_ref,occurred_at_ms,recorded_at_ms,provider,model,charge_basis,account_ref)
+                 VALUES ('late','opencode','lineage','late',?1,?2,'openai','m','subscription_included','acct')",
+                params![DAY_START - DAY_MS, recorded_at_ms],
+            ).map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO measurement (event_key,role,unit,kind,source,quantity_units,quantity_exponent)
+                 VALUES ((SELECT event_key FROM usage_event WHERE event_id='late'),'input','token','billed','usage.input',1000,0)", [],
+            ).map_err(|error| error.to_string())?;
+            Ok(((), true))
+        }).unwrap();
     }
 
     #[test]

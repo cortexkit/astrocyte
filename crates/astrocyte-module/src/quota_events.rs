@@ -35,7 +35,8 @@ struct Inner {
     hello_acked: bool,
     attached: bool,
     credential_expires_ms: i64,
-    last_pull_ms: Option<i64>,
+    last_activity_ms: Option<i64>,
+    batch_processing: bool,
     reason: &'static str,
     event_driven: bool,
     owed: u64,
@@ -57,7 +58,8 @@ impl Default for Control {
                 hello_acked: false,
                 attached: false,
                 credential_expires_ms: 0,
-                last_pull_ms: None,
+                last_activity_ms: None,
+                batch_processing: false,
                 reason: "no credential",
                 event_driven: false,
                 owed: 1,
@@ -110,13 +112,34 @@ impl Control {
         inner.hello_acked.then(|| inner.access.clone()).flatten()
     }
 
+    #[cfg(test)]
     fn pulled(&self, exp: i64, now: i64) {
         let mut inner = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        inner.attached = true;
-        inner.credential_expires_ms = exp.saturating_sub(60).saturating_mul(1000);
-        inner.last_pull_ms = Some(now);
-        inner.reason = "durable attached and pulling";
-        mode(&mut inner, now);
+        note_pull(&mut inner, exp, now);
+    }
+
+    async fn process_batch<T>(
+        &self,
+        exp: i64,
+        now: impl Fn() -> i64,
+        batch: impl std::future::Future<Output = Result<T, &'static str>>,
+    ) -> Result<T, &'static str> {
+        {
+            let mut inner = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            inner.batch_processing = true;
+            note_pull(&mut inner, exp, now());
+        }
+        // The reader cannot pull again until these notices are fetched,
+        // committed and acknowledged. Renewal or shutdown can drop the await.
+        let _processing = BatchProcessing(&self.0);
+        let result = batch.await;
+        if result.is_ok() {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .last_activity_ms = Some(now());
+        }
+        result
     }
 
     fn unavailable(&self, reason: &'static str) {
@@ -204,14 +227,34 @@ impl Control {
     }
 }
 
+struct BatchProcessing<'a>(&'a Mutex<Inner>);
+
+impl Drop for BatchProcessing<'_> {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .batch_processing = false;
+    }
+}
+
+fn note_pull(inner: &mut Inner, exp: i64, now: i64) {
+    inner.attached = true;
+    inner.credential_expires_ms = exp.saturating_sub(60).saturating_mul(1000);
+    inner.last_activity_ms = Some(now);
+    inner.reason = "durable attached and pulling";
+    mode(inner, now);
+}
+
 fn mode(inner: &mut Inner, now: i64) -> bool {
-    let recent_pull = inner
-        .last_pull_ms
-        .is_some_and(|last| now.saturating_sub(last) < PULL_FRESH_MS);
-    let healthy = inner.attached && now < inner.credential_expires_ms && recent_pull;
+    let active = inner.batch_processing
+        || inner
+            .last_activity_ms
+            .is_some_and(|last| now.saturating_sub(last) < PULL_FRESH_MS);
+    let healthy = inner.attached && now < inner.credential_expires_ms && active;
     if healthy != inner.event_driven {
-        let reason = if inner.attached && !recent_pull {
-            "successful pull is stale"
+        let reason = if inner.attached && !active {
+            "quota consumer activity is stale"
         } else if inner.attached && now >= inner.credential_expires_ms {
             "credential needs renewal"
         } else {
@@ -531,7 +574,7 @@ impl Drop for Reader {
     }
 }
 
-async fn stopped(stop: &AtomicBool) {
+pub(crate) async fn stopped(stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -658,43 +701,47 @@ async fn run_session(
 ) -> Result<(), &'static str> {
     while chrono::Utc::now().timestamp() < credential.exp.saturating_sub(60) {
         let batch = pull(consumer).await?;
-        control.pulled(credential.exp, now_ms());
-        let commit = async {
-            for message in &batch {
-                if message.subject.as_str() == subject {
-                    match Notice::decode(message) {
-                        Ok(notice) => {
-                            let key = notice.key.clone();
-                            cursors
-                                .admit(control, notice, insula.event_body(&key))
-                                .await?;
-                        }
-                        Err(_) => control.owe_snapshot(),
-                    }
-                }
-                message
-                    .double_ack()
-                    .await
-                    .map_err(|_| "quota acknowledgement failed")?;
-            }
-            Ok::<(), &'static str>(())
-        };
-        tokio::pin!(commit);
-        let mut progress = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(5),
-            Duration::from_secs(5),
-        );
-        loop {
-            tokio::select! {
-                result = &mut commit => { result?; break; }
-                _ = progress.tick() => {
+        control
+            .process_batch(credential.exp, now_ms, async {
+                let commit = async {
                     for message in &batch {
-                        message.ack_with(jetstream::AckKind::Progress).await
-                            .map_err(|_| "quota progress acknowledgement failed")?;
+                        if message.subject.as_str() == subject {
+                            match Notice::decode(message) {
+                                Ok(notice) => {
+                                    let key = notice.key.clone();
+                                    cursors
+                                        .admit(control, notice, insula.event_body(&key))
+                                        .await?;
+                                }
+                                Err(_) => control.owe_snapshot(),
+                            }
+                        }
+                        message
+                            .double_ack()
+                            .await
+                            .map_err(|_| "quota acknowledgement failed")?;
+                    }
+                    Ok::<(), &'static str>(())
+                };
+                tokio::pin!(commit);
+                let mut progress = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    Duration::from_secs(5),
+                );
+                loop {
+                    tokio::select! {
+                        result = &mut commit => { result?; break; }
+                        _ = progress.tick() => {
+                            for message in &batch {
+                                message.ack_with(jetstream::AckKind::Progress).await
+                                    .map_err(|_| "quota progress acknowledgement failed")?;
+                            }
+                        }
                     }
                 }
-            }
-        }
+                Ok(())
+            })
+            .await?;
     }
     Ok(())
 }
@@ -702,3 +749,58 @@ async fn run_session(
 #[cfg(test)]
 #[path = "quota_events_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[test]
+fn a_slow_quota_batch_does_not_make_an_attached_reader_fall_back_to_polling() {
+    use astrocyte_core::capacity::CapacityFreshness;
+    use std::cell::Cell;
+
+    let control = Control::default();
+    let now = Cell::new(10_000);
+    let exp = 600;
+    let snapshot = CapacitySnapshot {
+        windows: Vec::new(),
+        observations: Vec::new(),
+        provider_readings: Vec::new(),
+        complete_providers: None,
+        degraded_entries: 0,
+    };
+    let ticket = control.poll_ticket(now.get(), None).unwrap();
+    control.finish_poll(ticket, Some(&snapshot));
+    let freshness = CapacityFreshness {
+        runtime_variant: "active".into(),
+        effective_cadence_ms: 30_000,
+        changed_at_ms: None,
+        enabled_at_ms: Some(now.get()),
+        last_success_ms: Some(now.get()),
+        last_attempt_ms: Some(now.get()),
+        degraded_entries: 0,
+        detail: None,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(control.process_batch(exp, || now.get(), async {
+            now.set(now.get() + PULL_FRESH_MS + 1);
+            assert!(
+                control.poll_ticket(now.get(), Some(&freshness)).is_none(),
+                "a fetched batch can still be committing"
+            );
+            Ok(())
+        }))
+        .unwrap();
+    assert!(
+        control
+            .poll_ticket(now.get() + 1, Some(&freshness))
+            .is_none(),
+        "finishing the batch leaves time for the next pull"
+    );
+    assert!(
+        control
+            .poll_ticket(now.get() + PULL_FRESH_MS, Some(&freshness))
+            .is_some(),
+        "an idle reader without new activity still falls back"
+    );
+}

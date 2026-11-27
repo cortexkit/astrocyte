@@ -256,8 +256,10 @@ one half-even rounding of the row total. Independently displayed model lines
 may differ from that total by rounding nanodollars; they are not the source of
 the aggregate. Subscription/fee shares also round after aggregation.
 `fee_paid_nanos` remains the recurring fee over the **whole observation
-interval** for priced accounts of the plan, not the price of clean exposure;
-`fee_multiplier` is therefore ancillary and is not the routing divisor.
+interval** for priced accounts of the plan, not the price of clean exposure.
+`api_nanos` and `api_nanos_by_model` describe clean hours only, while the
+ancillary `fee_multiplier` uses the pool's calls from every hour in the
+observation interval. Routing uses the quota multiplier based on clean hours.
 
 ## Eligibility policy
 
@@ -318,8 +320,12 @@ For pools that can be measured, every tracked source must have
 daily stage retries until two hours after the later of the interval end and
 process start. After that deadline it may append a routing-ineligible row
 with `source_backlog` so a failing source does not leave a permanent gap.
-Operator recompute uses the same readiness check but counts two hours from
-the interval end alone. The daily stage also retries while a needed model's
+When the sources catch up, the daily stage can append one superseding
+recomputation per provider and observation day within its seven-day look-back.
+A source listed in `source_backlog` must have a successful drain before that
+automatic repair; removing it from `source_runtime` does not clear its backlog.
+Operator recompute checks the currently tracked sources and counts two hours
+from the interval end alone. The daily stage also retries while a needed model's
 rate timeline is not yet cached. Sources absent from `source_runtime` are not
 independently certified; this gate does not prove that traffic outside
 ingestion is visible.

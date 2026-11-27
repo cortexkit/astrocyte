@@ -6,9 +6,8 @@ use std::collections::HashSet;
 /// How many events that already carry an uncovered charge head one pass may
 /// re-resolve against newly declared subscription coverage.
 ///
-/// Measurements with no head at all are freshly recorded facts and keep the
-/// priority they have today: this bounds only the events added on top of them,
-/// never the ones the pass already had.
+/// This bounds repair work separately from freshly recorded facts with no
+/// charge head. Both kinds of work share the same per-tick time budget.
 ///
 /// The size trades two costs against each other. Coverage is answered from our
 /// own `account_subscription` table with no catalog call, so one of these
@@ -122,6 +121,7 @@ pub(crate) struct PricingWalk {
     backlog_logged: bool,
     /// Where the coverage backfill resumes; see [`BackfillSweep`].
     backfill: BackfillSweep,
+    backfill_first_next: bool,
 }
 
 /// The coverage backfill's position, carried across refresher ticks.
@@ -167,6 +167,7 @@ impl PricingWalk {
             after: None,
             backlog_logged: false,
             backfill: BackfillSweep::default(),
+            backfill_first_next: false,
         }
     }
 
@@ -503,6 +504,36 @@ fn run_pricing_walk_with_clock(
     // again in this pass and cannot hold the pass on one group.
     let tick_started = now();
     let deadline = tick_started.checked_add(budget.tick_time);
+    let price_group = |group: &[String]| {
+        price_event_group(
+            state,
+            catalog.as_ref(),
+            group,
+            recorded_at_ms,
+            stop,
+            deadline,
+            now,
+        )
+    };
+    let expired = || deadline.is_some_and(|deadline| now() >= deadline);
+    // If fresh queue work used the whole budget, give repair the first turn
+    // on the next tick. Only a queue-first tick can defer repair this way, so
+    // neither kind of work can keep the other from starting indefinitely.
+    let backfill_first = std::mem::take(&mut walk.backfill_first_next);
+    if backfill_first && !stop.load(Ordering::Relaxed) && !expired() {
+        run_coverage_backfill(
+            state,
+            walk,
+            &price_group,
+            &mut pass,
+            &mut failures,
+            &mut attempted,
+            &failed,
+        );
+        if stop.load(Ordering::Relaxed) || expired() {
+            return finish_pricing_pass(pass, failures);
+        }
+    }
     let mut slowest_group = Duration::ZERO;
     let mut taken = 0_usize;
     let mut reached_end = false;
@@ -524,20 +555,15 @@ fn run_pricing_walk_with_clock(
             }
         };
         pass.queue_selection_steps += steps;
-        let complete = group.len() < wanted;
+        let selected = group.len();
+        let selected_last = group.last().cloned();
+        let complete = selected < wanted;
+        group.retain(|event_id| !attempted.contains(event_id));
         let group_started = now();
         let Some(PricedGroup {
             attempted: processed,
             outcomes,
-        }) = price_event_group(
-            state,
-            catalog.as_ref(),
-            &group,
-            recorded_at_ms,
-            stop,
-            deadline,
-            now,
-        )
+        }) = price_group(&group)
         else {
             // The cursor stays before this group, so the next pass starts
             // with it.
@@ -562,14 +588,14 @@ fn run_pricing_walk_with_clock(
             pass.paused = true;
             break;
         }
-        taken += group.len();
+        taken += selected;
         if complete {
             walk.after = None;
             reached_end = true;
             attempted.extend(group);
             break;
         }
-        walk.after = group.last().cloned();
+        walk.after = selected_last;
         attempted.extend(group);
         slowest_group = slowest_group.max(now().duration_since(group_started));
         // Start another group only if one as slow as the slowest seen this
@@ -585,16 +611,35 @@ fn run_pricing_walk_with_clock(
     }
     walk.note_progress(state, pass.paused, reached_end);
 
-    // An event a newly declared plan covers already has a head saying no plan
-    // covered it, so it is not queued. Those are found by the backfill query,
-    // which is only run while a plan write has not yet been drained. Its batch
-    // is bounded by the budget's `backfill_events` on its own, so it runs on a
-    // tick whose queue walk paused on the event cap too, but shares its
-    // wall-time budget. Each tick's batch resumes where the last one ended;
-    // see `BackfillSweep`.
-    if stop.load(Ordering::Relaxed) || deadline.is_some_and(|deadline| now() >= deadline) {
-        return finish_pricing_pass(pass, failures);
+    if !backfill_first && !stop.load(Ordering::Relaxed) {
+        if !expired() {
+            run_coverage_backfill(
+                state,
+                walk,
+                &price_group,
+                &mut pass,
+                &mut failures,
+                &mut attempted,
+                &failed,
+            );
+        }
+        walk.backfill_first_next = expired();
     }
+    finish_pricing_pass(pass, failures)
+}
+
+/// After a subscription plan is written, reprice charges that it now covers
+/// until a sweep finds none left. Batches resume across ticks and share the
+/// fresh queue's deadline.
+fn run_coverage_backfill(
+    state: &SharedState,
+    walk: &mut PricingWalk,
+    price_group: &impl Fn(&[String]) -> Option<PricedGroup>,
+    pass: &mut PricingPass,
+    failures: &mut Vec<String>,
+    attempted: &mut HashSet<String>,
+    failed: &HashSet<String>,
+) {
     let due = match state.with_conn(|conn| {
         astrocyte_core::subscription::coverage_backfill_due(conn)
             .map_err(|error| format!("{}: {}", error.code(), error.message()))
@@ -602,7 +647,7 @@ fn run_pricing_walk_with_clock(
         Ok(due) => due,
         Err(error) => {
             failures.push(error);
-            return finish_pricing_pass(pass, failures);
+            return;
         }
     };
     if let Some(generation) = due {
@@ -611,7 +656,7 @@ fn run_pricing_walk_with_clock(
         if sweep.generation != Some(generation) {
             sweep.restart(generation);
         }
-        let batch_events = budget.backfill_events.max(1);
+        let batch_events = walk.budget.backfill_events.max(1);
         let backfill = match state.with_conn(|conn| {
             astrocyte_core::subscription::coverage_backfill_page(conn, sweep.after, batch_events)
                 .map_err(|error| format!("{}: {}", error.code(), error.message()))
@@ -619,7 +664,7 @@ fn run_pricing_walk_with_clock(
             Ok(backfill) => backfill,
             Err(error) => {
                 failures.push(error);
-                return finish_pricing_pass(pass, failures);
+                return;
             }
         };
         // A short candidate page read to the end of the index.
@@ -649,25 +694,18 @@ fn run_pricing_walk_with_clock(
                 fresh.push(event_id);
             }
         }
-        for group in fresh.chunks(group_events) {
+        for group in fresh.chunks(walk.budget.group_events.max(1)) {
             let Some(PricedGroup {
                 attempted: processed,
                 outcomes,
-            }) = price_event_group(
-                state,
-                catalog.as_ref(),
-                group,
-                recorded_at_ms,
-                stop,
-                deadline,
-                now,
-            )
+            }) = price_group(group)
             else {
                 // Nothing in this group was written, so the sweep resumes
                 // with it on the next tick.
                 batch_attempted = false;
                 break;
             };
+            attempted.extend(group.iter().take(processed).cloned());
             for (event_id, outcome) in outcomes {
                 match outcome {
                     Ok(PricingOutcome::Priced) => pass.priced += 1,
@@ -718,8 +756,6 @@ fn run_pricing_walk_with_clock(
             }
         }
     }
-
-    finish_pricing_pass(pass, failures)
 }
 
 fn finish_pricing_pass(pass: PricingPass, failures: Vec<String>) -> Result<PricingPass, String> {
@@ -1862,6 +1898,61 @@ pub(super) mod tests {
                 vec![("pricing_pass".to_string(), 1)]
             );
         }
+    }
+
+    #[test]
+    fn pricing_coverage_repair_progresses_when_the_queue_always_uses_the_deadline() {
+        let state = test_state();
+        let instant = 1_800_000_000_000;
+        seed_account_event(
+            &state,
+            "uncovered",
+            instant,
+            "subscription_included",
+            "claude",
+        );
+        state
+            .install_catalog(Some(
+                CatalogClient::connect(Arc::new(LateCatalog::warming(0))).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(price_unpriced_events(&state, 1, &NEVER_STOP).unwrap(), 1);
+        declare_plan(&state, instant - 1);
+        for (event_id, at) in [("metered-a", instant + 1), ("metered-b", instant + 2)] {
+            seed_account_event(&state, event_id, at, "metered_api", "claude");
+        }
+        let elapsed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let slow_metered_call = |at| {
+            let elapsed = elapsed.clone();
+            let peer = ActsDuringLookup::new(at, move || {
+                elapsed.fetch_add(200, Ordering::SeqCst);
+            });
+            state
+                .install_catalog(Some(CatalogClient::connect(Arc::new(peer)).unwrap()))
+                .unwrap();
+        };
+        let origin = std::time::Instant::now();
+        let now = || origin + Duration::from_millis(elapsed.load(Ordering::SeqCst));
+        let mut walk = PricingWalk::new(PricingBudget {
+            group_events: 100,
+            tick_events: usize::MAX,
+            tick_time: Duration::from_millis(200),
+            backfill_events: COVERAGE_BACKFILL_PER_PASS,
+        });
+        slow_metered_call(instant + 1);
+        run_pricing_walk_with_clock(&state, 2, &NEVER_STOP, &mut walk, &now).unwrap();
+        assert_eq!(queued_event_ids(&state), ["metered-b"]);
+        assert_eq!(charge_rows_by_origin(&state, "uncovered").len(), 1);
+        slow_metered_call(instant + 2);
+        run_pricing_walk_with_clock(&state, 3, &NEVER_STOP, &mut walk, &now).unwrap();
+        assert!(queued_event_ids(&state).is_empty());
+        assert_eq!(
+            charge_rows_by_origin(&state, "uncovered"),
+            [("pricing_pass".into(), 1), ("pricing_pass".into(), 2)]
+        );
+        let repaired = head(&state, "uncovered");
+        assert_eq!(repaired.outcome, "covered");
+        assert_eq!(repaired.charge_nanos, Some(0));
     }
 
     #[test]

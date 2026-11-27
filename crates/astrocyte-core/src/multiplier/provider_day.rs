@@ -75,6 +75,49 @@ impl ProviderDay<'_> {
         )?)
     }
 
+    /// An outstanding backlog must still be on a head. A superseding set that
+    /// cleared that backlog already repaired this day, even after restart.
+    pub fn needs_source_repair(self, conn: &Connection) -> Result<bool, MultiplierError> {
+        Ok(conn.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM multiplier_observation o
+                 WHERE o.quota_provider=?1 AND o.observation_day=?2 AND o.pool_scope IS NOT NULL
+                   AND o.source_backlog<>'[]'
+                   AND NOT EXISTS (SELECT 1 FROM multiplier_observation child WHERE child.supersedes=o.observation_id)
+             ) AND NOT EXISTS (
+                 SELECT 1 FROM multiplier_observation o
+                 JOIN multiplier_observation child ON child.supersedes=o.observation_id
+                 WHERE o.quota_provider=?1 AND o.observation_day=?2 AND o.pool_scope IS NOT NULL
+                   AND o.source_backlog<>'[]' AND child.source_backlog='[]'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM multiplier_observation sibling
+                       WHERE sibling.quota_provider=?1 AND sibling.observation_day=?2
+                         AND sibling.snapshot_at_ms=child.snapshot_at_ms AND sibling.source_backlog<>'[]'
+                   )
+             )",
+            params![self.provider, self.day],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The daily stage must not clear an old backlog just because its source
+    /// was removed from the runtime inventory.
+    pub fn missing_backlog_sources(
+        self,
+        conn: &Connection,
+    ) -> Result<Vec<String>, MultiplierError> {
+        let mut statement = conn.prepare_cached(
+            "SELECT DISTINCT backlog.value
+             FROM multiplier_observation o CROSS JOIN json_each(o.source_backlog) backlog
+             WHERE o.quota_provider=?1 AND o.observation_day=?2 AND o.pool_scope IS NOT NULL
+               AND o.source_backlog<>'[]'
+               AND NOT EXISTS (SELECT 1 FROM multiplier_observation child WHERE child.supersedes=o.observation_id)
+               AND NOT EXISTS (SELECT 1 FROM source_runtime r WHERE r.source_key=backlog.value)",
+        )?;
+        let rows = statement.query_map(params![self.provider, self.day], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The provider-day marker and all pool observations commit together. A recompute that
     /// recorded the day while its facts were being read wins over a daily tick.
     pub fn record(

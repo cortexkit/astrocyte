@@ -172,6 +172,9 @@ pub fn prepare_reconciliation(
     }
     let (winners, differences) = account_winners(plans);
     diagnostics.vault_record_differences = differences;
+    for plan in plans.iter().filter(|plan| plan.source != "config") {
+        close_obsolete_credential_keys(conn, plan, now, &mut changes)?;
+    }
     for plan in &winners {
         if plan.source == "config" {
             continue;
@@ -222,6 +225,63 @@ pub fn prepare_reconciliation(
         diagnostics,
         changes,
     })
+}
+
+fn close_obsolete_credential_keys(
+    conn: &Connection,
+    plan: &VaultPlan,
+    now: i64,
+    changes: &mut Vec<LedgerChange>,
+) -> Result<(), String> {
+    // The credential id stays stable when its billing key changes. A plan tier's
+    // effective date can predate that change, so close at the first observation
+    // of the new identity after the last evidence for the old one.
+    let mut query = conn
+        .prepare_cached(
+            "SELECT s.provider, (
+             SELECT changed.observed_at_ms FROM vault_plan_history changed
+             WHERE changed.credential_id=s.credential_ref AND changed.source<>'config'
+               AND changed.effective_from_ms<=?4
+               AND (changed.account_id IS NOT NULL OR changed.provider<>s.provider)
+               AND changed.history_id > (
+                   SELECT previous.history_id FROM vault_plan_history previous
+                   WHERE previous.credential_id=s.credential_ref AND previous.provider=s.provider
+                     AND previous.account_id IS NULL AND previous.effective_from_ms<=?4
+                   ORDER BY previous.history_id DESC LIMIT 1
+               )
+             ORDER BY changed.history_id LIMIT 1
+         ) FROM credential_subscription s
+         WHERE s.credential_ref=?1 AND s.effective_to_ms IS NULL AND s.operator=?5
+           AND (?2 IS NOT NULL OR s.provider<>?3)
+         ORDER BY s.provider",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = query
+        .query_map(
+            params![
+                plan.credential_id,
+                plan.account_id,
+                plan.provider,
+                now,
+                VAULT_OPERATOR
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let (provider, boundary) = row.map_err(|error| error.to_string())?;
+        if let Some(effective_to) = boundary {
+            changes.push(LedgerChange::Close(
+                PlanLedger::Credential,
+                CloseSubscriptionRequest {
+                    provider,
+                    account_ref: plan.credential_id.clone(),
+                    effective_to,
+                },
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reconcile one ledger key against its winning vault record. `confirmed_seed`
@@ -1015,6 +1075,63 @@ mod tests {
         assert_eq!(current.account_id.as_deref(), Some("account-b"));
         assert_eq!(current.plan_tier.as_deref(), Some("max_20x"));
         assert_eq!(current.source, "detected");
+    }
+
+    #[test]
+    fn reconciliation_closes_obsolete_credential_keys_at_first_identity_observation() {
+        for (next_provider, next_account) in [("openai", Some("account")), ("anthropic", None)] {
+            let mut conn = crate::test_support::conn();
+            let mut plan = VaultPlan {
+                credential_id: "cred".into(),
+                provider: Some("openai".into()),
+                account_id: None,
+                plan_tier: Some("plus".into()),
+                plan_key: Some("openai/plus".into()),
+                source: "detected".into(),
+                effective_from_ms: 100,
+                observed_at_ms: 200,
+            };
+            let tx = conn.transaction().unwrap();
+            assert!(append_in_tx(&tx, &plan).unwrap());
+            tx.execute_batch(
+                "INSERT INTO credential_subscription(credential_ref,provider,plan_name,recurring_cost_minor,currency,amount_exponent,period,effective_from_ms,operator)
+                 VALUES('cred','openai','openai/plus',2000,'USD',2,'month',150,'vault'),
+                       ('cred','manual','hand plan',1000,'USD',2,'month',175,NULL);",
+            ).unwrap();
+            // A plan's tier date does not establish when its billing identity changed.
+            plan.provider = Some(next_provider.into());
+            plan.account_id = next_account.map(str::to_string);
+            plan.plan_key = Some(format!("{next_provider}/plus"));
+            plan.observed_at_ms = 400;
+            assert!(append_in_tx(&tx, &plan).unwrap());
+            plan.plan_tier = Some("team".into());
+            plan.plan_key = Some(format!("{next_provider}/team"));
+            plan.observed_at_ms = 500;
+            assert!(append_in_tx(&tx, &plan).unwrap());
+            let plans = at(&tx, 501).unwrap();
+            let prices = PlanPricesResponse {
+                prices: Vec::new(),
+                resolved_at_ms: 500,
+                tier_vocabulary: String::new(),
+                unit_policy: String::new(),
+                quota_pools: Vec::new(),
+            };
+            prepare_reconciliation(&tx, &plans, &BTreeMap::new(), &prices, 500)
+                .unwrap()
+                .apply_in_tx(&tx)
+                .unwrap();
+            tx.commit().unwrap();
+            let intervals = conn.prepare(
+                "SELECT provider,effective_from_ms,effective_to_ms FROM credential_subscription ORDER BY provider",
+            ).unwrap().query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(
+                intervals,
+                [
+                    ("manual".into(), 175, None),
+                    ("openai".into(), 150, Some(400))
+                ]
+            );
+        }
     }
 
     #[test]

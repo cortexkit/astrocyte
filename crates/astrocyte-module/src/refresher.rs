@@ -164,6 +164,10 @@ pub trait SourceClient: Send + Sync {
 
 pub trait CapacitySource: Send + Sync {
     fn poll(&self) -> Result<CapacitySnapshot, PullError>;
+
+    fn poll_until_stopped(&self, _stop: &AtomicBool) -> Result<CapacitySnapshot, PullError> {
+        self.poll()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -820,10 +824,38 @@ fn run_loop_full(
     producers: Vec<Producer>,
     file_sources: FileSources,
     capacity: Option<Arc<dyn CapacitySource>>,
+    pending_catalog: Option<PendingCatalog>,
+    multiplier: MultiplierStage,
+    poll_secs: u64,
+    stop: Arc<AtomicBool>,
+) {
+    let started = std::time::Instant::now();
+    run_loop_full_with_clock(
+        state,
+        producers,
+        file_sources,
+        capacity,
+        pending_catalog,
+        multiplier,
+        poll_secs,
+        stop,
+        || started.elapsed(),
+        std::thread::sleep,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop_full_with_clock(
+    state: Arc<SharedState>,
+    producers: Vec<Producer>,
+    file_sources: FileSources,
+    capacity: Option<Arc<dyn CapacitySource>>,
     mut pending_catalog: Option<PendingCatalog>,
     mut multiplier: MultiplierStage,
     poll_secs: u64,
     stop: Arc<AtomicBool>,
+    elapsed: impl Fn() -> Duration,
+    pause: impl Fn(Duration),
 ) {
     let interval = Duration::from_secs(poll_secs.max(1));
     let mut reconciler = QueueReconciler::new(QUEUE_RECONCILE_CHUNK, QUEUE_RECONCILE_TICK_BUDGET);
@@ -831,6 +863,7 @@ fn run_loop_full(
     let mut summaries = astrocyte_core::report::SummaryMaintenance::default();
     let mut valuations = astrocyte_core::report::valuation::ValuationMaintenance::default();
     let mut vault = crate::vault_source::Stage::new(Arc::clone(&stop));
+    let mut next_fast = elapsed().saturating_add(FAST_LANE_INTERVAL);
     while !stop.load(Ordering::Relaxed) {
         vault.tick(&state, multiplier.plan_prices.as_deref(), current_time_ms());
         run_tick(
@@ -849,11 +882,19 @@ fn run_loop_full(
         if !stop.load(Ordering::Relaxed) {
             multiplier.tick_days(&state, pending_catalog.is_some(), current_time_ms(), &stop);
         }
-        let started = std::time::Instant::now();
-        let mut next_fast = FAST_LANE_INTERVAL;
+        let full_due = elapsed().saturating_add(interval);
         #[cfg(test)]
         state.note_interval_wait_for_test();
-        while !stop.load(Ordering::Relaxed) && started.elapsed() < interval {
+        while !stop.load(Ordering::Relaxed) && elapsed() < full_due {
+            fast_lane_if_due(
+                &state,
+                &producers,
+                &file_sources,
+                &stop,
+                elapsed(),
+                full_due,
+                &mut next_fast,
+            );
             crate::quota_events::drain(&state, &stop);
             catalog_wake_tick(&state, &mut pending_catalog, &mut multiplier, &stop, false);
             attribution_source::drain_all(&state, &stop, false);
@@ -867,15 +908,6 @@ fn run_loop_full(
                     drain_media_if_due(&state, source.as_ref(), &stop, false);
                 }
             }
-            fast_lane_if_due(
-                &state,
-                &producers,
-                &file_sources,
-                &stop,
-                started.elapsed(),
-                interval,
-                &mut next_fast,
-            );
             // A summary format change leaves every hour stale, and reports
             // read the whole ledger until each hour is rebuilt. At one budget
             // per full tick that takes most of an hour, so while hours are
@@ -888,9 +920,7 @@ fn run_loop_full(
                 multiplier.fill_rates(&state);
             }
             valuation_tick(&state, &mut valuations, &stop, Duration::from_millis(1_500));
-            std::thread::sleep(
-                Duration::from_millis(250).min(interval.saturating_sub(started.elapsed())),
-            );
+            pause(Duration::from_millis(250).min(full_due.saturating_sub(elapsed())));
         }
     }
     vault.join();
@@ -905,14 +935,14 @@ fn fast_lane_if_due(
     sources: &FileSources,
     stop: &AtomicBool,
     elapsed: Duration,
-    full_interval: Duration,
+    full_due: Duration,
     next_fast: &mut Duration,
 ) {
     #[cfg(all(test, target_os = "linux"))]
     if !fast_lane_measure::enabled() {
         return;
     }
-    if elapsed < *next_fast || elapsed >= full_interval || stop.load(Ordering::Relaxed) {
+    if elapsed < *next_fast || elapsed >= full_due || stop.load(Ordering::Relaxed) {
         return;
     }
     run_fast_lane(state, producers, sources, current_time_ms(), stop);
@@ -1361,7 +1391,11 @@ fn run_iteration_all(
                 .capacity_poll_ticket(current_time_ms())
                 .map(|ticket| (capacity, ticket))
         }) {
-            let result = capacity.poll();
+            let result = capacity.poll_until_stopped(stop);
+            if stop.load(Ordering::Relaxed) || matches!(result, Err(PullError::Stopped)) {
+                state.quota_bus().finish_poll(ticket, None);
+                return;
+            }
             let now_ms = current_time_ms();
             let persisted = match &result {
                 Ok(snapshot) => state.ordered_write(|tx| {
@@ -1843,6 +1877,65 @@ mod loop_tests {
     }
 
     struct PricingSource;
+
+    #[test]
+    fn overdue_fast_lane_tails_broca_before_waiting_after_a_long_full_tick() {
+        use std::sync::atomic::AtomicU64;
+
+        struct SlowFullDrain(Arc<AtomicU64>);
+        impl SourceClient for SlowFullDrain {
+            fn pull(
+                &self,
+                since: Option<SourceCursor>,
+                limit: u32,
+            ) -> Result<ExportPage, PullError> {
+                self.0.store(3, Ordering::Relaxed);
+                let mut page = PricingSource.pull(since, limit)?;
+                page.events.clear();
+                page.cursor.ordinal = 6;
+                page.high_water.ordinal = 6;
+                Ok(page)
+            }
+
+            fn pull_fast(
+                &self,
+                since: Option<SourceCursor>,
+                limit: u32,
+            ) -> Result<ExportPage, PullError> {
+                PricingSource.pull(since, limit)
+            }
+        }
+        let state = Arc::new(test_state());
+        let elapsed_secs = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        run_loop_full_with_clock(
+            state.clone(),
+            vec![Producer {
+                source_key: "broca".into(),
+                client: Arc::new(SlowFullDrain(elapsed_secs.clone())),
+            }],
+            FileSources::default(),
+            None,
+            None,
+            MultiplierStage::new(None),
+            30,
+            stop.clone(),
+            || Duration::from_secs(elapsed_secs.load(Ordering::Relaxed)),
+            |_| stop.store(true, Ordering::Relaxed),
+        );
+        let event_count = state
+            .with_conn(|conn| {
+                conn.query_row("SELECT count(*) FROM usage_event", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(
+            event_count, 1,
+            "the overdue tail must commit before the first interval wait"
+        );
+    }
 
     #[test]
     fn hourly_summary_tick_publishes_real_drain_facts_without_changing_the_served_report() {

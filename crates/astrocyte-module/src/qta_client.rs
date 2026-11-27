@@ -4,11 +4,12 @@
 //! (one connection, reused until an error, reopened on a dead route), but calls
 //! `usage.get` on QTA's ManagementSurface and maps the shared
 //! `cortexkit-provider-usage` array into a `CapacitySnapshot`. Read-only and
-//! advisory: every failure is `PullError::Unavailable` so the refresher marks
-//! the axis stale and keeps the last-known windows — nothing blocks.
+//! advisory: a failed exchange keeps the last-known windows, and shutdown
+//! cancels an in-flight poll without recording a failed attempt.
 
 #[cfg(test)]
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -80,10 +81,14 @@ impl QtaClient {
         Self::build(PeerAccess::Fixture(path.into()), request_timeout)
     }
 
-    fn fetch_inner(&self) -> Result<CapacitySnapshot, PullError> {
-        let body = self
-            .runtime
-            .block_on(self.request(OP_USAGE_GET, json!({})))?;
+    fn fetch_inner(&self, stop: &AtomicBool) -> Result<CapacitySnapshot, PullError> {
+        let body = self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                () = crate::quota_events::stopped(stop) => Err(PullError::Stopped),
+                result = self.request(OP_USAGE_GET, json!({})) => result,
+            }
+        })?;
         // Decode failures can quote an unexpected peer value. Keep that value
         // out of the durable capacity failure detail.
         decode_usage_response(&body)
@@ -155,7 +160,11 @@ fn decode_usage_response(body: &[u8]) -> Result<CapacitySnapshot, String> {
 
 impl CapacitySource for QtaClient {
     fn poll(&self) -> Result<CapacitySnapshot, PullError> {
-        self.fetch_inner()
+        self.fetch_inner(&AtomicBool::new(false))
+    }
+
+    fn poll_until_stopped(&self, stop: &AtomicBool) -> Result<CapacitySnapshot, PullError> {
+        self.fetch_inner(stop)
     }
 }
 
@@ -540,6 +549,60 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_cancels_a_silent_pending_quota_poll_without_recording_failure() {
+        struct ObservedQuota(QtaClient, AtomicBool);
+
+        impl CapacitySource for ObservedQuota {
+            fn poll(&self) -> Result<CapacitySnapshot, PullError> {
+                self.0.poll()
+            }
+
+            fn poll_until_stopped(&self, stop: &AtomicBool) -> Result<CapacitySnapshot, PullError> {
+                let result = self.0.poll_until_stopped(stop);
+                self.1.store(
+                    matches!(result, Err(PullError::Stopped)),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                result
+            }
+        }
+
+        let peer = SilentPeer::start(Duration::ZERO);
+        let client =
+            QtaClient::new_with_request_timeout(&peer.connection_file_path, Duration::from_secs(2))
+                .unwrap();
+        let quota = ObservedQuota(client, AtomicBool::new(false));
+        let state = test_state();
+        state.configure_capacity_runtime(true, 30_000, 100).unwrap();
+        let freshness = || {
+            state
+                .with_conn(|conn| {
+                    astrocyte_core::capacity::freshness(conn).map_err(|e| e.to_string())
+                })
+                .unwrap()
+        };
+        let before = freshness();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| run_iteration_with_capacity(&state, &[], Some(&quota), &stop));
+            wait_until("the silent quota peer receiving usage.get", || {
+                peer.connections.lock().unwrap().contains(&true)
+            });
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        assert!(
+            quota.1.load(std::sync::atomic::Ordering::Relaxed),
+            "usage.get must return Stopped rather than time out"
+        );
+        let after = freshness();
+        assert_eq!(after.last_attempt_ms, before.last_attempt_ms);
+        assert_eq!(after.last_success_ms, before.last_success_ms);
+        assert_eq!(after.detail, before.detail);
+        peer.finish();
+    }
+
+    #[test]
     fn safeguard_capacity_error_detail_omits_peer_message() {
         use crate::fusiform_client::tests::{DeadlinePeer, PeerReply};
 
@@ -756,7 +819,7 @@ mod tests {
                 assert!(live.is_none(), "a timeout must evict the cached socket");
                 *live = Some(open_fixture_route(&client));
             }
-            assert!(client.fetch_inner().is_err());
+            assert!(client.poll().is_err());
             // The request's bytes can be buffered even if the peer thread is
             // not scheduled until after the client's timer fires.
             wait_until("the silent QTA peer receiving usage.get", || {
@@ -808,7 +871,7 @@ mod tests {
 
         for _ in 0..2 {
             let before = peer.connection_count();
-            assert!(client.fetch_inner().is_err());
+            assert!(client.poll().is_err());
             assert!(
                 !peer.assert_fetch_reconnected(before),
                 "route.open was held past the timeout, so no connection may reach the request",
@@ -826,8 +889,8 @@ mod tests {
         let peer = RouteDeathPeer::start(death_code, json!({"result": []}));
         let client = QtaClient::for_test(&peer.connection_file_path).unwrap();
 
-        let first = client.fetch_inner();
-        let second = client.fetch_inner();
+        let first = client.poll();
+        let second = client.poll();
 
         peer.assert_route_reopened(QTA_MODULE_ID, death_code);
         assert!(
