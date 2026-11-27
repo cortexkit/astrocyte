@@ -1327,7 +1327,9 @@ mod tests {
     fn reconciliation_reports_the_last_committed_attempt_at_equal_times() {
         let mut conn = conn();
         seed_event(&conn, "event-1", "producer-a", "corr", None, 0);
-        // At this time the hash with attempt ordinal 0 sorts after ordinal 1.
+        // Reconciliation attempt ids are hashes of the line, time and attempt
+        // ordinal. At this time ordinal 0's id sorts after ordinal 1's, so
+        // ordering by id alone would return the earlier attempt.
         let attempted_at_ms = 302;
         let first = import_statement(
             &mut conn,

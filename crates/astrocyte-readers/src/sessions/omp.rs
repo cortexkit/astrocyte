@@ -134,7 +134,8 @@ impl OmpCallUsage {
                     }) =>
             {
                 // This record's total adds reasoning to the other token counts.
-                // Don't price a guessed split when reasoning is normally nested.
+                // OMP normally counts reasoning inside output, so a record whose total
+                // says otherwise can't be split reliably; don't price a guess.
                 OmpOutput::Visible(DerivedRole::Conflicted)
             }
             Some(reasoning) => {
