@@ -368,6 +368,73 @@ fn media_route_other_refusals_are_failures_not_absence() {
 }
 
 #[test]
+fn media_drain_yields_with_advancing_backlog_and_resumes_from_committed_cursor() {
+    let state = test_state();
+    let peer = Peer::start(Arc::new(move |value| {
+        if value["op"] == "route.open" {
+            return opened();
+        }
+        if value["method"] == "usage.ack" {
+            return result(json!({"acked_through_seq":value["params"]["through_seq"]}));
+        }
+        assert_eq!(value["method"], "usage.read");
+        let after = value["params"]["after_seq"].as_u64().unwrap();
+        result(page(if after < 20 {
+            vec![vendor_entry(after + 1)]
+        } else {
+            vec![]
+        }))
+    }));
+    let source = peer.source();
+    tick(&state, &source);
+    assert_eq!(peer.calls("usage.read").len(), 8);
+    assert_eq!(peer.calls("usage.ack").len(), 8);
+    assert_eq!(cursor(&state).as_deref(), Some("8"));
+    assert_eq!(count(&state, "usage_event"), 8);
+    tick(&state, &source);
+    assert_eq!(peer.calls("usage.read")[8]["params"]["after_seq"], 8);
+    assert_eq!(cursor(&state).as_deref(), Some("16"));
+    assert_eq!(count(&state, "usage_event"), 16);
+}
+
+#[test]
+fn media_fresh_source_reads_before_acknowledging_any_saved_cursor() {
+    let state = test_state();
+    let peer = Peer::start(fixed_page(vec![vendor_entry(1)]));
+    tick(&state, &peer.source());
+    assert_eq!(cursor(&state).as_deref(), Some("1"));
+
+    let read_seen = AtomicBool::new(false);
+    let restarted = Peer::start(Arc::new(move |value| {
+        if value["op"] == "route.open" {
+            return opened();
+        }
+        match value["method"].as_str().unwrap() {
+            "usage.read" => {
+                read_seen.store(true, Ordering::Relaxed);
+                let after = value["params"]["after_seq"].as_u64().unwrap();
+                result(page(if after == 1 {
+                    vec![vendor_entry(2)]
+                } else {
+                    vec![]
+                }))
+            }
+            "usage.ack" => {
+                let seq = value["params"]["through_seq"].as_u64().unwrap();
+                assert!(read_seen.load(Ordering::Relaxed) && seq == 2);
+                result(json!({"acked_through_seq":seq}))
+            }
+            other => panic!("unexpected method {other}"),
+        }
+    }));
+    tick(&state, &restarted.source());
+    assert_eq!(restarted.calls("usage.read")[0]["params"]["after_seq"], 1);
+    assert_eq!(restarted.calls("usage.ack").len(), 1);
+    assert_eq!(cursor(&state).as_deref(), Some("2"));
+    assert_eq!(count(&state, "usage_event"), 2);
+}
+
+#[test]
 fn media_feed_pages_commit_before_ack_and_retry_failed_ack() {
     let state = Arc::new(test_state());
     let observer = state.clone();
@@ -519,7 +586,7 @@ fn media_local_work_is_skipped_and_counted_once_under_redelivery() {
         Some(&1)
     );
     assert!(coverage(&state).set_aside_by_source[SOURCE_KEY].records == 0);
-    assert_eq!(peer.calls("usage.ack").len(), 3);
+    assert_eq!(peer.calls("usage.ack").len(), 2);
     assert_eq!(state.producer_degraded_reason(SOURCE_KEY), None);
 }
 
@@ -1116,7 +1183,8 @@ fn media_transient_preserves_cursor_and_existing_health_until_recovery() {
     tick(&state, &source);
     assert!(!source.transient_logged.load(Ordering::Relaxed));
     assert_eq!(state.producer_degraded_reason(SOURCE_KEY), None);
-    assert_eq!(peer.calls("usage.ack").len(), 1);
+    assert_eq!(peer.calls("usage.read").len(), 1);
+    assert!(peer.calls("usage.ack").is_empty());
 }
 
 #[test]

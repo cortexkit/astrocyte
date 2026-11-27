@@ -82,6 +82,14 @@ fn main() {
         eprintln!("refusing to run: empty corpus has no input to exercise");
         std::process::exit(2);
     }
+    let line_count = corpus_text.lines().count();
+    if line_count != manifest.event_count {
+        eprintln!(
+            "corpus event count {line_count} does not match manifest event count {}",
+            manifest.event_count
+        );
+        std::process::exit(2);
+    }
 
     // A fresh in-memory store per run: this harness measures whether real
     // shapes ingest, not whether they accumulate.

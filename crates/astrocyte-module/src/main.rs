@@ -1545,9 +1545,8 @@ fn self_signal_declarations() -> Vec<SelfSignalDeclaration> {
         domain: Some("colliculus".to_string()),
         note: Some(
             "Only while Colliculus ingestion is enabled: usage.read on each full \
-                 refresher tick, paging until empty; usage.ack \
-                 follows each committed page. A retry acknowledges the durable watermark \
-                 before reading."
+                 refresher tick, paging within a bounded drain; usage.ack follows each \
+                 committed page, and only for a sequence this process has read."
                 .to_string(),
         ),
     });

@@ -400,7 +400,7 @@ fn record_row(tx: &Transaction<'_>, record: &Record, at: i64) -> Result<Option<S
             return Ok(Some(reason));
         }
         if let Some(step) = &record.step_ref {
-            mark_conflicts(tx, &record.harness, step, at)?;
+            mark_conflicts(tx, &record.harness, &record.session, step, at)?;
             let producer = match record.harness.as_str() {
                 "claude-code" => "claude-code",
                 "opencode" => "opencode",
@@ -557,10 +557,13 @@ struct MirroredPayer {
 fn payer_rows(
     tx: &Transaction<'_>,
     harness: &str,
+    session: &str,
     step: &str,
 ) -> Result<Vec<MirroredPayer>, String> {
-    let mut statement = tx.prepare("SELECT attempt_id,charge_basis,auth_selection,account_ref,usage_json FROM thalamus_payer_record WHERE harness=?1 AND step_ref=?2 AND request_kind='main' ORDER BY attempt_id").map_err(sql)?;
-    let mut query = statement.query(params![harness, step]).map_err(sql)?;
+    let mut statement = tx.prepare("SELECT attempt_id,charge_basis,auth_selection,account_ref,usage_json FROM thalamus_payer_record WHERE harness=?1 AND step_ref=?2 AND session=?3 AND request_kind='main' ORDER BY attempt_id").map_err(sql)?;
+    let mut query = statement
+        .query(params![harness, step, session])
+        .map_err(sql)?;
     let mut rows = Vec::new();
     while let Some(row) = query.next().map_err(sql)? {
         let usage: Option<String> = row.get(4).map_err(sql)?;
@@ -582,9 +585,10 @@ fn payer_rows(
 pub(crate) fn payer_match(
     tx: &Transaction<'_>,
     harness: &str,
+    session: &str,
     step: &str,
 ) -> Result<PayerMatch, String> {
-    let rows = payer_rows(tx, harness, step)?;
+    let rows = payer_rows(tx, harness, session, step)?;
     let Some(first) = rows.first() else {
         return Ok(PayerMatch::Missing);
     };
@@ -612,13 +616,14 @@ pub(crate) fn payer_match(
 pub(crate) fn mark_conflicts(
     tx: &Transaction<'_>,
     harness: &str,
+    session: &str,
     step: &str,
     at: i64,
 ) -> Result<(), String> {
-    if payer_match(tx, harness, step)? != PayerMatch::Conflict {
+    if payer_match(tx, harness, session, step)? != PayerMatch::Conflict {
         return Ok(());
     }
-    for row in payer_rows(tx, harness, step)? {
+    for row in payer_rows(tx, harness, session, step)? {
         let attempt = row.attempt;
         harness_drain::record_set_aside_in_tx(
             tx,

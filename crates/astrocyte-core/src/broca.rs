@@ -147,6 +147,35 @@ pub fn record_segment_in_tx(
     Ok(true)
 }
 
+fn rejected_attempt_payload(attempt: &Attempt, eligible: &[(usize, &AttemptCall)]) -> String {
+    let mut payload = serde_json::json!(attempt.detail);
+    payload["fact_id"] = serde_json::json!(attempt.fact_id);
+    payload["shares"] = serde_json::json!(eligible
+        .iter()
+        .map(|&(index, call)| {
+            serde_json::json!({
+                "share_index": index,
+                "event": ingest::incoming_payload_value(&call.event, None),
+                "served_service_tier": call.served_service_tier,
+                "mode": call.mode,
+                "segment_fact_id": call.segment_fact_id,
+            })
+        })
+        .collect::<Vec<_>>());
+    payload.to_string()
+}
+
+fn attempt_redelivery<'a>(same: bool) -> AttemptRecordOutcome<'a> {
+    AttemptRecordOutcome {
+        disposition: if same {
+            RecordDisposition::ExactRedelivery
+        } else {
+            RecordDisposition::QuarantinedRedelivery
+        },
+        skipped_shares: Vec::new(),
+    }
+}
+
 /// Compare all eligible shares before inserting any of them. Changes confined
 /// to skipped shares are immaterial; any change to a recorded call, its
 /// detail, or the set of eligible positions quarantines the delivery.
@@ -201,38 +230,44 @@ pub fn record_attempt_in_tx<'a>(
         same &= row.is_none();
         drop(stored);
         if !same {
-            let mut payload = serde_json::json!(attempt.detail);
-            payload["fact_id"] = serde_json::json!(attempt.fact_id);
-            payload["shares"] = serde_json::json!(eligible
-                .iter()
-                .map(|&(index, call)| {
-                    serde_json::json!({
-                        "share_index": index,
-                        "event": ingest::incoming_payload_value(&call.event, None),
-                        "served_service_tier": call.served_service_tier,
-                        "mode": call.mode,
-                        "segment_fact_id": call.segment_fact_id,
-                    })
-                })
-                .collect::<Vec<_>>());
-            tx.execute(
-                "INSERT INTO rejected_delivery
-                     (producer,producer_lineage,producer_ref,incoming_payload,stored_event_key,detected_at_ms)
-                 SELECT producer,producer_lineage,producer_ref,?2,event_key,?3
-                   FROM usage_event WHERE event_key=?1",
-                params![event_key, payload.to_string(), recorded_at_ms],
+            ingest::record_rejected_delivery_in_tx(
+                tx,
+                event_key,
+                &rejected_attempt_payload(attempt, &eligible),
+                recorded_at_ms,
             )?;
         }
-        return Ok(AttemptRecordOutcome {
-            disposition: if same {
-                RecordDisposition::ExactRedelivery
-            } else {
-                RecordDisposition::QuarantinedRedelivery
-            },
-            skipped_shares: Vec::new(),
-        });
+        return Ok(attempt_redelivery(same));
     }
     drop(stored);
+
+    // An attempt skipped in full still claims its fact ID. There is no ledger
+    // event to identify it or to anchor the evidence when a share becomes eligible.
+    let empty_recorded: bool = tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM broca_empty_attempt WHERE fact_id=?1)")?
+        .query_row([&attempt.fact_id], |row| row.get(0))?;
+    if empty_recorded {
+        if !eligible.is_empty() {
+            tx.execute(
+                "INSERT INTO broca_empty_attempt_conflict(fact_id,incoming_payload,detected_at_ms)
+                 SELECT ?1,?2,?3 WHERE NOT EXISTS (
+                     SELECT 1 FROM broca_empty_attempt_conflict WHERE fact_id=?1 AND incoming_payload=?2
+                 )",
+                params![attempt.fact_id, rejected_attempt_payload(attempt, &eligible), recorded_at_ms],
+            )?;
+        }
+        return Ok(attempt_redelivery(eligible.is_empty()));
+    }
+    if eligible.is_empty() {
+        tx.execute(
+            "INSERT INTO broca_empty_attempt(fact_id,recorded_at_ms) VALUES(?1,?2)",
+            params![attempt.fact_id, recorded_at_ms],
+        )?;
+        return Ok(AttemptRecordOutcome {
+            disposition: RecordDisposition::Recorded,
+            skipped_shares,
+        });
+    }
 
     let detail = &attempt.detail;
     let mut insert = tx.prepare_cached(
@@ -273,6 +308,9 @@ pub fn record_attempt_in_tx<'a>(
             call.mode,
             call.segment_fact_id,
         ])?;
+        if let Some(segment) = &call.segment_fact_id {
+            segment_check::requeue_checked_segment(tx, segment)?;
+        }
     }
     Ok(AttemptRecordOutcome {
         disposition: RecordDisposition::Recorded,
@@ -287,6 +325,137 @@ pub(crate) use segment_check::segment_usage_mismatches;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{conn, measurement};
+
+    fn attempt(segment: Option<&str>) -> Attempt {
+        let event = serde_json::from_value(serde_json::json!({
+            "producer": "broca", "producer_ref": "attempt-1",
+            "occurred_at_ms": 1, "charge_basis": "metered_api",
+            "measurements": [measurement("input", Some(42))],
+        }))
+        .unwrap();
+        Attempt {
+            fact_id: "attempt-1".into(),
+            detail: AttemptDetail {
+                attempt_id: "request-1".into(),
+                step_id: 1,
+                attempt: 0,
+                outcome: "complete".into(),
+                http_status: None,
+                content_received: true,
+                response_bytes: 42,
+                recorded_at_ms: 1,
+                requested_service_tier: "standard".into(),
+                served_speed: None,
+                served_account_ref: None,
+            },
+            calls: vec![AttemptCall {
+                event,
+                served_service_tier: None,
+                mode: None,
+                segment_fact_id: segment.map(str::to_owned),
+            }],
+        }
+    }
+
+    #[test]
+    fn repeated_broca_attempt_contradiction_retains_only_distinct_evidence() {
+        let mut conn = conn();
+        let mut attempt = attempt(None);
+        let tx = conn.transaction().unwrap();
+        record_attempt_in_tx(&tx, &attempt, 1).unwrap();
+        for (at, bytes) in [(2, 43), (3, 43), (4, 44)] {
+            attempt.detail.response_bytes = bytes;
+            assert_eq!(
+                record_attempt_in_tx(&tx, &attempt, at).unwrap().disposition,
+                RecordDisposition::QuarantinedRedelivery
+            );
+        }
+        tx.commit().unwrap();
+        let mut query = conn
+            .prepare("SELECT detected_at_ms FROM rejected_delivery ORDER BY detected_at_ms")
+            .unwrap();
+        let timestamps = query
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(timestamps, [2, 4]);
+    }
+
+    #[test]
+    fn broca_all_skipped_attempt_cannot_gain_an_eligible_share_on_replay() {
+        let mut conn = conn();
+        let mut attempt = attempt(Some("legacy"));
+        let mut legacy = attempt.calls[0].event.clone();
+        legacy.producer_ref = "legacy".into();
+        ingest::record_event(&mut conn, &legacy, 1).unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let initial = record_attempt_in_tx(&tx, &attempt, 2).unwrap();
+        assert_eq!(initial.skipped_shares, [(0, "legacy")]);
+        tx.commit().unwrap();
+
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            record_attempt_in_tx(&tx, &attempt, 3).unwrap().disposition,
+            RecordDisposition::ExactRedelivery
+        );
+        attempt.calls[0].segment_fact_id = None;
+        for at in [4, 5] {
+            let replay = record_attempt_in_tx(&tx, &attempt, at).unwrap();
+            assert_eq!(replay.disposition, RecordDisposition::QuarantinedRedelivery);
+        }
+        tx.commit().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM usage_event", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let conflicts = conn.query_row(
+            "SELECT count(*),min(detected_at_ms) FROM broca_empty_attempt_conflict
+             WHERE fact_id='attempt-1' AND json_extract(incoming_payload,'$.shares[0].share_index')=0",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        ).unwrap();
+        assert_eq!(conflicts, (1, 4));
+    }
+
+    #[test]
+    fn broca_late_attempt_reconciles_current_mismatch_without_erasing_evidence() {
+        let mut conn = conn();
+        let tx = conn.transaction().unwrap();
+        for fact_id in ["matched-late", "still-different"] {
+            let segment = MarkedSegment {
+                fact_id: fact_id.into(),
+                run_id: "run".into(),
+                measurements: vec![measurement("input", Some(42))],
+            };
+            record_segment_in_tx(&tx, &segment, 1).unwrap();
+        }
+        assert_eq!(check_segments_in_tx(&tx, 3_600_002).unwrap(), 2);
+        tx.commit().unwrap();
+        assert_eq!(segment_usage_mismatches(&conn).unwrap(), 2);
+
+        let tx = conn.transaction().unwrap();
+        record_attempt_in_tx(&tx, &attempt(Some("matched-late")), 3_600_003).unwrap();
+        let mut different = attempt(Some("still-different"));
+        different.fact_id = "attempt-2".into();
+        different.calls[0].event.producer_ref = "attempt-2".into();
+        different.calls[0].event.measurements[0].quantity_units = Some(41);
+        record_attempt_in_tx(&tx, &different, 3_600_003).unwrap();
+        tx.commit().unwrap();
+
+        let tx = conn.transaction().unwrap();
+        check_segments_in_tx(&tx, 3_600_004).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(segment_usage_mismatches(&conn).unwrap(), 1);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM broca_segment_mismatch WHERE attempts_reported=0 AND checked_at_ms=3600002", [], |row| row.get::<_, i64>(0)).unwrap(),
+            2
+        );
+    }
 
     #[test]
     fn broca_segment_billing_and_coverage_lookups_seek_their_indexes() {

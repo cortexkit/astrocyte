@@ -82,9 +82,18 @@ fn stop_during_colliculus_peer_call_leaves_the_feed_for_retry() {
                                     FrameType::Response,
                                     json!({"result":{"acked_through_seq":7}}),
                                 ),
-                                "usage.read" => {
-                                    (FrameType::Response, json!({"result":{"entries":[]}}))
-                                }
+                                // A replay observes the durable sequence before the
+                                // ACK pause without adding any new usage.
+                                "usage.read" if pause == "usage.ack" => (
+                                    FrameType::Response,
+                                    json!({"result":{"entries":[{"seq":7,"record":{
+                                        "record_id":"local","principal":"person-a","job_id":"job-1",
+                                        "provider":"example","model":"speech","charge_basis":"local",
+                                        "started_at_ms":1,"finished_at_ms":2,"status":"done",
+                                        "selectors":{},"measurements":[]
+                                    }}],"last_seq":7}}),
+                                ),
+                                "usage.read" => (FrameType::Response, json!({"result":{"entries":[]}})),
                                 other => panic!("unexpected method {other}"),
                             };
                             if method != "server.describe" {
@@ -146,8 +155,8 @@ fn stop_during_colliculus_peer_call_leaves_the_feed_for_retry() {
         let expected: &[&str] = match pause {
             "connect" => &[],
             "route.open" => &["route.open"],
-            "usage.ack" => &["route.open", "usage.ack"],
-            _ => &["route.open", "usage.ack", "usage.read"],
+            "usage.ack" => &["route.open", "usage.read", "usage.ack"],
+            _ => &["route.open", "usage.read"],
         };
         assert_eq!(
             *calls.lock().unwrap(),
@@ -175,7 +184,9 @@ fn stop_during_colliculus_peer_call_leaves_the_feed_for_retry() {
                             row.get(0)
                         })
                         .unwrap();
-                    assert_eq!(rows, 0, "{pause}: {table} was not changed");
+                    let expected =
+                        i64::from(pause == "usage.ack" && table.starts_with("source_runtime"));
+                    assert_eq!(rows, expected, "{pause}: unexpected rows in {table}");
                 }
                 Ok(())
             })

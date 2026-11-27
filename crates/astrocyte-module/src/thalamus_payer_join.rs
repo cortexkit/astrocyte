@@ -86,8 +86,13 @@ impl Resolution {
         now: i64,
     ) -> Result<bool, String> {
         let started = match call.completed_at_ms {
-            Some(completed) => completed,
-            None => first_seen(tx, &id, now)?,
+            Some(completed) if now.saturating_sub(completed) >= PAYER_WAIT_MS => completed,
+            // Once a future timestamp becomes past, keep any earlier observation
+            // so crossing the producer's clock cannot extend the wait.
+            Some(completed) if completed <= now => {
+                stored_first_seen(tx, &id)?.map_or(completed, |seen| seen.min(completed))
+            }
+            _ => first_seen(tx, &id, now)?,
         };
         if now.saturating_sub(started) < PAYER_WAIT_MS {
             if self.next.len() < MAX_WAITING_CALLS {
@@ -250,15 +255,16 @@ impl WaitQueue {
                 result.push_ready(call, request.clone());
                 continue;
             }
+            let native_session = call.native_session();
             let owner: Option<Option<String>> = tx
                 .query_row(
                     "SELECT owner_principal FROM thalamus_payer_session WHERE harness=?1 AND session=?2",
-                    params![harness, call.native_session()],
+                    params![harness, native_session],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(|e| e.to_string())?;
-            if owner.is_none() {
+            let (Some(native_session), Some(owner)) = (native_session, owner) else {
                 if await_session_snapshot && call.native_session().is_some() {
                     let start = match request.occurred_at_ms.or(call.completed_at_ms) {
                         Some(start) => start,
@@ -280,8 +286,7 @@ impl WaitQueue {
                 }
                 result.push_ready(call, request.clone());
                 continue;
-            }
-            let owner = owner.flatten();
+            };
             if let (Some(owner), Some(roots_owner)) =
                 (owner.as_deref(), request.work_class.as_deref())
             {
@@ -303,7 +308,7 @@ impl WaitQueue {
             if ready.work_class.is_none() {
                 ready.work_class = owner;
             }
-            match payer_match(tx, harness, &request.producer_ref)? {
+            match payer_match(tx, harness, native_session, &request.producer_ref)? {
                 PayerMatch::Found {
                     basis,
                     auth,
@@ -318,7 +323,7 @@ impl WaitQueue {
                     }
                 }
                 PayerMatch::Conflict => {
-                    mark_conflicts(tx, harness, &request.producer_ref, now_ms)?;
+                    mark_conflicts(tx, harness, native_session, &request.producer_ref, now_ms)?;
                     unknown(&mut ready);
                 }
                 PayerMatch::Missing => {
@@ -415,14 +420,17 @@ fn first_seen(tx: &Transaction<'_>, id: &str, now_ms: i64) -> Result<i64, String
         params![id, now_ms],
     )
     .map_err(|e| e.to_string())?;
+    stored_first_seen(tx, id)?.ok_or_else(|| "waiting call first observation disappeared".into())
+}
+
+fn stored_first_seen(tx: &Transaction<'_>, id: &str) -> Result<Option<i64>, String> {
     tx.query_row(
         "SELECT first_seen_ms FROM thalamus_payer_first_seen WHERE event_id=?1",
         [id],
         |row| row.get(0),
     )
     .optional()
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "waiting call first observation disappeared".into())
+    .map_err(|e| e.to_string())
 }
 
 /// Call only after adopting a committed resolution, never before the write.
@@ -563,6 +571,62 @@ mod tests {
         assert_eq!(
             stored(&state),
             [("undated-session".into(), "unknown".into(), None, None)]
+        );
+    }
+
+    #[test]
+    fn payer_join_refuses_another_native_sessions_sole_payer() {
+        let state = test_state();
+        manage(&state);
+        payer(
+            &state,
+            "wrong",
+            "shared",
+            Some("metered_api"),
+            "wrong-login",
+        );
+        state
+            .ordered_write(|tx| {
+                tx.execute(
+                    "INSERT INTO thalamus_payer_session VALUES ('pi','session-b','owner',0)",
+                    [],
+                )
+                .unwrap();
+                Ok(((), true))
+            })
+            .unwrap();
+        let mut original = call("shared", Some(100));
+        original.native_session = Some("session-b".into());
+        let mut queue = WaitQueue::default();
+        assert_eq!(pass(&state, &mut queue, &[original], 600_100).0, 1);
+        assert_eq!(
+            stored(&state),
+            [("shared".into(), "unknown".into(), None, None)]
+        );
+    }
+
+    #[test]
+    fn payer_wait_future_completion_expires_from_first_observation_after_restart() {
+        let state = test_state();
+        manage(&state);
+        // Cover a timestamp still in the future at timeout and one that has since passed.
+        let calls = [
+            call("far-future", Some(86_400_000)),
+            call("near-future", Some(200)),
+        ];
+        let mut queue = WaitQueue::default();
+        assert_eq!(pass(&state, &mut queue, &calls, 100).0, 0);
+        assert!(stored(&state).is_empty());
+        let mut queue = WaitQueue::default();
+        assert_eq!(pass(&state, &mut queue, &calls, 600_099).0, 0);
+        assert_eq!(pass(&state, &mut queue, &[], 600_100).0, 2);
+        assert!(queue.is_empty());
+        assert_eq!(
+            stored(&state),
+            [
+                ("far-future".into(), "unknown".into(), None, None),
+                ("near-future".into(), "unknown".into(), None, None),
+            ]
         );
     }
 

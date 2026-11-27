@@ -2,8 +2,8 @@
 
 #[cfg(test)]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use astrocyte_core::ingest::{record_media_event_in_tx, RecordDisposition};
 use cortexkit_role_media::usage::{
@@ -26,6 +26,7 @@ use crate::state::SharedState;
 pub(crate) const SOURCE_KEY: &str = "colliculus";
 const BUDGET: Duration = Duration::from_secs(10);
 const LIMIT: u64 = 1_000;
+const PAGES_PER_DRAIN: usize = 8;
 
 #[derive(Debug, PartialEq, Eq)]
 enum FeedError {
@@ -237,6 +238,7 @@ pub(crate) struct ColliculusSource {
     #[cfg(test)]
     fixture_connection: Option<PathBuf>,
     transient_logged: AtomicBool,
+    pending_ack: AtomicU64,
     absent: std::sync::Mutex<AbsentBackoff>,
 }
 
@@ -246,6 +248,7 @@ impl ColliculusSource {
             #[cfg(test)]
             fixture_connection: None,
             transient_logged: AtomicBool::new(false),
+            pending_ack: AtomicU64::new(0),
             absent: std::sync::Mutex::new(AbsentBackoff::default()),
         }
     }
@@ -267,6 +270,7 @@ impl ColliculusSource {
         now: i64,
         stop: &AtomicBool,
     ) -> Result<Option<String>, FeedError> {
+        let started = Instant::now();
         let mut cursor = state.with_conn(|conn| {
             let text: Option<String> = conn
                 .query_row(
@@ -288,14 +292,15 @@ impl ColliculusSource {
         if stop.load(Ordering::Relaxed) {
             return Err(FeedError::Stopped);
         }
-        // A prior acknowledgement can be lost after the page committed. Retrying
-        // the durable watermark also releases retained records on a quiet feed.
-        if cursor > 0 {
+        // Retry a failed acknowledgement for a page this reader committed. A
+        // saved cursor alone doesn't prove a fresh route recognizes that sequence.
+        if cursor > 0 && self.pending_ack.load(Ordering::Relaxed) == cursor {
             route.ack(cursor).await?;
+            self.pending_ack.store(0, Ordering::Relaxed);
         }
         let mut unhealthy = false;
         let mut replayed = false;
-        loop {
+        for _ in 0..PAGES_PER_DRAIN {
             if stop.load(Ordering::Relaxed) {
                 return Err(FeedError::Stopped);
             }
@@ -309,6 +314,7 @@ impl ColliculusSource {
                 return Err(FeedError::Stopped);
             }
             check_page_structure(&page)?;
+            let observed_cursor = page.last_seq.is_some_and(|last| last >= cursor);
             let next = page.last_seq.unwrap_or(cursor).max(cursor);
             if !page.entries.is_empty() && next == cursor {
                 if replayed {
@@ -377,10 +383,19 @@ impl ColliculusSource {
             }
             // ordered_write returns only after SQLite commits events, evidence,
             // coverage and the cursor. No acknowledgement can precede that act.
-            if stop.load(Ordering::Relaxed) {
-                return Err(FeedError::Stopped);
+            if observed_cursor {
+                self.pending_ack.store(cursor, Ordering::Relaxed);
+                if stop.load(Ordering::Relaxed) {
+                    return Err(FeedError::Stopped);
+                }
+                route.ack(cursor).await?;
+                self.pending_ack.store(0, Ordering::Relaxed);
             }
-            route.ack(cursor).await?;
+            // Yield between pages, leaving the committed cursor and pending
+            // coverage for the next wake even when the feed never becomes quiet.
+            if started.elapsed() >= BUDGET {
+                break;
+            }
         }
         Ok(unhealthy.then(|| "colliculus deliveries were quarantined".into()))
     }

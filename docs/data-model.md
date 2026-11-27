@@ -2,7 +2,7 @@
 
 astrocyte keeps one SQLite ledger at `<data home>/cortexkit/astrocyte/store.db`.
 The schema is the `MIGRATIONS` chain in `crates/astrocyte-core/src/store.rs`,
-currently version 70. A schema change appends a migration; an applied
+currently version 71. A schema change appends a migration; an applied
 migration is never edited. A binary refuses to serve a store whose schema is
 ahead of its own chain (test: `store_ahead_of_binary_refuses_startup_by_name`).
 
@@ -19,11 +19,15 @@ copies that timeout without running the table-creating probes.
 | `broca_segment_evidence` | Each row preserves the fact id, run id and ingest time of a BROCA segment whose usage is billed through attempts instead. It has no ledger call. | insert only, once per fact |
 | `broca_segment_measurement` | Each row preserves a marked segment's quantity in the same roles and units as ledger measurements. | insert only, once per segment, role and unit |
 | `broca_attempt_detail` | Each row keeps a BROCA call's attempt identifiers, original share index, outcome and HTTP status, response counts, tier, speed, pricing mode and segment link. Usage lives in the call's ledger measurements. | insert only, once per call |
+| `broca_empty_attempt` | Each row reserves the fact ID of an attempt with no eligible shares; there is no ledger event for it. | insert only, once per attempt |
+| `broca_empty_attempt_conflict` | Each row preserves a distinct redelivery that would add a share to a previously all-skipped attempt. | insert only, once per contradiction |
 | `broca_scope_stamp` | Each row preserves the daemon-stamped agent, agent run or flow and the BROCA export fact kind for an existing ledger call. Unstamped calls have no row. The stamp is attribution evidence, not a ledger or pricing field. | insert only, once per call; dirties the attribution hour |
 | `broca_scope_backfill` | The singleton tracks how far a one-time read of retained BROCA exports has filled stamps for existing calls, and whether it caught up to the reader's committed cursor. | advances with each backfill page; stops on completion |
 | `media_caller` | Each row holds caller evidence for a Colliculus ledger call: the app's stated `agent_id` and the daemon-relayed `device` as JSON. Either may be absent, but not both. Without a matching publisher fact, the stated agent supplies only `alfonso`. Device is not a grouping dimension, and neither value changes pricing or permissions. | insert only, once per call; dirties the attribution hour |
 | `broca_segment_check_state` | The singleton stores the insertion cursor of the last segment checked against its attempt shares. | advances with each checked batch |
 | `broca_segment_mismatch` | Each row preserves a differing segment and attempt quantity (including whether each side reported it), the role and unit, and the check time. When the attempt sum exceeds the integer range, `over_range` is set and the sum is NULL. | insert only, once per segment, role and unit |
+| `broca_segment_recheck` | Queues already-checked segments whose attempt shares have changed. | derived queue |
+| `broca_segment_current_mismatch` | Lists the segments still differing at their most recent comparison. The original differences remain in `broca_segment_mismatch`. | derived |
 | `step_detail` | Each row records the finish reason or context window a harness reader saw for one event, for cache diagnostics. | insert only, once per event |
 | `step_message` | Each row records the host's own message id for a newly recorded event, for joining live feed rows within their harness and session. Old events are not backfilled. | insert only, once per event |
 | `cache_step_sequence` | Each row maps a ledger event to a durable cache cursor. | insert |
@@ -36,7 +40,7 @@ copies that timeout without running the table-creating probes.
 | `step_cause` | Each row records a changed explanation for one step identity; the newest key wins, including a null correction to no cause. | append only; kept forever |
 | `chargeability_transition` | Each row records the one terminal settlement of an event's chargeability. | insert only |
 | `quarantine_evidence` | Each row preserves a referring event's quantities that contradict its target. | insert |
-| `rejected_delivery` | Each row preserves a redelivery whose payload differs from the stored event. | insert |
+| `rejected_delivery` | Each row preserves a distinct redelivery payload that differs from the stored event. | insert |
 | `redelivery_log` | Each row records an identical redelivery pushed by a peer. | insert |
 | `adjustment` | Each row records a signed write-off, restatement, repricing, refund or goodwill adjustment. | insert |
 | `priced_charge` | Each row records a charge-chain entry for a measurement and the origin of the pricing act. | insert only |
@@ -56,7 +60,7 @@ copies that timeout without running the table-creating probes.
 | `thalamus_payer_cursor` | The row records the payer store incarnation and committed sequence. | upsert with each mirror page |
 | `thalamus_payer_session` | Each row preserves the declared owner of a THALAMUS session. | insert once per harness and session |
 | `thalamus_payer_record` | Each row preserves one payer attempt, including its original usage JSON, after THALAMUS deletes its copy. | insert only |
-| `thalamus_payer_first_seen` | Each row preserves when an undated transcript call first waited for its payer. | insert once per event |
+| `thalamus_payer_first_seen` | Each row preserves when a transcript call first waited for its payer when its reported time was absent or in the future. | insert once per event |
 | `thalamus_payer_coverage` | Each row identifies one payer coverage exception, so replay cannot count it twice. | insert once per kind and identity |
 | `set_aside_record` | Each row records an unreadable producer record by source and locator, including its reason and observation times. | upsert |
 | `declared_store_cursor` | Each row records the durable read position of one store that another module declared, per source and on-disk layout. OpenCode stores its file identity in `file_identity`. | upsert; deleted when the store is no longer declared |

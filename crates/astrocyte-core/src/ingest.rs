@@ -560,7 +560,7 @@ fn record_event_with_facts_in_tx(
 ) -> Result<EventRecordOutcome, IngestError> {
     validate_event_request(request, recorded_at_ms)?;
 
-    if let Some((stored_event_id, stored_payload)) =
+    if let Some((stored_event_id, stored_event_key, stored_payload)) =
         load_event_payload(tx, request, media.is_some())?
     {
         if stored_payload.restated_by(request, media) {
@@ -592,19 +592,7 @@ fn record_event_with_facts_in_tx(
             });
         }
         let incoming_payload = canonical_incoming_payload(request, media)?;
-        tx.execute(
-            "INSERT INTO rejected_delivery (
-                 producer,producer_lineage,producer_ref,incoming_payload,stored_event_key,detected_at_ms
-             ) VALUES (?1,?2,?3,?4,(SELECT event_key FROM usage_event WHERE event_id=?5),?6)",
-            params![
-                request.producer,
-                request.producer_lineage,
-                request.producer_ref,
-                incoming_payload,
-                stored_event_id,
-                recorded_at_ms,
-            ],
-        )?;
+        record_rejected_delivery_in_tx(tx, stored_event_key, &incoming_payload, recorded_at_ms)?;
         return Ok(EventRecordOutcome {
             event_id: stored_event_id,
             disposition: RecordDisposition::QuarantinedRedelivery,
@@ -937,6 +925,25 @@ fn canonical_incoming_payload(
     jcs_serialize(&incoming_payload_value(request, media))
 }
 
+pub(crate) fn record_rejected_delivery_in_tx(
+    tx: &Transaction<'_>,
+    stored_event_key: i64,
+    incoming_payload: &str,
+    detected_at_ms: i64,
+) -> rusqlite::Result<()> {
+    // The observation time is evidence, not part of the contradiction's identity.
+    tx.prepare_cached(
+        "INSERT INTO rejected_delivery (
+             producer,producer_lineage,producer_ref,incoming_payload,stored_event_key,detected_at_ms
+         ) SELECT producer,producer_lineage,producer_ref,?2,event_key,?3
+             FROM usage_event WHERE event_key=?1 AND NOT EXISTS (
+                 SELECT 1 FROM rejected_delivery WHERE stored_event_key=?1 AND incoming_payload=?2
+             )",
+    )?
+    .execute(params![stored_event_key, incoming_payload, detected_at_ms])?;
+    Ok(())
+}
+
 pub(crate) fn incoming_payload_value(
     request: &EventRecordRequest,
     media: Option<&crate::media::MediaEvidence>,
@@ -994,7 +1001,7 @@ pub(crate) fn strictly_restates_event(
     tx: &Transaction<'_>,
     request: &EventRecordRequest,
 ) -> Result<bool, IngestError> {
-    let Some((_, stored)) = load_event_payload(tx, request, false)? else {
+    let Some((_, _, stored)) = load_event_payload(tx, request, false)? else {
         return Ok(false);
     };
     let mut incoming = request.measurements.iter().collect::<Vec<_>>();
@@ -1011,7 +1018,7 @@ fn load_event_payload(
     tx: &Transaction<'_>,
     request: &EventRecordRequest,
     include_media_caller: bool,
-) -> Result<Option<(String, EventPayload)>, IngestError> {
+) -> Result<Option<(String, i64, EventPayload)>, IngestError> {
     // `IS` is null-safe equality: a lineage-absent request must find the
     // lineage-absent stored row, which `= NULL` could never match.
     let stored = tx
@@ -1083,7 +1090,7 @@ fn load_event_payload(
         media.caller = crate::media::read_caller(tx, event_key)?;
     }
     payload.measurements = load_measurements(tx, &event_id)?;
-    Ok(Some((event_id, payload)))
+    Ok(Some((event_id, event_key, payload)))
 }
 
 fn load_measurements(
@@ -1430,6 +1437,34 @@ mod tests {
             measurements,
             step_detail: Default::default(),
         }
+    }
+
+    #[test]
+    fn repeated_event_contradiction_retains_only_distinct_evidence() {
+        let mut conn = conn();
+        let mut request = request("reread", None, vec![]);
+        request.producer_lineage = None;
+        let tx = conn.transaction().unwrap();
+        record_event_in_tx(&tx, &request, 1, DeliveryPath::Read).unwrap();
+        for (at, model) in [(2, "changed-a"), (3, "changed-a"), (4, "changed-b")] {
+            request.model = Some(model.into());
+            let outcome = record_event_in_tx(&tx, &request, at, DeliveryPath::Read).unwrap();
+            assert_eq!(
+                outcome.disposition,
+                RecordDisposition::QuarantinedRedelivery
+            );
+        }
+        tx.commit().unwrap();
+        assert_eq!(count(&conn, "usage_event"), 1);
+        let mut query = conn
+            .prepare("SELECT detected_at_ms FROM rejected_delivery ORDER BY detected_at_ms")
+            .unwrap();
+        let timestamps = query
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(timestamps, [2, 4]);
     }
 
     #[test]

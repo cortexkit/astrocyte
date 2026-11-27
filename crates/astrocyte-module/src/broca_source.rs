@@ -227,7 +227,7 @@ impl SourceClient for BrocaSource {
 /// One row of `export_facts`.
 struct StoreRow {
     export_seq: i64,
-    fact_id: String,
+    fact_id: Result<String, String>,
     segment_json: Result<String, String>,
 }
 
@@ -311,6 +311,18 @@ fn sqlite_error(stop: &AtomicBool, context: &str, error: rusqlite::Error) -> Pul
     }
 }
 
+fn row_text(value: ValueRef<'_>, column: &str) -> Result<String, String> {
+    match value {
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|error| format!("{column} is not UTF-8: {error}")),
+        value => Err(format!(
+            "{column} is not Text (got {:?})",
+            value.data_type()
+        )),
+    }
+}
+
 fn read_snapshot(
     connection: &Connection,
     path: &Path,
@@ -346,16 +358,8 @@ fn read_snapshot(
             .query_map(rusqlite::params![start, i64::from(limit)], |row| {
                 Ok(StoreRow {
                     export_seq: row.get(0)?,
-                    fact_id: row.get(1)?,
-                    segment_json: match row.get_ref(2)? {
-                        ValueRef::Text(bytes) => std::str::from_utf8(bytes)
-                            .map(str::to_owned)
-                            .map_err(|error| format!("segment_json is not UTF-8: {error}")),
-                        value => Err(format!(
-                            "segment_json is not Text (got {:?})",
-                            value.data_type()
-                        )),
-                    },
+                    fact_id: row_text(row.get_ref(1)?, "fact_id"),
+                    segment_json: row_text(row.get_ref(2)?, "segment_json"),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -508,19 +512,22 @@ fn refuse_fact_id_mismatch(
 fn page_from_snapshot(snapshot: Snapshot, path: &Path) -> Result<ExportPage, PullError> {
     let mut broca_facts = Vec::new();
     let mut set_aside = Vec::new();
-    for row in &snapshot.rows {
+    let consumed = snapshot
+        .rows
+        .last()
+        .map_or(snapshot.high_water, |row| row.export_seq);
+    for row in snapshot.rows {
         let locator = || {
             format!(
                 "{path:?}:{}:export_seq:{}",
                 snapshot.lineage, row.export_seq
             )
         };
-        match row
-            .segment_json
-            .as_deref()
-            .map_err(Clone::clone)
-            .and_then(|json| decode_store_row(row.export_seq, &row.fact_id, json))
-        {
+        let fact = row.fact_id.and_then(|id| {
+            row.segment_json
+                .and_then(|json| decode_store_row(row.export_seq, &id, &json))
+        });
+        match fact {
             Ok(fact) => broca_facts.push((row.export_seq, fact)),
             Err(reason) => set_aside.push(crate::refresher::SetAsideRecord {
                 locator: locator(),
@@ -533,10 +540,6 @@ fn page_from_snapshot(snapshot: Snapshot, path: &Path) -> Result<ExportPage, Pul
     // its high water; committing that high water is what the pull did for an
     // empty page. A high water below a stored cursor is left for
     // `refuse_broca_regression` to refuse.
-    let consumed = snapshot
-        .rows
-        .last()
-        .map_or(snapshot.high_water, |row| row.export_seq);
     let high_water = snapshot.high_water.max(consumed);
     Ok(ExportPage {
         events: Vec::new(),
@@ -657,6 +660,33 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].0.ends_with("export_seq:2"));
         assert!(rows[0].1.contains("segment_json") && rows[0].1.contains("Blob"));
+    }
+
+    #[test]
+    fn set_aside_broca_malformed_fact_ids_keep_good_rows_and_progress() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("run-index.db");
+        create_store(&path, "instance-a", 1);
+        for (seq, id) in [(1, "before"), (2, "blob"), (3, "invalid"), (4, "after")] {
+            add_fact(&path, seq, id);
+        }
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "UPDATE export_facts SET fact_id=X'626C6F62' WHERE export_seq=2;
+                 UPDATE export_facts SET fact_id=CAST(X'FF' AS TEXT) WHERE export_seq=3;",
+            )
+            .unwrap();
+        let state = test_state();
+        drain_once(&state, &source(&path), BROCA_SOURCE_KEY, PAGE_LIMIT, 100).unwrap();
+        assert_eq!(count(&state, "usage_event"), 2);
+        assert_eq!(runtime(&state).unwrap().1, Some(4));
+        let rows = set_aside_rows(&state);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].0.ends_with("export_seq:2"));
+        assert!(rows[0].1.contains("fact_id") && rows[0].1.contains("Blob"));
+        assert!(rows[1].0.ends_with("export_seq:3"));
+        assert!(rows[1].1.contains("fact_id") && rows[1].1.contains("UTF-8"));
     }
 
     #[test]

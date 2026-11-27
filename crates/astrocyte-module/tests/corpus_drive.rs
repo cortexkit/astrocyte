@@ -57,6 +57,14 @@ fn fully_refused_corpus_still_reports_missing_coverage() {
 }
 
 #[test]
+fn valid_corpus_with_stale_manifest_event_count_is_refused() {
+    let bytes = format!("{}\n", serde_json::to_string(&event(100)).unwrap());
+    let output = drive(bytes.as_bytes(), 2);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not match manifest event count"));
+}
+
+#[test]
 fn accepted_corpus_exits_successfully() {
     let bytes = format!("{}\n", serde_json::to_string(&event(100)).unwrap());
     let output = drive(bytes.as_bytes(), 1);

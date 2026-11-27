@@ -578,3 +578,48 @@ WHEN (NEW.outcome = 'priced' AND NEW.rate_exponent IS NULL)
   OR (NEW.outcome = 'covered' AND NEW.charge_nanos IS NULL)
 BEGIN SELECT RAISE(ABORT, 'priced_charge_required_outcome_fields'); END;
 "#;
+
+pub(in crate::store) const V71: &str = r#"
+CREATE INDEX rejected_delivery_by_event ON rejected_delivery(stored_event_key);
+
+CREATE TABLE broca_empty_attempt (
+    fact_id TEXT PRIMARY KEY,
+    recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER broca_empty_attempt_no_update BEFORE UPDATE ON broca_empty_attempt
+    BEGIN SELECT RAISE(ABORT,'broca_empty_attempt is append-only'); END;
+CREATE TRIGGER broca_empty_attempt_no_delete BEFORE DELETE ON broca_empty_attempt
+    BEGIN SELECT RAISE(ABORT,'broca_empty_attempt is append-only'); END;
+CREATE TRIGGER broca_empty_attempt_insert_once BEFORE INSERT ON broca_empty_attempt
+    WHEN EXISTS (SELECT 1 FROM broca_empty_attempt WHERE fact_id=NEW.fact_id)
+    BEGIN SELECT RAISE(ABORT,'broca_empty_attempt is append-only'); END;
+
+CREATE TABLE broca_empty_attempt_conflict (
+    fact_id TEXT NOT NULL REFERENCES broca_empty_attempt(fact_id) ON DELETE RESTRICT,
+    incoming_payload TEXT NOT NULL CHECK (json_valid(incoming_payload) AND json_type(incoming_payload)='object'),
+    detected_at_ms INTEGER NOT NULL CHECK (detected_at_ms >= 0),
+    PRIMARY KEY (fact_id,incoming_payload)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER broca_empty_attempt_conflict_no_update BEFORE UPDATE ON broca_empty_attempt_conflict
+    BEGIN SELECT RAISE(ABORT,'broca_empty_attempt_conflict is append-only'); END;
+CREATE TRIGGER broca_empty_attempt_conflict_no_delete BEFORE DELETE ON broca_empty_attempt_conflict
+    BEGIN SELECT RAISE(ABORT,'broca_empty_attempt_conflict is append-only'); END;
+CREATE TRIGGER broca_empty_attempt_conflict_insert_once BEFORE INSERT ON broca_empty_attempt_conflict
+    WHEN EXISTS (SELECT 1 FROM broca_empty_attempt_conflict
+                 WHERE fact_id=NEW.fact_id AND incoming_payload=NEW.incoming_payload)
+    BEGIN SELECT RAISE(ABORT,'broca_empty_attempt_conflict is append-only'); END;
+
+CREATE TABLE broca_segment_recheck (
+    segment_key INTEGER PRIMARY KEY REFERENCES broca_segment_evidence(segment_key) ON DELETE RESTRICT
+) STRICT;
+CREATE TABLE broca_segment_current_mismatch (
+    segment_key INTEGER PRIMARY KEY REFERENCES broca_segment_evidence(segment_key) ON DELETE RESTRICT
+) STRICT;
+
+-- Only segments known to have disagreed need reconciliation on upgrade.
+INSERT INTO broca_segment_recheck(segment_key)
+SELECT DISTINCT e.segment_key FROM broca_segment_mismatch m
+CROSS JOIN broca_segment_evidence e ON e.fact_id=m.fact_id;
+INSERT INTO broca_segment_current_mismatch(segment_key)
+SELECT segment_key FROM broca_segment_recheck;
+"#;
