@@ -250,6 +250,8 @@ fn safe_refusal(value: &Value) -> String {
 pub(crate) struct Reader {
     ticks: mpsc::UnboundedSender<Access>,
     snapshots: Arc<Mutex<Vec<Snapshot>>>,
+    #[cfg(test)]
+    entered_polling: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -258,6 +260,10 @@ impl Reader {
         let (ticks, mut received) = mpsc::unbounded_channel::<Access>();
         let snapshots = Arc::new(Mutex::new(Vec::new()));
         let output = Arc::clone(&snapshots);
+        #[cfg(test)]
+        let entered_polling = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let announce_polling = Arc::clone(&entered_polling);
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -285,7 +291,11 @@ impl Reader {
                         notice = changed.recv() => {
                             match notice {
                                 Some(Ok(())) => reread = true,
-                                Some(Err(code)) if code == "unknown_method" => { polling = true; }
+                                Some(Err(code)) if code == "unknown_method" => {
+                                    polling = true;
+                                    #[cfg(test)]
+                                    announce_polling.store(true, Ordering::Release);
+                                }
                                 Some(Err(code)) => {
                                     output.lock().unwrap().push(Err(code));
                                     last_list = None;
@@ -309,6 +319,8 @@ impl Reader {
         Self {
             ticks,
             snapshots,
+            #[cfg(test)]
+            entered_polling,
             thread: Some(thread),
         }
     }

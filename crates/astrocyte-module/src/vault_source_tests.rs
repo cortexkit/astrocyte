@@ -11,6 +11,7 @@ fn stage() -> Stage {
         reader: Reader {
             ticks,
             snapshots: Arc::default(),
+            entered_polling: Arc::default(),
             thread: None,
         },
         available: false,
@@ -821,17 +822,25 @@ fn vault_unknown_watch_method_polls_only_on_full_ticks() {
     );
     state.acknowledge_module_hello();
     let reader = Reader::start(Arc::new(AtomicBool::new(false)));
-    reader.tick(&state);
-    crate::test_support::wait_until("watch refusal", || peer.count("auth.watch_scoped") == 1);
-    crate::test_support::wait_until("initial list completed", || {
-        !reader.snapshots.lock().unwrap().is_empty()
+    let wait_for_list = |mut snapshots: Vec<Snapshot>, what| {
+        crate::test_support::wait_until(what, || {
+            snapshots.extend(std::mem::take(&mut *reader.snapshots.lock().unwrap()));
+            !snapshots.is_empty()
+        });
+        assert_eq!(snapshots.len(), 1, "{what} returned extra snapshots");
+        if let Err(code) = &snapshots[0] {
+            panic!("{what} returned {code}");
+        }
+    };
+    // The reader can publish the list before tick finishes draining snapshots.
+    wait_for_list(reader.tick(&state), "initial list completed");
+    // A request seen by the peer does not mean the reader has handled its refusal.
+    crate::test_support::wait_until("reader switched to full-tick polling", || {
+        reader.entered_polling.load(Ordering::Acquire)
     });
-    let count = peer.count("credential.list_scoped");
-    assert_eq!(count, 1);
-    reader.tick(&state);
-    crate::test_support::wait_until("full-tick poll", || {
-        peer.count("credential.list_scoped") > count
-    });
+    assert_eq!(peer.count("credential.list_scoped"), 1);
+    wait_for_list(reader.tick(&state), "full-tick poll");
+    assert_eq!(peer.count("credential.list_scoped"), 2);
     assert_eq!(peer.count("auth.watch_scoped"), 1);
     assert_eq!(peer.count("credential.get_scoped"), 0);
     reader.join();
