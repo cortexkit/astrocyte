@@ -1942,8 +1942,9 @@ mod tests {
             // The session moves to another head under another owner, and its
             // new store carries the old call as well as a new one.
             // The fixture writer has closed and the declared reader keeps no
-            // connection. Copy the bytes directly to avoid the filesystem
-            // clone that fs::copy can use on macOS.
+            // connection. On macOS fs::copy clones the file, and on GitHub's
+            // macOS runners that clone has been seen to leave a zero-filled
+            // copy, so copy the bytes directly and check the copy below.
             let moved_db = moved.join("opencode.db");
             fs::create_dir_all(&moved).unwrap();
             fs::write(&moved_db, fs::read(&original_db).unwrap()).unwrap();
