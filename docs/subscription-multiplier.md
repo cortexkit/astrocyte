@@ -91,14 +91,16 @@ known only by its position in an array, so it cannot produce a row or compete
 with other windows. Plan prices and subset lists are requested as of the UTC
 midnight ending the observation day, including on recompute.
 
-A subset matches the call's own catalog model ID: try an exact row, then
-remove a trailing `-low` or `-high` if the row is missing, then try an alias.
-An unresolved model belongs only to `all` pools. Membership ignores a
-`quota_proxy` price link, through which a plan's model borrows another
-model's list prices, and does not depend on whether the rates are usable. A listed
-model with unusable rates is still a member, and its unpriced usage enters
-that pool's diagnostics. List valuation starts from the call's own provider
-and follows catalog references rather than a configured provider alias.
+A subset includes a call whose recorded `provider/model` exactly matches a
+served list entry, even if `catalog.get` has no dated rate facts for it.
+Otherwise membership uses the call's own catalog model ID: try an exact row,
+then remove a trailing `-low` or `-high` if the row is missing, then try an
+alias. An unresolved model without an exact list match belongs only to `all`
+pools. A `quota_proxy` price link lets a plan's model borrow another model's
+list prices but does not change its pool membership. A member with no usable
+rate contributes unpriced usage to the pool's diagnostics, not an API value.
+List valuation starts from the call's own provider and follows catalog
+references rather than a configured provider alias.
 Reasoning is priced at the selected output rate only when the served reasoning
 rule says so; otherwise it needs a reasoning rate and is unpriced without one.
 

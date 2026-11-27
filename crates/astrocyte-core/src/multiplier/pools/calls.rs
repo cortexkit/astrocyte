@@ -191,20 +191,29 @@ impl PoolDayCapture {
             if call.plan != pool.plan || !in_denominator(&call.login) {
                 continue;
             }
-            if let PoolCoverage::Subset(_) = coverage {
+            if let PoolCoverage::Subset(models) = coverage {
+                let provider = call.tokens.provider.as_str();
+                let Some(model) = call.tokens.model.as_deref() else {
+                    continue;
+                };
+                // The served list identifies exact members independently of
+                // whether the rate lookup found a card or a price reference.
+                if !provider.is_empty()
+                    && models
+                        .iter()
+                        .any(|listed| listed.split_once('/') == Some((provider, model)))
+                {
+                    calls.push(call);
+                    continue;
+                }
                 let Some(identity) = identities.get(&call.tokens) else {
                     continue;
                 };
                 if !coverage.covers_model(Some(&identity.catalog_id)) {
                     continue;
                 }
-                if let Some(model) = call
-                    .tokens
-                    .model
-                    .as_deref()
-                    .filter(|_| identity.via_fallback)
-                {
-                    fallback_models.insert(format!("{}/{model}", call.tokens.provider));
+                if identity.via_fallback {
+                    fallback_models.insert(format!("{provider}/{model}"));
                 }
             }
             calls.push(call);

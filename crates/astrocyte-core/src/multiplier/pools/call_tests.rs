@@ -227,7 +227,7 @@ impl CatalogConnection for Catalog {
         let current = request.at_ms.is_none();
         match (model, current, request.auth_method.as_deref()) {
             ("fable" | "exact-low", _, None) => (),
-            ("alias", true, None) => {
+            ("alias" | "alias-listed", true, None) => {
                 rate["inherited_from"] = json!({"provider_id": CATALOG_PROVIDER,
                     "model_id":"fable","family":"claude","basis":"alias"});
             }
@@ -266,7 +266,7 @@ fn subset_matches_exact_then_suffix_then_alias_but_never_quota_proxy() {
             "anthropic/fable",
             "anthropic/exact",
             "anthropic/unpriced",
-            "anthropic/unknown",
+            "anthropic/alias-listed",
         ],
     )];
     let models = [
@@ -276,6 +276,7 @@ fn subset_matches_exact_then_suffix_then_alias_but_never_quota_proxy() {
         "exact-low",
         "proxy",
         "alias",
+        "alias-listed",
         "unpriced",
         "unknown",
     ];
@@ -317,7 +318,14 @@ fn subset_matches_exact_then_suffix_then_alias_but_never_quota_proxy() {
             .iter()
             .filter_map(|call| call.tokens.model.as_deref())
             .collect::<Vec<_>>(),
-        ["fable", "fable-low", "fable-high", "alias", "unpriced"]
+        [
+            "fable",
+            "fable-low",
+            "fable-high",
+            "alias",
+            "alias-listed",
+            "unpriced"
+        ]
     );
     assert_eq!(
         selected.pool_member_models.unwrap(),
@@ -357,9 +365,9 @@ fn listed_models_before_catalog_history_keep_identity_and_unpriced_tokens() {
     let lists = [list(
         CATALOG_PROVIDER,
         "Fable",
-        &["anthropic/fable", "anthropic/unknown"],
+        &["anthropic/fable", "anthropic/list-only"],
     )];
-    for model in ["fable", "fable-low", "alias", "unknown"] {
+    for model in ["fable", "fable-low", "alias", "list-only", "unknown"] {
         call(
             &conn,
             model,
@@ -376,7 +384,14 @@ fn listed_models_before_catalog_history_keep_identity_and_unpriced_tokens() {
     let selection = day
         .select_calls(by_id(&pools, "Fable"), &identities)
         .unwrap();
-    assert_eq!(selection.calls.len(), 3);
+    assert_eq!(
+        selection
+            .calls
+            .iter()
+            .filter_map(|call| call.tokens.model.as_deref())
+            .collect::<Vec<_>>(),
+        ["fable", "fable-low", "alias", "list-only"]
+    );
     assert_eq!(
         selection.pool_member_models.unwrap(),
         ["anthropic/alias", "anthropic/fable-low"]

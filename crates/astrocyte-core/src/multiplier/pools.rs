@@ -105,8 +105,8 @@ pub enum PoolCoverage<'a> {
 }
 
 impl PoolCoverage<'_> {
-    /// Pass the call's own catalog id, before any substitution for pricing.
-    /// Unresolved models count only for all-model windows.
+    /// Check a model ID against the pool's coverage without substituting a
+    /// different model for pricing.
     pub fn covers_model(&self, catalog_id: Option<&str>) -> bool {
         match self {
             Self::All => true,

@@ -754,6 +754,7 @@ pub(crate) fn recompute_multiplier_day(
 
 #[cfg(test)]
 mod multiplier_stage_tests {
+    include!("antigravity_pool_tests.rs");
     include!("stop_multiplier_tests.rs");
     include!("provider_day_tests.rs");
     include!("../refresher_bus_publications_tests.rs");
@@ -794,6 +795,7 @@ mod multiplier_stage_tests {
         reasoning_billing: AtomicBool,
         cache_write_ttl: std::sync::atomic::AtomicBool,
         uncovered: std::sync::atomic::AtomicBool,
+        dated_snapshot_uncovered: AtomicBool,
         history_fingerprint: std::sync::atomic::AtomicI64,
         history_version: std::sync::atomic::AtomicI64,
         history_calls: AtomicUsize,
@@ -818,6 +820,7 @@ mod multiplier_stage_tests {
                 reasoning_billing: AtomicBool::new(false),
                 cache_write_ttl: std::sync::atomic::AtomicBool::new(false),
                 uncovered: std::sync::atomic::AtomicBool::new(false),
+                dated_snapshot_uncovered: AtomicBool::new(false),
                 history_fingerprint: std::sync::atomic::AtomicI64::new(320_000_000_000),
                 history_version: std::sync::atomic::AtomicI64::new(1),
                 history_calls: AtomicUsize::new(0),
@@ -895,7 +898,12 @@ mod multiplier_stage_tests {
                     message: "fusiform's history begins at 1".into(),
                 });
             }
-            if self.uncovered.load(Ordering::SeqCst) {
+            // The served history fixture reads its rate at 1, independently
+            // of the dated snapshots the multiplier queries for the day.
+            if self.uncovered.load(Ordering::SeqCst)
+                || (self.dated_snapshot_uncovered.load(Ordering::SeqCst)
+                    && request.at_ms.is_some_and(|at_ms| at_ms > 1))
+            {
                 return Err(CatalogCallError {
                     code: "no_coverage".into(),
                     message: "the catalog has no row for this model".into(),
