@@ -1769,12 +1769,13 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.39"
+version = "0.1.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47304270d356c5c1edf9fc778aa8a8666aeabd2a64104d5c59a8a471ec723e9c"
+checksum = "9fba3c52c0f9cd6485479ca243d7ac5690161e04f0bd8d29863cc4b14dd48478"
 dependencies = [
  "libc",
  "rustix",
+ "socket2",
  "tokio",
  "windows-sys 0.61.2",
  "zeroize",
