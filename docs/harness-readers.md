@@ -364,10 +364,13 @@ Rules that affect what is recorded:
   `declared_calls_keep_the_user_store_identity_and_carry_the_owner`,
   `an_unfinished_call_is_recorded_at_once_in_a_done_folder_and_waits_in_an_active_one`,
   `a_folder_seen_done_gets_a_full_pass_before_it_releases_the_watermark`.
-- A `kind: "shared"` entry declares THALAMUS's shared OpenCode 2 store at
-  `<H>/opencode2-server/data/opencode`. Its `sessions` items carry each listed
-  session's owner and state; unlisted sessions still read with no work class
-  and the active-session quiet window. A session item may declare
+- A `kind: "shared"` entry declares one of THALAMUS's shared OpenCode 2 stores:
+  `<H>/opencode2-server/data/opencode` or `<H>/opencode2-worker-server/data/opencode`.
+  These paths must match exactly after symlinks are resolved. Both can appear
+  in the same roots file, once each. Each store keeps its own cursor and
+  open-row floor. Its `sessions` items supply owner and state only for rows
+  read from that store; unlisted sessions still read with no work class and
+  the active-session quiet window. A session item may declare
   `imported_through_seq`, the copy's highest `session_message.seq` when it was
   made. Only assistant rows above that boundary are eligible for billing;
   sequence gaps do not change the comparison. Full and tail reads count rows
@@ -384,16 +387,18 @@ Rules that affect what is recorded:
   Tests: `shared_copy_cutoff_skips_history_without_holding_progress`,
   `shared_copy_cutoff_rejects_bad_values_as_unreadable_roots`,
   `v2_copied_history_is_counted_without_pinning_full_or_tail_reads`.
-- After every complete pass over the declared folders, the source stores its
-  read watermark (`read_watermark`, see the [data model](data-model.md)) in
-  the transaction that records the pass. The stored value is the greater of
-  the value already stored and the pass's start minus 60 seconds.
+- After every complete pass over the declared folders and shared stores, the
+  source stores one read watermark (`read_watermark`, see the
+  [data model](data-model.md)) in the transaction that records the pass. The
+  stored value is the greater of the value already stored and the pass's
+  start minus 60 seconds.
   A pass is complete, and moves the watermark, only when the roots file was
   usable, every `done` folder has been read by a full pass to its high water,
-  and every declared folder that still has its `opencode.db` was read and
-  committed. A folder that cannot be resolved, opened or queried for any other
-  reason, such as a corrupt file, holds the watermark back and degrades the
-  source until it reads; the other folders are still read. A folder whose
+  every newly `done` shared session has had its final full pass, and every
+  declared store that still has its `opencode.db` was read and committed. A
+  store that cannot be resolved, opened or queried for any other reason, such
+  as a corrupt file, holds the watermark back and degrades the source until it
+  reads; the other stores are still read. A store whose
   `opencode.db` is gone, including one erased during the pass, is skipped
   without degrading. Its cursor is deleted when the folder itself is erased or
   is no longer declared. When two entries name different paths that resolve to

@@ -91,13 +91,14 @@ An entry without `kind` declares a folder for one session, with these fields:
   once a read sees it marked `done`, so a `done_at_ms` from before that write
   could fall behind a watermark that never covered the folder as done.
 
-An entry with `kind: "shared"` declares the shared OpenCode 2 store. Its
+An entry with `kind: "shared"` declares one shared OpenCode 2 store. Its
 `path`, after symlinks are resolved, must be exactly
-`<H>/opencode2-server/data/opencode`, where `<H>` is the canonical parent of
-the `opencode-sessions/` folder that holds `roots.json`. No ancestor,
-descendant or similarly named path is accepted. This path is not accepted
-without `kind: "shared"`, and a shared entry cannot use a session-folder or
-runner-head path. A symlink does not exempt its target from these rules.
+`<H>/opencode2-server/data/opencode` or `<H>/opencode2-worker-server/data/opencode`,
+where `<H>` is the canonical parent of the `opencode-sessions/` folder that
+holds `roots.json`. No ancestor, descendant or similarly named path is
+accepted. Neither path is accepted without `kind: "shared"`, and a shared
+entry cannot use a session-folder or runner-head path. A symlink does not
+exempt its target from these rules.
 Astrocyte logs a refused entry once and skips it; the other entries still read.
 
 A shared entry has a `sessions` array instead of its own `state` and
@@ -109,7 +110,7 @@ write that first marks the item `done`, after that session can no longer
 write; the shared server need not exit. A listed session absent from the
 store is allowed because its rows may already have been erased.
 
-Astrocyte reads every session in the shared store, whether listed or not.
+Astrocyte reads every session in each shared store, whether listed or not.
 A listed session's calls use its `owner_principal` verbatim as `work_class`.
 An unlisted session's calls have no work class and use the active-session
 quiet window. The harness module writes a session's item before its first
@@ -168,6 +169,22 @@ declaration does not undo an already recorded call or a call already waiting
 for its payer. This preserves the existing behaviour for undeclared sessions.
 This amendment keeps roots-file `version: 1`.
 
+### Amendment: shared worker store (2026-11-28)
+
+THALAMUS may declare both shared OpenCode 2 stores in the same `version: 1`
+roots file, with one `kind: "shared"` entry and its own `sessions` array per
+store. A session item's owner, state and copied-history boundary apply only to
+rows read from that entry's store. Native OpenCode session ids are unique across
+the two servers, and sessions never move between them. Each store keeps its own
+read cursor and open-row floor. Repeating a declared path makes the roots file
+malformed, as for folder entries: astrocyte keeps the last good list and holds
+the watermark.
+
+The single watermark still covers every declared folder and shared store. A
+read failure on either shared store holds it back even if the other stores read
+successfully. Astrocyte must support the worker store and be live before
+THALAMUS turns it on; older readers skip its path and could release unread rows.
+
 | Roots file state | Astrocyte's behaviour |
 |---|---|
 | Absent | No sessions: no source row, health unaffected. |
@@ -211,7 +228,7 @@ a request with any member is refused `invalid_params`:
   that pass's recording transaction has committed. There is one watermark
   for the `opencode-thalamus` source, not one per store or session. Every call
   in a folder or shared session whose `done_at_ms` is at or before T has been
-  recorded. Every complete pass includes the shared store's unlisted sessions.
+  recorded. Every complete pass includes unlisted sessions in each shared store.
 - T is stored and never goes backwards, including across restarts.
 - A record astrocyte cannot parse counts as read once it has been set aside
   as evidence, so one bad record cannot hold T back.

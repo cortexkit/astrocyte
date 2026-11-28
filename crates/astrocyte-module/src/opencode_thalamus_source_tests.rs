@@ -1,4 +1,222 @@
-// Payer-join regressions share the fixtures in opencode_thalamus_source.
+// Tests for shared stores and for calls waiting on payer records use the
+// fixtures in opencode_thalamus_source.
+
+impl Fixture {
+    fn worker_path(&self) -> PathBuf {
+        self.folder
+            .parent()
+            .unwrap()
+            .join("opencode2-worker-server/data/opencode")
+    }
+
+    fn worker_entry(&self, sessions: Vec<Value>) -> Value {
+        json!({"path": self.worker_path(), "kind": "shared", "sessions": sessions})
+    }
+
+    fn v2_progress(&self, path: &Path) -> Option<(i64, Option<i64>)> {
+        self.state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT consumed_ordinal,open_row_floor FROM declared_store_cursor
+                     WHERE source_key=?1 AND store_path=?2 AND layout=?3",
+                    params![SOURCE_KEY, path.to_string_lossy(), LAYOUT_V2],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())
+            })
+            .unwrap()
+    }
+}
+
+#[test]
+fn both_shared_stores_record_listed_owners_and_keep_separate_progress() {
+    let mut f = Fixture::new();
+    let shared = f.shared_path();
+    let worker = f.worker_path();
+    f.shared_call("shared", "shared-front", true, CREATED);
+    f.shared_call("shared", "shared-open", false, T0 - 2);
+    f.shared_call("shared", "shared-later", true, T0 - 1);
+    Fixture::shared_call_at(&worker, "worker", "worker-open", false, T0 - 4);
+    Fixture::shared_call_at(&worker, "worker", "worker-first", true, T0);
+    Fixture::shared_call_at(&worker, "worker", "worker-last", true, T0 + 1);
+    let shared_entry = f.shared_entry(vec![Fixture::shared_session("shared", false)]);
+    let mut worker_session = Fixture::shared_session("worker", false);
+    worker_session["owner_principal"] = json!("magic-context");
+    f.declare(vec![
+        shared_entry.clone(),
+        f.worker_entry(vec![worker_session]),
+    ]);
+
+    f.tick(T0);
+    assert_eq!(
+        f.events(),
+        [
+            ("shared-front".into(), "opencode".into(), Some(OWNER.into())),
+            ("shared-later".into(), "opencode".into(), Some(OWNER.into())),
+            (
+                "worker-first".into(),
+                "opencode".into(),
+                Some("magic-context".into())
+            ),
+            (
+                "worker-last".into(),
+                "opencode".into(),
+                Some("magic-context".into())
+            ),
+        ]
+    );
+    assert_eq!(f.v2_progress(&shared), Some((T0 - 1, Some(2))));
+    assert_eq!(f.v2_progress(&worker), Some((T0 + 1, Some(1))));
+
+    // The worker's open row ages out first without changing its timestamp.
+    // On restart, the worker's floor gives the earliest row ID to check below
+    // the timestamp cursor. Using the other store's floor would miss it.
+    let worker_quiet = T0 - 4 + QUIET_WINDOW;
+    f.restart();
+    f.tick(worker_quiet);
+    assert_eq!(
+        f.refs(),
+        [
+            "shared-front",
+            "shared-later",
+            "worker-first",
+            "worker-last",
+            "worker-open"
+        ]
+    );
+    assert_eq!(f.v2_progress(&shared), Some((T0 - 1, Some(2))));
+    assert_eq!(f.v2_progress(&worker), Some((T0 + 1, Some(3))));
+
+    f.declare(vec![shared_entry]);
+    f.tick(worker_quiet + 1);
+    assert_eq!(f.v2_progress(&shared), Some((T0 - 1, Some(2))));
+    assert_eq!(f.v2_progress(&worker), None);
+    assert_eq!(f.degraded(), None);
+}
+
+#[test]
+fn shared_session_owner_state_and_copy_cutoff_stay_in_the_declaring_store() {
+    let f = Fixture::new();
+    let worker = f.worker_path();
+    let session = "ses_same";
+    // Deliberately reuse a native id to check that reading is scoped to the store.
+    f.shared_call(session, "shared-complete", true, T0);
+    f.shared_call(session, "shared-open", false, T0);
+    Fixture::shared_call_at(&worker, session, "worker-copied", false, T0);
+    Fixture::shared_call_at(&worker, session, "worker-done", false, T0);
+    let mut worker_session = Fixture::shared_session(session, true);
+    worker_session["imported_through_seq"] = json!(1);
+    f.declare(vec![
+        f.shared_entry(vec![]),
+        f.worker_entry(vec![worker_session]),
+    ]);
+
+    f.tick(T0);
+    assert_eq!(
+        f.events(),
+        [
+            ("shared-complete".into(), "opencode".into(), None),
+            ("worker-done".into(), "opencode".into(), Some(OWNER.into())),
+        ]
+    );
+    f.tick(T0 + QUIET_WINDOW);
+    assert_eq!(
+        f.events(),
+        [
+            ("shared-complete".into(), "opencode".into(), None),
+            ("shared-open".into(), "opencode".into(), None),
+            ("worker-done".into(), "opencode".into(), Some(OWNER.into())),
+        ]
+    );
+}
+
+#[test]
+fn watermark_get_waits_for_worker_store_while_other_stores_keep_recording() {
+    let f = Fixture::new();
+    let worker = f.worker_path();
+    let db = worker.join("opencode.db");
+    let saved = worker.join("saved.db");
+    let watermark = || {
+        let caller = subc_protocol::Principal::Reserved {
+            module_id: "thalamus-harness".into(),
+        };
+        crate::ops::watermark_get(&f.state, Some(&caller), json!({})).unwrap()
+    };
+    f.shared_call("shared", "shared-first", true, CREATED);
+    f.call(ONE, Layout::V2, "folder-first", true, CREATED);
+    Fixture::shared_call_at(&worker, "worker", "worker-first", true, CREATED);
+    f.declare(vec![
+        f.shared_entry(vec![]),
+        f.worker_entry(vec![]),
+        f.entry(ONE, false),
+    ]);
+
+    fs::rename(&db, &saved).unwrap();
+    fs::write(&db, [7_u8; 4096]).unwrap();
+    f.tick(T0);
+    assert_eq!(f.refs(), ["folder-first", "shared-first"]);
+    assert_eq!(watermark(), json!({"watermark_ms": null}));
+    assert!(f.degraded().unwrap().contains("opencode2-worker-server"));
+
+    fs::remove_file(&db).unwrap();
+    fs::rename(&saved, &db).unwrap();
+    f.tick(T0 + TICK);
+    assert_eq!(f.refs(), ["folder-first", "shared-first", "worker-first"]);
+    let released = json!({"watermark_ms": T0 + TICK - WATERMARK_MARGIN_MS});
+    assert_eq!(watermark(), released);
+    assert_eq!(f.degraded(), None);
+
+    fs::write(&db, [7_u8; 4096]).unwrap();
+    f.shared_call("shared", "shared-second", true, T0 + 2 * TICK);
+    f.tick(T0 + 2 * TICK);
+    assert_eq!(
+        f.refs(),
+        [
+            "folder-first",
+            "shared-first",
+            "shared-second",
+            "worker-first"
+        ]
+    );
+    assert_eq!(watermark(), released);
+}
+
+#[test]
+fn duplicate_shared_entries_are_malformed_and_keep_last_good_list() {
+    for duplicate_worker in [false, true] {
+        let f = Fixture::new();
+        let worker = f.worker_path();
+        f.shared_call("shared", "shared-first", true, CREATED);
+        Fixture::shared_call_at(&worker, "worker", "worker-first", true, CREATED);
+        let entries = [
+            f.shared_entry(vec![Fixture::shared_session("shared", false)]),
+            f.worker_entry(vec![Fixture::shared_session("worker", false)]),
+        ];
+        f.declare(entries.to_vec());
+        f.tick(T0);
+        assert_eq!(f.refs(), ["shared-first", "worker-first"]);
+        let released = f.watermark();
+
+        let repeated = &entries[usize::from(duplicate_worker)];
+        let mut other_owner = repeated.clone();
+        other_owner["sessions"][0]["owner_principal"] = json!("magic-context");
+        f.declare(vec![other_owner, repeated.clone()]);
+        Fixture::shared_call_at(&worker, "worker", "worker-second", true, T0 + TICK);
+        f.tick(T0 + TICK);
+        assert!(f.degraded().unwrap().contains("name one folder twice"));
+        assert_eq!(f.watermark(), released);
+        assert_eq!(f.cursor_rows(), 2);
+        assert_eq!(
+            f.events().last().unwrap(),
+            &(
+                "worker-second".into(),
+                "opencode".into(),
+                Some(OWNER.into())
+            )
+        );
+    }
+}
 
 fn recorded_cache_split_row(name: &str) -> Value {
     use sha2::{Digest, Sha256};

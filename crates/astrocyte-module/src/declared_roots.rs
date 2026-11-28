@@ -238,16 +238,17 @@ pub(crate) fn contain_opencode_session(
     )
 }
 
-/// A shared OpenCode 2 server has one fixed data folder beside the sessions folder.
+/// The two shared OpenCode 2 servers have fixed data folders beside the sessions folder.
 pub(crate) fn contain_opencode_shared(folder: &Path, declared: &Path) -> Result<Contained, String> {
     contain_with(
         Some(folder),
         declared,
         "shared OpenCode store",
         |folder, canonical| {
-            folder
-                .parent()
-                .is_some_and(|harness| canonical == harness.join("opencode2-server/data/opencode"))
+            folder.parent().is_some_and(|harness| {
+                canonical == harness.join("opencode2-server/data/opencode")
+                    || canonical == harness.join("opencode2-worker-server/data/opencode")
+            })
         },
     )
 }

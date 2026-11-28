@@ -901,7 +901,11 @@ mod tests {
         }
 
         fn shared_call(&self, session: &str, id: &str, complete: bool, updated: i64) {
-            let database = self.shared_path().join("opencode.db");
+            Self::shared_call_at(&self.shared_path(), session, id, complete, updated);
+        }
+
+        fn shared_call_at(path: &Path, session: &str, id: &str, complete: bool, updated: i64) {
+            let database = path.join("opencode.db");
             insert(
                 &database,
                 Layout::V2,
@@ -1324,12 +1328,20 @@ mod tests {
             "opencode2-server/data",
             "opencode2-server/data/opencode/x",
             "other/opencode2-server/data/opencode",
+            "opencode2-worker-server/data/opencode",
+            "opencode2-worker-server/data",
+            "opencode2-worker-server/data/opencode/x",
+            "other/opencode2-worker-server/data/opencode",
+            "opencode2-worker-server-copy/data/opencode",
             "launch-head-runner/data/opencode",
             "opencode-sessions/private",
         ] {
             for shared in [false, true] {
                 let accepted = if shared {
-                    relative == "opencode2-server/data/opencode"
+                    matches!(
+                        relative,
+                        "opencode2-server/data/opencode" | "opencode2-worker-server/data/opencode"
+                    )
                 } else {
                     relative.starts_with("launch-head-")
                         || relative.starts_with("opencode-sessions/")
@@ -1381,12 +1393,15 @@ mod tests {
         f.shared_call("session", "unmarked", true, CREATED);
         let mut shared = f.shared_entry(vec![]);
         shared.as_object_mut().unwrap().remove("kind");
-        f.declare(vec![shared, f.entry(ONE, false)]);
+        Fixture::shared_call_at(&f.worker_path(), "worker", "unmarked-worker", true, CREATED);
+        let mut worker = f.worker_entry(vec![]);
+        worker.as_object_mut().unwrap().remove("kind");
+        f.declare(vec![shared, worker, f.entry(ONE, false)]);
         f.tick(T0);
         assert_eq!(f.refs(), vec!["good"]);
-        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 1);
+        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 2);
         f.tick(T0 + TICK);
-        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 1);
+        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 2);
         assert_eq!(f.degraded(), None);
         assert_eq!(f.watermark(), Some(T0 + TICK - WATERMARK_MARGIN_MS));
     }
@@ -1396,19 +1411,26 @@ mod tests {
     fn shared_path_uses_the_resolved_location_even_for_an_in_sessions_alias() {
         let f = Fixture::new();
         f.shared_call("session", "shared", true, CREATED);
+        Fixture::shared_call_at(&f.worker_path(), "worker", "worker", true, CREATED);
         let alias = f.folder.join("alias");
+        let worker_alias = f.folder.join("worker-alias");
         std::os::unix::fs::symlink(f.shared_path(), &alias).unwrap();
+        std::os::unix::fs::symlink(f.worker_path(), &worker_alias).unwrap();
         let mut shared = f.shared_entry(vec![]);
         shared["path"] = json!(alias);
-        f.declare(vec![shared]);
+        let mut worker = f.worker_entry(vec![]);
+        worker["path"] = json!(worker_alias);
+        f.declare(vec![shared, worker]);
         f.tick(T0);
-        assert_eq!(f.refs(), vec!["shared"]);
+        assert_eq!(f.refs(), vec!["shared", "worker"]);
         assert_eq!(f.degraded(), None);
         let mut folder = f.entry(ONE, false);
         folder["path"] = json!(alias);
-        f.declare(vec![folder]);
+        let mut worker_folder = f.entry(TWO, false);
+        worker_folder["path"] = json!(worker_alias);
+        f.declare(vec![folder, worker_folder]);
         f.tick(T0 + TICK);
-        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 1);
+        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 2);
         assert_eq!(f.degraded(), None);
     }
 
@@ -1418,14 +1440,23 @@ mod tests {
         let f = Fixture::new();
         f.call(ONE, Layout::V2, "good", true, CREATED);
         f.shared_call("session", "escaped", true, CREATED);
-        let path = f.shared_path();
-        let outside = f.temp.path().join("outside");
-        fs::rename(&path, &outside).unwrap();
-        std::os::unix::fs::symlink(outside, &path).unwrap();
-        f.declare(vec![f.shared_entry(vec![]), f.entry(ONE, false)]);
+        Fixture::shared_call_at(&f.worker_path(), "worker", "worker-escaped", true, CREATED);
+        for (path, outside) in [
+            (f.shared_path(), "outside"),
+            (f.worker_path(), "worker-outside"),
+        ] {
+            let outside = f.temp.path().join(outside);
+            fs::rename(&path, &outside).unwrap();
+            std::os::unix::fs::symlink(outside, &path).unwrap();
+        }
+        f.declare(vec![
+            f.shared_entry(vec![]),
+            f.worker_entry(vec![]),
+            f.entry(ONE, false),
+        ]);
         f.tick(T0);
         assert_eq!(f.refs(), vec!["good"]);
-        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 1);
+        assert_eq!(f.source.cache.lock().unwrap().warned.len(), 2);
         assert_eq!(f.degraded(), None);
         assert_eq!(f.watermark(), Some(T0 - WATERMARK_MARGIN_MS));
     }
