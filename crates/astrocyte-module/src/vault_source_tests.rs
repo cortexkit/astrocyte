@@ -714,8 +714,10 @@ fn vault_watch_notice_is_applied_on_next_full_tick_without_restart() {
     let mut stage = Stage::new(Arc::new(AtomicBool::new(false)));
     let prices = Prices(vec![("pro_200", 20_000), ("plus", 2_000)]);
     stage.tick(&state, Some(&prices), 101);
+    // The first tick can already apply the initial list, when it arrives
+    // before the tick takes the reader's results.
     crate::test_support::wait_until("initial vault list", || {
-        !stage.reader.snapshots.lock().unwrap().is_empty()
+        !stage.reader.snapshots.lock().unwrap().is_empty() || !rows(&state).is_empty()
     });
     stage.tick(&state, Some(&prices), 101);
     assert_eq!(rows(&state)[0].0, "openai/pro_200");
@@ -759,9 +761,11 @@ fn regression_vault_failed_watch_reread_retries_on_full_tick() {
     );
     state.acknowledge_module_hello();
     let reader = Reader::start(Arc::new(AtomicBool::new(false)));
-    reader.tick(&state);
+    // A tick sends to the reader before it takes the results, so the first
+    // list can come back in this tick's own batch. Count it rather than drop it.
+    let first_batch = reader.tick(&state).len();
     crate::test_support::wait_until("initial vault list and watch notice", || {
-        reader.snapshots.lock().unwrap().len() >= 2
+        first_batch + reader.snapshots.lock().unwrap().len() >= 2
     });
     let mut invalid = listing(&["openai"], Some("plus"), Some(200));
     invalid["result"]["grant_tuples"] = json!([]);
