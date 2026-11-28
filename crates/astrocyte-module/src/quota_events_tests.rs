@@ -3,6 +3,8 @@ use crate::refresher::{CapacitySource, PullError};
 use crate::test_support::{wait_until, Background};
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicUsize;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -876,6 +878,168 @@ fn assert_runner_delivery(configure_insula: bool) {
         .filter(|request| request["method"] == "ckbus.credential")
         .count();
     assert_eq!(fresh, 1);
+}
+
+type BusWire = BufReader<TcpStream>;
+
+// Exercise async-nats's actual authentication and resubscription without a
+// nats-server process. Rejected attempts close the socket before sending CONNECT.
+async fn accept_bus_wire(listener: &TcpListener) -> (Value, BusWire) {
+    loop {
+        let mut wire = BufReader::new(listener.accept().await.unwrap().0);
+        wire.write_all(
+            b"INFO {\"nonce\":\"fixture\",\"max_payload\":1048576,\"headers\":true}\r\n",
+        )
+        .await
+        .unwrap();
+        let mut line = String::new();
+        if wire.read_line(&mut line).await.unwrap() == 0 {
+            continue;
+        }
+        let connect = serde_json::from_str(line.strip_prefix("CONNECT ").unwrap()).unwrap();
+        line.clear();
+        wire.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "PING\r\n");
+        wire.write_all(b"PONG\r\n").await.unwrap();
+        return (connect, wire);
+    }
+}
+
+async fn next_bus_command(wire: &mut BusWire) -> String {
+    let mut line = String::new();
+    assert_ne!(wire.read_line(&mut line).await.unwrap(), 0);
+    let mut words = line.split_ascii_whitespace();
+    match words.next() {
+        Some("PING") => wire.write_all(b"PONG\r\n").await.unwrap(),
+        Some("PUB" | "HPUB") => {
+            let len = words.last().unwrap().parse::<usize>().unwrap();
+            wire.read_exact(&mut vec![0; len + 2]).await.unwrap();
+        }
+        _ => {}
+    }
+    line
+}
+
+async fn deliver_runner_step(
+    wire: &mut BusWire,
+    names: &AccountNames,
+    state: Arc<SharedState>,
+    expected: u64,
+) {
+    let (subject, body) = crate::runner_steps::test_event(names, "minimal", "thalamus", |body| {
+        body["attempt_id"] = json!(format!("attempt_{expected}"));
+    });
+    let mut pending = crate::runner_steps::subjects(names).unwrap();
+    let mut sid = String::new();
+    while !pending.is_empty() {
+        let line = next_bus_command(wire).await;
+        let mut words = line.split_ascii_whitespace();
+        if words.next() == Some("SUB") {
+            let subscribed = words.next().unwrap();
+            pending.retain(|expected| expected != subscribed);
+            if subscribed == subject {
+                sid = words.last().unwrap().to_owned();
+            }
+        }
+    }
+    wire.write_all(format!("MSG {subject} {sid} {}\r\n", body.len()).as_bytes())
+        .await
+        .unwrap();
+    wire.write_all(&body).await.unwrap();
+    wire.write_all(b"\r\n").await.unwrap();
+    let appended = tokio::task::spawn_blocking(move || {
+        wait_until("runner step delivered over the bus", || {
+            state.step_feed().runner_counts().appended == expected
+        });
+    });
+    // Keep responding to bus commands until the reader has served the step.
+    tokio::select! {
+        result = appended => result.unwrap(),
+        () = async { loop { next_bus_command(wire).await; } } => unreachable!(),
+    }
+}
+
+fn assert_reader_reconnect(refusal: Option<&'static str>) {
+    runtime().block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("nats://{}", listener.local_addr().unwrap());
+        let names = AccountNames::derive("box_runner_reconnect").unwrap();
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let peer = Peer::start(Arc::new({
+            let disconnected = disconnected.clone();
+            let account = names.account().to_owned();
+            move |request| {
+                use subc_protocol::FrameType::{Error, Response};
+                let retired = refusal.filter(|_| disconnected.load(Ordering::Acquire));
+                let (kind, value) = match request["method"].as_str().unwrap() {
+                    "ckbus.credential" => {
+                        let (key, epoch) = if retired.is_some() { ("replacement", 2) } else { ("original", 1) };
+                        (Response, json!({"result": {"jwt":key, "exp":chrono::Utc::now().timestamp() + 900,
+                            "acct":account, "inbox_prefix":format!("_INBOX.{key}"), "server_url":url,
+                            "credential_public":key, "spawn_generation":1, "credential_epoch":epoch}}))
+                    }
+                    "ckbus.credential_renew" => (Error, json!({"code":retired.unwrap(), "message":"refused"})),
+                    "ckbus.nonce_sign" if retired.is_some() && request["params"]["credential_public"] == "original" => {
+                        (Error, json!({"code":retired.unwrap(), "message":"refused"}))
+                    }
+                    "ckbus.nonce_sign" => (Response, json!({"result":{"signature_b64":base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8;64])}})),
+                    _ => panic!("unexpected management operation"),
+                };
+                Some((kind, serde_json::to_vec(&value).unwrap()))
+            }
+        }));
+        let state = Arc::new(crate::state::test_state());
+        state.install_quota_bus_access(peer.path.clone(), "astrocyte".into(), "fixture-handoff".into());
+        state.acknowledge_module_hello();
+        let reader = Reader::start(state.clone(), None, Arc::new(AtomicBool::new(false))).unwrap();
+
+        let (connect, mut original) = tokio::time::timeout(Duration::from_secs(5), accept_bus_wire(&listener))
+            .await.expect("reader did not connect with the original credential");
+        assert_eq!(connect["jwt"], "original");
+        tokio::time::timeout(Duration::from_secs(5), deliver_runner_step(&mut original, &names, state.clone(), 1))
+            .await.expect("reader did not subscribe before the disconnect");
+
+        disconnected.store(true, Ordering::Release);
+        drop(original);
+        if refusal.is_none() {
+            // The server is still unavailable on the first reconnect attempt.
+            let (missed, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await.expect("client did not try reconnecting").unwrap();
+            drop(missed);
+        }
+        let (connect, mut reconnected) = tokio::time::timeout(Duration::from_secs(5), accept_bus_wire(&listener))
+            .await.expect("reader did not reconnect after nonce signing");
+        let expected_key = if refusal.is_some() { "replacement" } else { "original" };
+        assert_eq!(connect["jwt"], expected_key);
+        tokio::time::timeout(Duration::from_secs(5), deliver_runner_step(&mut reconnected, &names, state.clone(), 2))
+            .await.expect("reader did not subscribe after reconnecting");
+
+        let mut expected = vec![("ckbus.credential", None), ("ckbus.nonce_sign", Some("original")), ("ckbus.nonce_sign", Some("original"))];
+        if let Some(reason) = refusal {
+            assert_eq!(state.quota_bus().0.lock().unwrap().reason, reason);
+            expected.extend([("ckbus.credential_renew", Some("original")), ("ckbus.credential", None), ("ckbus.nonce_sign", Some(expected_key))]);
+        }
+        let requests = peer.requests.lock().unwrap();
+        let calls: Vec<_> = requests.iter().map(|request| (request["method"].as_str().unwrap(), request["params"]["credential_public"].as_str())).collect();
+        assert_eq!(calls, expected);
+        drop(requests);
+        drop(reader);
+    });
+}
+
+#[test]
+fn quota_reader_reconnect_replaces_a_superseded_credential() {
+    assert_reader_reconnect(Some("ckbus_credential_superseded"));
+}
+
+#[test]
+fn quota_reader_reconnect_replaces_a_revoked_credential() {
+    assert_reader_reconnect(Some("ckbus_credential_revoked"));
+}
+
+#[test]
+fn quota_reader_reconnect_reuses_a_valid_credential() {
+    assert_reader_reconnect(None);
 }
 
 #[test]

@@ -9,7 +9,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use subc_client_rs::{CallOptions, ConsumerOptions, RouteHandle, SubcConsumer};
 use subc_protocol::RouteTarget;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
+
+const SUPERSEDED: &str = "ckbus_credential_superseded";
+const REVOKED: &str = "ckbus_credential_revoked";
+const MAX_RECONNECTS: usize = 18;
 
 /// The nonce is shared with HELLO, never rediscovered or included in diagnostics.
 #[derive(Clone)]
@@ -137,8 +141,8 @@ fn safe_call_error(error: subc_client_rs::CallError) -> &'static str {
         .map(|body| body.code.as_str())
         .or_else(|| error.code())
     {
-        Some("ckbus_credential_superseded") => "ckbus_credential_superseded",
-        Some("ckbus_credential_revoked") => "ckbus_credential_revoked",
+        Some(SUPERSEDED) => SUPERSEDED,
+        Some(REVOKED) => REVOKED,
         Some("bad_consumer_identity") => "ckbus identity refused",
         Some("ckbus_principal_direct") => "ckbus principal refused",
         _ => "ckbus operation unavailable",
@@ -177,7 +181,7 @@ pub(crate) async fn credential(
                 renewed.validate()?;
                 return Ok(renewed);
             }
-            Err("ckbus_credential_superseded" | "ckbus_credential_revoked") => {}
+            Err(SUPERSEDED | REVOKED) => {}
             Err(reason) => return Err(reason),
         }
     }
@@ -188,16 +192,41 @@ pub(crate) async fn credential(
     Ok(credential)
 }
 
+pub(crate) struct SessionEnd(watch::Receiver<Option<&'static str>>);
+
+impl SessionEnd {
+    pub(crate) async fn reason(mut self) -> &'static str {
+        match self.0.wait_for(Option::is_some).await {
+            Ok(refusal) => refusal.expect("waited for a refusal"),
+            // The connector owns the sender; it drops it when it stops reconnecting.
+            Err(_) => "NATS connection closed",
+        }
+    }
+}
+
+fn reconnect_delay(attempt: usize) -> Duration {
+    if attempt <= 1 {
+        Duration::ZERO
+    } else {
+        Duration::from_millis((1_u64 << (attempt - 1).min(12)).min(4_000))
+    }
+}
+
 pub(crate) async fn connect(
     client: Arc<Mutex<Client>>,
     credential: &Credential,
-) -> Result<NatsConnection, &'static str> {
+) -> Result<(NatsConnection, SessionEnd), &'static str> {
     let jwt = credential.jwt.clone();
     let key = credential.credential_public.clone();
+    let (refusal, session_end) = watch::channel(None);
     let options =
         async_nats::ConnectOptions::with_auth_callback(move |nonce| {
             let (client, jwt, key) = (client.clone(), jwt.clone(), key.clone());
+            let refusal = refusal.clone();
             async move {
+                if refusal.is_closed() || refusal.borrow().is_some() {
+                    return Err(async_nats::AuthError::new("bus session ended"));
+                }
                 // NATS requires a Sync authentication future; the SDK connection future
                 // is Send but not Sync. A task boundary keeps its transport private.
                 let value =
@@ -209,7 +238,12 @@ pub(crate) async fn connect(
                     })
                     .await
                     .map_err(|_| async_nats::AuthError::new("signing task unavailable"))?
-                    .map_err(async_nats::AuthError::new)?;
+                    .map_err(|reason| {
+                        if matches!(reason, SUPERSEDED | REVOKED) {
+                            refusal.send_replace(Some(reason));
+                        }
+                        async_nats::AuthError::new(reason)
+                    })?;
                 let signature = value["signature_b64"]
                     .as_str()
                     .ok_or_else(|| async_nats::AuthError::new("signature absent"))?;
@@ -225,14 +259,32 @@ pub(crate) async fn connect(
                 Ok(auth)
             }
         })
-        .max_reconnects(0)
+        // Keep the 0.50 retry schedule: immediate, then 2, 4, 8, ... ms up to 4 s.
+        // Eighteen attempts span 28 s even with instant dial failures, enough to
+        // reuse the credential through a normal ck-bus restart (~20 s).
+        // async-nats 0.50 has no public abort for its reconnect loop. Dropping the
+        // client does not stop that loop, so cap it to retire failed sessions.
+        .reconnect_delay_callback(reconnect_delay)
+        .max_reconnects(MAX_RECONNECTS)
         .connection_timeout(Duration::from_secs(2));
-    NatsConnection::connect(
+    let connection = NatsConnection::connect(
         &credential.server_url,
         options,
         ConnectConfig::new(&credential.credential_public)
             .map_err(|_| "invalid credential inbox")?,
     )
     .await
-    .map_err(|_| "NATS connection failed")
+    .map_err(|_| session_end.borrow().unwrap_or("NATS connection failed"))?;
+    Ok((connection, SessionEnd(session_end)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_budget_covers_a_normal_bus_restart() {
+        let wait_before_last_attempt: Duration = (1..=MAX_RECONNECTS).map(reconnect_delay).sum();
+        assert!(wait_before_last_attempt > Duration::from_secs(20));
+    }
 }

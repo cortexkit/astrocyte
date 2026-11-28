@@ -604,7 +604,8 @@ async fn reader_loop(state: &SharedState, insula: Option<&crate::qta_client::Qta
             }
         };
         let session = async {
-            let connection = quota_bus_client::connect(client.clone(), &credential).await?;
+            let (connection, session_end) =
+                quota_bus_client::connect(client.clone(), &credential).await?;
             let names =
                 AccountNames::derive(&credential.acct).map_err(|_| "invalid bus account")?;
             let quota = match insula {
@@ -647,6 +648,8 @@ async fn reader_loop(state: &SharedState, insula: Option<&crate::qta_client::Qta
             // interrupt quota delivery.
             tokio::time::timeout(remaining, async {
                 tokio::select! {
+                    biased;
+                    reason = session_end.reason() => Err(reason),
                     result = quota_session => result,
                     () = crate::runner_steps::follow(state, &connection, &names) => Ok(()),
                     () = crate::event_wakes::follow(state, &connection, &names) => Ok(()),
