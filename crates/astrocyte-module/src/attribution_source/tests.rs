@@ -411,6 +411,62 @@ fn attribution_reader_saves_progress_through_replay_only_and_empty_pages() {
     assert_eq!(restarted.calls[0]["after"], json!({"sequence":6}));
 }
 
+fn drain(state: &SharedState, peer: &mut Peer) -> bool {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(drain_pages(
+            state,
+            Publisher::Basal,
+            100,
+            &AtomicBool::new(false),
+            peer,
+        ))
+        .unwrap()
+}
+
+fn set_aside_count(state: &SharedState) -> i64 {
+    state
+        .with_conn(|conn| {
+            conn.query_row("SELECT count(*) FROM set_aside_record", [], |r| r.get(0))
+                .map_err(|e| e.to_string())
+        })
+        .unwrap()
+}
+
+#[test]
+fn attribution_reader_treats_an_echoed_cursor_on_an_empty_page_as_caught_up() {
+    let state = test_state();
+    let mut pages = basal_pages();
+    pages[1]["result"]["next"] = json!({"sequence": 5});
+    let echo = json!({"result":{"facts":[],"next":{"sequence":5},"through":4}});
+    pages.push(echo.clone());
+    let mut first = Peer::new(pages);
+    assert!(drain(&state, &mut first), "the echo ends the feed");
+    assert_eq!(first.calls.len(), 3);
+
+    // The next refresh starts at the saved cursor and is caught up at once.
+    let mut idle = Peer::new(vec![echo]);
+    assert!(drain(&state, &mut idle));
+    assert_eq!(idle.calls.len(), 1);
+    assert_eq!(idle.calls[0]["after"], json!({"sequence":5}));
+    assert_eq!(set_aside_count(&state), 0, "caught up is not malformed");
+}
+
+#[test]
+fn attribution_reader_sets_aside_a_page_whose_facts_repeat_its_cursor() {
+    let state = test_state();
+    let mut pages = basal_pages();
+    pages[1]["result"]["next"] = json!({"sequence": 5});
+    let known = pages[1]["result"]["facts"].clone();
+    // A page that carries facts but hands back a cursor already read is a loop.
+    pages.push(json!({"result":{"facts":known,"next":{"sequence":5},"through":4}}));
+    let mut peer = Peer::new(pages);
+    assert!(!drain(&state, &mut peer));
+    assert_eq!(set_aside_count(&state), 1);
+}
+
 #[test]
 fn attribution_reader_yields_backlog_and_resumes_at_its_saved_cursor() {
     let state = test_state();

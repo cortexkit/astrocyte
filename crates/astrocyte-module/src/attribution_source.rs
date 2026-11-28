@@ -204,6 +204,11 @@ async fn drain_pages<T: ReadTransport>(
             malformed_page(state, publisher, &bytes, "malformed_page", now)?;
             return Ok(false);
         };
+        // A caught-up publisher may answer with no facts and echo the cursor
+        // it was sent. That ends the feed; it isn't a loop.
+        if page.facts.is_empty() && page.next.is_some() && page.next == cursor {
+            return Ok(true);
+        }
         if page.next.as_ref().is_some_and(|next| seen.contains(next)) {
             malformed_page(state, publisher, &bytes, "cursor_not_advanced", now)?;
             return Ok(false);
